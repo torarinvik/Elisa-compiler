@@ -57,6 +57,10 @@ check_case qualified_both_sides $'module Backend:\n    public:\n        error Sc
 check_case qualified_multi_family $'module Net:\n    public:\n        error SendError:\n            Refused\n\n        error RecvError:\n            Empty\n\n        def send(n: i64) -> void error[Net::SendError]:\n            raise Net::SendError.Refused if n > 10\n\n        def recv(n: i64) -> void error[Net::RecvError]:\n            raise Net::RecvError.Empty if n > 10\n\ndef relay(n: i64) -> void error[Net::SendError, Net::RecvError]:\n    try Net::send(n)\n    try Net::recv(n)\n\ndef main() -> i64:\n    return 0\n'
 check_case bare_unchanged $'error DiskError:\n    Full\n\ndef write_one(n: i64) -> void error[DiskError]:\n    raise DiskError.Full if n > 10\n\ndef write_all(n: i64) -> void error[DiskError]:\n    try write_one(n)\n\ndef main() -> i64:\n    return 0\n'
 
+# FIRES: family leaves alone must not equate Provider::Fault with Peer::Fault when
+# their variants differ. Check both direct `try` propagation and polymorphic wrapper return.
+check_case same_leaf_fault_different_modules $'module Provider:\n    public:\n        error Fault:\n            Available\n\nmodule Peer:\n    public:\n        error Fault:\n            Busy\n\ndef get() -> i64 error[Provider::Fault]:\n    raise Provider::Fault.Available\n\ndef wrap[errorset R](f: fn() -> i64 error[R]) -> i64 error[R]:\n    return try f()\n\ndef direct() -> i64 error[Peer::Fault]:\n    return try get()\n\ndef wrapped() -> i64 error[Peer::Fault]:\n    return wrap(get)\n\ndef main() -> i64:\n    return 0\n'
+
 # FIRES: a genuine family mismatch must survive the tail rule -- two DIFFERENT sets whose
 # module prefix is the same, which is exactly what reading the prefix used to conflate.
 check_case qualified_real_mismatch $'module Store:\n    public:\n        error ReadError:\n            Missing\n\n        error WriteError:\n            Denied\n\n        def load(n: i64) -> void error[Store::ReadError]:\n            raise Store::ReadError.Missing if n > 10\n\ndef save(n: i64) -> void error[Store::WriteError]:\n    try Store::load(n)\n\ndef main() -> i64:\n    return 0\n'

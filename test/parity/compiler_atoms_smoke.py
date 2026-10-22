@@ -39,6 +39,8 @@ def run(args, **kwargs):
     return result.stdout
 
 
+run(["bash", str(ROOT / "scripts/assert_stage0_fresh.sh"), COMPILER])
+
 with tempfile.TemporaryDirectory(prefix="elisa-compiler-atoms-") as work:
     work = Path(work)
     hooks = work / "hooks.c"

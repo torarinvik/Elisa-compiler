@@ -1,13 +1,249 @@
 extend Semantic:
     private:
-        # The line the callee's `__error_return` row was recorded at -- the key every other
-        # row about that callee's error surface is filed under.
-        def catch_error_return_line(annotations: darray[Ast::EnumAnnotation]&, callee: sview) -> u32:
+        def catch_module_is_ancestor(candidate: sview, module: sview) -> bool:
             can Abort.Panic:
-                declaration_line: mutable u32 = 0
-                for annotation in annotations |declaration_line|:
-                    declaration_line <- annotation.line if annotation.owner == callee and annotation.name == "__error_return" else declaration_line
-                return declaration_line
+                return true if candidate == module or candidate == ""
+                return false if candidate.len + 2.usize() >= module.len
+                for index in 0..<candidate.len |candidate, module|:
+                    return false if candidate[index] != module[index]
+                return module[candidate.len] == 58 and module[candidate.len + 1.usize()] == 58
+
+        # Same-named callees can be declared in separate modules. The Catch parser
+        # stores the caller's lexical module, while `__fn_module` rows carry the
+        # callee declaration identity. Prefer the closest callee module visible from
+        # that caller; if there is no lexical match, accept only a globally unique
+        # declaration module and fail closed for unresolved duplicates.
+        def catch_error_declaration(annotations: darray[Ast::EnumAnnotation]&, callee: sview @source, catch_module: sview @source) -> (known: bool, module: sview @source, line: u32, offset: u32, identity_id: u32):
+            can Abort.Panic:
+                only_module: mutable sview @source = ""
+                only_line: mutable u32 = 0
+                only_offset: mutable u32 = 0
+                only_identity_id: mutable u32 = 0
+                has_module: mutable bool = false
+                modules_ambiguous: mutable bool = false
+                fallback_count: mutable usize = 0.usize()
+                scoped_module: mutable sview @source = ""
+                scoped_length: mutable usize = 0.usize()
+                scoped_line: mutable u32 = 0
+                scoped_offset: mutable u32 = 0
+                scoped_identity_id: mutable u32 = 0
+                scoped_declaration_count: mutable usize = 0.usize()
+                for declaration in annotations |only_module, only_line, only_offset, only_identity_id, has_module, modules_ambiguous, fallback_count, scoped_module, scoped_length, scoped_line, scoped_offset, scoped_identity_id, scoped_declaration_count, callee, catch_module|:
+                    continue if declaration.owner != callee or declaration.name != "__error_return"
+                    fallback_count <- fallback_count + 1.usize()
+                    for module_annotation in annotations |declaration, only_module, only_line, only_offset, only_identity_id, has_module, modules_ambiguous, scoped_module, scoped_length, scoped_line, scoped_offset, scoped_identity_id, scoped_declaration_count, catch_module|:
+                        continue if module_annotation.owner != "__fn_module" or module_annotation.line != declaration.line
+                        continue if declaration.offset != 0 and module_annotation.offset != declaration.offset
+                        continue if declaration.identity_id != 0 and module_annotation.identity_id != declaration.identity_id
+                        candidate_module: sview @source = module_annotation.name
+                        if not has_module:
+                            only_module <- candidate_module
+                            only_line <- declaration.line
+                            only_offset <- declaration.offset
+                            only_identity_id <- declaration.identity_id
+                            has_module <- true
+                        elif candidate_module != only_module:
+                            modules_ambiguous <- true
+                        if catch_module_is_ancestor(candidate_module, catch_module):
+                            if scoped_declaration_count == 0.usize() or candidate_module.len > scoped_length:
+                                scoped_module <- candidate_module
+                                scoped_length <- candidate_module.len
+                                scoped_line <- declaration.line
+                                scoped_offset <- declaration.offset
+                                scoped_identity_id <- declaration.identity_id
+                                scoped_declaration_count <- 1.usize()
+                            elif candidate_module.len == scoped_length and candidate_module == scoped_module:
+                                scoped_declaration_count <- scoped_declaration_count + 1.usize()
+                            elif candidate_module.len == scoped_length:
+                                scoped_declaration_count <- scoped_declaration_count + 1.usize()
+                return (true, scoped_module, scoped_line, scoped_offset, scoped_identity_id) if scoped_declaration_count == 1.usize()
+                return (true, only_module, only_line, only_offset, only_identity_id) if fallback_count == 1.usize() and has_module and not modules_ambiguous
+                return (false, callee, 0, 0, 0)
+
+        # The family spelling alone does not identify Local::Fault when Peer::Fault
+        # exists too. Prefer the closest lexical module. If declaration provenance is
+        # missing, use a family whose owner is unique across the file; otherwise fail
+        # closed instead of merging unrelated variants into the catch's error set.
+        def catch_error_family_module(family: sview @source, function_module_known: bool, function_module: sview @source, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Abort.Panic:
+                only_module: mutable sview @source = ""
+                has_module: mutable bool = false
+                modules_ambiguous: mutable bool = false
+                scoped_module: mutable sview @source = ""
+                scoped_length: mutable usize = 0.usize()
+                scoped_found: mutable bool = false
+                for index in 0..<table.enum_variant_owner.count |only_module, has_module, modules_ambiguous, scoped_module, scoped_length, scoped_found, family, table, function_module_known, function_module|:
+                    continue if table.enum_variant_owner[index] != family
+                    return (false, family) if index >= table.enum_variant_module.count
+                    candidate_module: sview @source = table.enum_variant_module[index]
+                    if not has_module:
+                        only_module <- candidate_module
+                        has_module <- true
+                    elif candidate_module != only_module:
+                        modules_ambiguous <- true
+                    if function_module_known and catch_module_is_ancestor(candidate_module, function_module):
+                        if not scoped_found or candidate_module.len > scoped_length:
+                            scoped_module <- candidate_module
+                            scoped_length <- candidate_module.len
+                            scoped_found <- true
+                        elif candidate_module.len == scoped_length and candidate_module != scoped_module:
+                            return (false, family)
+                return (true, scoped_module) if scoped_found
+                return (true, only_module) if has_module and not modules_ambiguous
+                return (false, family)
+
+        # Preserve an explicitly qualified family in `error[Provider::Fault]`. The leaf
+        # row is still used for messages and subset matching; this parallel path row selects
+        # the enum inventory when the caller module also declares a same-leaf Fault.
+        def catch_module_alias_target(annotations: darray[Ast::EnumAnnotation]&, alias_name: sview @source, lexical_module: sview @source, declaration_line: u32, declaration_offset: u32) -> (found: bool, module: sview @source):
+            can Abort.Panic:
+                selected_target: mutable sview @source = alias_name
+                selected_scope: mutable sview @source = ""
+                selected_scope_length: mutable usize = 0.usize()
+                selected_offset: mutable u32 = 0
+                found: mutable bool = false
+                ambiguous: mutable bool = false
+                for alias in annotations |selected_target, selected_scope, selected_scope_length, selected_offset, found, ambiguous, alias_name, lexical_module, declaration_line, declaration_offset|:
+                    continue if not catch_module_path_matches(alias_name, alias.owner) or alias.name != "__using_alias"
+                    continue if declaration_offset != 0 and alias.offset >= declaration_offset
+                    continue if declaration_offset == 0 and alias.line >= declaration_line
+                    continue if not catch_module_is_ancestor(alias.module, lexical_module)
+                    target: mutable sview @source = ""
+                    target_found: mutable bool = false
+                    for target_row in annotations |target, target_found, alias|:
+                        continue if target_row.name != "__using_alias_target" or target_row.module != alias.module or target_row.line != alias.line or target_row.offset != alias.offset
+                        target <- target_row.owner
+                        target_found <- true
+                    continue if not target_found
+                    if not found or alias.module.len > selected_scope_length:
+                        selected_target <- target
+                        selected_scope <- alias.module
+                        selected_scope_length <- alias.module.len
+                        selected_offset <- alias.offset
+                        found <- true
+                        ambiguous <- false
+                    elif alias.module == selected_scope and alias.offset > selected_offset:
+                        selected_target <- target
+                        selected_offset <- alias.offset
+                        ambiguous <- false
+                    elif alias.module == selected_scope and alias.offset == selected_offset and selected_target != target:
+                        ambiguous <- true
+                return (false, alias_name) if ambiguous
+                return (true, selected_target) if found
+                return (false, alias_name)
+
+        # Comments are omitted from the parser token stream but preserved in this
+        # source-backed path row. Skip whitespace, `#` comments, and triple-quoted
+        # block comments while comparing against the canonical module spelling.
+        def catch_skip_path_trivia(raw_path: sview, start: usize) -> usize:
+            can Abort.Panic:
+                cursor: mutable usize = start
+                while cursor < raw_path.len:
+                    if raw_path[cursor] == 32 or raw_path[cursor] == 9 or raw_path[cursor] == 10 or raw_path[cursor] == 13:
+                        cursor <- cursor + 1.usize()
+                    elif raw_path[cursor] == 35:
+                        while cursor < raw_path.len and raw_path[cursor] != 10 and raw_path[cursor] != 13 |cursor, raw_path|:
+                            cursor <- cursor + 1.usize()
+                    elif raw_path[cursor] == 34 and cursor + 2.usize() < raw_path.len and raw_path[cursor + 1.usize()] == 34 and raw_path[cursor + 2.usize()] == 34:
+                        comment_cursor: mutable usize = cursor + 3.usize()
+                        comment_closed: mutable bool = false
+                        while comment_cursor + 2.usize() < raw_path.len |comment_cursor, comment_closed, raw_path|:
+                            if raw_path[comment_cursor] == 34 and raw_path[comment_cursor + 1.usize()] == 34 and raw_path[comment_cursor + 2.usize()] == 34:
+                                cursor <- comment_cursor + 3.usize()
+                                comment_closed <- true
+                                break
+                            comment_cursor <- comment_cursor + 1.usize()
+                        return raw_path.len if not comment_closed
+                    else:
+                        break
+                return cursor
+
+        # Compare a raw source path such as `Outer /* comment */ :: Provider` with
+        # canonical `Outer::Provider`; comments and whitespace are token trivia.
+        def catch_module_path_matches(raw_path: sview, canonical_path: sview) -> bool:
+            can Abort.Panic:
+                raw_index: mutable usize = 0.usize()
+                canonical_index: mutable usize = 0.usize()
+                while raw_index < raw_path.len or canonical_index < canonical_path.len |raw_index, canonical_index, raw_path, canonical_path|:
+                    raw_index <- catch_skip_path_trivia(raw_path, raw_index)
+                    return canonical_index == canonical_path.len if raw_index >= raw_path.len
+                    return false if canonical_index >= canonical_path.len
+                    if raw_path[raw_index] == 58:
+                        return false if canonical_index + 1.usize() >= canonical_path.len or canonical_path[canonical_index] != 58 or canonical_path[canonical_index + 1.usize()] != 58
+                        raw_index <- catch_skip_path_trivia(raw_path, raw_index + 1.usize())
+                        return false if raw_index >= raw_path.len or raw_path[raw_index] != 58
+                        raw_index <- raw_index + 1.usize()
+                        canonical_index <- canonical_index + 2.usize()
+                    else:
+                        return false if raw_path[raw_index] != canonical_path[canonical_index]
+                        raw_index <- raw_index + 1.usize()
+                        canonical_index <- canonical_index + 1.usize()
+                return true
+
+        def catch_family_separator_start(path: sview, family_start: usize) -> usize:
+            can Abort.Panic:
+                cursor: mutable usize = 0.usize()
+                separator: mutable usize = path.len
+                while cursor < family_start |cursor, separator, path, family_start|:
+                    cursor <- catch_skip_path_trivia(path, cursor)
+                    break if cursor >= family_start
+                    if path[cursor] == 58:
+                        next_colon: usize = catch_skip_path_trivia(path, cursor + 1.usize())
+                        if next_colon < family_start and path[next_colon] == 58:
+                            separator <- cursor
+                            cursor <- next_colon + 1.usize()
+                        else:
+                            cursor <- cursor + 1.usize()
+                    else:
+                        cursor <- cursor + 1.usize()
+                return separator
+
+        def catch_explicit_error_family_module(path: sview @source, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, function_module: sview @source, family: sview @source, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, module: sview @source):
+            can Abort.Panic:
+                selected_module: mutable sview @source = ""
+                found: mutable bool = false
+                ambiguous: mutable bool = false
+                return (false, family) if path == ""
+                path_end: mutable usize = path.len
+                while path_end > 0 and (path[path_end - 1.usize()] == 32 or path[path_end - 1.usize()] == 9) |path_end, path|:
+                    path_end <- path_end - 1.usize()
+                return (false, family) if path_end < family.len
+                family_start: usize = path_end - family.len
+                return (false, family) if not catch_module_path_matches(path[family_start:path_end], family)
+                separator: usize = catch_family_separator_start(path, family_start)
+                return (false, family) if separator == path.len
+                raw_module: sview @source = path[0:separator]
+                alias_target: mutable (found: bool, module: sview @source) = catch_module_alias_target(annotations, raw_module, function_module, declaration_line, declaration_offset)
+                candidate_path: mutable sview @source = alias_target.module if alias_target.found else raw_module
+                alias_hops: mutable usize = 0.usize()
+                while alias_target.found and alias_hops < 16.usize() |alias_target, candidate_path, alias_hops, annotations, function_module, declaration_line, declaration_offset|:
+                    alias_target <- catch_module_alias_target(annotations, candidate_path, function_module, declaration_line, declaration_offset)
+                    candidate_path <- alias_target.module if alias_target.found
+                    alias_hops <- alias_hops + 1.usize()
+                if alias_hops == 16.usize() and alias_target.found:
+                    return (false, family)
+                for index in 0..<table.enum_variant_owner.count |selected_module, found, ambiguous, table, family, candidate_path|:
+                    continue if table.enum_variant_owner[index] != family or index >= table.enum_variant_module.count
+                    candidate_module: sview @source = table.enum_variant_module[index]
+                    continue if not catch_module_path_matches(candidate_path, candidate_module)
+                    if not found:
+                        selected_module <- candidate_module
+                        found <- true
+                    elif selected_module != candidate_module:
+                        ambiguous <- true
+                return (false, family) if ambiguous
+                return (true, selected_module) if found
+                return (false, family)
+
+        def catch_error_family_module_for_declaration(annotations: darray[Ast::EnumAnnotation]&, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, family: sview @source, family_path: sview @source, function_module_known: bool, function_module: sview @source, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Abort.Panic:
+                explicit_module: (found: bool, module: sview @source) = catch_explicit_error_family_module(family_path, declaration_line, declaration_offset, declaration_identity_id, function_module, family, annotations, table)
+                if explicit_module.found:
+                    for index in 0..<table.enum_variant_owner.count |table, family, explicit_module|:
+                        continue if table.enum_variant_owner[index] != family
+                        return (true, explicit_module.module) if index < table.enum_variant_module.count and table.enum_variant_module[index] == explicit_module.module
+                    return (false, family)
+                return catch_error_family_module(family, function_module_known, function_module, table)
 
         # Whether the CALLEE narrows `family` to a subset of its variants -- the
         # `error[FooError{Bad1}, ...]` form. Such a catch is exhaustive once it handles the
@@ -19,15 +255,52 @@ extend Semantic:
         # rather than duplicating the subset arithmetic and disagreeing with it. NOTE these
         # rows put the MARKER in `owner` and the payload in `name` -- the opposite of every
         # other row read in this file.
-        def catch_family_is_subset(annotations: darray[Ast::EnumAnnotation]&, callee: sview, family: sview) -> bool:
+        def catch_family_is_subset(annotations: darray[Ast::EnumAnnotation]&, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, family: sview, family_path: sview) -> bool:
             can Abort.Panic:
-                declaration_line: u32 = catch_error_return_line(annotations, callee)
                 return false if declaration_line == 0
-                return any annotation in annotations where annotation.owner == "__error_variant_family" and annotation.line == declaration_line and annotation.name == family
+                for family_index in 0..<annotations.count:
+                    family_annotation: Ast::EnumAnnotation = annotations[family_index]
+                    continue if family_annotation.owner != "__error_set_family" or family_annotation.line != declaration_line or family_annotation.name != family
+                    continue if declaration_offset != 0 and family_annotation.offset != declaration_offset
+                    continue if declaration_identity_id != 0 and family_annotation.identity_id != declaration_identity_id
+                    continue if family_index + 2.usize() >= annotations.count
+                    family_path_annotation: Ast::EnumAnnotation = annotations[family_index + 1.usize()]
+                    continue if family_path_annotation.owner != "__error_set_family_path" or family_path_annotation.line != family_annotation.line or family_path_annotation.offset != family_annotation.offset or family_path_annotation.identity_id != family_annotation.identity_id
+                    continue if family_path != "" and not catch_module_path_matches(family_path_annotation.name, family_path)
+                    subset_annotation: Ast::EnumAnnotation = annotations[family_index + 2.usize()]
+                    return true if subset_annotation.owner == "__error_variant_family" and subset_annotation.line == declaration_line and subset_annotation.name == family and subset_annotation.offset == family_annotation.offset and subset_annotation.identity_id == family_annotation.identity_id
+                # Old parser producers without family/path rows remain supported conservatively.
+                return any annotation in annotations where family_path == "" and annotation.owner == "__error_variant_family" and annotation.line == declaration_line and annotation.name == family and (declaration_offset == 0 or annotation.offset == declaration_offset) and (declaration_identity_id == 0 or annotation.identity_id == declaration_identity_id)
 
-        def catch_error_family(annotations: darray[Ast::EnumAnnotation]&, callee: sview) -> sview:
+        # A restricted family occurrence contributes only its listed variants to the
+        # caught union. The rows after the family/path pair stay adjacent until the next
+        # family row, so repeated short names in excluded variants must not make a valid
+        # fallback arm ambiguous.
+        def catch_family_row_allows_variant(annotations: darray[Ast::EnumAnnotation]&, family_index: usize, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, family: sview, variant: sview) -> bool:
             can Abort.Panic:
-                declaration_line: u32 = catch_error_return_line(annotations, callee)
+                return false if family_index >= annotations.count
+                family_annotation: Ast::EnumAnnotation = annotations[family_index]
+                return false if family_annotation.owner != "__error_set_family" or family_annotation.line != declaration_line or family_annotation.name != family
+                return false if declaration_offset != 0 and family_annotation.offset != declaration_offset
+                return false if declaration_identity_id != 0 and family_annotation.identity_id != declaration_identity_id
+                return true if family_index + 2.usize() >= annotations.count
+                family_path_annotation: Ast::EnumAnnotation = annotations[family_index + 1.usize()]
+                return true if family_path_annotation.owner != "__error_set_family_path" or family_path_annotation.line != family_annotation.line or family_path_annotation.offset != family_annotation.offset or family_path_annotation.identity_id != family_annotation.identity_id
+                subset_annotation: Ast::EnumAnnotation = annotations[family_index + 2.usize()]
+                return true if subset_annotation.owner != "__error_variant_family" or subset_annotation.line != declaration_line or subset_annotation.name != family or subset_annotation.offset != family_annotation.offset or subset_annotation.identity_id != family_annotation.identity_id
+                allow_index: mutable usize = family_index + 3.usize()
+                while allow_index < annotations.count |allow_index, annotations, declaration_line, declaration_offset, declaration_identity_id, variant|:
+                    allow_annotation: Ast::EnumAnnotation = annotations[allow_index]
+                    # The next family occurrence is a hard boundary even when it belongs
+                    # to a different declaration on the same source line.
+                    if allow_annotation.owner == "__error_set_family" and allow_annotation.line == declaration_line:
+                        break
+                    return true if allow_annotation.owner == "__error_variant_allow" and allow_annotation.line == declaration_line and allow_annotation.name == variant and allow_annotation.offset == family_annotation.offset and allow_annotation.identity_id == family_annotation.identity_id
+                    allow_index <- allow_index + 1.usize()
+                return false
+
+        def catch_error_family(annotations: darray[Ast::EnumAnnotation]&, callee: sview, declaration_line: u32) -> sview:
+            can Abort.Panic:
                 return "" if declaration_line == 0
                 # SKIP EVERY RESERVED MARKER, not the two that existed when this was
                 # written. The parser records several rows against a function at its
@@ -54,26 +327,101 @@ extend Semantic:
                 return true if annotation.owner == callee and annotation.line == line and annotation.name == name
             return false
 
-        # A qualified catch arm records its source path (`Family.Variant`), while
-        # the enum registry stores the variant name separately from its family.
-        # Exhaustiveness must accept both spellings: bare `Variant:` when the
-        # family is unambiguous and qualified `Family.Variant:` when it is not.
-        def catch_line_has_variant(annotations: darray[Ast::EnumAnnotation]&, callee: sview, line: u32, family: sview, variant: sview) -> bool:
-            for annotation in annotations:
-                continue if annotation.owner != callee or annotation.line != line
-                return true if annotation.name == variant
-                path_length: usize = family.len + 1 + variant.len
-                continue if annotation.name.len != path_length
-                continue if annotation.name[family.len] != 46
-                family_matches: mutable bool = true
-                for family_index in 0..<family.len |family_matches, annotation, family|:
-                    family_matches <- false if annotation.name[family_index] != family[family_index]
-                continue if not family_matches
-                variant_matches: mutable bool = true
-                for variant_index in 0..<variant.len |variant_matches, annotation, family, variant|:
-                    variant_matches <- false if annotation.name[family.len + 1 + variant_index] != variant[variant_index]
-                return true if variant_matches
-            return false
+        def catch_variant_path_is_exact(path: sview, family: sview, variant: sview, family_module: sview) -> bool:
+            can Abort.Panic:
+                cursor: mutable usize = 0.usize()
+                if family_module != "":
+                    return false if path.len < family_module.len + 2.usize()
+                    for index in 0..<family_module.len |path, family_module|:
+                        return false if path[index] != family_module[index]
+                    cursor <- family_module.len
+                    return false if path[cursor] != 58 or path[cursor + 1.usize()] != 58
+                    cursor <- cursor + 2.usize()
+                return false if path.len - cursor != family.len + 1.usize() + variant.len
+                for index in 0..<family.len |path, family, cursor|:
+                    return false if path[cursor + index] != family[index]
+                cursor <- cursor + family.len
+                return false if path[cursor] != 46
+                cursor <- cursor + 1.usize()
+                for index in 0..<variant.len |path, variant, cursor|:
+                    return false if path[cursor + index] != variant[index]
+                return true
+
+        # Stage0 normalizes `::` to `.` and MatchErrorTag falls back to the suffix after the
+        # first dot. Compare that normalized short tag without allocating. This accepts one
+        # arbitrary leading module component (`Wrong::Fault.Bad` for `Local::Fault.Bad`) but
+        # rejects extra noncanonical components (`Wrong::Other::Fault.Bad`).
+        def catch_variant_path_matches(path: sview, family: sview, variant: sview, family_module: sview) -> bool:
+            can Abort.Panic:
+                # Stage0's short name for a root `Fault.Bad` tag is just `Bad`.
+                # Module-scoped tags retain the family component (`Fault.Bad`), so
+                # a bare `Bad` arm must not match `Local::Fault.Bad`.
+                return true if path == variant and family_module == ""
+                short_start: mutable usize = 0.usize()
+                for index in 0..<path.len |short_start, path|:
+                    if path[index] == 58 and index + 1.usize() < path.len and path[index + 1.usize()] == 58:
+                        short_start <- index + 2.usize()
+                        break
+                    if path[index] == 46:
+                        short_start <- index + 1.usize()
+                        break
+                cursor: mutable usize = short_start
+                if family_module == "":
+                    return path[cursor:path.len] == variant
+                module_separator: mutable usize = family_module.len
+                for index in 0..<family_module.len |family_module, module_separator|:
+                    if family_module[index] == 58 and index + 1.usize() < family_module.len and family_module[index + 1.usize()] == 58:
+                        module_separator <- index
+                        break
+                if module_separator < family_module.len:
+                    module_tail: sview = family_module[module_separator + 2.usize():family_module.len]
+                    return false if path.len - cursor < module_tail.len + 2.usize()
+                    for index in 0..<module_tail.len |path, module_tail, cursor|:
+                        return false if path[cursor + index] != module_tail[index]
+                    cursor <- cursor + module_tail.len
+                    return false if path[cursor] != 58 or path[cursor + 1.usize()] != 58
+                    cursor <- cursor + 2.usize()
+                return false if path.len - cursor < family.len + 1.usize() + variant.len
+                for index in 0..<family.len |path, family, cursor|:
+                    return false if path[cursor + index] != family[index]
+                cursor <- cursor + family.len
+                return false if path[cursor] != 46
+                cursor <- cursor + 1.usize()
+                return path[cursor:path.len] == variant
+
+        def catch_path_has_variant(path: sview, function_module: sview, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, family: sview, variant: sview, family_module: sview, include_only_caught_variants: bool, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return true if catch_variant_path_is_exact(path, family, variant, family_module)
+                return false if not catch_variant_path_matches(path, family, variant, family_module)
+                matching_union_tags: mutable usize = 0.usize()
+                matched_target: mutable bool = false
+                for family_index in 0..<annotations.count |matching_union_tags, matched_target, annotations, family_index, function_module, declaration_line, declaration_offset, declaration_identity_id, family, variant, family_module, table, path|:
+                    family_annotation: Ast::EnumAnnotation = annotations[family_index]
+                    continue if family_annotation.owner != "__error_set_family" or family_annotation.line != declaration_line
+                    continue if declaration_offset != 0 and family_annotation.offset != declaration_offset
+                    continue if declaration_identity_id != 0 and family_annotation.identity_id != declaration_identity_id
+                    continue if family_index + 1.usize() >= annotations.count
+                    family_path_annotation: Ast::EnumAnnotation = annotations[family_index + 1.usize()]
+                    continue if family_path_annotation.owner != "__error_set_family_path" or family_path_annotation.line != family_annotation.line or family_path_annotation.offset != family_annotation.offset or family_path_annotation.identity_id != family_annotation.identity_id
+                    candidate_family: sview = family_annotation.name
+                    candidate_module: (known: bool, module: sview @source) = catch_error_family_module_for_declaration(annotations, declaration_line, declaration_offset, declaration_identity_id, candidate_family, family_path_annotation.name, true, function_module, table)
+                    continue if not candidate_module.known
+                    for candidate_index in 0..<table.enum_variant_owner.count |matching_union_tags, matched_target, table, path, candidate_family, candidate_module, family, variant, family_module|:
+                        candidate_variant: sview = table.enum_variant_name[candidate_index]
+                        continue if table.enum_variant_owner[candidate_index] != candidate_family
+                        continue if candidate_index >= table.enum_variant_module.count or table.enum_variant_module[candidate_index] != candidate_module.module
+                        continue if include_only_caught_variants and not catch_family_row_allows_variant(annotations, family_index, declaration_line, declaration_offset, declaration_identity_id, candidate_family, candidate_variant)
+                        if catch_variant_path_matches(path, candidate_family, candidate_variant, candidate_module.module):
+                            matching_union_tags <- matching_union_tags + 1.usize()
+                            matched_target <- true if candidate_family == family and candidate_variant == variant and candidate_module.module == family_module
+                return matching_union_tags == 1.usize() and matched_target
+
+        def catch_line_has_variant(annotations: darray[Ast::EnumAnnotation]&, callee: sview, catch_line: u32, function_module: sview, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, family: sview, variant: sview, family_module: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for annotation in annotations:
+                    continue if annotation.owner != callee or annotation.line != catch_line
+                    return true if catch_path_has_variant(annotation.name, function_module, declaration_line, declaration_offset, declaration_identity_id, family, variant, family_module, true, annotations, table)
+                return false
 
         # Lexicographic `a < b` over sviews, byte by byte. stage0 runs the missing tags through
         # `sort.Strings` before joining them (analyzer_flow_match_core.go:610), so "the first
@@ -93,36 +441,65 @@ extend Semantic:
                 return false if verdict == 2
                 return a.len < b.len
 
+        def catch_error_tag_before(left_module: sview, left_family: sview, left_variant: sview, right_module: sview, right_family: sview, right_variant: sview) -> bool:
+            can Abort.Panic:
+                return catch_name_before(left_module, right_module) if left_module != right_module
+                return catch_name_before(left_family, right_family) if left_family != right_family
+                return catch_name_before(left_variant, right_variant)
+
+        # The caught error set may contain several families. Return the first missing tag
+        # from one family; the caller selects the first across the full union.
+        def catch_family_first_missing(annotations: darray[Ast::EnumAnnotation]&, callee: sview @source, catch_line: u32, catch_module: sview @source, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, family: sview @source, family_path: sview @source, function_module: sview @source, table: SymbolTable&) -> (known: bool, module: sview @source, variant: sview @source):
+            can Abort.Panic:
+                return (false, family, "") if family == "" or catch_family_is_subset(annotations, declaration_line, declaration_offset, declaration_identity_id, family, family_path)
+                family_module: (known: bool, module: sview @source) = catch_error_family_module_for_declaration(annotations, declaration_line, declaration_offset, declaration_identity_id, family, family_path, true, function_module, table)
+                return (false, family, "") if not family_module.known
+                missing_first: mutable sview @source = ""
+                while variant_index < table.enum_variant_owner.count |variant_index: usize = 0, table, missing_first, annotations, callee, declaration_line, family, family_module|:
+                    variant: sview = table.enum_variant_name[variant_index]
+                    belongs_to_family: bool = table.enum_variant_owner[variant_index] == family and variant_index < table.enum_variant_module.count and table.enum_variant_module[variant_index] == family_module.module
+                    missing_first <- variant if belongs_to_family and not catch_line_has_variant(annotations, callee, catch_line, function_module, declaration_line, declaration_offset, declaration_identity_id, family, variant, family_module.module, table) and (missing_first == "" or catch_name_before(variant, missing_first))
+                    variant_index <- variant_index + 1
+                return (true, family_module.module, missing_first)
+
         def check_catch_exhaustive_rows(annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for tail_annotation in annotations |table|:
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.CatchArmTail, name: "", line: tail_annotation.line, expected: "", actual: ""}) if tail_annotation.name == "__catch_arm_tail"
                 for annotation in annotations |table|:
                     if annotation.name == "__catch_expr" and not catch_line_has(annotations, annotation.owner, annotation.line, "__catch_all"):
-                        family: sview = catch_error_family(annotations, annotation.owner)
-                        if family != "" and not catch_family_is_subset(annotations, annotation.owner, family):
-                            # ONE diagnostic naming the alphabetically first missing variant, not
-                            # one diagnostic per missing variant. stage0 reports a SINGLE finding
-                            # whose tail is every missing tag sorted and joined with ", ", so the
-                            # per-variant loop this replaces diverged on the COUNT of diagnostics
-                            # as well as on their wording as soon as two variants were missing:
-                            # stage0 said `missing Problem.Second, Problem.Third` once, stage1 said
-                            # `missing error "Second"` and `missing error "Third"` twice.
-                            # Joining the list here is not open to us. The joined text exists in no
-                            # source buffer, and a Diagnostic may only carry SOURCE sviews -- a view
-                            # into table storage dangles once the table is copied through the next
-                            # lmut frame. NonExhaustiveMatch hit the same wall and settled on naming
-                            # the first case (resolve_types_match.elisa:98-105); matching that keeps
-                            # one rule for both families, and makes the single-missing case -- the
-                            # overwhelmingly common one -- byte-identical to stage0 rather than
-                            # merely close. The family is constant across the set, so ordering by
-                            # bare variant name orders the qualified `Family.Variant` names too.
-                            missing_first: mutable sview = ""
-                            while variant_index < table.enum_variant_owner.count |variant_index: usize = 0, table, missing_first, annotations, annotation, family|:
-                                variant: sview = table.enum_variant_name[variant_index]
-                                missing_first <- variant if table.enum_variant_owner[variant_index] == family and not catch_line_has_variant(annotations, annotation.owner, annotation.line, family, variant) and (missing_first == "" or catch_name_before(variant, missing_first))
-                                variant_index <- variant_index + 1
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonExhaustiveCatch, name: missing_first, line: annotation.line, expected: family, actual: ""}) if missing_first != ""
+                        function_declaration: (known: bool, module: sview @source, line: u32, offset: u32, identity_id: u32) = catch_error_declaration(annotations, annotation.owner, annotation.module)
+                        continue if not function_declaration.known
+                        missing_variant: mutable sview = ""
+                        missing_family: mutable sview = ""
+                        missing_module: mutable sview = ""
+                        family_row_count: mutable usize = 0.usize()
+                        for family_index in 0..<annotations.count |table, missing_variant, missing_family, missing_module, family_row_count, annotation, function_declaration, family_index|:
+                            family_annotation: Ast::EnumAnnotation = annotations[family_index]
+                            continue if family_annotation.owner != "__error_set_family" or family_annotation.line != function_declaration.line
+                            continue if function_declaration.offset != 0 and family_annotation.offset != function_declaration.offset
+                            continue if function_declaration.identity_id != 0 and family_annotation.identity_id != function_declaration.identity_id
+                            continue if family_index + 1.usize() >= annotations.count
+                            family_path_annotation: Ast::EnumAnnotation = annotations[family_index + 1.usize()]
+                            continue if family_path_annotation.owner != "__error_set_family_path" or family_path_annotation.line != family_annotation.line or family_path_annotation.offset != family_annotation.offset or family_path_annotation.identity_id != family_annotation.identity_id
+                            family_row_count <- family_row_count + 1.usize()
+                            family: sview = family_annotation.name
+                            first: (known: bool, module: sview @source, variant: sview @source) = catch_family_first_missing(annotations, annotation.owner, annotation.line, annotation.module, function_declaration.line, function_declaration.offset, function_declaration.identity_id, family, family_path_annotation.name, function_declaration.module, table)
+                            if first.known and first.variant != "" and (missing_variant == "" or catch_error_tag_before(first.module, family, first.variant, missing_module, missing_family, missing_variant)):
+                                missing_variant <- first.variant
+                                missing_family <- family
+                                missing_module <- first.module
+                        # Older declaration producers may only have the family on their
+                        # `__error_return` annotation. Keep a conservative single-family fallback.
+                        if family_row_count == 0.usize():
+                            family: sview = catch_error_family(annotations, annotation.owner, function_declaration.line)
+                            first: (known: bool, module: sview @source, variant: sview @source) = catch_family_first_missing(annotations, annotation.owner, annotation.line, annotation.module, function_declaration.line, function_declaration.offset, function_declaration.identity_id, family, "", function_declaration.module, table)
+                            missing_variant <- first.variant if first.known
+                            missing_family <- family if first.known
+                        # Stage0 combines every missing tag into one error. Diagnostic stores
+                        # source-backed pieces only, so report the first missing tag in sorted order
+                        # while still checking every family in the caught union.
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.NonExhaustiveCatch, name: missing_variant, line: annotation.line, expected: missing_family, actual: ""}) if missing_variant != ""
 
     public:
         def check_catch_exhaustive(file: Ast::File&, table: lmut SymbolTable) -> void:

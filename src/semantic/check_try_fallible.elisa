@@ -56,9 +56,15 @@ extend Semantic:
             next: mutable darray[u32]
             ready: mutable bool
 
+        struct TryErrorFamilyRef:
+            family: sview @source
+            module: sview @source
+            module_known: bool
+
         struct FallibleTryAnnotationProjection:
             module_annotations: mutable darray[Ast::EnumAnnotation]
             error_set_annotations: mutable darray[Ast::EnumAnnotation]
+            error_set_family_paths: mutable darray[Ast::EnumAnnotation]
             try_qualifiers: mutable dict[u64, sview]
 
         # Error-family facts for lexical bindings while locating a non-call try.
@@ -237,6 +243,7 @@ extend Semantic:
             can Memory.Allocate, Abort.Panic:
                 projection.module_annotations.push(annotation) if annotation.owner == "__fn_module"
                 projection.error_set_annotations.push(annotation) if annotation.owner == "__error_set_family"
+                projection.error_set_family_paths.push(annotation) if annotation.owner == "__error_set_family_path"
                 if annotation.owner == "__try_callee_module":
                     if projection.try_qualifiers.get(annotation.offset.u64()) is existing_qualifier:
                         pass
@@ -291,11 +298,14 @@ extend Semantic:
                         index.zero_offset_line_tails <- index.zero_offset_line_tails.put(line_key, row_id) can Global{Read,Write}
                 index.ready <- true
 
-        def try_error_set_destinations(index: TryErrorSetIndex&, error_set_annotations: darray[Ast::EnumAnnotation]&, declaration_offset: u32, declaration_line: u32) -> darray[sview]:
+        # Return projected row indices so callers can keep each family paired with its
+        # adjacent source-backed __error_set_family_path row.
+        def try_error_set_destinations(index: TryErrorSetIndex&, error_set_annotations: darray[Ast::EnumAnnotation]&, declaration_offset: u32, declaration_line: u32) -> darray[usize]:
             can Memory.Allocate, Abort.Panic, Global.Read:
-                destinations: mutable darray[sview] = []
+                destinations: mutable darray[usize] = []
                 if declaration_offset == 0:
-                    destinations.extend([destination_row.name for destination_row in error_set_annotations if destination_row.line == declaration_line])
+                    for row_index in 0..<error_set_annotations.count |destinations, error_set_annotations|:
+                        destinations.push(row_index) if error_set_annotations[row_index].line == declaration_line
                     return destinations
                 offset_row: mutable u32 = TRY_ERROR_SET_ROW_NONE
                 zero_offset_line_row: mutable u32 = TRY_ERROR_SET_ROW_NONE
@@ -306,11 +316,11 @@ extend Semantic:
                 while offset_row != TRY_ERROR_SET_ROW_NONE or zero_offset_line_row != TRY_ERROR_SET_ROW_NONE |offset_row, zero_offset_line_row, index, error_set_annotations, destinations|:
                     if zero_offset_line_row == TRY_ERROR_SET_ROW_NONE or (offset_row != TRY_ERROR_SET_ROW_NONE and offset_row < zero_offset_line_row):
                         row_index: usize = offset_row.usize() - 1.usize()
-                        destinations <- destinations.push(error_set_annotations[row_index].name)
+                        destinations <- destinations.push(row_index)
                         offset_row <- (index.next can Global.Read)[row_index]
                     else:
                         row_index: usize = zero_offset_line_row.usize() - 1.usize()
-                        destinations <- destinations.push(error_set_annotations[row_index].name)
+                        destinations <- destinations.push(row_index)
                         zero_offset_line_row <- (index.next can Global.Read)[row_index]
                 return destinations
 
@@ -402,6 +412,28 @@ extend Semantic:
                 return "" if scope_known
                 return fallback
 
+        def callable_error_indexed_family_ref(index: CallableErrorAnnotationIndex&, annotations: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview, scope_known: bool, table: SymbolTable&) -> TryErrorFamilyRef:
+            can Abort.Panic:
+                fallback: mutable TryErrorFamilyRef = TryErrorFamilyRef{family: "", module: "", module_known: false}
+                fallback_found: mutable bool = false
+                row: mutable u32 = callable_error_index_head(index, name)
+                while row != CALLABLE_ERROR_ROW_NONE |row, fallback, fallback_found, annotations, module_annotations, module_index, table, name, enclosing_module, callee_qualifier|:
+                    source_row: usize = index.source_rows[row.usize()]
+                    annotation: Ast::EnumAnnotation = annotations[source_row]
+                    if annotation.owner == name and callable_error_family_row(annotations, source_row):
+                        family_path: sview = try_error_family_path_for_declaration(annotations, annotation.name, annotation.line, annotation.offset, annotation.identity_id)
+                        candidate_module: sview = fallible_fn_module_indexed(module_index, module_annotations, annotation.offset, annotation.line)
+                        candidate_module_known: bool = fallible_fn_module_known(module_annotations, annotation.offset, annotation.line)
+                        family_ref: TryErrorFamilyRef = try_error_family_ref_for_annotation(annotations, annotation, family_path, candidate_module_known, candidate_module, table)
+                        if not fallback_found:
+                            fallback <- family_ref
+                            fallback_found <- true
+                        if callable_row_in_scope_indexed(module_index, module_annotations, annotations, annotation.offset, annotation.line, enclosing_module, callee_qualifier):
+                            return family_ref
+                    row <- index.next[row.usize()]
+                return TryErrorFamilyRef{family: "", module: "", module_known: false} if scope_known
+                return fallback
+
         # The module a fallible function was declared in, keyed by the declaration's byte
         # offset (the same key the destination side already uses).
         # Matched by OFFSET when both sides carry one and by LINE otherwise — the same rule
@@ -431,6 +463,34 @@ extend Semantic:
                 if zero_offset_line_row == CALLABLE_ERROR_ROW_NONE or offset_row < zero_offset_line_row:
                     return module_annotations[offset_row.usize()].name
                 return module_annotations[zero_offset_line_row.usize()].name
+
+        def fallible_fn_module_known(module_annotations: darray[Ast::EnumAnnotation]&, declaration_offset: u32, declaration_line: u32) -> bool:
+            can Abort.Panic:
+                for module_annotation in module_annotations |declaration_offset, declaration_line|:
+                    continue if module_annotation.owner != "__fn_module"
+                    matched: bool = module_annotation.offset == declaration_offset if declaration_offset != 0 and module_annotation.offset != 0 else module_annotation.line == declaration_line
+                    return true if matched
+                return false
+
+        def try_error_family_ref_for_annotation(annotations: darray[Ast::EnumAnnotation]&, family_annotation: Ast::EnumAnnotation, family_path: sview @source, function_module_known: bool, function_module: sview @source, table: SymbolTable&) -> TryErrorFamilyRef:
+            can Abort.Panic:
+                resolved: (known: bool, module: sview @source) = catch_error_family_module_for_declaration(annotations, family_annotation.line, family_annotation.offset, family_annotation.identity_id, family_annotation.name, family_path, function_module_known, function_module, table)
+                return TryErrorFamilyRef{family: family_annotation.name, module: resolved.module, module_known: resolved.known}
+
+        # The callable index points at the compact __error_return/name pair, while the
+        # source-backed family path is emitted later by capture_header_error_families.
+        # Join the rows by declaration identity and family leaf, then keep the adjacent path.
+        def try_error_family_path_for_declaration(annotations: darray[Ast::EnumAnnotation]&, family: sview, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32) -> sview @source:
+            can Abort.Panic:
+                for family_index in 0..<annotations.count |annotations, family, declaration_line, declaration_offset, declaration_identity_id|:
+                    family_annotation: Ast::EnumAnnotation = annotations[family_index]
+                    continue if family_annotation.owner != "__error_set_family" or family_annotation.name != family or family_annotation.line != declaration_line
+                    continue if declaration_offset != 0 and family_annotation.offset != declaration_offset
+                    continue if declaration_identity_id != 0 and family_annotation.identity_id != declaration_identity_id
+                    continue if family_index + 1.usize() >= annotations.count
+                    path_annotation: Ast::EnumAnnotation = annotations[family_index + 1.usize()]
+                    return path_annotation.name if path_annotation.owner == "__error_set_family_path" and path_annotation.line == family_annotation.line and path_annotation.offset == family_annotation.offset and path_annotation.identity_id == family_annotation.identity_id
+                return ""
 
         # The LAST `::` segment of a module path (`WasmBrowser::Delivery` -> `Delivery`), so a
         # qualified call's written qualifier can be compared without rebuilding the spelling.
@@ -614,44 +674,82 @@ extend Semantic:
                         return (position.line, position.offset)
                 return enclosing_try_function(table, try_line, try_offset)
 
-        def error_family_covers(source: sview, destination: sview, table: SymbolTable&) -> bool:
+        def try_error_family_refs_match(source: TryErrorFamilyRef, destination: TryErrorFamilyRef) -> bool:
+            can Abort.Panic:
+                return false if source.family != destination.family
+                return source.module == destination.module if source.module_known and destination.module_known
+                return true
+
+        def error_family_covers(source: TryErrorFamilyRef, destination: TryErrorFamilyRef, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 saw_source_tag: mutable bool = false
-                for variant_index in 0..<table.enum_variant_owner.count |saw_source_tag|:
-                    if table.enum_variant_owner[variant_index] == source:
+                for variant_index in 0..<table.enum_variant_owner.count |saw_source_tag, source, destination, table|:
+                    belongs_to_source: mutable bool = table.enum_variant_owner[variant_index] == source.family
+                    belongs_to_source <- belongs_to_source and variant_index < table.enum_variant_module.count and table.enum_variant_module[variant_index] == source.module if source.module_known
+                    if belongs_to_source:
                         saw_source_tag <- true
-                        return false if not enum_has_variant(table, destination, table.enum_variant_name[variant_index])
+                        destination_has_tag: mutable bool = false
+                        for destination_index in 0..<table.enum_variant_owner.count |destination_has_tag, destination, table, variant_index|:
+                            belongs_to_destination: mutable bool = table.enum_variant_owner[destination_index] == destination.family
+                            belongs_to_destination <- belongs_to_destination and destination_index < table.enum_variant_module.count and table.enum_variant_module[destination_index] == destination.module if destination.module_known
+                            destination_has_tag <- true if belongs_to_destination and table.enum_variant_name[destination_index] == table.enum_variant_name[variant_index]
+                        if not source.module_known or not destination.module_known:
+                            destination_has_tag <- enum_has_variant(table, destination.family, table.enum_variant_name[variant_index])
+                        return false if not destination_has_tag
                 return saw_source_tag
 
-        def check_try_propagation_row(annotation: Ast::EnumAnnotation&, enclosing: (line: u32, offset: u32), enclosing_module: sview, callee_qualifier: sview, annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, error_set_index: mutable TryErrorSetIndex&, propagation_site_count: usize, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, error_index: CallableErrorAnnotationIndex&, table: lmut SymbolTable, first_class_error_family: sview @source = "", lambda_error_family: sview @source = "", inside_lambda: bool = false) -> void:
+        def check_try_propagation_row(annotation: Ast::EnumAnnotation&, enclosing: (line: u32, offset: u32), enclosing_module: sview, callee_qualifier: sview, annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, error_set_family_paths: darray[Ast::EnumAnnotation]&, error_set_index: mutable TryErrorSetIndex&, propagation_site_count: usize, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, error_index: CallableErrorAnnotationIndex&, table: lmut SymbolTable, first_class_error_family: sview @source = "", lambda_error_family: sview @source = "", inside_lambda: bool = false) -> void:
             can Memory.Allocate, Abort.Panic, Global.Read:
                 scope_known: bool = enclosing.line != 0 or enclosing.offset != 0 or enclosing_module != "" or callee_qualifier != ""
-                source: sview @source = first_class_error_family if first_class_error_family != "" else callable_error_indexed_family(error_index, annotations, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known)
-                return if source == ""
+                source: mutable TryErrorFamilyRef = TryErrorFamilyRef{family: "", module: "", module_known: false}
+                if first_class_error_family != "":
+                    source <- TryErrorFamilyRef{family: first_class_error_family, module: "", module_known: false}
+                else:
+                    source <- callable_error_indexed_family_ref(error_index, annotations, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known, table)
+                return if source.family == ""
                 function_line: u32 = enclosing.line
-                destinations: mutable darray[sview @source] = []
+                destinations: mutable darray[TryErrorFamilyRef] = []
                 if inside_lambda:
-                    destinations.push(lambda_error_family) if lambda_error_family != ""
+                    destinations.push(TryErrorFamilyRef{family: lambda_error_family, module: "", module_known: false}) if lambda_error_family != ""
                 else:
                     if propagation_site_count > 1 and propagation_site_count * error_set_annotations.count > TRY_ERROR_SET_INDEX_MIN_WORK:
                         try_error_set_index_build(error_set_index, error_set_annotations) can Global{Read,Write}
                         can Global.Read:
-                            destinations <- try_error_set_destinations(error_set_index, error_set_annotations, enclosing.offset, function_line)
+                            destination_indices: darray[usize] = try_error_set_destinations(error_set_index, error_set_annotations, enclosing.offset, function_line)
+                            caller_module: sview = fallible_fn_module_indexed(module_index, module_annotations, enclosing.offset, function_line)
+                            caller_module_known: bool = fallible_fn_module_known(module_annotations, enclosing.offset, function_line)
+                            for destination_index in destination_indices |destinations, annotations, error_set_annotations, error_set_family_paths, caller_module, caller_module_known, table|:
+                                family_annotation: Ast::EnumAnnotation = error_set_annotations[destination_index]
+                                family_path: sview = ""
+                                if destination_index < error_set_family_paths.count:
+                                    path_annotation: Ast::EnumAnnotation = error_set_family_paths[destination_index]
+                                    family_path <- path_annotation.name if path_annotation.line == family_annotation.line and path_annotation.offset == family_annotation.offset and path_annotation.identity_id == family_annotation.identity_id
+                                destinations.push(try_error_family_ref_for_annotation(annotations, family_annotation, family_path, caller_module_known, caller_module, table))
                     else:
-                        destinations.extend([destination_row.name for destination_row in error_set_annotations if destination_row.owner == "__error_set_family" and (destination_row.offset == enclosing.offset if enclosing.offset != 0 and destination_row.offset != 0 else destination_row.line == function_line)])
+                        caller_module: sview = fallible_fn_module_indexed(module_index, module_annotations, enclosing.offset, function_line)
+                        caller_module_known: bool = fallible_fn_module_known(module_annotations, enclosing.offset, function_line)
+                        for destination_index in 0..<error_set_annotations.count |destinations, annotations, error_set_annotations, error_set_family_paths, enclosing, function_line, caller_module, caller_module_known, table|:
+                            family_annotation: Ast::EnumAnnotation = error_set_annotations[destination_index]
+                            continue if family_annotation.owner != "__error_set_family"
+                            continue if not (family_annotation.offset == enclosing.offset if enclosing.offset != 0 and family_annotation.offset != 0 else family_annotation.line == function_line)
+                            family_path: sview = ""
+                            if destination_index < error_set_family_paths.count:
+                                path_annotation: Ast::EnumAnnotation = error_set_family_paths[destination_index]
+                                family_path <- path_annotation.name if path_annotation.line == family_annotation.line and path_annotation.offset == family_annotation.offset and path_annotation.identity_id == family_annotation.identity_id
+                            destinations.push(try_error_family_ref_for_annotation(annotations, family_annotation, family_path, caller_module_known, caller_module, table))
                 # A fallible callee (`source != ""`) whose enclosing function declares NO error set
                 # cannot propagate the `try` — stage0 requires the current function to return an
                 # error union. (A function WITH an error set proceeds to the set-coverage check.)
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryWithoutElseNonErrorFunction, name: "", line: annotation.line, expected: "", actual: ""}) if destinations.count == 0 and function_line != 0
                 return if destinations.count == 0
-                covered: bool = any destination in destinations where destination == source or error_family_covers(source, destination, table)
+                covered: bool = any destination in destinations where try_error_family_refs_match(source, destination) or error_family_covers(source, destination, table)
                 return if covered
-                first: mutable sview @source = destinations[0]
+                first: mutable sview @source = destinations[0].family
                 second: mutable sview @source = ""
-                second <- destinations[1] if destinations.count > 1
+                second <- destinations[1].family if destinations.count > 1
                 swap: bool = second != "" and error_family_symbol_position(table, second) < error_family_symbol_position(table, first)
                 first, second <- second, first if swap
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryPropagationMismatch, name: source, pos: annotation.pos, line: annotation.line, expected: first, actual: "", detail: second})
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryPropagationMismatch, name: source.family, pos: annotation.pos, line: annotation.line, expected: first, actual: "", detail: second})
 
         # The compact AST erases the `try` head and records `__noncall` when its operand
         # is not a Call. Recover the narrow `try parameter` form from the function body and
@@ -1575,7 +1673,7 @@ extend Semantic:
                         return true if try_noncall_expression_aborts_with_annotations(scrutinee, annotations)
                         scrutinee_bool: (known: bool, value: bool) = try_noncall_literal_bool(scrutinee)
                         return try_noncall_match_bool_arms_terminate(arms, scrutinee_bool.value) if scrutinee_bool.known
-                        has_unconditional_wildcard: bool = any arm in arms where arm.pattern is Pattern.Wildcard and arm.guard is Expr.Absent
+                        has_unconditional_wildcard: bool = any arm in arms where try_noncall_pattern_is_match_catchall(arm.pattern) and arm.guard is Expr.Absent
                         has_true_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "true" and arm.guard is Expr.Absent
                         has_false_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "false" and arm.guard is Expr.Absent
                         all_arms_abort: bool = all arm in arms where try_noncall_guard_is_definitely_false(arm.guard) or try_noncall_expression_aborts_with_annotations(arm.guard, annotations) or try_noncall_block_terminates(arm.body)
@@ -1679,7 +1777,7 @@ extend Semantic:
                         return try_noncall_expression_directly_raises(scrutinee) if try_noncall_expression_aborts(scrutinee)
                         scrutinee_bool: (known: bool, value: bool) = try_noncall_literal_bool(scrutinee)
                         return try_noncall_match_bool_arms_directly_raise(arms, scrutinee_bool.value) if scrutinee_bool.known
-                        has_unconditional_wildcard: bool = any arm in arms where arm.pattern is Pattern.Wildcard and arm.guard is Expr.Absent
+                        has_unconditional_wildcard: bool = any arm in arms where try_noncall_pattern_is_match_catchall(arm.pattern) and arm.guard is Expr.Absent
                         has_true_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "true" and arm.guard is Expr.Absent
                         has_false_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "false" and arm.guard is Expr.Absent
                         return false if not has_unconditional_wildcard and not (has_true_literal and has_false_literal)
@@ -1799,7 +1897,7 @@ extend Semantic:
                             return true if try_noncall_expression_aborts(scrutinee)
                             scrutinee_bool: (known: bool, value: bool) = try_noncall_literal_bool(scrutinee)
                             return try_noncall_match_bool_arms_terminate(arms, scrutinee_bool.value) if scrutinee_bool.known
-                            has_unconditional_wildcard: bool = any arm in arms where arm.pattern is Pattern.Wildcard and arm.guard is Expr.Absent
+                            has_unconditional_wildcard: bool = any arm in arms where try_noncall_pattern_is_match_catchall(arm.pattern) and arm.guard is Expr.Absent
                             has_true_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "true" and arm.guard is Expr.Absent
                             has_false_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "false" and arm.guard is Expr.Absent
                             all_arms_terminate: bool = all arm in arms where try_noncall_guard_is_definitely_false(arm.guard) or try_noncall_expression_aborts(arm.guard) or try_noncall_block_terminates(arm.body)
@@ -1844,7 +1942,7 @@ extend Semantic:
                         return true if try_noncall_expression_aborts(scrutinee)
                         scrutinee_bool: (known: bool, value: bool) = try_noncall_literal_bool(scrutinee)
                         return try_noncall_match_bool_arms_terminate(arms, scrutinee_bool.value) if scrutinee_bool.known
-                        has_unconditional_wildcard: bool = any arm in arms where (arm.pattern is Pattern.Wildcard or arm.pattern is Pattern.Binding(_)) and arm.guard is Expr.Absent
+                        has_unconditional_wildcard: bool = any arm in arms where try_noncall_pattern_is_match_catchall(arm.pattern) and arm.guard is Expr.Absent
                         has_true_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "true" and arm.guard is Expr.Absent
                         has_false_literal: bool = any arm in arms where arm.pattern is Pattern.Literal(text) and text == "false" and arm.guard is Expr.Absent
                         all_arms_terminate: bool = all arm in arms where try_noncall_guard_is_definitely_false(arm.guard) or try_noncall_expression_aborts(arm.guard) or try_noncall_block_terminates(arm.body)
@@ -2039,7 +2137,12 @@ extend Semantic:
                                 return true if not condition_bool.value and try_noncall_statements_may_raise_catchably_with_annotations(else_body, annotations)
                             else:
                                 return true if try_noncall_statements_may_raise_catchably_with_annotations(then_body, annotations) or try_noncall_statements_may_raise_catchably_with_annotations(else_body, annotations)
-                        Stmt.Match(scrutinee, arms, _):
+                        Stmt.Match(scrutinee, arms, match_position):
+                            # Statement Catch lowers to Match plus a parser marker. Reuse
+                            # Expr.Catch's reachability rules so its success binding does
+                            # not hide a raising error handler as an ordinary wildcard arm.
+                            is_catch: bool = any marker in annotations where marker.name == "__catch_match" and marker.line == match_position.line
+                            return try_noncall_expression_may_raise_catchably_with_annotations(Ast::Expr.Catch(scrutinee, arms, match_position), annotations) if is_catch
                             return true if try_noncall_expression_may_raise_catchably_with_annotations(scrutinee, annotations)
                             return false if try_noncall_expression_aborts_with_annotations(scrutinee, annotations)
                             scrutinee_bool: (known: bool, value: bool) = try_noncall_literal_bool(scrutinee)
@@ -2741,7 +2844,7 @@ extend Semantic:
                     Expr.Binary(left, operator, right, _):
                         try_noncall_scan_expression(left, candidate, params, environment, annotations, annotation, site_offset, current_shadow, current_local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         right_shadow: mutable bool = local_shadow
-                        right_error_family: mutable sview = local_error_family
+                        right_error_family: mutable sview @source = local_error_family
                         visible_count: usize = environment.names.count
                         base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                         right_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
@@ -2795,7 +2898,7 @@ extend Semantic:
                         visible_count: usize = environment.names.count
                         base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                         then_shadow: mutable bool = current_shadow
-                        then_error_family: mutable sview = current_local_error_family
+                        then_error_family: mutable sview @source = current_local_error_family
                         then_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                         else_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                         if try_noncall_truthy_condition_binds_name(condition, candidate, annotations):
@@ -2821,7 +2924,7 @@ extend Semantic:
                             return if found == true
                             binds_candidate: bool = try_noncall_pattern_shadows_name(arm.pattern, candidate)
                             arm_shadow: bool = current_shadow or binds_candidate
-                            arm_error_family: sview = "" if binds_candidate else current_local_error_family
+                            arm_error_family: sview @source = "" if binds_candidate else current_local_error_family
                             arm_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             if binds_candidate:
                                 pattern_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_pattern_binding_facts(arm.pattern, candidate)
@@ -2831,7 +2934,7 @@ extend Semantic:
                             try_noncall_scan_expression(arm.guard, candidate, params, arm_environment, annotations, annotation, site_offset, arm_shadow, arm_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate, annotations)
                             body_shadow: bool = arm_shadow or guard_binds_candidate
-                            body_error_family: sview = "" if guard_binds_candidate else arm_error_family
+                            body_error_family: sview @source = "" if guard_binds_candidate else arm_error_family
                             if guard_binds_candidate:
                                 guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params, annotations)
                                 try_noncall_family_bind(arm_environment, candidate, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
@@ -2861,7 +2964,7 @@ extend Semantic:
                             return if found == true
                             binds_candidate: bool = try_noncall_catch_pattern_shadows_name(arm.pattern, arm_index, candidate)
                             arm_shadow: bool = current_shadow or binds_candidate
-                            arm_error_family: sview = "" if binds_candidate else current_local_error_family
+                            arm_error_family: sview @source = "" if binds_candidate else current_local_error_family
                             arm_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             if binds_candidate:
                                 pattern_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_pattern_binding_facts(arm.pattern, candidate)
@@ -2872,7 +2975,7 @@ extend Semantic:
                             try_noncall_scan_expression(arm.guard, candidate, params, arm_environment, annotations, annotation, site_offset, arm_shadow, arm_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate, annotations)
                             body_shadow: bool = arm_shadow or guard_binds_candidate
-                            body_error_family: sview = "" if guard_binds_candidate else arm_error_family
+                            body_error_family: sview @source = "" if guard_binds_candidate else arm_error_family
                             if guard_binds_candidate:
                                 guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params, annotations)
                                 try_noncall_family_bind(arm_environment, candidate, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
@@ -2891,7 +2994,7 @@ extend Semantic:
                         try_noncall_scan_expression(iterable, candidate, params, environment, annotations, annotation, site_offset, current_shadow, current_local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         comprehension_binds_candidate: bool = variable == candidate
                         comprehension_shadow: bool = current_shadow or comprehension_binds_candidate
-                        comprehension_error_family: sview = "" if comprehension_binds_candidate else current_local_error_family
+                        comprehension_error_family: sview @source = "" if comprehension_binds_candidate else current_local_error_family
                         comprehension_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                         try_noncall_family_bind(comprehension_environment, variable, "", false) if variable != ""
                         try_noncall_scan_expression(condition, candidate, params, comprehension_environment, annotations, annotation, site_offset, comprehension_shadow, comprehension_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
@@ -2914,7 +3017,7 @@ extend Semantic:
                         visible_count: usize = environment.names.count
                         base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                         block_families: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
-                        block_environment: (shadow: bool, local_error_family: sview) = try_noncall_scan_statements(block_statements, candidate, params, block_families, annotations, annotation, site_offset, local_shadow, local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
+                        block_environment: (shadow: bool, local_error_family: sview @source) = try_noncall_scan_statements(block_statements, candidate, params, block_families, annotations, annotation, site_offset, local_shadow, local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         try_noncall_scan_expression(value, candidate, params, block_families, annotations, annotation, site_offset, block_environment.shadow, block_environment.local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         try_noncall_family_join_into(environment, base_environment, block_families, block_families, visible_count)
                         if try_noncall_family_branch_wrote(base_environment, block_families, candidate):
@@ -3014,7 +3117,7 @@ extend Semantic:
                             visible_count: usize = environment.names.count
                             base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                             then_shadow: mutable bool = local_shadow
-                            then_error_family: mutable sview = local_error_family
+                            then_error_family: mutable sview @source = local_error_family
                             then_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             else_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             if try_noncall_truthy_condition_binds_name(condition, candidate, annotations):
@@ -3033,7 +3136,7 @@ extend Semantic:
                             visible_count: usize = environment.names.count
                             base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                             body_shadow: mutable bool = local_shadow
-                            body_error_family: mutable sview = local_error_family
+                            body_error_family: mutable sview @source = local_error_family
                             loop_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             if try_noncall_truthy_condition_binds_name(condition, candidate, annotations):
                                 body_shadow <- true
@@ -3051,7 +3154,7 @@ extend Semantic:
                             base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                             loop_binds_name: bool = any variable in variables where variable == candidate
                             loop_shadow: bool = local_shadow or loop_binds_name
-                            loop_error_family: mutable sview = local_error_family
+                            loop_error_family: mutable sview @source = local_error_family
                             loop_error_family <- "" if loop_binds_name
                             loop_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             for variable in variables |loop_environment|:
@@ -3065,7 +3168,7 @@ extend Semantic:
                             visible_count: usize = environment.names.count
                             base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                             block_shadow: bool = local_shadow or binding == candidate
-                            block_error_family: mutable sview = local_error_family
+                            block_error_family: mutable sview @source = local_error_family
                             block_error_family <- "" if binding == candidate
                             block_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             try_noncall_family_bind(block_environment, binding, "") if binding != ""
@@ -3091,7 +3194,7 @@ extend Semantic:
                                 return (local_shadow, local_error_family) if found == true
                                 pattern_binds_candidate: bool = try_noncall_pattern_shadows_name(arm.pattern, candidate)
                                 arm_shadow: bool = local_shadow or pattern_binds_candidate
-                                arm_error_family: sview = "" if pattern_binds_candidate else local_error_family
+                                arm_error_family: sview @source = "" if pattern_binds_candidate else local_error_family
                                 arm_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                                 if pattern_binds_candidate:
                                     pattern_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_pattern_binding_facts(arm.pattern, candidate)
@@ -3101,7 +3204,7 @@ extend Semantic:
                                 try_noncall_scan_expression(arm.guard, candidate, params, arm_environment, annotations, annotation, site_offset, arm_shadow, arm_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                                 guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate, annotations)
                                 body_shadow: bool = arm_shadow or guard_binds_candidate
-                                body_error_family: sview = "" if guard_binds_candidate else arm_error_family
+                                body_error_family: sview @source = "" if guard_binds_candidate else arm_error_family
                                 if guard_binds_candidate:
                                     guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, candidate, params, annotations)
                                     try_noncall_family_bind(arm_environment, candidate, "", guard_facts.known_nonfallible, guard_facts.numeric, guard_facts.integer)
@@ -3192,7 +3295,7 @@ extend Semantic:
                             pass
                 return (false, "", "", false)
 
-        def check_try_fallible_rows(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, try_qualifiers: dict[u64, sview]&, error_index: CallableErrorAnnotationIndex&, try_site_count: usize, table: lmut SymbolTable) -> void:
+        def check_try_fallible_rows(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, error_set_annotations: darray[Ast::EnumAnnotation]&, error_set_family_paths: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, try_qualifiers: dict[u64, sview]&, error_index: CallableErrorAnnotationIndex&, try_site_count: usize, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic, Global.Read:
                 function_positions: mutable FallibleFunctionPositionIndex = FallibleFunctionPositionIndex{positions: [], offsets_ordered: true, ready: false}
                 error_set_index: mutable TryErrorSetIndex = TryErrorSetIndex{by_offset_heads: {}, by_offset_tails: {}, zero_offset_line_heads: {}, zero_offset_line_tails: {}, next: [], ready: false}
@@ -3234,7 +3337,7 @@ extend Semantic:
                     if annotation.name == "__try_without_else" and annotation.owner != "__unknown_call" and row_is_fallible:
                         propagation_site_count <- propagation_site_count + 1.usize()
                         can Global{Read,Write}:
-                            table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, first_class_error_family, noncall_lambda_error_family, noncall_inside_lambda)
+                            table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_family_paths, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, first_class_error_family, noncall_lambda_error_family, noncall_inside_lambda)
 
         # The bare callee name of `try f(...) else …`, "" for anything else. Deliberately
         # bare-ident only: a qualified callee would need the module-resolution dance above,
@@ -3635,7 +3738,7 @@ extend Semantic:
     public:
         def check_try_fallible(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                projection: mutable FallibleTryAnnotationProjection = FallibleTryAnnotationProjection{module_annotations: [], error_set_annotations: [], try_qualifiers: {}}
+                projection: mutable FallibleTryAnnotationProjection = FallibleTryAnnotationProjection{module_annotations: [], error_set_annotations: [], error_set_family_paths: [], try_qualifiers: {}}
                 module_index: mutable FallibleFunctionModuleIndex = FallibleFunctionModuleIndex{by_line: {}, by_offset: {}, zero_offset_by_line: {}, ready: false}
                 fallback_function_positions: mutable FallibleFunctionPositionIndex = FallibleFunctionPositionIndex{positions: [], offsets_ordered: true, ready: false}
                 try_site_count: mutable usize = 0
@@ -3659,5 +3762,5 @@ extend Semantic:
                     fallible_try_projection_add(projection, annotation) can Global{Read,Write} if projection_ready
                 fallible_function_module_index_build(module_index, projection.module_annotations) can Global{Read,Write} if try_site_count > 0 or fallback_site_count > 0
                 callable_error_index_build(file.enum_annotations, error_index, true) can Global{Read,Write} if try_site_count > 0
-                table <- check_try_fallible_rows(file.top_decls, file.enum_annotations, projection.error_set_annotations, module_index, projection.module_annotations, projection.try_qualifiers, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0
+                table <- check_try_fallible_rows(file.top_decls, file.enum_annotations, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0
                 table <- try_fallback_void_decls(file.top_decls, file.enum_annotations, module_index, projection.module_annotations, error_index, fallback_function_positions, table) can Global{Read,Write} if fallback_site_count > 0

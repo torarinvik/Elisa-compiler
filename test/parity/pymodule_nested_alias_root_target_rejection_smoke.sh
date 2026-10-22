@@ -17,7 +17,7 @@ for emit_mode in obj pymodule; do
         exit 1
     fi
     [[ ! -e "$output" ]] || { echo "$emit_mode rejection left an artifact" >&2; exit 1; }
-    grep -Fq 'undefined identifier' "$WORK/unresolved.$emit_mode.log" || {
+    grep -Fq 'undefined identifier "X.Mode"' "$WORK/unresolved.$emit_mode.log" || {
         cat "$WORK/unresolved.$emit_mode.log" >&2
         exit 1
     }
