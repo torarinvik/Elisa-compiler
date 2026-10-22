@@ -45,9 +45,9 @@ value_arms = (
     "Expr.Block(body,carries_value,_,_):returnregion_escape_body_carries_handles(body,carries_value,annotations,line,local_names,local_types,table)",
     "Expr.Match(_,carries_arms,_):forarmincarries_arms:arm_names:mutabledarray[sview]=[namefornameinlocal_names]",
     "returntrueifregion_escape_body_carries_handles(arm.body,null,annotations,line,arm_names,arm_types,table)returnfalse",
-    "Expr.Catch(guarded,carries_arms,_):truereturnifregion_escape_value_carries_handles(guarded,annotations,line,local_names,local_types,table)",
-    "truereturnifarm.body.count==0",
-    "Stmt.Expr(arm_value,_):truereturnifregion_escape_value_carries_handles(arm_value,annotations,line,local_names,local_types,table)",
+    "Expr.Catch(guarded,carries_arms,_):returntrueifregion_escape_value_carries_handles(guarded,annotations,line,local_names,local_types,table)",
+    "returntrueifarm.body.count==0",
+    "Stmt.Expr(arm_value,_):returntrueifregion_escape_value_carries_handles(arm_value,annotations,line,local_names,local_types,table)",
 )
 for arm in body_arms:
     if arm not in body:

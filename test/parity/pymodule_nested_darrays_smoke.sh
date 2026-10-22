@@ -19,6 +19,14 @@ manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 rows = {row["name"]: row for row in manifest["functions"]}
 assert rows["roundtrip"]["parameters"] == [{"name": "values", "type": "darray[darray[i64]]"}]
 assert rows["roundtrip"]["return"] == "darray[darray[i64]]"
+assert rows["roundtrip_isize"]["parameters"] == [{"name": "values", "type": "darray[darray[isize]]"}]
+assert rows["roundtrip_usize"]["parameters"] == [{"name": "values", "type": "darray[darray[usize]]"}]
+assert rows["roundtrip_uintptr"]["parameters"] == [{"name": "values", "type": "darray[darray[uintptr]]"}]
+assert rows["roundtrip_optional_isize"]["parameters"] == [{"name": "values", "type": "darray[darray[isize?]]"}]
+assert rows["roundtrip_optional_uintptr"]["parameters"] == [{"name": "values", "type": "darray[darray[uintptr?]]"}]
+assert rows["roundtrip_optional_isize"]["return"] == "darray[darray[isize?]]"
+assert rows["roundtrip_optional_isize_scalar"]["parameters"] == [{"name": "value", "type": "isize?"}]
+assert rows["roundtrip_optional_uintptr_scalar"]["parameters"] == [{"name": "value", "type": "uintptr?"}]
 assert rows["count"]["return"] == "i64"
 assert rows["roundtrip_deep"]["parameters"] == [{"name": "values", "type": "darray[darray[darray[darray[i64]]]]"}]
 assert rows["roundtrip_deep"]["return"] == "darray[darray[darray[darray[i64]]]]"
@@ -30,6 +38,13 @@ PY
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi -o "$WORK/nested_darrays.pyi" "$SOURCE" >/dev/null
 grep -Fq 'def roundtrip(values: Sequence[Sequence[int]]) -> list[list[int]]: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_isize(values: Sequence[Sequence[int]]) -> list[list[int]]: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_usize(values: Sequence[Sequence[int]]) -> list[list[int]]: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_uintptr(values: Sequence[Sequence[int]]) -> list[list[int]]: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_optional_isize(values: Sequence[Sequence[int | None]]) -> list[list[int | None]]: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_optional_uintptr(values: Sequence[Sequence[int | None]]) -> list[list[int | None]]: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_optional_isize_scalar(value: int | None) -> int | None: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_optional_uintptr_scalar(value: int | None) -> int | None: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_deep(values: Sequence[Sequence[Sequence[Sequence[int]]]]) -> list[list[list[list[int]]]]: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_points(values: Sequence[Sequence[Point | PointInput]]) -> list[list[Point]]: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_points_deep(values: Sequence[Sequence[Sequence[Point | PointInput]]]) -> list[list[list[Point]]]: ...' "$WORK/nested_darrays.pyi"
@@ -39,6 +54,8 @@ grep -Fq 'def roundtrip_points_deep(values: Sequence[Sequence[Sequence[Point | P
 # the field object on failure.  It must release that reference on the successful path too.
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c -o "$WORK/nested_darrays.c" "$SOURCE" >/dev/null
 grep -Fq 'Py_DECREF(field_obj); *destination = holder.value; return 0;' "$WORK/nested_darrays.c"
+grep -Fq 'INTPTR_MIN' "$WORK/nested_darrays.c"
+grep -Fq 'UINTPTR_MAX' "$WORK/nested_darrays.c"
 
 if ! command -v clang >/dev/null 2>&1 || ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; then
     echo "pymodule nested darrays manifest/stub smoke OK (native build unavailable)"
@@ -50,8 +67,18 @@ PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import nested_darrays
 import sys
 
+pointer_unsigned_max = 2 * sys.maxsize + 1
 payload = [[1, 2, 3], [], [40, 50]]
 assert nested_darrays.roundtrip(payload) == payload
+assert nested_darrays.roundtrip_isize([[-sys.maxsize - 1, sys.maxsize], []]) == [[-sys.maxsize - 1, sys.maxsize], []]
+assert nested_darrays.roundtrip_usize([[0, pointer_unsigned_max], []]) == [[0, pointer_unsigned_max], []]
+assert nested_darrays.roundtrip_uintptr([[0, pointer_unsigned_max], []]) == [[0, pointer_unsigned_max], []]
+assert nested_darrays.roundtrip_optional_isize([[None, -sys.maxsize - 1, sys.maxsize]]) == [[None, -sys.maxsize - 1, sys.maxsize]]
+assert nested_darrays.roundtrip_optional_uintptr([[None, 0, pointer_unsigned_max]]) == [[None, 0, pointer_unsigned_max]]
+assert nested_darrays.roundtrip_optional_isize_scalar(None) is None
+assert nested_darrays.roundtrip_optional_isize_scalar(-sys.maxsize - 1) == -sys.maxsize - 1
+assert nested_darrays.roundtrip_optional_uintptr_scalar(None) is None
+assert nested_darrays.roundtrip_optional_uintptr_scalar(pointer_unsigned_max) == pointer_unsigned_max
 assert nested_darrays.count(payload) == 3
 payload_refcount = sys.getrefcount(payload)
 for _ in range(100):
@@ -73,6 +100,21 @@ for bad in ([[1, "bad"]], [None], [[2**63]]):
             assert "at path [0][1]" in str(exc)
     else:
         raise AssertionError(f"invalid nested value accepted: {bad!r}")
+
+for fn, bad in (
+    (nested_darrays.roundtrip_isize, [[sys.maxsize + 1]]),
+    (nested_darrays.roundtrip_optional_isize, [[sys.maxsize + 1]]),
+    (nested_darrays.roundtrip_usize, [[pointer_unsigned_max + 1]]),
+    (nested_darrays.roundtrip_optional_uintptr, [[pointer_unsigned_max + 1]]),
+    (nested_darrays.roundtrip_optional_isize_scalar, sys.maxsize + 1),
+    (nested_darrays.roundtrip_optional_uintptr_scalar, pointer_unsigned_max + 1),
+):
+    try:
+        fn(bad)
+    except OverflowError:
+        pass
+    else:
+        raise AssertionError(f"out-of-range pointer-sized value accepted: {bad!r}")
 
 print("pymodule nested darrays smoke OK")
 PY

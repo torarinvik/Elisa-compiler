@@ -255,7 +255,7 @@ if not contains_contiguous_block(rows_function, expected_dispatch):
 if compact_inline(rows_function).count("enclosing_try_function_indexed(") != 1 or \
         compact_inline(rows_function).count("enclosing_try_function(") != 1:
     raise SystemExit("try rows must retain exactly one indexed and one linear enclosing-function dispatch arm")
-propagation_call = "table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, first_class_error_family)"
+propagation_call = "table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, first_class_error_family, noncall_binding.lambda_error_family, noncall_binding.inside_lambda)"
 if compact_inline(propagation_call) not in compact_inline(rows_function):
     raise SystemExit("resolved enclosing function must flow into try-propagation diagnostics")
 

@@ -90,11 +90,22 @@ def explicit_match_arm_names(source: str, match_line: str, prefix: str) -> tuple
         if len(line) - len(line.lstrip(" \t")) != parent_indent + 4:
             continue
         value = line.strip()
-        if value.startswith(prefix) and value.endswith(":"):
+        # A guarded arm can make the displayed AST variant unreachable (for
+        # example, `Stmt.For(...) if false:`). Do not let the broad prefix
+        # check count it as an exhaustive recursive case.
+        if value.startswith(prefix) and value.endswith(":") and " if " not in value:
             match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", value[len(prefix):])
             if match:
                 names.append(match.group(0))
     return tuple(names)
+
+
+_GUARDED_ARM_SAMPLE = """match statement:
+    Stmt.For(bind, variables, iterable, body, _) if false:
+        pass
+"""
+if "For" in explicit_match_arm_names(_GUARDED_ARM_SAMPLE, "match statement:", "Stmt."):
+    raise SystemExit("guarded AST match arms must not satisfy exhaustive-source checks")
 
 
 def match_arm_body(source: str, match_line: str, arm_text: str) -> str | None:
@@ -454,8 +465,10 @@ FOR_ITERATOR_REF_ALIAS_EDGES = (
 )
 
 ITERABLE_BINDING_FACTS_ALIAS_EDGES = (
-    ("can Memory.Allocate, Abort.Panic:", "known, elements = chv_iterable_binding_elements(iterable, slot, destructure, flow, view_names, view_values)"),
-    ("for element in elements |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values|:", "may_alias_reference <- may_alias_reference or (not element_is_aggregate and chv_expression_may_alias_ref(element, ref_params, flow, table, 0))"),
+    ("can Memory.Allocate, Abort.Panic:", "known, outer_shape = chv_known_iterable_shape_with_locals(iterable, flow, view_names, view_values, 0)"),
+    ("for outer_index in 0..<outer_count |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values, slot, destructure, outer_shape|:", "element_is_aggregate, nested_shape = chv_known_iterable_shape_with_locals(element, flow, view_names, view_values, 0)"),
+    ("for outer_index in 0..<outer_count |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values, slot, destructure, outer_shape|:", "may_alias_reference <- may_alias_reference or (not element_is_aggregate and chv_expression_may_alias_ref(element, ref_params, flow, table, 0))"),
+    ("for outer_index in 0..<outer_count |may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview, ref_params, flow, table, view_names, view_values, slot, destructure, outer_shape|:", "may_contain_alias_reference <- may_contain_alias_reference or chv_expression_may_contain_alias_ref(element, ref_params, flow, table, 0)"),
     ("can Memory.Allocate, Abort.Panic:", "return (true, may_owned_view, may_alias_reference, may_contain_alias_reference, may_be_scalar_sview, may_yield_scalar_sview)"),
 )
 
@@ -1485,6 +1498,9 @@ for name, routes in theorem_routes.items():
             "binder_bound": (("walker", FOR_ITERATOR_REF_ALIAS_EDGES[4]),
                              ("binding_facts", ITERABLE_BINDING_FACTS_ALIAS_EDGES[0]),
                              ("binding_facts", ITERABLE_BINDING_FACTS_ALIAS_EDGES[1]),
+                             ("binding_facts", ITERABLE_BINDING_FACTS_ALIAS_EDGES[2]),
+                             ("binding_facts", ITERABLE_BINDING_FACTS_ALIAS_EDGES[3]),
+                             ("binding_facts", ITERABLE_BINDING_FACTS_ALIAS_EDGES[4]),
                              ("walker", FOR_ITERATOR_REF_ALIAS_EDGES[5]),
                              ("walker", FOR_ITERATOR_REF_ALIAS_EDGES[6]),
                              ("walker", FOR_ITERATOR_REF_ALIAS_EDGES[7]),
@@ -1765,6 +1781,7 @@ validate_ordered_source_lines(for_arm, (
     "chv_flow_bind(loop_flow, loop_variable, false, loop_variable_may_be_owned_view, loop_variable_may_alias_reference)",
     "loop_flow.may_contain_alias_reference[loop_index] <- loop_variable_may_contain_alias_reference if loop_index < loop_flow.names.count",
     "table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)",
+    "chv_flow_merge(flow, loop_flow, branch_mark)",
 ), "holder-view for-iterator taint order")
 validate_edge_set(holder_walk_expressions, BINARY_OPERATOR_FALLBACK_EDGES, "holder-view binary operator fallback")
 validate_edge_set(function_section(holder_text, "chv_binary_operator_has_non_runtime_target"), (BINARY_NON_RUNTIME_TARGET_EDGES[0],), "holder-view non-runtime binary target classification")

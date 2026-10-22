@@ -23,6 +23,11 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 from collections import UserDict
 import dicts
+import sys
+
+pointer_signed_min = -sys.maxsize - 1
+pointer_signed_max = sys.maxsize
+pointer_unsigned_max = 2 * sys.maxsize + 1
 
 assert dicts.count_i64({}) == 0
 assert dicts.count_i64({1: 2, 3: 4}) == 2
@@ -52,6 +57,12 @@ assert dicts.pair_count({1: 2}, {"ok": True, "no": False}) == 3
 assert dicts.empty_i64() == {}
 assert dicts.roundtrip_i64({}) == {}
 assert dicts.roundtrip_i64({1: 40, 2: 2}) == {1: 40, 2: 2}
+assert dicts.roundtrip_isize_values({1: pointer_signed_min, 2: pointer_signed_max}) == {
+    1: pointer_signed_min, 2: pointer_signed_max
+}
+assert dicts.roundtrip_uintptr_values({1: 0, 2: pointer_unsigned_max}) == {
+    1: 0, 2: pointer_unsigned_max
+}
 assert dicts.roundtrip_i32({1: -2147483648, 2: 2147483647}) == {1: -2147483648, 2: 2147483647}
 assert dicts.roundtrip_u8({"low": 0, "high": 255}) == {"low": 0, "high": 255}
 assert dicts.roundtrip_text({"yes": True, "no": False}) == {"yes": True, "no": False}
@@ -69,15 +80,15 @@ assert dicts.roundtrip_i8_keys({-128: 1, 127: 2}) == {-128: 1, 127: 2}
 assert dicts.get_i8({-128: 10, -1: 20, 127: 30}, -1) == 20
 assert dicts.roundtrip_i16_keys({-32768: 1, 32767: 2}) == {-32768: 1, 32767: 2}
 assert dicts.roundtrip_i32_keys({-(2**31): 1, 2**31 - 1: 2}) == {-(2**31): 1, 2**31 - 1: 2}
-assert dicts.roundtrip_int_keys({-(2**63) + 1: 1, 2**63 - 1: 2}) == {-(2**63) + 1: 1, 2**63 - 1: 2}
-assert dicts.roundtrip_isize_keys({-(2**63) + 1: 1, 2**63 - 1: 2}) == {-(2**63) + 1: 1, 2**63 - 1: 2}
+assert dicts.roundtrip_int_keys({pointer_signed_min: 1, pointer_signed_max: 2}) == {pointer_signed_min: 1, pointer_signed_max: 2}
+assert dicts.roundtrip_isize_keys({pointer_signed_min: 1, pointer_signed_max: 2}) == {pointer_signed_min: 1, pointer_signed_max: 2}
 assert dicts.roundtrip_char_keys({0: 1, 0x10FFFF: 2}) == {0: 1, 0x10FFFF: 2}
 assert dicts.roundtrip_u8_keys({0: 1, 255: 2}) == {0: 1, 255: 2}
 assert dicts.get_u8({0: 10, 255: 20}, 255) == 20
 assert dicts.roundtrip_u16_keys({0: 1, 65535: 2}) == {0: 1, 65535: 2}
 assert dicts.roundtrip_u32_keys({0: 1, 2**32 - 1: 2}) == {0: 1, 2**32 - 1: 2}
-assert dicts.roundtrip_usize_keys({0: 1, 2**63: 2}) == {0: 1, 2**63: 2}
-assert dicts.roundtrip_uintptr_keys({0: 1, 2**63: 2}) == {0: 1, 2**63: 2}
+assert dicts.roundtrip_usize_keys({0: 1, pointer_unsigned_max: 2}) == {0: 1, pointer_unsigned_max: 2}
+assert dicts.roundtrip_uintptr_keys({0: 1, pointer_unsigned_max: 2}) == {0: 1, pointer_unsigned_max: 2}
 obj = {"kind": "payload"}
 assert dicts.count_objects({1: obj, 2: None}) == 2
 returned = dicts.roundtrip_objects({"payload": obj, "empty": None})
@@ -155,16 +166,21 @@ assert dicts.roundtrip_nested_f32({"one": [1.5, -2.25], "empty": []}) == {"one":
 assert dicts.roundtrip_nested_i8({1: [-128, 0, 127], 2: []}) == {1: [-128, 0, 127], 2: []}
 assert dicts.roundtrip_nested_i16({"one\x00key": [-32768, 32767]}) == {"one\x00key": [-32768, 32767]}
 assert dicts.roundtrip_nested_i32({1: [-(2**31), 2**31 - 1]}) == {1: [-(2**31), 2**31 - 1]}
-assert dicts.roundtrip_nested_int({1: [-(2**63) + 1, 2**63 - 1]}) == {1: [-(2**63) + 1, 2**63 - 1]}
-assert dicts.roundtrip_nested_isize({1: [-(2**63) + 1, 2**63 - 1]}) == {1: [-(2**63) + 1, 2**63 - 1]}
+assert dicts.roundtrip_nested_int({1: [pointer_signed_min, pointer_signed_max]}) == {1: [pointer_signed_min, pointer_signed_max]}
+assert dicts.roundtrip_nested_isize({1: [pointer_signed_min, pointer_signed_max]}) == {1: [pointer_signed_min, pointer_signed_max]}
 assert dicts.roundtrip_nested_char({1: [0, 0x10FFFF]}) == {1: [0, 0x10FFFF]}
 assert dicts.roundtrip_nested_u16({1: [0, 65535]}) == {1: [0, 65535]}
 assert dicts.roundtrip_nested_u32({1: [0, 2**32 - 1]}) == {1: [0, 2**32 - 1]}
 assert dicts.roundtrip_nested_u64({1: [0, 2**64 - 1]}) == {1: [0, 2**64 - 1]}
-assert dicts.roundtrip_nested_usize({1: [0, 2**63]}) == {1: [0, 2**63]}
-assert dicts.roundtrip_nested_uintptr({1: [0, 2**63]}) == {1: [0, 2**63]}
+assert dicts.roundtrip_nested_usize({1: [0, pointer_unsigned_max]}) == {1: [0, pointer_unsigned_max]}
+assert dicts.roundtrip_nested_uintptr({1: [0, pointer_unsigned_max]}) == {1: [0, pointer_unsigned_max]}
+assert dicts.roundtrip_optional_uintptr({1: None, 2: 0, 3: pointer_unsigned_max}) == {
+    1: None, 2: 0, 3: pointer_unsigned_max
+}
 assert dicts.roundtrip_nested_bool({1: [True, False, 1, 0]}) == {1: [True, False, True, False]}
 for fn, value in (
+    (dicts.roundtrip_isize_values, {1: pointer_signed_max + 1}),
+    (dicts.roundtrip_uintptr_values, {1: pointer_unsigned_max + 1}),
     (dicts.roundtrip_nested_i8, {1: [128]}),
     (dicts.roundtrip_nested_i16, {"bad": [-32769]}),
     (dicts.roundtrip_nested_u16, {1: [-1]}),

@@ -12,6 +12,7 @@ SOURCES=(
 )
 STAGE1_ONLY_SOURCES=(
     "$ROOT/test/repro/sview_region_get_else_nested_call_return.neg.elisa"
+    "$ROOT/test/repro/sview_region_get_else_nested_array_return.neg.elisa"
 )
 
 fail() { echo "sview GetElse recovery region smoke FAIL: $1" >&2; exit 1; }

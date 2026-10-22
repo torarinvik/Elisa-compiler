@@ -25,14 +25,19 @@ for item, sequence in (
 ):
     pattern = rf"for {item} in {sequence} \|([^|]+)\| -> table:"
     matches = re.findall(pattern, text)
-    if len(matches) != 1:
-        raise SystemExit(f"expected exactly one {item} fallback traversal, found {len(matches)}")
-    captures = {name.strip() for name in matches[0].split(",")}
-    readonly = captures & {"annotations", "module_annotations"}
-    if readonly:
-        raise SystemExit(f"{item} fallback traversal threads read-only inputs: {sorted(readonly)}")
-    missing = required - captures
-    if missing:
-        raise SystemExit(f"{item} fallback traversal omits captures: {sorted(missing)}")
+    if not matches:
+        raise SystemExit(f"expected at least one {item} fallback traversal")
+    for route, capture_list in enumerate(matches, start=1):
+        captures = {name.strip() for name in capture_list.split(",")}
+        readonly = captures & {"annotations", "module_annotations"}
+        if readonly:
+            raise SystemExit(
+                f"{item} fallback traversal {route} threads read-only inputs: {sorted(readonly)}"
+            )
+        missing = required - captures
+        if missing:
+            raise SystemExit(
+                f"{item} fallback traversal {route} omits captures: {sorted(missing)}"
+            )
 
-print("try fallback capture accounting: all four recursive value-block walks capture mutable indexes")
+print("try fallback capture accounting: every recursive value-block route captures mutable indexes")

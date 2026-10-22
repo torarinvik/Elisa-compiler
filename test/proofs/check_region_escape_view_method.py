@@ -29,9 +29,12 @@ helper = HELPER.read_text()
 
 def match_names(block: str, description: str) -> None:
     arms = [line.strip() for line in block.splitlines() if line.strip()]
-    if len(arms) != 2 or arms[-1] != "_ -> false":
+    if len(arms) != 2 or arms[-1] not in {"_ -> false", "_ -> result == (false)"}:
         raise SystemExit(f"{description} must have one literal arm and one false fallback")
-    if not re.fullmatch(r'"[^"\\]+"(?:\s*\|\s*"[^"\\]+")*\s*->\s*true', arms[0]):
+    if not re.fullmatch(
+        r'"[^"\\]+"(?:\s*\|\s*"[^"\\]+")*\s*->\s*(?:true|result\s*==\s*\(true\))',
+        arms[0],
+    ):
         raise SystemExit(f"{description} contains a non-literal or non-true arm")
     names = re.findall(r'"([^"\\]+)"', arms[0])
     if names != list(methods):
@@ -39,14 +42,20 @@ def match_names(block: str, description: str) -> None:
 
 
 def extract_contract_match(text: str, description: str) -> str:
-    match = re.search(
-        r"ensure\s+result\s*==\s*\(\s*when\s+method:\s*\n(.*?)^\s*\)",
-        text,
-        re.DOTALL | re.MULTILINE,
-    )
-    if not match:
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines)
+              if re.fullmatch(r"\s*ensure\s+when\s+method:\s*", line)]
+    if len(starts) != 1:
         raise SystemExit(f"{description} must specify the closed method set with pattern matching")
-    return match.group(1)
+    start = starts[0]
+    indent = len(lines[start]) - len(lines[start].lstrip(" \t"))
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and len(line) - len(line.lstrip(" \t")) <= indent:
+            break
+        end += 1
+    return "\n".join(lines[start + 1:end])
 
 
 production_contract_match = extract_contract_match(helper, "production view-method contract")

@@ -21,6 +21,13 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     "$ROOT/test/repro/pymodule_dict_views.elisa" >/dev/null
 grep -Fq '"type": "dict[i64,view[i64]]"' "$WORK/dict_views.json"
 grep -Fq '"type": "dict[sview,view[u8]]"' "$WORK/dict_views.json"
+grep -Fq '"type": "dict[i64,view[uintptr?]]"' "$WORK/dict_views.json"
+
+PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
+    -o "$WORK/dict_views.c" \
+    "$ROOT/test/repro/pymodule_dict_views.elisa" >/dev/null
+grep -Fq 'UINTPTR_MAX' "$WORK/dict_views.c"
 
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
@@ -29,7 +36,9 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
 
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import dict_views
+import sys
 
+pointer_unsigned_max = 2 * sys.maxsize + 1
 assert dict_views.roundtrip({1: [2, 3], 4: []}) == {1: [2, 3], 4: []}
 assert dict_views.roundtrip({1: (item for item in (7, 8))}) == {1: [7, 8]}
 assert dict_views.roundtrip_bytes({"raw": b"\x00ab", "empty": b""}) == {
@@ -38,11 +47,15 @@ assert dict_views.roundtrip_bytes({"raw": b"\x00ab", "empty": b""}) == {
 assert dict_views.roundtrip_bytes({"array": bytearray(b"abc"), "view": memoryview(b"xyz")}) == {
     "array": b"abc", "view": b"xyz"
 }
+assert dict_views.roundtrip_optional_uintptr({1: [None, 0, pointer_unsigned_max], 2: []}) == {
+    1: [None, 0, pointer_unsigned_max], 2: []
+}
 
 for fn, value in (
     (dict_views.roundtrip, {1: [2**63]}),
     (dict_views.roundtrip, {1: ["bad"]}),
     (dict_views.roundtrip_bytes, {"bad": [256]}),
+    (dict_views.roundtrip_optional_uintptr, {1: [pointer_unsigned_max + 1]}),
 ):
     try:
         fn(value)
