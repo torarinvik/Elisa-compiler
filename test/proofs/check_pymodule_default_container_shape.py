@@ -15,8 +15,8 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 POSITIVE = HERE / "pymodule_default_container_shape.elisa"
 NEGATIVE = HERE / "pymodule_default_container_shape_rejected.elisa"
-POLICY = ROOT / "src/driver/elisac_pymodule_default_container_shape_policy.elisa"
-DEFAULT_POLICY = ROOT / "src/driver/elisac_pymodule_default_policy.elisa"
+POLICY = ROOT / "src/driver/pymodule/default_container_shape_policy.elisa"
+DEFAULT_POLICY = ROOT / "src/driver/pymodule/default_policy.elisa"
 DRIVER = ROOT / "src/driver/elisac.elisa"
 AST_NODES = ROOT / "src/parser/ast_nodes.elisa"
 AST_SIDE_TABLES = ROOT / "src/parser/ast_side_tables.elisa"
@@ -221,9 +221,9 @@ def validate_source(
 ) -> list[str]:
     errors: list[str] = []
     errors.extend(source_projection_errors(ast_nodes_text, ast_side_tables_text, parser_tokens_text, projection_text))
-    if 'include "./elisac_pymodule_default_container_shape_policy.elisa"' not in driver_text or \
-            'include "./elisac_pymodule_default_policy.elisa"' not in driver_text or \
-            driver_text.index('include "./elisac_pymodule_default_container_shape_policy.elisa"') > driver_text.index('include "./elisac_pymodule_default_policy.elisa"'):
+    if 'include "./pymodule/default_container_shape_policy.elisa"' not in driver_text or \
+            'include "./pymodule/default_policy.elisa"' not in driver_text or \
+            driver_text.index('include "./pymodule/default_container_shape_policy.elisa"') > driver_text.index('include "./pymodule/default_policy.elisa"'):
         errors.append("compiler driver must include the proved container policy before its consumers")
 
     for name, expected_arms in (("is_empty_container", EXPECTED_EMPTY_ARMS), ("is_container", EXPECTED_CONTAINER_ARMS)):
@@ -255,7 +255,7 @@ def validate_source(
 
     proof_text = POSITIVE.read_text()
     negative_text = NEGATIVE.read_text()
-    if 'include "../../src/driver/elisac_pymodule_default_container_shape_policy.elisa"' not in proof_text:
+    if 'include "../../src/driver/pymodule/default_container_shape_policy.elisa"' not in proof_text:
         errors.append("positive proof no longer includes the exact production container-shape helper")
     if 'include "./pymodule_default_container_shape.elisa"' not in negative_text:
         errors.append("false-claim controls no longer include the source-linked positive proof")

@@ -15,8 +15,8 @@ HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 POSITIVE = HERE / "pymodule_default_hashable_policy.elisa"
 NEGATIVE = HERE / "pymodule_default_hashable_policy_rejected.elisa"
-POLICY = ROOT / "src/driver/elisac_pymodule_default_hashable_policy.elisa"
-DEFAULT_POLICY = ROOT / "src/driver/elisac_pymodule_default_policy.elisa"
+POLICY = ROOT / "src/driver/pymodule/default_hashable_policy.elisa"
+DEFAULT_POLICY = ROOT / "src/driver/pymodule/default_policy.elisa"
 DRIVER = ROOT / "src/driver/elisac.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
@@ -88,7 +88,7 @@ def check_match_implementation(text, description):
 check_when_contract(policy_text, "production hashable-type policy contract")
 check_match_implementation(policy_text, "production hashable-type policy")
 check_when_contract(proof_text, "proof hashable-type contract")
-if 'include "./elisac_pymodule_default_hashable_policy.elisa"' not in DRIVER.read_text():
+if 'include "./pymodule/default_hashable_policy.elisa"' not in DRIVER.read_text():
     raise SystemExit("PyModule driver no longer includes the proved policy")
 wrapper = re.search(
     r"(?m)^def pymodule_default_python_hashable_type\(type_name: sview\) -> bool can\[Abort\.Panic\]:\s*\n(.*?)(?=^def |\Z)",

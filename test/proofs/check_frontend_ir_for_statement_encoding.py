@@ -20,7 +20,7 @@ NEGATIVE = HERE / "frontend_ir_for_statement_encoding_rejected.elisa"
 ENCODING = ROOT / "src/driver/frontend_ir_for_statement_encoding.elisa"
 WRITER = ROOT / "src/driver/frontend_ir_write.elisa"
 STMT_WRITER = ROOT / "src/driver/frontend_ir_stmt.elisa"
-TYPE_TABLE = ROOT / "src/driver/frontend_ir_type_table_2.elisa"
+TYPE_TABLE = ROOT / "src/driver/frontend_ir_type_table_statements.elisa"
 PARSER = ROOT / "src/parser/parser_stmt_for.elisa"
 STAGE0_ROOT = Path(os.environ.get(
     "ELISA_STAGE0_COMPILER_ROOT",

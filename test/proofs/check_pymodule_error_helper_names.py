@@ -17,10 +17,10 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 POSITIVE = HERE / "pymodule_error_helper_names.elisa"
 NEGATIVE = HERE / "pymodule_error_helper_names_rejected.elisa"
-CLASSIFIER = ROOT / "src/driver/pymodule_error_helper_names.elisa"
-PAYLOAD = ROOT / "src/driver/elisac_pymodule_error_payload.elisa"
-CONVERT = ROOT / "src/driver/elisac_pymodule_error_convert.elisa"
-HELPERS = ROOT / "src/driver/elisac_pymodule_error_helpers.elisa"
+CLASSIFIER = ROOT / "src/driver/pymodule/error_helper_names.elisa"
+PAYLOAD = ROOT / "src/driver/pymodule/error_payload.elisa"
+CONVERT = ROOT / "src/driver/pymodule/error_convert.elisa"
+HELPERS = ROOT / "src/driver/pymodule/error_helpers.elisa"
 DRIVER = ROOT / "src/driver/elisac.elisa"
 
 if not __debug__:
@@ -69,7 +69,7 @@ if arm_lines != expected_arms:
     raise SystemExit("classifier match no longer implements the complete closed suffix table")
 
 payload_text = PAYLOAD.read_text()
-if 'include "./pymodule_error_helper_names.elisa"' not in payload_text:
+if 'include "./error_helper_names.elisa"' not in payload_text:
     raise SystemExit("error payload builder no longer imports the proved suffix classifier")
 helper_name = function_section(payload_text, "pymodule_error_nested_darray_helper_name")
 if "return PymoduleErrorHelperNames::nested_darray_helper_suffix(element_name)" not in helper_name:
@@ -83,7 +83,7 @@ if not all(fragment in helpers_text for fragment in (
     'emit_tokens_push_sview(&helper_name_storage, "_to_py")',
 )):
     raise SystemExit("nested error helper emitter no longer consumes classified suffixes")
-if 'include "./elisac_pymodule_error_payload.elisa"' not in DRIVER.read_text():
+if 'include "./pymodule/error_payload.elisa"' not in DRIVER.read_text():
     raise SystemExit("compiler driver no longer includes the nested error payload implementation")
 
 positive_names = {
@@ -130,7 +130,7 @@ if rejected_claims != {
 if 'PymoduleErrorHelperNames::nested_darray_helper_suffix("String") != ""' not in negative_text:
     raise SystemExit("rejected proof no longer challenges unsupported type acceptance")
 for path in (POSITIVE, NEGATIVE):
-    if 'include "../../src/driver/pymodule_error_helper_names.elisa"' not in path.read_text():
+    if 'include "../../src/driver/pymodule/error_helper_names.elisa"' not in path.read_text():
         raise SystemExit(f"{path.name} no longer proves the production classifier directly")
 
 try:

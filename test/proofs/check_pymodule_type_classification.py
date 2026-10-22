@@ -14,9 +14,9 @@ HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 DRIVER = ROOT / "src/driver/elisac.elisa"
-MODULE = ROOT / "src/driver/pymodule_type_classification.elisa"
-LOOKUP = ROOT / "src/driver/elisac_pymodule_lookup.elisa"
-REPORT = ROOT / "src/driver/elisac_pymodule_report.elisa"
+MODULE = ROOT / "src/driver/pymodule/type_classification.elisa"
+LOOKUP = ROOT / "src/driver/pymodule/lookup.elisa"
+REPORT = ROOT / "src/driver/pymodule/report.elisa"
 POSITIVE = HERE / "pymodule_type_classification.elisa"
 NEGATIVE = HERE / "pymodule_type_classification_rejected.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
@@ -117,7 +117,7 @@ def validate_source(module_text: str, lookup_text: str, report_text: str, driver
     if expected_spec is not None or expected_impl != EXPECTED_TYPE_GROUPS:
         errors.append("Python expected-type classifier differs from its exact closed mapping")
 
-    if compact(driver_text).count('include"./pymodule_type_classification.elisa"') != 1:
+    if compact(driver_text).count('include"./pymodule/type_classification.elisa"') != 1:
         errors.append("compiler driver must include the shared type classifier exactly once")
 
     lookup = compact(function_source(lookup_text, "pymodule_struct_scalar_field_type"))
@@ -164,7 +164,7 @@ if mutated_label == module_text or not validate_source(mutated_label, lookup_tex
 
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
-if 'include "../../src/driver/pymodule_type_classification.elisa"' not in positive_text:
+if 'include "../../src/driver/pymodule/type_classification.elisa"' not in positive_text:
     raise SystemExit("positive proof no longer imports the production type tables")
 if 'include "./pymodule_type_classification.elisa"' not in negative_text:
     raise SystemExit("negative controls no longer share the source-linked positive proof")

@@ -20,7 +20,7 @@ NEGATIVE = HERE / "frontend_ir_expression_literals_rejected.elisa"
 ENCODING = ROOT / "src/driver/frontend_ir_expression_literal_encoding.elisa"
 WRITER = ROOT / "src/driver/frontend_ir_write.elisa"
 EXPR_WRITER = ROOT / "src/driver/frontend_ir_expr.elisa"
-TYPE_TABLE = ROOT / "src/driver/frontend_ir_type_table_2.elisa"
+TYPE_TABLE = ROOT / "src/driver/frontend_ir_type_table_statements.elisa"
 
 if not __debug__:
     raise SystemExit("run without Python -O")

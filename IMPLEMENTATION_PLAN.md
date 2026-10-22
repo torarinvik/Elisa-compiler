@@ -910,7 +910,7 @@ These are implementation decisions to settle with examples and compatibility dat
 
 ### J.2 Python extension generation
 
-**S19 — CPython boundary ownership and failure paths.** Audit `src/driver/elisac_pymodule*.elisa`, `emit_pymodule_so.elisa`, and `scripts/pymodule_runtime_fallback.c`.
+**S19 — CPython boundary ownership and failure paths.** Audit `src/driver/pymodule/*.elisa`, `src/driver/pymodule/shared_object.elisa`, and `scripts/pymodule_runtime_fallback.c`.
 
 - [ ] Specify borrowed/new/stolen Python reference ownership for each API call and converter; carry one cleanup record per initialized object.
 - [ ] Release partially constructed lists/dicts/sets/tuples and nested aggregate conversions correctly when conversion/allocation fails at any element.

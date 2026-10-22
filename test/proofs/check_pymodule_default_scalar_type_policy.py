@@ -15,8 +15,8 @@ HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 POSITIVE = HERE / "pymodule_default_scalar_type_policy.elisa"
 NEGATIVE = HERE / "pymodule_default_scalar_type_policy_rejected.elisa"
-POLICY = ROOT / "src/driver/elisac_pymodule_default_scalar_type_policy.elisa"
-DEFAULT_POLICY = ROOT / "src/driver/elisac_pymodule_default_policy.elisa"
+POLICY = ROOT / "src/driver/pymodule/default_scalar_type_policy.elisa"
+DEFAULT_POLICY = ROOT / "src/driver/pymodule/default_policy.elisa"
 DRIVER = ROOT / "src/driver/elisac.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
@@ -48,9 +48,9 @@ policy_text = POLICY.read_text()
 default_policy_text = DEFAULT_POLICY.read_text()
 driver_text = DRIVER.read_text()
 proof_text = POSITIVE.read_text()
-if 'include "./elisac_pymodule_default_scalar_type_policy.elisa"' not in driver_text:
+if 'include "./pymodule/default_scalar_type_policy.elisa"' not in driver_text:
     raise SystemExit("PyModule driver no longer includes the scalar type-name policy")
-if 'include "../../src/driver/elisac_pymodule_default_hashable_policy.elisa"' not in proof_text:
+if 'include "../../src/driver/pymodule/default_hashable_policy.elisa"' not in proof_text:
     raise SystemExit("the scalar group partition proof no longer includes the hashable-type policy")
 for name, expected_names in groups.items():
     section = function_section(policy_text, name)

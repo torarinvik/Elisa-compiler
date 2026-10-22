@@ -15,10 +15,10 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 POSITIVE = HERE / "pymodule_struct_field_names.elisa"
 NEGATIVE = HERE / "pymodule_struct_field_names_rejected.elisa"
-HELPER = ROOT / "src/driver/pymodule_struct_field_names.elisa"
-WRAPPER = ROOT / "src/driver/elisac_pymodule_struct_fields.elisa"
-TYPEDEF = ROOT / "src/driver/elisac_pymodule_struct_typedef.elisa"
-DEFAULT_POLICY = ROOT / "src/driver/elisac_pymodule_default_policy.elisa"
+HELPER = ROOT / "src/driver/pymodule/struct_field_names.elisa"
+WRAPPER = ROOT / "src/driver/pymodule/struct_fields.elisa"
+TYPEDEF = ROOT / "src/driver/pymodule/struct_typedef.elisa"
+DEFAULT_POLICY = ROOT / "src/driver/pymodule/default_policy.elisa"
 DRIVER = ROOT / "src/driver/elisac.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
@@ -146,7 +146,7 @@ if parse_match(implementation.group(1), "expected-name mapping") != EXPECTED:
     raise SystemExit("C field expected-name mapping differs from the closed expected keyword map")
 
 wrapper_source = WRAPPER.read_text()
-if 'include "./pymodule_struct_field_names.elisa"' not in wrapper_source:
+if 'include "./struct_field_names.elisa"' not in wrapper_source:
     raise SystemExit("production struct-field adapter no longer imports the proved mapper")
 wrapper = compact_source(source_function(wrapper_source, "pymodule_struct_c_field_name"))
 expected_wrapper = compact_source("""def pymodule_struct_c_field_name(field_name: sview) -> sview can[Abort.Panic]:
@@ -155,7 +155,7 @@ expected_wrapper = compact_source("""def pymodule_struct_c_field_name(field_name
         return PymoduleStructFieldNames::c_field_name(field_name)""")
 if wrapper != expected_wrapper:
     raise SystemExit("production struct-field adapter changed from the exact proved forwarding body")
-if compact_source(DRIVER.read_text()).count('include"./elisac_pymodule_struct_fields.elisa"') != 1:
+if compact_source(DRIVER.read_text()).count('include"./pymodule/struct_fields.elisa"') != 1:
     raise SystemExit("main compiler driver no longer includes the struct-field adapter exactly once")
 for path, expected_calls in ((TYPEDEF, 8), (DEFAULT_POLICY, 2)):
     calls = compact_source(path.read_text()).count("pymodule_struct_c_field_name(")

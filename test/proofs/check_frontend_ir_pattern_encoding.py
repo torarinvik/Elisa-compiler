@@ -18,7 +18,7 @@ MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 ENCODING = ROOT / "src/driver/frontend_ir_pattern_encoding.elisa"
 WRITER = ROOT / "src/driver/frontend_ir_write.elisa"
 PATTERNS = ROOT / "src/driver/frontend_ir_patterns.elisa"
-TYPE_TABLE = ROOT / "src/driver/frontend_ir_type_table_2.elisa"
+TYPE_TABLE = ROOT / "src/driver/frontend_ir_type_table_statements.elisa"
 POSITIVE = HERE / "frontend_ir_pattern_encoding.elisa"
 NEGATIVE = HERE / "frontend_ir_pattern_encoding_rejected.elisa"
 
