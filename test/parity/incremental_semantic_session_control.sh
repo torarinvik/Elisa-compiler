@@ -86,6 +86,19 @@ grep -Eq 'short-lived region escapes via store into longer-lived storage|stored 
     || fail "Stage1 rejected the borrowed-source control for an unrelated reason: $(tail -n 8 "$WORK/session-borrowed-source.log")"
 [[ ! -e "$borrowed_source_output" ]] || fail "Stage1 emitted LLVM for a rejected borrowed-source control"
 
+# Exercise the same storage-region resolution through two generic field projections.
+nested_region_output="$WORK/session-nested-region-layout.ll"
+if ! "$STAGE1" -emit llvm -O0 -o "$nested_region_output" "$ROOT/test/repro/incremental_session_nested_region_storage.elisa" >"$WORK/session-nested-region-layout.log" 2>&1; then
+    fail "Stage1 rejected a same-region store through nested generic fields: $(tail -n 8 "$WORK/session-nested-region-layout.log")"
+fi
+nested_borrowed_output="$WORK/session-nested-borrowed-source.ll"
+if "$STAGE1" -emit llvm -O0 -o "$nested_borrowed_output" "$ROOT/test/repro/incremental_session_nested_borrowed_source.neg.elisa" >"$WORK/session-nested-borrowed-source.log" 2>&1; then
+    fail "Stage1 accepted a request-borrowed view stored through nested fields into session storage"
+fi
+grep -Eq 'short-lived region escapes via store into longer-lived storage|stored into longer-lived region' "$WORK/session-nested-borrowed-source.log" \
+    || fail "Stage1 rejected the nested borrowed-source control for an unrelated reason: $(tail -n 8 "$WORK/session-nested-borrowed-source.log")"
+[[ ! -e "$nested_borrowed_output" ]] || fail "Stage1 emitted LLVM for a rejected nested borrowed-source control"
+
 read_status() {
     local expected="$1"
     local actual=""

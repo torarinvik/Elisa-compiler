@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise complete native checker diagnostics; does not build the checker."""
 from pathlib import Path
+import os
 import re
 import subprocess
 import sys
@@ -64,3 +65,11 @@ for name, source, expected_count, fragments in cases:
     if any(fragment not in output for fragment in fragments):
         raise SystemExit(f"{name}: diagnostic payload missing\n{output}")
     print(f"native checker {name}: ok")
+
+    if name in ("clean", "undefined_name"):
+        errors_env = dict(os.environ, ELISA_CHECKER_ERRORS_ONLY="1")
+        filtered = subprocess.run([checker], input=source, capture_output=True, text=True, timeout=30, env=errors_env)
+        filtered_output = filtered.stdout + filtered.stderr
+        expected_errors = 1 if name == "undefined_name" else 0
+        if filtered.returncode != (1 if expected_errors else 0) or f"errors={expected_errors}" not in filtered_output:
+            raise SystemExit(f"{name}: error-only reporting changed the error count/status\n{filtered_output}")

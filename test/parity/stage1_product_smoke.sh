@@ -67,6 +67,8 @@ fi
 
 echo "stage1_product_smoke OK: product $BIN compiled fixture → exit 42 (no stage0)"
 
+python3 "$ROOT/test/parity/stage1_region_constant_smoke.py" "$BIN"
+
 # The installed snapshot has no .git directory. Exercise its public wrapper so
 # startup cannot accidentally depend on running from the compiler checkout.
 snapshot_prefix="$SCRATCH_DIR/snapshot-prefix"

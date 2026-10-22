@@ -79,6 +79,7 @@ helper_names = {
     "easm_compose_close_offset", "easm_compose_span_argument_count_from_open",
     "easm_compose_span_from_trim_bounds", "easm_compose_trimmed_span",
     "easm_compose_span_reference_from", "easm_compose_span_wanted_in_range",
+    "easm_compose_span_equal",
     "easm_compose_span_reference_at_bounds",
     "easm_compose_span_reference_from_open", "easm_compose_span_reference",
     "easm_compose_span_matches_reference", "easm_compose_span_state_matches_reference",
@@ -93,10 +94,17 @@ span_body = compact(function_section(text_source, "easm_compose_span"))
 matches_reference_body = compact(function_section(text_source, "easm_compose_span_matches_reference"))
 required_match_fragments = (
     "ghost def easm_compose_span_matches_reference(candidate:ComposeSpan,text:sview,wanted:i64)->bool",
-    "return (candidate.valid == easm_compose_span_reference(text, wanted).valid and candidate.start == easm_compose_span_reference(text, wanted).start and candidate.end == easm_compose_span_reference(text, wanted).end)",
+    "return easm_compose_span_equal(candidate, easm_compose_span_reference(text, wanted))",
 )
 if any(compact(fragment) not in matches_reference_body for fragment in required_match_fragments):
     raise SystemExit("compose-span reference predicate no longer compares every result field")
+span_equal_body = compact(function_section(text_source, "easm_compose_span_equal"))
+if any(compact(fragment) not in span_equal_body for fragment in (
+    "ghost def easm_compose_span_equal(left:ComposeSpan,right:ComposeSpan)->bool",
+    "ensure result == (left.valid == right.valid and left.start == right.start and left.end == right.end)",
+    "return left.valid == right.valid and left.start == right.start and left.end == right.end",
+)):
+    raise SystemExit("compose-span equality helper no longer covers validity and both endpoints")
 state_matches_reference_body = compact(function_section(text_source, "easm_compose_span_state_matches_reference"))
 required_state_match_fragments = (
     "ghost def easm_compose_span_state_matches_reference(values:sview,base:usize,source_end:usize,segment_start:usize,cursor:usize,current:i64,wanted:i64,text:sview)->bool",
@@ -122,9 +130,7 @@ if any(compact(fragment) not in state_wrapper_body for fragment in (
 
 required_span_fragments = (
     "ensure (wanted >= 0 and wanted < easm_compose_span_argument_count(text)) implies result.valid",
-    "ensure result.valid == easm_compose_span_reference(text, wanted).valid",
-    "ensure result.start == easm_compose_span_reference(text, wanted).start",
-    "ensure result.end == easm_compose_span_reference(text, wanted).end",
+    "ensure easm_compose_span_equal(result, easm_compose_span_reference(text, wanted))",
     "ensure not result.valid implies result.start == 0 and result.end == 0",
     "ensure result.valid implies result.start <= result.end",
     "ensure result.valid implies result.end <= text.len",
@@ -251,19 +257,11 @@ required_reference_fragments = (
     "requires base <= source_end",
     "requires cursor <= source_end - base",
     "decreases values.len - cursor",
-    "ensure wanted < current implies not result.valid",
-    "ensure (wanted >= current and wanted - current > easm_compose_comma_count_from(values, cursor)) implies not result.valid",
-    "ensure (wanted >= current and cursor < values.len and values[cursor] != 44) implies (",
-    "result.start == easm_compose_span_reference_from(values, base, source_end, segment_start, cursor + 1.usize(), current, wanted).start",
-    "ensure (wanted > current and cursor < values.len and values[cursor] == 44) implies (",
-    "result.start == easm_compose_span_reference_from(values, base, source_end, cursor + 1.usize(), cursor + 1.usize(), current + 1, wanted).start",
-    "ensure (cursor == values.len and current == wanted) implies (",
-    "result.start == easm_compose_trimmed_span(values, base, source_end, segment_start, cursor).start",
-    "result.end == easm_compose_trimmed_span(values, base, source_end, segment_start, cursor).end",
-    "ensure (cursor < values.len and values[cursor] == 44 and current == wanted) implies (",
-    "result.start == easm_compose_trimmed_span(values, base, source_end, segment_start, cursor).start",
-    "result.end == easm_compose_trimmed_span(values, base, source_end, segment_start, cursor).end",
-    "ensure (wanted >= current and wanted - current <= easm_compose_comma_count_from(values, cursor)) implies result.valid",
+    "ensure result.valid == (wanted >= current and wanted - current <= easm_compose_comma_count_from(values, cursor))",
+    "ensure (wanted >= current and cursor < values.len and values[cursor] != 44) implies easm_compose_span_equal(result, easm_compose_span_reference_from(values, base, source_end, segment_start, cursor + 1.usize(), current, wanted))",
+    "ensure (wanted > current and cursor < values.len and values[cursor] == 44) implies easm_compose_span_equal(result, easm_compose_span_reference_from(values, base, source_end, cursor + 1.usize(), cursor + 1.usize(), current + 1, wanted))",
+    "ensure (cursor == values.len and current == wanted) implies easm_compose_span_equal(result, easm_compose_trimmed_span(values, base, source_end, segment_start, cursor))",
+    "ensure (cursor < values.len and values[cursor] == 44 and current == wanted) implies easm_compose_span_equal(result, easm_compose_trimmed_span(values, base, source_end, segment_start, cursor))",
     "return ComposeSpan{start: 0, end: 0, valid: false} if wanted < current",
     "return easm_compose_span_reference_from(values, base, source_end, segment_start, cursor + 1.usize(), current, wanted) if cursor < values.len and values[cursor] != 44",
     "return easm_compose_trimmed_span(values, base, source_end, segment_start, cursor) if current == wanted",
@@ -275,7 +273,7 @@ if any(compact(fragment) not in reference_body for fragment in required_referenc
 reference_state_body = compact(function_section(text_source, "easm_compose_span_reference_from_state"))
 if any(compact(fragment) not in reference_state_body for fragment in (
     "ghost def easm_compose_span_reference_from_state(values:sview,base:usize,source_end:usize,segment_start:usize,cursor:usize,current:i64,wanted:i64)",
-    "ensure (base <= source_end and values.len == source_end - base and cursor <= values.len and segment_start <= cursor and current >= 0 and cursor <= source_end - base and wanted >= 0 and wanted < easm_compose_argument_count_spec(values)) implies (result.valid == easm_compose_span_reference_from(values, base, source_end, segment_start, cursor, current, wanted).valid and result.start == easm_compose_span_reference_from(values, base, source_end, segment_start, cursor, current, wanted).start and result.end == easm_compose_span_reference_from(values, base, source_end, segment_start, cursor, current, wanted).end)",
+    "ensure (base <= source_end and values.len == source_end - base and cursor <= values.len and segment_start <= cursor and current >= 0 and cursor <= source_end - base and wanted >= 0 and wanted < easm_compose_argument_count_spec(values)) implies (easm_compose_span_equal(result, easm_compose_span_reference_from(values, base, source_end, segment_start, cursor, current, wanted)))",
     "return ComposeSpan{start:0,end:0,valid:false} if base > source_end",
     "return ComposeSpan{start:0,end:0,valid:false} if values.len != source_end - base",
     "return ComposeSpan{start:0,end:0,valid:false} if cursor > values.len",

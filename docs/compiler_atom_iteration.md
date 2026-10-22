@@ -643,3 +643,92 @@ last-row allocation metadata on duplicate lines. It compiles/links/runs in 1.23s
 checker, matching the prefilter results exactly. Existing overlapping negative
 region reports are recorded as comparison baselines rather than endorsed as an
 ideal diagnostic count.
+
+
+On the full expanded driver, the preflattened native semantic run completes in
+29.57s with 206,540 diagnostics. Of these, 102,987 were Global permission errors
+caused by a single depth-overflow report: the generated 221-arm pass dispatcher
+was represented as a nested `elif` chain. Its generator and source now use
+independent `if` arms over unique immutable pass IDs. The dispatcher audit accepts
+either consistent legacy chains or the flat form, rejects mixed forms, and has
+93 passing regressions. The fresh run on flat arms completes in 26.76s with
+104,438 diagnostics and zero depth reports.
+
+The test checker now has an opt-in `ELISA_CHECKER_ERRORS_ONLY=1` mode that uses
+the same semantic severity function as the driver. Default fixture output is
+unchanged; smoke tests cover both modes. It reports 1,720 error-severity
+diagnostics on the flat full-source snapshot. The largest groups are mutable
+global calls (759), short-lived region stores (416), aggregate stores (267),
+mutable global reads (87), tied returns (86), and region-store escapes (33).
+Warning and note rows no longer inflate this count.
+
+One region false positive has a fully checked reproducer. `backend_type_visit_grow`
+stores a freshly allocated bucket array through a caller-owned mutable set. A
+tiny Core-built executable survives allocation churn and validates its contents;
+the stage1 checker previously rejected the store. The fix gives `visited` and its
+temporary `new_buckets` the same inferred region parameter. The expanded checker
+with this edit built previously; a focused backend atom now inserts nine keys,
+crosses the hash-growth threshold, and verifies the promoted table.
+
+
+## 2026-10-21 continuation checks
+
+The Stage1 product smoke now checks that region-only generic calls and immutable
+integer constants in match arms are accepted, while ordinary functions with a
+region argument and a shadowing local remain rejected. The new Stage1 smoke passes
+against the rebuilt `/private/tmp` product. The
+checked-in `bin/elisac-stage1` is older than the current source and must be reseeded
+before the product gate can use it.
+
+The driver line-map cache parity smoke passes. Sorted flat-line entries now use an
+upper-bound binary search, preserving the last duplicate entry; unsorted maps keep
+the linear fallback. Its focused Stage0 benchmark measures 56.1 ms uncached and
+2.1 ms cached for 500 lookups across 2,000 map entries. The Stage1 benchmark fixture
+currently includes an unrelated parallel-runtime body that the available Stage1
+products decline (`for_indices_par`), so that path has no current timing result.
+
+The full self-host gate remains open. Stage1 `-emit check src/driver/elisac.elisa`
+timed out twice at the 29-second cap, and a cold Stage0 `--seed -O0` did the same.
+Retrying through the running retained server returned HTTP 409 and fell back to the
+cold compile before the cap. The incremental semantic-session control passes the
+new nested region-store fixtures, then stops at the existing
+`complete_empty_body_eligible` expectation; that failure needs a source-current
+collector run before it can be classified as implementation or stale-product
+behavior. No full self-compilation or sub-10-second incremental-build result is
+claimed.
+
+
+## 2026-10-22 continuation checks
+
+Region-only generic specialization and named integer constants in match arms are
+valid Stage1 forms. The Stage1 regression passed all five checking cases and
+emitted LLVM for the three positive fixtures using the available product; that
+product is stale by source provenance, so this is a compatibility check rather
+than a fresh-product gate. Current-source Stage0 integration passed all seven
+native region/constant cases in 17.1s. Ordinary non-generic region arguments and
+same-named local shadows remain rejected.
+
+`ifc_candidate_is_complete_empty_body` now skips leading newline tokens before
+matching its closed `return <literal>` shape. The focused
+`incremental_empty_body` atom uses the production lexer and token-span helper,
+checks the literal and newline-prefixed forms, and confirms a call body is not
+classified as empty; it compiles and runs in 1.32s. The earlier
+`complete_empty_body_eligible` failure remains unresolved until the session
+control can run against a product built from current source.
+
+The checked-in Stage1 executable remains stale. A fresh self-compilation and the
+sub-10-second incremental-build target are still open.
+
+The full checker timing had `check_firm_arg_type_mismatch` at 3.54s on the
+expanded compiler. Its extern index was built but the per-call parameter,
+compatibility, and protocol lookups still walked all extern declarations. Those
+lookups now follow the existing hash bucket chain, with a linear fallback only
+when the index shape is stale. The semantic, incremental-empty-body, and
+same-name-overload atoms pass together in 3.7s. This focused result does not
+replace a full self-check timing.
+
+Fresh Stage1 seed attempts from the native Stage0 product remain over the 30s
+cap: `-O3` reached the 6 GiB guard, `-O0` also reached that guard, and raising the
+single-build limit to 9 GiB avoided the guard but still timed out at 30s. No
+timed-out seed was retried unchanged. The next full-build attempt needs a source
+or pipeline optimization before it can be claimed as current.

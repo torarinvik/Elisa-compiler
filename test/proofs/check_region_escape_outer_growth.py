@@ -37,7 +37,8 @@ def source_function(name: str) -> str:
 growth = source_function("region_escape_outer_growth")
 growth_branches = (
     "return(false,sview(\"\",0,0),sview(\"\",0,0),sview(\"\",0,0))ifnotgrowth.foundorgrowth.receiver==\"\"ornesting.count==0",
-    "return(false,sview(\"\",0,0),sview(\"\",0,0),sview(\"\",0,0))ifowner_region==store_region",
+    "same_region:bool=field_owner.binding_id==store_region_idiffield_owner.foundandfield_owner.binding_id!=0andstore_region_id!=0elseowner_region==store_region",
+    "return(false,sview(\"\",0,0),sview(\"\",0,0),sview(\"\",0,0))ifsame_region",
     "return(false,sview(\"\",0,0),sview(\"\",0,0),sview(\"\",0,0))ifnotowner_on_stack.foundandnotowner_is_param",
     "return(growth.found,growth.operation,store_region,owner_region)",
     "return(growth.found,growth.operation,store_region,sview(\"\",0,0))ifreceiver_is_outerorreceiver_is_global",
@@ -50,6 +51,23 @@ if "owner_on_stack: (found: bool, position: usize)".replace(" ", "") not in grow
     raise SystemExit("outer-growth owner no longer checks lexical region ancestry")
 if "owner_is_param: bool = region_escape_is_region_param(owner_region, annotations, line)".replace(" ", "") not in growth:
     raise SystemExit("outer-growth owner no longer distinguishes caller-owned region parameters")
+
+receiver_region = source_function("region_escape_receiver_storage_region")
+for fragment in (
+    'return(true,"__auto",0)ifowner==""',
+    'return(true,"__auto",0)ifstruct_line==0',
+    'return(true,"__auto",0)iftable.generic_param_lines.count!=table.generic_param_names.count',
+    'matching_parameter_count.usize()!=interned_elem_count(object_type_id,table)',
+    'return(true,"__auto",0)ifbinding_id==0',
+):
+    if fragment not in receiver_region:
+        raise SystemExit(f"projected generic storage region no longer fails closed on ambiguous metadata: {fragment}")
+field_region = source_function("region_escape_field_region_info")
+if 'return(true,"__auto","")iffallback_has_region' not in field_region:
+    raise SystemExit("ambiguous field metadata with a storage region must not fall back to the root local")
+struct_line = source_function("region_escape_struct_line")
+if 'matching_structs!=1' not in struct_line or 'same_name_structs!=1' not in struct_line or 'same_line_owners==1' not in struct_line:
+    raise SystemExit("generic region parameter order must be associated with one unambiguous declaration identity")
 
 store = source_function("region_escape_check_store")
 consumer_branch = (

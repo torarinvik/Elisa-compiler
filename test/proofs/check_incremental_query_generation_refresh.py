@@ -39,6 +39,7 @@ if not SOURCE.is_file():
 source = SOURCE.read_text()
 compact_source = compact(source)
 dependencies = compact(section(source, "ifq_query_dependencies_check"))
+apply_dependencies = compact(section(source, "ifq_apply_dependency_set"))
 refresh = compact(section(source, "ifq_refresh_dependency_generations"))
 commit = compact(section(source, "ifq_query_commit"))
 
@@ -47,9 +48,21 @@ for fragment in (
     "check.all_dependencies_green <- false if dependency_node.status != IncrementalSemanticQueryStatus.Green",
     "check.results_current <- false if edge.observed_result_generation != dependency_node.result_generation",
     "check.equal <- false if not found",
+    "check.dependency_ids.push(dependency)",
 ):
     if compact(fragment) not in dependencies:
         raise SystemExit(f"dependency validation no longer proves refresh eligibility: {fragment}")
+
+if "check.old_count <- steps" not in section(source, "ifq_query_dependencies_check"):
+    raise SystemExit("old dependency count must use the validated edge-chain traversal")
+if "matched_old:mutabledarray[bool]=[]" not in dependencies or "ifmatched_old[candidate]:" not in dependencies:
+    raise SystemExit("old edge multiplicity must be checked by the bounded membership pass")
+for forbidden in ("old_ids", "duplicate_old"):
+    if forbidden in dependencies:
+        raise SystemExit(f"old edge validation retained a separate quadratic duplicate scan: {forbidden}")
+
+if "forpreviousin0..<index" in apply_dependencies or "continueifduplicate" in apply_dependencies:
+    raise SystemExit("dependency application must rely on the unique IDs produced by dependency validation")
 
 for fragment in (
     "expected_count > INCREMENTAL_SEMANTIC_QUERY_PER_DEPENDENCY_LIMIT",
@@ -81,7 +94,7 @@ ordered(source, "ifq_query_commit", (
     "session.query_nodes[query_id.value.usize()].status <- IncrementalSemanticQueryStatus.Green",
 ))
 
-if "if result_changed and not ifq_mark_reverse_closure(session, query_id, IncrementalSemanticQueryStatus.PotentiallyDirty):" not in commit:
+if compact("if result_changed and not ifq_mark_reverse_closure(session, query_id, IncrementalSemanticQueryStatus.PotentiallyDirty):") not in commit:
     raise SystemExit("result changes must still dirty dependers through the reverse closure")
 if "if dependency_generation_refresh_required:" in commit and "ifq_apply_dependency_set" in commit[commit.find("if dependency_generation_refresh_required:"):]:
     raise SystemExit("unchanged dependency IDs must refresh generations without replacing edges")

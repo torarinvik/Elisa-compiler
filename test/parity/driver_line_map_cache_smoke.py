@@ -101,6 +101,15 @@ def main() -> i32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global{R
         driver_line_map_refresh()
         return 27 if source_line_of(5) != 5
         return 28 if compare_locations() != 0
+        sorted_map: mutable darray[u8] = []
+        sorted_map.extend("0:9:zero.elisa\n1:20:first.elisa\n5:30:old.elisa\n5:40:new.elisa\n15:7:other.elisa\n25:8:")
+        Lexer::line_map_publish(sorted_map)
+        return 31 if driver_line_map_cached()
+        driver_line_map_refresh()
+        return 32 if not driver_line_map_cached()
+        return 33 if compare_locations() != 0
+        return 34 if source_line_of(5) != 40
+        return 35 if source_line_of(15) != 7
         Lexer::line_map_clear()
         return 29 if driver_line_map_cached()
         return 30 if compare_locations() != 0

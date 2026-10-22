@@ -82,48 +82,33 @@ root_only_contract = compact("""
 """)
 if root_only_contract not in cleaner:
     raise SystemExit("production path_clean no longer specifies exact cleaning of the root-only path")
-output_start = compact("body: mutable darray[u8] = []")
+output_start = compact("out: mutable darray[u8] = []")
 fallback_start = compact("if out.count == 0.usize():")
 if output_start not in cleaner or fallback_start not in cleaner:
     raise SystemExit("production path_clean output construction or empty-relative fallback is missing")
 build = cleaner.split(output_start, 1)[1].split(fallback_start, 1)[0]
 expected_build = compact("""
-    for segment in 0..<depth |body, starts, lengths, path|:
-        body.push(47) if segment > 0.usize()
-        for offset in 0..<lengths[segment] |body, starts, lengths, path, segment|:
-            body.push(path[starts[segment] + offset])
-    out: mutable darray[u8] = []
-    if path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH:
+    if rooted:
         out.push(ProjectSystemPathByte::ASCII_FORWARD_SLASH)
-    assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
-        out.count > 0.usize() and
-        out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
-    )
-    for index in 0..<body.count |out, body, path|:
-        invariant not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
-            out.count > 0.usize() and
-            out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
-        )
-        assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
-            out.count > 0.usize() and
-            out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
-        )
-        out.push(body[index])
-        assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
-            out.count > 0.usize() and
-            out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
-        )
-    assert not (path.count > 0.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
+        assert out.count > 0.usize() and out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
+    for segment in 0..<depth |out, starts, lengths, path|:
+        if segment > 0.usize():
+            out.push(ProjectSystemPathByte::ASCII_FORWARD_SLASH)
+            assert not rooted or (out.count > 0.usize() and out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH)
+        for offset in 0..<lengths[segment] |out, starts, lengths, path, segment|:
+            out.push(path[starts[segment] + offset])
+            assert not rooted or (out.count > 0.usize() and out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH)
+    assert not rooted or (
         out.count > 0.usize() and
         out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
     )
 """)
 if build != expected_build:
-    raise SystemExit("path_clean root-preserving output loops changed or gained a root-mutating operation")
+    raise SystemExit("path_clean direct segment output lost root preservation or gained a root-mutating operation")
 if compact("""
     if out.count == 0.usize():
         out.push(46)
-    assert (path.count != 0.usize()) or (out.count == 1.usize() and out[0.usize()] == 46)
+    assert (path.count != 0.usize() or (out.count == 1.usize() and out[0.usize()] == 46))
     assert not (path.count == 1.usize() and path[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH) or (
         out.count == 1.usize() and
         out[0.usize()] == ProjectSystemPathByte::ASCII_FORWARD_SLASH
