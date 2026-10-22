@@ -94,7 +94,7 @@ core_hits=$(grep -rn 'requires an active in <arena>: scope' --include='*.go' "$E
   | grep -vc '^[[:space:]]*//' || true)
 [ "$core_hits" -eq 0 ] || fail "$core_hits stage0 sites still emit the deprecated in <arena>: scope wording"
 grep -Fq 'darray push has no region to grow into; a region is inferred from where the receiver is declared (a typed local, a parameter, or a struct field)' \
-  "$REPO_ROOT/src/semantic/semantic_api_message_3.elisa" \
+  "$REPO_ROOT/src/semantic/diagnostic_messages/views_and_regions.elisa" \
   || fail "stage1's DarrayPushArenaRequired text has drifted from stage0's NoGrowthRegionMessage"
 
 echo "container-region-message smoke OK: darray/dict/set literals positioned + actionable, 3 valid destinations compile, 0 deprecated-wording sites, stage1 text in sync"

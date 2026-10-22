@@ -18,7 +18,8 @@ MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 POSITIVE = HERE / "semantic_api_growth_default_family.elisa"
 NEGATIVE = HERE / "semantic_api_growth_default_family_rejected.elisa"
 SOURCE = ROOT / "src/semantic/semantic_api_growth_default_family.elisa"
-CALLER = ROOT / "src/semantic/semantic_api_message_3.elisa"
+CALLER = ROOT / "src/semantic/diagnostic_messages/views_and_regions.elisa"
+CALLER_ARMS = ROOT / "src/semantic/diagnostic_messages/proofs.elisa"
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -29,7 +30,7 @@ def compact(text: str) -> str:
 
 
 source_text = compact(SOURCE.read_text())
-caller_text = compact(CALLER.read_text())
+caller_text = compact(CALLER.read_text() + CALLER_ARMS.read_text())
 positive_text = compact(POSITIVE.read_text())
 negative_text = compact(NEGATIVE.read_text())
 expected_dispatch = (
@@ -52,7 +53,7 @@ contract_clauses = tuple(clause.replace(" ", "") for clause in contract_clauses)
 if any(source_text.count(clause) != 1 or positive_text.count(clause) != 1
        for clause in contract_clauses):
     raise SystemExit("production growth-family contract and proof specification have diverged")
-if 'include"./semantic_api_growth_default_family.elisa"' not in caller_text:
+if 'include"../semantic_api_growth_default_family.elisa"' not in caller_text:
     raise SystemExit("semantic API diagnostic formatter no longer imports the proved helper")
 if "returnSemanticApiGrowthDefaultFamily::growth_default_family(method)" not in caller_text:
     raise SystemExit("semantic API wrapper no longer delegates to the proved mapping")
@@ -75,7 +76,7 @@ source_closure = source_include_closure([POSITIVE, NEGATIVE, CALLER])
 inputs = [
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POSITIVE, NEGATIVE, SOURCE, CALLER, *source_closure,
+    POSITIVE, NEGATIVE, SOURCE, CALLER, CALLER_ARMS, *source_closure,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

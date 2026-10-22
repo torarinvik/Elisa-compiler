@@ -56,7 +56,9 @@ def items_of(lines):
         if first is None:
             items.append((lines[s:e], None, None))
             continue
-        mi = indent(first)
+        # members sit at the most common `def` indent (a stray unlabeled member may sit higher)
+        def_indents = [indent(l) for l in body if l.lstrip().startswith("def ")]
+        mi = max(set(def_indents), key=def_indents.count) if def_indents else indent(first)
         label_re = re.compile(rf"^ {{{mi - 4}}}(public|private):\s*$") if mi >= 8 else None
         mstarts = []
         for k, l in enumerate(body):

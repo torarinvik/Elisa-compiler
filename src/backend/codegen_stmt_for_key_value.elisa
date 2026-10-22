@@ -1,0 +1,166 @@
+extend Backend:
+    private:
+        def emit_for_key_value_pairs(for_bind: sview, for_variables: darray[sview @source]&, for_iterable: Expr, for_body: darray[Stmt]&, for_line: Ast::Pos, for_interleave_count: u32, fast_push_cursor_mark: usize, return_type: ValueType, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, matched: mutable bool&, for_scope_mark: usize) -> EmitStatus can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # `for i, x in xs.enumerate()` — INDEX + VALUE iteration over a darray. The
+            # first binder is the running index (i64), the second the element. Detected by
+            # the `.enumerate()` receiver before the dict path (its iterable is a call, not
+            # a DynDict value).
+            match for_iterable:
+                Expr.Call(en_callee, en_args, en_arg_names, en_call_line):
+                    match en_callee:
+                        Expr.Field(en_source, en_method, en_method_line):
+                            if en_method == "enumerate" and en_args.count == 0:
+                                en_source_type: mutable ValueType = darray_type_behind_expr(en_source, local_scope, structs)
+                                # A FIXED array enumerates too (`for i, x in items.enumerate()`
+                                # where `items: array[T, 3]`). Rather than a second copy of the
+                                # loop, borrow the same trick the plain `for x in xs` walk uses:
+                                # build a synthetic darray HEADER over the array's storage and
+                                # run the darray path unchanged.
+                                en_fixed_type: ValueType = iterable_fixed_array_type(en_source, local_scope, fns, structs, generics)
+                                en_fixed_header: mutable LLVMValueRef? = null
+                                if en_source_type.kind != TypeKind.DArray and en_fixed_type.kind == TypeKind.Array:
+                                    en_fixed_header <- fixed_array_header_slot(en_source, en_fixed_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                                    en_source_type <- intern_darray_type(copied_type(structs.interned_types.array_elements[en_fixed_type.bits.usize()]), structs) if en_fixed_header is en_fixed_present
+                                return EmitStatus.Declined if en_source_type.kind != TypeKind.DArray
+                                en_source_opt: LLVMValueRef? = en_fixed_header if en_fixed_header is en_fixed_ready else (darray_address_of_expr(en_source, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+                                if en_source_opt is en_source_slot:
+                                    en_elem_type: ValueType = darray_element_of(en_source_type, structs)
+                                    return EmitStatus.Declined if en_elem_type.kind == TypeKind.Unmodeled
+                                    en_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                    en_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                    en_elem_llvm: LLVMTypeRef = llvm_type_of(en_elem_type, structs, ctx)
+                                    en_count_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, en_header, en_source_slot, 1, "enum.cnt.ptr")
+                                    en_count: LLVMValueRef = darray_load_size_i64(en_count_ptr, ctx, builder, "enum.cnt", structs.target.target_pointer_bits)
+                                    en_items_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, en_header, en_source_slot, 0, "enum.items.ptr")
+                                    en_items: LLVMValueRef = LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), en_items_ptr, "enum.items")
+                                    en_index_slot: LLVMValueRef = build_entry_alloca(builder, en_i64, "enum.i")
+                                    _ = LLVMBuildStore(builder, LLVMConstInt(en_i64, 0, 0), en_index_slot)
+                                    en_idx_name_storage: mutable darray[u8] = []
+                                    en_idx_slot: LLVMValueRef = build_entry_alloca(builder, en_i64, sview_to_cstr(for_variables[0], en_idx_name_storage))
+                                    declare_local(local_scope, for_variables[0], en_idx_slot, ValueType{kind: TypeKind.Signed, bits: 64})
+                                    en_val_name_storage: mutable darray[u8] = []
+                                    en_val_slot: LLVMValueRef = build_entry_alloca(builder, en_elem_llvm, sview_to_cstr(for_variables[1], en_val_name_storage))
+                                    declare_local(local_scope, for_variables[1], en_val_slot, en_elem_type)
+                                    en_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                                    en_cond: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.cond")
+                                    en_bodyb: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.body")
+                                    en_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.step")
+                                    en_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, en_function, "enum.exit")
+                                    _ = LLVMBuildBr(builder, en_cond)
+                                    LLVMPositionBuilderAtEnd(builder, en_cond)
+                                    en_cur: LLVMValueRef = LLVMBuildLoad2(builder, en_i64, en_index_slot, "enum.cur")
+                                    en_more: LLVMValueRef = LLVMBuildICmp(builder, 40, en_cur, en_count, "enum.more")
+                                    _ = LLVMBuildCondBr(builder, en_more, en_bodyb, en_exit)
+                                    LLVMPositionBuilderAtEnd(builder, en_bodyb)
+                                    # i = cur; x = items[cur].
+                                    _ = LLVMBuildStore(builder, en_cur, en_idx_slot)
+                                    en_gep_indices: mutable darray[LLVMValueRef] = [en_cur]
+                                    en_gep_pointer: void& = (&en_gep_indices[0]).cast[void&] can Unsafe.PointerCast
+                                    en_elem_ptr: LLVMValueRef = LLVMBuildGEP2(builder, en_elem_llvm, en_items, en_gep_pointer, 1, "enum.elem.ptr")
+                                    _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, en_elem_llvm, en_elem_ptr, "enum.elem"), en_val_slot)
+                                    loops.exits <- loops.exits.push(en_exit)
+                                    loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                                    loops.continues <- loops.continues.push(en_step)
+                                    en_body_status: EmitStatus = emit_loop_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                                    scope_restore(local_scope, for_scope_mark)
+                                    _ = loops.exits.pop()
+                                    _ = loops.defer_marks.pop()
+                                    _ = loops.continues.pop()
+                                    return EmitStatus.Declined if en_body_status == EmitStatus.Declined
+                                    branch_if_open(en_body_status, builder, en_step)
+                                    LLVMPositionBuilderAtEnd(builder, en_step)
+                                    _ = LLVMBuildStore(builder, LLVMBuildAdd(builder, LLVMBuildLoad2(builder, en_i64, en_index_slot, "enum.next.cur"), LLVMConstInt(en_i64, 1, 0), "enum.next"), en_index_slot)
+                                    _ = LLVMBuildBr(builder, en_cond)
+                                    LLVMPositionBuilderAtEnd(builder, en_exit)
+                                    return EmitStatus.Open
+                                return EmitStatus.Declined
+                        _:
+                            pass
+                _:
+                    pass
+            return EmitStatus.Declined if for_bind == "mutable"
+            dict_iter_type: ValueType = expression_type(for_iterable, local_scope, fns, structs, generics)
+            return EmitStatus.Declined if dict_iter_type.kind != TypeKind.Struct
+            dict_slot: usize = dict_iter_type.bits.usize()
+            return EmitStatus.Declined if structs.records.names[dict_slot] != "DynDict"
+            dict_items_index: i64 = field_index_of(structs, dict_slot, "items")
+            dict_capacity_index: i64 = field_index_of(structs, dict_slot, "capacity")
+            return EmitStatus.Declined if dict_items_index < 0 or dict_capacity_index < 0
+            dict_items_field_type: ValueType = copied_type(structs.records.field_types[structs.records.field_start[dict_slot] + dict_items_index.usize()])
+            return EmitStatus.Declined if dict_items_field_type.kind != TypeKind.Optional
+            dict_items_ref_type: ValueType = optional_payload_of(dict_items_field_type, structs)
+            return EmitStatus.Declined if dict_items_ref_type.kind != TypeKind.Ref
+            dict_bucket_type: ValueType = ref_target_of(dict_items_ref_type, structs)
+            return EmitStatus.Declined if dict_bucket_type.kind != TypeKind.Struct
+            dict_bucket_slot: usize = dict_bucket_type.bits.usize()
+            dict_key_index: i64 = field_index_of(structs, dict_bucket_slot, "key")
+            dict_value_index: i64 = field_index_of(structs, dict_bucket_slot, "value")
+            dict_state_index: i64 = field_index_of(structs, dict_bucket_slot, "state")
+            return EmitStatus.Declined if dict_key_index < 0 or dict_value_index < 0 or dict_state_index < 0
+            dict_key_type: ValueType = copied_type(structs.records.field_types[structs.records.field_start[dict_bucket_slot] + dict_key_index.usize()])
+            dict_value_type: ValueType = copied_type(structs.records.field_types[structs.records.field_start[dict_bucket_slot] + dict_value_index.usize()])
+            if (struct_chain_address(for_iterable, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is dict_address:
+                dict_llvm: LLVMTypeRef = llvm_type_of(dict_iter_type, structs, ctx)
+                dict_optional_llvm: LLVMTypeRef = llvm_type_of(dict_items_field_type, structs, ctx)
+                dict_bucket_llvm: LLVMTypeRef = llvm_type_of(dict_bucket_type, structs, ctx)
+                dict_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                dict_i8: LLVMTypeRef = LLVMInt8TypeInContext(ctx)
+                # items is `DictBucket&?` — a TAGGED optional {i1, ptr}; the raw array
+                # pointer is field 1. Empty dict → null items, but capacity is then 0 so
+                # the loop body never runs.
+                dict_items_opt_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_items_index.u32(), "dict.items.opt.ptr")
+                dict_items_opt: LLVMValueRef = LLVMBuildLoad2(builder, dict_optional_llvm, dict_items_opt_ptr, "dict.items.opt")
+                dict_items_raw: LLVMValueRef = optional_payload_value_of(dict_items_opt, dict_items_field_type, structs, ctx, builder)
+                dict_capacity_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_llvm, dict_address, dict_capacity_index.u32(), "dict.cap.ptr")
+                dict_capacity: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_capacity_ptr, "dict.cap")
+                dict_index_slot: LLVMValueRef = build_entry_alloca(builder, dict_i64, "dict.i")
+                _ = LLVMBuildStore(builder, LLVMConstInt(dict_i64, 0, 0), dict_index_slot)
+                dict_key_storage: mutable darray[u8] = []
+                dict_key_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(dict_key_type, structs, ctx), sview_to_cstr(for_variables[0], dict_key_storage))
+                declare_local(local_scope, for_variables[0], dict_key_slot, dict_key_type)
+                dict_value_storage: mutable darray[u8] = []
+                dict_value_slot: LLVMValueRef = build_entry_alloca(builder, llvm_type_of(dict_value_type, structs, ctx), sview_to_cstr(for_variables[1], dict_value_storage))
+                declare_local(local_scope, for_variables[1], dict_value_slot, dict_value_type)
+                dict_function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                dict_head: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.head")
+                dict_check: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.check")
+                dict_body: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.body")
+                dict_step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.step")
+                dict_exit: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, dict_function, "dict.exit")
+                _ = LLVMBuildBr(builder, dict_head)
+                LLVMPositionBuilderAtEnd(builder, dict_head)
+                dict_current: LLVMValueRef = LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.cur")
+                dict_keep: LLVMValueRef = LLVMBuildICmp(builder, 36, dict_current, dict_capacity, "dict.cmp")
+                _ = LLVMBuildCondBr(builder, dict_keep, dict_check, dict_exit)
+                # CHECK: load this slot's state; occupied (1) → body, else → step.
+                LLVMPositionBuilderAtEnd(builder, dict_check)
+                dict_slot_indices: mutable darray[LLVMValueRef] = [dict_current]
+                dict_slot_indices_pointer: void& = (&dict_slot_indices[0]).cast[void&] can Unsafe.PointerCast
+                dict_bucket_ptr: LLVMValueRef = LLVMBuildGEP2(builder, dict_bucket_llvm, dict_items_raw, dict_slot_indices_pointer, 1, "dict.bucket.ptr")
+                dict_state_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_state_index.u32(), "dict.state.ptr")
+                dict_state: LLVMValueRef = LLVMBuildLoad2(builder, dict_i8, dict_state_ptr, "dict.state")
+                dict_occupied: LLVMValueRef = LLVMBuildICmp(builder, 32, dict_state, LLVMConstInt(dict_i8, 1, 0), "dict.occ")
+                _ = LLVMBuildCondBr(builder, dict_occupied, dict_body, dict_step)
+                # BODY: bind k = bucket.key, v = bucket.value, then run the loop body.
+                LLVMPositionBuilderAtEnd(builder, dict_body)
+                dict_key_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_key_index.u32(), "dict.key.ptr")
+                _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_key_type, structs, ctx), dict_key_ptr, "dict.key"), dict_key_slot)
+                dict_value_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, dict_bucket_llvm, dict_bucket_ptr, dict_value_index.u32(), "dict.value.ptr")
+                _ = LLVMBuildStore(builder, LLVMBuildLoad2(builder, llvm_type_of(dict_value_type, structs, ctx), dict_value_ptr, "dict.value"), dict_value_slot)
+                loops.exits <- loops.exits.push(dict_exit)
+                loops.defer_marks <- loops.defer_marks.push(local_scope.deferred.count)
+                loops.continues <- loops.continues.push(dict_step)
+                dict_body_status: EmitStatus = emit_loop_statements_scoped(for_body, return_type, local_scope, loops, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                scope_restore(local_scope, for_scope_mark)
+                _ = loops.exits.pop()
+                _ = loops.defer_marks.pop()
+                _ = loops.continues.pop()
+                return EmitStatus.Declined if dict_body_status == EmitStatus.Declined
+                branch_if_open(dict_body_status, builder, dict_step)
+                LLVMPositionBuilderAtEnd(builder, dict_step)
+                dict_next: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildLoad2(builder, dict_i64, dict_index_slot, "dict.next.cur"), LLVMConstInt(dict_i64, 1, 0), "dict.next")
+                _ = LLVMBuildStore(builder, dict_next, dict_index_slot)
+                _ = LLVMBuildBr(builder, dict_head)
+                LLVMPositionBuilderAtEnd(builder, dict_exit)
+                return EmitStatus.Open
+            return EmitStatus.Declined

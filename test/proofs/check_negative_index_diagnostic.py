@@ -17,7 +17,7 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 HELPER = ROOT / "src/semantic/negative_index_diagnostic.elisa"
 CONSUMER = ROOT / "src/semantic/check_negative_index.elisa"
 DIAGNOSTIC_TYPES = ROOT / "src/semantic/semantic_types.elisa"
-RENDERER = ROOT / "src/semantic/semantic_api_message_2.elisa"
+RENDERER = ROOT / "src/semantic/diagnostic_messages/values_and_lints.elisa"
 POSITIVE = HERE / "negative_index_diagnostic.elisa"
 NEGATIVE = HERE / "negative_index_diagnostic_rejected.elisa"
 
@@ -94,7 +94,7 @@ require_ordered(walk, (
 ), "unary-minus literal diagnostic")
 if "actual_count:u32=0" not in compact(DIAGNOSTIC_TYPES.read_text()):
     raise SystemExit("NegativeIndex diagnostic payload is no longer bounded by the proved u32 representation")
-renderer = function_section(RENDERER.read_text(), "diagnostic_message_part2")
+renderer = function_section(RENDERER.read_text(), "diagnostic_message_values_and_lints")
 require_ordered(renderer, (
     'DiagnosticKind.NegativeIndex:',
     'if diagnostic.actual == "magnitude exceeds u32":',
