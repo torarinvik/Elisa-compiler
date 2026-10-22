@@ -18,8 +18,10 @@ set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -x "${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}" ] || { echo "adversarial_differential FAIL: no stage1 binary" >&2; exit 1; }
 bash "$ROOT/scripts/assert_stage1_fresh.sh" || exit $?
-[ -x "${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}" ] || { echo "adversarial_differential FAIL: no stage0" >&2; exit 1; }
-bash "$ROOT/scripts/assert_stage0_fresh.sh" || exit $?
+ELISA_CORE_ROOT="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
+STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE_ROOT/compiler/bin/elisac}"
+[ -x "$STAGE0_BIN" ] || { echo "adversarial_differential FAIL: no stage0" >&2; exit 1; }
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0_BIN" || exit $?
 [ -f "$ROOT/build/runtime/elisacore_runtime.o" ] || { echo "adversarial_differential FAIL: no runtime object" >&2; exit 1; }
 
 out="$(REPO_ROOT="$ROOT" python3 "$ROOT/test/breadth/adversarial_differential.py" 2>&1)"

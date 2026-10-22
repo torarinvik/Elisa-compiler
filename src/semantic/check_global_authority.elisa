@@ -9,6 +9,7 @@ extend Semantic:
         # Reserved ceiling for encoded local-root identities. The legacy generic local
         # alias sentinel remains below UNKNOWN_ALIAS but is no longer emitted.
         const GLOBAL_AUTHORITY_LOCAL_ALIAS: usize = 4294967293
+        const GLOBAL_AUTHORITY_OFFSET_NONE: u32 = 4294967295
         const GLOBAL_AUTHORITY_PERMISSION_PARAM_CACHE_MISS: u8 = 2
         const GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT: u32 = 128
         # Return-origin summary value meaning "the join of the call's arguments". Only
@@ -236,9 +237,10 @@ extend Semantic:
                     module_scope <- state.parents[module_scope]
                 return false
 
-        # Select the nearest visible alias declaration for a head. A tie at one lexical
-        # depth is ambiguous and must not depend on annotation insertion order.
-        def ga_module_alias_choice(name: sview, lexical_scope: usize, state: GlobalAuthority&) -> (found: bool, ambiguous: bool, index: usize, scope: usize):
+        # Select the nearest visible alias declaration for a head. When resolving an
+        # alias target, before_offset limits candidates to aliases already registered at
+        # that source position; use-site lookup leaves it unbounded.
+        def ga_module_alias_choice(name: sview, lexical_scope: usize, state: GlobalAuthority&, depth: u32 = 0, before_offset: u32 = GLOBAL_AUTHORITY_OFFSET_NONE) -> (found: bool, ambiguous: bool, index: usize, scope: usize):
             can Abort.Panic:
                 return (false, false, state.annotations.count, state.modules.count) if lexical_scope >= state.parents.count
                 selected_index: mutable usize = state.annotations.count
@@ -248,6 +250,7 @@ extend Semantic:
                 for alias_index in 0..<state.annotations.count:
                     alias: Ast::EnumAnnotation = state.annotations[alias_index]
                     continue if alias.name != "__using_alias" or alias.owner != name
+                    continue if before_offset != GLOBAL_AUTHORITY_OFFSET_NONE and alias.offset >= before_offset
                     alias_scope: usize = ga_module_text(alias.module, state)
                     continue if alias_scope >= state.modules.count
                     distance: mutable usize = 0
@@ -263,19 +266,120 @@ extend Semantic:
                         selected_scope <- alias_scope
                         ambiguous <- false
                     elif distance == best_distance:
-                        ambiguous <- true
+                        selected_alias: Ast::EnumAnnotation = state.annotations[selected_index]
+                        selected_target: (found: bool, path: sview @source) = ga_module_alias_target_path(selected_alias.module, selected_alias.line, selected_alias.offset, state)
+                        candidate_target: (found: bool, path: sview @source) = ga_module_alias_target_path(alias.module, alias.line, alias.offset, state)
+                        same_target: bool = selected_target.found and candidate_target.found and ga_module_alias_targets_equal(selected_target.path, selected_scope, selected_alias.offset, candidate_target.path, alias_scope, alias.offset, state, depth + 1)
+                        ambiguous <- true if not same_target
                 return (selected_scope < state.modules.count, ambiguous, selected_index, selected_scope)
 
         # Alias target rows are paired by the alias token's full declaration identity.
-        def ga_module_alias_target_path(module: sview, line: u32, offset: u32, state: GlobalAuthority&) -> (found: bool, path: sview):
+        def ga_module_alias_target_path(module: sview, line: u32, offset: u32, state: GlobalAuthority&) -> (found: bool, path: sview @source):
             can Abort.Panic:
-                target_path: mutable sview = ""
+                target_path: mutable sview @source = ""
                 target_count: mutable usize = 0
                 for target in state.annotations:
                     continue if target.name != "__using_alias_target" or target.offset != offset or target.line != line or target.module != module
                     target_path <- target.owner
                     target_count <- target_count + 1
                 return (target_count == 1, target_path)
+
+        def ga_module_alias_raw_segment_count(path: sview @source, start_index: usize = 0) -> (valid: bool, count: usize):
+            can Abort.Panic:
+                return (false, 0.usize()) if start_index > path.len
+                return (true, 0.usize()) if start_index == path.len
+                start: mutable usize = start_index
+                count: mutable usize = 0.usize()
+                while start < path.len |start, count|:
+                    end: mutable usize = start
+                    while end < path.len and path[end] != 58 |end|:
+                        end <- end + 1
+                    return (false, 0.usize()) if effect_ref_trim_layout(path[start:end]).len == 0
+                    count <- count + 1.usize()
+                    return (false, 0.usize()) if end < path.len and (end + 2 >= path.len or path[end + 1] != 58)
+                    start <- path.len if end == path.len else end + 2
+                return (true, count)
+
+        def ga_module_alias_raw_segment_at(path: sview @source, start_index: usize, target_index: usize) -> (found: bool, segment: sview @source):
+            can Abort.Panic:
+                return (false, "") if start_index > path.len
+                start: mutable usize = start_index
+                current: mutable usize = 0.usize()
+                while start < path.len |start, current, target_index|:
+                    end: mutable usize = start
+                    while end < path.len and path[end] != 58 |end|:
+                        end <- end + 1
+                    part: sview @source = effect_ref_trim_layout(path[start:end])
+                    return (false, "") if part.len == 0 or (end < path.len and (end + 2 >= path.len or path[end + 1] != 58))
+                    return (true, part) if current == target_index
+                    current <- current + 1.usize()
+                    start <- path.len if end == path.len else end + 2
+                return (false, "")
+
+        # Count the canonical path without allocating. Unresolved module names still
+        # compare by their declaration-scope-qualified segments, preserving idempotent
+        # duplicate aliases even when their target module has not been declared.
+        def ga_module_alias_target_segment_count(path: sview @source, declaration_scope: usize, state: GlobalAuthority&, before_offset: u32, depth: u32 = 0) -> (valid: bool, count: usize):
+            can Abort.Panic:
+                return (false, 0.usize()) if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT or declaration_scope >= state.modules.count or path.len == 0
+                first_end: mutable usize = 0
+                while first_end < path.len and path[first_end] != 58 |first_end|:
+                    first_end <- first_end + 1
+                first: sview = effect_ref_trim_layout(path[0:first_end])
+                return (false, 0.usize()) if first.len == 0 or (first_end < path.len and (first_end + 2 >= path.len or path[first_end + 1] != 58))
+                alias: (found: bool, ambiguous: bool, index: usize, scope: usize) = ga_module_alias_choice(first, declaration_scope, state, depth, before_offset)
+                return (false, 0.usize()) if alias.ambiguous
+                suffix_start: usize = path.len if first_end == path.len else first_end + 2
+                suffix_count: (valid: bool, count: usize) = ga_module_alias_raw_segment_count(path, suffix_start)
+                return (false, 0.usize()) if not suffix_count.valid
+                if alias.found:
+                    alias_row: Ast::EnumAnnotation = state.annotations[alias.index]
+                    target: (found: bool, path: sview @source) = ga_module_alias_target_path(alias_row.module, alias_row.line, alias_row.offset, state)
+                    return (false, 0.usize()) if not target.found
+                    target_count: (valid: bool, count: usize) = ga_module_alias_target_segment_count(target.path, alias.scope, state, alias_row.offset, depth + 1)
+                    return (false, 0.usize()) if not target_count.valid
+                    return (true, target_count.count + suffix_count.count)
+                scope_count: (valid: bool, count: usize) = ga_module_alias_raw_segment_count(state.modules[declaration_scope], 0.usize())
+                path_count: (valid: bool, count: usize) = ga_module_alias_raw_segment_count(path, 0.usize())
+                return (false, 0.usize()) if not scope_count.valid or not path_count.valid
+                return (true, scope_count.count + path_count.count)
+
+        def ga_module_alias_target_segment_at(path: sview @source, declaration_scope: usize, state: GlobalAuthority&, before_offset: u32, target_index: usize, depth: u32 = 0) -> (found: bool, segment: sview @source):
+            can Abort.Panic:
+                return (false, "") if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT or declaration_scope >= state.modules.count or path.len == 0
+                first_end: mutable usize = 0
+                while first_end < path.len and path[first_end] != 58 |first_end|:
+                    first_end <- first_end + 1
+                first: sview = effect_ref_trim_layout(path[0:first_end])
+                return (false, "") if first.len == 0 or (first_end < path.len and (first_end + 2 >= path.len or path[first_end + 1] != 58))
+                alias: (found: bool, ambiguous: bool, index: usize, scope: usize) = ga_module_alias_choice(first, declaration_scope, state, depth, before_offset)
+                return (false, "") if alias.ambiguous
+                suffix_start: usize = path.len if first_end == path.len else first_end + 2
+                if alias.found:
+                    alias_row: Ast::EnumAnnotation = state.annotations[alias.index]
+                    target: (found: bool, path: sview @source) = ga_module_alias_target_path(alias_row.module, alias_row.line, alias_row.offset, state)
+                    return (false, "") if not target.found
+                    target_count: (valid: bool, count: usize) = ga_module_alias_target_segment_count(target.path, alias.scope, state, alias_row.offset, depth + 1)
+                    return (false, "") if not target_count.valid
+                    if target_index < target_count.count:
+                        return ga_module_alias_target_segment_at(target.path, alias.scope, state, alias_row.offset, target_index, depth + 1)
+                    return ga_module_alias_raw_segment_at(path, suffix_start, target_index - target_count.count)
+                scope_count: (valid: bool, count: usize) = ga_module_alias_raw_segment_count(state.modules[declaration_scope], 0.usize())
+                return (false, "") if not scope_count.valid
+                if target_index < scope_count.count:
+                    return ga_module_alias_raw_segment_at(state.modules[declaration_scope], 0.usize(), target_index)
+                return ga_module_alias_raw_segment_at(path, 0.usize(), target_index - scope_count.count)
+
+        def ga_module_alias_targets_equal(left_path: sview @source, left_scope: usize, left_before_offset: u32, right_path: sview @source, right_scope: usize, right_before_offset: u32, state: GlobalAuthority&, depth: u32) -> bool:
+            can Abort.Panic:
+                left_count: (valid: bool, count: usize) = ga_module_alias_target_segment_count(left_path, left_scope, state, left_before_offset, depth)
+                right_count: (valid: bool, count: usize) = ga_module_alias_target_segment_count(right_path, right_scope, state, right_before_offset, depth)
+                return false if not left_count.valid or not right_count.valid or left_count.count != right_count.count
+                for index in 0..<left_count.count:
+                    left_segment: (found: bool, segment: sview @source) = ga_module_alias_target_segment_at(left_path, left_scope, state, left_before_offset, index, depth)
+                    right_segment: (found: bool, segment: sview @source) = ga_module_alias_target_segment_at(right_path, right_scope, state, right_before_offset, index, depth)
+                    return false if not left_segment.found or not right_segment.found or left_segment.segment != right_segment.segment
+                return true
 
         def ga_module_lexical_child(name: sview, lexical_scope: usize, state: GlobalAuthority&) -> usize:
             can Abort.Panic:
@@ -288,19 +392,17 @@ extend Semantic:
                     current <- state.parents[current]
                 return state.modules.count
 
-        # Resolve a complete raw module path through lexical parents. Try each complete
-        # candidate so a missing suffix in a nearer namespace does not hide a valid root
-        # fallback for the original spelling.
+        # Resolve a complete module path through non-root lexical namespaces. Root lookup
+        # is intentionally left until after alias rewriting at a use site.
         def ga_module_lexical_path(path: sview, first: sview, start_index: usize, lexical_scope: usize, state: GlobalAuthority&) -> usize:
             can Abort.Panic:
                 return state.modules.count if lexical_scope >= state.parents.count
                 current: mutable usize = lexical_scope
-                while current < state.parents.count |current|:
+                while current != 0 and current < state.parents.count |current|:
                     child: usize = ga_child(state, current, first)
                     if child < state.modules.count:
                         candidate: usize = ga_module_path_suffix(path, start_index, child, state)
                         return candidate if candidate < state.modules.count
-                    break if current == 0
                     current <- state.parents[current]
                 return state.modules.count
 
@@ -321,6 +423,96 @@ extend Semantic:
                     start <- path.len if end == path.len else end + 2
                 return current
 
+        # Split a qualified source path into borrowed components. Keeping the original
+        # spelling as parts lets expression lookup apply lexical, alias, and raw-root
+        # candidates to the complete qualifier instead of resolving one Expr.Scope node
+        # at a time.
+        def ga_module_path_parts(path: sview) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                return [] if path.len == 0
+                parts: mutable darray[sview] = []
+                start: mutable usize = 0
+                offset: mutable usize = 0
+                while offset < path.len |start, offset, parts, path|:
+                    if path[offset] == 58:
+                        return [] if offset + 1.usize() >= path.len or path[offset + 1.usize()] != 58
+                        parts.push(effect_ref_trim_layout(path[start:offset]))
+                        offset <- offset + 2.usize()
+                        start <- offset
+                    else:
+                        offset <- offset + 1.usize()
+                parts.push(effect_ref_trim_layout(path[start:path.len]))
+                return parts
+
+        def ga_module_path_parts_suffix(parts: darray[sview]&, start_index: usize, base_scope: usize, state: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                return state.modules.count if base_scope >= state.modules.count or start_index > parts.count
+                current: mutable usize = base_scope
+                index: mutable usize = start_index
+                while index < parts.count |current, index, parts, state|:
+                    return state.modules.count if parts[index].len == 0
+                    current <- ga_child(state, current, parts[index])
+                    return state.modules.count if current >= state.modules.count
+                    index <- index + 1.usize()
+                return current
+
+        # Stage0 checks a complete candidate in the current namespace, then each
+        # enclosing namespace. The root spelling is deliberately left for after alias
+        # rewriting, because a visible alias beats a same-named root module.
+        def ga_module_lexical_parts_path(parts: darray[sview]&, lexical_scope: usize, state: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                return state.modules.count if parts.count == 0 or lexical_scope >= state.parents.count
+                current: mutable usize = lexical_scope
+                while current != 0 and current < state.parents.count |current, parts, state|:
+                    child: usize = ga_child(state, current, parts[0])
+                    if child < state.modules.count:
+                        candidate: usize = ga_module_path_parts_suffix(parts, 1, child, state)
+                        return candidate if candidate < state.modules.count
+                    current <- state.parents[current]
+                return state.modules.count
+
+        def ga_module_parts_resolve(parts: darray[sview]&, lexical_scope: usize, state: GlobalAuthority&, depth: u32 = 0) -> usize:
+            can Abort.Panic:
+                if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT:
+                    return GLOBAL_AUTHORITY_NONE
+                return state.modules.count if parts.count == 0 or lexical_scope >= state.parents.count
+                for part in parts:
+                    return state.modules.count if part.len == 0
+                lexical: usize = ga_module_lexical_parts_path(parts, lexical_scope, state)
+                return lexical if lexical < state.modules.count
+
+                alias: (found: bool, ambiguous: bool, index: usize, scope: usize) = ga_module_alias_choice(parts[0], lexical_scope, state, depth)
+                return GLOBAL_AUTHORITY_NONE if alias.ambiguous
+                if alias.found:
+                    alias_row: Ast::EnumAnnotation = state.annotations[alias.index]
+                    target: (found: bool, path: sview @source) = ga_module_alias_target_path(alias_row.module, alias_row.line, alias_row.offset, state)
+                    if target.found:
+                        resolved: usize = ga_module_alias_target_resolve(target.path, alias.scope, state, depth + 1, alias_row.offset)
+                        return GLOBAL_AUTHORITY_NONE if resolved == GLOBAL_AUTHORITY_NONE
+                        if resolved < state.modules.count:
+                            alias_path: usize = ga_module_path_parts_suffix(parts, 1, resolved, state)
+                            return alias_path if alias_path < state.modules.count
+
+                # The final Stage0 candidate is the raw spelling in the root namespace.
+                raw_root: usize = ga_child(state, 0, parts[0])
+                return ga_module_path_parts_suffix(parts, 1, raw_root, state)
+
+        def ga_module_expression_parts(expression: Ast::Expr, parts: mutable darray[sview]&, depth: u32 = 0) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT
+                match expression:
+                    Expr.Ident(name, _):
+                        parts.push(effect_ref_trim_layout(name))
+                        return true
+                    Expr.Scope(base, name, _):
+                        return false if not ga_module_expression_parts(base, parts, depth + 1)
+                        parts.push(effect_ref_trim_layout(name))
+                        return true
+                    Expr.Paren(inner, _):
+                        return ga_module_expression_parts(inner, parts, depth + 1)
+                    _:
+                        return false
+
         # Resolve an unaliased target relative to exactly the module where its alias was
         # declared. Do not climb to a same-named root module; the using-site resolver owns
         # fallback to the alias's raw spelling when this canonical target is absent.
@@ -338,11 +530,10 @@ extend Semantic:
                 start: usize = path.len if first_end == path.len else first_end + 2
                 return ga_module_path_suffix(path, start, first_scope, state)
 
-        # Resolve a `using TARGET as ALIAS` target. Existing alias heads are expanded
-        # before module lookup, matching Stage0 registration order, including forward
-        # chains collected in the same declaration block. Non-alias paths stay anchored
-        # to the exact declaration module.
-        def ga_module_alias_target_resolve(path: sview, declaration_scope: usize, state: GlobalAuthority&, depth: u32 = 0) -> usize:
+        # Resolve a `using TARGET as ALIAS` target. Only aliases declared earlier than
+        # the current alias may rewrite its head, matching Stage0 registration order.
+        # Non-alias paths stay anchored to the exact declaration module.
+        def ga_module_alias_target_resolve(path: sview @source, declaration_scope: usize, state: GlobalAuthority&, depth: u32 = 0, before_offset: u32 = GLOBAL_AUTHORITY_OFFSET_NONE) -> usize:
             can Abort.Panic:
                 if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT:
                     return GLOBAL_AUTHORITY_NONE
@@ -353,22 +544,22 @@ extend Semantic:
                 first: sview = effect_ref_trim_layout(path[0:first_end])
                 return state.modules.count if first.len == 0
                 return state.modules.count if first_end < path.len and (first_end + 2 >= path.len or path[first_end + 1] != 58)
-                alias: (found: bool, ambiguous: bool, index: usize, scope: usize) = ga_module_alias_choice(first, declaration_scope, state)
+                alias: (found: bool, ambiguous: bool, index: usize, scope: usize) = ga_module_alias_choice(first, declaration_scope, state, depth, before_offset)
                 return GLOBAL_AUTHORITY_NONE if alias.ambiguous
                 return ga_module_path_exact(path, declaration_scope, state) if not alias.found
                 alias_row: Ast::EnumAnnotation = state.annotations[alias.index]
-                target: (found: bool, path: sview) = ga_module_alias_target_path(alias_row.module, alias_row.line, alias_row.offset, state)
+                target: (found: bool, path: sview @source) = ga_module_alias_target_path(alias_row.module, alias_row.line, alias_row.offset, state)
                 return GLOBAL_AUTHORITY_NONE if not target.found
-                resolved: usize = ga_module_alias_target_resolve(target.path, alias.scope, state, depth + 1)
+                resolved: usize = ga_module_alias_target_resolve(target.path, alias.scope, state, depth + 1, alias_row.offset)
                 return GLOBAL_AUTHORITY_NONE if resolved == GLOBAL_AUTHORITY_NONE
                 return state.modules.count if resolved >= state.modules.count
                 start: usize = path.len if first_end == path.len else first_end + 2
                 return ga_module_path_suffix(path, start, resolved, state)
 
-        # Resolve a module path at a use site. Expression paths can prefer a complete
-        # concrete child in the current lexical module, then a visible alias, then the
-        # original spelling through lexical parents. Import annotations keep their own
-        # lookup order and call this helper with use_site_child_precedence=false.
+        # Resolve a module path at a use site. A complete concrete candidate in the
+        # current or enclosing namespace wins first, then a visible alias rewrites the
+        # head, then the original spelling is tried at root. Import annotations keep
+        # their own lookup order and call this helper with use_site_child_precedence=false.
         def ga_module_alias_resolve(path: sview, lexical_scope: usize, state: GlobalAuthority&, depth: u32 = 0, use_site_child_precedence: bool = false) -> usize:
             can Abort.Panic:
                 if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT:
@@ -381,25 +572,26 @@ extend Semantic:
                 return state.modules.count if first.len == 0
                 return state.modules.count if first_end < path.len and (first_end + 2 >= path.len or path[first_end + 1] != 58)
                 start: usize = path.len if first_end == path.len else first_end + 2
-                if use_site_child_precedence and lexical_scope != 0:
-                    direct_child: usize = ga_child(state, lexical_scope, first)
-                    if direct_child < state.modules.count:
-                        direct_path: usize = ga_module_path_suffix(path, start, direct_child, state)
-                        return direct_path if direct_path < state.modules.count
-                alias: (found: bool, ambiguous: bool, index: usize, scope: usize) = ga_module_alias_choice(first, lexical_scope, state)
+                if use_site_child_precedence:
+                    lexical_path: usize = ga_module_lexical_path(path, first, start, lexical_scope, state)
+                    return lexical_path if lexical_path < state.modules.count
+                alias: (found: bool, ambiguous: bool, index: usize, scope: usize) = ga_module_alias_choice(first, lexical_scope, state, depth)
                 return GLOBAL_AUTHORITY_NONE if alias.ambiguous
                 resolved: mutable usize = state.modules.count
                 if alias.found:
                     alias_row: Ast::EnumAnnotation = state.annotations[alias.index]
-                    target: (found: bool, path: sview) = ga_module_alias_target_path(alias_row.module, alias_row.line, alias_row.offset, state)
-                    return GLOBAL_AUTHORITY_NONE if not target.found
-                    resolved <- ga_module_alias_target_resolve(target.path, alias.scope, state, depth + 1)
-                    return GLOBAL_AUTHORITY_NONE if resolved == GLOBAL_AUTHORITY_NONE
+                    target: (found: bool, path: sview @source) = ga_module_alias_target_path(alias_row.module, alias_row.line, alias_row.offset, state)
+                    if not target.found:
+                        return GLOBAL_AUTHORITY_NONE if not use_site_child_precedence
+                    else:
+                        resolved <- ga_module_alias_target_resolve(target.path, alias.scope, state, depth + 1, alias_row.offset)
+                        return GLOBAL_AUTHORITY_NONE if resolved == GLOBAL_AUTHORITY_NONE
                 if use_site_child_precedence:
                     if alias.found and resolved < state.modules.count:
                         alias_path: usize = ga_module_path_suffix(path, start, resolved, state)
                         return alias_path if alias_path < state.modules.count
-                    return ga_module_lexical_path(path, first, start, lexical_scope, state)
+                    raw_root: usize = ga_child(state, 0, first)
+                    return ga_module_path_suffix(path, start, raw_root, state)
                 if not alias.found or resolved >= state.modules.count:
                     resolved <- ga_module_lexical_child(first, lexical_scope, state)
                 return state.modules.count if resolved >= state.modules.count
@@ -514,33 +706,20 @@ extend Semantic:
                 if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT:
                     ga_mark_walk_overflow(Ast::expr_pos(expression), state)
                     return state.modules.count
-                match expression:
-                    Expr.Ident(name, _):
-                        return ga_module_alias_resolve(name, state.module_scope if lexical_scope == GLOBAL_AUTHORITY_NONE else lexical_scope, state, depth + 1, true)
-                    Expr.Scope(base, name, _):
-                        parent: usize = ga_module(base, state, lexical_scope, depth + 1)
-                        return ga_child(state, parent, name) if parent < state.modules.count else state.modules.count
-                    _:
-                        return state.modules.count
-                return state.modules.count
+                resolved_scope: usize = state.module_scope if lexical_scope == GLOBAL_AUTHORITY_NONE else lexical_scope
+                parts: mutable darray[sview] = []
+                return state.modules.count if not ga_module_expression_parts(expression, parts, depth)
+                return ga_module_parts_resolve(parts, resolved_scope, state, depth)
 
         # Read-only module lookup for type and origin queries. On excessive nesting it
         # returns the unresolved sentinel; callers already treat that as unknown metadata.
         def ga_module_readonly(expression: Ast::Expr, state: GlobalAuthority&, lexical_scope: usize = GLOBAL_AUTHORITY_NONE, depth: u32 = 0) -> usize:
             can Memory.Allocate, Abort.Panic:
                 return state.modules.count if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT
-                match expression:
-                    Expr.Ident(name, _):
-                        # A scope lookup that found nothing hands back `modules.count`; the
-                        # alias helper checks its lexical scope before walking the module table.
-                        resolved_scope: usize = state.module_scope if lexical_scope == GLOBAL_AUTHORITY_NONE or lexical_scope >= state.parents.count else lexical_scope
-                        return ga_module_alias_resolve(name, resolved_scope, state, depth + 1, true)
-                    Expr.Scope(base, name, _):
-                        parent: usize = ga_module_readonly(base, state, lexical_scope, depth + 1)
-                        return ga_child(state, parent, name) if parent < state.modules.count
-                        return state.modules.count
-                    _:
-                        return state.modules.count
+                resolved_scope: usize = state.module_scope if lexical_scope == GLOBAL_AUTHORITY_NONE or lexical_scope >= state.parents.count else lexical_scope
+                parts: mutable darray[sview] = []
+                return state.modules.count if not ga_module_expression_parts(expression, parts, depth)
+                return ga_module_parts_resolve(parts, resolved_scope, state, depth)
 
         # ga_resolve over a table that keeps a name-hash chain (`heads`/`next`, newest first):
         # walks only same-hash rows and returns the LOWEST matching row per scope, exactly what
@@ -743,26 +922,18 @@ extend Semantic:
         # Store clauses carry source text rather than an Expr. Resolve their qualified
         # path using the same lexical module/import identities as expression accesses.
         def ga_store_slot(path: sview, state: GlobalAuthority&) -> usize:
-            can Abort.Panic:
-                separator: mutable usize = 0
-                while separator < path.len and path[separator] != 58 |separator|:
-                    separator <- separator + 1
-                if separator == path.len:
+            can Memory.Allocate, Abort.Panic:
+                parts: darray[sview] = ga_module_path_parts(path) can Memory{Allocate}
+                if parts.count < 2:
                     for index in state.local_floor..<min(state.local_limit, state.locals.count):
                         return state.globals.count if state.locals[index] == path
                     return ga_resolve_global(path, state.module_scope, false, state)
-                module_slot: mutable usize = ga_module_alias_resolve(path[0:separator], state.module_scope, state, 0, true)
-                start: mutable usize = separator + 2
-                while start < path.len and module_slot < state.modules.count |start, module_slot|:
-                    end: mutable usize = start
-                    while end < path.len and path[end] != 58 |end|:
-                        end <- end + 1
-                    part: sview = effect_ref_trim_layout(path[start:end])
-                    if end == path.len:
-                        return ga_resolve_global(part, module_slot, true, state)
-                    module_slot <- ga_child(state, module_slot, part)
-                    start <- end + 2
-                return state.globals.count
+                module_parts: mutable darray[sview] = []
+                for index in 0..<(parts.count - 1):
+                    module_parts.push(parts[index])
+                module_slot: usize = ga_module_parts_resolve(module_parts, state.module_scope, state)
+                return state.globals.count if module_slot >= state.modules.count
+                return ga_resolve_global(parts[parts.count - 1], module_slot, true, state)
 
         def ga_function_head(name: sview, state: GlobalAuthority&) -> usize:
             can Abort.Panic:

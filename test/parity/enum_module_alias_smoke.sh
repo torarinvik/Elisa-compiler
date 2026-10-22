@@ -13,7 +13,7 @@ compilers=("$STAGE1")
 [[ ! -x "$STAGE0" ]] || compilers+=("$STAGE0")
 for compiler in "${compilers[@]}"; do
     for level in 0 2; do
-        for repro in enum_module_alias_payload enum_module_alias_reference enum_module_alias_nested enum_module_alias_chained enum_module_nested_direct enum_module_nested_deep enum_module_ancestor_relative enum_module_ancestor_nearest enum_module_ancestor_deep enum_module_ancestor_mixed_type enum_module_ancestor_canonical_alias enum_module_ancestor_const_values enum_module_ancestor_packed; do
+        for repro in enum_module_alias_payload enum_module_alias_reference enum_module_alias_nested enum_module_alias_chained enum_module_nested_direct enum_module_nested_deep enum_module_ancestor_relative enum_module_ancestor_nearest enum_module_ancestor_deep enum_module_ancestor_mixed_type enum_module_ancestor_canonical_alias enum_module_ancestor_const_values enum_module_ancestor_packed enum_module_alias_scoped_type_collision; do
             "$compiler" -emit obj "-O$level" -o "$WORK/valid.o" "$ROOT/test/repro/$repro.elisa"
             "${ELISA_CLANG:-clang}" -fno-builtin -o "$WORK/valid" "$WORK/valid.o" "$RUNTIME" "$ROOT/scripts/pymodule_runtime_fallback.c" "$ROOT/test/parity/profile_hooks.c"
             set +e
