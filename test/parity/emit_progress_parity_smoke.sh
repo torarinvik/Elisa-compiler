@@ -39,8 +39,10 @@ same=0
 total=0
 for src in "$REPO_ROOT"/test/repro/*.elisa "$REPO_ROOT"/test/fixtures/ast/*.elisa; do
     name="$(basename "$src" .elisa)"
-    # Signed-step behavior intentionally tightens the Stage1 proof rule beyond the
-    # separate Stage0 compiler's legacy operator-only heuristic.
+    # Check this focused step-sign fixture against its explicit Stage1 expectations
+    # below instead of counting it in the broad Stage0 byte-parity ratchet. Stage0's
+    # canonical counting-loop rule also requires a positive integer literal and the
+    # direction-matched update operator.
     [ "$name" = "progress_step_signs" ] && continue
     s0 -emit progress "$src" </dev/null > "$WORK/$name.s0" 2>/dev/null || continue
     s1 -emit progress -o "$WORK/$name.s1" "$src" >/dev/null 2>&1 || continue
@@ -55,8 +57,8 @@ if ! s1 -emit progress -o "$step_fixture" "$REPO_ROOT/test/repro/progress_step_s
     echo "emit_progress parity FAILED: progress_step_signs fixture did not produce a Stage1 report"
     exit 1
 fi
-if ! grep -q '^warnings: 18$' "$step_fixture" || [ "$(grep -c 'evidence=none' "$step_fixture")" -ne 18 ] || [ "$(grep -c 'evidence=progress' "$step_fixture")" -ne 4 ]; then
-    echo "emit_progress parity FAILED: progress_step_signs did not classify all 18 unproven and 4 valid steps as expected"
+if ! grep -q '^warnings: 20$' "$step_fixture" || [ "$(grep -c 'evidence=none' "$step_fixture")" -ne 20 ] || [ "$(grep -c 'evidence=progress' "$step_fixture")" -ne 4 ]; then
+    echo "emit_progress parity FAILED: progress_step_signs did not classify all 20 unproven and 4 valid steps as expected"
     exit 1
 fi
 if ! grep -q '^  valid_compound_increment: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
@@ -89,6 +91,14 @@ if ! grep -q '^  unrecognized_explicit_increment_parenthesized_positive_step: ob
 fi
 if ! grep -q '^  unrecognized_compound_increment_unary_positive_step: obligations=Loop:1 evidence=none ' "$step_fixture"; then
     echo "emit_progress parity FAILED: unsupported unary-positive step was incorrectly accepted as progress"
+    exit 1
+fi
+if ! grep -q '^  compound_decrement_rhs_mimics_explicit_increment: obligations=Loop:1 evidence=none ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: compound RHS was incorrectly reinterpreted as an explicit loop update"
+    exit 1
+fi
+if ! grep -q '^  shadow_assignment_mimics_explicit_increment: obligations=Loop:1 evidence=none ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: a shadow binding was incorrectly counted as mutating the loop variable"
     exit 1
 fi
 

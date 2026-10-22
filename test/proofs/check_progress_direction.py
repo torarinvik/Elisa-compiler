@@ -29,8 +29,21 @@ def compact(text: str) -> str:
     return "".join(text.split())
 
 
+def top_level_function(source: str, name: str) -> str:
+    lines = source.splitlines()
+    start = next((index for index, line in enumerate(lines)
+                  if line.startswith(f"def {name}(")), None)
+    if start is None:
+        return ""
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end][0].isspace()):
+        end += 1
+    return compact("\n".join(lines[start:end]))
+
+
 classifier = compact(CLASSIFIER.read_text())
-progress = compact(PROGRESS.read_text())
+progress_source = PROGRESS.read_text()
+progress = compact(progress_source)
 driver = compact(DRIVER.read_text())
 positive = compact(POSITIVE.read_text())
 negative = compact(NEGATIVE.read_text())
@@ -52,8 +65,18 @@ if progress.count("ProgressDirection::advances_by_step(direction,operator,step_d
     raise SystemExit("progress emitter no longer delegates signed-step decisions to the proved rule")
 if progress.count("returntrueifprogress_update_advances(direction,pb_operator,pb_value,") != 1 or progress.count("returntrueifprogress_update_advances(direction,pv_op,pv_right,") != 1:
     raise SystemExit("progress emitter no longer checks both compound and explicit updates through the signed-step rule")
-if "ifexpressionisExpr.IntLit(step_value,_):returnProgressDirection::Direction.Increaseifstep_value>0returnProgressDirection::Direction.NoDirection" not in progress:
-    raise SystemExit("progress emitter no longer requires a bare positive integer literal step")
+explicit_update_gate = "continueifpb_operator!=Lexer::TokenKind.LArrow"
+explicit_update_match = "ifpb_valueisExpr.Binary(pv_left,pv_op,pv_right,pv_line)"
+if explicit_update_gate not in progress or progress.index(explicit_update_gate) > progress.index(explicit_update_match):
+    raise SystemExit("progress emitter can reinterpret a compound assignment RHS as an explicit update")
+expected_step_direction = compact("""
+def progress_step_direction(expression: Ast::Expr) -> ProgressDirection::Direction:
+    if expression is Expr.IntLit(step_value, _):
+        return ProgressDirection::Direction.Increase if step_value > 0
+    return ProgressDirection::Direction.NoDirection
+""")
+if top_level_function(progress_source, "progress_step_direction") != expected_step_direction:
+    raise SystemExit("progress emitter step classifier is no longer closed to bare positive integer literals")
 if 'include"./elisac_emit_progress.elisa"' not in driver or "emit_progress_report(" not in driver:
     raise SystemExit("compiler driver no longer connects the proved progress rule to reporting")
 if 'include"../../src/driver/progress_direction.elisa"' not in positive:

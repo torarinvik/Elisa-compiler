@@ -31,6 +31,26 @@ assert functions["roundtrip_nested"]["parameters"] == [{"name": "values", "type"
 assert functions["roundtrip_nested"]["return"] == "dict[i64,dict[i64,set[i64]]]"
 assert functions["count_bool"]["parameters"] == [{"name": "values", "type": "set[bool]"}]
 assert functions["roundtrip_bool"]["return"] == "set[bool]"
+assert functions["contains_bool"]["parameters"] == [
+    {"name": "values", "type": "set[bool]"},
+    {"name": "key", "type": "bool"},
+]
+assert functions["contains_bool"]["return"] == "bool"
+assert functions["contains_i64"]["parameters"] == [
+    {"name": "values", "type": "set[i64]"},
+    {"name": "key", "type": "i64"},
+]
+assert functions["contains_i64"]["return"] == "bool"
+assert functions["contains_i8"]["parameters"] == [
+    {"name": "values", "type": "set[i8]"},
+    {"name": "key", "type": "i8"},
+]
+assert functions["contains_i8"]["return"] == "bool"
+assert functions["contains_u8"]["parameters"] == [
+    {"name": "values", "type": "set[u8]"},
+    {"name": "key", "type": "u8"},
+]
+assert functions["contains_u8"]["return"] == "bool"
 PY
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi \
@@ -39,6 +59,10 @@ grep -Fq 'def roundtrip(values: Mapping[int, Iterable[int]]) -> dict[int, set[in
 grep -Fq 'def roundtrip_text(values: Mapping[str | bytes, Iterable[str | bytes]]) -> dict[str, set[str]]: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def roundtrip_nested(values: Mapping[int, Mapping[int, Iterable[int]]]) -> dict[int, dict[int, set[int]]]: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def roundtrip_bool(values: Iterable[bool]) -> set[bool]: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def contains_bool(values: Iterable[bool], key: bool) -> bool: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def contains_i64(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def contains_i8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def contains_u8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/dict_set_probe.pyi"
 
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
@@ -60,6 +84,12 @@ assert dict_set_probe.count_bool({2, 3}) == 1
 assert dict_set_probe.count_bool([2, 3]) == 1
 assert dict_set_probe.count_bool([0, False, 2, 3]) == 2
 assert dict_set_probe.roundtrip_bool([2, 3]) == {True}
+assert dict_set_probe.contains_bool([2, 3], True)
+assert not dict_set_probe.contains_bool([2, 3], False)
+assert dict_set_probe.contains_i64([1, 4], 1)
+assert dict_set_probe.contains_i64([-1, 4], -1)
+assert dict_set_probe.contains_i8([-1, 4], -1)
+assert dict_set_probe.contains_u8([255, 4], 255)
 
 for function, bad in (
     (dict_set_probe.roundtrip, {"bad": {1}}),

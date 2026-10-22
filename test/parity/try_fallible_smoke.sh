@@ -94,6 +94,9 @@ grep -q '^D 0$' <<< "$local_error_union_alias"
 fallible_call_alias=$(printf 'error E:\n    Bad\n\ndef load() -> i64 error[E]:\n    return 1\n\ndef forward() -> i64 error[E]:\n    copied = load()\n    return try copied\n' | "$RPT")
 grep -q '^D 0$' <<< "$fallible_call_alias"
 
+pure_call_alias_nonfallible=$(printf 'def pure() -> i64:\n    return 1\ndef bad() -> i64:\n    value = pure()\n    return try value\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$pure_call_alias_nonfallible"
+
 conditional_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = load() if flag else load()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$conditional_fallible_alias"
 
@@ -105,6 +108,15 @@ grep -q 'cannot propagate E from a function returning F' <<< "$match_fallible_al
 
 match_fallible_block_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = match flag:\n        true:\n            copied = load()\n            copied\n        false: load()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$match_fallible_block_alias"
+
+block_expression_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch() -> i64 error[F]:\n    value =\n        copied = load()\n        copied\n    return try value\n' | "$RPT")
+grep -q 'cannot propagate E from a function returning F' <<< "$block_expression_fallible_alias"
+
+fresh_guard_pattern_nonfallible=$(printf 'def bad(values: darray[i64]) -> i64:\n    result = item if values is [item] else 0\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$fresh_guard_pattern_nonfallible"
+
+fallback_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = try load() else 0\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$fallback_alias_nonfallible"
 
 match_pattern_binder_shadows_family=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef mismatch(subject: i64, value: i64 error[E]) -> i64 error[F]:\n    copied = value\n    result = match subject:\n        copied: copied\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$match_pattern_binder_shadows_family"

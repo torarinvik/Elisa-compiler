@@ -728,6 +728,26 @@ extend Semantic:
                         pass
                 return (false, false, false)
 
+        # Catch's plain success binding receives the payload after the guarded expression's
+        # error family has been removed. The source-level scan doesn't need the concrete
+        # return type to know that this payload isn't itself the caught error union; numeric
+        # metadata is preserved only when it is already available for an identifier.
+        # A Match binder is different: it receives the complete scrutinee value.
+        def try_noncall_catch_success_payload_facts(expression: Ast::Expr, params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&, annotations: darray[Ast::EnumAnnotation]&) -> (known_nonfallible: bool, numeric: bool, integer: bool):
+            can Abort.Panic:
+                guarded_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(expression, params, environment, annotations)
+                return (false, false, false) if guarded_facts.family == ""
+                match expression:
+                    Expr.Ident(name, _):
+                        index: usize = try_noncall_family_index(environment, name)
+                        if index < environment.names.count and environment.families[index] != "":
+                            return (true, environment.numeric[index], environment.integer[index])
+                    Expr.Paren(inner, _):
+                        return try_noncall_catch_success_payload_facts(inner, params, environment, annotations)
+                    _:
+                        pass
+                return (true, false, false)
+
         def try_noncall_target_binds_name(target: Ast::Expr, candidate: sview) -> bool:
             can Abort.Panic:
                 match target:
@@ -779,6 +799,14 @@ extend Semantic:
         def try_noncall_callable_error_family(callee_name: sview @source, annotations: darray[Ast::EnumAnnotation]&) -> (known: bool, family: sview @source):
             can Abort.Panic:
                 return (false, "") if callee_name == ""
+                declarations: mutable usize = 0
+                for declaration in annotations:
+                    # This source-only alias scan does not carry the caller module,
+                    # unlike the direct-call checker below. A duplicate bare name may
+                    # resolve to a different declaration (or to a nonfallible overload),
+                    # so refuse to borrow any family when the name is not globally unique.
+                    declarations <- declarations + 1.usize() if declaration.name == "__lsp_func_name" and declaration.owner == callee_name
+                return (false, "") if declarations > 1.usize()
                 found: mutable bool = false
                 conflicting: mutable bool = false
                 family: mutable sview @source = ""
@@ -790,7 +818,22 @@ extend Semantic:
                         conflicting <- true if found and family != next_family
                         found <- true
                 return (true, family) if found and not conflicting
+                # A unique parser declaration marker with no error-return row is a
+                # declared nonfallible function. Keep optional's more specific message
+                # available on direct calls; through this noncall alias path the owner is
+                # erased, but rejecting `try` on the returned value is still sound.
+                return (true, "") if declarations == 1.usize() and not found
                 return (false, "")
+
+        def try_noncall_unqualified_callable_name(expression: Ast::Expr) -> sview @source:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Paren(inner, _):
+                        return try_noncall_unqualified_callable_name(inner)
+                    _:
+                        return ""
 
         def try_noncall_assignment_source_facts(expression: Ast::Expr, params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&, annotations: darray[Ast::EnumAnnotation]&) -> (family: sview @source, known_nonfallible: bool):
             can Abort.Panic:
@@ -800,8 +843,12 @@ extend Semantic:
                     Expr.Paren(inner, _):
                         return try_noncall_assignment_source_facts(inner, params, environment, annotations)
                     Expr.Call(callee, _, _, _):
-                        call_family: (known: bool, family: sview @source) = try_noncall_callable_error_family(ident_name_of(callee), annotations)
-                        return (call_family.family, false) if call_family.known
+                        callee_name: sview @source = try_noncall_unqualified_callable_name(callee)
+                        return ("", false) if callee_name == "" or try_noncall_family_index(environment, callee_name) < environment.names.count
+                        for parameter in params:
+                            return ("", false) if parameter.name == callee_name
+                        call_family: (known: bool, family: sview @source) = try_noncall_callable_error_family(callee_name, annotations)
+                        return (call_family.family, call_family.family == "") if call_family.known
                         return ("", false)
                     Expr.If(condition, then_value, else_value, _):
                         then_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
@@ -811,7 +858,10 @@ extend Semantic:
                             if try_noncall_truthy_condition_binds_name(condition, outer_name):
                                 condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, outer_name, params)
                                 try_noncall_family_bind(&then_environment, outer_name, "", condition_facts.known_nonfallible, condition_facts.numeric, condition_facts.integer)
-                        then_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(then_value, params, then_environment, annotations)
+                        then_facts: mutable (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(then_value, params, then_environment, annotations)
+                        if not then_facts.known_nonfallible and then_facts.family == "" and then_value is Expr.Ident(then_binder, _) and try_noncall_truthy_condition_binds_name(condition, then_binder):
+                            condition_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(condition, then_binder, params)
+                            then_facts <- ("", condition_facts.known_nonfallible)
                         else_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(else_value, params, environment, annotations)
                         return (then_facts.family, false) if then_facts.family != "" and then_facts.family == else_facts.family
                         return (then_facts.family, false) if then_facts.family != "" and else_facts.family == "" and else_facts.known_nonfallible
@@ -854,11 +904,25 @@ extend Semantic:
                                     unknown <- true
                         return (common_family, false) if not conflicting and not unknown and common_family != ""
                         return ("", true) if not conflicting and not unknown and common_family == "" and saw_nonfallible and arms.count > 0
-                    Expr.Catch(_, arms, _):
+                    Expr.Block(statements, value, _, _):
+                        return try_noncall_block_source_facts(statements, params, environment, annotations, value)
+                    Expr.Refinement(fallback, guarded, _):
+                        if try_noncall_expression_is_try_fallback(expression, annotations):
+                            guarded_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(guarded, params, environment, annotations)
+                            fallback_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(fallback, params, environment, annotations)
+                            return ("", true) if guarded_facts.family != "" and fallback_facts.known_nonfallible
+                            return (fallback_facts.family, false) if guarded_facts.family != "" and fallback_facts.family != ""
+                            return ("", false)
+                        return try_noncall_assignment_source_facts(fallback, params, environment, annotations)
+                    Expr.GetElse(guarded, _, _):
+                        guarded_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(guarded, params, environment, annotations)
+                        return ("", true) if guarded_facts.family != ""
+                    Expr.Catch(guarded, arms, _):
                         common_family: mutable sview @source = ""
                         saw_nonfallible: mutable bool = false
                         conflicting: mutable bool = false
                         unknown: mutable bool = false
+                        payload_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_catch_success_payload_facts(guarded, params, environment, annotations)
                         for arm in arms |common_family, saw_nonfallible, conflicting, unknown, params, environment, annotations|:
                             if arm.body.count == 0:
                                 unknown <- true
@@ -868,7 +932,9 @@ extend Semantic:
                                 gather_arm_pattern(arm.pattern, arm_binders)
                                 for arm_binder in arm_binders |arm_environment|:
                                     pattern_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_pattern_binding_facts(arm.pattern, arm_binder)
-                                    try_noncall_family_bind(&arm_environment, arm_binder, "", pattern_facts.known_nonfallible, pattern_facts.numeric, pattern_facts.integer)
+                                    binder_facts: mutable (known_nonfallible: bool, numeric: bool, integer: bool) = pattern_facts
+                                    binder_facts <- payload_facts if arm.pattern is Pattern.Binding(success_name) and success_name == arm_binder and payload_facts.known_nonfallible
+                                    try_noncall_family_bind(&arm_environment, arm_binder, "", binder_facts.known_nonfallible, binder_facts.numeric, binder_facts.integer)
                                 for outer_name in environment.names |arm_environment|:
                                     if try_noncall_truthy_condition_binds_name(arm.guard, outer_name):
                                         guard_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(arm.guard, outer_name, params)
@@ -903,7 +969,7 @@ extend Semantic:
         # A match-expression arm may compute its value through a local alias (`copied =
         # load(); copied`). Analyze those statements in an arm-local snapshot before reading
         # the final expression, so its source family is available without escaping the arm.
-        def try_noncall_block_source_facts(statements: darray[Ast::Stmt], params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&, annotations: darray[Ast::EnumAnnotation]&) -> (family: sview @source, known_nonfallible: bool):
+        def try_noncall_block_source_facts(statements: darray[Ast::Stmt], params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&, annotations: darray[Ast::EnumAnnotation]&, block_value: Ast::Expr? = null) -> (family: sview @source, known_nonfallible: bool):
             can Memory.Allocate, Abort.Panic:
                 arm_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
                 last_facts: mutable (family: sview @source, known_nonfallible: bool) = ("", false)
@@ -928,6 +994,7 @@ extend Semantic:
                             last_facts <- try_noncall_assignment_source_facts(value, params, arm_environment, annotations)
                         _:
                             last_facts <- ("", false)
+                return try_noncall_assignment_source_facts(present_block_value, params, arm_environment, annotations) if block_value is present_block_value
                 return last_facts if statements.count > 0 and statements[statements.count - 1] is Stmt.Expr(_, _)
                 return ("", false)
 
@@ -954,6 +1021,11 @@ extend Semantic:
                     _:
                         pass
                 return false
+
+        def try_noncall_expression_is_try_fallback(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&) -> bool:
+            can Abort.Panic:
+                position: Ast::Pos = Ast::expr_pos(expression)
+                return any annotation in annotations where annotation.owner == "__try_fallback_expression" and annotation.line == position.line and annotation.offset == position.offset
 
         def try_noncall_truthy_condition_binds_name(condition: Ast::Expr, candidate: sview) -> bool:
             can Abort.Panic:
@@ -1393,6 +1465,7 @@ extend Semantic:
                         try_noncall_scan_expression(guarded, candidate, params, environment, annotations, annotation, site_offset, current_shadow, current_local_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         visible_count: usize = environment.names.count
                         base_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
+                        payload_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_catch_success_payload_facts(guarded, params, base_environment, annotations)
                         merged_arms: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                         candidate_wrote: mutable bool = false
                         for arm in arms |found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site|:
@@ -1403,7 +1476,9 @@ extend Semantic:
                             arm_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(base_environment)
                             if binds_candidate:
                                 pattern_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_pattern_binding_facts(arm.pattern, candidate)
-                                try_noncall_family_bind(arm_environment, candidate, "", pattern_facts.known_nonfallible, pattern_facts.numeric, pattern_facts.integer)
+                                binder_facts: mutable (known_nonfallible: bool, numeric: bool, integer: bool) = pattern_facts
+                                binder_facts <- payload_facts if arm.pattern is Pattern.Binding(success_name) and success_name == candidate and payload_facts.known_nonfallible
+                                try_noncall_family_bind(arm_environment, candidate, "", binder_facts.known_nonfallible, binder_facts.numeric, binder_facts.integer)
                             try_noncall_scan_expression(arm.guard, candidate, params, arm_environment, annotations, annotation, site_offset, arm_shadow, arm_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                             guard_binds_candidate: bool = try_noncall_truthy_condition_binds_name(arm.guard, candidate)
                             body_shadow: bool = arm_shadow or guard_binds_candidate
@@ -1427,7 +1502,7 @@ extend Semantic:
                         comprehension_shadow: bool = current_shadow or comprehension_binds_candidate
                         comprehension_error_family: sview = "" if comprehension_binds_candidate else current_local_error_family
                         comprehension_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
-                        try_noncall_family_bind(comprehension_environment, candidate, "") if comprehension_binds_candidate
+                        try_noncall_family_bind(comprehension_environment, variable, "", false) if variable != ""
                         try_noncall_scan_expression(condition, candidate, params, comprehension_environment, annotations, annotation, site_offset, comprehension_shadow, comprehension_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                         try_noncall_scan_expression(body, candidate, params, comprehension_environment, annotations, annotation, site_offset, comprehension_shadow, comprehension_error_family, found, shadowed_at_site, local_error_family_at_site, lambda_error_family_at_site, inside_lambda_at_site, known_nonfallible_at_site)
                     Expr.Refinement(base, predicate, _):
@@ -1916,7 +1991,7 @@ extend Semantic:
                 return if:
                     callee_name == ""
                     not callee_is_fallible
-                expected_name: mutable sview = function_return_type(table, callee_name)
+                expected_name: mutable sview @source = function_return_type(table, callee_name)
                 expected_id: u32 = function_return_type_id(table, callee_name)
                 extern_info: mutable TryFallbackExternReturnInfo = TryFallbackExternReturnInfo{name: "", element: "", has_pointer: false, has_optional: false}
                 if expected_name == "" or expected_id == 0:
@@ -1926,9 +2001,9 @@ extend Semantic:
                     expected_name == "" or expected_name == "void"
                     expected_id != 0 and interned_kind(expected_id, table) == SemTypeKind.Void
                 actual_id: u32 = try_fallback_cast_target_id(fallback, table) can Global{Read,Write}
-                actual_name: sview = try_fallback_cast_target_spelling(fallback)
+                actual_name: sview @source = try_fallback_cast_target_spelling(fallback)
                 return if expected_name == "" or actual_name == ""
-                actual_detail: sview = "&" if try_fallback_cast_target_has_ref(fallback) else ""
+                actual_detail: sview @source = "&" if try_fallback_cast_target_has_ref(fallback) else ""
                 if expected_id != 0:
                     return if actual_id == 0 or type_ids_compatible(expected_id, actual_id, table)
                 else:
@@ -1942,8 +2017,8 @@ extend Semantic:
                 # An extern `-> darray[u8]` side-tables only the `darray` head; its element rides
                 # on a companion row, so stage0's `expects darray[u8]` (and an element mismatch
                 # such as `got darray[i32]`) is spelled from the two element names.
-                expected_element: sview = extern_info.element if expected_id == 0 and expected_name == "darray" else ""
-                actual_element: sview = try_fallback_cast_target_element(fallback) if expected_element != "" and actual_name == "darray" else ""
+                expected_element: sview @source = extern_info.element if expected_id == 0 and expected_name == "darray" else ""
+                actual_element: sview @source = try_fallback_cast_target_element(fallback) if expected_element != "" and actual_name == "darray" else ""
                 elements_agree: bool = expected_element == "" or actual_element == "" or expected_element == actual_element
                 return if elements_agree and try_fallback_declared_name_matches(expected_name, actual_name, actual_detail)
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TryFallbackTypeMismatch, name: callee_name, pos: site_pos, line: site_pos.line, expected: expected_name, actual: actual_name, detail: actual_detail, detail2: expected_element, detail3: actual_element})
@@ -1971,15 +2046,15 @@ extend Semantic:
                         table <- try_fallback_void_expression(guarded, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.StaticEffectCall(effect_type, _, candidates, arguments, _, _):
                         table <- try_fallback_void_expression(effect_type, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for candidate in candidates |table| -> table:
+                        for candidate in candidates |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(candidate.effect_type, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                            for capture in candidate.captures |table| -> table:
+                            for capture in candidate.captures |table, module_index, error_index, function_positions| -> table:
                                 table <- try_fallback_void_expression(capture, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for argument in arguments |table| -> table:
+                        for argument in arguments |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(argument, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Call(callee, arguments, _, _):
                         table <- try_fallback_void_expression(callee, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for argument in arguments |table| -> table:
+                        for argument in arguments |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(argument, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Field(object, _, _) | Expr.Scope(object, _, _):
                         table <- try_fallback_void_expression(object, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
@@ -1988,7 +2063,7 @@ extend Semantic:
                         table <- try_fallback_void_expression(index, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.IndexN(object, arguments, _):
                         table <- try_fallback_void_expression(object, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for argument in arguments |table| -> table:
+                        for argument in arguments |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(argument, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Slice(object, low, high, _):
                         table <- try_fallback_void_expression(object, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
@@ -2004,19 +2079,19 @@ extend Semantic:
                     Expr.Paren(inner, paren_pos):
                         table <- try_fallback_void_expression(inner, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
-                        for element in elements |table| -> table:
+                        for element in elements |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(element, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.DictLit(entries, _):
-                        for entry in entries |table| -> table:
+                        for entry in entries |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(entry.key, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                             table <- try_fallback_void_expression(entry.value, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Construct(type_expression, fields, _):
                         table <- try_fallback_void_expression(type_expression, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for field in fields |table| -> table:
+                        for field in fields |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(field.value, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.RecordUpdate(base, fields, _):
                         table <- try_fallback_void_expression(base, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for field in fields |table| -> table:
+                        for field in fields |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(field.value, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.If(condition, then_value, else_value, _):
                         table <- try_fallback_void_expression(condition, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
@@ -2024,12 +2099,12 @@ extend Semantic:
                         table <- try_fallback_void_expression(else_value, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Match(scrutinee, arms, _):
                         table <- try_fallback_void_expression(scrutinee, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for arm in arms |table| -> table:
+                        for arm in arms |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(arm.guard, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                             table <- try_fallback_void_statements(arm.body, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Catch(guarded, arms, _):
                         table <- try_fallback_void_expression(guarded, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        for arm in arms |table| -> table:
+                        for arm in arms |table, module_index, error_index, function_positions| -> table:
                             table <- try_fallback_void_expression(arm.guard, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                             table <- try_fallback_void_statements(arm.body, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                     Expr.Comprehension(_, iterable, condition, body, _, _):
@@ -2076,8 +2151,6 @@ extend Semantic:
                         Stmt.For(bind, variables, iterable, for_body, line):
                             table <- try_fallback_void_expression(iterable, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                             table <- try_fallback_void_statements(for_body, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
-                        Stmt.Block(kind, clause, binding, body, line):
-                            table <- try_fallback_void_statements(body, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                         Stmt.Match(scrutinee, arms, line):
                             table <- try_fallback_void_expression(scrutinee, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                             for arm in arms |table, module_index, error_index, function_positions| -> table:
@@ -2094,6 +2167,27 @@ extend Semantic:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             table <- try_fallback_void_statements(body, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                        Decl.Struct(_, members, _, _, _, invariants, _):
+                            for member in members |table, module_index, error_index, function_positions| -> table:
+                                table <- try_fallback_void_expression(member.type_expression, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                                table <- try_fallback_void_expression(member.default_value, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                                for bit_member in member.bit_group_members |table, module_index, error_index, function_positions| -> table:
+                                    table <- try_fallback_void_expression(bit_member.type_expression, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                            for invariant in invariants |table, module_index, error_index, function_positions| -> table:
+                                table <- try_fallback_void_expression(invariant, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                        Decl.Enum(_, variants, _, storage_type, _):
+                            table <- try_fallback_void_expression(storage_type, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                            for variant in variants |table, module_index, error_index, function_positions| -> table:
+                                for field_type in variant.fields |table, module_index, error_index, function_positions| -> table:
+                                    table <- try_fallback_void_expression(field_type, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                                table <- try_fallback_void_expression(variant.value_expr, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                        Decl.Alias(_, target, _):
+                            table <- try_fallback_void_expression(target, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                        Decl.Law(_, predicate, _):
+                            table <- try_fallback_void_expression(predicate, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                        Decl.Const(_, type_expression, value, _, _):
+                            table <- try_fallback_void_expression(type_expression, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
+                            table <- try_fallback_void_expression(value, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                         Decl.Module(module_name, module_body, module_line):
                             table <- try_fallback_void_decls(module_body, annotations, module_index, module_annotations, error_index, function_positions, table) can Global{Read,Write}
                         Decl.Scoped(scoped_body, scoped_line):
