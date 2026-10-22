@@ -25,6 +25,18 @@ grep -q 'try requires a fallible expression' <<< "$numeric_alias_parameter"
 chained_numeric_alias_parameter=$(printf 'type Count = i64\ntype SmallCount = Count\ndef bad(value: SmallCount) -> i64:\n    return try value + 1\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$chained_numeric_alias_parameter"
 
+module_scoped_numeric_alias_collision='module Alpha:
+    type Count = i64
+    def bad(value: Count) -> i64:
+        return try value + 1
+module Beta:
+    type Count = string'
+module_scoped_numeric_alias_report=$(printf '%s\n' "$module_scoped_numeric_alias_collision" | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$module_scoped_numeric_alias_report" || {
+    echo "try_fallible FAILED: sibling-module alias shadowed a visible numeric alias: $module_scoped_numeric_alias_report"
+    exit 1
+}
+
 numeric_alias_local=$(printf 'type Count = i64\ndef bad() -> i64:\n    value: Count = 1\n    return try value + 1\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$numeric_alias_local"
 
@@ -125,11 +137,35 @@ module OuterB:
                     return 2'
 nested_qualified_pure_call_alias_nonfallible=$(printf '%s\ndef bad() -> i64:\n    value = OuterA::Common::pure()\n    return try value\n' "$nested_qualified_module_declarations" | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$nested_qualified_pure_call_alias_nonfallible"
+nested_qualified_pure_direct_try_nonfallible=$(printf '%s\ndef bad() -> i64:\n    return try OuterA::Common::pure()\n' "$nested_qualified_module_declarations" | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$nested_qualified_pure_direct_try_nonfallible"
+nested_qualified_pure_direct_try_fallible=$(printf '%s\ndef good() -> i64 error[E]:\n    return try OuterB::Common::pure()\n' "$nested_qualified_module_declarations" | "$RPT")
+grep -q '^D 0$' <<< "$nested_qualified_pure_direct_try_fallible" || {
+    echo "try_fallible FAILED: direct try through OuterB::Common lost its error family: $nested_qualified_pure_direct_try_fallible"
+    exit 1
+}
 nested_qualified_pure_call_alias_fallible=$(printf '%s\ndef good() -> i64:\n    value = OuterB::Common::pure()\n    return try value\n' "$nested_qualified_module_declarations" | "$RPT")
 if grep -q 'try requires a fallible expression' <<< "$nested_qualified_pure_call_alias_fallible"; then
     echo "try_fallible FAILED: fallible OuterB::Common::pure was classified as nonfallible"
     exit 1
 fi
+using_alias_declarations='error E:
+    Bad
+module Backend:
+    public:
+        def load() -> i64 error[E]:
+            return 1
+using Backend as B'
+using_alias_direct=$(printf '%s\ndef forward() -> i64 error[E]:\n    return try B::load()\n' "$using_alias_declarations" | "$RPT")
+grep -q '^D 0$' <<< "$using_alias_direct" || {
+    echo "try_fallible FAILED: direct try through using alias lost its error family: $using_alias_direct"
+    exit 1
+}
+using_alias_assignment=$(printf '%s\ndef forward() -> i64 error[E]:\n    copied = B::load()\n    return try copied\n' "$using_alias_declarations" | "$RPT")
+grep -q '^D 0$' <<< "$using_alias_assignment" || {
+    echo "try_fallible FAILED: assigned call through using alias lost its error family: $using_alias_assignment"
+    exit 1
+}
 
 catch_success_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = catch load():\n        success:\n            success\n        error problem:\n            0\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$catch_success_alias_nonfallible"

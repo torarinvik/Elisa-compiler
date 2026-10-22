@@ -24,6 +24,7 @@ STAGE1_ONLY_STORE_SOURCES=(
     "$ROOT/test/repro/sview_region_match_taint_join.neg.elisa"
     "$ROOT/test/repro/sview_region_statement_match_taint_join.neg.elisa"
     "$ROOT/test/repro/sview_region_for_taint_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_for_named_taint_join.neg.elisa"
     "$ROOT/test/repro/sview_region_comprehension_store.neg.elisa"
 )
 STAGE1_ONLY_POSITIVE_SOURCES=(

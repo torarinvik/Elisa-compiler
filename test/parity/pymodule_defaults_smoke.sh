@@ -36,6 +36,16 @@ assert defaults.count_from() == 0
 assert defaults.count_from(9) == 9
 pointer_unsigned_max = 2 * sys.maxsize + 1
 assert defaults.count_from(pointer_unsigned_max) == pointer_unsigned_max
+unsigned_long_long_max = (1 << 64) - 1
+assert defaults.u64_max() == unsigned_long_long_max
+assert defaults.u64_max(unsigned_long_long_max - 1) == unsigned_long_long_max - 1
+assert str(inspect.signature(defaults.u64_max)) == f"(value={unsigned_long_long_max})"
+signed_long_long_min = -(1 << 63)
+assert defaults.i64_min() == signed_long_long_min
+assert defaults.i64_min(signed_long_long_min + 1) == signed_long_long_min + 1
+assert str(inspect.signature(defaults.i64_min)) == f"(value={signed_long_long_min})"
+assert defaults.narrowed_u8() == 1
+assert str(inspect.signature(defaults.narrowed_u8)) == "(value=1)"
 for bad in (-1, pointer_unsigned_max + 1):
     try:
         defaults.count_from(bad)
@@ -79,6 +89,29 @@ assert str(inspect.signature(defaults.empty_mix)) == "(values=[], mapping={}, un
 PY
 
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
+    -o "$WORK/defaults.c" \
+    "$ROOT/test/repro/pymodule_defaults.elisa" >/dev/null
+grep -Fq '(-9223372036854775807LL - 1LL)' "$WORK/defaults.c"
+grep -Fq '18446744073709551615ULL' "$WORK/defaults.c"
+
+if "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.maxsize > 2**32 else 1)'; then
+    PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
+        bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
+        -o "$WORK/defaults_usize_max.cpython-314-darwin.so" \
+        "$ROOT/test/repro/pymodule_defaults_usize_max.elisa" >/dev/null
+
+    PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+import inspect
+from defaults_usize_max import usize_max
+
+maximum = (1 << 64) - 1
+assert usize_max() == maximum
+assert str(inspect.signature(usize_max)) == f"(value={maximum})"
+PY
+fi
+
+PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/defaults_unsupported.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_defaults_unsupported.elisa" >/dev/null
@@ -115,7 +148,7 @@ grep -Fq 'def bytes_default(values: bytes | bytearray | memoryview = b"\x01\x02\
 grep -Fq 'def nested(values: Sequence[Sequence[int]] = [[1, 2], [3]]) -> int: ...' "$WORK/defaults_unsupported.pyi"
 grep -Fq 'def viewed(values: Sequence[int] = [1, 2]) -> int: ...' "$WORK/defaults_unsupported.pyi"
 
-for invalid_default in negative_unsigned negative_usize negative_uintptr out_of_range bad_escape; do
+for invalid_default in negative_unsigned negative_usize negative_uintptr out_of_range i64_out_of_range u64_out_of_range usize_out_of_range bad_escape; do
     if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule \
         -o "$WORK/$invalid_default.json" \
         "$ROOT/test/repro/pymodule_defaults_${invalid_default}.elisa" \

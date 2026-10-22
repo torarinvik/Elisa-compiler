@@ -42,6 +42,15 @@ except ValueError:
     pass
 else:
     raise AssertionError("embedded NUL should be rejected for cstr")
+assert strings.accept_optional_cstr(None) == 1
+try:
+    strings.accept_optional_cstr("a\x00b")
+except ValueError as exc:
+    assert exc.function == "accept_optional_cstr"
+    assert exc.parameter == "value"
+    assert str(exc).count("Elisa function 'accept_optional_cstr' argument 'value'") == 1
+else:
+    raise AssertionError("embedded NUL should be rejected for optional cstr")
 try:
     strings.sview(b"\xff")
 except UnicodeDecodeError:

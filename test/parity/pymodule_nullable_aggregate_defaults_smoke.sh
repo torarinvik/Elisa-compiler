@@ -30,6 +30,7 @@ assert functions["dict_default"]["parameters"][0]["default"] == '{"a": 1, "b": N
 assert functions["text_default"]["parameters"][0]["default"] == '["hello", None, "a\\0b"]'
 assert functions["object_default"]["parameters"][0]["default"] == "[None]"
 assert functions["optional_scalar_default"]["parameters"][0]["default"] == "7"
+assert functions["optional_then_bad"]["parameters"][0]["default"] == "1234567890123456789"
 assert functions["optional_text_default"]["parameters"][0]["default"] == '"hello"'
 assert functions["optional_cstr_default"]["parameters"][0]["default"] == '"world"'
 assert functions["optional_object_default"]["parameters"][0]["default"] == "None"
@@ -42,6 +43,7 @@ grep -Fq 'def dict_default(values: Mapping[str | bytes, int | None] = {"a": 1, "
 grep -Fq 'def text_default(values: Sequence[str | bytes | None] = ["hello", None, "a\0b"]) -> list[str | None]: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def object_default(values: Sequence[Any | None] = [None]) -> list[Any | None]: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_scalar_default(value: int | None = 7) -> int | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
+grep -Fq 'def optional_then_bad(value: int | None = 1234567890123456789, invalid: int | None = 0) -> int | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_text_default(value: str | bytes | None = "hello") -> str | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_cstr_default(value: str | bytes | None = "world") -> str | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_object_default(value: Any | None = None) -> Any | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
@@ -53,6 +55,8 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
 
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import nullable_aggregate_defaults as module
+import gc
+import tracemalloc
 
 assert module.list_default() == [1, None, -2]
 assert module.dict_default() == {"a": 1, "b": None}
@@ -61,6 +65,23 @@ assert module.object_default() == [None]
 assert module.optional_scalar_default() == 7
 assert module.optional_scalar_default(None) is None
 assert module.optional_scalar_default(9) == 9
+
+# A later optional conversion failure must release an earlier omitted scalar default.
+gc.collect()
+tracemalloc.start()
+before, _ = tracemalloc.get_traced_memory()
+for _ in range(5000):
+    try:
+        module.optional_then_bad(invalid="not an integer")
+    except (TypeError, OverflowError):
+        pass
+    else:
+        raise AssertionError("invalid optional value unexpectedly converted")
+gc.collect()
+after, _ = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+assert after - before < 65536, f"optional defaults leaked across conversion failures: {after - before} bytes"
+
 assert module.optional_text_default() == "hello"
 assert module.optional_text_default(None) is None
 assert module.optional_text_default("β") == "β"
