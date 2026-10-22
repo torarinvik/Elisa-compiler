@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+
+PYTHON_BIN="${PYTHON_BIN:-$ELISA_PYTHON314_BIN}"
+PYTHON_CONFIG="${PYTHON_CONFIG:-$ELISA_PYTHON314_CONFIG}"
+CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
+
+if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -f "$ROOT/build/runtime/elisacore_runtime.o" ]]; then
+    echo "pymodule qualified enum defaults smoke SKIP (Python/Homebrew clang/runtime unavailable)"
+    exit 0
+fi
+
+PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
+    -o "$WORK/qualified_enum_defaults.cpython-314-darwin.so" \
+    "$ROOT/test/repro/pymodule_qualified_enum_defaults.elisa" >/dev/null
+
+PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+import inspect
+import qualified_enum_defaults as module
+
+assert module.left() == 2
+assert str(inspect.signature(module.left)) == "(value=2)"
+assert module.right() == 77
+assert str(inspect.signature(module.right)) == "(value=77)"
+PY
+
+echo "pymodule qualified enum defaults smoke OK"

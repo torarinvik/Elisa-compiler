@@ -52,12 +52,13 @@ out=$(printf 'def f() -> i64:\n    region scratch(1024):\n        new[scratch] p
 grep -q "may fall through" <<< "$out" && fail "false positive on aborting region-allocation operand: $out"
 grep -q "unreachable code" <<< "$out" || fail "statement after aborting region-allocation operand not flagged: $out"
 
-# 10. An exhaustive value match whose arms all panic terminates its declaration.
-out=$(printf 'def f(flag: bool) -> i64:\n    dead: i64 = match flag:\n        true: panic("left")\n        false: panic("right")\n' | "$RPT")
+# 10. An exhaustive value match whose arms all panic terminates its declaration. Literal
+# bool coverage is outside stage0's exhaustiveness subset, so use a wildcard final arm.
+out=$(printf 'def f(flag: bool) -> i64:\n    dead: i64 = match flag:\n        true: panic("left")\n        _: panic("right")\n' | "$RPT")
 grep -q "may fall through" <<< "$out" && fail "false positive on two-arm aborting match initializer: $out"
 
-# 11. A value match with a fall-through arm is not a terminator.
-out=$(printf 'def f(flag: bool) -> i64:\n    dead: i64 = match flag:\n        true: panic("left")\n        false: 1\n' | "$RPT")
+# 11. An exhaustive value match with a fall-through wildcard arm is not a terminator.
+out=$(printf 'def f(flag: bool) -> i64:\n    dead: i64 = match flag:\n        true: panic("left")\n        _: 1\n' | "$RPT")
 grep -q "may fall through without returning a value" <<< "$out" || fail "one-arm aborting match hid a fall-through path: $out"
 
 # 12. Non-breaking `while true:` MUST be flagged -- stage0 treats no loop as a terminator.
@@ -77,4 +78,39 @@ grep -q "may fall through without returning a value" <<< "$out" || fail "breakin
 out=$(printf 'def k(n: i64) -> i64:\n    return n\n' | "$RPT")
 grep -q "may fall through" <<< "$out" && fail "false positive on direct return: $out"
 
-echo "missing-return smoke OK: fall-through/breaking-loop/while-true and one-arm abort conditional flagged; both-branch/void/panic/two-arm abort conditional/value block/region allocation silent, 0 FP"
+# 15. An aborting if condition terminates before either branch is entered.
+out=$(printf 'def f() -> i64:\n    if panic():\n        value: i64 = 1\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting if condition: $out"
+
+# 16. An aborting match scrutinee terminates before a fall-through arm can run.
+out=$(printf 'def f() -> i64:\n    match panic():\n        _:\n            value: i64 = 1\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting match scrutinee: $out"
+
+# 17. Loop bodies remain non-terminating for parity, while an aborting condition ends execution.
+out=$(printf 'def f() -> i64:\n    while panic():\n        value: i64 = 1\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting while condition: $out"
+
+# 18. A for iterable is evaluated before entering the loop and can abort unconditionally.
+out=$(printf 'def f() -> i64:\n    for value in panic():\n        result: i64 = 1\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting for iterable: $out"
+
+# 19-24. Catch/get-else/comprehension wrappers eagerly evaluate their guarded child or
+# iterable. Check both expression statements and initializers.
+out=$(printf 'def f() -> i64:\n    catch panic():\n        value:\n            value\n        error e:\n            0\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting catch child: $out"
+out=$(printf 'def f() -> i64:\n    value: i64 = catch panic():\n        result:\n            result\n        error e:\n            0\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting catch initializer: $out"
+out=$(printf 'def f() -> i64:\n    get panic() else 0\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting get-else child: $out"
+out=$(printf 'def f() -> i64:\n    value: i64 = get panic() else 0\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting get-else initializer: $out"
+out=$(printf 'def f() -> i64:\n    [value for value in panic()]\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting comprehension iterable: $out"
+out=$(printf 'def f() -> i64:\n    values: darray[i64] = [value for value in panic()]\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "false positive on aborting comprehension initializer: $out"
+
+# 25. Naming the panic function does not invoke it; only `panic(...)` terminates.
+out=$(printf 'def f() -> i64:\n    panic\n' | "$RPT")
+grep -q "may fall through without returning a value" <<< "$out" || fail "bare panic identifier was treated as a call: $out"
+
+echo "missing-return smoke OK: fall-through/breaking-loop/while-true and one-arm abort conditional flagged; aborting headers and eager wrappers terminate; bare panic value remains non-terminating; both-branch/void/panic-call/value-block/region allocation silent, 0 FP"

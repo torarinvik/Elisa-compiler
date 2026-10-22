@@ -167,6 +167,42 @@ grep -q '^D 0$' <<< "$using_alias_assignment" || {
     exit 1
 }
 
+root_using_alias_nested_module='error E:
+    Bad
+module Backend:
+    public:
+        def load() -> i64 error[E]:
+            return 1
+using Backend as RootB
+module Outer:
+    module Worker:
+        def direct() -> i64 error[E]:
+            return try RootB::load()
+        def assigned() -> i64 error[E]:
+            copied = RootB::load()
+            return try copied'
+root_using_alias_nested_report=$(printf '%s\n' "$root_using_alias_nested_module" | "$RPT")
+grep -q '^D 0$' <<< "$root_using_alias_nested_report" || {
+    echo "try_fallible FAILED: nested module could not resolve root using alias on direct and assigned calls: $root_using_alias_nested_report"
+    exit 1
+}
+
+nested_same_leaf_aliases='module OuterA:
+    module Common:
+        type Count = i64
+        def bad(value: Count) -> i64:
+            return try value
+module OuterB:
+    module Common:
+        type Count = string
+        def bad(value: Count) -> i64:
+            return try value'
+nested_same_leaf_aliases_report=$(printf '%s\n' "$nested_same_leaf_aliases" | "$RPT")
+[[ $(grep -c 'try requires a fallible expression' <<< "$nested_same_leaf_aliases_report") -eq 2 ]] || {
+    echo "try_fallible FAILED: nested same-leaf type aliases collided: $nested_same_leaf_aliases_report"
+    exit 1
+}
+
 catch_success_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = catch load():\n        success:\n            success\n        error problem:\n            0\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$catch_success_alias_nonfallible"
 
@@ -175,6 +211,21 @@ grep -q 'try requires a fallible expression' <<< "$catch_success_arithmetic_alia
 
 catch_success_bool_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load_flag() -> bool error[E]:\n    return true\ndef bad() -> bool:\n    result = catch load_flag():\n        success:\n            success\n        error problem:\n            false\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$catch_success_bool_alias_nonfallible"
+
+catch_success_identifier_string_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load_text() -> string error[E]:\n    return "loaded"\ndef bad() -> string:\n    cached = load_text()\n    result = catch cached:\n        success:\n            success\n        error problem:\n            "fallback"\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$catch_success_identifier_string_alias_nonfallible"
+
+catch_success_arm_try_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = catch load():\n        success:\n            try success\n        error problem:\n            0\n    return result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$catch_success_arm_try_nonfallible"
+
+catch_success_optional_payload_try=$(printf 'error E:\n    Bad\ndef load() -> i64? error[E]:\n    return 1\ndef good() -> i64? error[E]:\n    return catch load():\n        success:\n            try success\n        error problem:\n            null\n' | "$RPT")
+! grep -q 'try requires a fallible expression' <<< "$catch_success_optional_payload_try"
+
+catch_success_generic_error_union_payload=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef wrap[T](value: T) -> T error[E]:\n    return value\ndef good(value: i64 error[F]) -> i64 error[F]:\n    return catch wrap(value):\n        success:\n            try success\n        error problem:\n            0\n' | "$RPT")
+! grep -q 'try requires a fallible expression' <<< "$catch_success_generic_error_union_payload"
+
+generic_return_alias_try=$(printf 'error E:\n    Bad\ndef identity[T](value: T) -> T:\n    return value\ndef forward(value: i64 error[E]) -> i64 error[E]:\n    copied = identity(value)\n    return try copied\n' | "$RPT")
+! grep -q 'try requires a fallible expression' <<< "$generic_return_alias_try"
 
 conditional_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = load() if flag else load()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$conditional_fallible_alias"

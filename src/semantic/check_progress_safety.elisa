@@ -11,6 +11,14 @@
 # (EnforceProgressSafety).
 extend Semantic:
     private:
+        # A literal condition makes one branch unreachable, so use only the branch that can run.
+        def progress_literal_bool(expression: Ast::Expr) -> (known: bool, value: bool):
+            can Abort.Panic:
+                return match expression:
+                    Expr.BoolLit(value, _): (true, value)
+                    Expr.Paren(inner, _): progress_literal_bool(inner)
+                    _: (false, false)
+
         # The block grants that discharge a loop's progress obligation.
         def progress_grant_is_evidence(grant: sview) -> bool:
             can Abort.Panic:
@@ -18,27 +26,135 @@ extend Semantic:
                     "Unsafe.AssumeProgress" | "Unsafe.NonProgress" | "Progress.Tick" | "Progress.Yield" | "Progress.EnterRecursion" -> true
                     _ -> false
 
-        # Whether a statement list contains a progress-discharging `can/trusted …:` block
-        # anywhere (recursing through control flow), so a hatch NESTED in the loop body counts.
-        def progress_has_evidence_block(statements: darray[Ast::Stmt]) -> bool:
+        # Carry the paths that have/have not reached a progress hatch through the body. Function
+        # exits and breaks are discharged paths; continues are frozen at their source position.
+        # Nested loops are separate obligations and may execute zero times.
+        def progress_evidence_paths(statements: darray[Ast::Stmt], table: SymbolTable&, starts_uncovered: bool, starts_covered: bool) -> (uncovered: bool, covered: bool, continued_uncovered: bool, continued_covered: bool):
             can Memory.Allocate, Abort.Panic:
-                for statement in statements:
+                uncovered: mutable bool = starts_uncovered
+                covered: mutable bool = starts_covered
+                continued_uncovered: mutable bool = false
+                continued_covered: mutable bool = false
+                for statement in statements |uncovered, covered, continued_uncovered, continued_covered, table|:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, block_line):
-                            return true if:
-                                (kind == "can" or kind == "trusted") and (any grant in clause where progress_grant_is_evidence(grant))
-                                progress_has_evidence_block(body)
+                            direct_grant: bool = (kind == "can" or kind == "trusted") and (any grant in clause where progress_grant_is_evidence(grant))
+                            if direct_grant:
+                                covered <- covered or uncovered
+                                uncovered <- false
+                            else:
+                                nested: (uncovered: bool, covered: bool, continued_uncovered: bool, continued_covered: bool) = progress_evidence_paths(body, table, uncovered, covered)
+                                uncovered <- nested.uncovered
+                                covered <- nested.covered
+                                continued_uncovered <- continued_uncovered or nested.continued_uncovered
+                                continued_covered <- continued_covered or nested.continued_covered
                         Stmt.If(condition, then_body, else_body, if_line):
-                            return true if:
-                                progress_has_evidence_block(then_body)
-                                progress_has_evidence_block(else_body)
-                        Stmt.While(condition, while_body, while_line):
-                            return true if progress_has_evidence_block(while_body)
-                        Stmt.For(bind, variables, iterable, for_body, for_line):
-                            return true if progress_has_evidence_block(for_body)
+                            literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                            if literal.known:
+                                selected_body: darray[Ast::Stmt] = then_body if literal.value else else_body
+                                selected: (uncovered: bool, covered: bool, continued_uncovered: bool, continued_covered: bool) = progress_evidence_paths(selected_body, table, uncovered, covered)
+                                uncovered <- selected.uncovered
+                                covered <- selected.covered
+                                continued_uncovered <- continued_uncovered or selected.continued_uncovered
+                                continued_covered <- continued_covered or selected.continued_covered
+                            else:
+                                then_summary: (uncovered: bool, covered: bool, continued_uncovered: bool, continued_covered: bool) = progress_evidence_paths(then_body, table, uncovered, covered)
+                                else_summary: (uncovered: bool, covered: bool, continued_uncovered: bool, continued_covered: bool) = progress_evidence_paths(else_body, table, uncovered, covered)
+                                uncovered <- then_summary.uncovered or else_summary.uncovered
+                                covered <- then_summary.covered or else_summary.covered
+                                continued_uncovered <- continued_uncovered or then_summary.continued_uncovered or else_summary.continued_uncovered
+                                continued_covered <- continued_covered or then_summary.continued_covered or else_summary.continued_covered
+                        Stmt.Match(scrutinee, arms, match_line):
+                            match_is_total: bool = arms.count > 0 and not (any arm in arms where not (arm.guard is Ast::Expr.Absent)) and match_arms_exhaustive(arms, table)
+                            start_uncovered: bool = uncovered
+                            start_covered: bool = covered
+                            uncovered <- start_uncovered if not match_is_total
+                            covered <- start_covered if not match_is_total
+                            if match_is_total:
+                                uncovered <- false
+                                covered <- false
+                            for arm in arms |uncovered, covered, continued_uncovered, continued_covered, start_uncovered, start_covered, table|:
+                                arm_summary: (uncovered: bool, covered: bool, continued_uncovered: bool, continued_covered: bool) = progress_evidence_paths(arm.body, table, start_uncovered, start_covered)
+                                uncovered <- uncovered or arm_summary.uncovered
+                                covered <- covered or arm_summary.covered
+                                continued_uncovered <- continued_uncovered or arm_summary.continued_uncovered
+                                continued_covered <- continued_covered or arm_summary.continued_covered
+                        Stmt.Return(_, _) | Stmt.Break(_, _):
+                            uncovered <- false
+                            covered <- false
+                        Stmt.Continue(_, _):
+                            continued_uncovered <- continued_uncovered or uncovered
+                            continued_covered <- continued_covered or covered
+                            uncovered <- false
+                            covered <- false
                         _:
                             pass
-                return false
+                return (uncovered, covered, continued_uncovered, continued_covered)
+
+        # Every path that can reach the next iteration must have discharged progress.
+        def progress_body_evidence_summary(statements: darray[Ast::Stmt], table: SymbolTable&) -> (all_loop_paths_covered: bool, has_looping_path: bool):
+            can Memory.Allocate, Abort.Panic:
+                paths: (uncovered: bool, covered: bool, continued_uncovered: bool, continued_covered: bool) = progress_evidence_paths(statements, table, true, false)
+                has_looping_path: bool = paths.uncovered or paths.covered or paths.continued_uncovered or paths.continued_covered
+                return (not paths.uncovered and not paths.continued_uncovered, has_looping_path)
+
+        def progress_has_evidence_block(statements: darray[Ast::Stmt], table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                summary: (all_loop_paths_covered: bool, has_looping_path: bool) = progress_body_evidence_summary(statements, table)
+                return summary.all_loop_paths_covered and summary.has_looping_path
+
+        # Function-cycle evidence must be an actual hatch, not the loop checker's vacuous
+        # success for a body whose paths all return or break. Track reachability so a hatch after
+        # an unconditional exit cannot suppress a recursive-cycle finding.
+        def progress_func_evidence_summary(statements: darray[Ast::Stmt], table: SymbolTable&) -> (found: bool, falls_through: bool):
+            can Abort.Panic:
+                found: mutable bool = false
+                falls_through: mutable bool = true
+                for statement in statements |found, falls_through|:
+                    return (found, false) if not falls_through
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, block_line):
+                            direct_grant: bool = (kind == "can" or kind == "trusted") and (any grant in clause where progress_grant_is_evidence(grant))
+                            return (true, falls_through) if direct_grant
+                            nested: (found: bool, falls_through: bool) = progress_func_evidence_summary(body, table)
+                            found <- found or nested.found
+                            falls_through <- nested.falls_through
+                        Stmt.If(condition, then_body, else_body, if_line):
+                            literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                            if literal.known:
+                                selected: (found: bool, falls_through: bool) = progress_func_evidence_summary(then_body, table) if literal.value else progress_func_evidence_summary(else_body, table)
+                                found <- found or selected.found
+                                falls_through <- selected.falls_through
+                            else:
+                                then_summary: (found: bool, falls_through: bool) = progress_func_evidence_summary(then_body, table)
+                                else_summary: (found: bool, falls_through: bool) = progress_func_evidence_summary(else_body, table)
+                                found <- found or then_summary.found or else_summary.found
+                                falls_through <- then_summary.falls_through or else_summary.falls_through
+                        Stmt.Match(scrutinee, arms, match_line):
+                            match_total: bool = arms.count > 0 and not (any arm in arms where not (arm.guard is Ast::Expr.Absent)) and match_arms_exhaustive(arms, table)
+                            match_falls_through: mutable bool = not match_total
+                            for arm in arms |found, match_falls_through|:
+                                arm_summary: (found: bool, falls_through: bool) = progress_func_evidence_summary(arm.body, table)
+                                found <- found or arm_summary.found
+                                match_falls_through <- match_falls_through or arm_summary.falls_through
+                            falls_through <- match_falls_through
+                        Stmt.While(condition, body, _):
+                            literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                            if literal.known and literal.value:
+                                nested: (found: bool, falls_through: bool) = progress_func_evidence_summary(body, table)
+                                found <- found or nested.found
+                        Stmt.For(_, _, _, _, _):
+                            pass
+                        Stmt.Return(_, _) | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                            falls_through <- false
+                        _:
+                            pass
+                return (found, falls_through)
+
+        def progress_func_has_evidence_block(statements: darray[Ast::Stmt], table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                summary: (found: bool, falls_through: bool) = progress_func_evidence_summary(statements, table)
+                return summary.found
 
         # Whether the loop body carries a `decreases` contract (its own progress measure).
         def progress_body_has_decreases(statements: darray[Ast::Stmt]) -> bool:
@@ -50,6 +166,18 @@ extend Semantic:
                         _:
                             pass
                 return false
+
+        # `=` introduces a binding only for a plain name (or a tuple of binding names). A
+        # projected target such as `object.field = value` still writes through its base.
+        def progress_target_binds_name(target: Ast::Expr, name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(target_name, _):
+                        return target_name == name
+                    Expr.Tuple(elements, _):
+                        return any element in elements where progress_target_binds_name(element, name)
+                    _:
+                        return false
 
         # The identifiers a (condition) expression mentions.
         def progress_expr_idents(expression: Ast::Expr, out: mutable darray[sview]&) -> void:
@@ -65,9 +193,8 @@ extend Semantic:
                     Expr.Paren(inner, line):
                         progress_expr_idents(inner, out)
                     Expr.Field(object, field, line):
-                        progress_expr_idents(object, out)
+                        pass
                     Expr.Index(object, index, line):
-                        progress_expr_idents(object, out)
                         progress_expr_idents(index, out)
                     Expr.Call(callee, arguments, argument_names, line):
                         progress_expr_idents(callee, out)
@@ -76,96 +203,259 @@ extend Semantic:
                     _:
                         pass
 
-        # Whether any statement in the body ASSIGNS (any operator) to a name in `names`.
-        def progress_body_assigns_any(statements: darray[Ast::Stmt], names: darray[sview]&) -> bool:
+        # For the comparison shape understood by the direction proof, separate the subject from
+        # its bound. A changing RHS must not stand in for movement of the LHS; nontrivial bounds
+        # stay unsupported so their stability is not silently assumed.
+        def progress_bound_is_static_or_named(expression: Ast::Expr, names: mutable darray[sview]&) -> bool:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |names|:
+                match expression:
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.BoolLit(_, _):
+                        return true
+                    Expr.Ident(name, _):
+                        names.push(name)
+                        return true
+                    Expr.Paren(inner, _):
+                        return progress_bound_is_static_or_named(inner, names)
+                    Expr.Unary(operator, operand, _) if operator == TokenKind.Minus:
+                        match operand:
+                            Expr.IntLit(_, _) | Expr.FloatLit(_, _):
+                                return true
+                            _:
+                                return false
+                    _:
+                        return false
+
+        def progress_condition_names(condition: Ast::Expr, subject_names: mutable darray[sview]&, bound_names: mutable darray[sview]&) -> (supported_subject: bool, supported_bound: bool):
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, _):
+                        comparison: bool = operator == TokenKind.Lt or operator == TokenKind.LtEq or operator == TokenKind.Gt or operator == TokenKind.GtEq
+                        subject: sview = ident_name_of(left)
+                        if comparison and subject != "":
+                            subject_names.push(subject)
+                            return (true, progress_bound_is_static_or_named(right, bound_names))
+                    _:
+                        pass
+                progress_expr_idents(condition, subject_names)
+                return (false, false)
+
+        # Whether a statement mutates a condition name in the current lexical scope. Plain `=`
+        # and declarations introduce shadows; subsequent writes to that name no longer reach
+        # the loop variable. Each nested scope gets its own shadow state.
+        def progress_body_assigns_name(statements: darray[Ast::Stmt], name: sview, was_shadowed: bool, table: SymbolTable&) -> (assigns: bool, falls_through: bool):
+            can Memory.Allocate, Abort.Panic:
+                shadowed: mutable bool = was_shadowed
+                falls_through: mutable bool = true
+                for statement in statements |name, shadowed, falls_through|:
+                    return (false, false) if not falls_through
                     match statement:
                         Stmt.Assign(target, operator, value, assign_line):
-                            assigned: sview = decreases_target_base(target)
-                            return true if assigned != "" and (any candidate in names where candidate == assigned)
-                        Stmt.VarDecl(name, type_expression, decl_value, decl_line):
-                            return true if any candidate in names where candidate == name
+                            if operator == TokenKind.Assign and progress_target_binds_name(target, name):
+                                shadowed <- true
+                            else:
+                                assigned: sview = ident_name_of(target)
+                                return (true, false) if assigned == name and not shadowed
+                        Stmt.VarDecl(declared_name, type_expression, decl_value, decl_line):
+                            shadowed <- true if declared_name == name
                         Stmt.If(condition, then_body, else_body, if_line):
-                            return true if:
-                                progress_body_assigns_any(then_body, names)
-                                progress_body_assigns_any(else_body, names)
-                        Stmt.While(inner_condition, inner_body, inner_line):
-                            return true if progress_body_assigns_any(inner_body, names)
-                        Stmt.For(bind, variables, iterable, for_body, for_line):
-                            return true if progress_body_assigns_any(for_body, names)
+                            literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                            if literal.known:
+                                branch: (assigns: bool, falls_through: bool) = progress_body_assigns_name(then_body, name, shadowed, table) if literal.value else progress_body_assigns_name(else_body, name, shadowed, table)
+                                return (true, false) if branch.assigns
+                                falls_through <- branch.falls_through
+                            else:
+                                then_branch: (assigns: bool, falls_through: bool) = progress_body_assigns_name(then_body, name, shadowed, table)
+                                else_branch: (assigns: bool, falls_through: bool) = progress_body_assigns_name(else_body, name, shadowed, table)
+                                return (true, false) if then_branch.assigns or else_branch.assigns
+                                falls_through <- then_branch.falls_through or else_branch.falls_through
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            return true if progress_body_assigns_any(block_body, names)
+                            block_shadows_name: bool = binding == name
+                            block_summary: (assigns: bool, falls_through: bool) = progress_body_assigns_name(block_body, name, shadowed or block_shadows_name, table)
+                            return (true, false) if block_summary.assigns
+                            falls_through <- block_summary.falls_through
+                        Stmt.Match(scrutinee, arms, match_line):
+                            match_total: bool = arms.count > 0 and not (any arm in arms where not (arm.guard is Ast::Expr.Absent)) and match_arms_exhaustive(arms, table)
+                            match_falls_through: mutable bool = not match_total
+                            for arm in arms |name, shadowed, table, match_falls_through|:
+                                arm_summary: (assigns: bool, falls_through: bool) = progress_body_assigns_name(arm.body, name, shadowed or mdc_pattern_binds_name(arm.pattern, name), table)
+                                return (true, false) if arm_summary.assigns
+                                match_falls_through <- match_falls_through or arm_summary.falls_through
+                            falls_through <- match_falls_through
+                        Stmt.Return(_, _) | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                            return (false, false)
                         _:
                             pass
+                return (false, falls_through)
+
+        # Whether any statement list mutates any identifier used by the condition.
+        def progress_body_assigns_any(statements: darray[Ast::Stmt], names: darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for candidate in names:
+                    summary: (assigns: bool, falls_through: bool) = progress_body_assigns_name(statements, candidate, false, table)
+                    return true if summary.assigns
                 return false
 
         # The direction of a signed integer literal. Keep this deliberately narrow: parser
         # payloads at or below zero can represent oversized positive magnitudes, and unary
         # negation of i64.min overflows, so those shapes stay opaque.
-        def progress_literal_step_sign(value: Ast::Expr) -> i64:
+        def progress_literal_step_sign(value: Ast::Expr) -> (known: bool, sign: i64):
             can Abort.Panic:
                 match value:
                     Expr.IntLit(literal_value, _):
-                        return 1 if literal_value > 0
-                        return 0
+                        return (true, 1) if literal_value > 0
+                        return (true, 0) if literal_value == 0
+                        return (false, 0)
                     Expr.Unary(operator, operand, _):
-                        return 0 if operator != TokenKind.Minus
+                        return (false, 0) if operator != TokenKind.Minus
                         return match operand:
                             # Integer magnitudes above i64.max are represented by i64.min;
                             # negating that payload is overflow and the source direction is
                             # deliberately left unproven.
-                            Expr.IntLit(literal_value, _): (0 - 1) if literal_value > 0 else 0
-                            _: 0
-                        return 0
+                            Expr.IntLit(literal_value, _): (true, 0 - 1) if literal_value > 0 else (false, 0)
+                            _: (false, 0)
                     _:
-                        return 0
+                        return (false, 0)
 
-        # Classify an assignment to `v`: +1 means the update increases `v`, -1 decreases it,
-        # and 0 is any write whose direction cannot be proved from a signed integer literal.
-        def progress_step_sign(operator: TokenKind, value: Ast::Expr, v: sview) -> i64:
+        # Classify an assignment to `v`: known=true with sign +1/0/-1 means increase/stall/
+        # decrease; known=false means an update whose direction is not provable.
+        def progress_step_sign(operator: TokenKind, value: Ast::Expr, v: sview) -> (known: bool, sign: i64):
             can Memory.Allocate, Abort.Panic:
-                literal_sign: i64 = progress_literal_step_sign(value)
-                return literal_sign if operator == TokenKind.PlusEq
-                return (0 - literal_sign) if operator == TokenKind.MinusEq
-                return 0 if operator != TokenKind.LArrow
+                literal_step: (known: bool, sign: i64) = progress_literal_step_sign(value)
+                return literal_step if operator == TokenKind.PlusEq
+                if operator == TokenKind.MinusEq:
+                    return (false, 0) if not literal_step.known
+                    return (true, 0 - literal_step.sign)
+                return (false, 0) if operator != TokenKind.LArrow
                 match value:
                     Expr.Binary(left, binary_operator, right, binary_line):
-                        return 0 if ident_name_of(left) != v
-                        right_sign: i64 = progress_literal_step_sign(right)
-                        return 0 if right_sign == 0
-                        return right_sign if binary_operator == TokenKind.Plus
-                        return (0 - right_sign) if binary_operator == TokenKind.Minus
-                        return 0
+                        return (false, 0) if ident_name_of(left) != v
+                        right_step: (known: bool, sign: i64) = progress_literal_step_sign(right)
+                        return (false, 0) if not right_step.known
+                        return right_step if binary_operator == TokenKind.Plus
+                        return (true, 0 - right_step.sign) if binary_operator == TokenKind.Minus
+                        return (false, 0)
                     _:
-                        return 0
+                        return (false, 0)
 
-        # Accumulate the direction evidence for `v` over a body: whether it has an increment
-        # step, a decrement step, and/or an opaque (unclassifiable) write. Recurses `if`
-        # branches and blocks; a nested loop's own steps are ignored (its concern, not ours).
-        def progress_collect_steps(statements: darray[Ast::Stmt], v: sview, has_inc: mutable bool&, has_dec: mutable bool&, has_opaque: mutable bool&) -> void:
+        # Carry the possible outcomes of the current loop iteration through a statement list.
+        # A path is waiting if it has not updated `v`, advancing if every known write so far
+        # points toward the bound, wrong if a known write stalls/reverses that movement, and
+        # opaque if an unclassified write prevents a direction conclusion. Return/break paths
+        # disappear; continue paths are saved separately so later unreachable statements cannot
+        # count as progress. Nested loops are ignored because they may execute zero times.
+        def progress_all_paths_advance(statements: darray[Ast::Stmt], v: sview, expected_sign: i64, was_shadowed: bool, starts_waiting: bool, starts_advancing: bool, starts_wrong: bool, starts_opaque: bool, table: SymbolTable&) -> (waiting: bool, advancing: bool, wrong: bool, opaque: bool, continued_waiting: bool, continued_advancing: bool, continued_wrong: bool, continued_opaque: bool):
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |v, has_inc, has_dec, has_opaque|:
+                waiting: mutable bool = starts_waiting
+                advancing: mutable bool = starts_advancing
+                wrong: mutable bool = starts_wrong
+                opaque: mutable bool = starts_opaque
+                continued_waiting: mutable bool = false
+                continued_advancing: mutable bool = false
+                continued_wrong: mutable bool = false
+                continued_opaque: mutable bool = false
+                shadowed: mutable bool = was_shadowed
+                for statement in statements |v, expected_sign, shadowed, waiting, advancing, wrong, opaque, continued_waiting, continued_advancing, continued_wrong, continued_opaque, table|:
                     match statement:
                         Stmt.Assign(target, operator, value, assign_line):
-                            if decreases_target_base(target) == v:
-                                sign: i64 = progress_step_sign(operator, value, v)
-                                has_inc <- true if sign > 0
-                                has_dec <- true if sign < 0
-                                has_opaque <- true if sign == 0
+                            if operator == TokenKind.Assign and progress_target_binds_name(target, v):
+                                shadowed <- true
+                            elif ident_name_of(target) == v and not shadowed:
+                                step: (known: bool, sign: i64) = progress_step_sign(operator, value, v)
+                                if not step.known:
+                                    opaque <- opaque or waiting or advancing or wrong
+                                    waiting <- false
+                                    advancing <- false
+                                    wrong <- false
+                                elif step.sign == expected_sign:
+                                    advancing <- advancing or waiting
+                                    waiting <- false
+                                else:
+                                    wrong <- wrong or waiting or advancing
+                                    waiting <- false
+                        Stmt.VarDecl(name, type_expression, value, decl_line):
+                            shadowed <- true if name == v
                         Stmt.If(condition, then_body, else_body, if_line):
-                            progress_collect_steps(then_body, v, has_inc, has_dec, has_opaque)
-                            progress_collect_steps(else_body, v, has_inc, has_dec, has_opaque)
+                            literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                            if literal.known:
+                                selected_body: darray[Ast::Stmt] = then_body if literal.value else else_body
+                                selected_summary: (waiting: bool, advancing: bool, wrong: bool, opaque: bool, continued_waiting: bool, continued_advancing: bool, continued_wrong: bool, continued_opaque: bool) = progress_all_paths_advance(selected_body, v, expected_sign, shadowed, waiting, advancing, wrong, opaque, table)
+                                waiting <- selected_summary.waiting
+                                advancing <- selected_summary.advancing
+                                wrong <- selected_summary.wrong
+                                opaque <- selected_summary.opaque
+                                continued_waiting <- continued_waiting or selected_summary.continued_waiting
+                                continued_advancing <- continued_advancing or selected_summary.continued_advancing
+                                continued_wrong <- continued_wrong or selected_summary.continued_wrong
+                                continued_opaque <- continued_opaque or selected_summary.continued_opaque
+                            else:
+                                then_summary: (waiting: bool, advancing: bool, wrong: bool, opaque: bool, continued_waiting: bool, continued_advancing: bool, continued_wrong: bool, continued_opaque: bool) = progress_all_paths_advance(then_body, v, expected_sign, shadowed, waiting, advancing, wrong, opaque, table)
+                                else_summary: (waiting: bool, advancing: bool, wrong: bool, opaque: bool, continued_waiting: bool, continued_advancing: bool, continued_wrong: bool, continued_opaque: bool) = progress_all_paths_advance(else_body, v, expected_sign, shadowed, waiting, advancing, wrong, opaque, table)
+                                waiting <- then_summary.waiting or else_summary.waiting
+                                advancing <- then_summary.advancing or else_summary.advancing
+                                wrong <- then_summary.wrong or else_summary.wrong
+                                opaque <- then_summary.opaque or else_summary.opaque
+                                continued_waiting <- continued_waiting or then_summary.continued_waiting or else_summary.continued_waiting
+                                continued_advancing <- continued_advancing or then_summary.continued_advancing or else_summary.continued_advancing
+                                continued_wrong <- continued_wrong or then_summary.continued_wrong or else_summary.continued_wrong
+                                continued_opaque <- continued_opaque or then_summary.continued_opaque or else_summary.continued_opaque
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            progress_collect_steps(block_body, v, has_inc, has_dec, has_opaque)
+                            block_summary: (waiting: bool, advancing: bool, wrong: bool, opaque: bool, continued_waiting: bool, continued_advancing: bool, continued_wrong: bool, continued_opaque: bool) = progress_all_paths_advance(block_body, v, expected_sign, shadowed or binding == v, waiting, advancing, wrong, opaque, table)
+                            waiting <- block_summary.waiting
+                            advancing <- block_summary.advancing
+                            wrong <- block_summary.wrong
+                            opaque <- block_summary.opaque
+                            continued_waiting <- continued_waiting or block_summary.continued_waiting
+                            continued_advancing <- continued_advancing or block_summary.continued_advancing
+                            continued_wrong <- continued_wrong or block_summary.continued_wrong
+                            continued_opaque <- continued_opaque or block_summary.continued_opaque
+                        Stmt.Match(scrutinee, arms, match_line):
+                            match_is_total: bool = arms.count > 0 and not (any arm in arms where not (arm.guard is Ast::Expr.Absent)) and match_arms_exhaustive(arms, table)
+                            start_waiting: bool = waiting
+                            start_advancing: bool = advancing
+                            start_wrong: bool = wrong
+                            start_opaque: bool = opaque
+                            waiting <- false
+                            advancing <- false
+                            wrong <- false
+                            opaque <- false
+                            waiting <- start_waiting if not match_is_total
+                            advancing <- start_advancing if not match_is_total
+                            wrong <- start_wrong if not match_is_total
+                            opaque <- start_opaque if not match_is_total
+                            for arm in arms |v, expected_sign, shadowed, waiting, advancing, wrong, opaque, continued_waiting, continued_advancing, continued_wrong, continued_opaque, start_waiting, start_advancing, start_wrong, start_opaque, table|:
+                                arm_summary: (waiting: bool, advancing: bool, wrong: bool, opaque: bool, continued_waiting: bool, continued_advancing: bool, continued_wrong: bool, continued_opaque: bool) = progress_all_paths_advance(arm.body, v, expected_sign, shadowed or mdc_pattern_binds_name(arm.pattern, v), start_waiting, start_advancing, start_wrong, start_opaque, table)
+                                waiting <- waiting or arm_summary.waiting
+                                advancing <- advancing or arm_summary.advancing
+                                wrong <- wrong or arm_summary.wrong
+                                opaque <- opaque or arm_summary.opaque
+                                continued_waiting <- continued_waiting or arm_summary.continued_waiting
+                                continued_advancing <- continued_advancing or arm_summary.continued_advancing
+                                continued_wrong <- continued_wrong or arm_summary.continued_wrong
+                                continued_opaque <- continued_opaque or arm_summary.continued_opaque
+                        Stmt.Return(_, _) | Stmt.Break(_, _):
+                            waiting <- false
+                            advancing <- false
+                            wrong <- false
+                            opaque <- false
+                        Stmt.Continue(_, _):
+                            continued_waiting <- continued_waiting or waiting
+                            continued_advancing <- continued_advancing or advancing
+                            continued_wrong <- continued_wrong or wrong
+                            continued_opaque <- continued_opaque or opaque
+                            waiting <- false
+                            advancing <- false
+                            wrong <- false
+                            opaque <- false
                         _:
                             pass
+                return (waiting, advancing, wrong, opaque, continued_waiting, continued_advancing, continued_wrong, continued_opaque)
 
-        # A loop that provably moves AWAY from its bound makes no progress. Only the simple
+        # A loop with a reachable path lacking an update toward its bound has no progress
+        # evidence. Only the simple
         # single-variable comparison condition `v < B` / `v <= B` / `v > B` / `v >= B` is
         # judged: an upper-bounded loop must INCREMENT `v`; a lower-bounded loop must
-        # DECREMENT it. When every step goes the wrong way (and none is opaque), it is stuck.
-        def progress_moves_wrong_direction(condition: Ast::Expr, while_body: darray[Ast::Stmt]) -> bool:
+        # DECREMENT it. An opaque update suppresses the finding conservatively.
+        def progress_moves_wrong_direction(condition: Ast::Expr, while_body: darray[Ast::Stmt], table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match condition:
                     Expr.Binary(left, operator, right, line):
@@ -174,16 +464,14 @@ extend Semantic:
                         upper_bounded: bool = operator == TokenKind.Lt or operator == TokenKind.LtEq
                         lower_bounded: bool = operator == TokenKind.Gt or operator == TokenKind.GtEq
                         return false if not upper_bounded and not lower_bounded
-                        has_inc: mutable bool = false
-                        has_dec: mutable bool = false
-                        has_opaque: mutable bool = false
-                        progress_collect_steps(while_body, v, has_inc, has_dec, has_opaque)
-                        return false if has_opaque
-                        # Upper-bounded stuck: only decrements, no increment. Lower-bounded
-                        # stuck: only increments, no decrement.
-                        upper_stuck: bool = upper_bounded and has_dec and not has_inc
-                        lower_stuck: bool = lower_bounded and has_inc and not has_dec
-                        return upper_stuck or lower_stuck
+                        expected_sign: i64 = 1 if upper_bounded else (0 - 1)
+                        summary: (waiting: bool, advancing: bool, wrong: bool, opaque: bool, continued_waiting: bool, continued_advancing: bool, continued_wrong: bool, continued_opaque: bool) = progress_all_paths_advance(while_body, v, expected_sign, false, true, false, false, false, table)
+                        has_opaque: bool = summary.opaque or summary.continued_opaque
+                        has_looping_path: bool = summary.waiting or summary.advancing or summary.wrong or summary.opaque or summary.continued_waiting or summary.continued_advancing or summary.continued_wrong or summary.continued_opaque
+                        return false if has_opaque or not has_looping_path
+                        body_mutates_v: (assigns: bool, falls_through: bool) = progress_body_assigns_name(while_body, v, false, table)
+                        has_unadvanced_path: bool = summary.waiting or summary.continued_waiting
+                        return summary.wrong or summary.continued_wrong or (body_mutates_v.assigns and has_unadvanced_path)
                     _:
                         return false
 
@@ -193,21 +481,33 @@ extend Semantic:
                     match statement:
                         Stmt.While(condition, while_body, line):
                             has_decreases: bool = progress_body_has_decreases(while_body)
-                            has_hatch: bool = progress_has_evidence_block(while_body)
+                            body_evidence: (all_loop_paths_covered: bool, has_looping_path: bool) = progress_body_evidence_summary(while_body, table)
+                            has_hatch: bool = body_evidence.all_loop_paths_covered and body_evidence.has_looping_path
                             condition_names: mutable darray[sview] = []
-                            progress_expr_idents(condition, condition_names)
-                            mutates_condition: bool = progress_body_assigns_any(while_body, condition_names)
-                            wrong_direction: bool = progress_moves_wrong_direction(condition, while_body)
-                            # No evidence: either the body never touches a condition variable,
-                            # or it does but provably in the non-terminating direction.
-                            no_evidence: bool = not has_decreases and not has_hatch and (not mutates_condition or wrong_direction)
+                            condition_bound_names: mutable darray[sview] = []
+                            condition_shape: (supported_subject: bool, supported_bound: bool) = progress_condition_names(condition, condition_names, condition_bound_names)
+                            mutates_condition: bool = progress_body_assigns_any(while_body, condition_names, table)
+                            mutates_bound: bool = progress_body_assigns_any(while_body, condition_bound_names, table)
+                            wrong_direction: bool = progress_moves_wrong_direction(condition, while_body, table)
+                            # No evidence: the body never touches the comparison subject, changes
+                            # its bound, relies on a dynamic bound we cannot track, or stalls/reverses.
+                            unstable_bound: bool = condition_shape.supported_subject and not condition_shape.supported_bound
+                            no_evidence: bool = body_evidence.has_looping_path and not has_decreases and not has_hatch and (not mutates_condition or wrong_direction or mutates_bound or unstable_bound)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProgressNoEvidence, name: "", line: line.line, expected: "", actual: ""}) if no_evidence
                             table <- progress_safety_statements(while_body, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- progress_safety_statements(then_body, table)
-                            table <- progress_safety_statements(else_body, table)
+                            literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                            if literal.known:
+                                table <- progress_safety_statements(then_body, table) if literal.value
+                                table <- progress_safety_statements(else_body, table) if not literal.value
+                            else:
+                                table <- progress_safety_statements(then_body, table)
+                                table <- progress_safety_statements(else_body, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
                             table <- progress_safety_statements(for_body, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |table| -> table:
+                                table <- progress_safety_statements(arm.body, table)
                         Stmt.Block(kind, clause, binding, body, block_line):
                             # A `can/trusted …:` progress hatch wrapping the loop discharges every
                             # loop nested inside it — skip the whole subtree.
@@ -244,6 +544,63 @@ extend Semantic:
                     Expr.Index(object, index, line):
                         progress_zero_arg_calls_expr(object, out)
                         progress_zero_arg_calls_expr(index, out)
+                    Expr.IndexN(object, indices, line):
+                        progress_zero_arg_calls_expr(object, out)
+                        for index in indices |out|:
+                            progress_zero_arg_calls_expr(index, out)
+                    Expr.Scope(base, name, line):
+                        progress_zero_arg_calls_expr(base, out)
+                    Expr.Slice(object, low, high, line):
+                        progress_zero_arg_calls_expr(object, out)
+                        progress_zero_arg_calls_expr(low, out)
+                        progress_zero_arg_calls_expr(high, out)
+                    Expr.If(condition, then_value, else_value, line):
+                        progress_zero_arg_calls_expr(condition, out)
+                        literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                        if literal.known:
+                            progress_zero_arg_calls_expr(then_value, out) if literal.value
+                            progress_zero_arg_calls_expr(else_value, out) if not literal.value
+                        else:
+                            progress_zero_arg_calls_expr(then_value, out)
+                            progress_zero_arg_calls_expr(else_value, out)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |out|:
+                            progress_zero_arg_calls_expr(element, out)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |out|:
+                            progress_zero_arg_calls_expr(entry.key, out)
+                            progress_zero_arg_calls_expr(entry.value, out)
+                    Expr.Construct(type_expression, fields, line):
+                        progress_zero_arg_calls_expr(type_expression, out)
+                        for field in fields |out|:
+                            progress_zero_arg_calls_expr(field.value, out)
+                    Expr.RecordUpdate(base, fields, line):
+                        progress_zero_arg_calls_expr(base, out)
+                        for field in fields |out|:
+                            progress_zero_arg_calls_expr(field.value, out)
+                    Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
+                        progress_zero_arg_calls_expr(scrutinee, out)
+                        for arm in arms |out|:
+                            progress_zero_arg_calls_expr(arm.guard, out)
+                            progress_zero_arg_calls_body(arm.body, out)
+                    Expr.GetElse(guarded, recovery, line):
+                        progress_zero_arg_calls_expr(guarded, out)
+                        progress_zero_arg_calls_body(recovery, out)
+                    Expr.Comprehension(variable, iterable, condition, body, line, _):
+                        progress_zero_arg_calls_expr(iterable, out)
+                        progress_zero_arg_calls_expr(condition, out)
+                        progress_zero_arg_calls_expr(body, out)
+                    Expr.Block(statements, value, captures, line):
+                        progress_zero_arg_calls_body(statements, out)
+                        progress_zero_arg_calls_expr(value, out)
+                    Expr.Move(operand, line) | Expr.RegionNew(operand, _, line):
+                        progress_zero_arg_calls_expr(operand, out)
+                    Expr.Refinement(base, predicate, line):
+                        progress_zero_arg_calls_expr(base, out)
+                        progress_zero_arg_calls_expr(predicate, out)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        for child in Ast::effect_runtime_children(candidates, arguments) |out|:
+                            progress_zero_arg_calls_expr(child, out)
                     _:
                         pass
 
@@ -257,28 +614,53 @@ extend Semantic:
                         Stmt.Return(value, return_line):
                             if value is present_value:
                                 progress_zero_arg_calls_expr(present_value, out)
+                            return
                         Stmt.VarDecl(name, type_expression, value, decl_line):
+                            progress_zero_arg_calls_expr(type_expression, out)
                             progress_zero_arg_calls_expr(value, out)
                         Stmt.Assign(target, operator, value, assign_line):
+                            progress_zero_arg_calls_expr(target, out)
                             progress_zero_arg_calls_expr(value, out)
                         Stmt.If(condition, then_body, else_body, if_line):
-                            progress_zero_arg_calls_body(then_body, out)
-                            progress_zero_arg_calls_body(else_body, out)
+                            progress_zero_arg_calls_expr(condition, out)
+                            literal: (known: bool, value: bool) = progress_literal_bool(condition)
+                            if literal.known:
+                                progress_zero_arg_calls_body(then_body, out) if literal.value
+                                progress_zero_arg_calls_body(else_body, out) if not literal.value
+                            else:
+                                progress_zero_arg_calls_body(then_body, out)
+                                progress_zero_arg_calls_body(else_body, out)
                         Stmt.While(condition, while_body, while_line):
+                            progress_zero_arg_calls_expr(condition, out)
                             progress_zero_arg_calls_body(while_body, out)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
+                            progress_zero_arg_calls_expr(iterable, out)
                             progress_zero_arg_calls_body(for_body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            progress_zero_arg_calls_expr(scrutinee, out)
+                            for arm in arms |out|:
+                                progress_zero_arg_calls_expr(arm.guard, out)
+                                progress_zero_arg_calls_body(arm.body, out)
+                        Stmt.Contract(kind, expression, contract_line):
+                            progress_zero_arg_calls_expr(expression, out)
                         Stmt.Block(kind, clause, binding, block_body, block_line):
                             progress_zero_arg_calls_body(block_body, out)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            progress_zero_arg_calls_expr(scrutinee, out)
+                            for arm in arms |out|:
+                                progress_zero_arg_calls_expr(arm.guard, out)
+                                progress_zero_arg_calls_body(arm.body, out)
+                        Stmt.Break(_, _) | Stmt.Continue(_, _):
+                            return
                         _:
                             pass
 
         # Whether a function body carries its own progress evidence: a `decreases` contract
         # or a Progress/Unsafe budget block anywhere in the body.
-        def progress_func_has_evidence(body: darray[Ast::Stmt]) -> bool:
+        def progress_func_has_evidence(body: darray[Ast::Stmt], table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return true if progress_body_has_decreases(body)
-                return progress_has_evidence_block(body)
+                return progress_func_has_evidence_block(body, table)
 
         # Whether zero-arg-call node `origin` can reach itself following zero-arg-call edges
         # (a non-progressing recursive cycle). `visited` tracks nodes already expanded.
@@ -318,7 +700,7 @@ extend Semantic:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             names.push(function_name)
                             lines.push(line.line)
-                            has_evidence.push(progress_func_has_evidence(body))
+                            has_evidence.push(progress_func_has_evidence(body, table))
                             callee_start.push(all_callees.count)
                             local_callees: mutable darray[sview] = []
                             progress_zero_arg_calls_body(body, local_callees)

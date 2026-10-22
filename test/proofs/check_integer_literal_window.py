@@ -135,17 +135,21 @@ if 'include "./integer_literal_window.elisa"' not in cast_text:
     raise AssertionError("constant-cast overflow checker no longer imports the proved window predicate")
 cast_compact = compact(cast_text)
 cast_path = (
-    "postfix_window:(found:bool,low:i64,high:i64)=bit_int_window(method_name)",
+    "postfix_window:(found:bool,low:i64,high:i64)=cast_integer_window(method_name)",
     "ifpostfix_window.found:",
     "base_value:(found:bool,value:i64)=fold_const_int(base)",
     "(true,base_value.value,method_name)returnifSemanticIntegerLiteral::value_is_outside_window_if_known(postfix_window.found,base_value.found,base_value.value,postfix_window.low,postfix_window.high)",
-    "prefix_window:(found:bool,low:i64,high:i64)=bit_int_window(callee_name)",
+    "prefix_window:(found:bool,low:i64,high:i64)=cast_integer_window(callee_name)",
     "ifprefix_window.foundandarguments.count==1:",
     "argument_value:(found:bool,value:i64)=fold_const_int(arguments[0])",
     "(true,argument_value.value,callee_name)returnifSemanticIntegerLiteral::value_is_outside_window_if_known(prefix_window.found,argument_value.found,argument_value.value,prefix_window.low,prefix_window.high)",
 )
 if not ordered_fragments(cast_text, cast_path):
     raise AssertionError("postfix and one-argument prefix casts must use the proved range predicate only for folded constants")
+for alias, canonical in (("s8", "i8"), ("s16", "i16"), ("s32", "i32"), ("s64", "i64")):
+    mapping = compact(f'if type_name == "{alias}": return bit_int_window("{canonical}")')
+    if mapping not in compact(cast_text):
+        raise AssertionError(f"signed cast alias {alias} must use the {canonical} truncation window")
 mutated_cast = cast_text.replace(
     "SemanticIntegerLiteral::value_is_outside_window_if_known(postfix_window.found, base_value.found, base_value.value, postfix_window.low, postfix_window.high)",
     "base_value.value < postfix_window.low or base_value.value > postfix_window.high",

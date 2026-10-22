@@ -16,6 +16,7 @@ STAGE1_ONLY_SOURCES=(
     "$ROOT/test/repro/sview_region_get_else_nested_array_return.neg.elisa"
 )
 STAGE1_ONLY_STORE_SOURCES=(
+    "$ROOT/test/repro/sview_region_block_live_tail.neg.elisa"
     "$ROOT/test/repro/sview_region_get_else_match_arm_scope.neg.elisa"
     "$ROOT/test/repro/sview_region_get_else_match_continuing_arm.neg.elisa"
     "$ROOT/test/repro/sview_region_get_else_match_payload_binder.neg.elisa"
@@ -28,6 +29,7 @@ STAGE1_ONLY_STORE_SOURCES=(
     "$ROOT/test/repro/sview_region_comprehension_store.neg.elisa"
 )
 STAGE1_ONLY_POSITIVE_SOURCES=(
+    "$ROOT/test/repro/sview_region_block_dead_tail.pos.elisa"
     "$ROOT/test/repro/sview_region_get_else_match_terminating_arm.pos.elisa"
     "$ROOT/test/repro/sview_region_get_else_match_terminating_call_arg.pos.elisa"
     "$ROOT/test/repro/sview_region_get_else_match_terminating_binary_operand.pos.elisa"

@@ -21,7 +21,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = os.environ.get("ELISACORE_BIN", str(ROOT / "../../Go projects/Elisa-core/compiler/bin/elisac"))
 LLVM_CONFIG = os.environ.get("LLVM_CONFIG") or shutil.which("llvm-config") or "/opt/homebrew/opt/llvm/bin/llvm-config"
-ATOMS = ("semantic", "backend", "borrow_replay", "thread_shareability", "exclusivity", "readonly_ref", "error_union", "or_constants", "region_assignment", "incremental_empty_body", "firm_extern_index", "pymodule_struct_typedef", "try_fallback_source", "authority_coverage", "authority_annotation_index", "iterator_alias_resolution", "lmut_scope", "loop_program_view", "type_region_suffix", "holder_view_depth", "holder_view_wrappers", "foreign_handle_flow", "holder_comprehension_alias", "try_fallible_entry")
+ATOMS = ("semantic", "backend", "borrow_replay", "thread_shareability", "exclusivity", "readonly_ref", "error_union", "or_constants", "region_assignment", "incremental_empty_body", "firm_extern_index", "pymodule_struct_typedef", "try_fallback_source", "authority_coverage", "authority_annotation_index", "iterator_alias_resolution", "lmut_scope", "loop_program_view", "type_region_suffix", "holder_view_depth", "holder_view_wrappers", "foreign_handle_flow", "holder_comprehension_alias", "try_fallible_entry", "cast_constant_truncated")
 selected_atoms = sys.argv[1:] or ATOMS
 if any(atom not in ATOMS for atom in selected_atoms):
     raise SystemExit(f"Choose atom names from: {', '.join(ATOMS)}")

@@ -31,6 +31,7 @@ assert functions["text_default"]["parameters"][0]["default"] == '["hello", None,
 assert functions["object_default"]["parameters"][0]["default"] == "[None]"
 assert functions["optional_scalar_default"]["parameters"][0]["default"] == "7"
 assert functions["optional_then_bad"]["parameters"][0]["default"] == "1234567890123456789"
+assert functions["optional_then_bad"]["parameters"][1]["default"] == '"default cleanup text"'
 assert functions["optional_text_default"]["parameters"][0]["default"] == '"hello"'
 assert functions["optional_cstr_default"]["parameters"][0]["default"] == '"world"'
 assert functions["optional_object_default"]["parameters"][0]["default"] == "None"
@@ -43,7 +44,7 @@ grep -Fq 'def dict_default(values: Mapping[str | bytes, int | None] = {"a": 1, "
 grep -Fq 'def text_default(values: Sequence[str | bytes | None] = ["hello", None, "a\0b"]) -> list[str | None]: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def object_default(values: Sequence[Any | None] = [None]) -> list[Any | None]: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_scalar_default(value: int | None = 7) -> int | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
-grep -Fq 'def optional_then_bad(value: int | None = 1234567890123456789, invalid: int | None = 0) -> int | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
+grep -Fq 'def optional_then_bad(value: int | None = 1234567890123456789, text: str | bytes | None = "default cleanup text", invalid: int | None = 0) -> int | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_text_default(value: str | bytes | None = "hello") -> str | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_cstr_default(value: str | bytes | None = "world") -> str | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
 grep -Fq 'def optional_object_default(value: Any | None = None) -> Any | None: ...' "$WORK/nullable_aggregate_defaults.pyi"
@@ -70,13 +71,20 @@ assert module.optional_scalar_default(9) == 9
 gc.collect()
 tracemalloc.start()
 before, _ = tracemalloc.get_traced_memory()
-for _ in range(5000):
+for _ in range(3000):
     try:
         module.optional_then_bad(invalid="not an integer")
     except (TypeError, OverflowError):
         pass
     else:
         raise AssertionError("invalid optional value unexpectedly converted")
+for _ in range(3000):
+    try:
+        module.optional_then_bad(text="embedded\x00nul")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("cstr? accepted an embedded NUL")
 gc.collect()
 after, _ = tracemalloc.get_traced_memory()
 tracemalloc.stop()

@@ -170,6 +170,94 @@ def validate_ordered_source_lines(source: str, expected_lines: tuple[str, ...], 
         previous_index = next_index
 
 
+FOR_ITERATOR_STATEMENT = "Stmt.For(bind, loop_variables, iterable, loop_body, _):"
+FOR_ITERATOR_BINDER_LOOP = "for loop_variable_index in 0..<loop_variables.count |loop_flow, loop_variables|:"
+FOR_ITERATOR_BIND = "chv_flow_bind(loop_flow, loop_variable, false, loop_variable_may_be_owned_view, loop_variable_may_alias_reference)"
+FOR_ITERATOR_BODY_WALK = "table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)"
+
+
+def validate_for_iterator_direct_routes(arm: str, full_source: str, label: str) -> None:
+    """Require the per-variable bind and body walk to be direct, unconditional children."""
+    if not direct_child(arm, FOR_ITERATOR_BINDER_LOOP, FOR_ITERATOR_BIND):
+        raise SystemExit(f"{label} misses direct loop-variable bind")
+    if not direct_child(full_source, FOR_ITERATOR_STATEMENT, FOR_ITERATOR_BODY_WALK):
+        raise SystemExit(f"{label} misses direct loop-body walk")
+
+
+def validate_for_iterator_order_self_cases() -> None:
+    """Keep postfix guards and missing/misordered loop merges outside accepted routes."""
+    statement = FOR_ITERATOR_STATEMENT
+    iterable_walk = "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"
+    branch_mark = "branch_mark: usize = flow.names.count"
+    loop_flow = "loop_flow: mutable CHVViewFlow = chv_flow_clone(flow)"
+    binder_loop = FOR_ITERATOR_BINDER_LOOP
+    bind = FOR_ITERATOR_BIND
+    body_walk = FOR_ITERATOR_BODY_WALK
+    merge = "chv_flow_merge(flow, loop_flow, branch_mark)"
+    required_order = (iterable_walk, branch_mark, loop_flow, binder_loop, bind, body_walk, merge)
+    arm = "\n".join((
+        statement,
+        f"    {iterable_walk}",
+        f"    {branch_mark}",
+        f"    {loop_flow}",
+        f"    {binder_loop}",
+        f"        {bind}",
+        f"    {body_walk}",
+        f"    {merge}",
+    ))
+
+    def require_order_rejection(source: str, label: str) -> None:
+        try:
+            validate_ordered_source_lines(source, required_order, label)
+        except SystemExit:
+            return
+        raise SystemExit(f"for-iterator order self-case accepted {label}")
+
+    validate_ordered_source_lines(arm, required_order, "valid for-iterator route")
+    validate_for_iterator_direct_routes(arm, arm, "valid for-iterator route self-case")
+
+    postfix_bind = arm.replace(bind, bind + " if false", 1)
+    try:
+        validate_for_iterator_direct_routes(postfix_bind, postfix_bind, "postfix-guarded binder")
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("for-iterator route self-case accepted a postfix-guarded binder")
+    require_order_rejection(postfix_bind, "postfix-guarded binder")
+
+    postfix_body = arm.replace(body_walk, body_walk + " if false", 1)
+    try:
+        validate_for_iterator_direct_routes(postfix_body, postfix_body, "postfix-guarded body walk")
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("for-iterator route self-case accepted a postfix-guarded body walk")
+    require_order_rejection(postfix_body, "postfix-guarded body walk")
+
+    guarded_bind = arm.replace(f"        {bind}", f"        if false:\n            {bind}", 1)
+    try:
+        validate_for_iterator_direct_routes(guarded_bind, guarded_bind, "nested-guarded binder")
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("for-iterator route self-case accepted a nested guarded binder")
+    guarded_body = arm.replace(f"    {body_walk}", f"    if false:\n        {body_walk}", 1)
+    try:
+        validate_for_iterator_direct_routes(guarded_body, guarded_body, "nested-guarded body walk")
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit("for-iterator route self-case accepted a nested guarded body walk")
+
+    merge_before_body = arm.replace(f"    {body_walk}\n    {merge}", f"    {merge}\n    {body_walk}", 1)
+    require_order_rejection(merge_before_body, "pre-body merge")
+    missing_merge = arm.replace(f"\n    {merge}", "", 1)
+    require_order_rejection(missing_merge, "missing post-body merge")
+
+
+validate_for_iterator_order_self_cases()
+
+
 def edge_parts(edge: tuple) -> tuple[str, str, int]:
     if len(edge) == 2:
         return edge[0], edge[1], 0
@@ -1786,6 +1874,7 @@ validate_ordered_source_lines(assignment_arm, (
 for_arm = match_arm_body(holder_walk_statements, "match statement:", "Stmt.For(bind, loop_variables, iterable, loop_body, _):")
 if for_arm is None:
     raise SystemExit("holder-view for arm is missing")
+validate_for_iterator_direct_routes(for_arm, holder_walk_statements, "holder-view for-iterator routes")
 validate_ordered_source_lines(for_arm, (
     "table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)",
     "iterable_may_be_owned_view: bool = chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)",
@@ -1793,6 +1882,7 @@ validate_ordered_source_lines(for_arm, (
     "loop_element_may_alias_reference: bool = chv_iterable_element_may_alias_reference(iterable, ref_params, flow, table, 0)",
     "loop_element_may_contain_alias_reference: bool = chv_iterable_element_may_contain_alias_ref(iterable, ref_params, flow, table, 0)",
     "loop_variable_may_alias_reference: bool = loop_element_may_alias_reference or (bind == \"mutable\" and iterable_may_alias_reference)",
+    "branch_mark: usize = flow.names.count",
     "loop_flow: mutable CHVViewFlow = chv_flow_clone(flow)",
     "for loop_variable_index in 0..<loop_variables.count |loop_flow, loop_variables|:",
     "element_facts: (known: bool, may_owned_view: bool, may_alias_reference: bool, may_contain_alias_reference: bool, may_be_scalar_sview: bool, may_yield_scalar_sview: bool) = chv_iterable_binding_facts(iterable, loop_variable_index, loop_variables.count > 1, ref_params, flow, table, view_names, view_values)",

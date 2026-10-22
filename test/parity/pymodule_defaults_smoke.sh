@@ -46,6 +46,14 @@ assert defaults.i64_min(signed_long_long_min + 1) == signed_long_long_min + 1
 assert str(inspect.signature(defaults.i64_min)) == f"(value={signed_long_long_min})"
 assert defaults.narrowed_u8() == 1
 assert str(inspect.signature(defaults.narrowed_u8)) == "(value=1)"
+assert defaults.narrowed_bytes() == b"\x01"
+assert str(inspect.signature(defaults.narrowed_bytes)) == "(values=b'\\x01')"
+assert defaults.wrapping_u8() == 255
+assert str(inspect.signature(defaults.wrapping_u8)) == "(value=255)"
+assert defaults.enum_narrowing() == 44
+assert str(inspect.signature(defaults.enum_narrowing)) == "(value=44)"
+assert defaults.signed_alias_cast() == 1
+assert str(inspect.signature(defaults.signed_alias_cast)) == "(value=1)"
 for bad in (-1, pointer_unsigned_max + 1):
     try:
         defaults.count_from(bad)
