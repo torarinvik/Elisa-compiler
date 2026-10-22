@@ -1,0 +1,516 @@
+extend Semantic:
+    private:
+        def ifc_token_span(tokens: darray[Lexer::Token]&, definition: usize) -> IncrementalFactTokenSpan:
+            can Abort.Panic:
+                if definition >= tokens.count or tokens[definition].kind != TokenKind.Def:
+                    return IncrementalFactTokenSpan{found: false, body_start: 0, body_end: 0, skip_start: 0, skip_end: 0, definition_token: tokens.count}
+                indent: mutable usize = tokens.count
+                scan: mutable usize = definition + 1
+                while scan < tokens.count:
+                    kind: TokenKind = tokens[scan].kind
+                    if kind == TokenKind.Indent:
+                        indent <- scan
+                        break
+                    if kind == TokenKind.Def or kind == TokenKind.Dedent or kind == TokenKind.Eof:
+                        break
+                    scan <- scan + 1
+                if indent >= tokens.count:
+                    return IncrementalFactTokenSpan{found: false, body_start: 0, body_end: 0, skip_start: 0, skip_end: 0, definition_token: definition}
+                depth: mutable u32 = 1
+                scan <- indent + 1
+                while scan < tokens.count:
+                    if tokens[scan].kind == TokenKind.Indent:
+                        depth <- depth + 1
+                    elif tokens[scan].kind == TokenKind.Dedent:
+                        depth <- depth - 1
+                        if depth == 0:
+                            return IncrementalFactTokenSpan{found: true, body_start: indent + 1, body_end: scan, skip_start: indent, skip_end: scan + 1, definition_token: definition}
+                    scan <- scan + 1
+                return IncrementalFactTokenSpan{found: false, body_start: 0, body_end: 0, skip_start: 0, skip_end: 0, definition_token: definition}
+
+        def ifc_generic_header(tokens: darray[Lexer::Token]&, definition: usize) -> bool:
+            can Abort.Panic:
+                name_token: mutable usize = definition + 1
+                while name_token < tokens.count and tokens[name_token].kind != TokenKind.Ident:
+                    name_token <- name_token + 1
+                return false if name_token + 1 >= tokens.count
+                return tokens[name_token + 1].kind == TokenKind.LBracket
+
+        # The string views stored in a scratch array and the probe view can have
+        # different owners. This helper only compares them; it never retains either.
+        def ifc_contains[@array_region, @values_region, @name_region](names: darray[sview @values_region]& @array_region, name: sview @name_region) -> bool:
+            can Abort.Panic:
+                for item in names:
+                    return true if item == name
+                return false
+
+        # Invocation-local index: hashes narrow lookup, exact name bytes decide equality.
+        private struct IncrementalCandidateNameIndex[@r]:
+            heads: mutable darray[usize] @r = []
+            next: mutable darray[usize] @r = []
+
+        def ifc_candidate_name_hash(name: sview) -> u64:
+            can Abort.Panic:
+                hash: u64 = for offset in 0..<name.len |hash: u64 = INCREMENTAL_FACT_HASH_OFFSET| -> hash:
+                    hash <- (hash ^ name[offset].u64()) * INCREMENTAL_FACT_HASH_PRIME
+                return hash
+
+        # Invocation-local membership index for the translation unit's global names.
+        # Hashes choose a bucket only; exact sview equality remains authoritative.
+        private struct IncrementalStringNameIndex[@r]:
+            heads: mutable darray[usize] @r = []
+            next: mutable darray[usize] @r = []
+
+        def ifc_string_name_index[@array_region, @name_region, @index_region](names: darray[sview @name_region]& @array_region, index: mutable IncrementalStringNameIndex[index_region]& @index_region) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index.heads.resize(names.count)
+                index.next.resize(names.count)
+                for bucket in 0..<index.heads.count |index|:
+                    index.heads[bucket] <- names.count
+                for reverse_row in 0..<names.count |index|:
+                    row: usize = names.count - 1 - reverse_row
+                    bucket: usize = (ifc_candidate_name_hash(names[row]) % index.heads.count.u64()).usize()
+                    index.next[row] <- index.heads[bucket]
+                    index.heads[bucket] <- row
+
+        # The index belongs to the name array, but the probe may be borrowed from a
+        # parser AST or request buffer with a different lifetime. This helper compares
+        # bytes only and never retains the probe.
+        def ifc_string_name_contains[@array_region, @values_region, @name_region, @index_region](names: darray[sview @values_region]& @array_region, name: sview @name_region, index: IncrementalStringNameIndex[index_region]& @index_region) -> bool:
+            can Abort.Panic:
+                return ifc_contains[array_region, values_region, name_region](names, name) if names.count < INCREMENTAL_STRING_NAME_INDEX_MIN_COUNT or index.heads.count != names.count or index.next.count != names.count
+                bucket: usize = (ifc_candidate_name_hash(name) % index.heads.count.u64()).usize()
+                row: mutable usize = index.heads[bucket]
+                while row < names.count |row|:
+                    return true if names[row] == name
+                    row <- index.next[row]
+                return false
+
+        def ifc_candidate_name_index[@r](candidates: darray[IncrementalFactCandidate]& @r, index: mutable IncrementalCandidateNameIndex[r]& @r) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index.heads.resize(candidates.count)
+                index.next.resize(candidates.count)
+                for bucket in 0..<index.heads.count |index|:
+                    index.heads[bucket] <- candidates.count
+                for reverse_row in 0..<candidates.count |index|:
+                    row: usize = candidates.count - 1 - reverse_row
+                    bucket: usize = (ifc_candidate_name_hash(candidates[row].name) % index.heads.count.u64()).usize()
+                    index.next[row] <- index.heads[bucket]
+                    index.heads[bucket] <- row
+
+        def ifc_name_unique[@r](candidates: darray[IncrementalFactCandidate]& @r, name: sview @r, index: IncrementalCandidateNameIndex[r]& @r) -> bool:
+            can Abort.Panic:
+                return false if index.heads.count == 0
+                bucket: usize = (ifc_candidate_name_hash(name) % index.heads.count.u64()).usize()
+                count: mutable usize = 0
+                row: mutable usize = index.heads[bucket]
+                while row < candidates.count |row, count|:
+                    count <- count + 1 if candidates[row].name == name
+                    return false if count > 1
+                    row <- index.next[row]
+                return count == 1
+
+        # Hash buckets narrow the search; exact owned-key bytes remain authoritative.
+        # Reverse insertion preserves ascending row order and the old first-match rule.
+        private struct IncrementalPriorKeyIndex[@r]:
+            heads: mutable darray[usize] @r = []
+            next: mutable darray[usize] @r = []
+
+        def ifc_prior_key_index[@previous_region, @index_region](previous: IncrementalSemanticSnapshot[previous_region]&, index: mutable IncrementalPriorKeyIndex[index_region]& @index_region) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index.next.resize(previous.functions.count)
+                index.heads.resize(previous.functions.count)
+                for bucket in 0..<index.heads.count |index|:
+                    index.heads[bucket] <- previous.functions.count
+                for reverse_row in 0..<previous.functions.count |index|:
+                    row: usize = previous.functions.count - 1 - reverse_row
+                    prior: IncrementalFunctionFactRecord = previous.functions[row]
+                    index.next[row] <- previous.functions.count
+                    continue if prior.key_start > previous.bytes.count or prior.key_length > previous.bytes.count - prior.key_start
+                    hash: u64 = ifc_hash(previous.bytes, prior.key_start, prior.key_length)
+                    bucket: usize = (hash % index.heads.count.u64()).usize()
+                    index.next[row] <- index.heads[bucket]
+                    index.heads[bucket] <- row
+
+        def ifc_prior_index[@previous_region, @index_region](previous: IncrementalSemanticSnapshot[previous_region]&, bytes: darray[u8]&, key_start: usize, key_length: usize, index: IncrementalPriorKeyIndex[index_region]& @index_region) -> usize:
+            can Abort.Panic:
+                return previous.functions.count if key_start > bytes.count or key_length > bytes.count - key_start
+                hash: u64 = ifc_hash(bytes, key_start, key_length)
+                return previous.functions.count if index.heads.count == 0
+                bucket: usize = (hash % index.heads.count.u64()).usize()
+                row: mutable usize = index.heads[bucket]
+                while row < previous.functions.count |row|:
+                    prior: IncrementalFunctionFactRecord = previous.functions[row]
+                    return row if ifc_equal(bytes, key_start, key_length, previous.bytes, prior.key_start, prior.key_length)
+                    row <- index.next[row]
+                return previous.functions.count
+
+        def ifc_safe_return_type[@alias_region](expression: Ast::Expr, aliases: darray[sview @alias_region]&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return false if ifc_contains(aliases, name)
+                        return when name:
+                            "void" | "bool" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" | "int" | "float" | "f32" | "f64" | "char" | "str" | "cstr" -> true
+                            _ -> false
+                    _:
+                        return false
+
+        def ifc_signature_supported[@alias_region](parameters: darray[Ast::ParamDecl], return_type: Ast::Expr?, aliases: darray[sview @alias_region]&) -> bool:
+            can Abort.Panic:
+                if return_type is declared_return:
+                    return false if not ifc_safe_return_type(declared_return, aliases)
+                else:
+                    return false
+                for parameter in parameters:
+                    return false if parameter.has_default
+                return true
+
+        def ifc_call_target[@candidate_borrow, @name_region, @index_region](candidates: darray[IncrementalFactCandidate]& @candidate_borrow, name: sview @name_region, candidate_names: IncrementalCandidateNameIndex[index_region]& @index_region) -> bool:
+            can Abort.Panic:
+                return false if candidate_names.heads.count == 0
+                bucket: usize = (ifc_candidate_name_hash(name) % candidate_names.heads.count.u64()).usize()
+                matches: mutable usize = 0
+                row: mutable usize = candidate_names.heads[bucket]
+                while row < candidates.count |row, matches|:
+                    candidate: IncrementalFactCandidate = candidates[row]
+                    row <- candidate_names.next[row]
+                    continue if candidate.name != name
+                    matches <- matches + 1
+                    return false if matches > 1 or not candidate.header_supported or candidate.parameters.count != 0
+                return matches == 1
+
+        def ifc_anchor(tokens: darray[Lexer::Token]&, body_start: usize, body_end: usize, offset: u32) -> u32:
+            can Abort.Panic:
+                return INCREMENTAL_NO_ANCHOR if:
+                    offset == 0
+                    body_start >= body_end or body_end > tokens.count
+                # Token spans are ordered and non-overlapping. Find the first token whose
+                # full spelling (including a numeric suffix) ends after OFFSET. This is
+                # also the first token after OFFSET when it lies in inter-token whitespace.
+                low: mutable usize = body_start
+                high: mutable usize = body_end
+                while low < high |low, high, tokens, offset|:
+                    middle: usize = low + (high - low) / 2
+                    token: Lexer::Token = tokens[middle]
+                    end: u32 = token.start + token.length + token.suffix_length.u32()
+                    if end <= offset:
+                        low <- middle + 1
+                    else:
+                        high <- middle
+                if low < body_end:
+                    return (low - body_start).u32()
+                return INCREMENTAL_NO_ANCHOR
+
+        def ifc_exact_token_anchor(tokens: darray[Lexer::Token]&, body_start: usize, body_end: usize, position: Ast::Pos) -> u32:
+            can Abort.Panic:
+                anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                return INCREMENTAL_NO_ANCHOR if anchor == INCREMENTAL_NO_ANCHOR
+                token: Lexer::Token = tokens[body_start + anchor.usize()]
+                return INCREMENTAL_NO_ANCHOR if:
+                    token.start != position.offset
+                    token.line != position.line or token.line != position.end_line
+                    token.column != position.column
+                    token.column + token.length != position.end_column
+                    token.start + token.length != position.end_offset
+                return anchor
+
+        def ifc_rebind_self_assignment_anchor(tokens: darray[Lexer::Token]&, body_start: usize, body_end: usize, target_anchor: u32, statement_anchor: u32) -> (valid: bool, anchor: IncrementalSelfAssignmentAnchor):
+            can Abort.Panic:
+                invalid: IncrementalSelfAssignmentAnchor = IncrementalSelfAssignmentAnchor{target_position: Ast::pos_at_line(0), statement_line: 0}
+                return (false, invalid) if:
+                    body_start >= body_end or body_end > tokens.count
+                    target_anchor == INCREMENTAL_NO_ANCHOR or statement_anchor == INCREMENTAL_NO_ANCHOR
+                    target_anchor.usize() >= body_end - body_start or statement_anchor.usize() >= body_end - body_start
+                target_token: Lexer::Token = tokens[body_start + target_anchor.usize()]
+                statement_token: Lexer::Token = tokens[body_start + statement_anchor.usize()]
+                return (false, invalid) if:
+                    target_token.kind != TokenKind.Ident
+                    target_token.suffix_length != 0
+                    statement_token.start == 0
+                    statement_token.line == 0
+                position: Ast::Pos = Ast::Pos{line: target_token.line, column: target_token.column, offset: target_token.start, end_line: target_token.line, end_column: target_token.column + target_token.length, end_offset: target_token.start + target_token.length}
+                anchor: IncrementalSelfAssignmentAnchor = IncrementalSelfAssignmentAnchor{target_position: position, statement_line: statement_token.line}
+                return (true, anchor)
+
+        # A fact stores its target name as a byte span within its owner's encoded body.
+        # Body records are immutable across exact-body reuse, so canonical layout only
+        # needs to rebase the owner's body_start.
+        def ifc_self_assignment_name_span[@snapshot_region](snapshot: IncrementalSemanticSnapshot[snapshot_region]&, record: IncrementalFunctionFactRecord, fact: IncrementalSelfAssignmentFact) -> (valid: bool, start: usize, length: usize):
+            can Abort.Panic:
+                return (false, 0, 0) if:
+                    fact.name_length == 0
+                    fact.name_body_offset > record.body_length
+                    fact.name_length > record.body_length - fact.name_body_offset
+                    record.body_start > snapshot.bytes.count
+                    record.body_length > snapshot.bytes.count - record.body_start
+                start: usize = record.body_start + fact.name_body_offset
+                return (false, 0, 0) if start > snapshot.bytes.count or fact.name_length > snapshot.bytes.count - start
+                return (true, start, fact.name_length)
+
+        def ifc_self_assignment_fact_capacity[@snapshot_region](snapshot: IncrementalSemanticSnapshot[snapshot_region]&) -> usize:
+            can Abort.Panic:
+                return 0 if snapshot.self_assignment_facts.count >= 1000000 or snapshot.self_assignment_ranges.count > 1000000 or snapshot.bytes.count > INCREMENTAL_SNAPSHOT_CODEC_LIMIT
+                fact_count: u64 = snapshot.self_assignment_facts.count.u64()
+                range_count: u64 = snapshot.self_assignment_ranges.count.u64()
+                # Facts include token ordinals and a body-relative name span. Budget 96
+                # bytes per finding for the fact and invocation-local anchor, plus 32 per
+                # function range, with alignment headroom.
+                snapshot_baseline: u64 = 146 + snapshot.bytes.count.u64() + snapshot.options_key.count.u64() + snapshot.functions.count.u64() * 72 + snapshot.direct_facts.count.u64() * 56 + snapshot.active_grants.count.u64() * 24
+                total: u64 = snapshot_baseline + fact_count * 96 + range_count * 32
+                return 0 if total >= INCREMENTAL_SNAPSHOT_CODEC_LIMIT.u64()
+                by_bytes: usize = ((INCREMENTAL_SNAPSHOT_CODEC_LIMIT.u64() - total) / 96).usize()
+                by_count: usize = 1000000 - snapshot.self_assignment_facts.count
+                return by_bytes if by_bytes < by_count else by_count
+
+        def ifc_self_assignment_storage_within_limit[@snapshot_region](snapshot: IncrementalSemanticSnapshot[snapshot_region]&, additional_facts: usize) -> bool:
+            can Abort.Panic:
+                return additional_facts <= ifc_self_assignment_fact_capacity(snapshot)
+
+        def ifc_self_assignment_forget[@snapshot_region](snapshot: mutable IncrementalSemanticSnapshot[snapshot_region]&) -> void:
+            can Memory.Allocate:
+                snapshot.self_assignment_facts.truncate(0)
+                snapshot.current_self_assignment_anchors.truncate(0)
+                for index in 0..<snapshot.self_assignment_ranges.count |snapshot|:
+                    snapshot.self_assignment_ranges[index] <- IncrementalSelfAssignmentFactRange{start: 0, count: 0, complete: false, reused_previous: false}
+                snapshot.self_assignment_bodies_reused <- 0
+
+        def ifc_scan_self_assignment_candidate[@snapshot_region, @candidate_borrow](index: usize, candidates: darray[IncrementalFactCandidate]& @candidate_borrow, tokens: darray[Lexer::Token]& @candidate_borrow, snapshot: mutable IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if index >= candidates.count
+                candidate: IncrementalFactCandidate = candidates[index]
+                start: usize = snapshot.self_assignment_facts.count
+                if not candidate.header_supported or candidate.body_token_start >= candidate.body_token_end or candidate.body_token_end > tokens.count:
+                    snapshot.self_assignment_ranges[candidate.owner] <- IncrementalSelfAssignmentFactRange{start: start, count: 0, complete: false, reused_previous: false}
+                    return
+                findings: mutable darray[SelfAssignmentFinding] = []
+                collection_complete: mutable bool = true
+                snapshot.self_assignment_bodies_scanned <- snapshot.self_assignment_bodies_scanned + 1
+                collect_self_assignment_findings_bounded(candidate.body, ifc_self_assignment_fact_capacity(snapshot), &findings, &collection_complete)
+                if not collection_complete:
+                    snapshot.self_assignment_ranges[candidate.owner] <- IncrementalSelfAssignmentFactRange{start: start, count: 0, complete: false, reused_previous: false}
+                    return
+                if not ifc_self_assignment_storage_within_limit(snapshot, findings.count):
+                    snapshot.self_assignment_ranges[candidate.owner] <- IncrementalSelfAssignmentFactRange{start: start, count: 0, complete: false, reused_previous: false}
+                    return
+                staged_facts: mutable darray[IncrementalSelfAssignmentFact] = []
+                staged_anchors: mutable darray[IncrementalSelfAssignmentAnchor] = []
+                previous_target_anchor: mutable u32 = INCREMENTAL_NO_ANCHOR
+                staged_facts.reserve(findings.count)
+                staged_anchors.reserve(findings.count)
+                # Preflight every finding before extending snapshot storage. A single
+                # synthetic or ambiguous position keeps the whole function cold.
+                for finding in findings:
+                    target_anchor: u32 = ifc_exact_token_anchor(tokens, candidate.body_token_start, candidate.body_token_end, finding.target_position)
+                    statement_anchor: u32 = ifc_exact_token_anchor(tokens, candidate.body_token_start, candidate.body_token_end, finding.statement_position)
+                    return if target_anchor == INCREMENTAL_NO_ANCHOR or statement_anchor == INCREMENTAL_NO_ANCHOR
+                    return if previous_target_anchor != INCREMENTAL_NO_ANCHOR and target_anchor <= previous_target_anchor
+                    previous_target_anchor <- target_anchor
+                    rebound: (valid: bool, anchor: IncrementalSelfAssignmentAnchor) = ifc_rebind_self_assignment_anchor(tokens, candidate.body_token_start, candidate.body_token_end, target_anchor, statement_anchor)
+                    return if not rebound.valid
+                    staged_facts.push(IncrementalSelfAssignmentFact{target_anchor_token: target_anchor, statement_anchor_token: statement_anchor, name_body_offset: 0, name_length: 0})
+                    staged_anchors.push(rebound.anchor)
+                if staged_facts.count > 0:
+                    record: IncrementalFunctionFactRecord = snapshot.functions[candidate.owner]
+                    return if record.body_start > snapshot.bytes.count or record.body_length > snapshot.bytes.count - record.body_start
+                    body_end: usize = record.body_start + record.body_length
+                    cursor: mutable usize = record.body_start
+                    token_index: mutable usize = 0
+                    finding_index: mutable usize = 0
+                    while cursor < body_end and finding_index < staged_facts.count |cursor, token_index, finding_index, staged_facts|:
+                        return if body_end - cursor < 8
+                        kind: u32 = ifc_read_u32(snapshot.bytes, cursor)
+                        text_length: usize = ifc_read_u32(snapshot.bytes, cursor + 4).usize()
+                        text_start: usize = cursor + 8
+                        return if text_length > body_end - text_start
+                        if token_index == staged_facts[finding_index].target_anchor_token.usize():
+                            return if kind != TokenKind.Ident.u32() or text_length == 0
+                            name_matches: mutable bool = false
+                            if ifc_byte_span(snapshot.bytes, text_start, text_length) is target_name:
+                                name_matches <- target_name == findings[finding_index].name
+                            return if not name_matches
+                            staged_facts[finding_index].name_body_offset <- text_start - record.body_start
+                            staged_facts[finding_index].name_length <- text_length
+                            finding_index <- finding_index + 1
+                        cursor <- text_start + text_length
+                        token_index <- token_index + 1
+                    return if finding_index != staged_facts.count
+                for fact in staged_facts |snapshot|:
+                    snapshot.self_assignment_facts.push(fact)
+                for anchor in staged_anchors |snapshot|:
+                    snapshot.current_self_assignment_anchors.push(anchor)
+                snapshot.self_assignment_ranges[candidate.owner] <- IncrementalSelfAssignmentFactRange{start: start, count: findings.count, complete: true, reused_previous: false}
+
+        # Reuse is authorized only by the private session collector's exact function key
+        # and exact token-body comparison. Hashes are never consulted here.
+        def ifc_reuse_previous_self_assignment_candidate[@previous_region, @snapshot_region, @candidate_borrow, @previous_borrow](index: usize, candidates: darray[IncrementalFactCandidate]& @candidate_borrow, previous: IncrementalSemanticSnapshot[previous_region]& @previous_borrow, tokens: darray[Lexer::Token]& @candidate_borrow, snapshot: mutable IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if index >= candidates.count
+                candidate: IncrementalFactCandidate = candidates[index]
+                return false if not candidate.header_supported or not candidate.prior_body_matches or candidate.prior_record >= previous.functions.count or candidate.prior_record >= previous.self_assignment_ranges.count
+                old_range: IncrementalSelfAssignmentFactRange = previous.self_assignment_ranges[candidate.prior_record]
+                return false if not old_range.complete or old_range.start > previous.self_assignment_facts.count or old_range.count > previous.self_assignment_facts.count - old_range.start
+                return false if not ifc_self_assignment_storage_within_limit(snapshot, old_range.count)
+                rebound_anchors: mutable darray[IncrementalSelfAssignmentAnchor] = []
+                rebound_anchors.reserve(old_range.count)
+                for relative in 0..<old_range.count |rebound_anchors|:
+                    old_fact: IncrementalSelfAssignmentFact = previous.self_assignment_facts[old_range.start + relative]
+                    old_record: IncrementalFunctionFactRecord = previous.functions[candidate.prior_record]
+                    return false if not ifc_self_assignment_name_span(previous, old_record, old_fact).valid
+                    rebound: (valid: bool, anchor: IncrementalSelfAssignmentAnchor) = ifc_rebind_self_assignment_anchor(tokens, candidate.body_token_start, candidate.body_token_end, old_fact.target_anchor_token, old_fact.statement_anchor_token)
+                    return false if not rebound.valid
+                    rebound_anchors.push(rebound.anchor)
+                start: usize = snapshot.self_assignment_facts.count
+                for relative in 0..<old_range.count |snapshot|:
+                    old_fact: IncrementalSelfAssignmentFact = previous.self_assignment_facts[old_range.start + relative]
+                    snapshot.self_assignment_facts.push(IncrementalSelfAssignmentFact{target_anchor_token: old_fact.target_anchor_token, statement_anchor_token: old_fact.statement_anchor_token, name_body_offset: old_fact.name_body_offset, name_length: old_fact.name_length})
+                    snapshot.current_self_assignment_anchors.push(rebound_anchors[relative])
+                snapshot.self_assignment_ranges[candidate.owner] <- IncrementalSelfAssignmentFactRange{start: start, count: old_range.count, complete: true, reused_previous: true}
+                snapshot.self_assignment_bodies_reused <- snapshot.self_assignment_bodies_reused + 1
+                return true
+
+        def ifc_has_inline_grant(annotations: darray[Ast::EnumAnnotation]&, tokens: darray[Lexer::Token]&, body_start: usize, body_end: usize) -> bool:
+            can Abort.Panic:
+                return false if body_start >= body_end or body_end > tokens.count
+                first_offset: u32 = tokens[body_start].start
+                last_token: Lexer::Token = tokens[body_end - 1]
+                last_offset: u32 = last_token.start + last_token.length + last_token.suffix_length.u32()
+                for annotation in annotations:
+                    continue if annotation.owner != "__inline_expression_grant"
+                    return true if annotation.pos.offset >= first_offset and annotation.pos.offset < last_offset
+                return false
+
+        def ifc_push_fact[@snapshot_region, @candidate_borrow, @path_region](snapshot: mutable IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region, owner: usize, kind: IncrementalFactKind, subject: sview @candidate_borrow, path: sview @path_region, anchor: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                subject_span: mutable (start: usize, length: usize) = (snapshot.bytes.count, subject.len)
+                if kind == IncrementalFactKind.DirectCall or kind == IncrementalFactKind.GlobalRead or kind == IncrementalFactKind.GlobalWrite:
+                    subject_span <- ifc_append_name[snapshot_region, path_region, candidate_borrow](snapshot, path, subject)
+                else:
+                    ifc_append_view[snapshot_region, candidate_borrow](snapshot, subject)
+                active_start: usize = snapshot.active_grants.count
+                snapshot.direct_facts.push(IncrementalDirectFact{owner: owner, kind: kind, subject_start: subject_span.start, subject_length: subject_span.length, anchor_token: anchor, active_grant_start: active_start, active_grant_count: snapshot.active_grants.count - active_start})
+
+        def ifc_walk_expr[@snapshot_region, @candidate_borrow, @path_region, @scratch_region](expression: Ast::Expr, owner: usize, path: sview @path_region, body_start: usize, body_end: usize, tokens: darray[Lexer::Token]& @candidate_borrow, locals: darray[sview @candidate_borrow]& @scratch_region, all_globals: darray[sview @candidate_borrow]& @candidate_borrow, all_globals_index: IncrementalStringNameIndex[candidate_borrow]& @candidate_borrow, mutable_globals: darray[sview @candidate_borrow]& @candidate_borrow, mutable_globals_index: IncrementalStringNameIndex[candidate_borrow]& @candidate_borrow, candidates: darray[IncrementalFactCandidate]& @candidate_borrow, candidate_names: IncrementalCandidateNameIndex[candidate_borrow]& @candidate_borrow, snapshot: mutable IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _):
+                        return true
+                    Expr.Ident(name, position):
+                        # Locals and parameters may be mutable aliases or callback
+                        # values. v0 records only literal initializers and direct globals.
+                        return false if ifc_contains(locals, name)
+                        if ifc_string_name_contains(mutable_globals, name, mutable_globals_index):
+                            anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                            if anchor != INCREMENTAL_NO_ANCHOR:
+                                ifc_push_fact[snapshot_region, candidate_borrow, path_region](snapshot, owner, IncrementalFactKind.GlobalRead, name, path, anchor)
+                                return true
+                            return false
+                        # Readonly globals still produce inferred Global.Read rows in
+                        # the authority checker. Until that fact has its own kind, fail
+                        # closed instead of treating a name as a pure value.
+                        return false
+                    Expr.Paren(_, _):
+                        # The authority walker has a recursive expression-depth limit.
+                        # Until this collector tracks the same depth, parenthesized trees
+                        # stay cold even when their leaves are otherwise supported.
+                        return false
+                    Expr.Call(callee, arguments, labels, position):
+                        return false if arguments.count != 0 or labels.count != 0
+                        if callee is Ast::Expr.Ident(name, _):
+                            # `panic` is reserved by the lexer, so source cannot bind a local of that name.
+                            # A local function value shadows the translation-unit declaration
+                            # and builtins; never cache a call selected by name alone.
+                            return false if ifc_contains(locals, name) or ifc_string_name_contains(all_globals, name, all_globals_index)
+                            anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                            if anchor != INCREMENTAL_NO_ANCHOR:
+                                if ifc_call_target(candidates, name, candidate_names):
+                                    ifc_push_fact[snapshot_region, candidate_borrow, path_region](snapshot, owner, IncrementalFactKind.DirectCall, name, path, anchor)
+                                    return true
+                                if name == "panic":
+                                    ifc_push_fact[snapshot_region, candidate_borrow, path_region](snapshot, owner, IncrementalFactKind.PanicSite, "Abort.Panic", path, anchor)
+                                    return true
+                        return false
+                    _:
+                        return false
+
+        def ifc_walk_body[@snapshot_region, @candidate_borrow, @path_region, @scratch_region](statements: darray[Ast::Stmt], owner: usize, path: sview @path_region, body_start: usize, body_end: usize, tokens: darray[Lexer::Token]& @candidate_borrow, locals: mutable darray[sview @candidate_borrow]& @scratch_region, all_globals: darray[sview @candidate_borrow]& @candidate_borrow, all_globals_index: IncrementalStringNameIndex[candidate_borrow]& @candidate_borrow, mutable_globals: darray[sview @candidate_borrow]& @candidate_borrow, mutable_globals_index: IncrementalStringNameIndex[candidate_borrow]& @candidate_borrow, candidates: darray[IncrementalFactCandidate]& @candidate_borrow, candidate_names: IncrementalCandidateNameIndex[candidate_borrow]& @candidate_borrow, snapshot: mutable IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |locals, snapshot|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            return false if not ifc_walk_expr[snapshot_region, candidate_borrow, path_region, scratch_region](expression, owner, path, body_start, body_end, tokens, locals, all_globals, all_globals_index, mutable_globals, mutable_globals_index, candidates, candidate_names, snapshot)
+                        Stmt.Return(value, _):
+                            if value is result:
+                                return false if not ifc_walk_expr[snapshot_region, candidate_borrow, path_region, scratch_region](result, owner, path, body_start, body_end, tokens, locals, all_globals, all_globals_index, mutable_globals, mutable_globals_index, candidates, candidate_names, snapshot)
+                        Stmt.VarDecl(name, type_expression, value, _):
+                            return false if ifc_contains(locals, name)
+                            # A typed/mutable place or an identifier initializer can
+                            # make ga_write_place infer a Global.Write row. Keep v0 local
+                            # declarations to untyped literal bindings only.
+                            return false if:
+                                not (type_expression is Expr.Absent or type_expression is Expr.Invalid)
+                                not (value is Expr.IntLit or value is Expr.FloatLit or value is Expr.StringLit or value is Expr.CharLit or value is Expr.BoolLit)
+                            locals.push(name)
+                        Stmt.Assign(target, operator, value, _):
+                            if operator == TokenKind.Assign:
+                                # Keep every plain `=` assignment cold, including a
+                                # literal assignment to an apparent local. Resolver,
+                                # Global-permission, and Global-authority walks disagree
+                                # about fresh identifier targets and module/import names
+                                # are not covered by the translation-unit global index.
+                                # Literal Stmt.VarDecl bindings remain independently safe.
+                                return false
+                            else:
+                                return false if:
+                                    operator != TokenKind.LArrow
+                                    not ifc_walk_expr[snapshot_region, candidate_borrow, path_region, scratch_region](value, owner, path, body_start, body_end, tokens, locals, all_globals, all_globals_index, mutable_globals, mutable_globals_index, candidates, candidate_names, snapshot)
+                                if target is Ast::Expr.Ident(name, position):
+                                    # A local may be a reference parameter whose write
+                                    # reaches a caller's mutable global. Keep local LArrow
+                                    # assignments cold until parameter aliasing is modeled.
+                                    if ifc_contains(locals, name):
+                                        return false
+                                    elif ifc_string_name_contains(mutable_globals, name, mutable_globals_index):
+                                        anchor: u32 = ifc_anchor(tokens, body_start, body_end, position.offset)
+                                        if anchor != INCREMENTAL_NO_ANCHOR:
+                                            ifc_push_fact[snapshot_region, candidate_borrow, path_region](snapshot, owner, IncrementalFactKind.GlobalWrite, name, path, anchor)
+                                        else:
+                                            return false
+                                    else:
+                                        return false
+                                else:
+                                    return false
+                        Stmt.Block(_, _, _, _, _):
+                            # Nested block depth has independent diagnostics in semantic
+                            # walkers; do not skip those walkers until that budget is part
+                            # of the current-source fact proof.
+                            return false
+                        _:
+                            return false
+                return true
+
+        def ifc_scan_candidate[@snapshot_region, @candidate_borrow, @path_region, @scratch_region](index: usize, candidates: darray[IncrementalFactCandidate]& @candidate_borrow, candidate_names: IncrementalCandidateNameIndex[candidate_borrow]& @candidate_borrow, path: sview @path_region, tokens: darray[Lexer::Token]& @candidate_borrow, all_globals: darray[sview @candidate_borrow]& @candidate_borrow, all_globals_index: IncrementalStringNameIndex[candidate_borrow]& @candidate_borrow, mutable_globals: darray[sview @candidate_borrow]& @candidate_borrow, mutable_globals_index: IncrementalStringNameIndex[candidate_borrow]& @candidate_borrow, locals: mutable darray[sview @candidate_borrow]& @scratch_region, snapshot: mutable IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region) -> void:
+            can Memory.Allocate, Abort.Panic:
+                candidate: IncrementalFactCandidate = candidates[index]
+                owner: usize = candidate.owner
+                fact_start: usize = snapshot.direct_facts.count
+                grant_start: usize = snapshot.active_grants.count
+                bytes_start: usize = snapshot.bytes.count
+                supported: mutable bool = candidate.header_supported and candidate.body_token_start < candidate.body_token_end
+                locals.truncate(0)
+                for parameter in candidate.parameters |locals|:
+                    locals.push(parameter.name)
+                if supported:
+                    supported <- ifc_walk_body[snapshot_region, candidate_borrow, path_region, scratch_region](candidate.body, owner, path, candidate.body_token_start, candidate.body_token_end, tokens, locals, all_globals, all_globals_index, mutable_globals, mutable_globals_index, candidates, candidate_names, snapshot)
+                snapshot.bodies_visited <- snapshot.bodies_visited + 1
+                if not supported:
+                    snapshot.direct_facts.truncate(fact_start)
+                    snapshot.active_grants.truncate(grant_start)
+                    snapshot.bytes.truncate(bytes_start)
+                snapshot.functions[owner].direct_fact_start <- fact_start
+                snapshot.functions[owner].direct_fact_count <- snapshot.direct_facts.count - fact_start
+                snapshot.functions[owner].cacheable <- supported
+                snapshot.functions[owner].matched_previous <- false
+                if candidate.header_supported:
+                    snapshot.functions[owner].reject_reason <- IncrementalRejectReason.None if supported else IncrementalRejectReason.UnsupportedBodySyntax
+                snapshot.bodies_rejected <- snapshot.bodies_rejected + 1 if not supported

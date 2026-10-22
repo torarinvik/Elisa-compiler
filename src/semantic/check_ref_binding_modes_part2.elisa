@@ -1,0 +1,197 @@
+extend Semantic:
+    private:
+        # The type of a value expression as stage0 prints it, or a decline (no PRESENT).
+        def rbm_spell_value(expression: Ast::Expr, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, lookup: ReadonlyFunctionIndex&, table: SymbolTable&) -> RefSpelling:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(int_value, int_pos):
+                        return RefSpelling{elem: "int", flags: RBM_PRESENT}
+                    Expr.FloatLit(float_text, float_pos):
+                        return RefSpelling{elem: "f64", flags: RBM_PRESENT}
+                    Expr.BoolLit(bool_value, bool_pos):
+                        return RefSpelling{elem: "bool", flags: RBM_PRESENT}
+                    Expr.CharLit(char_text, char_pos):
+                        return RefSpelling{elem: "char", flags: RBM_PRESENT}
+                    Expr.StringLit(string_text, string_pos):
+                        return RefSpelling{elem: "u8", flags: RBM_PRESENT | RBM_REF | RBM_STATIC}
+                    Expr.Ident(name, ident_pos):
+                        binding: RefBinding = rbm_lookup(bindings, name, table)
+                        return rbm_decline() if binding.mode == RBM_MODE_OPAQUE or binding.elem == ""
+                        return RefSpelling{elem: binding.elem, flags: RBM_PRESENT} if binding.mode == RBM_MODE_VALUE or binding.mode == RBM_MODE_VALUE_MUTABLE
+                        return RefSpelling{elem: binding.elem, flags: binding.current | RBM_PRESENT}
+                    Expr.Binary(left, operator, right, binary_pos):
+                        return RefSpelling{elem: "bool", flags: RBM_PRESENT} if rbm_is_comparison(operator)
+                        return rbm_decline() if not rbm_is_arithmetic(operator)
+                        left_value: RefSpelling = rbm_spell_value(left, bindings, callee_names, callee_owners, positions, lookup, table)
+                        right_value: RefSpelling = rbm_spell_value(right, bindings, callee_names, callee_owners, positions, lookup, table)
+                        return rbm_decline() if:
+                            (left_value.flags & RBM_PRESENT) == 0 or (right_value.flags & RBM_PRESENT) == 0
+                            (left_value.flags & RBM_REF) != 0 or (right_value.flags & RBM_REF) != 0
+                        return RefSpelling{elem: right_value.elem, flags: RBM_PRESENT} if left_value.elem == "int"
+                        return RefSpelling{elem: left_value.elem, flags: RBM_PRESENT}
+                    Expr.Unary(operator, operand, unary_pos):
+                        return RefSpelling{elem: "bool", flags: RBM_PRESENT} if operator == TokenKind.Not
+                        return rbm_spell_borrow(operand, bindings, table) if operator == TokenKind.Ampersand
+                        if operator == TokenKind.Minus or operator == TokenKind.Tilde:
+                            negated: RefSpelling = rbm_spell_value(operand, bindings, callee_names, callee_owners, positions, lookup, table)
+                            return rbm_decline() if (negated.flags & RBM_REF) != 0
+                            return negated
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        returned: RefSpelling = rbm_return_row(callee, bindings, callee_names, callee_owners, positions, lookup, table)
+                        return rbm_decline() if returned.flags == 0
+                        return rbm_value_or_decline(RefSpelling{elem: returned.elem, flags: returned.flags | RBM_PRESENT})
+                    Expr.Construct(construct_type, construct_fields, construct_pos):
+                        if construct_type is Ast::Expr.Ident(struct_name, _):
+                            return RefSpelling{elem: struct_name, flags: RBM_PRESENT}
+                    Expr.Paren(inner, paren_pos):
+                        return rbm_spell_value(inner, bindings, callee_names, callee_owners, positions, lookup, table)
+                    Expr.Index(object, index, index_pos):
+                        if object is Ast::Expr.Field(cast_source, cast_field, _):
+                            if cast_field == "cast":
+                                target_type: RefSpelling = rbm_type_spelling(index)
+                                # stage0 keeps a MUTABLE reference operand's write capability
+                                # through a cast to a reference type that does not spell it:
+                                # `(&x).cast[void&]` of a `mutable` x is a `mutable void&`. An
+                                # operand this pass cannot spell leaves that capability unknown.
+                                if (target_type.flags & RBM_REF) != 0 and (target_type.flags & RBM_MUTABLE) == 0:
+                                    operand: RefSpelling = rbm_spell_value(cast_source, bindings, callee_names, callee_owners, positions, lookup, table)
+                                    return rbm_decline() if (operand.flags & RBM_PRESENT) == 0
+                                    return RefSpelling{elem: target_type.elem, flags: target_type.flags | RBM_MUTABLE} if (operand.flags & RBM_REF) != 0 and (operand.flags & RBM_MUTABLE) != 0
+                                return rbm_value_or_decline(target_type)
+                    Expr.Field(object, field, field_pos):
+                        row: u32 = rbm_field_row(bindings, rbm_expr_struct(object, bindings, table), field, table)
+                        return rbm_decline() if row == RBM_NONE
+                        field_type: RefSpelling = rbm_type_spelling(table.private_field_types[row.usize()])
+                        return field_type if (field_type.flags & RBM_REF) != 0
+                        return rbm_value_or_decline(RefSpelling{elem: field_type.elem, flags: rbm_clear(field_type.flags, RBM_MUTABLE)})
+                    _:
+                        pass
+                return rbm_decline()
+
+
+        def rbm_numeric(elem: sview) -> bool:
+            can Abort.Panic:
+                named_numeric: bool = when elem:
+                    "int" | "char" | "isize" | "usize" | "uintptr" | "f32" | "f64" -> true
+                    _ -> false
+                return true if named_numeric
+                length: usize = elem.len
+                return false if length < 2
+                head: u8 = elem[0]
+                return false if head != 105 and head != 117
+                digits: bool =
+                    for probe in 1..<length |ok: bool = true| -> ok:
+                        ok <- false if elem[probe] < 48 or elem[probe] > 57
+                return digits
+
+
+        # A type whose identity this pass can compare: a primitive or a declared struct or
+        # enum. Not sview/dstr/void, an alias, a generic parameter, or a name it cannot see.
+        def rbm_concrete(elem: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return true if rbm_numeric(elem) or elem == "bool" or elem == "cstr"
+                row: mutable u32 = symbol_chain_head(table, elem)
+                while row != SYMBOL_INDEX_ROW_NONE |row|:
+                    symbol: Semantic::Symbol = table.symbols[row.usize()]
+                    return true if symbol.name == elem and (symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum)
+                    row <- table.symbol_name_next[row.usize()]
+                return false
+
+
+        # Whether SOURCE may be stored where TARGET is expected. NO only when stage0's rule is
+        # certain to reject; anything this pass cannot compare is UNKNOWN.
+        def rbm_assignable(target: RefSpelling, source: RefSpelling, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                return RBM_UNKNOWN if:
+                    (target.flags & RBM_PRESENT) == 0 or (source.flags & RBM_PRESENT) == 0
+                    target.elem == "" or source.elem == ""
+                target_ref: bool = (target.flags & RBM_REF) != 0
+                source_ref: bool = (source.flags & RBM_REF) != 0
+                if target_ref and source_ref:
+                    return RBM_NO if:
+                        target.elem != source.elem and rbm_concrete(target.elem, table) and rbm_concrete(source.elem, table)
+                        (target.flags & RBM_MUTABLE) != 0 and (source.flags & RBM_MUTABLE) == 0
+                        (target.flags & RBM_NULLABLE) == 0 and (source.flags & RBM_NULLABLE) != 0
+                    target_storage: u32 = target.flags & RBM_STORAGE
+                    source_storage: u32 = source.flags & RBM_STORAGE
+                    return RBM_NO if target_storage != 0 and source_storage != 0 and target_storage != source_storage
+                    return RBM_UNKNOWN if target.elem != source.elem
+                    return RBM_YES
+                if not target_ref and not source_ref:
+                    return RBM_YES if:
+                        target.elem == source.elem
+                        rbm_numeric(target.elem) and rbm_numeric(source.elem)
+                    return RBM_UNKNOWN if not rbm_concrete(target.elem, table) or not rbm_concrete(source.elem, table)
+                    return RBM_NO
+                if not target_ref:
+                    return RBM_UNKNOWN if not rbm_concrete(target.elem, table)
+                    return RBM_NO if (source.flags & RBM_NULLABLE) != 0
+                    if rbm_numeric(source.elem) or source.elem == "bool":
+                        return RBM_YES if target.elem == source.elem
+                        return RBM_NO
+                    return RBM_UNKNOWN
+                return RBM_UNKNOWN if source.elem == "cstr" or not rbm_concrete(source.elem, table)
+                return RBM_NO
+
+
+        # Whether a function declaration is generic: its signature types name parameters this
+        # pass cannot resolve per call, so its rows carry no element.
+        def rbm_function_is_generic(line: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for generic_line in table.generic_param_lines:
+                    return true if generic_line == line
+                return false
+
+
+        # The spelling a callee row carries: the declared type, with the element dropped for a
+        # generic function and a `void` return spelled as nothing.
+        def rbm_signature_spelling(type_expression: Ast::Expr, generic: bool) -> RefSpelling:
+            can Abort.Panic:
+                spelled: RefSpelling = rbm_type_spelling(type_expression)
+                return rbm_decline() if (spelled.flags & RBM_REF) == 0 and spelled.elem == "void"
+                return RefSpelling{elem: "", flags: spelled.flags} if generic
+                return spelled
+
+
+        # The parameter at POSITION of CALLEE in OWNER, when every declaration with that name
+        # agrees it is the same `mutable` reference; a decline otherwise.
+        def rbm_param_row(callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, type_names: darray[sview @source]&, lookup: ReadonlyFunctionIndex&, bindings: RefBindingScope&, callee: sview, owner: sview, position: usize) -> RefSpelling:
+            can Abort.Panic:
+                found: mutable bool = false
+                result_type: mutable sview = ""
+                result: mutable RefSpelling = rbm_decline()
+                row: mutable u32 = readonly_function_index_head(lookup, callee)
+                while row != READONLY_FUNCTION_ROW |row, found, result_type, result|:
+                    at: usize = row.usize()
+                    if callee_names[at] == callee and callee_owners[at] == owner and positions[at] == position.u32():
+                        return rbm_decline() if type_names[at] == ""
+                        if not found:
+                            found <- true
+                            result_type <- type_names[at]
+                            result <- RefSpelling{elem: bindings.call_elems[at], flags: bindings.call_flags[at]}
+                        elif result_type != type_names[at] or result.elem != bindings.call_elems[at] or result.flags != bindings.call_flags[at]:
+                            return rbm_decline()
+                    row <- lookup.next[at]
+                return result
+
+
+        # The return type of the function a call resolves to; a decline when the call does not
+        # resolve or two declarations of it disagree.
+        def rbm_return_row(callee: Ast::Expr, bindings: RefBindingScope&, callee_names: darray[sview]&, callee_owners: darray[sview]&, positions: darray[u32]&, lookup: ReadonlyFunctionIndex&, table: SymbolTable&) -> RefSpelling:
+            can Abort.Panic:
+                target_name: mutable sview = ""
+                target_owner: mutable sview = ""
+                return rbm_decline() if not readonly_callee_target(callee, callee_names, callee_owners, positions, lookup, table.current_module, &target_name, &target_owner, table)
+                found: mutable bool = false
+                result: mutable RefSpelling = rbm_decline()
+                row: mutable u32 = readonly_function_index_head(lookup, target_name)
+                while row != READONLY_FUNCTION_ROW |row, found, result|:
+                    at: usize = row.usize()
+                    if positions[at] == READONLY_FUNCTION_ROW and callee_names[at] == target_name and callee_owners[at] == target_owner:
+                        if not found:
+                            found <- true
+                            result <- RefSpelling{elem: bindings.call_elems[at], flags: bindings.call_flags[at]}
+                        elif result.elem != bindings.call_elems[at] or result.flags != bindings.call_flags[at]:
+                            return rbm_decline()
+                    row <- lookup.next[at]
+                return result

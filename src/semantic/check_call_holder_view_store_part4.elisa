@@ -1,0 +1,403 @@
+extend Semantic:
+    private:
+        # Pattern binders at the root carry the scrutinee's direct and contained
+        # provenance separately. Nested payload bindings stay conservative because
+        # the checker has no field type information.
+        def chv_flow_bind_pattern_name(name: sview, root_pattern: bool, root_may_owned_view: bool, root_may_direct_alias_reference: bool, root_may_contain_alias_reference: bool, flow: mutable CHVViewFlow&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if name != "":
+                    bound_may_direct_alias_reference: bool = root_may_direct_alias_reference if root_pattern else true
+                    bound_may_contain_alias_reference: bool = root_may_contain_alias_reference if root_pattern else true
+                    chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern else true, bound_may_direct_alias_reference or bound_may_contain_alias_reference)
+                    bound_index: usize = chv_flow_latest(flow, name)
+                    flow.may_direct_alias_reference[bound_index] <- bound_may_direct_alias_reference if bound_index < flow.names.count
+                    flow.may_contain_alias_reference[bound_index] <- bound_may_contain_alias_reference if bound_index < flow.names.count
+
+        def chv_flow_bind_pattern(pattern: Ast::Pattern, root_pattern: bool, root_may_owned_view: bool, root_may_direct_alias_reference: bool, root_may_contain_alias_reference: bool, flow: mutable CHVViewFlow&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.Rest(name) | Pattern.TypeBind(_, name):
+                        chv_flow_bind_pattern_name(name, root_pattern, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
+                    Pattern.As(name, inner):
+                        chv_flow_bind_pattern_name(name, root_pattern, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
+                        for child in inner |flow|:
+                            chv_flow_bind_pattern(child, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
+                    Pattern.Variant(_, fields) | Pattern.Tuple(fields) | Pattern.Or(fields):
+                        for field in fields |flow|:
+                            chv_flow_bind_pattern(field, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
+                    Pattern.Struct(_, fields):
+                        for field in fields |flow|:
+                            chv_flow_bind_pattern(field, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
+                    Pattern.Field(_, inner):
+                        for child in inner |flow|:
+                            chv_flow_bind_pattern(child, false, root_may_owned_view, root_may_direct_alias_reference, root_may_contain_alias_reference, flow)
+                    _:
+                        pass
+
+        def chv_flow_bind_truthy_condition_binders(condition: Ast::Expr, ref_params: darray[sview]&, flow: mutable CHVViewFlow&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview @source] = []
+                gather_truthy_condition_bindings(condition, table, names)
+                for name in names |flow, table|:
+                    facts: (found: bool, may_owned_view: bool, may_alias_reference: bool) = chv_truthy_binding_facts(condition, name, ref_params, flow, table)
+                    # A gathered true-path binder should resolve to a source fact. If
+                    # the syntax helper cannot recover it, fail closed rather than
+                    # dropping provenance on the new binding.
+                    chv_flow_bind(flow, name, false, facts.may_owned_view or not facts.found, facts.may_alias_reference or not facts.found)
+
+        def chv_check_static_effect_call(candidates: darray[Ast::StaticEffectCandidate], arguments: darray[Ast::Expr], argument_names: darray[sview], runtime_owned_views: darray[bool], runtime_may_alias_refs: darray[bool], ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                argument_offset: mutable usize = 0
+                for candidate in candidates |argument_offset|:
+                    argument_offset <- argument_offset + candidate.captures.count
+                candidate_capture_offset: mutable usize = 0
+                for candidate in candidates |table, flow, candidate_capture_offset| -> table:
+                    candidate_arguments: mutable darray[Ast::Expr] = []
+                    candidate_owned_views: mutable darray[bool] = []
+                    candidate_may_alias_refs: mutable darray[bool] = []
+                    candidate_arguments.extend(candidate.captures)
+                    candidate_arguments.extend(arguments)
+                    for capture_index in 0..<candidate.captures.count |candidate_owned_views, candidate_may_alias_refs|:
+                        candidate_owned_views.push(runtime_owned_views[candidate_capture_offset + capture_index]) if candidate_capture_offset + capture_index < runtime_owned_views.count else candidate_owned_views.push(true)
+                        candidate_may_alias_refs.push(runtime_may_alias_refs[candidate_capture_offset + capture_index]) if candidate_capture_offset + capture_index < runtime_may_alias_refs.count else candidate_may_alias_refs.push(true)
+                    for argument_index in 0..<arguments.count |candidate_owned_views, candidate_may_alias_refs|:
+                        candidate_owned_views.push(runtime_owned_views[argument_offset + argument_index]) if argument_offset + argument_index < runtime_owned_views.count else candidate_owned_views.push(true)
+                        candidate_may_alias_refs.push(runtime_may_alias_refs[argument_offset + argument_index]) if argument_offset + argument_index < runtime_may_alias_refs.count else candidate_may_alias_refs.push(true)
+                    chv_check_call_target(candidate.callee, candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table) if not chv_call_has_named_arguments(argument_names)
+                    chv_check_unknown_call(candidate_arguments, candidate_owned_views, candidate_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table) if chv_call_has_named_arguments(argument_names)
+                    candidate_capture_offset <- candidate_capture_offset + candidate.captures.count
+
+        def chv_walk_expression(expression: Ast::Expr, in_region: bool, ref_params: darray[sview]&, binders: darray[sview]&, owned: darray[sview]&, view_names: darray[sview]&, view_values: darray[Ast::Expr]&, flow: mutable CHVViewFlow&, summary: StoreThroughSummary&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                flow.last_value_may_be_owned_view <- false
+                match expression:
+                    Expr.Invalid:
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Absent:
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.IntLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.FloatLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.StringLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.CharLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.BoolLit(_, _):
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Ident(identifier_name, _):
+                        flow.last_value_may_be_owned_view <- chv_is_owned_view(expression, flow, 0)
+                    Expr.Call(callee, arguments, _, _):
+                        result_may_be_owned_view: mutable bool = chv_is_owned_view(expression, flow, 0)
+                        method_found, method_name = chv_call_method_info(callee, 0)
+                        mutator_root: sview = chv_mutator_receiver_root_from_callee(callee, 0) if method_found else ""
+                        receiver_may_be_owned_view: mutable bool = false
+                        receiver_may_alias_reference: mutable bool = false
+                        callee_may_be_owned_view: mutable bool = false
+                        table <- chv_walk_call_callee(callee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_may_be_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)
+                        result_may_be_owned_view <- chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == "as_sview" or method_name == "as_cstr" or method_name == "view")) or callee_may_be_owned_view
+                        arguments_may_be_owned_view: mutable bool = false
+                        arguments_may_contain_alias_reference: mutable bool = false
+                        argument_owned_views: mutable darray[bool] = []
+                        argument_may_alias_refs: mutable darray[bool] = []
+                        for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:
+                            table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view
+                            argument_owned_views.push(flow.last_value_may_be_owned_view)
+                            argument_may_alias_refs.push(chv_expression_may_alias_ref(argument, ref_params, flow, table, 0))
+                            arguments_may_contain_alias_reference <- arguments_may_contain_alias_reference or chv_expression_may_contain_alias_ref(argument, ref_params, flow, table, 0)
+                        table <- chv_check_call(expression, argument_owned_views, argument_may_alias_refs, receiver_may_be_owned_view, receiver_may_alias_reference, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        if mutator_root != "":
+                            mutator_index: usize = chv_flow_latest(flow, mutator_root)
+                            if mutator_index < flow.names.count:
+                                flow.shape_unknown[mutator_index] <- true
+                                if chv_collection_mutator_adds_values(method_name):
+                                    flow.may_contain_alias_reference[mutator_index] <- flow.may_contain_alias_reference[mutator_index] or arguments_may_contain_alias_reference
+                                # An inferred literal's exact element-yield fact no longer
+                                # describes the mutated collection. Explicit element types
+                                # remain authoritative and are read from binding_types.
+                                flow.may_yield_alias_reference_known[mutator_index] <- false if mutator_index >= flow.binding_type_known.count or not flow.binding_type_known[mutator_index]
+                        flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view
+                    Expr.StaticEffectCall(candidates: candidates, arguments: arguments, argument_names: argument_names, _):
+                        runtime_children: darray[Ast::Expr] = Ast::effect_runtime_children(candidates, arguments)
+                        runtime_may_be_owned_view: mutable bool = false
+                        runtime_owned_views: mutable darray[bool] = []
+                        runtime_may_alias_refs: mutable darray[bool] = []
+                        for child in runtime_children |table, runtime_owned_views, runtime_may_alias_refs|:
+                            table <- chv_walk_expression(child, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            runtime_may_be_owned_view <- runtime_may_be_owned_view or flow.last_value_may_be_owned_view
+                            runtime_owned_views.push(flow.last_value_may_be_owned_view)
+                            runtime_may_alias_refs.push(chv_expression_may_alias_ref(child, ref_params, flow, table, 0))
+                        table <- chv_check_static_effect_call(candidates, arguments, argument_names, runtime_owned_views, runtime_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- runtime_may_be_owned_view
+                    Expr.Field(object, _, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- flow.last_value_may_be_owned_view or chv_is_owned_view(expression, flow, 0)
+                    Expr.Scope(base, _, _):
+                        table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.ShorthandMember(_, _):
+                        pass
+                    Expr.Index(object, index, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        object_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        object_may_alias_ref: bool = chv_expression_may_alias_ref(object, ref_params, flow, table, 0)
+                        index_may_be_owned_view: mutable bool = false
+                        if not index_receiver_is_type_application(object):
+                            table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            index_may_be_owned_view <- flow.last_value_may_be_owned_view
+                            index_may_alias_ref: bool = chv_expression_may_alias_ref(index, ref_params, flow, table, 0)
+                            indexed_arguments: darray[Ast::Expr] = [object, index]
+                            indexed_owned_views: darray[bool] = [object_may_be_owned_view, index_may_be_owned_view]
+                            indexed_alias_refs: darray[bool] = [object_may_alias_ref, index_may_alias_ref]
+                            table <- chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)
+                        flow.last_value_may_be_owned_view <- object_may_be_owned_view or index_may_be_owned_view or chv_is_owned_view(expression, flow, 0)
+                    Expr.Slice(object, low, high, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        object_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        table <- chv_walk_expression(low, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        table <- chv_walk_expression(high, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- object_may_be_owned_view or chv_is_owned_view(expression, flow, 0)
+                    Expr.IndexN(object, arguments, _):
+                        table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        object_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        if not index_receiver_is_type_application(object):
+                            for argument in arguments |table|:
+                                table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        # Multi-argument subscripts select from the receiver and do not invoke
+                        # __index__; visiting each runtime selector above is sufficient.
+                        flow.last_value_may_be_owned_view <- object_may_be_owned_view or chv_is_owned_view(expression, flow, 0)
+                    Expr.Binary(left, binary_operator, right, _):
+                        table <- chv_walk_expression(left, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        left_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        left_may_alias_ref: bool = chv_expression_may_alias_ref(left, ref_params, flow, table, 0)
+                        binary_rhs_is_runtime_value: bool = not chv_binary_operator_has_non_runtime_target(binary_operator)
+                        right_may_be_owned_view: mutable bool = false
+                        right_may_alias_ref: mutable bool = false
+                        if binary_rhs_is_runtime_value:
+                            if binary_operator == TokenKind.And:
+                                visible_count: usize = flow.names.count
+                                right_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                                chv_flow_bind_truthy_condition_binders(left, ref_params, &right_flow, table)
+                                table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, &right_flow, summary, table)
+                                right_may_be_owned_view <- right_flow.last_value_may_be_owned_view
+                                right_may_alias_ref <- chv_expression_may_alias_ref(right, ref_params, right_flow, table, 0)
+                                # The RHS runs only when the left side is true. Join its
+                                # possible writes into bindings that were visible before
+                                # adding the temporary pattern binders.
+                                chv_flow_merge(flow, right_flow, visible_count)
+                            if binary_operator != TokenKind.And:
+                                table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                                right_may_be_owned_view <- flow.last_value_may_be_owned_view
+                                right_may_alias_ref <- chv_expression_may_alias_ref(right, ref_params, flow, table, 0)
+                        binary_arguments: darray[Ast::Expr] = [left, right]
+                        binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]
+                        binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]
+                        # `and`/`or` are not overloadable and only test their operands; they
+                        # cannot store one operand through the other.
+                        if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:
+                            table <- chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)
+                        # Boolean operators inspect their operands but return a bool. Other
+                        # operators preserve possible view provenance from structured children
+                        # that the syntax-only helper cannot reconstruct.
+                        binary_result_is_bool: bool = chv_binary_operator_returns_bool(binary_operator, right)
+                        flow.last_value_may_be_owned_view <- (left_may_be_owned_view or right_may_be_owned_view) if not binary_result_is_bool else false
+                    Expr.Unary(operator, operand, _):
+                        # Unary negation has one operand, so the store-through checker has no
+                        # distinct source/target argument pair to inspect. Preserve the operand's
+                        # reference and owned-view provenance through the operator result instead.
+                        table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        operand_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        unary_result_may_be_owned_view: bool = operator != TokenKind.Not
+                        flow.last_value_may_be_owned_view <- operand_may_be_owned_view and unary_result_may_be_owned_view
+                    Expr.Move(operand, _):
+                        table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.RegionNew(operand, _, _):
+                        table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- false
+                    Expr.Paren(inner, _):
+                        table <- chv_walk_expression(inner, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                    Expr.Array(elements, _):
+                        aggregate_may_be_owned_view: mutable bool = false
+                        for element in elements |table, aggregate_may_be_owned_view, flow| -> table:
+                            table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view
+                        flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view
+                    Expr.Tuple(elements, _):
+                        aggregate_may_be_owned_view: mutable bool = false
+                        for element in elements |table, aggregate_may_be_owned_view, flow| -> table:
+                            table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view
+                        flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view
+                    Expr.SetLit(elements, _):
+                        aggregate_may_be_owned_view: mutable bool = false
+                        for element in elements |table, aggregate_may_be_owned_view, flow| -> table:
+                            table <- chv_walk_expression(element, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view
+                        flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view
+                    Expr.DictLit(entries, _):
+                        aggregate_may_be_owned_view: mutable bool = false
+                        for entry in entries |table, aggregate_may_be_owned_view, flow| -> table:
+                            table <- chv_walk_expression(entry.key, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            key_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                            table <- chv_walk_expression(entry.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            aggregate_may_be_owned_view <- aggregate_may_be_owned_view or key_may_be_owned_view or flow.last_value_may_be_owned_view
+                        flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view
+                    Expr.Construct(_, fields, _):
+                        aggregate_may_be_owned_view: mutable bool = false
+                        for field in fields |table, aggregate_may_be_owned_view, flow| -> table:
+                            table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view
+                        flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        aggregate_may_be_owned_view: mutable bool = flow.last_value_may_be_owned_view
+                        for field in fields |table, aggregate_may_be_owned_view, flow| -> table:
+                            table <- chv_walk_expression(field.value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                            aggregate_may_be_owned_view <- aggregate_may_be_owned_view or flow.last_value_may_be_owned_view
+                        flow.last_value_may_be_owned_view <- aggregate_may_be_owned_view
+                    Expr.If(condition, then_value, else_value, _):
+                        table <- chv_walk_expression(condition, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        branch_mark: usize = flow.names.count
+                        then_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        else_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        chv_flow_bind_truthy_condition_binders(condition, ref_params, &then_flow, table)
+                        table <- chv_walk_expression(then_value, in_region, ref_params, binders, owned, view_names, view_values, &then_flow, summary, table)
+                        table <- chv_walk_expression(else_value, in_region, ref_params, binders, owned, view_names, view_values, &else_flow, summary, table)
+                        branch_value_may_be_owned: bool = then_flow.last_value_may_be_owned_view or else_flow.last_value_may_be_owned_view
+                        chv_flow_set_merge(flow, &then_flow, &else_flow, branch_mark)
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Match(scrutinee, arms, _):
+                        table <- chv_walk_expression(scrutinee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        scrutinee_may_be_owned_view: bool = flow.last_value_may_be_owned_view
+                        scrutinee_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(scrutinee, ref_params, flow, table, 0)
+                        scrutinee_may_contain_alias_reference: bool = chv_expression_may_contain_alias_ref(scrutinee, ref_params, flow, table, 0)
+                        branch_mark: usize = flow.names.count
+                        entry_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        merged_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        merged_ready: mutable bool = false
+                        branch_value_may_be_owned: mutable bool = false
+                        for arm in arms |table, branch_value_may_be_owned, merged_flow, merged_ready| -> table:
+                            arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
+                            chv_flow_bind_pattern(arm.pattern, true, scrutinee_may_be_owned_view, scrutinee_may_direct_alias_reference, scrutinee_may_contain_alias_reference, arm_flow)
+                            table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
+                            table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
+                            branch_value_may_be_owned <- branch_value_may_be_owned or arm_flow.last_value_may_be_owned_view
+                            if not merged_ready:
+                                chv_flow_set_merge(&merged_flow, &arm_flow, &arm_flow, branch_mark)
+                                merged_ready <- true
+                            else:
+                                chv_flow_merge(&merged_flow, &arm_flow, branch_mark)
+                        chv_flow_set_merge(flow, &merged_flow, &merged_flow, branch_mark) if merged_ready
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Catch(guarded, arms, _):
+                        branch_mark: usize = flow.names.count
+                        entry_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        guarded_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
+                        table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, &guarded_flow, summary, table)
+                        branch_value_may_be_owned: mutable bool = guarded_flow.last_value_may_be_owned_view
+                        guarded_may_direct_alias_reference: bool = chv_expression_may_direct_alias_ref(guarded, ref_params, guarded_flow, table, 0)
+                        guarded_may_contain_alias_reference: bool = chv_expression_may_contain_alias_ref(guarded, ref_params, guarded_flow, table, 0)
+                        merged_flow: mutable CHVViewFlow = chv_flow_clone(guarded_flow)
+                        arm_index: mutable usize = 0
+                        for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:
+                            arm_flow: mutable CHVViewFlow = chv_flow_clone(entry_flow)
+                            chv_flow_merge(&arm_flow, &guarded_flow, branch_mark)
+                            is_success_arm: bool = arm_index == 0
+                            # Catch arm zero binds the guarded success value. Later arms
+                            # bind error variants and cannot reuse success provenance; with
+                            # no error payload types, keep their roots conservatively tainted.
+                            chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_direct_alias_reference if is_success_arm else true, guarded_may_contain_alias_reference if is_success_arm else true, arm_flow)
+                            table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
+                            table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, &arm_flow, summary, table)
+                            branch_value_may_be_owned <- branch_value_may_be_owned or arm_flow.last_value_may_be_owned_view
+                            chv_flow_merge(&merged_flow, &arm_flow, branch_mark)
+                            arm_index <- arm_index + 1
+                        chv_flow_set_merge(flow, &guarded_flow, &merged_flow, branch_mark)
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Comprehension(variable, iterable, condition, body, _, _):
+                        table <- chv_walk_expression(iterable, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        element_facts: (known: bool, may_owned_view: bool, may_alias_reference: bool, may_contain_alias_reference: bool, may_be_scalar_sview: bool, may_yield_scalar_sview: bool) = chv_iterable_binding_facts(iterable, 0, false, ref_params, flow, table, view_names, view_values)
+                        iterable_may_yield_owned_view: bool = element_facts.may_owned_view if element_facts.known else chv_iterable_element_may_be_owned_view(iterable, flow, view_names, view_values, flow.last_value_may_be_owned_view, 0)
+                        iterable_may_yield_alias_reference: bool = element_facts.may_alias_reference if element_facts.known else chv_iterable_element_may_alias_reference(iterable, ref_params, flow, table, 0)
+                        iterable_may_contain_alias_reference: bool = element_facts.may_contain_alias_reference if element_facts.known else chv_iterable_element_may_contain_alias_ref(iterable, ref_params, flow, table, 0)
+                        iterable_element_is_scalar_sview: bool = element_facts.may_be_scalar_sview if element_facts.known else chv_iterable_element_is_scalar_sview(iterable, flow, view_names, view_values, 0)
+                        iterable_element_yields_scalar_sview: bool = element_facts.may_yield_scalar_sview if element_facts.known else chv_iterable_element_yields_scalar_sview(iterable, flow, view_names, view_values, 0)
+                        branch_mark: usize = flow.names.count
+                        comprehension_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        chv_flow_bind(&comprehension_flow, variable, false, iterable_may_yield_owned_view, iterable_may_yield_alias_reference)
+                        chv_flow_set_iterable_element_type(&comprehension_flow, variable, iterable)
+                        comprehension_index: usize = chv_flow_latest(comprehension_flow, variable)
+                        comprehension_flow.may_contain_alias_reference[comprehension_index] <- iterable_may_contain_alias_reference if comprehension_index < comprehension_flow.names.count
+                        comprehension_flow.may_be_scalar_sview[comprehension_index] <- iterable_element_is_scalar_sview if comprehension_index < comprehension_flow.names.count
+                        comprehension_flow.may_yield_scalar_sview[comprehension_index] <- iterable_element_yields_scalar_sview if comprehension_index < comprehension_flow.names.count
+                        comprehension_ref_params: mutable darray[sview] = []
+                        comprehension_binders: mutable darray[sview] = [name for name in binders]
+                        comprehension_owned: mutable darray[sview] = [name for name in owned]
+                        comprehension_view_names: mutable darray[sview] = [name for name in view_names]
+                        comprehension_view_values: mutable darray[Ast::Expr] = [value for value in view_values]
+                        for outer_ref in ref_params |comprehension_ref_params|:
+                            comprehension_ref_params.push(outer_ref) if outer_ref != variable
+                        comprehension_binders.push(variable)
+                        chv_scan_expression_locals(condition, in_region, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values)
+                        chv_scan_expression_locals(body, in_region, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values)
+                        chv_flow_add_shape_shadows(&comprehension_flow, comprehension_view_names)
+                        table <- chv_walk_expression(condition, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, &comprehension_flow, summary, table)
+                        chv_flow_bind_truthy_condition_binders(condition, comprehension_ref_params, &comprehension_flow, table)
+                        table <- chv_walk_expression(body, in_region, comprehension_ref_params, comprehension_binders, comprehension_owned, comprehension_view_names, comprehension_view_values, &comprehension_flow, summary, table)
+                        body_may_be_owned_view: bool = comprehension_flow.last_value_may_be_owned_view
+                        chv_flow_merge(flow, &comprehension_flow, branch_mark)
+                        flow.last_value_may_be_owned_view <- body_may_be_owned_view
+                    Expr.Refinement(base, predicate, _):
+                        table <- chv_walk_expression(base, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        base_may_be_owned: bool = flow.last_value_may_be_owned_view
+                        table <- chv_walk_expression(predicate, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        flow.last_value_may_be_owned_view <- base_may_be_owned
+                    Expr.GetElse(guarded, recovery, _):
+                        branch_mark: usize = flow.names.count
+                        guarded_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        table <- chv_walk_expression(guarded, in_region, ref_params, binders, owned, view_names, view_values, &guarded_flow, summary, table)
+                        branch_value_may_be_owned: mutable bool = guarded_flow.last_value_may_be_owned_view
+                        recovery_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        chv_flow_merge(&recovery_flow, &guarded_flow, branch_mark)
+                        table <- chv_walk_statements(recovery, in_region, ref_params, binders, owned, view_names, view_values, &recovery_flow, summary, table)
+                        recovery_terminates: bool = statements_terminate(recovery, table)
+                        branch_value_may_be_owned <- branch_value_may_be_owned or recovery_flow.last_value_may_be_owned_view if not recovery_terminates
+                        chv_flow_set_merge(flow, &guarded_flow, &recovery_flow, branch_mark) if not recovery_terminates
+                        chv_flow_set_merge(flow, &guarded_flow, &guarded_flow, branch_mark) if recovery_terminates
+                        flow.last_value_may_be_owned_view <- branch_value_may_be_owned
+                    Expr.Lambda(parameters, body, _):
+                        flow.last_value_may_be_owned_view <- false
+                        lambda_ref_params: mutable darray[sview] = []
+                        lambda_binders: mutable darray[sview] = []
+                        lambda_owned: mutable darray[sview] = []
+                        lambda_view_names: mutable darray[sview] = []
+                        lambda_view_values: mutable darray[Ast::Expr] = []
+                        lambda_flow: mutable CHVViewFlow = chv_flow_clone(flow)
+                        for outer_ref in ref_params |lambda_ref_params, parameters|:
+                            shadowed: bool = any parameter in parameters where parameter == outer_ref
+                            lambda_ref_params.push(outer_ref) if not shadowed
+                        for binder in binders |lambda_binders|:
+                            lambda_binders.push(binder)
+                        for parameter in parameters |lambda_binders|:
+                            lambda_binders.push(parameter)
+                            # Lambda parameters carry no source type in this AST. Preserve
+                            # both possible view and reference provenance instead of
+                            # treating an untyped parameter as a known scalar.
+                            chv_flow_bind(&lambda_flow, parameter, false, true, true)
+                            lambda_ref_params.push(parameter)
+                        for local_owned in owned |lambda_owned|:
+                            lambda_owned.push(local_owned)
+                        for view_index in 0..<view_names.count |view_index, lambda_view_names|:
+                            lambda_view_names.push(view_names[view_index])
+                            lambda_view_values.push(view_values[view_index]) if view_index < view_values.count
+                        chv_scan_locals(body, in_region, lambda_binders, lambda_owned, lambda_view_names, lambda_view_values)
+                        chv_flow_add_shape_shadows(&lambda_flow, lambda_view_names)
+                        table <- chv_walk_statements(body, in_region, lambda_ref_params, lambda_binders, lambda_owned, lambda_view_names, lambda_view_values, &lambda_flow, summary, table)
+                    Expr.Block(block_statements, block_value, _, _):
+                        block_mark: usize = flow.names.count
+                        table <- chv_walk_statements(block_statements, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        table <- chv_walk_expression(block_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)
+                        block_value_may_be_owned: bool = flow.last_value_may_be_owned_view
+                        chv_flow_truncate(flow, block_mark)
+                        flow.last_value_may_be_owned_view <- block_value_may_be_owned

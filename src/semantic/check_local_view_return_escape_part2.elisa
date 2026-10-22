@@ -1,0 +1,241 @@
+extend Semantic:
+    private:
+        # A returned closure that captures a view of (or a `&` borrow of) a local container or
+        # frame array carries that storage out of the frame: stage0 rejects it ("cannot return
+        # value: region dependency facts include local region") even where the function could
+        # otherwise adopt its caller's region, because a closure cannot carry the region.
+        def lvre_nested_lambdas(value: Ast::Expr, out: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match oe_strip(value):
+                    Expr.Lambda(lambda_params, lambda_body, lambda_pos):
+                        out.push(oe_strip(value))
+                    Expr.Construct(construct_type, construct_fields, construct_pos):
+                        for field in construct_fields |out|:
+                            lvre_nested_lambdas(field.value, out)
+                    Expr.Tuple(elements, tuple_pos) | Expr.Array(elements, tuple_pos):
+                        for element in elements |out|:
+                            lvre_nested_lambdas(element, out)
+                    Expr.Call(call_callee, call_arguments, call_names, call_pos):
+                        if enum_variant_callee(call_callee):
+                            for argument in call_arguments |out|:
+                                lvre_nested_lambdas(argument, out)
+                    _:
+                        pass
+
+        # A direct local darray return is normally backed by this function's inferred `in auto:`
+        # region. It is not an auto-region escape when the binding itself is explicitly tied to
+        # the same caller-provided region parameter as the function's declared return type:
+        # `out: mutable darray[T] @r = []; return move out`.
+        # Keep this exception deliberately narrow: only a bare ident through parens/move, an
+        # active region-carrying local annotation, and a matching declared return region that is
+        # a formal region parameter qualify. An unrelated local container still fails closed.
+        def lvre_returned_container_name(value: Ast::Expr, depth: usize) -> sview:
+            can Abort.Panic:
+                return "" if depth >= 64
+                match value:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return lvre_returned_container_name(inner, depth + 1)
+                    _:
+                        return ""
+
+        def lvre_initializer_allocates_in_region(value: Ast::Expr, region: sview, enum_annotations: darray[Ast::EnumAnnotation]&, depth: usize) -> bool:
+            can Abort.Panic:
+                return false if depth >= 64
+                match value:
+                    Expr.RegionNew(inner, allocation_region, _):
+                        return allocation_region == region
+                    Expr.Paren(inner, _):
+                        return lvre_initializer_allocates_in_region(inner, region, enum_annotations, depth + 1)
+                    Expr.Array(_, array_pos):
+                        # A plain destination-typed array literal is allocated in the local's
+                        # explicit region. `new[]`/`new[auto]` is different: its parser marker
+                        # denotes inferred/auto storage and must not borrow the @r annotation.
+                        return not (any marker in enum_annotations where (marker.name == "__new_construct" or marker.name == "__new_auto") and marker.line == array_pos.line)
+                    _:
+                        return false
+
+        def lvre_returns_caller_region_container(value: Ast::Expr, escaped_name: sview, names: darray[sview @source]&, name_lines: darray[u32]&, name_values: darray[Ast::Expr]&, writes: darray[sview @source]&, write_lines: darray[u32]&, annotations: darray[Ast::LocalRegionAnnotation]&, enum_annotations: darray[Ast::EnumAnnotation]&, function_line: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if escaped_name == "" or lvre_returned_container_name(value, 0) != escaped_name
+                declared_return_region: mutable sview = ""
+                for annotation in annotations |declared_return_region|:
+                    declared_return_region <- annotation.region if annotation.name == "__region_return" and annotation.line == function_line
+                return false if:
+                    declared_return_region == ""
+                    not (any parameter_region in annotations where parameter_region.name == "__region_param" and parameter_region.line == function_line and parameter_region.region == declared_return_region)
+                use_line: u32 = Ast::expr_pos(value).line
+                local_region: mutable sview = ""
+                local_annotation_line: mutable u32 = 0
+                for annotation in annotations |local_region, local_annotation_line|:
+                    active: bool = annotation.name == escaped_name and annotation.line >= function_line and annotation.line <= use_line and (annotation.end_line == 0 or use_line <= annotation.end_line) and lvre_scalar_darray_value(annotation.type_expression)
+                    if active and annotation.line >= local_annotation_line:
+                        local_region <- annotation.region
+                        local_annotation_line <- annotation.line
+                # The escape pass is flow-insensitive, while region annotations are line-keyed.
+                # Resolve the latest same-name binding at the return site. Earlier/disjoint
+                # bindings do not disable a genuine @r local; a later shadow/rebind fails closed.
+                latest_binding_line: mutable u32 = 0
+                latest_binding_count: mutable usize = 0
+                latest_binding_index: mutable usize = names.count
+                for binding_index in 0..<names.count |latest_binding_line, latest_binding_count, latest_binding_index|:
+                    if names[binding_index] == escaped_name and name_lines[binding_index] <= use_line:
+                        if name_lines[binding_index] > latest_binding_line:
+                            latest_binding_line <- name_lines[binding_index]
+                            latest_binding_count <- 1
+                            latest_binding_index <- binding_index
+                        else:
+                            latest_binding_count <- latest_binding_count + 1 if name_lines[binding_index] == latest_binding_line
+                return false if:
+                    latest_binding_line != local_annotation_line or latest_binding_count != 1
+                    latest_binding_index >= name_values.count
+                initializer: Ast::Expr = name_values[latest_binding_index]
+                return false if not lvre_initializer_allocates_in_region(initializer, declared_return_region, enum_annotations, 0)
+                # An annotated destination may be reassigned after its safe initialization.
+                # Do not let the declaration annotation bless a later move/copy from auto or a
+                # shorter-lived region; those need independent region-flow proof, not this rule.
+                for write_index in 0..<writes.count:
+                    return false if writes[write_index] == escaped_name and write_lines[write_index] >= local_annotation_line and write_lines[write_index] <= use_line
+                return local_region != "" and local_region == declared_return_region
+
+        def lvre_check_lambda_returns(returned: darray[Ast::Expr]&, arrays: darray[sview @source]&, containers: darray[sview @source]&, bound: darray[sview @source]&, values: darray[Ast::Expr]&, sroots: darray[sview @source]&, sfields: darray[sview @source]&, droots: darray[sview @source]&, dfields: darray[sview @source]&, rows: darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # Lambdas returned directly or nested in a struct literal, tuple, array or enum
+                # payload (`return H{f: fn() => s[0]}`) all outlive the frame they capture.
+                lambdas: mutable darray[Ast::Expr] = []
+                for value in returned |lambdas|:
+                    lvre_nested_lambdas(value, lambdas)
+                return if lambdas.count == 0
+                carriers: mutable darray[sview @source] = []
+                for name in containers |carriers|:
+                    carriers.push(name)
+                array_views: mutable darray[sview @source] = []
+                container_views: mutable darray[sview @source] = []
+                changed: mutable bool = true
+                while changed |changed, array_views, container_views, carriers|:
+                    changed <- false
+                    while index < bound.count |index: usize = 0, changed, array_views, container_views, carriers|:
+                        if not lvre_has(carriers, bound[index]):
+                            carried: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(values[index], arrays, containers, array_views, container_views, sroots, sfields, droots, dfields, rows)
+                            if carried.found or lvre_address_root(values[index], arrays, containers) != "":
+                                container_views.push(bound[index])
+                                carriers.push(bound[index])
+                                changed <- true
+                        index <- index + 1
+                for value in lambdas |table| -> table:
+                    match oe_strip(value):
+                        Expr.Lambda(lambda_params, lambda_body, lambda_pos):
+                            captured: sview = lvre_stmts_mention(lambda_body, carriers, lambda_params)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionReturnEscape, name: "", line: lambda_pos.line, pos: lambda_pos, expected: "", actual: ""}) if captured != ""
+                        _:
+                            pass
+
+        def lvre_function(function_line: u32, annotations: darray[Ast::LocalRegionAnnotation]&, enum_annotations: darray[Ast::EnumAnnotation]&, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, f_struct: darray[sview @source]&, f_name: darray[sview @source]&, f_type: darray[Ast::Expr]&, f_heads: dict[u64, u32]&, f_next: darray[u32]&, rows: darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview @source] = []
+                name_lines: mutable darray[u32] = []
+                name_values: mutable darray[Ast::Expr] = []
+                kinds: mutable darray[u8] = []
+                bound: mutable darray[sview @source] = []
+                bound_lines: mutable darray[u32] = []
+                writes: mutable darray[sview @source] = []
+                write_lines: mutable darray[u32] = []
+                values: mutable darray[Ast::Expr] = []
+                arena_param: mutable bool = false
+                for parameter in parameters |names, name_lines, name_values, kinds, arena_param|:
+                    names.push(parameter.name)
+                    name_lines.push(function_line)
+                    name_values.push(Ast::Expr.Invalid)
+                    kinds.push(1 if lvre_frame_array(parameter.type_expression) else 0)
+                    arena_param <- true if lvre_arena_param(parameter.type_expression)
+                lvre_collect(body, names, name_lines, name_values, kinds, bound, bound_lines, writes, write_lines, values)
+                sr_names: mutable darray[sview @source] = []
+                sr_types: mutable darray[sview @source] = []
+                for parameter in parameters |sr_names, sr_types|:
+                    declared_type: sview = bare_type_name(parameter.type_expression)
+                    if declared_type != "":
+                        sr_names.push(parameter.name)
+                        sr_types.push(declared_type)
+                lvre_struct_decls(body, sr_names, sr_types)
+                sroots: mutable darray[sview @source] = []
+                sfields: mutable darray[sview @source] = []
+                lvre_struct_array_fields(names, sr_names, sr_types, f_struct, f_name, f_type, f_heads, f_next, sroots, sfields)
+                droots: mutable darray[sview @source] = []
+                dfields: mutable darray[sview @source] = []
+                lvre_struct_darray_fields(names, parameters, sr_names, sr_types, f_struct, f_name, f_type, f_heads, f_next, droots, dfields)
+                arrays: darray[sview @source] = lvre_roots(names, kinds, 1)
+                containers: mutable darray[sview @source] = lvre_roots(names, kinds, 2)
+                returned: mutable darray[Ast::Expr] = []
+                lvre_returns(body, true, returned)
+                adopting: mutable bool = arena_param
+                for value in returned |adopting|:
+                    adopting <- true if lvre_adopting_value(value, containers, rows)
+                containers <- [] if adopting
+                droots <- [] if adopting
+                dfields <- [] if adopting
+                # Dangling views: a fixpoint over every binding (flow-insensitive).
+                array_views: mutable darray[sview @source] = []
+                container_views: mutable darray[sview @source] = []
+                # droots too: `v: sview = h.bytes.as_sview(); return v` (fuzz F1) has only a
+                # darray FIELD of a by-value struct local as its root, and without it the
+                # fixpoint never ran, so the bound view was never marked (both compilers
+                # returned a dangling view; stage1 read 0 where the bytes had been 65).
+                changed: mutable bool = arrays.count > 0 or containers.count > 0 or sroots.count > 0 or droots.count > 0
+                while changed |changed, array_views, container_views|:
+                    changed <- false
+                    while index < bound.count |index: usize = 0, changed, array_views, container_views|:
+                        if not lvre_has(array_views, bound[index]) and not lvre_has(container_views, bound[index]):
+                            carried: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(values[index], arrays, containers, array_views, container_views, sroots, sfields, droots, dfields, rows)
+                            if carried.found:
+                                if carried.container:
+                                    container_views.push(bound[index])
+                                else:
+                                    array_views.push(bound[index])
+                                changed <- true
+                        index <- index + 1
+                lambda_containers: darray[sview @source] = lvre_roots(names, kinds, 2)
+                table <- lvre_check_lambda_returns(returned, arrays, lambda_containers, bound, values, sroots, sfields, droots, dfields, rows, table)
+                for value in returned |table| -> table:
+                    escape: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(value, arrays, containers, array_views, container_views, sroots, sfields, droots, dfields, rows)
+                    if escape.found:
+                        continue if escape.container and lvre_returns_caller_region_container(value, escape.name, names, name_lines, name_values, writes, write_lines, annotations, enum_annotations, function_line)
+                        kind: DiagnosticKind = DiagnosticKind.AutoRegionReturnEscape if escape.container else DiagnosticKind.LocalViewEscapesReturn
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: kind, name: escape.name, line: escape.pos.line, pos: escape.pos, expected: "", actual: ""})
+
+        def lvre_walk(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, enum_annotations: darray[Ast::EnumAnnotation]&, f_struct: darray[sview @source]&, f_name: darray[sview @source]&, f_type: darray[Ast::Expr]&, f_heads: dict[u64, u32]&, f_next: darray[u32]&, rows: darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table| -> table:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            table <- lvre_function(line.line, annotations, enum_annotations, parameters, body, f_struct, f_name, f_type, f_heads, f_next, rows, table) if return_type is declared_return
+                        Decl.Module(module_name, module_body, module_line):
+                            table <- lvre_walk(module_body, annotations, enum_annotations, f_struct, f_name, f_type, f_heads, f_next, rows, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            table <- lvre_walk(scoped_body, annotations, enum_annotations, f_struct, f_name, f_type, f_heads, f_next, rows, table)
+                        _:
+                            pass
+
+    public:
+        def check_local_view_return_escape(file: Ast::File&, origin_rows: darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                f_struct: mutable darray[sview @source] = []
+                f_name: mutable darray[sview @source] = []
+                f_type: mutable darray[Ast::Expr] = []
+                oe_collect_fields(file.top_decls, f_struct, f_name, f_type)
+                # Field rows chained per struct name in ascending order, so a struct local's
+                # fields are found without scanning every field of the file.
+                f_heads: mutable dict[u64, u32] = {}
+                f_tails: mutable dict[u64, u32] = {}
+                f_next: mutable darray[u32] = []
+                for field_index in 0..<f_struct.count |f_struct, f_heads, f_tails, f_next|:
+                    field_hash: u64 = name_hash(f_struct[field_index])
+                    f_next.push(SYMBOL_INDEX_ROW_NONE)
+                    if f_tails.get(field_hash) is field_tail:
+                        f_next[field_tail.usize()] <- field_index.u32()
+                    else:
+                        f_heads <- f_heads.put(field_hash, field_index.u32()) can Global{Read,Write}
+                    f_tails <- f_tails.put(field_hash, field_index.u32()) can Global{Read,Write}
+                # Complete: key-sort so per-call lookups binary-search (view_return_origins_sorted).
+                rows: darray[sview @source] = vro_sort_rows(origin_rows)
+                table <- lvre_walk(file.top_decls, file.local_region_annotations, file.enum_annotations, f_struct, f_name, f_type, f_heads, f_next, rows, table)

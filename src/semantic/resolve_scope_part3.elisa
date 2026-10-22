@@ -1,0 +1,178 @@
+extend Semantic:
+    private:
+        # Is `expression` a BARE variant pattern used as a filter — `where Enum.Variant(a, b)`
+        # with no `subject is` in front? Such a filter is a PATTERN: its arguments are BINDERS
+        # the loop/comprehension body may read, not references to resolve. Walking one as an
+        # ordinary expression reports every binder undefined and rejects the whole function.
+        #
+        # Deliberately narrow, because guessing wrong here would BIND a name that should have
+        # been a use (silently accepting an undefined identifier, the PERMISSIVE direction the
+        # gate ratchets at zero). Two conditions must hold:
+        #   * the callee is a DOTTED path (`Enum.Variant`), never a bare `f(...)`; and
+        #   * every argument is a bare Ident.
+        # An ordinary predicate call in filter position (`m.check(x.field)`) fails the second
+        # test and is walked normally. One that passes both (`m.check(x)`) can only re-push a
+        # name the loop already bound, which is a no-op.
+        def is_bare_pattern_filter(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(filter_callee, filter_arguments, filter_argument_names, filter_line):
+                        match filter_callee:
+                            Expr.Field(filter_head, filter_variant, filter_field_line):
+                                match filter_head:
+                                    Expr.Ident(filter_enum, filter_enum_line):
+                                        return false if filter_arguments.count == 0
+                                        for filter_argument in filter_arguments:
+                                            match filter_argument:
+                                                Expr.Ident(bare_name, bare_line):
+                                                    pass
+                                                _:
+                                                    return false
+                                        return true
+                                    _:
+                                        pass
+                            _:
+                                pass
+                    _:
+                        pass
+                return false
+
+
+        # Walk an expression collecting the bindings introduced by any `is` refinement test,
+        # packed-enum `as` pattern, or comprehension inside it, so later uses resolve.
+        # Whether `expression` contains a higher-order `ensures(f, PRED)` predicate call —
+        # its PRED argument may reference the callable's `result`, so the enclosing contract
+        # must bind `result`. A shallow structural walk over the shapes a contract predicate
+        # takes (calls, boolean/comparison operators, groups) is enough.
+        def expression_mentions_ensures(expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, line):
+                        return true if ident_name_of(callee) == "ensures"
+                        return any argument in arguments where expression_mentions_ensures(argument)
+                    Expr.Binary(left, operator, right, line):
+                        return expression_mentions_ensures(left) or expression_mentions_ensures(right)
+                    Expr.Unary(operator, operand, line):
+                        return expression_mentions_ensures(operand)
+                    Expr.Paren(inner, line):
+                        return expression_mentions_ensures(inner)
+                    _:
+                        return false
+
+        def gather_expression_bindings(expression: Ast::Expr, bound: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        for child in Ast::effect_runtime_children(candidates, arguments):
+                            gather_expression_bindings(child, bound)
+                    Expr.Binary(left, operator, right, line):
+                        gather_expression_bindings(left, bound)
+                        match operator:
+                            TokenKind.Is | TokenKind.As:
+                                gather_is_target(right, bound)
+                            _:
+                                gather_expression_bindings(right, bound)
+                    Expr.Call(callee, arguments, argument_names, line):
+                        gather_expression_bindings(callee, bound)
+                        for argument in arguments:
+                            gather_expression_bindings(argument, bound)
+                    Expr.Field(receiver, field, line):
+                        gather_expression_bindings(receiver, bound)
+                    Expr.Scope(base, name, line):
+                        gather_expression_bindings(base, bound)
+                    Expr.Index(receiver, index, line):
+                        gather_expression_bindings(receiver, bound)
+                        gather_expression_bindings(index, bound)
+                    Expr.Unary(operator, operand, line):
+                        gather_expression_bindings(operand, bound)
+                    Expr.Move(operand, line):
+                        gather_expression_bindings(operand, bound)
+                    Expr.RegionNew(operand, region, line):
+                        gather_expression_bindings(operand, bound)
+                    Expr.Refinement(base, predicate, line):
+                        gather_expression_bindings(base, bound)
+                        gather_expression_bindings(predicate, bound)
+                    # `get EXPR else return …` — walk the GUARDED expression; the recovery is a
+                    # statement list, which this expression walker does not descend into.
+                    Expr.GetElse(guarded, recovery, line):
+                        gather_expression_bindings(guarded, bound)
+                    Expr.Paren(inner, line):
+                        gather_expression_bindings(inner, bound)
+                    Expr.Array(elements, line):
+                        for element in elements:
+                            gather_expression_bindings(element, bound)
+                    Expr.Tuple(elements, line):
+                        for element in elements:
+                            gather_expression_bindings(element, bound)
+                    Expr.Slice(receiver, low, high, line):
+                        gather_expression_bindings(receiver, bound)
+                        gather_expression_bindings(low, bound)
+                        gather_expression_bindings(high, bound)
+                    Expr.IndexN(receiver, arguments, line):
+                        gather_expression_bindings(receiver, bound)
+                        for argument in arguments:
+                            gather_expression_bindings(argument, bound)
+                    Expr.SetLit(elements, line):
+                        for element in elements:
+                            gather_expression_bindings(element, bound)
+                    Expr.DictLit(entries, line):
+                        for entry in entries:
+                            gather_expression_bindings(entry.key, bound)
+                            gather_expression_bindings(entry.value, bound)
+                    Expr.Construct(type, fields, line):
+                        for field in fields:
+                            gather_expression_bindings(field.value, bound)
+                    Expr.RecordUpdate(base, fields, line):
+                        gather_expression_bindings(base, bound)
+                        for field in fields:
+                            gather_expression_bindings(field.value, bound)
+                    Expr.If(condition, then_expression, else_expression, line):
+                        gather_expression_bindings(condition, bound)
+                        gather_expression_bindings(then_expression, bound)
+                        gather_expression_bindings(else_expression, bound)
+                    Expr.Comprehension(variable, iterable, condition, body, line, _):
+                        # A comprehension's loop variable and any `where … is …(bind)` payload
+                        # bindings are scoped to the comprehension body ONLY — they do NOT escape
+                        # to the enclosing statement scope (stage0 rejects using them afterward, so
+                        # hoisting them here would MISS that undefined-identifier). Gather only from
+                        # the outer-scoped iterable.
+                        gather_expression_bindings(iterable, bound)
+                    # A lambda's params and an expression match's or catch's arm bindings
+                    # scope the lambda body or that arm only; walk_expression resolves each
+                    # in its own scope, so nothing here escapes to the statements after it.
+                    # These used to hoist the params, every arm pattern and every local of the
+                    # bodies into the ENCLOSING scope, which silently accepted a use of a
+                    # lambda param, of a catch arm's `value`, or of an `is` binding from
+                    # either, after the expression; stage0 rejects each (`undefined
+                    # identifier`). Only a match's or catch's scrutinee is outer-scoped.
+                    Expr.Lambda(parameters, body, line):
+                        pass
+                    Expr.Match(scrutinee, arms, line):
+                        gather_expression_bindings(scrutinee, bound)
+                    Expr.Catch(scrutinee, arms, line):
+                        gather_expression_bindings(scrutinee, bound)
+                    Expr.Block(statements, value, captures, line):
+                        # walk_expression resolves the body and tail in their own scope.
+                        # Neither leading declarations nor capture aliases escape it.
+                        pass
+                    # Leaves and references bind nothing. Listed explicitly (no wildcard) so a
+                    # new Expr variant is a compile error rather than a silently-missed binding.
+                    Expr.Invalid:
+                        pass
+                    Expr.Absent:
+                        pass
+                        pass
+                    Expr.IntLit(value, _):
+                        pass
+                    Expr.FloatLit(text, _):
+                        pass
+                    Expr.StringLit(text, _):
+                        pass
+                    Expr.CharLit(text, _):
+                        pass
+                    Expr.BoolLit(value, _):
+                        pass
+                    Expr.Ident(name, line):
+                        pass
+                    Expr.ShorthandMember(parts, line):
+                        pass

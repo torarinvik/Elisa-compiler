@@ -1,0 +1,107 @@
+extend Backend:
+    private:
+        def finalize_payload_enum_words(structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic:
+                round_index: mutable usize = 0
+                changed: mutable bool = true
+                while changed and round_index <= structs.payload_enums.penum_names.count |round_index, changed, structs|:
+                    changed <- false
+                    round_index <- round_index + 1
+                    for enum_slot in 0..<structs.payload_enums.penum_names.count |structs, changed|:
+                        continue if structs.payload_enums.penum_names[enum_slot] == ""
+                        variant_start: usize = structs.payload_enums.penum_variant_start[enum_slot]
+                        variant_count: usize = structs.payload_enums.penum_variant_count[enum_slot]
+                        widest: mutable u32 = structs.payload_enums.penum_payload_words[enum_slot]
+                        unsizeable: mutable bool = false
+                        for variant_offset in 0..<variant_count |structs, widest, unsizeable, variant_start|:
+                            variant_slot: usize = variant_start + variant_offset
+                            # A MULTI-FIELD variant: the blob must hold every field, so its
+                            # extent is the SUM of the fields' words, not the field count. The
+                            # count is right only while every field is one word wide.
+                            if structs.payload_enums.penum_field_type_count[variant_slot] > 1.usize():
+                                multi_start: usize = structs.payload_enums.penum_field_type_start[variant_slot]
+                                multi_total: mutable u32 = 0
+                                multi_unsizeable: mutable bool = false
+                                for multi_offset in 0..<structs.payload_enums.penum_field_type_count[variant_slot] |structs, multi_total, multi_unsizeable, multi_start|:
+                                    multi_field: ValueType = copied_type(structs.payload_enums.penum_field_types[multi_start + multi_offset])
+                                    multi_words: u32 = payload_type_words(multi_field, structs)
+                                    if multi_words == 0:
+                                        multi_unsizeable <- true
+                                    else:
+                                        multi_total <- multi_total + multi_words
+                                if multi_unsizeable:
+                                    unsizeable <- true
+                                elif multi_total > widest:
+                                    widest <- multi_total
+                            continue if not structs.payload_enums.penum_has_payload[variant_slot]
+                            payload_type: ValueType = copied_type(structs.payload_enums.penum_payloads[variant_slot])
+                            continue if payload_type.kind != TypeKind.Struct and payload_type.kind != TypeKind.PayloadEnum
+                            # An inner enum this pass already gave up on is unusable as a payload:
+                            # its recorded extent is whatever it happened to settle at.
+                            if payload_type.kind == TypeKind.PayloadEnum and structs.payload_enums.penum_names[payload_type.bits.usize()] == "":
+                                unsizeable <- true
+                            else:
+                                payload_words: u32 = payload_type_words(payload_type, structs)
+                                if payload_words == 0:
+                                    unsizeable <- true
+                                elif payload_words > widest:
+                                    widest <- payload_words
+                        # Unregister by BLANKING the name rather than compacting the pools: every
+                        # penum_* pool is index-parallel and three of them are indexed through
+                        # penum_variant_start, so removing a row would have to renumber the variant
+                        # spans too. penum_index_of matches by name and no enum is named "", so a
+                        # blanked row is unreachable — and rewriting one field in place keeps this
+                        # allocation-free (rebuilding the pools made them escape the inferred region).
+                        if unsizeable:
+                            structs.payload_enums.penum_names[enum_slot] <- ""
+                            changed <- true
+                        elif widest != structs.payload_enums.penum_payload_words[enum_slot]:
+                            structs.payload_enums.penum_payload_words[enum_slot] <- widest
+                            structs.packed_layouts.layout_epoch <- structs.packed_layouts.layout_epoch + 1
+                            changed <- true
+
+
+
+
+            # Register fieldless enums from parser side tables. Payload-bearing enums are handled
+            # by the packed/payload passes; this pass only needs their scalar backing and ordinals.
+        def register_enums_from_metadata(file: Ast::File&, membership: PackedOwnerMembership&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for enum_index in 0..<file.enum_decl_names.count |enum_index, file, membership, structs|:
+                enum_name: sview = file.enum_decl_names[enum_index]
+                enum_owner: sview = "" if enum_index >= file.enum_decl_owners.count else file.enum_decl_owners[enum_index]
+                continue if enum_index_of_owned(structs, enum_owner, enum_name) >= 0
+                continue if enum_index < membership.enum_declarations.count and membership.enum_declarations[enum_index]
+                # A member of an INLINE hierarchy is never a plain ordinal enum, even when
+                # its own variants carry no payload: the whole tree is ONE tagged union
+                # sized for its widest leaf, registered by register_inline_hierarchy. A
+                # payload-less root that landed here became an i32 while its refinements
+                # were the union, and a widening `y: Event = mouse` crashed.
+                # Const enums cannot be hierarchy members; a foreign hierarchy
+                # with the same leaf name must not suppress their registration.
+                if not file.enum_decl_is_const[enum_index]:
+                    continue if hierarchy_parent_in_file(file, enum_name, enum_owner) != "" or hierarchy_has_children_in_file(file, enum_name, enum_owner)
+                backing: mutable ValueType = ValueType{kind: TypeKind.Signed, bits: 32}
+                if file.enum_decl_is_const[enum_index]:
+                    backing <- resolve_type_head(file.enum_decl_storage_heads[enum_index], structs)
+                    # A SUB-BYTE backing (`const enum Mode of u4`). `u4` is not a modeled type
+                    # NAME — deliberately, since stage0 rejects one as a PARAMETER — so the
+                    # backing came back Unmodeled and the whole enum was discarded, taking
+                    # every mention of `Mode.Fast` with it. Only the enum's own backing is
+                    # widened this way; a bare `u4` elsewhere still declines.
+                    if backing.kind == TypeKind.Unmodeled:
+                        backing <- sub_byte_backing_type(file.enum_decl_storage_heads[enum_index])
+                continue if not is_integer_type(backing)
+                variant_start: usize = file.enum_decl_variant_starts[enum_index]
+                variant_count: usize = file.enum_decl_variant_counts[enum_index]
+                continue if variant_count == 0
+                enum_variant_index: mutable usize = 0
+                while enum_variant_index < variant_count |enum_variant_index, variant_start, variant_count, file, structs|:
+                    structs.const_enums.enum_variants <- structs.const_enums.enum_variants.push(file.enum_decl_variant_names[variant_start + enum_variant_index])
+                    structs.const_enums.enum_variant_values <- structs.const_enums.enum_variant_values.push(file.enum_decl_variant_values[variant_start + enum_variant_index])
+                    enum_variant_index <- enum_variant_index + 1
+                structs.const_enums.enum_names <- structs.const_enums.enum_names.push(enum_name)
+                name_chain_extend(structs.const_enums.enum_name_buckets, structs.const_enums.enum_name_tails, structs.const_enums.enum_name_next, structs.const_enums.enum_names)
+                structs.const_enums.enum_owners <- structs.const_enums.enum_owners.push(enum_owner)
+                structs.const_enums.enum_backings <- structs.const_enums.enum_backings.push(backing)
+                structs.const_enums.enum_variant_start <- structs.const_enums.enum_variant_start.push(structs.const_enums.enum_variants.count - variant_count)
+                structs.const_enums.enum_variant_count <- structs.const_enums.enum_variant_count.push(variant_count)

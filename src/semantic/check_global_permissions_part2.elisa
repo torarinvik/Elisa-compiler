@@ -1,0 +1,555 @@
+extend Semantic:
+    private:
+        # Whether a body STORES into a mutable global. `trusted` only affects Unsafe tracking.
+        def gp_body_writes(statements: darray[Ast::Stmt], authority: GlobalAuthority&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |locals|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            return true if gp_expression_writes(expression, authority, locals, table)
+                        Stmt.VarDecl(name, _, value, _):
+                            return true if gp_expression_writes(value, authority, locals, table)
+                            locals.push(name)
+                        Stmt.Assign(target, operator, value, line):
+                            return true if gp_expression_writes(target, authority, locals, table) or gp_expression_writes(value, authority, locals, table)
+                            if operator == TokenKind.Assign:
+                                match target:
+                                    Expr.Ident(binding_name, _):
+                                        return true if gp_names_global(binding_name, authority, locals)
+                                        locals.push(binding_name) if not gp_call_name_is_local(binding_name, locals)
+                                    _:
+                                        return true if gp_target_root_is_global(target, authority, locals)
+                            else:
+                                return true if gp_target_root_is_global(target, authority, locals)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                return true if gp_expression_writes(returned, authority, locals, table)
+                        Stmt.If(condition, then_body, else_body, line):
+                            then_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, then_locals)
+                            return true if gp_condition_writes(condition, authority, then_locals, table)
+                            return true if gp_body_writes(then_body, authority, then_locals, table)
+                            else_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, else_locals)
+                            return true if gp_body_writes(else_body, authority, else_locals, table)
+                        Stmt.While(condition, while_body, line):
+                            body_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, body_locals)
+                            return true if gp_condition_writes(condition, authority, body_locals, table)
+                            return true if gp_body_writes(while_body, authority, body_locals, table)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            base_expression: mutable Ast::Expr = iterable
+                            filter_expression: mutable Ast::Expr? = null
+                            filter_guard: mutable Ast::Expr? = null
+                            match iterable:
+                                Expr.Refinement(filter_base, filter_predicate, _):
+                                    match filter_base:
+                                        Expr.Refinement(inner_base, inner_predicate, _):
+                                            base_expression <- inner_base
+                                            filter_expression <- inner_predicate
+                                            filter_guard <- filter_predicate
+                                        _:
+                                            base_expression <- filter_base
+                                            filter_expression <- filter_predicate
+                                _:
+                                    pass
+                            return true if gp_expression_writes(base_expression, authority, locals, table)
+                            body_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, body_locals)
+                            for variable in variables |body_locals|:
+                                body_locals.push(variable)
+                            if filter_expression is filter_value:
+                                return true if gp_filter_writes(filter_value, authority, body_locals, table)
+                            if filter_guard is guard_value:
+                                guard_locals: mutable darray[sview] = []
+                                gp_locals_copy(body_locals, guard_locals)
+                                return true if gp_condition_writes(guard_value, authority, guard_locals, table)
+                            return true if gp_body_writes(for_body, authority, body_locals, table)
+                        Stmt.Contract(_, expression, _):
+                            return true if gp_expression_writes(expression, authority, locals, table)
+                        Stmt.Block(binding: binding, body: block_body, _):
+                            block_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, block_locals)
+                            block_locals.push(binding) if binding != ""
+                            return true if gp_body_writes(block_body, authority, block_locals, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            return true if gp_expression_writes(scrutinee, authority, locals, table)
+                            for arm in arms |authority, locals|:
+                                arm_locals: mutable darray[sview] = []
+                                gp_locals_copy(locals, arm_locals)
+                                _ = gp_pattern_call_locals(arm.pattern, arm_locals)
+                                return true if gp_condition_writes(arm.guard, authority, arm_locals, table)
+                                return true if gp_body_writes(arm.body, authority, arm_locals, table)
+                        Stmt.Invalid | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                            pass
+                        _:
+                            return true
+                return false
+
+        # Value blocks and recovery expressions can contain statement lists; walk those
+        # lists on the write axis as well as the ordinary expression children. This keeps
+        # the cold fallback conservative when a nested value form performs an assignment.
+        def gp_expression_writes(expression: Ast::Expr, authority: GlobalAuthority&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Slice(object, low, high, _):
+                        return gp_expression_writes(object, authority, locals, table) or gp_expression_writes(low, authority, locals, table) or gp_expression_writes(high, authority, locals, table)
+                    Expr.Field(object, _, _) | Expr.Paren(object, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _):
+                        return gp_expression_writes(object, authority, locals, table)
+                    Expr.Scope(_, _, _):
+                        return false
+                    Expr.ShorthandMember(_, _) | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.Absent | Expr.Invalid:
+                        return false
+                    Expr.Binary(left, _, right, _):
+                        condition_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, condition_locals)
+                        return gp_condition_writes(expression, authority, condition_locals, table)
+                    Expr.Index(left, right, _):
+                        return gp_expression_writes(left, authority, locals, table) or gp_expression_writes(right, authority, locals, table)
+                    Expr.Refinement(base, predicate, _):
+                        if gp_expression_writes(base, authority, locals, table):
+                            return true
+                        predicate_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, predicate_locals)
+                        return gp_condition_writes(predicate, authority, predicate_locals, table)
+                    Expr.IndexN(object, arguments, _):
+                        return true if gp_expression_writes(object, authority, locals, table)
+                        for argument in arguments:
+                            return true if gp_callback_argument_writes(argument, authority, locals, table)
+                        return false
+                    Expr.Call(callee, arguments, _, _):
+                        return true if gp_called_expression_writes(callee, authority, locals, table)
+                        for argument in arguments:
+                            return true if gp_callback_argument_writes(argument, authority, locals, table)
+                        return false
+                    Expr.StaticEffectCall(candidates: candidates, arguments: arguments, _):
+                        for candidate in candidates:
+                            for capture in candidate.captures:
+                                return true if gp_expression_writes(capture, authority, locals, table)
+                        for argument in arguments:
+                            return true if gp_callback_argument_writes(argument, authority, locals, table)
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements:
+                            return true if gp_expression_writes(element, authority, locals, table)
+                        return false
+                    Expr.DictLit(entries, _):
+                        for entry in entries:
+                            return true if gp_expression_writes(entry.key, authority, locals, table) or gp_expression_writes(entry.value, authority, locals, table)
+                        return false
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        match expression:
+                            Expr.RecordUpdate(base, _, _):
+                                return true if gp_expression_writes(base, authority, locals, table)
+                            _:
+                                pass
+                        for field in fields:
+                            return true if gp_expression_writes(field.value, authority, locals, table)
+                        return false
+                    Expr.If(condition, then_expression, else_expression, _):
+                        then_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, then_locals)
+                        return true if gp_condition_writes(condition, authority, then_locals, table)
+                        return true if gp_expression_writes(then_expression, authority, then_locals, table)
+                        else_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, else_locals)
+                        return gp_expression_writes(else_expression, authority, else_locals, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        return true if gp_expression_writes(scrutinee, authority, locals, table)
+                        for arm in arms |authority, locals|:
+                            arm_locals: mutable darray[sview] = []
+                            gp_locals_copy(locals, arm_locals)
+                            _ = gp_pattern_call_locals(arm.pattern, arm_locals)
+                            return true if gp_condition_writes(arm.guard, authority, arm_locals, table) or gp_body_writes(arm.body, authority, arm_locals, table)
+                        return false
+                    Expr.GetElse(guarded, recovery, _):
+                        return true if gp_expression_writes(guarded, authority, locals, table)
+                        recovery_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, recovery_locals)
+                        return gp_body_writes(recovery, authority, recovery_locals, table)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, query_scope_id):
+                        return true if gp_expression_writes(iterable, authority, locals, table)
+                        body_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, body_locals)
+                        body_locals.push(variable)
+                        gp_query_binders_add(query_scope_id, table, body_locals)
+                        return gp_filter_writes(condition, authority, body_locals, table) or gp_expression_writes(body, authority, body_locals, table)
+                    Expr.Lambda(_, _, _):
+                        return false
+                    Expr.Block(statements, value, _, _):
+                        block_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, block_locals)
+                        return gp_body_writes(statements, authority, block_locals, table) or gp_expression_writes(value, authority, block_locals, table)
+                    _:
+                        return true
+
+        def gp_call_locals_copy(source: darray[sview]&, target: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for name in source |target|:
+                    target.push(name)
+
+        def gp_call_name_is_local(name: sview, locals: darray[sview]&) -> bool:
+            can Abort.Panic:
+                for local in locals:
+                    return true if local == name
+                return false
+
+        def gp_called_expression_writes(callee: Ast::Expr, authority: GlobalAuthority&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Lambda(parameters, body, _):
+                        lambda_locals: mutable darray[sview] = []
+                        gp_locals_copy(locals, lambda_locals)
+                        for parameter in parameters |lambda_locals|:
+                            lambda_locals.push(parameter)
+                        return gp_body_writes(body, authority, lambda_locals, table)
+                    Expr.Paren(inner, _):
+                        return gp_called_expression_writes(inner, authority, locals, table)
+                    _:
+                        if gp_direct_call_name(callee) != "" and not gp_namespace_root_is_local(callee, locals) and not gp_namespace_root_is_global(callee, authority, locals):
+                            return gp_expression_writes(callee, authority, locals, table)
+                        return true
+
+        def gp_callback_argument_writes(argument: Ast::Expr, authority: GlobalAuthority&, locals: mutable darray[sview]&, table: SymbolTable&) -> bool:
+            match argument:
+                Expr.Lambda(_, _, _) | Expr.Paren(_, _):
+                    return gp_called_expression_writes(argument, authority, locals, table)
+                _:
+                    return gp_expression_writes(argument, authority, locals, table)
+
+        def gp_callback_argument_calls(argument: Ast::Expr, caller: usize, authority: GlobalAuthority&, locals: mutable darray[sview]&, out_from: mutable darray[usize]&, out_to: mutable darray[usize]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Lambda(parameters, body, _):
+                        lambda_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, lambda_locals)
+                        for parameter in parameters |lambda_locals|:
+                            lambda_locals.push(parameter)
+                        gp_body_calls(body, caller, authority, lambda_locals, out_from, out_to, table)
+                    Expr.Paren(inner, _):
+                        gp_callback_argument_calls(inner, caller, authority, locals, out_from, out_to, table)
+                    _:
+                        gp_expression_calls(argument, caller, authority, locals, out_from, out_to, table)
+
+        # Pattern bindings are in scope in their arm's guard and body. `Other` retains
+        # syntax that this checker cannot classify, so callers conservatively add an
+        # unknown-target edge for that arm rather than trusting a possibly shadowed name.
+        def gp_pattern_call_locals(pattern: Ast::Pattern, locals: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Binding(name) | Pattern.Rest(name):
+                        locals.push(name)
+                    Pattern.TypeBind(_, binder):
+                        locals.push(binder)
+                    Pattern.As(name, inner):
+                        locals.push(name)
+                        for sub in inner |locals|:
+                            return true if gp_pattern_call_locals(sub, locals)
+                    Pattern.Variant(_, fields) | Pattern.Struct(_, fields) | Pattern.Field(_, fields) | Pattern.Tuple(fields) | Pattern.Or(fields):
+                        for sub in fields |locals|:
+                            return true if gp_pattern_call_locals(sub, locals)
+                    Pattern.Other(_):
+                        return true
+                    _:
+                        pass
+                return false
+
+        def gp_namespace_root_is_local(expression: Ast::Expr, locals: darray[sview]&) -> bool:
+            match expression:
+                Expr.Ident(name, _):
+                    return gp_call_name_is_local(name, locals)
+                Expr.Scope(base, _, _) | Expr.Field(base, _, _) | Expr.Paren(base, _):
+                    return gp_namespace_root_is_local(base, locals)
+                _:
+                    return false
+
+        def gp_namespace_root_is_global(expression: Ast::Expr, authority: GlobalAuthority&, locals: darray[sview]&) -> bool:
+            match expression:
+                Expr.Ident(name, _):
+                    return gp_names_global(name, authority, locals)
+                Expr.Scope(_, _, _):
+                    return gp_expression_is_global(expression, authority, locals)
+                Expr.Field(base, _, _) | Expr.Paren(base, _):
+                    return gp_namespace_root_is_global(base, authority, locals)
+                _:
+                    return false
+
+        def gp_unknown_call_edge(caller: usize, out_from: mutable darray[usize]&, out_to: mutable darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out_from.push(caller)
+                out_to.push(GLOBAL_AUTHORITY_NONE)
+
+        def gp_direct_call_name(callee: Ast::Expr) -> sview:
+            match callee:
+                Expr.Ident(name, _):
+                    return name
+                # Namespace calls have a statically named root. A field call may be a
+                # method or a stored callback, so leave it to the unknown-call path.
+                Expr.Scope(_, name, _):
+                    return name
+                Expr.Paren(inner, _):
+                    return gp_direct_call_name(inner)
+                _:
+                    return ""
+
+        # The authority registry intentionally returns the first same-scope overload,
+        # because many of its consumers need only a declaration namespace. This effect
+        # graph has no argument types, so a same-name overload set is not a sound direct
+        # edge. Keep only uniquely named declarations; ambiguous calls take the unknown
+        # edge and conservatively inherit any effect in the file.
+        def gp_unique_function_slot(name: sview, module_scope: usize, qualified: bool, authority: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                selected: usize = ga_resolve_function(name, module_scope, qualified, authority)
+                return authority.functions.count if selected >= authority.functions.count
+                selected_scope: usize = authority.function_scopes[selected]
+                matches: mutable usize = 0
+                candidate: mutable usize = ga_function_head(name, authority)
+                while candidate < authority.functions.count |candidate, matches|:
+                    matches <- matches + 1 if authority.functions[candidate] == name and authority.function_scopes[candidate] == selected_scope
+                    return authority.functions.count if matches > 1
+                    candidate <- authority.function_next[candidate]
+                return selected if matches == 1 else authority.functions.count
+
+        def gp_direct_call_slot(callee: Ast::Expr, locals: darray[sview]&, authority: GlobalAuthority&) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Ident(name, _):
+                        return authority.functions.count if gp_call_name_is_local(name, locals)
+                        return gp_unique_function_slot(name, authority.module_scope, false, authority)
+                    Expr.Scope(base, name, _):
+                        module_scope: usize = ga_module_readonly(base, authority)
+                        return authority.functions.count if module_scope >= authority.modules.count
+                        return gp_unique_function_slot(name, module_scope, true, authority)
+                    Expr.Paren(inner, _):
+                        return gp_direct_call_slot(inner, locals, authority)
+                    _:
+                        return authority.functions.count
+
+        # The functions this body may call DIRECTLY. The local stack follows source order
+        # and branch scopes, so a function-typed local does not create a false edge to a
+        # same-named root function. `trusted` only drops Unsafe tracking.
+        def gp_body_calls(statements: darray[Ast::Stmt], caller: usize, authority: GlobalAuthority&, locals: mutable darray[sview]&, out_from: mutable darray[usize]&, out_to: mutable darray[usize]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |caller, locals, out_from, out_to|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            gp_expression_calls(expression, caller, authority, locals, out_from, out_to, table)
+                        Stmt.VarDecl(name, _, value, _):
+                            gp_expression_calls(value, caller, authority, locals, out_from, out_to, table)
+                            locals.push(name)
+                        Stmt.Assign(target, operator, value, _):
+                            gp_expression_calls(target, caller, authority, locals, out_from, out_to, table)
+                            gp_expression_calls(value, caller, authority, locals, out_from, out_to, table)
+                            if operator == TokenKind.Assign and target is Expr.Ident(binding_name, _):
+                                locals.push(binding_name) if not gp_names_global(binding_name, authority, locals) and not gp_call_name_is_local(binding_name, locals)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                gp_expression_calls(returned, caller, authority, locals, out_from, out_to, table)
+                        Stmt.If(condition, then_body, else_body, _):
+                            then_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, then_locals)
+                            gp_condition_calls(condition, caller, authority, then_locals, out_from, out_to, table)
+                            gp_body_calls(then_body, caller, authority, then_locals, out_from, out_to, table)
+                            else_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, else_locals)
+                            gp_body_calls(else_body, caller, authority, else_locals, out_from, out_to, table)
+                        Stmt.While(condition, while_body, _):
+                            body_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, body_locals)
+                            gp_condition_calls(condition, caller, authority, body_locals, out_from, out_to, table)
+                            gp_body_calls(while_body, caller, authority, body_locals, out_from, out_to, table)
+                        Stmt.For(_, variables, iterable, for_body, _):
+                            base_expression: mutable Ast::Expr = iterable
+                            filter_expression: mutable Ast::Expr? = null
+                            filter_guard: mutable Ast::Expr? = null
+                            match iterable:
+                                Expr.Refinement(filter_base, filter_predicate, _):
+                                    match filter_base:
+                                        Expr.Refinement(inner_base, inner_predicate, _):
+                                            base_expression <- inner_base
+                                            filter_expression <- inner_predicate
+                                            filter_guard <- filter_predicate
+                                        _:
+                                            base_expression <- filter_base
+                                            filter_expression <- filter_predicate
+                                _:
+                                    pass
+                            gp_expression_calls(base_expression, caller, authority, locals, out_from, out_to, table)
+                            body_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, body_locals)
+                            for variable in variables |body_locals|:
+                                body_locals.push(variable)
+                            gp_filter_calls(filter_value, caller, authority, body_locals, out_from, out_to, table) if filter_expression is filter_value
+                            if filter_guard is guard_value:
+                                guard_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(body_locals, guard_locals)
+                                gp_condition_calls(guard_value, caller, authority, guard_locals, out_from, out_to, table)
+                            gp_body_calls(for_body, caller, authority, body_locals, out_from, out_to, table)
+                        Stmt.Block(binding: binding, body: block_body, _):
+                            block_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, block_locals)
+                            block_locals.push(binding) if binding != ""
+                            gp_body_calls(block_body, caller, authority, block_locals, out_from, out_to, table)
+                        Stmt.Match(scrutinee, arms, _):
+                            gp_expression_calls(scrutinee, caller, authority, locals, out_from, out_to, table)
+                            for arm in arms |caller, locals, out_from, out_to|:
+                                arm_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(locals, arm_locals)
+                                unknown_pattern: bool = gp_pattern_call_locals(arm.pattern, arm_locals)
+                                gp_unknown_call_edge(caller, out_from, out_to) if unknown_pattern
+                                gp_condition_calls(arm.guard, caller, authority, arm_locals, out_from, out_to, table)
+                                gp_body_calls(arm.body, caller, authority, arm_locals, out_from, out_to, table)
+                        Stmt.Contract(_, expression, _):
+                            gp_expression_calls(expression, caller, authority, locals, out_from, out_to, table)
+                        Stmt.Invalid | Stmt.Break(_, _) | Stmt.Continue(_, _):
+                            pass
+                        _:
+                            gp_unknown_call_edge(caller, out_from, out_to)
+
+        # Every direct callee and nested call in an expression. A module-qualified call
+        # (`M::f()`) maps to the declaration registry key `f`; when the namespace root is
+        # a local, the spelling is shadowed and contributes no root-function edge.
+        def gp_expression_calls(expression: Ast::Expr, caller: usize, authority: GlobalAuthority&, locals: mutable darray[sview]&, out_from: mutable darray[usize]&, out_to: mutable darray[usize]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        callee_name: sview = gp_direct_call_name(callee)
+                        callee_is_local: bool = gp_namespace_root_is_local(callee, locals)
+                        callee_is_global: bool = gp_namespace_root_is_global(callee, authority, locals)
+                        if callee_name != "" and not callee_is_local and not callee_is_global:
+                            callee_slot: usize = gp_direct_call_slot(callee, locals, authority)
+                            if callee_slot < authority.functions.count:
+                                out_from.push(caller)
+                                out_to.push(callee_slot)
+                            else:
+                                gp_unknown_call_edge(caller, out_from, out_to)
+                        elif callee_is_local or callee_is_global or not (callee is Expr.Lambda(_, _, _)):
+                            # A local callback or computed callee may target any function;
+                            # never bind it to a root function with the same spelling.
+                            gp_unknown_call_edge(caller, out_from, out_to)
+                        match callee:
+                            Expr.Lambda(parameters, body, _):
+                                lambda_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(locals, lambda_locals)
+                                for parameter in parameters |lambda_locals|:
+                                    lambda_locals.push(parameter)
+                                gp_body_calls(body, caller, authority, lambda_locals, out_from, out_to, table)
+                            _:
+                                gp_expression_calls(callee, caller, authority, locals, out_from, out_to, table)
+                        for argument in arguments |caller, locals, out_from, out_to|:
+                            gp_callback_argument_calls(argument, caller, authority, locals, out_from, out_to, table)
+                    Expr.StaticEffectCall(candidates: candidates, arguments: arguments, _):
+                        for candidate in candidates |caller, locals, out_from, out_to|:
+                            if candidate.callee != "" and not gp_call_name_is_local(candidate.callee, locals):
+                                callee_slot: usize = gp_unique_function_slot(candidate.callee, authority.module_scope, false, authority)
+                                if callee_slot < authority.functions.count:
+                                    out_from.push(caller)
+                                    out_to.push(callee_slot)
+                                else:
+                                    gp_unknown_call_edge(caller, out_from, out_to)
+                            for capture in candidate.captures |caller, locals, out_from, out_to|:
+                                gp_expression_calls(capture, caller, authority, locals, out_from, out_to, table)
+                        for argument in arguments |caller, locals, out_from, out_to|:
+                            gp_callback_argument_calls(argument, caller, authority, locals, out_from, out_to, table)
+                    Expr.Field(object, _, _) | Expr.Paren(object, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _):
+                        gp_expression_calls(object, caller, authority, locals, out_from, out_to, table)
+                    Expr.Scope(base, _, _):
+                        gp_expression_calls(base, caller, authority, locals, out_from, out_to, table)
+                    Expr.Binary(_, _, _, _):
+                        condition_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, condition_locals)
+                        gp_condition_calls(expression, caller, authority, condition_locals, out_from, out_to, table)
+                    Expr.Index(left, right, _):
+                        gp_expression_calls(left, caller, authority, locals, out_from, out_to, table)
+                        gp_expression_calls(right, caller, authority, locals, out_from, out_to, table)
+                    Expr.Refinement(base, predicate, _):
+                        gp_expression_calls(base, caller, authority, locals, out_from, out_to, table)
+                        predicate_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, predicate_locals)
+                        gp_condition_calls(predicate, caller, authority, predicate_locals, out_from, out_to, table)
+                    Expr.Slice(object, low, high, _):
+                        gp_expression_calls(object, caller, authority, locals, out_from, out_to, table)
+                        gp_expression_calls(low, caller, authority, locals, out_from, out_to, table)
+                        gp_expression_calls(high, caller, authority, locals, out_from, out_to, table)
+                    Expr.IndexN(object, arguments, _):
+                        gp_expression_calls(object, caller, authority, locals, out_from, out_to, table)
+                        for argument in arguments |caller, locals, out_from, out_to|:
+                            gp_expression_calls(argument, caller, authority, locals, out_from, out_to, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |caller, locals, out_from, out_to|:
+                            gp_expression_calls(element, caller, authority, locals, out_from, out_to, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |caller, locals, out_from, out_to|:
+                            gp_expression_calls(entry.key, caller, authority, locals, out_from, out_to, table)
+                            gp_expression_calls(entry.value, caller, authority, locals, out_from, out_to, table)
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        match expression:
+                            Expr.RecordUpdate(base, _, _):
+                                gp_expression_calls(base, caller, authority, locals, out_from, out_to, table)
+                            _:
+                                pass
+                        for field in fields |caller, locals, out_from, out_to|:
+                            gp_expression_calls(field.value, caller, authority, locals, out_from, out_to, table)
+                    Expr.If(condition, then_expression, else_expression, _):
+                        then_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, then_locals)
+                        gp_condition_calls(condition, caller, authority, then_locals, out_from, out_to, table)
+                        gp_expression_calls(then_expression, caller, authority, then_locals, out_from, out_to, table)
+                        else_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, else_locals)
+                        gp_expression_calls(else_expression, caller, authority, else_locals, out_from, out_to, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        gp_expression_calls(scrutinee, caller, authority, locals, out_from, out_to, table)
+                        for arm in arms |caller, locals, out_from, out_to|:
+                            arm_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, arm_locals)
+                            unknown_pattern: bool = gp_pattern_call_locals(arm.pattern, arm_locals)
+                            gp_unknown_call_edge(caller, out_from, out_to) if unknown_pattern
+                            gp_condition_calls(arm.guard, caller, authority, arm_locals, out_from, out_to, table)
+                            gp_body_calls(arm.body, caller, authority, arm_locals, out_from, out_to, table)
+                    Expr.GetElse(guarded, recovery, _):
+                        gp_expression_calls(guarded, caller, authority, locals, out_from, out_to, table)
+                        recovery_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, recovery_locals)
+                        gp_body_calls(recovery, caller, authority, recovery_locals, out_from, out_to, table)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, query_scope_id):
+                        gp_expression_calls(iterable, caller, authority, locals, out_from, out_to, table)
+                        body_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, body_locals)
+                        body_locals.push(variable)
+                        gp_query_binders_add(query_scope_id, table, body_locals)
+                        gp_filter_calls(condition, caller, authority, body_locals, out_from, out_to, table)
+                        gp_expression_calls(body, caller, authority, body_locals, out_from, out_to, table)
+                    Expr.Lambda(_, _, _):
+                        pass
+                    Expr.Block(statements, value, _, _):
+                        block_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, block_locals)
+                        gp_body_calls(statements, caller, authority, block_locals, out_from, out_to, table)
+                        gp_expression_calls(value, caller, authority, block_locals, out_from, out_to, table)
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _) | Expr.Absent | Expr.Invalid:
+                        pass
+                    _:
+                        gp_unknown_call_edge(caller, out_from, out_to)
+
+        # Fact projection is admitted only for the collector's flat body grammar. Local
+        # bindings are excluded here because this checker pre-collects shadowing names,
+        # while the fact walker discovers them in source order.
+        def gp_fact_projection_body_safe(body: darray[Ast::Stmt]) -> bool:
+            can Abort.Panic:
+                for statement in body:
+                    match statement:
+                        Stmt.Expr(_, _) | Stmt.Return(_, _):
+                            pass
+                        Stmt.VarDecl(_, _, _, _):
+                            return false
+                        Stmt.Assign(operator: operator, _):
+                            return false if operator != TokenKind.LArrow
+                        Stmt.Block(_, _, _, _, _) | Stmt.If(_, _, _, _) | Stmt.While(_, _, _) | Stmt.For(_, _, _, _, _) | Stmt.Match(_, _, _):
+                            return false
+                        _:
+                            # Keep projection closed over this statement grammar. A
+                            # future statement form must stay on the AST path until its
+                            # binding and global-effect behavior is modeled here.
+                            return false
+                return true

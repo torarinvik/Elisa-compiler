@@ -1,0 +1,580 @@
+extend Semantic:
+    private:
+        # Join another possible path into the current provenance state (may-union).
+        def bam_merge_borrow_state(borrow_names: mutable darray[sview @source]&, borrow_fields: mutable darray[sview @source]&, borrow_owners: mutable darray[sview @source]&, alternate_names: darray[sview @source]&, alternate_fields: darray[sview @source]&, alternate_owners: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                current: BorrowStateSnapshot = bam_borrow_state_snapshot(borrow_names, borrow_fields, borrow_owners)
+                alternate: BorrowStateSnapshot = bam_borrow_state_snapshot(alternate_names, alternate_fields, alternate_owners)
+                key_names: mutable darray[sview @source] = []
+                key_fields: mutable darray[sview @source] = []
+                bam_collect_borrow_keys(current.names, current.fields, "", key_names, key_fields)
+                bam_collect_borrow_keys(alternate.names, alternate.fields, "", key_names, key_fields)
+                for row in 0..<key_names.count |row, borrow_names, borrow_fields, borrow_owners, alternate_names, alternate_fields, alternate_owners, key_names, key_fields|:
+                    owners: mutable darray[sview @source] = []
+                    alternate_owner_values: mutable darray[sview @source] = []
+                    bam_borrow_snapshot_owners(current, key_names[row], key_fields[row], owners)
+                    bam_borrow_snapshot_owners(alternate, key_names[row], key_fields[row], alternate_owner_values)
+                    if owners.count == 0:
+                        owners.extend(alternate_owner_values)
+                    elif alternate_owner_values.count == 1:
+                        alternate_owner: sview = alternate_owner_values[0]
+                        owners.push(alternate_owner) if not (any known_owner in owners where known_owner == alternate_owner)
+                    elif alternate_owner_values.count > 0:
+                        capacity: mutable usize = 16
+                        while capacity < (owners.count + alternate_owner_values.count + 1) * 2 |capacity, owners, alternate_owner_values|:
+                            capacity <- capacity * 2
+                        owner_slots: mutable darray[usize] = []
+                        owner_slots.reserve(capacity)
+                        for _ in 0..<capacity |owner_slots|:
+                            owner_slots.push(0)
+                        for owner_index in 0..<owners.count |owner_index, owner_slots, owners|:
+                            slot, found = bam_borrow_field_probe(owner_slots, owners, owners[owner_index])
+                            owner_slots[slot] <- owner_index + 1 if not found
+                        for alternate_owner in alternate_owner_values |owner_slots, owners|:
+                            slot, found = bam_borrow_field_probe(owner_slots, owners, alternate_owner)
+                            if not found:
+                                owners.push(alternate_owner)
+                                owner_slots[slot] <- owners.count
+                    bam_force_reset_borrow_field(borrow_names, borrow_fields, borrow_owners, key_names[row], key_fields[row])
+                    for owner in owners |borrow_names, borrow_fields, borrow_owners|:
+                        bam_push_borrow(borrow_names, borrow_fields, borrow_owners, key_names[row], key_fields[row], owner)
+
+        # Recreate the compact snapshot as an append-only state log. Closed rows must remain
+        # explicit tombstones so a missing exact field cannot fall back to a stale wildcard.
+        def bam_replay_materialize_snapshot(snapshot: BorrowStateSnapshot&, names: mutable darray[sview]&, fields: mutable darray[sview]&, owners: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                names.truncate(0)
+                fields.truncate(0)
+                owners.truncate(0)
+                for row in 0..<snapshot.names.count |snapshot, names, fields, owners|:
+                    name: sview = snapshot.names[row]
+                    field: sview = snapshot.fields[row] if row < snapshot.fields.count else ""
+                    names.push(name)
+                    fields.push(field)
+                    if row < snapshot.owner_heads.count and snapshot.owner_heads[row] != 0:
+                        node: mutable usize = snapshot.owner_heads[row]
+                        while node != 0 |node, snapshot, owners|:
+                            owner_row: usize = node - 1
+                            owners.push(snapshot.owner_values[owner_row])
+                            node <- snapshot.owner_next[owner_row]
+                    else:
+                        # A closed row with no live owners is the current tombstone. If it
+                        # also has owner heads, the tombstone belongs to an older generation.
+                        owners.push("")
+
+        def bam_replay_snapshot_owner_row(snapshot: mutable BorrowStateSnapshot&, owner_slots: mutable darray[usize]&, owner_key_indices: mutable darray[usize]&, key_index: usize, owner: sview @source) -> (owner_row: usize, inserted: bool):
+            can Memory.Allocate, Abort.Panic:
+                mask: mutable usize = owner_slots.count - 1
+                slot: mutable usize = bam_borrow_snapshot_owner_hash(key_index, owner).usize() & mask
+                while owner_slots[slot] != 0 |slot, snapshot, owner_slots, owner_key_indices, key_index, owner, mask|:
+                    owner_row: usize = owner_slots[slot] - 1
+                    if owner_key_indices[owner_row] == key_index and snapshot.owner_values[owner_row] == owner:
+                        return (owner_row, false)
+                    slot <- (slot + 1) & mask
+                if snapshot.owner_values.count + 1 > owner_slots.count / 2:
+                    capacity: mutable usize = owner_slots.count * 2
+                    owner_slots.truncate(0)
+                    owner_slots.reserve(capacity)
+                    for _ in 0..<capacity |owner_slots|:
+                        owner_slots.push(0)
+                    mask <- capacity - 1
+                    for row in 0..<snapshot.owner_values.count |row, snapshot, owner_slots, owner_key_indices, mask|:
+                        existing_slot: mutable usize = bam_borrow_snapshot_owner_hash(owner_key_indices[row], snapshot.owner_values[row]).usize() & mask
+                        while owner_slots[existing_slot] != 0 |existing_slot, owner_slots, mask|:
+                            existing_slot <- (existing_slot + 1) & mask
+                        owner_slots[existing_slot] <- row + 1
+                    slot <- bam_borrow_snapshot_owner_hash(key_index, owner).usize() & mask
+                    while owner_slots[slot] != 0 |slot, owner_slots, mask|:
+                        slot <- (slot + 1) & mask
+                owner_row: usize = snapshot.owner_values.count
+                snapshot.owner_values.push(owner)
+                snapshot.owner_next.push(0)
+                owner_key_indices.push(key_index)
+                owner_slots[slot] <- owner_row + 1
+                return (owner_row, true)
+
+        def bam_replay_snapshot_link_owner(snapshot: mutable BorrowStateSnapshot&, key_index: usize, owner_row: usize) -> void:
+            can Abort.Panic:
+                snapshot.owner_next[owner_row] <- 0
+                if snapshot.owner_heads[key_index] == 0:
+                    snapshot.owner_heads[key_index] <- owner_row + 1
+                else:
+                    snapshot.owner_next[snapshot.owner_tails[key_index] - 1] <- owner_row + 1
+                snapshot.owner_tails[key_index] <- owner_row + 1
+
+        def bam_replay_snapshot_merge(left: BorrowStateSnapshot, right: BorrowStateSnapshot) -> BorrowStateSnapshot:
+            can Memory.Allocate, Abort.Panic:
+                merged: mutable BorrowStateSnapshot = BorrowStateSnapshot{}
+                key_capacity: mutable usize = 16
+                while key_capacity < (left.names.count + right.names.count + 1) * 2 |key_capacity, left, right|:
+                    key_capacity <- key_capacity * 2
+                merged.slots.reserve(key_capacity)
+                for _ in 0..<key_capacity |merged|:
+                    merged.slots.push(0)
+
+                # The old materialize/merge/resnapshot path yields right-only keys first in
+                # right order, then all left keys in left order. Keep that iteration order.
+                # Queries still resolve each input key through the shared lookup helper so
+                # wildcard inheritance and exact tombstones remain path-specific.
+                for row in 0..<right.names.count |row, left, right, merged|:
+                    name: sview @source = right.names[row]
+                    field: sview @source = right.fields[row] if row < right.fields.count else ""
+                    found_in_left: mutable bool = false
+                    if left.names.count > 0:
+                        _, found_in_left <- bam_borrow_key_probe(left.slots, left.names, left.fields, name, field)
+                    continue if found_in_left
+                    slot, found = bam_borrow_key_probe(merged.slots, merged.names, merged.fields, name, field)
+                    if not found:
+                        merged.names.push(name)
+                        merged.fields.push(field)
+                        merged.closed.push(false)
+                        merged.owner_heads.push(0)
+                        merged.owner_tails.push(0)
+                        merged.slots[slot] <- merged.names.count
+                for row in 0..<left.names.count |row, left, merged|:
+                    name: sview @source = left.names[row]
+                    field: sview @source = left.fields[row] if row < left.fields.count else ""
+                    slot, found = bam_borrow_key_probe(merged.slots, merged.names, merged.fields, name, field)
+                    if not found:
+                        merged.names.push(name)
+                        merged.fields.push(field)
+                        merged.closed.push(false)
+                        merged.owner_heads.push(0)
+                        merged.owner_tails.push(0)
+                        merged.slots[slot] <- merged.names.count
+
+                owner_capacity: mutable usize = 16
+                while owner_capacity < (left.owner_values.count + right.owner_values.count + 1) * 2 |owner_capacity, left, right|:
+                    owner_capacity <- owner_capacity * 2
+                owner_slots: mutable darray[usize] = []
+                owner_slots.reserve(owner_capacity)
+                for _ in 0..<owner_capacity |owner_slots|:
+                    owner_slots.push(0)
+                owner_key_indices: mutable darray[usize] = []
+                left_values: mutable darray[sview @source] = []
+                right_values: mutable darray[sview @source] = []
+                left_owner_rows: mutable darray[usize] = []
+                for key_index in 0..<merged.names.count |key_index, merged, left, right, owner_slots, owner_key_indices, left_values, right_values, left_owner_rows|:
+                    name: sview @source = merged.names[key_index]
+                    field: sview @source = merged.fields[key_index]
+                    left_values.truncate(0)
+                    right_values.truncate(0)
+                    left_owner_rows.truncate(0)
+                    bam_borrow_snapshot_owners(left, name, field, left_values)
+                    bam_borrow_snapshot_owners(right, name, field, right_values)
+
+                    # The old path writes left owners followed by unique right owners, then
+                    # reverse-scans that log into a snapshot. Its observable owner traversal
+                    # order is therefore right-only owners followed by all left owners.
+                    # Record left owners first for membership, but link their nodes last.
+                    for owner in left_values |key_index, merged, owner_slots, owner_key_indices|:
+                        owner_row, inserted = bam_replay_snapshot_owner_row(merged, owner_slots, owner_key_indices, key_index, owner)
+                        left_owner_rows.push(owner_row) if inserted
+                    for owner in right_values |key_index, merged, owner_slots, owner_key_indices|:
+                        owner_row, inserted = bam_replay_snapshot_owner_row(merged, owner_slots, owner_key_indices, key_index, owner)
+                        bam_replay_snapshot_link_owner(merged, key_index, owner_row) if inserted
+                    for owner_row in left_owner_rows |key_index, merged|:
+                        bam_replay_snapshot_link_owner(merged, key_index, owner_row)
+                    merged.closed[key_index] <- merged.owner_heads[key_index] == 0
+                return merged
+
+        def bam_replay_flow_reset(flow: mutable BorrowReplayFlow&) -> void:
+            can Abort.Panic:
+                flow.normal_seen <- false
+                flow.normal <- BorrowStateSnapshot{}
+                flow.return_seen <- false
+                flow.returned <- BorrowStateSnapshot{}
+                flow.breaks.truncate(0)
+                flow.continues.truncate(0)
+
+        def bam_replay_flow_set_normal(flow: mutable BorrowReplayFlow&, names: darray[sview @source]&, fields: darray[sview @source]&, owners: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                flow.normal <- bam_borrow_state_snapshot(names, fields, owners)
+                flow.normal_seen <- true
+
+        def bam_replay_flow_set_reachable(flow: mutable BorrowReplayFlow&) -> void:
+            can Abort.Panic:
+                flow.normal_seen <- true
+
+        def bam_replay_flow_merge_normal(flow: mutable BorrowReplayFlow&, alternate: BorrowReplayFlow&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not alternate.normal_seen
+                if flow.normal_seen:
+                    flow.normal <- bam_replay_snapshot_merge(flow.normal, alternate.normal)
+                else:
+                    flow.normal <- alternate.normal
+                    flow.normal_seen <- true
+
+        # Copy directly into destination-owned buffers. In particular a labeled exit
+        # lives inside a darray: assigning a returned aggregate there loses the
+        # destination ownership relation in interprocedural store summaries.
+        def bam_replay_snapshot_copy_into(destination: mutable BorrowStateSnapshot&, state: BorrowStateSnapshot) -> void:
+            can Memory.Allocate:
+                destination.slots.truncate(0)
+                destination.slots.extend(state.slots)
+                destination.names.truncate(0)
+                destination.names.extend(state.names)
+                destination.fields.truncate(0)
+                destination.fields.extend(state.fields)
+                destination.closed.truncate(0)
+                destination.closed.extend(state.closed)
+                destination.owner_heads.truncate(0)
+                destination.owner_heads.extend(state.owner_heads)
+                destination.owner_tails.truncate(0)
+                destination.owner_tails.extend(state.owner_tails)
+                destination.owner_values.truncate(0)
+                destination.owner_values.extend(state.owner_values)
+                destination.owner_next.truncate(0)
+                destination.owner_next.extend(state.owner_next)
+
+        def bam_replay_flow_add_return(flow: mutable BorrowReplayFlow&, state: BorrowStateSnapshot) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if flow.return_seen:
+                    flow.returned <- bam_replay_snapshot_merge(flow.returned, state)
+                else:
+                    # A fresh copy allocated in `flow`'s region: `state` may live in a caller's
+                    # shorter-lived local flow (bam_replay_flow_merge_exits).
+                    bam_replay_snapshot_copy_into(&flow.returned, state)
+                    flow.return_seen <- true
+
+        def bam_replay_flow_add_break(flow: mutable BorrowReplayFlow&, label: sview @source, state: BorrowStateSnapshot) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for row in 0..<flow.breaks.count |flow, label, state|:
+                    if flow.breaks[row].label == label:
+                        flow.breaks[row].state <- bam_replay_snapshot_merge(flow.breaks[row].state, state)
+                        return
+                flow.breaks.push(BorrowReplayLabeledState{label: label})
+                bam_replay_snapshot_copy_into(&flow.breaks[flow.breaks.count - 1].state, state)
+
+        def bam_replay_flow_add_continue(flow: mutable BorrowReplayFlow&, label: sview @source, state: BorrowStateSnapshot) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for row in 0..<flow.continues.count |flow, label, state|:
+                    if flow.continues[row].label == label:
+                        flow.continues[row].state <- bam_replay_snapshot_merge(flow.continues[row].state, state)
+                        return
+                flow.continues.push(BorrowReplayLabeledState{label: label})
+                bam_replay_snapshot_copy_into(&flow.continues[flow.continues.count - 1].state, state)
+
+        def bam_replay_flow_merge_exits(flow: mutable BorrowReplayFlow&, alternate: BorrowReplayFlow&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if alternate.return_seen:
+                    bam_replay_flow_add_return(flow, alternate.returned)
+                for exit in alternate.breaks |flow|:
+                    bam_replay_flow_add_break(flow, exit.label, exit.state)
+                for exit in alternate.continues |flow|:
+                    bam_replay_flow_add_continue(flow, exit.label, exit.state)
+
+        def bam_replay_snapshot_filter(snapshot: BorrowStateSnapshot, statements: darray[Ast::Stmt], extra_locals: darray[sview @source]&, binders: BorrowBinders&, base_names: darray[sview @source]&, base_fields: darray[sview @source]&, base_owners: darray[sview @source]&) -> BorrowStateSnapshot:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview @source] = []
+                fields: mutable darray[sview @source] = []
+                owners: mutable darray[sview @source] = []
+                bam_replay_materialize_snapshot(snapshot, names, fields, owners)
+                bam_filter_rhs_scope_borrow_state(statements, extra_locals, binders, names, fields, owners, base_names, base_fields, base_owners)
+                return bam_borrow_state_snapshot(names, fields, owners)
+
+        def bam_replay_flow_filter_scope(flow: mutable BorrowReplayFlow&, statements: darray[Ast::Stmt], extra_locals: darray[sview @source]&, binders: BorrowBinders&, base_names: darray[sview @source]&, base_fields: darray[sview @source]&, base_owners: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                bam_replay_flow_filter_normal_scope(flow, statements, extra_locals, binders, base_names, base_fields, base_owners)
+                bam_replay_flow_filter_exits_scope(flow, statements, extra_locals, binders, base_names, base_fields, base_owners)
+
+        def bam_replay_flow_filter_normal_scope(flow: mutable BorrowReplayFlow&, statements: darray[Ast::Stmt], extra_locals: darray[sview @source]&, binders: BorrowBinders&, base_names: darray[sview @source]&, base_fields: darray[sview @source]&, base_owners: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if flow.normal_seen:
+                    flow.normal <- bam_replay_snapshot_filter(flow.normal, statements, extra_locals, binders, base_names, base_fields, base_owners)
+
+        def bam_replay_flow_filter_exits_scope(flow: mutable BorrowReplayFlow&, statements: darray[Ast::Stmt], extra_locals: darray[sview @source]&, binders: BorrowBinders&, base_names: darray[sview @source]&, base_fields: darray[sview @source]&, base_owners: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if flow.return_seen:
+                    flow.returned <- bam_replay_snapshot_filter(flow.returned, statements, extra_locals, binders, base_names, base_fields, base_owners)
+                for row in 0..<flow.breaks.count |flow, statements, extra_locals, binders, base_names, base_fields, base_owners|:
+                    flow.breaks[row].state <- bam_replay_snapshot_filter(flow.breaks[row].state, statements, extra_locals, binders, base_names, base_fields, base_owners)
+                for row in 0..<flow.continues.count |flow, statements, extra_locals, binders, base_names, base_fields, base_owners|:
+                    flow.continues[row].state <- bam_replay_snapshot_filter(flow.continues[row].state, statements, extra_locals, binders, base_names, base_fields, base_owners)
+
+        def bam_replay_snapshot_restore_pattern(snapshot: BorrowStateSnapshot, pattern: Ast::Pattern, base_names: darray[sview @source]&, base_fields: darray[sview @source]&, base_owners: darray[sview @source]&) -> BorrowStateSnapshot:
+            can Memory.Allocate, Abort.Panic:
+                names: mutable darray[sview @source] = []
+                fields: mutable darray[sview @source] = []
+                owners: mutable darray[sview @source] = []
+                bam_replay_materialize_snapshot(snapshot, names, fields, owners)
+                bam_restore_pattern_borrow_state(pattern, names, fields, owners, base_names, base_fields, base_owners)
+                return bam_borrow_state_snapshot(names, fields, owners)
+
+        def bam_replay_flow_restore_pattern(flow: mutable BorrowReplayFlow&, pattern: Ast::Pattern, base_names: darray[sview @source]&, base_fields: darray[sview @source]&, base_owners: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if flow.normal_seen:
+                    flow.normal <- bam_replay_snapshot_restore_pattern(flow.normal, pattern, base_names, base_fields, base_owners)
+                if flow.return_seen:
+                    flow.returned <- bam_replay_snapshot_restore_pattern(flow.returned, pattern, base_names, base_fields, base_owners)
+                for row in 0..<flow.breaks.count |flow, pattern, base_names, base_fields, base_owners|:
+                    flow.breaks[row].state <- bam_replay_snapshot_restore_pattern(flow.breaks[row].state, pattern, base_names, base_fields, base_owners)
+                for row in 0..<flow.continues.count |flow, pattern, base_names, base_fields, base_owners|:
+                    flow.continues[row].state <- bam_replay_snapshot_restore_pattern(flow.continues[row].state, pattern, base_names, base_fields, base_owners)
+
+        def bam_borrow_state_equal(left_names: darray[sview @source]&, left_fields: darray[sview @source]&, left_owners: darray[sview @source]&, right_names: darray[sview @source]&, right_fields: darray[sview @source]&, right_owners: darray[sview @source]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                if left_names.count == right_names.count:
+                    same_order: mutable bool = true
+                    for row in 0..<left_names.count |same_order, left_names, left_fields, left_owners, right_names, right_fields, right_owners, row|:
+                        left_field: sview = left_fields[row] if row < left_fields.count else ""
+                        right_field: sview = right_fields[row] if row < right_fields.count else ""
+                        left_owner: sview = left_owners[row] if row < left_owners.count else ""
+                        right_owner: sview = right_owners[row] if row < right_owners.count else ""
+                        same_order <- false if left_names[row] != right_names[row] or left_field != right_field or left_owner != right_owner
+                        break if not same_order
+                    return true if same_order
+                left: BorrowStateSnapshot = bam_borrow_state_snapshot(left_names, left_fields, left_owners)
+                right: BorrowStateSnapshot = bam_borrow_state_snapshot(right_names, right_fields, right_owners)
+                key_names: mutable darray[sview @source] = []
+                key_fields: mutable darray[sview @source] = []
+                bam_collect_borrow_keys(left.names, left.fields, "", key_names, key_fields)
+                bam_collect_borrow_keys(right.names, right.fields, "", key_names, key_fields)
+                left_values: mutable darray[sview @source] = []
+                right_values: mutable darray[sview @source] = []
+                owner_slots: mutable darray[usize] = []
+                owner_values: mutable darray[sview @source] = []
+                for row in 0..<key_names.count |key_names, key_fields, left, right, left_values, right_values, owner_slots, owner_values|:
+                    left_values.truncate(0)
+                    right_values.truncate(0)
+                    bam_borrow_snapshot_owners(left, key_names[row], key_fields[row], left_values)
+                    bam_borrow_snapshot_owners(right, key_names[row], key_fields[row], right_values)
+                    return false if left_values.count != right_values.count
+                    continue if right_values.count == 0
+                    if right_values.count == 1:
+                        return false if left_values[0] != right_values[0]
+                        continue
+                    owner_capacity: mutable usize = 16
+                    while owner_capacity < (right_values.count + 1) * 2 |owner_capacity, right_values|:
+                        owner_capacity <- owner_capacity * 2
+                    owner_slots.truncate(0)
+                    owner_slots.reserve(owner_capacity)
+                    for _ in 0..<owner_capacity |owner_slots|:
+                        owner_slots.push(0)
+                    owner_values.truncate(0)
+                    for owner in right_values |owner_slots, owner_values|:
+                        owner_slot, found = bam_borrow_field_probe(owner_slots, owner_values, owner)
+                        if not found:
+                            owner_values.push(owner)
+                            owner_slots[owner_slot] <- owner_values.count
+                    for owner in left_values |right_values, owner_slots, owner_values|:
+                        _, found = bam_borrow_field_probe(owner_slots, owner_values, owner)
+                        return false if not found
+                return true
+
+        def bam_consumed_state_equal(left_kinds: darray[u32]&, left_details: darray[sview @source]&, right_kinds: darray[u32]&, right_details: darray[sview @source]&) -> bool:
+            can Abort.Panic:
+                return false if left_kinds.count != right_kinds.count
+                for row in 0..<left_kinds.count |left_details, right_kinds, right_details|:
+                    return false if:
+                        left_kinds[row] != right_kinds[row]
+                        left_kinds[row] != 0 and (row >= left_details.count or row >= right_details.count or left_details[row] != right_details[row])
+                return true
+
+        def bam_reset_loop_exits(exits: mutable BorrowLoopExitState&) -> void:
+            can Abort.Panic:
+                exits.active_locals.truncate(0)
+                exits.names.truncate(0)
+                exits.fields.truncate(0)
+                exits.owners.truncate(0)
+                exits.kinds.truncate(0)
+                exits.details.truncate(0)
+                exits.seen <- false
+                exits.exit_active_locals.truncate(0)
+                exits.exit_paths.truncate(0)
+                exits.continue_names.truncate(0)
+                exits.continue_fields.truncate(0)
+                exits.continue_owners.truncate(0)
+                exits.continue_kinds.truncate(0)
+                exits.continue_details.truncate(0)
+                exits.continue_seen <- false
+                exits.continue_active_locals.truncate(0)
+                exits.continue_paths.truncate(0)
+
+        def bam_scope_locals_equal(left: darray[sview @source]&, right: darray[sview @source]&) -> bool:
+            return false if left.count != right.count
+            for row in 0..<left.count |left, right|:
+                return false if left[row] != right[row]
+            return true
+
+        def bam_capture_loop_exit_path(paths: mutable darray[BorrowLoopExitPath]&, active_locals: darray[sview @source]&, borrow_names: darray[sview @source]&, borrow_fields: darray[sview @source]&, borrow_owners: darray[sview @source]&, kinds: darray[u32]&, details: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                path: mutable BorrowLoopExitPath = BorrowLoopExitPath{}
+                path.active_locals.extend(active_locals)
+                path.names.extend(borrow_names)
+                path.fields.extend(borrow_fields)
+                path.owners.extend(borrow_owners)
+                path.kinds.extend(kinds)
+                path.details.extend(details)
+                paths.push(path)
+
+        def bam_capture_continue(exits: mutable BorrowLoopExitState&, borrow_names: darray[sview @source]&, borrow_fields: darray[sview @source]&, borrow_owners: darray[sview @source]&, kinds: darray[u32]&, details: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if exits.continue_seen:
+                    if exits.continue_paths.count == 0 and bam_scope_locals_equal(exits.continue_active_locals, exits.active_locals):
+                        bam_merge_borrow_state(exits.continue_names, exits.continue_fields, exits.continue_owners, borrow_names, borrow_fields, borrow_owners)
+                        bam_merge(exits.continue_kinds, exits.continue_details, kinds, details)
+                        return
+                    if exits.continue_paths.count == 0:
+                        bam_capture_loop_exit_path(exits.continue_paths, exits.continue_active_locals, exits.continue_names, exits.continue_fields, exits.continue_owners, exits.continue_kinds, exits.continue_details)
+                    last_index: usize = exits.continue_paths.count - 1
+                    last_path: mutable BorrowLoopExitPath = exits.continue_paths[last_index]
+                    if bam_scope_locals_equal(last_path.active_locals, exits.active_locals):
+                        bam_merge_borrow_state(last_path.names, last_path.fields, last_path.owners, borrow_names, borrow_fields, borrow_owners)
+                        bam_merge(last_path.kinds, last_path.details, kinds, details)
+                        exits.continue_paths[last_index] <- last_path
+                    else:
+                        bam_capture_loop_exit_path(exits.continue_paths, exits.active_locals, borrow_names, borrow_fields, borrow_owners, kinds, details)
+                    # Once path snapshots exist, defer their join until filtering. Joining here
+                    # duplicates work because the scope boundary must rebuild the joined state.
+                else:
+                    bam_replace_borrow_state(exits.continue_names, exits.continue_fields, exits.continue_owners, borrow_names, borrow_fields, borrow_owners)
+                    exits.continue_kinds.extend(kinds)
+                    exits.continue_details.extend(details)
+                    exits.continue_active_locals.extend(exits.active_locals)
+                    exits.continue_seen <- true
+
+        def bam_capture_loop_exit(exits: mutable BorrowLoopExitState&, borrow_names: darray[sview @source]&, borrow_fields: darray[sview @source]&, borrow_owners: darray[sview @source]&, kinds: darray[u32]&, details: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if exits.seen:
+                    if exits.exit_paths.count == 0 and bam_scope_locals_equal(exits.exit_active_locals, exits.active_locals):
+                        bam_merge_borrow_state(exits.names, exits.fields, exits.owners, borrow_names, borrow_fields, borrow_owners)
+                        bam_merge(exits.kinds, exits.details, kinds, details)
+                        return
+                    if exits.exit_paths.count == 0:
+                        bam_capture_loop_exit_path(exits.exit_paths, exits.exit_active_locals, exits.names, exits.fields, exits.owners, exits.kinds, exits.details)
+                    last_index: usize = exits.exit_paths.count - 1
+                    last_path: mutable BorrowLoopExitPath = exits.exit_paths[last_index]
+                    if bam_scope_locals_equal(last_path.active_locals, exits.active_locals):
+                        bam_merge_borrow_state(last_path.names, last_path.fields, last_path.owners, borrow_names, borrow_fields, borrow_owners)
+                        bam_merge(last_path.kinds, last_path.details, kinds, details)
+                        exits.exit_paths[last_index] <- last_path
+                    else:
+                        bam_capture_loop_exit_path(exits.exit_paths, exits.active_locals, borrow_names, borrow_fields, borrow_owners, kinds, details)
+                    # As with continues, the scope boundary performs the needed join.
+                else:
+                    bam_replace_borrow_state(exits.names, exits.fields, exits.owners, borrow_names, borrow_fields, borrow_owners)
+                    exits.kinds.extend(kinds)
+                    exits.details.extend(details)
+                    exits.exit_active_locals.extend(exits.active_locals)
+                    exits.seen <- true
+
+        def bam_merge_loop_exit_states(target: mutable BorrowLoopExitState&, alternate: BorrowLoopExitState&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                bam_capture_loop_exit(target, alternate.names, alternate.fields, alternate.owners, alternate.kinds, alternate.details) if alternate.seen
+                bam_capture_continue(target, alternate.continue_names, alternate.continue_fields, alternate.continue_owners, alternate.continue_kinds, alternate.continue_details) if alternate.continue_seen
+
+        # Non-scoped conditional blocks keep their declarations in the enclosing resolver
+        # scope. Preserve each abrupt path's reached names when bringing it into that scope;
+        # the caller adds normally reached names only when the block has a normal outcome.
+        def bam_merge_unscoped_loop_exit_paths(target: mutable BorrowLoopExitState&, alternate: BorrowLoopExitState&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                parent_locals: mutable darray[sview @source] = []
+                parent_locals.extend(target.active_locals)
+                if alternate.exit_paths.count == 0 and alternate.seen:
+                    for local in alternate.exit_active_locals |target|:
+                        bam_append_scope_local(target.active_locals, local)
+                    bam_capture_loop_exit(target, alternate.names, alternate.fields, alternate.owners, alternate.kinds, alternate.details)
+                else:
+                    for path in alternate.exit_paths |target, parent_locals|:
+                        target.active_locals.truncate(0)
+                        target.active_locals.extend(parent_locals)
+                        for local in path.active_locals |target|:
+                            bam_append_scope_local(target.active_locals, local)
+                        bam_capture_loop_exit(target, path.names, path.fields, path.owners, path.kinds, path.details)
+                if alternate.continue_paths.count == 0 and alternate.continue_seen:
+                    target.active_locals.truncate(0)
+                    target.active_locals.extend(parent_locals)
+                    for local in alternate.continue_active_locals |target|:
+                        bam_append_scope_local(target.active_locals, local)
+                    bam_capture_continue(target, alternate.continue_names, alternate.continue_fields, alternate.continue_owners, alternate.continue_kinds, alternate.continue_details)
+                else:
+                    for path in alternate.continue_paths |target, parent_locals|:
+                        target.active_locals.truncate(0)
+                        target.active_locals.extend(parent_locals)
+                        for local in path.active_locals |target|:
+                            bam_append_scope_local(target.active_locals, local)
+                        bam_capture_continue(target, path.names, path.fields, path.owners, path.kinds, path.details)
+                target.active_locals.truncate(0)
+                target.active_locals.extend(parent_locals)
+
+        # Stop reading `name` as a borrow: the newest row wins, and this one names no owner.
+        def bam_drop_borrow(borrow_names: mutable darray[sview @source]&, borrow_fields: mutable darray[sview @source]&, borrow_owners: mutable darray[sview @source]&, name: sview @source) -> void:
+            can Memory.Allocate, Abort.Panic:
+                bam_clear_borrow_fields(name, borrow_names, borrow_fields, borrow_owners)
+
+        def bam_field_key_matches(candidate: sview, parent: sview, field: sview) -> bool:
+            can Abort.Panic:
+                needed: usize = parent.len + (1.usize() if parent != "" else 0.usize()) + field.len
+                return false if candidate.len != needed
+                cursor: mutable usize = 0
+                if parent != "":
+                    for index in 0..<parent.len |cursor, candidate, parent|:
+                        return false if candidate[cursor] != parent[index]
+                        cursor <- cursor + 1.usize()
+                    return false if candidate[cursor] != 46
+                    cursor <- cursor + 1.usize()
+                for index in 0..<field.len |cursor, candidate, field|:
+                    return false if candidate[cursor] != field[index]
+                    cursor <- cursor + 1.usize()
+                return true
+
+        # `parent.field`, interned (semantic_joined_text.elisa): the key is program-lived, so it
+        # outlives every borrow-state row that records it.
+        def bam_join_field_key(parent: sview, field: sview, known_fields: darray[sview]&, table: mutable SymbolTable&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return field if parent == ""
+                for known in known_fields |parent, field|:
+                    return known if bam_field_key_matches(known, parent, field)
+                bytes: mutable darray[u8] = []
+                bytes.reserve(parent.len + field.len + 1)
+                for index in 0..<parent.len |bytes, parent|:
+                    bytes.push(parent[index])
+                bytes.push(46)
+                for index in 0..<field.len |bytes, field|:
+                    bytes.push(field[index])
+                return intern_joined_text(bytes, table)
+
+        def bam_expression_field_path(expression: Ast::Expr, known_fields: darray[sview]&, table: mutable SymbolTable&) -> (root: sview, field: sview):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(root_name, _):
+                        return (root_name, "")
+                    Expr.Field(field_object, field_name, _):
+                        parent_path: (root: sview, field: sview) = bam_expression_field_path(field_object, known_fields, table)
+                        return ("", "") if parent_path.root == ""
+                        return (parent_path.root, bam_join_field_key(parent_path.field, field_name, known_fields, table))
+                    Expr.Paren(inner, _):
+                        return bam_expression_field_path(inner, known_fields, table)
+                    _:
+                        return ("", "")
+
+        def bam_value_owners(value: Ast::Expr, owners: darray[sview @source]&, borrow_names: darray[sview @source]&, borrow_fields: darray[sview @source]&, borrow_owners: darray[sview @source]&, out: mutable darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Unary(operator, operand, _):
+                        if operator == TokenKind.Ampersand:
+                            addressed: sview = ident_name_of(operand)
+                            bam_append_unique_owner(out, addressed) if bam_is_owner(owners, addressed)
+                    Expr.Paren(inner, _):
+                        table <- bam_value_owners(inner, owners, borrow_names, borrow_fields, borrow_owners, out, table)
+                    Expr.Move(inner, _):
+                        table <- bam_value_owners(inner, owners, borrow_names, borrow_fields, borrow_owners, out, table)
+                    Expr.Ident(source_name, _):
+                        bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, source_name, "", out)
+                    Expr.Field(field_object, _, _):
+                        source_path: (root: sview, field: sview) = bam_expression_field_path(value, borrow_fields, table)
+                        if source_path.root != "" and source_path.field != "":
+                            bam_borrow_owners(borrow_names, borrow_fields, borrow_owners, source_path.root, source_path.field, out)
+                        else:
+                            table <- bam_value_owners(field_object, owners, borrow_names, borrow_fields, borrow_owners, out, table)
+                    _:
+                        pass
+
+        def bam_update_has_later_field(fields: darray[Ast::FieldInit], field_name: sview, after: usize) -> bool:
+            can Abort.Panic:
+                probe: mutable usize = after + 1
+                while probe < fields.count |probe, fields, field_name|:
+                    return true if fields[probe].name == field_name
+                    probe <- probe + 1
+                return false

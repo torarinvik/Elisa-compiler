@@ -1,0 +1,567 @@
+extend Semantic:
+    private:
+        # Expression blocks, match arms, get-else recoveries, and comprehensions can contain
+        # frame-local values too. Keep them in the same root set used by the store-through
+        # walk; otherwise a call nested there can publish a borrow while `locals` is empty.
+        def bam_collect_local_expression(expression: Ast::Expr, binders: BorrowBinders&, out: mutable darray[sview @source]&, collect_perm_containers: bool, perm_containers: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, _, _):
+                        bam_collect_local_expression(callee, binders, out, collect_perm_containers, perm_containers)
+                        for argument in arguments:
+                            bam_collect_local_expression(argument, binders, out, collect_perm_containers, perm_containers)
+                    Expr.StaticEffectCall(effect_type: effect_type, candidates: candidates, arguments: arguments, _):
+                        bam_collect_local_expression(effect_type, binders, out, collect_perm_containers, perm_containers)
+                        for candidate in candidates:
+                            for capture in candidate.captures:
+                                bam_collect_local_expression(capture, binders, out, collect_perm_containers, perm_containers)
+                        for argument in arguments:
+                            bam_collect_local_expression(argument, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _):
+                        bam_collect_local_expression(object, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Index(object, index, _) | Expr.Binary(object, _, index, _):
+                        bam_collect_local_expression(object, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(index, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Slice(object, low, high, _):
+                        bam_collect_local_expression(object, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(low, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(high, binders, out, collect_perm_containers, perm_containers)
+                    Expr.IndexN(object, arguments, _):
+                        bam_collect_local_expression(object, binders, out, collect_perm_containers, perm_containers)
+                        for argument in arguments:
+                            bam_collect_local_expression(argument, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Unary(_, operand, _) | Expr.Move(operand, _) | Expr.Paren(operand, _) | Expr.RegionNew(operand, _, _):
+                        bam_collect_local_expression(operand, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements:
+                            bam_collect_local_expression(element, binders, out, collect_perm_containers, perm_containers)
+                    Expr.DictLit(entries, _):
+                        for entry in entries:
+                            bam_collect_local_expression(entry.key, binders, out, collect_perm_containers, perm_containers)
+                            bam_collect_local_expression(entry.value, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Construct(head, fields, _) | Expr.RecordUpdate(head, fields, _):
+                        bam_collect_local_expression(head, binders, out, collect_perm_containers, perm_containers)
+                        for field in fields:
+                            bam_collect_local_expression(field.value, binders, out, collect_perm_containers, perm_containers)
+                    Expr.If(condition, then_value, else_value, _):
+                        bam_collect_local_expression(condition, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(then_value, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(else_value, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        bam_collect_local_expression(scrutinee, binders, out, collect_perm_containers, perm_containers)
+                        for arm in arms:
+                            bam_collect_local_pattern(arm.pattern, binders, out)
+                            bam_collect_local_expression(arm.guard, binders, out, collect_perm_containers, perm_containers)
+                            bam_collect_locals(arm.body, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Comprehension(variable, iterable, condition, body, _, _):
+                        bam_collect_local_expression(iterable, binders, out, collect_perm_containers, perm_containers)
+                        out.push(variable) if binders_bound_once(binders, variable)
+                        bam_collect_local_expression(condition, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(body, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Refinement(base, predicate, _):
+                        bam_collect_local_expression(base, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(predicate, binders, out, collect_perm_containers, perm_containers)
+                    Expr.GetElse(guarded, recovery, _):
+                        bam_collect_local_expression(guarded, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_locals(recovery, binders, out, collect_perm_containers, perm_containers)
+                    Expr.Block(body, value, _, _):
+                        bam_collect_locals(body, binders, out, collect_perm_containers, perm_containers)
+                        bam_collect_local_expression(value, binders, out, collect_perm_containers, perm_containers)
+                    # A lambda body can run after this frame has ended; its locals do not
+                    # become roots in the enclosing function's frame analysis.
+                    _:
+                        pass
+
+        def bam_collect_locals(statements: darray[Ast::Stmt], binders: BorrowBinders&, out: mutable darray[sview @source]&, collect_perm_containers: bool, perm_containers: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out, perm_containers|:
+                    match statement:
+                        Stmt.VarDecl(declared_name, declared_type, declared_value, declared_pos):
+                            # A plain `T` / `mutable T` annotation is frame storage. A region
+                            # qualifier or a reference is not, and neither is an inferred binding.
+                            value_type: Ast::Expr = rvc_value_type(declared_type)
+                            if not rvc_is_absent(value_type):
+                                unique_binder: bool = binders_bound_once(binders, declared_name)
+                                out.push(declared_name) if unique_binder
+                                perm_containers.push(declared_name) if collect_perm_containers and unique_binder and emit_ast_expr_head_is_container(value_type)
+                            bam_collect_local_expression(declared_value, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.Expr(value, _):
+                            bam_collect_local_expression(value, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.Assign(target, _, value, _):
+                            bam_collect_local_expression(target, binders, out, collect_perm_containers, perm_containers)
+                            bam_collect_local_expression(value, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.If(branch_condition, branch_then, branch_else, branch_pos):
+                            bam_collect_local_expression(branch_condition, binders, out, collect_perm_containers, perm_containers)
+                            bam_collect_locals(branch_then, binders, out, collect_perm_containers, perm_containers)
+                            bam_collect_locals(branch_else, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.While(loop_condition, loop_body, loop_pos):
+                            bam_collect_local_expression(loop_condition, binders, out, collect_perm_containers, perm_containers)
+                            bam_collect_locals(loop_body, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
+                            bam_collect_local_expression(for_iterable, binders, out, collect_perm_containers, perm_containers)
+                            for for_variable in for_variables |out|:
+                                out.push(for_variable) if binders_bound_once(binders, for_variable)
+                            bam_collect_locals(for_body, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.Match(match_scrutinee, match_arms, match_pos):
+                            bam_collect_local_expression(match_scrutinee, binders, out, collect_perm_containers, perm_containers)
+                            for match_arm in match_arms |out, perm_containers|:
+                                bam_collect_local_pattern(match_arm.pattern, binders, out)
+                                bam_collect_local_expression(match_arm.guard, binders, out, collect_perm_containers, perm_containers)
+                                bam_collect_locals(match_arm.body, binders, out, collect_perm_containers, perm_containers)
+                        # `can …:` / `trusted …:` / `region …:` / `try:` bodies declare frame
+                        # locals too; skipping them let `can X: local = 5; return &local` escape.
+                        Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
+                            out.push(block_binding) if block_binding != "" and binders_bound_once(binders, block_binding)
+                            bam_collect_locals(block_body, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.Return(value, _):
+                            if value is returned_expression:
+                                bam_collect_local_expression(returned_expression, binders, out, collect_perm_containers, perm_containers)
+                        Stmt.Contract(_, value, _):
+                            bam_collect_local_expression(value, binders, out, collect_perm_containers, perm_containers)
+                        _:
+                            pass
+
+        # Whether an aggregate expression places `parameter_name` itself into a value.
+        # This deliberately follows value-building syntax, not arbitrary reads: `length(x)`
+        # may consume a reference parameter without returning a borrow of it, while
+        # `Lease{owner: x}` stores that reference in the returned value.
+        def bam_summary_alias_carries(name: sview, alias_names: darray[sview]&, alias_carries: darray[bool]&) -> bool:
+            can Abort.Panic:
+                alias_index: mutable usize = alias_names.count
+                while alias_index > 0 |alias_index|:
+                    alias_index <- alias_index - 1
+                    return alias_carries[alias_index] if alias_names[alias_index] == name
+                return false
+
+        def bam_aggregate_carries_parameter(expression: Ast::Expr, parameter_name: sview, alias_names: darray[sview]&, alias_carries: darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(value_name, value_pos):
+                        return value_name == parameter_name or bam_summary_alias_carries(value_name, alias_names, alias_carries)
+                    Expr.Unary(operator, operand, unary_pos):
+                        return bam_place_root(operand) == parameter_name if operator == TokenKind.Ampersand
+                        return false
+                    Expr.Paren(inner, paren_pos):
+                        return bam_aggregate_carries_parameter(inner, parameter_name, alias_names, alias_carries)
+                    Expr.Construct(_, fields, _):
+                        for initializer in fields |parameter_name|:
+                            return true if bam_aggregate_carries_parameter(initializer.value, parameter_name, alias_names, alias_carries)
+                        return false
+                    Expr.RecordUpdate(base, fields, _):
+                        return true if bam_aggregate_carries_parameter(base, parameter_name, alias_names, alias_carries)
+                        for initializer in fields |parameter_name|:
+                            return true if bam_aggregate_carries_parameter(initializer.value, parameter_name, alias_names, alias_carries)
+                        return false
+                    Expr.Tuple(elements, _) | Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |parameter_name|:
+                            return true if bam_aggregate_carries_parameter(element, parameter_name, alias_names, alias_carries)
+                        return false
+                    Expr.DictLit(entries, _):
+                        for entry in entries |parameter_name|:
+                            return true if bam_aggregate_carries_parameter(entry.value, parameter_name, alias_names, alias_carries)
+                        return false
+                    Expr.If(_, then_value, else_value, _):
+                        return bam_aggregate_carries_parameter(then_value, parameter_name, alias_names, alias_carries) or bam_aggregate_carries_parameter(else_value, parameter_name, alias_names, alias_carries)
+                    Expr.Block(block_statements, value, _, _):
+                        block_alias_names: mutable darray[sview @source] = []
+                        block_alias_carries: mutable darray[bool] = []
+                        block_alias_names.extend(alias_names)
+                        block_alias_carries.extend(alias_carries)
+                        return true if bam_returns_aggregate_borrow(block_statements, parameter_name, false, &block_alias_names, &block_alias_carries)
+                        return bam_aggregate_carries_parameter(value, parameter_name, block_alias_names, block_alias_carries)
+                    _:
+                        return false
+
+        # A helper is a known aggregate lender only when its returned value actually contains
+        # the summarized reference parameter. This avoids treating a reader such as `count(values)`
+        # as a lender just because its signature accepts a reference.
+        def bam_returns_aggregate_borrow(statements: darray[Ast::Stmt], parameter_name: sview, tail_value: bool, alias_names: mutable darray[sview]&, alias_carries: mutable darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                statement_index: mutable usize = 0
+                for statement in statements |parameter_name, tail_value, statement_index, alias_names, alias_carries|:
+                    match statement:
+                        Stmt.Return(returned_option, _):
+                            if returned_option is returned_expression:
+                                return true if bam_aggregate_carries_parameter(returned_expression, parameter_name, alias_names, alias_carries)
+                        Stmt.Expr(tail_expression, _):
+                            return true if tail_value and statement_index + 1 == statements.count and bam_aggregate_carries_parameter(tail_expression, parameter_name, alias_names, alias_carries)
+                        Stmt.VarDecl(declared_name, _, declared_value, _):
+                            carries_parameter: bool = bam_aggregate_carries_parameter(declared_value, parameter_name, alias_names, alias_carries)
+                            alias_names.push(declared_name)
+                            alias_carries.push(carries_parameter)
+                        Stmt.Assign(assign_target, _, assigned_value, _):
+                            assigned_name: sview = bam_place_root(assign_target)
+                            if assigned_name != "":
+                                carries_parameter: bool = bam_aggregate_carries_parameter(assigned_value, parameter_name, alias_names, alias_carries)
+                                was_carrying: bool = bam_summary_alias_carries(assigned_name, alias_names, alias_carries)
+                                # This is a may-carry summary: once any reachable assignment
+                                # stores the input borrow, a later safe overwrite must not hide
+                                # the escaping path from the summary.
+                                alias_names.push(assigned_name)
+                                alias_carries.push(carries_parameter or was_carrying)
+                        Stmt.If(_, branch_then, branch_else, _):
+                            is_tail: bool = tail_value and statement_index + 1 == statements.count
+                            return true if:
+                                bam_returns_aggregate_borrow(branch_then, parameter_name, is_tail, alias_names, alias_carries)
+                                bam_returns_aggregate_borrow(branch_else, parameter_name, is_tail, alias_names, alias_carries)
+                        Stmt.Match(_, arms, _):
+                            is_tail_match: bool = tail_value and statement_index + 1 == statements.count
+                            for arm in arms |parameter_name, is_tail_match, alias_names, alias_carries|:
+                                return true if bam_returns_aggregate_borrow(arm.body, parameter_name, is_tail_match, alias_names, alias_carries)
+                        Stmt.Block(body: block_body, _):
+                            is_tail_block: bool = tail_value and statement_index + 1 == statements.count
+                            return true if bam_returns_aggregate_borrow(block_body, parameter_name, is_tail_block, alias_names, alias_carries)
+                        Stmt.While(_, loop_body, _) | Stmt.For(_, _, _, loop_body, _):
+                            return true if bam_returns_aggregate_borrow(loop_body, parameter_name, false, alias_names, alias_carries)
+                        _:
+                            pass
+                    statement_index <- statement_index + 1
+                return false
+
+        def bam_expression_is_parameter(expression: Ast::Expr, parameter_name: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name == parameter_name
+                    Expr.Paren(inner, _):
+                        return bam_expression_is_parameter(inner, parameter_name)
+                    _:
+                        return false
+
+        # A forwarding helper may return the aggregate-lender's result directly or store it in
+        # a field/tuple before returning. Each possible lender parameter is checked against the
+        # callee's own summarized borrow parameters.
+        def bam_expression_returns_lender(expression: Ast::Expr, parameter_name: sview, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, alias_names: darray[sview]&, alias_carries: darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(value_name, _):
+                        return bam_summary_alias_carries(value_name, alias_names, alias_carries)
+                    Expr.Call(callee, arguments, argument_names, _):
+                        callee_name: sview = ident_name_of(callee)
+                        return false if callee_name == ""
+                        target: DeclId = bam_direct_callee_target(callee, call_targets)
+                        return false if target.value == 4294967295
+                        slot: mutable usize = 0
+                        while slot < lend_names.count |slot|:
+                            if lend_names[slot] == callee_name and slot < lend_positions.count and slot < lend_parameter_names.count:
+                                argument_index: i64 = bam_lender_argument_index(arguments.count, argument_names, lend_positions[slot], lend_parameter_names[slot])
+                                return true if argument_index >= 0 and argument_index.usize() < arguments.count and bam_expression_is_parameter(arguments[argument_index.usize()], parameter_name)
+                            slot <- slot + 1
+                        return false
+                    Expr.Construct(_, fields, _):
+                        for initializer in fields |parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries|:
+                            return true if bam_expression_returns_lender(initializer.value, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                        return false
+                    Expr.RecordUpdate(base, fields, _):
+                        return true if bam_expression_returns_lender(base, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                        for initializer in fields |parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries|:
+                            return true if bam_expression_returns_lender(initializer.value, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                        return false
+                    Expr.Tuple(elements, _) | Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries|:
+                            return true if bam_expression_returns_lender(element, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                        return false
+                    Expr.DictLit(entries, _):
+                        for entry in entries |parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries|:
+                            return true if bam_expression_returns_lender(entry.value, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                        return false
+                    Expr.If(_, then_value, else_value, _):
+                        return bam_expression_returns_lender(then_value, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries) or bam_expression_returns_lender(else_value, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                    Expr.Paren(inner, _):
+                        return bam_expression_returns_lender(inner, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                    Expr.Block(block_statements, inner, _, _):
+                        block_alias_names: mutable darray[sview @source] = []
+                        block_alias_carries: mutable darray[bool] = []
+                        block_alias_names.extend(alias_names)
+                        block_alias_carries.extend(alias_carries)
+                        return true if bam_statements_return_lender(block_statements, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, &block_alias_names, &block_alias_carries, false)
+                        return bam_expression_returns_lender(inner, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, block_alias_names, block_alias_carries)
+                    _:
+                        return false
+
+        def bam_statements_return_lender(statements: darray[Ast::Stmt], parameter_name: sview, lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, alias_names: mutable darray[sview]&, alias_carries: mutable darray[bool]&, tail_value: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                statement_index: mutable usize = 0
+                for statement in statements |parameter_name, lend_names, lend_positions, alias_names, alias_carries, tail_value, statement_index|:
+                    match statement:
+                        Stmt.Return(returned_option, _):
+                            if returned_option is returned_expression:
+                                return true if bam_expression_returns_lender(returned_expression, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                        Stmt.Expr(tail_expression, _):
+                            return true if tail_value and statement_index + 1 == statements.count and bam_expression_returns_lender(tail_expression, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                        Stmt.VarDecl(declared_name, _, declared_value, _):
+                            carries_lender: bool = bam_expression_returns_lender(declared_value, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                            alias_names.push(declared_name)
+                            alias_carries.push(carries_lender)
+                        Stmt.Assign(assign_target, _, assigned_value, _):
+                            assigned_name: sview = bam_place_root(assign_target)
+                            if assigned_name != "":
+                                carries_lender: bool = bam_expression_returns_lender(assigned_value, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries)
+                                was_carrying: bool = bam_summary_alias_carries(assigned_name, alias_names, alias_carries)
+                                alias_names.push(assigned_name)
+                                alias_carries.push(carries_lender or was_carrying)
+                        Stmt.If(_, branch_then, branch_else, _):
+                            is_tail: bool = tail_value and statement_index + 1 == statements.count
+                            return true if:
+                                bam_statements_return_lender(branch_then, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries, is_tail)
+                                bam_statements_return_lender(branch_else, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries, is_tail)
+                        Stmt.Match(_, arms, _):
+                            is_tail_match: bool = tail_value and statement_index + 1 == statements.count
+                            for arm in arms |parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries, is_tail_match|:
+                                return true if bam_statements_return_lender(arm.body, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries, is_tail_match)
+                        Stmt.Block(body: block_body, _):
+                            is_tail_block: bool = tail_value and statement_index + 1 == statements.count
+                            return true if bam_statements_return_lender(block_body, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries, is_tail_block)
+                        Stmt.While(_, loop_body, _) | Stmt.For(_, _, _, loop_body, _):
+                            return true if bam_statements_return_lender(loop_body, parameter_name, lend_names, lend_positions, lend_parameter_names, call_targets, alias_names, alias_carries, false)
+                        _:
+                            pass
+                    statement_index <- statement_index + 1
+                return false
+
+        def bam_collect_lend_wrappers(declarations: darray[Ast::Decl], lend_names: darray[sview]&, lend_positions: darray[usize]&, lend_parameter_names: darray[sview]&, call_targets: BorrowResolvedCallTargets&, candidate_names: mutable darray[sview]&, candidate_positions: mutable darray[usize]&, candidate_parameter_names: mutable darray[sview]&, declared_names: BorrowBinders&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |lend_names, lend_positions, lend_parameter_names, candidate_names, candidate_positions, candidate_parameter_names|:
+                    match declaration:
+                        Decl.Func(name: function_name, params: function_parameters, return_type: function_return, body: function_body, _):
+                            if function_return is declared_return and binders_bound_once(declared_names, function_name):
+                                parameter_index: mutable usize = 0
+                                summary_binders: mutable BorrowBinders = empty_borrow_binders()
+                                borrow_function_binders(function_parameters, function_body, summary_binders)
+                                for parameter in function_parameters |parameter_index, candidate_names, candidate_positions|:
+                                    if affine_annotation_is_ref(parameter.type_expression) and not bam_lend_position_exists(lend_names, lend_positions, function_name, parameter_index):
+                                        summary_parameter: sview = parameter.name
+                                        can_summarize: bool = not (any unreadable_binder in summary_binders.names where unreadable_binder == "*") and binders_bound_once(summary_binders, summary_parameter)
+                                        lender_alias_names: mutable darray[sview @source] = []
+                                        lender_alias_carries: mutable darray[bool] = []
+                                        forwards_aggregate_borrow: bool = can_summarize and bam_statements_return_lender(function_body, summary_parameter, lend_names, lend_positions, lend_parameter_names, call_targets, &lender_alias_names, &lender_alias_carries, true)
+                                        if forwards_aggregate_borrow:
+                                            candidate_names.push(function_name)
+                                            candidate_positions.push(parameter_index)
+                                            candidate_parameter_names.push(summary_parameter)
+                                    parameter_index <- parameter_index + 1
+                        Decl.Module(module_name, module_body, _):
+                            bam_collect_lend_wrappers(module_body, lend_names, lend_positions, lend_parameter_names, call_targets, candidate_names, candidate_positions, candidate_parameter_names, declared_names)
+                        Decl.Scoped(scoped_body, _):
+                            bam_collect_lend_wrappers(scoped_body, lend_names, lend_positions, lend_parameter_names, call_targets, candidate_names, candidate_positions, candidate_parameter_names, declared_names)
+                        _:
+                            pass
+
+        def bam_report_escape_root(escaping: sview @source, pos: Ast::Pos, locals: darray[sview]&, aggregate_result: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                kind: mutable DiagnosticKind = DiagnosticKind.ReturnRefToLocal
+                kind <- DiagnosticKind.ReturnRefAggregateLocal if aggregate_result
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: kind, name: escaping, pos: pos, line: pos.line, expected: "", actual: ""}) if escaping != "" and (any known_local in locals where known_local == escaping)
+
+        def bam_escape_roots_for_binding(name: sview, escape_names: darray[sview @source]&, escape_roots: darray[sview @source]&) -> darray[sview @source]:
+            can Memory.Allocate, Abort.Panic:
+                roots: mutable darray[sview @source] = []
+                row: mutable usize = escape_names.count
+                while row > 0 |row, roots|:
+                    row <- row - 1
+                    if escape_names[row] == name:
+                        break if escape_roots[row] == ""
+                        roots.push(escape_roots[row])
+                return roots
+
+        def bam_place_is_detached(place: Ast::Expr, detached: darray[BorrowDetachedPlace]&) -> bool:
+            can Abort.Panic:
+                match place:
+                    Expr.Paren(inner, _):
+                        return bam_place_is_detached(inner, detached)
+                    Expr.Field(Expr.Ident(root, _), field, _):
+                        return any entry in detached where entry.root == root and entry.field == field
+                    Expr.Index(Expr.Ident(root, _), _, _):
+                        return any entry in detached where entry.root == root and entry.field == ""
+                    _:
+                        return false
+
+        def bam_escape_collect_lend_argument_roots(argument: Ast::Expr, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview @source]&, escape_roots: darray[sview @source]&, detached: darray[BorrowDetachedPlace]&, out_roots: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                borrowed_root: sview = bam_borrow_root(argument)
+                if borrowed_root != "":
+                    out_roots.push(borrowed_root)
+                    return
+                match argument:
+                    Expr.Ident(argument_name, _):
+                        alias_roots: darray[sview @source] = bam_escape_roots_for_binding(argument_name, escape_names, escape_roots)
+                        if alias_roots.count > 0:
+                            for alias_root in alias_roots |out_roots|:
+                                out_roots.push(alias_root)
+                        else:
+                            out_roots.push(argument_name)
+                    Expr.Field(_, _, _) | Expr.Index(_, _, _):
+                        value_roots: mutable darray[sview @source] = []
+                        bam_escape_collect_roots(argument, lend_names, lend_positions, escape_names, escape_roots, detached, value_roots)
+                        if value_roots.count > 0:
+                            for value_root in value_roots |out_roots|:
+                                out_roots.push(value_root)
+                        elif not bam_place_is_detached(argument, detached):
+                            place_root: sview = bam_place_root(argument)
+                            out_roots.push(place_root) if place_root != ""
+                    Expr.Paren(inner, _):
+                        bam_escape_collect_lend_argument_roots(inner, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    _:
+                        bam_escape_collect_roots(argument, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+
+        def bam_escape_collect_lend_call_roots(call: Ast::Expr, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview @source]&, escape_roots: darray[sview @source]&, detached: darray[BorrowDetachedPlace]&, out_roots: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match call:
+                    Expr.Call(callee, arguments, _, _):
+                        callee_name: sview = ident_name_of(callee)
+                        slot: mutable usize = 0
+                        while slot < lend_names.count |slot|:
+                            if lend_names[slot] == callee_name and slot < lend_positions.count:
+                                position: usize = lend_positions[slot]
+                                if position < arguments.count:
+                                    bam_escape_collect_lend_argument_roots(arguments[position], lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                            slot <- slot + 1
+                    Expr.Paren(inner, _):
+                        bam_escape_collect_lend_call_roots(inner, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    _:
+                        pass
+
+        # Merge one possible control-flow path into the current may-carry environment.
+        # Keep only bindings that existed before the path: branch-local names do not escape.
+        #
+        # Every name in the environment receives a fresh version here (an empty root, then
+        # its roots), and both readers (bam_escape_roots_for_binding, the Ident arm of
+        # bam_escape_collect_roots) walk back from the newest entry and stop at that empty
+        # root -- so the entries that were in the environment before the merge can never be
+        # read again. The merged environment is therefore REBUILT from the fresh versions
+        # rather than appended behind the dead ones: appending grew the lists by every
+        # binding per branch, and each later merge and lookup re-walked that dead history
+        # (quadratic in the number of branches of a function). Lookup results are unchanged.
+        def bam_escape_binding_probe(slots: darray[usize]&, names: darray[sview]&, name: sview) -> (slot: usize, found: bool):
+            can Abort.Panic:
+                mask: usize = slots.count - 1
+                slot: mutable usize = bam_borrow_key_hash(name, "").usize() & mask
+                while slots[slot] != 0 |slot, slots, names, name, mask|:
+                    row: usize = slots[slot] - 1
+                    if names[row] == name:
+                        return (slot, true)
+                    slot <- (slot + 1) & mask
+                return (slot, false)
+
+        def bam_escape_root_pair_probe(slots: darray[usize]&, binding_indices: darray[usize]&, roots: darray[sview]&, binding_index: usize, root: sview) -> (slot: usize, found: bool):
+            can Abort.Panic:
+                mask: usize = slots.count - 1
+                slot: mutable usize = bam_borrow_snapshot_owner_hash(binding_index, root).usize() & mask
+                while slots[slot] != 0 |slot, slots, binding_indices, roots, binding_index, root, mask|:
+                    row: usize = slots[slot] - 1
+                    if binding_indices[row] == binding_index and roots[row] == root:
+                        return (slot, true)
+                    slot <- (slot + 1) & mask
+                return (slot, false)
+
+        # Index each selected binding's latest root generation in one reverse pass. This
+        # preserves the lookup order of bam_escape_roots_for_binding while avoiding one full
+        # history scan per binding at every branch and loop fixed-point merge.
+        def bam_escape_active_root_groups(source_names: darray[sview]&, source_roots: darray[sview @source]&, binding_names: darray[sview]&) -> BorrowEscapeRootGroups:
+            can Memory.Allocate, Abort.Panic:
+                groups: mutable BorrowEscapeRootGroups = BorrowEscapeRootGroups{}
+                active: mutable darray[bool] = []
+                capacity: mutable usize = 16
+                while capacity < (binding_names.count + 1) * 2 |capacity, binding_names|:
+                    capacity <- capacity * 2
+                slots: mutable darray[usize] = []
+                slots.reserve(capacity)
+                for _ in 0..<capacity |slots|:
+                    slots.push(0)
+                for binding_index in 0..<binding_names.count |binding_index, binding_names, groups, active, slots|:
+                    groups.heads.push(0)
+                    groups.tails.push(0)
+                    active.push(true)
+                    slot, found = bam_escape_binding_probe(slots, binding_names, binding_names[binding_index])
+                    slots[slot] <- binding_index + 1 if not found
+                row: mutable usize = source_names.count
+                while row > 0 |row, source_names, source_roots, binding_names, slots, active, groups|:
+                    row <- row - 1
+                    slot, found = bam_escape_binding_probe(slots, binding_names, source_names[row])
+                    if found:
+                        binding_index: usize = slots[slot] - 1
+                        if active[binding_index]:
+                            root: sview = source_roots[row]
+                            if root == "":
+                                active[binding_index] <- false
+                            else:
+                                root_row: usize = groups.values.count
+                                groups.values.push(root)
+                                groups.next.push(0)
+                                if groups.heads[binding_index] == 0:
+                                    groups.heads[binding_index] <- root_row + 1
+                                else:
+                                    groups.next[groups.tails[binding_index] - 1] <- root_row + 1
+                                groups.tails[binding_index] <- root_row + 1
+                return groups
+
+        # Shared indexed may-union for branch joins and the loop escape fixed point.
+        def bam_escape_merge_branch_indexed[@r](target_names: mutable darray[sview]& @r, target_roots: mutable darray[sview @source]& @r, branch_names: darray[sview]& @r, branch_roots: darray[sview @source]& @r) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                merge_names: mutable darray[sview] = []
+                name_capacity: mutable usize = 16
+                while name_capacity < (target_names.count + 1) * 2 |name_capacity, target_names|:
+                    name_capacity <- name_capacity * 2
+                name_slots: mutable darray[usize] = []
+                name_slots.reserve(name_capacity)
+                for _ in 0..<name_capacity |name_slots|:
+                    name_slots.push(0)
+                for target_name in target_names |target_names, merge_names, name_slots|:
+                    slot, found = bam_escape_binding_probe(name_slots, merge_names, target_name)
+                    if not found:
+                        merge_names.push(target_name)
+                        name_slots[slot] <- merge_names.count
+                target_groups: BorrowEscapeRootGroups = bam_escape_active_root_groups(target_names, target_roots, merge_names)
+                branch_groups: BorrowEscapeRootGroups = bam_escape_active_root_groups(branch_names, branch_roots, merge_names)
+                target_root_count: usize = target_groups.values.count
+                root_capacity: mutable usize = 16
+                while root_capacity < (target_root_count + 1) * 2 |root_capacity, target_root_count|:
+                    root_capacity <- root_capacity * 2
+                root_slots: mutable darray[usize] = []
+                root_slots.reserve(root_capacity)
+                for _ in 0..<root_capacity |root_slots|:
+                    root_slots.push(0)
+                target_binding_indices: mutable darray[usize] = []
+                target_root_values: mutable darray[sview @source] = []
+                for binding_index in 0..<target_groups.heads.count |binding_index, target_groups, target_binding_indices, target_root_values, root_slots|:
+                    root_node: mutable usize = target_groups.heads[binding_index]
+                    while root_node != 0 |root_node, binding_index, target_groups, target_binding_indices, target_root_values, root_slots|:
+                        root: sview = target_groups.values[root_node - 1]
+                        slot, found = bam_escape_root_pair_probe(root_slots, target_binding_indices, target_root_values, binding_index, root)
+                        if not found:
+                            target_binding_indices.push(binding_index)
+                            target_root_values.push(root)
+                            root_slots[slot] <- target_root_values.count
+                        root_node <- target_groups.next[root_node - 1]
+                merged_names: mutable darray[sview] @r = []
+                merged_roots: mutable darray[sview @source] @r = []
+                grew: mutable bool = false
+                for binding_index in 0..<merge_names.count |binding_index, merge_names, target_groups, branch_groups, merged_names, merged_roots, root_slots, target_binding_indices, target_root_values, grew|:
+                    merged_names.push(merge_names[binding_index])
+                    merged_roots.push("")
+                    root_node: mutable usize = target_groups.heads[binding_index]
+                    while root_node != 0 |root_node, binding_index, merge_names, target_groups, merged_names, merged_roots|:
+                        root: sview = target_groups.values[root_node - 1]
+                        merged_names.push(merge_names[binding_index])
+                        merged_roots.push(root)
+                        root_node <- target_groups.next[root_node - 1]
+                    root_node <- branch_groups.heads[binding_index]
+                    while root_node != 0 |root_node, binding_index, merge_names, branch_groups, merged_names, merged_roots, root_slots, target_binding_indices, target_root_values, grew|:
+                        root: sview = branch_groups.values[root_node - 1]
+                        _, found = bam_escape_root_pair_probe(root_slots, target_binding_indices, target_root_values, binding_index, root)
+                        if not found:
+                            merged_names.push(merge_names[binding_index])
+                            merged_roots.push(root)
+                            grew <- true
+                        root_node <- branch_groups.next[root_node - 1]
+                target_names.truncate(0)
+                target_roots.truncate(0)
+                for merged_row in 0..<merged_names.count |merged_row, merged_names, merged_roots, target_names, target_roots|:
+                    target_names.push(merged_names[merged_row])
+                    target_roots.push(merged_roots[merged_row])
+                return grew
+
+        def bam_escape_merge_branch[@r](target_names: mutable darray[sview]& @r, target_roots: mutable darray[sview @source]& @r, branch_names: darray[sview]& @r, branch_roots: darray[sview @source]& @r) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if bam_escape_merge_branch_indexed(target_names, target_roots, branch_names, branch_roots):
+                    pass

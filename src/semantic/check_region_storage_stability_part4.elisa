@@ -1,0 +1,512 @@
+extend Semantic:
+    private:
+        # `&s.items[i]` borrows an element of a darray held in a struct field. Its alias row is
+        # keyed on the root `s`, which cannot tell it from `&s.n`, so replacing `s` or
+        # `s.items` (the old buffer is released) needs the field chain the view indexes.
+        # Collect such views, and plain copies of them, with that chain; a chain that does not
+        # resolve through the struct field rows to a darray is left out.
+        def storage_view_resolve_field_element_views(candidate_names: darray[sview @source]&, candidate_values: darray[Ast::Expr]&, local_names: darray[sview @source]&, local_types: darray[Ast::Expr]&, table: SymbolTable&, views: mutable darray[sview @source]&, heads: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                first_view_names: mutable NameSet = empty_name_set()
+                first_view_rows: mutable darray[usize] = []
+                first_view_index_ready: mutable bool = false
+                for candidate_index in 0..<candidate_names.count |candidate_names, candidate_values, local_names, local_types, table, views, heads|:
+                    name: sview = candidate_names[candidate_index]
+                    value: Ast::Expr = candidate_values[candidate_index]
+                    head: mutable Ast::Expr = value
+                    if storage_view_field_element_head(value, head):
+                        type_id: u32 = storage_view_field_chain_type_id(head, local_names, local_types, table)
+                        if type_id != 0 and interned_kind(type_id, table) == SemTypeKind.Container and interned_name(type_id, table) == "darray":
+                            view_row: usize = views.count
+                            views.push(name)
+                            heads.push(head)
+                            if first_view_index_ready and not name_set_contains(first_view_names, name):
+                                name_set_add(first_view_names, name)
+                                first_view_rows.push(view_row)
+                    elif storage_view_dstr_field_view_head(value, head):
+                        type_id: u32 = storage_view_field_chain_type_id(head, local_names, local_types, table)
+                        if type_id != 0 and interned_name(type_id, table) == "dstr":
+                            view_row: usize = views.count
+                            views.push(name)
+                            heads.push(head)
+                            if first_view_index_ready and not name_set_contains(first_view_names, name):
+                                name_set_add(first_view_names, name)
+                                first_view_rows.push(view_row)
+                    else:
+                        copied: sview = ident_name_of(storage_view_strip_paren_move(value))
+                        if copied != "" and not first_view_index_ready:
+                            # Most functions have no plain identifier copies. Defer the hash
+                            # table until one appears so those cases retain the append-only path.
+                            for seed_row in 0..<views.count |first_view_names, first_view_rows, views|:
+                                if not name_set_contains(first_view_names, views[seed_row]):
+                                    name_set_add(first_view_names, views[seed_row])
+                                    first_view_rows.push(seed_row)
+                            first_view_index_ready <- true
+                        copied_slot: i64 = name_set_index(first_view_names, copied) if copied != "" else -1
+                        if copied_slot >= 0:
+                            index: usize = first_view_rows[copied_slot.usize()]
+                            if index < views.count and index < heads.count:
+                                views.push(name)
+                                heads.push(heads[index])
+                                if first_view_index_ready and not name_set_contains(first_view_names, name):
+                                    name_set_add(first_view_names, name)
+                                    first_view_rows.push(views.count - 1)
+
+        def storage_view_strip_paren_move(expression: Ast::Expr) -> Ast::Expr:
+            current: mutable Ast::Expr = expression
+            while true:
+                match current:
+                    Expr.Paren(inner, line) | Expr.Move(inner, line):
+                        current <- inner
+                    _:
+                        return current
+            return current
+
+        def storage_view_same_place(left: Ast::Expr, right: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match left:
+                    Expr.Ident(left_name, left_line):
+                        match right:
+                            Expr.Ident(right_name, right_line):
+                                return left_name == right_name
+                            _:
+                                return false
+                    Expr.Field(left_object, left_field, left_line):
+                        match right:
+                            Expr.Field(right_object, right_field, right_line):
+                                return left_field == right_field and storage_view_same_place(left_object, right_object)
+                            _:
+                                return false
+                    _:
+                        return false
+
+        # Whether PLACE is CHAIN or one of its receivers: replacing `s` or `s.items` releases
+        # the buffer `s.items` points at; replacing `s.n` does not.
+        def storage_view_place_encloses(place: Ast::Expr, chain: Ast::Expr) -> bool:
+            can Abort.Panic:
+                current: mutable Ast::Expr = chain
+                while true:
+                    return true if storage_view_same_place(place, current)
+                    match current:
+                        Expr.Field(object, field, line):
+                            current <- object
+                        _:
+                            return false
+                return false
+
+        def invalidate_replaced_field_element_views(target: Ast::Expr, operator: TokenKind, field_views: darray[sview @source]&, field_view_heads: darray[Ast::Expr]&, alias_names: darray[sview @source]&, alias_sources: darray[sview @source]&, alias_is_view: darray[bool]&, invalidated: mutable darray[sview @source]&, invalidated_by: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if:
+                    operator != TokenKind.Assign and operator != TokenKind.LArrow
+                    not (target is Expr.Ident(_, _)) and not (target is Expr.Field(_, _, _))
+                root: sview = storage_view_place_root(target)
+                return if root == ""
+                for index in 0..<field_views.count |field_views, field_view_heads, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, target, root|:
+                    view: sview = field_views[index]
+                    if index < field_view_heads.count and not fresh_wrapper_name_exists(invalidated, view) and storage_view_place_encloses(target, field_view_heads[index]):
+                        live: mutable bool = false
+                        for row in 0..<alias_names.count |live, alias_names, alias_sources, alias_is_view, view, root|:
+                            live <- true if alias_names[row] == view and row < alias_sources.count and alias_sources[row] == root and row < alias_is_view.count and alias_is_view[row]
+                        if live:
+                            invalidated.push(view)
+                            invalidated_by.push("") if invalidated.count > invalidated_by.count
+
+        # Unlike growth, a replacement is not saved by a stable backing (the old buffer is
+        # released, not extended) and does not follow value aliases: `ys <- xs_copy` replaces
+        # `ys` only. The target's own row is skipped, since `xs <- [h for h in xs]` rebuilds it.
+        # `p <- P{..}` / `p.storage <- []` releases the buffer a view of the darray field
+        # `p.storage` points into (stage0 invalidateStorageViewsForSourceScoped on a
+        # reassignment). Only rows carrying a "[field]" marker over a darray field with a
+        # concrete element type qualify, so a view read out of an sview field (`t: sview =
+        # p.name`) does not depend on the root. Replacing a sibling field spares the view under
+        # the same disjoint-element rule as growth. A value that mentions the root keeps it.
+        def invalidate_replaced_field_views(target: Ast::Expr, operator: TokenKind, value: Ast::Expr, field_elems: darray[sview]&, alias_names: darray[sview @source]&, alias_sources: darray[sview @source]&, alias_is_view: darray[bool]&, invalidated: mutable darray[sview @source]&, invalidated_by: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if operator != TokenKind.Assign and operator != TokenKind.LArrow
+                root: mutable sview = ident_name_of(target)
+                target_field: sview = storage_view_direct_field(target)
+                match target:
+                    Expr.Field(object, field, field_line):
+                        root <- ident_name_of(object)
+                    _:
+                        pass
+                return if root == "" or expr_mentions_name(value, root)
+                for index in 1..<alias_sources.count |alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, field_elems, root, target_field|:
+                    if alias_sources[index] == root and alias_names[index - 1] == "[field]" and index < alias_is_view.count and alias_is_view[index] and alias_names[index] != root:
+                        view_field: sview = alias_sources[index - 1]
+                        if storage_view_field_elem(root, view_field, field_elems) != "" and not storage_view_row_spared(index, root, target_field, field_elems, alias_names, alias_sources) and not fresh_wrapper_name_exists(invalidated, alias_names[index]):
+                            invalidated.push(alias_names[index])
+                            invalidated_by.push("") if invalidated.count > invalidated_by.count
+
+        def invalidate_replaced_container_views(target: Ast::Expr, operator: TokenKind, value: Ast::Expr, replace_names: darray[sview @source]&, alias_names: darray[sview @source]&, alias_sources: darray[sview @source]&, alias_is_view: darray[bool]&, invalidated: mutable darray[sview @source]&, invalidated_by: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if operator != TokenKind.Assign and operator != TokenKind.LArrow
+                container: mutable sview =
+                    match target:
+                        Expr.Ident(name, line):
+                            name
+                        _:
+                            sview("", 0, 0)
+                # An element replacement `grid[i] <- [..]` of a darray whose elements own a buffer.
+                match target:
+                    Expr.Index(object, index_value, index_line):
+                        element_owner: sview = ident_name_of(object)
+                        container <- element_owner if element_owner != "" and storage_view_has_element_marker(alias_names, alias_sources, element_owner)
+                    _:
+                        pass
+                return if:
+                    container == "" or not fresh_wrapper_name_exists(replace_names, container)
+                    storage_view_expr_carries_borrow(value, alias_names, alias_sources, alias_is_view)
+                for source in alias_sources |index: usize = 0, invalidated, invalidated_by, alias_names, alias_is_view, container|:
+                    if source == container and index < alias_names.count and index < alias_is_view.count and alias_is_view[index] and alias_names[index] != container and not fresh_wrapper_name_exists(invalidated, alias_names[index]):
+                        invalidated.push(alias_names[index])
+                        # An empty invalidator renders the replacement-neutral wording; the
+                        # "darray push of" sentence would name the wrong mutation.
+                        invalidated_by.push("") if invalidated.count > invalidated_by.count
+                    index <- index + 1
+
+        # A declaration introduces a new binding, so an invalidation recorded against an earlier
+        # binding of the same name no longer applies to later uses. The walk that owns the
+        # declaring body restores the marks on exit (`storage_view_restore_invalidated`), so an
+        # inner shadowing declaration cannot hide an invalidated outer binding.
+        def storage_view_forget_invalidated(name: sview, invalidated: mutable darray[sview @source]&, invalidated_by: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if not fresh_wrapper_name_exists(invalidated, name)
+                kept: mutable darray[sview @source] = []
+                kept_by: mutable darray[sview @source] = []
+                for index in 0..<invalidated.count |kept, kept_by, invalidated, invalidated_by, name|:
+                    if invalidated[index] != name:
+                        kept.push(invalidated[index])
+                        kept_by.push(invalidated_by[index]) if index < invalidated_by.count
+                invalidated.truncate(0)
+                invalidated_by.truncate(0)
+                for index in 0..<kept.count |kept, kept_by, invalidated, invalidated_by|:
+                    invalidated.push(kept[index])
+                    invalidated_by.push(kept_by[index]) if index < kept_by.count
+
+        def storage_view_restore_invalidated(saved: darray[sview @source]&, saved_by: darray[sview @source]&, invalidated: mutable darray[sview @source]&, invalidated_by: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for index in 0..<saved.count |saved, saved_by, invalidated, invalidated_by|:
+                    if not fresh_wrapper_name_exists(invalidated, saved[index]):
+                        invalidated.push(saved[index])
+                        invalidated_by.push(saved_by[index]) if index < saved_by.count and invalidated.count > invalidated_by.count
+
+        # Whether control never reaches the end of STATEMENTS and never loops back from them:
+        # the last statement returns, breaks or raises (or is an `if` whose branches both do)
+        # and no `continue` of this loop appears. A `continue` is a back edge, not a leave.
+        def storage_view_body_leaves(statements: darray[Ast::Stmt]&) -> bool:
+            can Abort.Panic:
+                return false if statements.count == 0 or storage_view_body_continues(statements)
+                return match statements[statements.count - 1]:
+                    Stmt.Return(_, _): true
+                    Stmt.Break(_, _): true
+                    Stmt.Expr(exit_expression, _): affine_is_raise(exit_expression)
+                    Stmt.If(_, then_body, else_body, _): storage_view_body_leaves(then_body) and storage_view_body_leaves(else_body)
+                    Stmt.Block(body: block_body, _): storage_view_body_leaves(block_body)
+                    _: false
+
+        # Whether a `continue` of the enclosing loop appears in STATEMENTS (nested loops own
+        # their own `continue`s).
+        def storage_view_body_continues(statements: darray[Ast::Stmt]&) -> bool:
+            can Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Continue(_, _):
+                            return true
+                        Stmt.If(_, then_body, else_body, _):
+                            return true if storage_view_body_continues(then_body) or storage_view_body_continues(else_body)
+                        Stmt.Block(body: block_body, _):
+                            return true if storage_view_body_continues(block_body)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms:
+                                return true if storage_view_body_continues(arm.body)
+                        _:
+                            pass
+                return false
+
+        # `r <- &xs[0]`: a plain assignment to a name whose value takes a fresh borrow rebinds the
+        # view, so it is not a use of the old referent and clears the old invalidation.
+        def storage_view_rebind_target(target: Ast::Expr, operator: TokenKind, value: Ast::Expr, alias_names: darray[sview @source]&, alias_sources: darray[sview @source]&, alias_is_view: darray[bool]&) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                return "" if operator != TokenKind.Assign and operator != TokenKind.LArrow
+                match target:
+                    Expr.Ident(name, line):
+                        return name if storage_view_expr_carries_borrow(value, alias_names, alias_sources, alias_is_view) else ""
+                    _:
+                        return ""
+
+        def storage_view_borrow_is_local(value: Ast::Expr) -> bool:
+            match value:
+                Expr.Ident(_, _):
+                    return true
+                Expr.Field(object, _, _):
+                    return storage_view_borrow_is_local(object)
+                Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.Unary(TokenKind.Ampersand, inner, _):
+                    return storage_view_borrow_is_local(inner)
+                Expr.Index(object, _, _):
+                    match object:
+                        Expr.Field(cast_object, method, _):
+                            return method == "cast" and storage_view_borrow_is_local(cast_object)
+                        Expr.Ident(_, _):
+                            return true
+                        _:
+                            return false
+                Expr.Call(callee, arguments, _, _):
+                    match callee:
+                        Expr.Field(receiver, _, _):
+                            return false if not storage_view_borrow_is_local(receiver)
+                        _:
+                            pass
+                    for argument in arguments:
+                        match argument:
+                            Expr.Unary(operator, operand, _):
+                                return false if operator == TokenKind.Ampersand and not storage_view_borrow_is_local(operand)
+                            _:
+                                pass
+                    return true
+                _:
+                    return false
+
+        def storage_view_value_rebind_target(target: Ast::Expr, operator: TokenKind, value_names: darray[sview @source]&) -> sview:
+            return "" if operator != TokenKind.Assign and operator != TokenKind.LArrow
+            return match target:
+                Expr.Ident(name, _):
+                    name if fresh_wrapper_name_exists(value_names, name) else ""
+                _:
+                    ""
+
+        # Locals and params declared with an explicit non-reference type. A name also bound
+        # with a reference or inferred type anywhere in the function is left out.
+        def storage_view_collect_value_names(names: darray[sview @source]&, types: darray[Ast::Expr]&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                others: mutable darray[sview @source] = []
+                for index in 0..<names.count |names, types, out, others|:
+                    if index < types.count and not (types[index] is Expr.Absent) and not storage_view_type_is_reference(types[index]):
+                        out.push(names[index])
+                    else:
+                        others.push(names[index])
+                storage_view_drop_shadowed(out, others)
+
+        def storage_view_snapshot(invalidated: darray[sview @source]&, invalidated_by: darray[sview @source]&, out: mutable darray[sview]&, out_by: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                out.truncate(0)
+                out_by.truncate(0)
+                for index in 0..<invalidated.count |invalidated, invalidated_by, out, out_by|:
+                    out.push(invalidated[index])
+                    out_by.push(invalidated_by[index]) if index < invalidated_by.count
+
+        # Walk a branch that leaves the loop (or function): its invalidations never reach the
+        # code after the branch or the loop's back edge, only the code after the loop, so they
+        # are parked in EXIT_MARKS until the enclosing loop ends.
+        def walk_region_storage_branch(body: darray[Ast::Stmt], annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, view_fns: darray[sview @source]&, replace_names: darray[sview @source]&, value_names: darray[sview @source]&, field_elems: darray[sview]&, field_views: darray[sview @source]&, field_view_heads: darray[Ast::Expr]&, stable_regions: mutable darray[sview @source]&, alias_names: mutable darray[sview @source]&, alias_sources: mutable darray[sview @source]&, alias_is_view: mutable darray[bool]&, invalidated: mutable darray[sview @source]&, invalidated_by: mutable darray[sview @source]&, exit_marks: mutable darray[sview @source]&, exit_marks_by: mutable darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if not storage_view_body_leaves(body):
+                    table <- walk_region_storage_stability(body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table) can Global{Read,Write}
+                    return
+                before: mutable darray[sview @source] = []
+                before_by: mutable darray[sview @source] = []
+                storage_view_snapshot(invalidated, invalidated_by, before, before_by)
+                table <- walk_region_storage_stability(body, annotations, function_line, view_fns, replace_names, value_names, field_elems, field_views, field_view_heads, stable_regions, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, exit_marks, exit_marks_by, table) can Global{Read,Write}
+                for index in 0..<invalidated.count |invalidated, invalidated_by, before, exit_marks, exit_marks_by|:
+                    if not fresh_wrapper_name_exists(before, invalidated[index]) and not fresh_wrapper_name_exists(exit_marks, invalidated[index]):
+                        exit_marks.push(invalidated[index])
+                        exit_marks_by.push(invalidated_by[index]) if index < invalidated_by.count and exit_marks.count > exit_marks_by.count
+                storage_view_snapshot(before, before_by, invalidated, invalidated_by)
+
+        def storage_view_already_reported(name: sview, line: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for diagnostic in table.diagnostics:
+                    return true if diagnostic.kind == DiagnosticKind.StorageDependencyInvalidated and diagnostic.name == name and diagnostic.line == line
+                return false
+
+        # Record EXPRESSION's position in FOUND if it reads the view PROBE[0]; 1 when it does.
+        def storage_view_loop_use(expression: Ast::Expr, probe: darray[sview @source]&, line: u32, found_pos: mutable darray[Ast::Pos]&, found_line: mutable darray[u32]&) -> u8:
+            can Memory.Allocate, Abort.Panic:
+                return 0 if invalidated_alias_in_expression(expression, probe) == ""
+                found_pos.push(ident_extent_or_line(expression, line))
+                found_line.push(line)
+                return 1
+
+        # Find the first read of the view PROBE[0] in STATEMENTS, in walk order: 1 = found (its
+        # position is in FOUND), 2 = a declaration or rebind of the name ends this list first,
+        # 0 = neither. A nested list's 2 only ends that list (the other path still continues).
+        def storage_view_loop_first_use(statements: darray[Ast::Stmt], probe: darray[sview @source]&, alias_names: darray[sview @source]&, alias_sources: darray[sview @source]&, alias_is_view: darray[bool]&, found_pos: mutable darray[Ast::Pos]&, found_line: mutable darray[u32]&) -> u8:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable u8 = 0
+                for statement in statements |result, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line|:
+                    break if result != 0
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            result <- storage_view_loop_use(value, probe, line.line, found_pos, found_line)
+                            result <- 2 if result == 0 and name == probe[0]
+                        Stmt.Expr(expression, line):
+                            result <- storage_view_loop_use(expression, probe, line.line, found_pos, found_line)
+                            match expression:
+                                Expr.Block(block_statements, value, captures, block_line):
+                                    result <- 1 if result == 0 and storage_view_loop_first_use(block_statements, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) == 1
+                                _:
+                                    pass
+                        Stmt.Assign(target, operator, value, line):
+                            rebound: sview = storage_view_rebind_target(target, operator, value, alias_names, alias_sources, alias_is_view)
+                            result <- storage_view_loop_use(target, probe, line.line, found_pos, found_line) if rebound == ""
+                            result <- storage_view_loop_use(value, probe, line.line, found_pos, found_line) if result == 0
+                            result <- 2 if result == 0 and rebound == probe[0]
+                        Stmt.Return(value, line):
+                            result <- storage_view_loop_use(returned, probe, line.line, found_pos, found_line) if value is returned
+                        Stmt.If(condition, then_body, else_body, line):
+                            result <- storage_view_loop_use(condition, probe, line.line, found_pos, found_line)
+                            result <- 1 if result == 0 and storage_view_loop_first_use(then_body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) == 1
+                            result <- 1 if result == 0 and storage_view_loop_first_use(else_body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) == 1
+                        Stmt.While(condition, while_body, line):
+                            result <- storage_view_loop_use(condition, probe, line.line, found_pos, found_line)
+                            result <- 1 if result == 0 and storage_view_loop_first_use(while_body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) == 1
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            result <- storage_view_loop_use(iterable, probe, line.line, found_pos, found_line)
+                            result <- 1 if result == 0 and storage_view_loop_first_use(for_body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) == 1
+                        Stmt.Match(scrutinee, arms, line):
+                            result <- storage_view_loop_use(scrutinee, probe, line.line, found_pos, found_line)
+                            for arm in arms |result, probe, alias_names, alias_is_view, found_pos, found_line|:
+                                result <- 1 if result == 0 and storage_view_loop_first_use(arm.body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) == 1
+                        Stmt.Block(kind, clause, binding, block_body, line):
+                            result <- 1 if storage_view_loop_first_use(block_body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) == 1
+                        _:
+                            pass
+                return result
+
+        # A loop body runs again after its last statement: a view that the body invalidated (and
+        # did not rebind afterwards) is stale when the next iteration reaches its first read. The
+        # walk sees that read once, before the growth, so the back edge is checked here. BEFORE
+        # holds the marks at loop entry; CONDITION is re-evaluated each iteration (a `while`).
+        def check_storage_view_loop_back_edge(body: darray[Ast::Stmt], condition: Ast::Expr, has_condition: bool, loop_line: u32, before: darray[sview @source]&, alias_names: darray[sview @source]&, alias_sources: darray[sview @source]&, alias_is_view: darray[bool]&, invalidated: darray[sview @source]&, invalidated_by: darray[sview @source]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if storage_view_body_leaves(body)
+                # Each probe retains only its first read, so reuse the scratch arrays and
+                # truncate the two result columns before scanning the next invalidated name.
+                probe: mutable darray[sview @source] = []
+                found_pos: mutable darray[Ast::Pos] = []
+                found_line: mutable darray[u32] = []
+                for index in 0..<invalidated.count |table, body, condition, before, alias_names, alias_sources, alias_is_view, invalidated, invalidated_by, probe, found_pos, found_line|:
+                    if not fresh_wrapper_name_exists(before, invalidated[index]):
+                        if probe.count == 0:
+                            probe.push(invalidated[index])
+                        else:
+                            probe[0] <- invalidated[index]
+                        found_pos.truncate(0)
+                        found_line.truncate(0)
+                        found: u8 = storage_view_loop_use(condition, probe, loop_line, found_pos, found_line) if has_condition else 0
+                        rest: u8 = storage_view_loop_first_use(body, probe, alias_names, alias_sources, alias_is_view, found_pos, found_line) if found == 0 else 0
+                        by: sview = invalidated_by[index] if index < invalidated_by.count else ""
+                        if found_pos.count > 0 and not storage_view_already_reported(probe[0], found_line[0], table):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StorageDependencyInvalidated, name: probe[0], pos: found_pos[0], line: found_line[0], expected: by, actual: ""})
+
+        # The task operands submitted anywhere inside a `nursery:`/`pool:` body. `submit f(v)`
+        # parses as a statement-less value block around the call (so does `await t`, whose
+        # operand is a task handle rather than a view, so including it cannot add a report).
+        def storage_view_collect_submits(statements: darray[Ast::Stmt]&, out: mutable darray[Ast::Expr]&, out_lines: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |out, out_lines|:
+                    match statement:
+                        Stmt.Expr(expression, line):
+                            storage_view_collect_submit_expr(expression, line.line, out, out_lines)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            storage_view_collect_submit_expr(value, line.line, out, out_lines)
+                        Stmt.Assign(target, operator, value, line):
+                            storage_view_collect_submit_expr(value, line.line, out, out_lines)
+                        Stmt.If(condition, then_body, else_body, line):
+                            storage_view_collect_submits(then_body, out, out_lines)
+                            storage_view_collect_submits(else_body, out, out_lines)
+                        Stmt.While(condition, while_body, line):
+                            storage_view_collect_submits(while_body, out, out_lines)
+                        Stmt.For(bind, variables, iterable, for_body, line):
+                            storage_view_collect_submits(for_body, out, out_lines)
+                        Stmt.Match(scrutinee, arms, line):
+                            for arm in arms |out, out_lines|:
+                                storage_view_collect_submits(arm.body, out, out_lines)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            storage_view_collect_submits(body, out, out_lines)
+                        _:
+                            pass
+
+        def storage_view_collect_submit_expr(expression: Ast::Expr, line: u32, out: mutable darray[Ast::Expr]&, out_lines: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Block(block_statements, block_value, block_captures, block_line):
+                        if block_statements.count == 0:
+                            out.push(block_value)
+                            out_lines.push(line)
+                    _:
+                        pass
+
+        # A payload binder of an enum value that carries a view (`t: Tok =
+        # Tok.Word(buf.as_sview())`, then `match t: Tok.Word(text)` or `t is
+        # Tok.Word(text)`) borrows the same storage, so it inherits the scrutinee's view
+        # rows (stage0 enterVariantPayloadPattern). Scalar payload fields copy out.
+        def storage_view_payload_field_is_scalar(variant: sview, position: usize, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                seen: mutable bool = false
+                for row in 0..<table.enum_payload_owner.count |seen, variant, position, table|:
+                    if row < table.enum_payload_variant.count and table.enum_payload_variant[row] == variant and row < table.enum_payload_position.count and table.enum_payload_position[row].usize() == position:
+                        type_id: u32 = table.enum_payload_type_id[row] if row < table.enum_payload_type_id.count else 0
+                        return false if not storage_scalar_pointee(type_id, table)
+                        seen <- true
+                return seen
+
+        def storage_view_bind_payload_name(name: sview @source, root: sview, alias_names: mutable darray[sview @source]&, alias_sources: mutable darray[sview @source]&, alias_is_view: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if name == "" or root == "" or name == root
+                count: usize = alias_names.count
+                for index in 0..<count |name, root, alias_names, alias_sources, alias_is_view|:
+                    if alias_names[index] == root and index < alias_sources.count and index < alias_is_view.count and alias_is_view[index]:
+                        alias_names.push(name)
+                        alias_sources.push(alias_sources[index])
+                        alias_is_view.push(true)
+
+        def storage_view_bind_payload_pattern(pattern: Ast::Pattern, root: sview, alias_names: mutable darray[sview @source]&, alias_sources: mutable darray[sview @source]&, alias_is_view: mutable darray[bool]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Pattern.Variant(path, fields):
+                        variant: sview = pag_pattern_terminal_name(path)
+                        for position in 0..<fields.count |fields, variant, root, alias_names, alias_sources, alias_is_view, table|:
+                            match fields[position]:
+                                Pattern.Binding(name):
+                                    storage_view_bind_payload_name(name, root, alias_names, alias_sources, alias_is_view) if not storage_view_payload_field_is_scalar(variant, position, table)
+                                _:
+                                    storage_view_bind_payload_pattern(fields[position], root, alias_names, alias_sources, alias_is_view, table)
+                    Pattern.As(name, inner):
+                        storage_view_bind_payload_name(name, root, alias_names, alias_sources, alias_is_view)
+                        for nested in inner |root, alias_names, alias_sources, alias_is_view, table|:
+                            storage_view_bind_payload_pattern(nested, root, alias_names, alias_sources, alias_is_view, table)
+                    Pattern.Or(options):
+                        for nested in options |root, alias_names, alias_sources, alias_is_view, table|:
+                            storage_view_bind_payload_pattern(nested, root, alias_names, alias_sources, alias_is_view, table)
+                    _:
+                        pass
+
+        def storage_view_callee_terminal(callee: Ast::Expr) -> sview:
+            match callee:
+                Expr.Ident(name, _): return name
+                Expr.Field(_, field, _) | Expr.Scope(_, field, _): return field
+                _: return ""
+
+        def storage_view_bind_payload_condition(condition: Ast::Expr, alias_names: mutable darray[sview @source]&, alias_sources: mutable darray[sview @source]&, alias_is_view: mutable darray[bool]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, line):
+                        if operator == TokenKind.Is:
+                            match right:
+                                Expr.Call(callee, arguments, argument_names, call_line):
+                                    variant: sview = storage_view_callee_terminal(callee)
+                                    root: sview = storage_view_place_root(left)
+                                    for position in 0..<arguments.count |arguments, variant, root, alias_names, alias_sources, alias_is_view, table|:
+                                        match arguments[position]:
+                                            Expr.Ident(name, _):
+                                                storage_view_bind_payload_name(name, root, alias_names, alias_sources, alias_is_view) if not storage_view_payload_field_is_scalar(variant, position, table)
+                                            _:
+                                                pass
+                                _:
+                                    pass
+                        else:
+                            storage_view_bind_payload_condition(left, alias_names, alias_sources, alias_is_view, table)
+                            storage_view_bind_payload_condition(right, alias_names, alias_sources, alias_is_view, table)
+                    _:
+                        pass

@@ -1,0 +1,172 @@
+extend Semantic:
+    private:
+        # Only a darray, fixed array, or view has a known buffer extent. Reference and
+        # mutability wrappers preserve that underlying extent (`mutable darray[T]&` is still
+        # a sized buffer); a bare reference such as `static u8&` remains an unsized raw pointer.
+        def pec_type_is_sized_buffer(type_expression: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, operand, unary_line):
+                        return pec_type_is_sized_buffer(operand)
+                    Expr.Paren(inner, paren_line):
+                        return pec_type_is_sized_buffer(inner)
+                    Expr.Index(head, argument, index_line):
+                        head_name: sview = ident_name_of(head)
+                        match head_name:
+                            "darray" | "view":
+                                return true
+                            _:
+                                pass
+                        return match argument:
+                            Expr.IntLit(extent_value, extent_line): head_name != ""
+                            _: false
+                    Expr.IndexN(head_n, arguments, index_n_line):
+                        head_n_name: sview = ident_name_of(head_n)
+                        return when head_n_name:
+                            "darray" | "view" -> true
+                            _ -> false
+                    _:
+                        return false
+
+
+        def pec_collect_buffer_locals(statements: darray[Ast::Stmt], buffer_locals: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |buffer_locals|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            buffer_locals.push(name) if pec_type_is_sized_buffer(type_expression)
+                        Stmt.If(condition, then_body, else_body, line):
+                            pec_collect_buffer_locals(then_body, buffer_locals)
+                            pec_collect_buffer_locals(else_body, buffer_locals)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            pec_collect_buffer_locals(body, buffer_locals)
+                        Stmt.While(_, body, while_line) | Stmt.For(_, _, _, body, while_line):
+                            pec_collect_buffer_locals(body, buffer_locals)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |buffer_locals|:
+                                pec_collect_buffer_locals(arm.body, buffer_locals)
+                        _:
+                            pass
+
+
+        # A struct FIELD that is itself a sized buffer (`data: mutable darray[u8]`), read off
+        # the interned field rows. Resolved by field NAME across every struct: the semantic
+        # phase keeps type names bare, so the receiver's own struct is not always recoverable
+        # here, and a field of this name that is a buffer somewhere is the closest sound
+        # answer -- the alternative (never firing on a field receiver) drops the whole family.
+        def pec_field_is_sized_buffer(table: SymbolTable&, field_name: sview) -> bool:
+            can Abort.Panic:
+                return false if field_name == ""
+                paired: mutable usize = table.struct_field_name.count
+                paired <- table.struct_field_type_id.count if paired > table.struct_field_type_id.count
+                for row_index in 0..<paired |table, field_name|:
+                    continue if table.struct_field_name[row_index] != field_name
+                    row_id: u32 = table.struct_field_type_id[row_index]
+                    continue if interned_kind(row_id, table) != SemTypeKind.Container
+                    head: sview = interned_name(row_id, table)
+                    is_buffer_head: bool = when head:
+                        "darray" | "array" | "view" -> true
+                        _ -> false
+                    return true if is_buffer_head
+                return false
+
+
+        # stage0's `castOperandRootsAtBufferIndex`: walk through parens / address-of / casts
+        # to the INDEX at the root, and ask whether the thing being indexed is a sized buffer.
+        def pec_indexed_object_is_buffer(indexed_object: Ast::Expr, buffer_locals: darray[sview @source]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match indexed_object:
+                    Expr.Paren(inner, paren_line):
+                        return pec_indexed_object_is_buffer(inner, buffer_locals, table)
+                    Expr.Ident(object_name, object_line):
+                        return any known in buffer_locals where known == object_name
+                    Expr.Field(field_object, field_name, field_line):
+                        return pec_field_is_sized_buffer(table, field_name)
+                    _:
+                        return false
+
+
+        def pec_receiver_roots_at_buffer(receiver: Ast::Expr, buffer_locals: darray[sview @source]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match receiver:
+                    Expr.Paren(inner, paren_line):
+                        return pec_receiver_roots_at_buffer(inner, buffer_locals, table)
+                    Expr.Unary(operator, operand, unary_line):
+                        return pec_receiver_roots_at_buffer(operand, buffer_locals, table) if operator == TokenKind.Ampersand
+                        return false
+                    Expr.Index(indexed_object, index_expression, index_line):
+                        return pec_indexed_object_is_buffer(indexed_object, buffer_locals, table)
+                    _:
+                        return false
+
+
+        # A darray's `.items` field is an unbounded pointer into its backing. Treat using
+        # it as a C string as a raw-pointer conversion unless the local unsafe boundary
+        # explicitly accepts responsibility for the terminator and live extent.
+        def pec_receiver_is_buffer_items(receiver: Ast::Expr, buffer_locals: darray[sview @source]&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match receiver:
+                    Expr.Field(object, field, line):
+                        return field == "items" and pec_indexed_object_is_buffer(object, buffer_locals, table)
+                    Expr.Paren(inner, line):
+                        return pec_receiver_is_buffer_items(inner, buffer_locals, table)
+                    _:
+                        return false
+
+
+        def pec_collect_pointer_locals(statements: darray[Ast::Stmt], pointer_locals: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |pointer_locals|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            pointer_locals.push(name) if type_marker_present_here(type_expression, TokenKind.Ampersand)
+                        Stmt.If(condition, then_body, else_body, line):
+                            pec_collect_pointer_locals(then_body, pointer_locals)
+                            pec_collect_pointer_locals(else_body, pointer_locals)
+                        Stmt.Block(kind, clause, binding, body, line):
+                            pec_collect_pointer_locals(body, pointer_locals)
+                        Stmt.While(_, body, while_line) | Stmt.For(_, _, _, body, while_line):
+                            pec_collect_pointer_locals(body, pointer_locals)
+                        Stmt.Match(scrutinee, arms, match_line):
+                            for arm in arms |pointer_locals|:
+                                pec_collect_pointer_locals(arm.body, pointer_locals)
+                        _:
+                            pass
+
+        def check_pointer_erasure_declarations(declarations: darray[Ast::Decl], generic_lines: darray[u32]&, enforce_unsafe_permissions: bool, runtime_std: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table|:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            immutable_params: mutable darray[sview @source] = []
+                            # Authority checks apply to every declaration. Runtime internals
+                            # must carry their own explicit local unsafe grants.
+                            numeric_locals: mutable darray[sview @source] = []
+                            pointer_locals: mutable darray[sview @source] = []
+                            buffer_locals: mutable darray[sview @source] = []
+                            for parameter in params |immutable_params, numeric_locals|:
+                                is_mutable_binding: bool = parameter.is_mutable or type_marker_present_here(parameter.type_expression, TokenKind.Mutable)
+                                immutable_params.push(parameter.name) if not is_mutable_binding
+                                numeric_locals.push(parameter.name) if pec_type_is_numeric(parameter.type_expression)
+                                pointer_locals.push(parameter.name) if type_marker_present_here(parameter.type_expression, TokenKind.Ampersand)
+                                buffer_locals.push(parameter.name) if pec_type_is_sized_buffer(parameter.type_expression)
+                            pec_collect_numeric_locals(body, numeric_locals)
+                            pec_collect_pointer_locals(body, pointer_locals)
+                            pec_collect_buffer_locals(body, buffer_locals)
+                            nul_names: mutable darray[sview @source] = []
+                            no_pointer_grants: darray[sview @source] = []
+                            no_trusted_grants: darray[sview @source] = []
+                            table <- check_pointer_erasure_statements(body, name, line.line, params, effects, no_pointer_grants, no_trusted_grants, enforce_unsafe_permissions, enforce_unsafe_permissions or pointer_erasure_generic_line(generic_lines, line.line), immutable_params, numeric_locals, pointer_locals, buffer_locals, nul_names, table)
+                        Decl.Module(name, body, line) | Decl.Scoped(body, line):
+                            table <- check_pointer_erasure_declarations(body, generic_lines, enforce_unsafe_permissions, runtime_std, table)
+                        _:
+                            pass
+
+    public:
+        def check_pointer_erasure_cast(file: Ast::File&, enforce_unsafe_permissions: bool, runtime_std: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table.inline_pointer_grant_spans <- table.inline_pointer_grant_spans.truncate(0)
+                for annotation in file.enum_annotations |table|:
+                    if annotation.owner == "__inline_expression_grant" and (annotation.name == "Unsafe.PointerCast" or annotation.name == "PointerCast" or annotation.name == "Unsafe"):
+                        table.inline_pointer_grant_spans <- table.inline_pointer_grant_spans.push(annotation.pos)
+                table <- check_pointer_erasure_declarations(file.top_decls, file.generic_param_lines, enforce_unsafe_permissions, runtime_std, table)

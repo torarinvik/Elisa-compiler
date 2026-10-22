@@ -1,0 +1,590 @@
+extend Semantic:
+    private:
+        # Collect local-storage roots carried by a value. Bindings are stored as groups in
+        # `escape_names`/`escape_roots`; an empty root starts a new binding version and stops
+        # lookup from reaching an older assignment.
+        def bam_escape_collect_roots(value: Ast::Expr, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview @source]&, escape_roots: darray[sview @source]&, detached: darray[BorrowDetachedPlace]&, out_roots: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Unary(operator, operand, _) if operator == TokenKind.Ampersand:
+                        root: sview = bam_place_root(operand)
+                        out_roots.push(root) if root != ""
+                    Expr.Index(Expr.Field(receiver, selector, _), _, _) if selector == "ref":
+                        root: sview = bam_place_root(receiver)
+                        out_roots.push(root) if root != ""
+                    Expr.Call(_, _, _, _):
+                        bam_escape_collect_lend_call_roots(value, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.Ident(name, _):
+                        found_alias: mutable bool = false
+                        alias_index: mutable usize = escape_names.count
+                        while alias_index > 0 |alias_index, escape_names, escape_roots, found_alias, out_roots|:
+                            alias_index <- alias_index - 1
+                            if escape_names[alias_index] == name:
+                                if escape_roots[alias_index] == "":
+                                    break
+                                out_roots.push(escape_roots[alias_index])
+                                found_alias <- true
+                    Expr.Field(object, _, _):
+                        bam_escape_collect_roots(object, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.Construct(_, fields, _):
+                        for initializer in fields |out_roots|:
+                            bam_escape_collect_roots(initializer.value, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.RecordUpdate(base, fields, _):
+                        bam_escape_collect_roots(base, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                        for initializer in fields |out_roots|:
+                            bam_escape_collect_roots(initializer.value, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.Tuple(elements, _) | Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |out_roots|:
+                            bam_escape_collect_roots(element, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |out_roots|:
+                            bam_escape_collect_roots(entry.value, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.If(_, then_value, else_value, _):
+                        bam_escape_collect_roots(then_value, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                        bam_escape_collect_roots(else_value, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.RegionNew(inner, _, _):
+                        bam_escape_collect_roots(inner, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    Expr.Block(value: block_value, _):
+                        bam_escape_collect_roots(block_value, lend_names, lend_positions, escape_names, escape_roots, detached, out_roots)
+                    _:
+                        pass
+
+        def bam_expression_is_direct_borrow(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Unary(operator, _, _):
+                        return operator == TokenKind.Ampersand
+                    Expr.Index(Expr.Field(receiver, selector, _), target, _):
+                        return selector == "ref" or (selector == "cast" and bam_type_is_address(target) and bam_expression_is_direct_borrow(receiver))
+                    Expr.Paren(inner, _):
+                        return bam_expression_is_direct_borrow(inner)
+                    _:
+                        return false
+
+        def bam_return_uses_aggregate_diagnostic(expression: Ast::Expr, aggregate_result: bool, direct_reference_result: bool) -> bool:
+            can Abort.Panic:
+                return true if aggregate_result
+                return direct_reference_result and not bam_expression_is_direct_borrow(expression)
+
+        def bam_escape_anchor(returned: Ast::Expr) -> Ast::Pos:
+            can Abort.Panic:
+                match returned:
+                    Expr.Construct(construct_type, _, _):
+                        return Ast::expr_pos(construct_type)
+                    _:
+                        return Ast::expr_pos(returned)
+
+        def bam_report_escape(returned: Ast::Expr, locals: darray[sview]&, perm_containers: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: darray[sview @source]&, escape_roots: darray[sview @source]&, detached: darray[BorrowDetachedPlace]&, aggregate_result: bool, anchor: Ast::Pos, anchored: bool, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # stage0 reports the escape at the RETURNED expression's first token, not at
+                # the `&` nested inside a literal; compound arms pass that anchor inward.
+                nested_anchor: Ast::Pos = anchor if anchored else bam_escape_anchor(returned)
+                match returned:
+                    Expr.Unary(return_operator, return_operand, return_pos):
+                        return if return_operator != TokenKind.Ampersand or (anchored and bam_place_is_detached(return_operand, detached))
+                        table <- bam_report_escape_root(bam_place_root(return_operand), (anchor if anchored else return_pos), locals, aggregate_result, table)
+                    # `x.ref[T]` -- the REMOVED reference shorthand. stage0 reports its removal
+                    # and then keeps analysing it as `&x`, so the dangle lands too; stage1 used
+                    # to stop at the removal message and let the use-after-free through.
+                    Expr.Index(Expr.Field(ref_receiver, ref_selector, ref_field_pos), ref_target, ref_index_pos):
+                        # `(&x).cast[T&?]` (also inside `trusted`) still points at x.
+                        if ref_selector == "cast" and bam_type_is_address(ref_target):
+                            # stage0's `perm` rule: a `static T&` function allocates its containers
+                            # in `perm`, so `(&out[i]).cast[static T&]` outlives the frame.
+                            return if bam_annotation_is_static(ref_target) and bam_borrow_is_element(bam_strip_paren(ref_receiver)) and (any perm_name in perm_containers where perm_name == bam_borrow_root(bam_strip_paren(ref_receiver)))
+                            table <- bam_report_escape_root(bam_borrow_root(bam_strip_paren(ref_receiver)), (anchor if anchored else ref_field_pos), locals, aggregate_result, table)
+                            return
+                        return if ref_selector != "ref"
+                        table <- bam_report_escape_root(bam_place_root(ref_receiver), (anchor if anchored else ref_index_pos), locals, aggregate_result, table)
+                    Expr.Call(pos: call_pos, _):
+                        roots: mutable darray[sview @source] = []
+                        bam_escape_collect_roots(returned, lend_names, lend_positions, escape_names, escape_roots, detached, roots)
+                        for root in roots |table| -> table:
+                            table <- bam_report_escape_root(root, (anchor if anchored else call_pos), locals, aggregate_result, table)
+                    Expr.Ident(returned_name, returned_pos):
+                        roots: mutable darray[sview @source] = []
+                        bam_escape_collect_roots(returned, lend_names, lend_positions, escape_names, escape_roots, detached, roots)
+                        for root in roots |table| -> table:
+                            table <- bam_report_escape_root(root, (anchor if anchored else returned_pos), locals, aggregate_result, table)
+                    Expr.Field(field_object, _, field_pos):
+                        roots: mutable darray[sview @source] = []
+                        bam_escape_collect_roots(field_object, lend_names, lend_positions, escape_names, escape_roots, detached, roots)
+                        for root in roots |table| -> table:
+                            table <- bam_report_escape_root(root, (anchor if anchored else field_pos), locals, aggregate_result, table)
+                    Expr.Construct(_, fields, _):
+                        for initializer in fields |table| -> table:
+                            table <- bam_report_escape(initializer.value, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- bam_report_escape(base, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                        for initializer in fields |table| -> table:
+                            table <- bam_report_escape(initializer.value, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                    Expr.Tuple(elements, _) | Expr.Array(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |table| -> table:
+                            table <- bam_report_escape(element, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |table| -> table:
+                            table <- bam_report_escape(entry.value, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                    Expr.If(_, then_value, else_value, _):
+                        table <- bam_report_escape(then_value, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                        table <- bam_report_escape(else_value, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.RegionNew(inner, _, _):
+                        table <- bam_report_escape(inner, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                    Expr.Block(block_statements, block_value, _, _):
+                        table <- bam_report_escape(block_value, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, aggregate_result, nested_anchor, true, table)
+                    _:
+                        pass
+
+        # `name = value`: a fresh binding version holding the value's local-storage roots.
+        def bam_escape_track_declaration(declared_name: sview @source, declared_value: Ast::Expr, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview @source]&, escape_roots: mutable darray[sview @source]&, detached: darray[BorrowDetachedPlace]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                declared_roots: mutable darray[sview @source] = []
+                bam_escape_collect_roots(declared_value, lend_names, lend_positions, escape_names, escape_roots, detached, declared_roots)
+                escape_names.push(declared_name)
+                escape_roots.push("")
+                for declared_root in declared_roots |escape_names, escape_roots|:
+                    escape_names.push(declared_name)
+                    escape_roots.push(declared_root)
+
+        def bam_escape_track_assign(assign_target: Ast::Expr, assign_value: Ast::Expr, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview @source]&, escape_roots: mutable darray[sview @source]&, detached: darray[BorrowDetachedPlace]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                assigned_name: sview = bam_place_root(assign_target)
+                return if assigned_name == ""
+                assigned_roots: mutable darray[sview @source] = []
+                bam_escape_collect_roots(assign_value, lend_names, lend_positions, escape_names, escape_roots, detached, assigned_roots)
+                # An interior write changes one field/element, not the whole
+                # aggregate. Preserve other possibly-borrowed members.
+                if bam_place_is_interior(assign_target):
+                    existing_roots: darray[sview @source] = bam_escape_roots_for_binding(assigned_name, escape_names, escape_roots)
+                    for existing_root in existing_roots |assigned_roots|:
+                        assigned_roots.push(existing_root) if not (any known_root in assigned_roots where known_root == existing_root)
+                escape_names.push(assigned_name)
+                escape_roots.push("")
+                for assigned_root in assigned_roots |escape_names, escape_roots|:
+                    escape_names.push(assigned_name)
+                    escape_roots.push(assigned_root)
+
+        # The container methods that RETAIN their arguments (stage0's
+        # returnBorrowContainerInsertMethods).
+        def bam_is_container_insert(method: sview) -> bool:
+            can Abort.Panic:
+                return when method:
+                    "push" | "extend" | "insert" | "put" | "add" | "append" | "push_back" | "push_front" | "set" -> true
+                    _ -> false
+
+        # `out.push(&x)` as a statement: the receiver now ALSO holds the arguments' roots, so a
+        # later `return out` carries them. The receiver's existing roots stay.
+        def bam_escape_track_insert(statement_value: Ast::Expr, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview @source]&, escape_roots: mutable darray[sview @source]&, detached: darray[BorrowDetachedPlace]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match statement_value:
+                    Expr.Call(Expr.Field(insert_receiver, insert_method, _), insert_arguments, _, _):
+                        return if not bam_is_container_insert(insert_method)
+                        receiver_name: sview = bam_place_root(insert_receiver)
+                        return if receiver_name == ""
+                        inserted_roots: mutable darray[sview @source] = []
+                        for insert_argument in insert_arguments |inserted_roots|:
+                            bam_escape_collect_roots(insert_argument, lend_names, lend_positions, escape_names, escape_roots, detached, inserted_roots)
+                        return if inserted_roots.count == 0
+                        existing_roots: darray[sview @source] = bam_escape_roots_for_binding(receiver_name, escape_names, escape_roots)
+                        escape_names.push(receiver_name)
+                        escape_roots.push("")
+                        for existing_root in existing_roots |escape_names, escape_roots|:
+                            escape_names.push(receiver_name)
+                            escape_roots.push(existing_root)
+                        for inserted_root in inserted_roots |escape_names, escape_roots, existing_roots|:
+                            if not (any known_root in existing_roots where known_root == inserted_root):
+                                escape_names.push(receiver_name)
+                                escape_roots.push(inserted_root)
+                    _:
+                        pass
+
+        def bam_escape_statements[@r](statements: darray[Ast::Stmt], locals: darray[sview]&, perm_containers: darray[sview]&, lend_names: darray[sview]&, lend_positions: darray[usize]&, escape_names: mutable darray[sview @source]& @r, escape_roots: mutable darray[sview @source]& @r, detached: darray[BorrowDetachedPlace]&, table: lmut SymbolTable, aggregate_result: bool, direct_reference_result: bool, tail_value: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                statement_index: mutable usize = 0
+                for statement in statements |table, statement_index, escape_names, escape_roots| -> table:
+                    match statement:
+                        Stmt.Return(returned_option, returned_pos):
+                            if returned_option is returned_expression:
+                                table <- bam_report_escape(returned_expression, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, bam_return_uses_aggregate_diagnostic(returned_expression, aggregate_result, direct_reference_result), Ast::expr_pos(returned_expression), false, table)
+                        # A body's tail expression is its return value.
+                        Stmt.Expr(tail_expression, tail_pos):
+                            is_tail_expression: bool = tail_value and statement_index + 1 == statements.count
+                            # A value-form loop (`for v in xs |acc| -> acc:`) keeps its
+                            # Expr.Block shape in the loop view: its statements write the
+                            # captured names like a loop body, and only its yield is a value.
+                            value_block: mutable bool = false
+                            match tail_expression:
+                                Expr.Block(value_block_statements, value_block_value, _, _):
+                                    value_block <- true
+                                    block_names: mutable darray[sview @source] @r = []
+                                    block_roots: mutable darray[sview @source] @r = []
+                                    block_names.extend(escape_names)
+                                    block_roots.extend(escape_roots)
+                                    table <- bam_escape_statements(value_block_statements, locals, perm_containers, lend_names, lend_positions, block_names, block_roots, detached, table, aggregate_result, direct_reference_result, false)
+                                    bam_escape_merge_branch(escape_names, escape_roots, block_names, block_roots)
+                                    if is_tail_expression and not (value_block_value is Ast::Expr.Invalid):
+                                        table <- bam_report_escape(value_block_value, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, bam_return_uses_aggregate_diagnostic(value_block_value, aggregate_result, direct_reference_result), Ast::expr_pos(value_block_value), false, table)
+                                _:
+                                    pass
+                            if is_tail_expression and not value_block:
+                                table <- bam_report_escape(tail_expression, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, bam_return_uses_aggregate_diagnostic(tail_expression, aggregate_result, direct_reference_result), Ast::expr_pos(tail_expression), false, table)
+                            elif not value_block:
+                                bam_escape_track_insert(tail_expression, lend_names, lend_positions, escape_names, escape_roots, detached)
+                        Stmt.VarDecl(declared_name, _, declared_value, _):
+                            bam_escape_track_declaration(declared_name, declared_value, lend_names, lend_positions, escape_names, escape_roots, detached)
+                        Stmt.Assign(assign_target, _, assign_value, _):
+                            bam_escape_track_assign(assign_target, assign_value, lend_names, lend_positions, escape_names, escape_roots, detached)
+                        Stmt.If(branch_condition, branch_then, branch_else, branch_pos):
+                            then_names: mutable darray[sview @source] @r = []
+                            then_roots: mutable darray[sview @source] @r = []
+                            else_names: mutable darray[sview @source] @r = []
+                            else_roots: mutable darray[sview @source] @r = []
+                            then_names.extend(escape_names)
+                            then_roots.extend(escape_roots)
+                            else_names.extend(escape_names)
+                            else_roots.extend(escape_roots)
+                            table <- bam_escape_statements(branch_then, locals, perm_containers, lend_names, lend_positions, then_names, then_roots, detached, table, aggregate_result, direct_reference_result, false)
+                            table <- bam_escape_statements(branch_else, locals, perm_containers, lend_names, lend_positions, else_names, else_roots, detached, table, aggregate_result, direct_reference_result, false)
+                            bam_escape_merge_branch(escape_names, escape_roots, then_names, then_roots)
+                            bam_escape_merge_branch(escape_names, escape_roots, else_names, else_roots)
+                        Stmt.While(loop_condition, loop_body, loop_pos):
+                            loop_names: mutable darray[sview @source] @r = []
+                            loop_roots: mutable darray[sview @source] @r = []
+                            loop_names.extend(escape_names)
+                            loop_roots.extend(escape_roots)
+                            table <- bam_escape_statements(loop_body, locals, perm_containers, lend_names, lend_positions, loop_names, loop_roots, detached, table, aggregate_result, direct_reference_result, false)
+                            bam_escape_merge_branch(escape_names, escape_roots, loop_names, loop_roots)
+                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_pos):
+                            loop_names: mutable darray[sview @source] @r = []
+                            loop_roots: mutable darray[sview @source] @r = []
+                            loop_names.extend(escape_names)
+                            loop_roots.extend(escape_roots)
+                            table <- bam_escape_statements(for_body, locals, perm_containers, lend_names, lend_positions, loop_names, loop_roots, detached, table, aggregate_result, direct_reference_result, false)
+                            bam_escape_merge_branch(escape_names, escape_roots, loop_names, loop_roots)
+                        Stmt.Block(block_kind, block_clause, block_binding, block_body, block_pos):
+                            table <- bam_escape_statements(block_body, locals, perm_containers, lend_names, lend_positions, escape_names, escape_roots, detached, table, aggregate_result, direct_reference_result, false)
+                        Stmt.Match(match_scrutinee, match_arms, match_pos):
+                            base_names: mutable darray[sview @source] @r = []
+                            base_roots: mutable darray[sview @source] @r = []
+                            base_names.extend(escape_names)
+                            base_roots.extend(escape_roots)
+                            for match_arm in match_arms |table, base_names, base_roots, escape_names, escape_roots| -> table:
+                                arm_names: mutable darray[sview @source] @r = []
+                                arm_roots: mutable darray[sview @source] @r = []
+                                arm_names.extend(base_names)
+                                arm_roots.extend(base_roots)
+                                table <- bam_escape_statements(match_arm.body, locals, perm_containers, lend_names, lend_positions, arm_names, arm_roots, detached, table, aggregate_result, direct_reference_result, false)
+                                bam_escape_merge_branch(escape_names, escape_roots, arm_names, arm_roots)
+                        _:
+                            pass
+                    statement_index <- statement_index + 1
+
+        # The root of a BORROW expression: `&place` and the removed `place.ref[T]` shorthand
+        # both hand out a reference into `place`'s storage.
+        # A cast target that still carries an address: `T&`, `T&?`, `mutable T&`, `cstr`.
+        def bam_type_is_address(type_expression: Ast::Expr) -> bool:
+            return match type_expression:
+                Expr.Ident(name, _): name == "cstr"
+                Expr.Unary(operator, operand, _): operator == TokenKind.Ampersand or operator == TokenKind.Lmut or bam_type_is_address(operand)
+                Expr.Paren(inner, _): bam_type_is_address(inner)
+                _: false
+
+        def bam_annotation_is_static(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                return match type_expression:
+                    Expr.Unary(operator, operand, _): operator == TokenKind.Static or bam_annotation_is_static(operand)
+                    Expr.Paren(inner, _): bam_annotation_is_static(inner)
+                    _: false
+
+        # `&place[i]`: the address of a container ELEMENT (heap/arena storage), not of the
+        # local's own frame slot.
+        def bam_borrow_is_element(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                return match expression:
+                    Expr.Unary(operator, operand, _): operator == TokenKind.Ampersand and (operand is Expr.Index(_, _, _))
+                    Expr.Paren(inner, _): bam_borrow_is_element(inner)
+                    _: false
+
+        def bam_borrow_root(expression: Ast::Expr) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Unary(borrow_operator, borrow_operand, borrow_pos):
+                        return "" if borrow_operator != TokenKind.Ampersand
+                        return bam_place_root(borrow_operand)
+                    Expr.Index(Expr.Field(borrow_receiver, borrow_selector, borrow_field_pos), borrow_target, borrow_index_pos):
+                        # `(&x).cast[T&?]` re-types the address of a local; the result still
+                        # points at the local's storage (stage0 returnRefToLocal sees through it).
+                        return bam_borrow_root(bam_strip_paren(borrow_receiver)) if borrow_selector == "cast" and bam_type_is_address(borrow_target)
+                        return "" if borrow_selector != "ref"
+                        return bam_place_root(borrow_receiver)
+                    Expr.Paren(borrow_inner, _):
+                        return bam_borrow_root(borrow_inner)
+                    _:
+                        return ""
+
+        # Match the root above with the exact identifier occurrence so closure effects can
+        # distinguish local storage from a same-named file global or parameter.
+        def bam_borrow_root_position(expression: Ast::Expr) -> (known: bool, position: Ast::Pos):
+            can Abort.Panic:
+                match expression:
+                    Expr.Unary(operator, operand, _) if operator == TokenKind.Ampersand:
+                        return bam_place_root_position(operand)
+                    Expr.Index(Expr.Field(receiver, selector, _), target, _):
+                        return bam_borrow_root_position(receiver) if selector == "cast" and bam_type_is_address(target)
+                        return bam_place_root_position(receiver) if selector == "ref"
+                        return (false, Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0})
+                    Expr.Paren(inner, _):
+                        return bam_borrow_root_position(inner)
+                    _:
+                        return (false, Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0})
+
+        # A bare TypeId name proves a nominal kind only when every declaration with that
+        # spelling is a struct or every declaration is an enum, and it cannot be shadowed
+        # by a generic parameter. Module scope is absent from TypeIds, so the reference-free
+        # walk below checks the union of same-named fields/payloads across modules. That is
+        # conservative for collisions while still allowing module-owned POD types to prove
+        # reference-free.
+        def bam_named_type_declaration_kind(type_name: sview @source, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                hash: u64 = name_hash(type_name)
+                cache_valid: mutable bool = reference_sites.named_type_kind_names.count == reference_sites.named_type_kind_values.count and reference_sites.named_type_kind_names.count == reference_sites.named_type_kind_next.count
+                cache_head: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                if cache_valid:
+                    cache_head <- head if reference_sites.named_type_kind_heads.get(hash) is head
+                    cursor: mutable u32 = cache_head
+                    probes: mutable usize = 0
+                    while cursor != SYMBOL_INDEX_ROW_NONE and probes < reference_sites.named_type_kind_names.count |cursor, probes, cache_valid, type_name, reference_sites|:
+                        if cursor.usize() >= reference_sites.named_type_kind_names.count or cursor.usize() >= reference_sites.named_type_kind_values.count or cursor.usize() >= reference_sites.named_type_kind_next.count:
+                            cache_valid <- false
+                            cursor <- SYMBOL_INDEX_ROW_NONE
+                        else:
+                            if reference_sites.named_type_kind_names[cursor.usize()] == type_name:
+                                return reference_sites.named_type_kind_values[cursor.usize()]
+                            cursor <- reference_sites.named_type_kind_next[cursor.usize()]
+                        probes <- probes + 1.usize()
+                    cache_valid <- false if cursor != SYMBOL_INDEX_ROW_NONE
+                kind: mutable u32 = 0
+                if type_name != "" and table.symbol_name_index_valid and table.symbol_name_indexed_rows == table.symbols.count and table.symbol_name_next.count == table.symbols.count and table.generic_param_names.count == table.generic_param_lines.count:
+                    has_generic_shadow: mutable bool = false
+                    generic_index: mutable usize = 0
+                    while generic_index < table.generic_param_names.count |generic_index, has_generic_shadow, type_name, table|:
+                        has_generic_shadow <- true if table.generic_param_names[generic_index] == type_name
+                        generic_index <- generic_index + 1
+                    if not has_generic_shadow:
+                        hash: u64 = name_hash(type_name)
+                        cursor: mutable u32 = symbol_chain_head(table, type_name)
+                        chain_rows: mutable u32 = 0
+                        invalid: mutable bool = false
+                        while cursor != SYMBOL_INDEX_ROW_NONE |cursor, chain_rows, invalid, kind, type_name, table|:
+                            if cursor.usize() >= table.symbols.count or cursor.usize() >= table.symbol_name_next.count:
+                                invalid <- true
+                                cursor <- SYMBOL_INDEX_ROW_NONE
+                            else:
+                                chain_rows <- chain_rows + 1.u32()
+                                symbol: Symbol = table.symbols[cursor.usize()]
+                                if symbol.name == type_name and (symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum or symbol.kind == SymbolKind.Alias or symbol.kind == SymbolKind.Extern):
+                                    if symbol.kind != SymbolKind.Struct and symbol.kind != SymbolKind.Enum:
+                                        invalid <- true
+                                    else:
+                                        candidate_kind: u32 = 1 if symbol.kind == SymbolKind.Struct else 2
+                                        kind <- candidate_kind if kind == 0
+                                        invalid <- true if kind != candidate_kind
+                                cursor <- table.symbol_name_next[cursor.usize()]
+                        expected_chain_rows: u32 = count if table.symbol_name_count.get(hash) is count else 0.u32()
+                        kind <- 0 if invalid or chain_rows != expected_chain_rows
+                if cache_valid and reference_sites.named_type_kind_names.count < SYMBOL_INDEX_ROW_NONE.usize():
+                    row: u32 = reference_sites.named_type_kind_names.count.u32()
+                    reference_sites.named_type_kind_next <- reference_sites.named_type_kind_next.push(cache_head)
+                    reference_sites.named_type_kind_names <- reference_sites.named_type_kind_names.push(type_name)
+                    reference_sites.named_type_kind_values <- reference_sites.named_type_kind_values.push(kind)
+                    reference_sites.named_type_kind_heads <- reference_sites.named_type_kind_heads.put(hash, row) can Global{Read,Write}
+                return kind
+
+        # Build the enum payload owner chains once per borrow check. Every row in the
+        # chain is later checked against its full owner spelling to handle hash collisions.
+        def bam_index_enum_payload_owners(reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return false if:
+                    reference_sites.enum_payload_owner_indexed_count > table.enum_payload_owner.count
+                    reference_sites.enum_payload_owner_next.count != reference_sites.enum_payload_owner_indexed_count
+                    table.enum_payload_type_id.count != table.enum_payload_owner.count
+                while reference_sites.enum_payload_owner_indexed_count < table.enum_payload_owner.count |reference_sites, table|:
+                    row: usize = reference_sites.enum_payload_owner_indexed_count
+                    return false if row >= 4294967295.usize()
+                    hash: u64 = name_hash(table.enum_payload_owner[row])
+                    previous: u32 = head if reference_sites.enum_payload_owner_heads.get(hash) is head else SYMBOL_INDEX_ROW_NONE
+                    reference_sites.enum_payload_owner_next <- reference_sites.enum_payload_owner_next.push(previous)
+                    reference_sites.enum_payload_owner_heads <- reference_sites.enum_payload_owner_heads.put(hash, row.u32()) can Global{Read,Write}
+                    reference_sites.enum_payload_owner_indexed_count <- row + 1.usize()
+                return reference_sites.enum_payload_owner_next.count == table.enum_payload_owner.count
+
+        # Return true only when every reachable component is known to be reference-free.
+        # Unknown, ambiguous, generic, and malformed nominal metadata fails closed.
+        def bam_type_is_proven_reference_free(type_id: u32, visited: mutable dict[u32, bool]&, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return false if type_id == 0
+                return true if visited.get(type_id) is already_seen
+                visited <- visited.put(type_id, true) can Global{Read,Write}
+                kind: SemTypeKind = interned_kind(type_id, table)
+                return true if kind == SemTypeKind.Int or kind == SemTypeKind.Float or kind == SemTypeKind.Bool or kind == SemTypeKind.Char
+                return interned_name(type_id, table) == "dstr" if kind == SemTypeKind.String
+                return false if kind == SemTypeKind.Ref or kind == SemTypeKind.Region or kind == SemTypeKind.Unknown
+                if kind == SemTypeKind.Named:
+                    type_name: sview = interned_name(type_id, table)
+                    nominal_kind: u32 = bam_named_type_declaration_kind(type_name, reference_sites, table)
+                    return false if nominal_kind == 0 or interned_elem_count(type_id, table) != 0
+                    if nominal_kind == 1:
+                        return false if table.struct_field_owner_next.count != table.struct_field_owner.count or table.struct_field_type_id.count != table.struct_field_owner.count
+                        hash: u64 = name_hash(type_name)
+                        cursor: mutable u32 = struct_field_owner_head(table, type_name)
+                        bucket_rows: mutable u32 = 0
+                        found_field: mutable bool = false
+                        while cursor != SYMBOL_INDEX_ROW_NONE |cursor, bucket_rows, found_field, type_id, visited, reference_sites, table, type_name|:
+                            return false if cursor.usize() >= table.struct_field_owner.count or cursor.usize() >= table.struct_field_owner_next.count or cursor.usize() >= table.struct_field_type_id.count
+                            bucket_rows <- bucket_rows + 1.u32()
+                            if table.struct_field_owner[cursor.usize()] == type_name:
+                                found_field <- true
+                                return false if not bam_type_is_proven_reference_free(table.struct_field_type_id[cursor.usize()], visited, reference_sites, table)
+                            cursor <- table.struct_field_owner_next[cursor.usize()]
+                        expected_bucket_rows: u32 = count if table.struct_field_owner_counts.get(hash) is count else 0.u32()
+                        return false if not found_field or bucket_rows != expected_bucket_rows
+                        return true
+                    return false if not bam_index_enum_payload_owners(reference_sites, table)
+                    hash: u64 = name_hash(type_name)
+                    cursor: mutable u32 = head if reference_sites.enum_payload_owner_heads.get(hash) is head else SYMBOL_INDEX_ROW_NONE
+                    while cursor != SYMBOL_INDEX_ROW_NONE |cursor, type_id, visited, reference_sites, table, type_name|:
+                        return false if cursor.usize() >= table.enum_payload_owner.count or cursor.usize() >= reference_sites.enum_payload_owner_next.count or cursor.usize() >= table.enum_payload_type_id.count
+                        if table.enum_payload_owner[cursor.usize()] == type_name:
+                            return false if not bam_type_is_proven_reference_free(table.enum_payload_type_id[cursor.usize()], visited, reference_sites, table)
+                        cursor <- reference_sites.enum_payload_owner_next[cursor.usize()]
+                    return true
+                if kind == SemTypeKind.Optional or kind == SemTypeKind.Tuple:
+                    element_position: mutable u32 = 0
+                    while element_position < interned_elem_count(type_id, table) |element_position, visited|:
+                        return false if not bam_type_is_proven_reference_free(interned_elem(type_id, element_position, table), visited, reference_sites, table)
+                        element_position <- element_position + 1
+                    return true
+                if kind == SemTypeKind.Container:
+                    container_name: sview = interned_name(type_id, table)
+                    return false if:
+                        container_name == "view" or interned_elem_count(type_id, table) == 0
+                        container_name != "darray" and container_name != "array" and container_name != "set" and container_name != "dict" and container_name != "list"
+                    element_position: mutable u32 = 0
+                    while element_position < interned_elem_count(type_id, table) |element_position, visited|:
+                        return false if not bam_type_is_proven_reference_free(interned_elem(type_id, element_position, table), visited, reference_sites, table)
+                        element_position <- element_position + 1
+                    return true
+                return false
+
+        def bam_type_is_proven_reference_free_cached(type_id: u32, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                if reference_sites.type_reference_free.get(type_id) is cached_result:
+                    return cached_result
+                visited: mutable dict[u32, bool] = {}
+                result: bool = bam_type_is_proven_reference_free(type_id, visited, reference_sites, table)
+                reference_sites.type_reference_free <- reference_sites.type_reference_free.put(type_id, result) can Global{Read,Write}
+                return result
+
+        # Unknown and unresolved nominal types may carry references. Use the proof-free
+        # predicate so only complete, uniquely resolved shapes are classified as safe.
+        def bam_type_may_contain_reference(type_id: u32, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return not bam_type_is_proven_reference_free_cached(type_id, reference_sites, table)
+
+        def bam_binding_type_hash(binding_id: BindingId) -> u64:
+            can Abort.Panic:
+                hash: mutable u64 = (14695981039346656037 ^ binding_id.owner.value.u64()) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ binding_id.serial) * SEMANTIC_HASH_PRIME
+                return hash
+
+        # Build the exact-binding type index once, then read only the matching hash chain.
+        # Full IDs are always compared after hashing; duplicate conflicting declarations
+        # degrade to unknown instead of selecting one shadowed or inconsistent row.
+        def bam_binding_declared_type_id(binding_id: BindingId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                while reference_sites.binding_type_indexed_count < table.binding_declared_types.count and reference_sites.binding_type_indexed_count < SYMBOL_INDEX_ROW_NONE.usize() |binding_id, reference_sites, table|:
+                    declared: BindingDeclaredType = table.binding_declared_types[reference_sites.binding_type_indexed_count]
+                    hash: u64 = bam_binding_type_hash(declared.binding_id)
+                    head: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                    if reference_sites.binding_type_heads.get(hash) is existing_head:
+                        head <- existing_head
+                    reference_sites.binding_type_next.push(head)
+                    reference_sites.binding_type_heads <- reference_sites.binding_type_heads.put(hash, reference_sites.binding_type_indexed_count.u32()) can Global{Read,Write}
+                    reference_sites.binding_type_indexed_count <- reference_sites.binding_type_indexed_count + 1
+                hash: u64 = bam_binding_type_hash(binding_id)
+                if reference_sites.binding_type_heads.get(hash) is head:
+                    found: mutable bool = false
+                    type_id: mutable u32 = 0
+                    row: mutable u32 = head
+                    while row != SYMBOL_INDEX_ROW_NONE |row, binding_id, reference_sites, table, found, type_id|:
+                        declared: BindingDeclaredType = table.binding_declared_types[row.usize()]
+                        if ownership_binding_ids_equal(declared.binding_id, binding_id):
+                            return 0 if found and type_id != declared.type_id
+                            type_id <- declared.type_id
+                            found <- true
+                        row <- reference_sites.binding_type_next[row.usize()]
+                    return type_id if found
+                return 0
+
+        def bam_parameter_is_ast_decl_array(parameter: Ast::ParamDecl, ast_decl_type_id: u32, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                parameter_type_id: u32 = annotation_type_id(parameter.type_expression, table) can Global{Read,Write}
+                parameter_value_type_id: u32 = bam_strip_ref(parameter_type_id, table)
+                return interned_kind(parameter_value_type_id, table) == SemTypeKind.Container and interned_name(parameter_value_type_id, table) == "darray" and interned_elem_count(parameter_value_type_id, table) == 1.u32() and interned_elem(parameter_value_type_id, 0.u32(), table) == ast_decl_type_id
+
+        # A `for` binder inherits the element type of its iterable. This recovers the exact
+        # Ast::Decl subject type for `for declaration in declarations` when no annotation is
+        # attached to the loop binder itself.
+        def bam_ast_decl_loop_subject_in_statements(subject_name: sview, parameters: darray[Ast::ParamDecl]&, statements: darray[Ast::Stmt], ast_decl_type_id: u32, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                for statement in statements |subject_name, parameters, ast_decl_type_id, table|:
+                    match statement:
+                        Stmt.For(_, variables, iterable, body, _):
+                            match iterable:
+                                Expr.Ident(iterable_name, _):
+                                    if any loop_name in variables where loop_name == subject_name:
+                                        return true if any parameter in parameters where parameter.name == iterable_name and bam_parameter_is_ast_decl_array(parameter, ast_decl_type_id, table)
+                                _:
+                                    pass
+                            return true if bam_ast_decl_loop_subject_in_statements(subject_name, parameters, body, ast_decl_type_id, table)
+                        Stmt.If(_, then_body, else_body, _):
+                            return true if bam_ast_decl_loop_subject_in_statements(subject_name, parameters, then_body, ast_decl_type_id, table)
+                            return true if bam_ast_decl_loop_subject_in_statements(subject_name, parameters, else_body, ast_decl_type_id, table)
+                        Stmt.While(_, loop_body, _):
+                            return true if bam_ast_decl_loop_subject_in_statements(subject_name, parameters, loop_body, ast_decl_type_id, table)
+                        Stmt.Block(body: block_body, _):
+                            return true if bam_ast_decl_loop_subject_in_statements(subject_name, parameters, block_body, ast_decl_type_id, table)
+                        Stmt.Match(_, arms, _):
+                            for arm in arms |subject_name, parameters, ast_decl_type_id, table|:
+                                return true if bam_ast_decl_loop_subject_in_statements(subject_name, parameters, arm.body, ast_decl_type_id, table)
+                        _:
+                            pass
+                return false
+
+        # Unknown declarations stay conservative. A proven scalar source should not
+        # become a reference alias just because it appears in a closure-local assignment.
+        def bam_binding_may_carry_reference(binding_id: BindingId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                type_id: u32 = bam_binding_declared_type_id(binding_id, reference_sites, table)
+                return not bam_type_is_proven_reference_free_cached(type_id, reference_sites, table)
+
+        # An INTERIOR place (`out.p`, `out[i]`) -- writing one publishes through the target's
+        # own storage. A bare `p <- ...` writes the POINTEE of a reference parameter, which is
+        # the caller's value and not a place that can hold a borrow.
+        def bam_place_is_interior(place: Ast::Expr) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match place:
+                    Expr.Field(interior_object, interior_field, interior_field_pos):
+                        return true
+                    Expr.Index(interior_indexed, interior_index, interior_index_pos):
+                        return true
+                    Expr.Paren(interior_inner, interior_paren_pos):
+                        return bam_place_is_interior(interior_inner)
+                    _:
+                        return false
+
+        def bam_strip_ref(type_id: u32, table: SymbolTable&) -> u32:
+            can Abort.Panic:
+                stripped: mutable u32 = type_id
+                while interned_kind(stripped, table) == SemTypeKind.Ref |stripped|:
+                    stripped <- interned_elem(stripped, 0, table)
+                return stripped

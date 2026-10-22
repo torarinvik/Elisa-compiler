@@ -1,0 +1,592 @@
+extend Semantic:
+    private:
+        # Parse only signed decimal pattern literals here. Unsupported spelling stays
+        # unknown, which keeps the analysis conservative and avoids duplicating parser rules.
+        def progress_decimal_pattern_value(text: sview) -> (known: bool, value: i64):
+            can Abort.Panic:
+                value: mutable i64 = 0
+                has_digit: mutable bool = false
+                negative: bool = text.len > 0 and text[0] == 45
+                start: usize = 1 if negative else 0
+                return (false, 0) if start == text.len
+                for index in start..<text.len |index, value, has_digit, text, negative|:
+                    byte: u8 = text[index].u8()
+                    if byte == 95:
+                        pass
+                    elif byte >= 48 and byte <= 57:
+                        digit: i64 = (byte - 48).i64()
+                        if negative:
+                            return (false, 0) if value < (0 - 922337203685477580) or (value == (0 - 922337203685477580) and digit > 8)
+                            value <- value * 10 - digit
+                        else:
+                            return (false, 0) if value > 922337203685477580 or (value == 922337203685477580 and digit > 7)
+                            value <- value * 10 + digit
+                        has_digit <- true
+                    else:
+                        return (false, 0)
+                (has_digit, value)
+
+        def progress_literal_int(expression: Ast::Expr) -> (known: bool, value: i64):
+            can Abort.Panic:
+                return match expression:
+                    Ast::Expr.IntLit(value, _): (true, value)
+                    Ast::Expr.Paren(inner, _): progress_literal_int(inner)
+                    Ast::Expr.Unary(TokenKind.Minus, Ast::Expr.IntLit(magnitude, _), _) if magnitude >= 0:
+                        (true, 0 - magnitude)
+                    _: (false, 0)
+
+        def progress_int_pattern_matches(pattern: Ast::Pattern, value: i64) -> (known: bool, matches: bool):
+            can Memory.Allocate, Abort.Panic:
+                return match pattern:
+                    Ast::Pattern.Wildcard | Ast::Pattern.Binding(_): (true, true)
+                    Ast::Pattern.Literal(text):
+                        literal: (known: bool, value: i64) = progress_decimal_pattern_value(text)
+                        (literal.known, literal.value == value) if literal.known else (false, false)
+                    Ast::Pattern.Or(options):
+                        known: mutable bool = options.count > 0
+                        matches: mutable bool = false
+                        for option in options |known, matches|:
+                            option_match: (known: bool, matches: bool) = progress_int_pattern_matches(option, value)
+                            known <- known and option_match.known
+                            matches <- matches or option_match.matches
+                        (known, matches)
+                    Ast::Pattern.As(_, inner):
+                        if inner.count == 1:
+                            progress_int_pattern_matches(inner[0], value)
+                        else:
+                            (false, false)
+                    _: (false, false)
+
+        # For supported literal scrutinees, skip value patterns excluded by the value and
+        # arms made dead by earlier unguarded (or literal-true guarded) matching patterns.
+        # Unknown literal domains remain conservative.
+        def progress_match_arm_reachable(scrutinee: Ast::Expr, arms: darray[Ast::MatchArm], target_index: usize) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                literal: (known: bool, value: bool) = progress_literal_bool(scrutinee)
+                integer_literal: (known: bool, value: i64) = progress_literal_int(scrutinee)
+                if not literal.known and integer_literal.known:
+                    prior_int: mutable usize = 0
+                    while prior_int < target_index |prior_int, arms, integer_literal|:
+                        prior_arm: Ast::MatchArm = arms[prior_int]
+                        prior_guard: (known: bool, value: bool) = progress_literal_bool(prior_arm.guard)
+                        prior_unconditional: bool = prior_arm.guard is Ast::Expr.Absent or (prior_guard.known and prior_guard.value)
+                        if prior_unconditional:
+                            prior_match: (known: bool, matches: bool) = progress_int_pattern_matches(prior_arm.pattern, integer_literal.value)
+                            return false if prior_match.known and prior_match.matches
+                            return false if progress_pattern_is_irrefutable(prior_arm.pattern)
+                        prior_int <- prior_int + 1
+                    target_match: (known: bool, matches: bool) = progress_int_pattern_matches(arms[target_index].pattern, integer_literal.value)
+                    return target_match.matches if target_match.known
+                    return true
+                prior: mutable usize = 0
+                while prior < target_index |prior, literal, arms|:
+                    arm: Ast::MatchArm = arms[prior]
+                    guard_is_unconditional: mutable bool = arm.guard is Ast::Expr.Absent
+                    guard_literal: (known: bool, value: bool) = progress_literal_bool(arm.guard)
+                    guard_is_unconditional <- guard_is_unconditional or (guard_literal.known and guard_literal.value)
+                    if guard_is_unconditional:
+                        if literal.known:
+                            prior_match: (known: bool, matches: bool) = progress_bool_pattern_matches(arm.pattern, literal.value)
+                            return false if prior_match.known and prior_match.matches
+                        else:
+                            return false if progress_pattern_is_irrefutable(arm.pattern)
+                    prior <- prior + 1
+                return true if not literal.known
+                current_match: (known: bool, matches: bool) = progress_bool_pattern_matches(arms[target_index].pattern, literal.value)
+                return current_match.matches if current_match.known
+                return true
+
+        # The exhaustiveness helper ignores guarded rows, but still recognizes an unguarded
+        # fallback after them. That is exactly the totality needed for path joins here.
+        def progress_is_catch_match(table: SymbolTable&, line: u32) -> bool:
+            can Abort.Panic:
+                return any catch_line in table.catch_match_lines where catch_line == line
+
+        def progress_catch_path_is_space(byte: u8) -> bool:
+            can Abort.Panic:
+                return byte == 32 or byte == 9
+
+        # Family path rows retain their source spans. Skip token trivia, including the
+        # line and triple-quoted comments the lexer removes from the parser stream.
+        def progress_catch_skip_path_trivia(path: sview, start: usize) -> usize:
+            can Abort.Panic:
+                cursor: mutable usize = start
+                while cursor < path.len:
+                    if path[cursor] == 32 or path[cursor] == 9 or path[cursor] == 10 or path[cursor] == 13:
+                        cursor <- cursor + 1.usize()
+                    elif path[cursor] == 35:
+                        while cursor < path.len and path[cursor] != 10 and path[cursor] != 13 |cursor, path|:
+                            cursor <- cursor + 1.usize()
+                    elif path[cursor] == 34 and cursor + 2.usize() < path.len and path[cursor + 1.usize()] == 34 and path[cursor + 2.usize()] == 34:
+                        comment_cursor: mutable usize = cursor + 3.usize()
+                        comment_closed: mutable bool = false
+                        while comment_cursor + 2.usize() < path.len |comment_cursor, comment_closed, path|:
+                            if path[comment_cursor] == 34 and path[comment_cursor + 1.usize()] == 34 and path[comment_cursor + 2.usize()] == 34:
+                                cursor <- comment_cursor + 3.usize()
+                                comment_closed <- true
+                                break
+                            comment_cursor <- comment_cursor + 1.usize()
+                        return path.len if not comment_closed
+                    else:
+                        break
+                return cursor
+
+        def progress_catch_path_trim(path: sview) -> sview:
+            can Abort.Panic:
+                start: mutable usize = 0.usize()
+                end: mutable usize = path.len
+                while start < end and progress_catch_path_is_space(path[start]) |start, end, path|:
+                    start <- start + 1.usize()
+                while end > start and progress_catch_path_is_space(path[end - 1.usize()]) |start, end, path|:
+                    end <- end - 1.usize()
+                return path[start:end]
+
+        def progress_catch_raw_path_canonical_length(raw_path: sview) -> (valid: bool, length: usize):
+            can Abort.Panic:
+                raw_index: mutable usize = 0.usize()
+                length: mutable usize = 0.usize()
+                while raw_index < raw_path.len |raw_index, length, raw_path|:
+                    raw_index <- progress_catch_skip_path_trivia(raw_path, raw_index)
+                    break if raw_index >= raw_path.len
+                    if raw_path[raw_index] == 58:
+                        next_colon: usize = progress_catch_skip_path_trivia(raw_path, raw_index + 1.usize())
+                        return (false, 0.usize()) if next_colon >= raw_path.len or raw_path[next_colon] != 58
+                        length <- length + 2.usize()
+                        raw_index <- next_colon + 1.usize()
+                    else:
+                        length <- length + 1.usize()
+                        raw_index <- raw_index + 1.usize()
+                return (true, length)
+
+        def progress_catch_raw_path_matches_canonical(raw_path: sview, canonical_path: sview) -> bool:
+            can Abort.Panic:
+                info: (valid: bool, length: usize) = progress_catch_raw_path_canonical_length(raw_path)
+                return false if not info.valid or info.length != canonical_path.len
+                raw_index: mutable usize = 0.usize()
+                canonical_index: mutable usize = 0.usize()
+                while raw_index < raw_path.len or canonical_index < canonical_path.len |raw_index, canonical_index, raw_path, canonical_path|:
+                    raw_index <- progress_catch_skip_path_trivia(raw_path, raw_index)
+                    return canonical_index == canonical_path.len if raw_index >= raw_path.len
+                    return false if canonical_index >= canonical_path.len
+                    if raw_path[raw_index] == 58:
+                        return false if canonical_index + 1.usize() >= canonical_path.len or canonical_path[canonical_index] != 58 or canonical_path[canonical_index + 1.usize()] != 58
+                        raw_index <- progress_catch_skip_path_trivia(raw_path, raw_index + 1.usize())
+                        return false if raw_index >= raw_path.len or raw_path[raw_index] != 58
+                        raw_index <- raw_index + 1.usize()
+                        canonical_index <- canonical_index + 2.usize()
+                    else:
+                        return false if raw_path[raw_index] != canonical_path[canonical_index]
+                        raw_index <- raw_index + 1.usize()
+                        canonical_index <- canonical_index + 1.usize()
+                return true
+
+        def progress_catch_path_scope_separator(path: sview, find_last: bool) -> (found: bool, start: usize, after: usize):
+            can Abort.Panic:
+                cursor: mutable usize = 0.usize()
+                selected_start: mutable usize = path.len
+                selected_after: mutable usize = path.len
+                found: mutable bool = false
+                while cursor < path.len |cursor, selected_start, selected_after, found, path, find_last|:
+                    cursor <- progress_catch_skip_path_trivia(path, cursor)
+                    break if cursor >= path.len
+                    if path[cursor] == 58:
+                        next_colon: usize = progress_catch_skip_path_trivia(path, cursor + 1.usize())
+                        if next_colon < path.len and path[next_colon] == 58:
+                            selected_start <- cursor
+                            selected_after <- next_colon + 1.usize()
+                            found <- true
+                            return (true, selected_start, selected_after) if not find_last
+                            cursor <- selected_after
+                        else:
+                            cursor <- cursor + 1.usize()
+                    else:
+                        cursor <- cursor + 1.usize()
+                return (found, selected_start, selected_after)
+
+        def progress_catch_module_path_matches_exact(path: sview, suffixes: darray[sview]&, module: sview) -> bool:
+            can Abort.Panic:
+                path_info: (valid: bool, length: usize) = progress_catch_raw_path_canonical_length(path)
+                return false if not path_info.valid or module.len < path_info.length
+                return false if not progress_catch_raw_path_matches_canonical(path, module[0:path_info.length])
+                module_offset: mutable usize = path_info.length
+                for suffix in suffixes |module_offset, suffixes, module|:
+                    return false if module_offset + 1.usize() >= module.len or module[module_offset] != 58 or module[module_offset + 1.usize()] != 58
+                    module_offset <- module_offset + 2.usize()
+                    suffix_info: (valid: bool, length: usize) = progress_catch_raw_path_canonical_length(suffix)
+                    return false if not suffix_info.valid or module_offset + suffix_info.length > module.len
+                    return false if not progress_catch_raw_path_matches_canonical(suffix, module[module_offset:module_offset + suffix_info.length])
+                    module_offset <- module_offset + suffix_info.length
+                return module_offset == module.len
+
+        # Resolve the explicit module prefix in a callee's declared error family. Catch arm
+        # prefixes use different Stage0 semantics and are matched separately by short variant.
+        # Aliases here are selected from the nearest lexical scope, and their targets resolve
+        # relative to the scope where each alias was declared.
+        def progress_catch_module_path_matches_scoped(path: sview, suffixes: darray[sview]&, module: sview, table: SymbolTable&, lexical_scope: sview, before_offset: u32, depth: u32 = 0) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if depth > 64
+                normalized_path: sview = progress_catch_path_trim(path)
+                alias_separator: (found: bool, start: usize, after: usize) = progress_catch_path_scope_separator(normalized_path, false)
+                alias_name_path: sview = normalized_path[0:alias_separator.start] if alias_separator.found else normalized_path
+                alias_suffixes: mutable darray[sview] = []
+                if alias_separator.found and alias_separator.after < normalized_path.len:
+                    alias_suffixes.push(normalized_path[alias_separator.after:normalized_path.len])
+                for suffix in suffixes |alias_suffixes, suffixes|:
+                    alias_suffixes.push(suffix)
+                alias_found: mutable bool = false
+                alias_ambiguous: mutable bool = false
+                alias_scope: mutable sview = ""
+                alias_target: mutable sview = ""
+                alias_selected_offset: mutable u32 = 0
+                best_scope_length: mutable usize = 0
+                for alias in table.using_alias_rows |alias_found, alias_ambiguous, alias_scope, alias_target, alias_selected_offset, best_scope_length, alias_name_path, alias_suffixes, module, depth, table|:
+                    continue if alias.name != "__using_alias" or not progress_catch_raw_path_matches_canonical(alias_name_path, alias.owner)
+                    continue if before_offset != 4294967295 and alias.offset >= before_offset
+                    continue if not named_type_owner_is_lexical(alias.module, lexical_scope)
+                    target_count: mutable usize = 0
+                    target_owner: mutable sview = ""
+                    for target in table.using_alias_rows |target_count, target_owner, alias|:
+                        if target.name == "__using_alias_target" and target.module == alias.module and target.line == alias.line and target.offset == alias.offset:
+                            target_owner <- target.owner
+                            target_count <- target_count + 1.usize()
+                    return false if target_count != 1.usize()
+                    if not alias_found or best_scope_length < alias.module.len:
+                        alias_found <- true
+                        alias_ambiguous <- false
+                        alias_scope <- alias.module
+                        alias_target <- target_owner
+                        alias_selected_offset <- alias.offset
+                        best_scope_length <- alias.module.len
+                    elif best_scope_length == alias.module.len:
+                        if alias_scope != alias.module:
+                            alias_ambiguous <- true
+                        elif alias_target != target_owner:
+                            selected_matches: bool = progress_catch_module_path_matches_scoped(alias_target, alias_suffixes, module, table, alias_scope, alias_selected_offset, depth + 1.u32())
+                            candidate_matches: bool = progress_catch_module_path_matches_scoped(target_owner, alias_suffixes, module, table, alias.module, alias.offset, depth + 1.u32())
+                            alias_ambiguous <- true if not selected_matches or not candidate_matches
+                if not alias_found:
+                    if lexical_scope == "":
+                        return progress_catch_module_path_matches_exact(normalized_path, suffixes, module)
+                    scoped_suffixes: mutable darray[sview] = [normalized_path]
+                    for suffix in suffixes |scoped_suffixes|:
+                        scoped_suffixes.push(suffix)
+                    candidate_scope: mutable sview = lexical_scope
+                    while candidate_scope != "" |candidate_scope, scoped_suffixes, module|:
+                        return true if progress_catch_module_path_matches_exact(candidate_scope, scoped_suffixes, module)
+                        parent_separator: mutable usize = candidate_scope.len
+                        probe: mutable usize = 0.usize()
+                        while probe + 1.usize() < candidate_scope.len |parent_separator, probe, candidate_scope|:
+                            parent_separator <- probe if candidate_scope[probe] == 58 and candidate_scope[probe + 1.usize()] == 58
+                            probe <- probe + 1.usize()
+                        candidate_scope <- candidate_scope[0:parent_separator] if parent_separator < candidate_scope.len
+                        candidate_scope <- "" if parent_separator == candidate_scope.len
+                    return progress_catch_module_path_matches_exact(normalized_path, suffixes, module)
+                return false if alias_ambiguous
+                return progress_catch_module_path_matches_scoped(alias_target, alias_suffixes, module, table, alias_scope, alias_selected_offset, depth + 1.u32())
+
+        def progress_catch_module_path_matches(path: sview, suffixes: darray[sview]&, module: sview, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return progress_catch_module_path_matches_scoped(path, suffixes, module, table, table.current_module, 4294967295, 0)
+
+        def progress_catch_path_tag_bytes(path: sview) -> darray[u8]:
+            can Memory.Allocate, Abort.Panic:
+                bytes: mutable darray[u8] = []
+                offset: mutable usize = 0.usize()
+                while offset < path.len |bytes, offset, path|:
+                    byte: u8 = path[offset]
+                    if progress_catch_path_is_space(byte):
+                        offset <- offset + 1.usize()
+                    elif byte == 58 and offset + 1.usize() < path.len and path[offset + 1.usize()] == 58:
+                        bytes.push(46)
+                        offset <- offset + 2.usize()
+                    else:
+                        bytes.push(byte)
+                        offset <- offset + 1.usize()
+                return bytes
+
+        def progress_catch_declared_tag_bytes(module: sview, family: sview, variant: sview) -> darray[u8]:
+            can Memory.Allocate, Abort.Panic:
+                bytes: mutable darray[u8] = []
+                offset: mutable usize = 0.usize()
+                while offset < module.len |bytes, offset, module|:
+                    byte: u8 = module[offset]
+                    if byte == 58 and offset + 1.usize() < module.len and module[offset + 1.usize()] == 58:
+                        bytes.push(46)
+                        offset <- offset + 2.usize()
+                    else:
+                        bytes.push(byte)
+                        offset <- offset + 1.usize()
+                if module != "":
+                    bytes.push(46)
+                for index in 0..<family.len |bytes, family|:
+                    bytes.push(family[index])
+                bytes.push(46)
+                for index in 0..<variant.len |bytes, variant|:
+                    bytes.push(variant[index])
+                return bytes
+
+        def progress_catch_tag_bytes_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+            can Abort.Panic:
+                return false if left.count != right.count
+                for index in 0..<left.count |left, right|:
+                    return false if left[index] != right[index]
+                return true
+
+        # Go's ErrorTagShortName drops exactly the first dotted path component. For
+        # `Parent.Child.Fault.Bad`, the fallback key is `Child.Fault.Bad`, not just `Bad`.
+        def progress_catch_tag_short_names_equal(left: darray[u8]&, right: darray[u8]&) -> bool:
+            can Abort.Panic:
+                left_start: mutable usize = 0.usize()
+                right_start: mutable usize = 0.usize()
+                for index in 0..<left.count |left_start, left|:
+                    if left[index] == 46:
+                        left_start <- index + 1.usize()
+                        break
+                for index in 0..<right.count |right_start, right|:
+                    if right[index] == 46:
+                        right_start <- index + 1.usize()
+                        break
+                left_short_length: usize = left.count - left_start
+                return false if left_short_length != right.count - right_start
+                for offset in 0..<left_short_length |left, right, left_start, right_start|:
+                    return false if left[left_start + offset] != right[right_start + offset]
+                return true
+
+        def progress_catch_variant_path_matches(path: sview, module: sview, family: sview, variant: sview, allow_short_fallback: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                arm_tag: darray[u8] = progress_catch_path_tag_bytes(path)
+                declared_tag: darray[u8] = progress_catch_declared_tag_bytes(module, family, variant)
+                return true if progress_catch_tag_bytes_equal(arm_tag, declared_tag)
+                return false if not allow_short_fallback
+                return progress_catch_tag_short_names_equal(arm_tag, declared_tag)
+
+        def progress_catch_pattern_covers_declared_variant(pattern: Ast::Pattern, module: sview, family: sview, variant: sview, allow_short_fallback: bool) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return match pattern:
+                    Ast::Pattern.Binding(name): progress_catch_variant_path_matches(name, module, family, variant, allow_short_fallback)
+                    Ast::Pattern.Variant(path, fields): fields.count == 0 and progress_catch_variant_path_matches(path, module, family, variant, allow_short_fallback)
+                    Ast::Pattern.As(_, inner): inner.count == 1 and progress_catch_pattern_covers_declared_variant(inner[0], module, family, variant, allow_short_fallback)
+                    Ast::Pattern.Or(options): options.count > 0 and any option in options where progress_catch_pattern_covers_declared_variant(option, module, family, variant, allow_short_fallback)
+                    _: false
+
+        def progress_catch_family_module_in_scope(family: sview, function_module: sview, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Abort.Panic:
+                module: mutable sview @source = table.current_module
+                found: mutable bool = false
+                scoped_module: mutable sview @source = table.current_module
+                scoped_length: mutable usize = 0.usize()
+                scoped_found: mutable bool = false
+                has_module: mutable bool = false
+                modules_ambiguous: mutable bool = false
+                for index in 0..<table.enum_variant_owner.count |module, found, scoped_module, scoped_length, scoped_found, has_module, modules_ambiguous, table, family, function_module|:
+                    continue if table.enum_variant_owner[index] != family
+                    return (false, table.current_module) if index >= table.enum_variant_module.count
+                    candidate_module: sview @source = table.enum_variant_module[index]
+                    if not found:
+                        module <- candidate_module
+                        found <- true
+                    elif candidate_module != module:
+                        modules_ambiguous <- true
+                    if named_type_owner_is_lexical(candidate_module, function_module):
+                        if not scoped_found or candidate_module.len > scoped_length:
+                            scoped_module <- candidate_module
+                            scoped_length <- candidate_module.len
+                            scoped_found <- true
+                        elif candidate_module.len == scoped_length and candidate_module != scoped_module:
+                            return (false, table.current_module)
+                return (true, scoped_module) if scoped_found
+                return (true, module) if found and not modules_ambiguous
+                return (false, table.current_module)
+
+        def progress_catch_function_module(declaration_line: u32, declaration_offset: u32, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Abort.Panic:
+                selected_module: mutable sview @source = table.current_module
+                module_count: mutable usize = 0.usize()
+                for annotation in table.protocol_annotations |selected_module, module_count, declaration_line, declaration_offset|:
+                    if annotation.owner == "__fn_module" and annotation.line == declaration_line and annotation.offset == declaration_offset:
+                        selected_module <- annotation.name
+                        module_count <- module_count + 1.usize()
+                return (module_count == 1.usize(), selected_module)
+
+        def progress_catch_family_path_leaf_matches(path: sview, family: sview) -> bool:
+            can Abort.Panic:
+                normalized_path: sview = progress_catch_path_trim(path)
+                separator: (found: bool, start: usize, after: usize) = progress_catch_path_scope_separator(normalized_path, true)
+                family_path: sview = normalized_path[separator.after:normalized_path.len] if separator.found else normalized_path
+                return progress_catch_raw_path_matches_canonical(family_path, family)
+
+        def progress_catch_explicit_family_module(path: sview, family: sview, declaration_offset: u32, function_module: sview, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                normalized_path: sview = progress_catch_path_trim(path)
+                separator: (found: bool, start: usize, after: usize) = progress_catch_path_scope_separator(normalized_path, true)
+                return (false, table.current_module) if not separator.found or not progress_catch_family_path_leaf_matches(normalized_path, family)
+                module_prefix: sview = normalized_path[0:separator.start]
+                suffixes: darray[sview] = []
+                selected_module: mutable sview @source = table.current_module
+                selected: mutable bool = false
+                ambiguous: mutable bool = false
+                for index in 0..<table.enum_variant_owner.count |selected_module, selected, ambiguous, module_prefix, suffixes, table, family, function_module|:
+                    continue if table.enum_variant_owner[index] != family
+                    return (false, table.current_module) if index >= table.enum_variant_module.count
+                    candidate_module: sview @source = table.enum_variant_module[index]
+                    continue if not progress_catch_module_path_matches_scoped(module_prefix, suffixes, candidate_module, table, function_module, declaration_offset, 0)
+                    if not selected:
+                        selected_module <- candidate_module
+                        selected <- true
+                    elif selected_module != candidate_module:
+                        ambiguous <- true
+                return (false, table.current_module) if ambiguous or not selected
+                return (true, selected_module)
+
+        def progress_catch_declared_family_module_for_row(family_row_index: usize, family: sview, declaration_line: u32, declaration_offset: u32, function_module: sview, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                selected_path: mutable sview @source = table.current_module
+                path_count: mutable usize = 0.usize()
+                return (false, table.current_module) if family_row_index >= table.protocol_annotations.count
+                family_row: Ast::EnumAnnotation = table.protocol_annotations[family_row_index]
+                return (false, table.current_module) if family_row.owner != "__error_set_family" or family_row.name != family or family_row.line != declaration_line or family_row.offset != declaration_offset
+                path_index: mutable usize = family_row_index + 1.usize()
+                # A path row attached to this family occurrence but carrying another
+                # identity cannot be ignored in favor of scope-based recovery.
+                if path_index < table.protocol_annotations.count:
+                    adjacent_path: Ast::EnumAnnotation = table.protocol_annotations[path_index]
+                    if adjacent_path.owner == "__error_set_family_path" and adjacent_path.line == declaration_line and adjacent_path.offset == declaration_offset:
+                        return (false, table.current_module) if adjacent_path.identity_id != family_row.identity_id
+                while path_index < table.protocol_annotations.count |selected_path, path_count, path_index, declaration_line, declaration_offset, family, family_row, table|:
+                    annotation: Ast::EnumAnnotation = table.protocol_annotations[path_index]
+                    break if annotation.owner == "__error_set_family" and annotation.line == declaration_line and annotation.offset == declaration_offset
+                    if annotation.owner == "__error_set_family_path" and annotation.line == declaration_line and annotation.offset == declaration_offset and annotation.identity_id == family_row.identity_id and progress_catch_family_path_leaf_matches(annotation.name, family):
+                        selected_path <- annotation.name
+                        path_count <- path_count + 1.usize()
+                    path_index <- path_index + 1.usize()
+                return (false, table.current_module) if path_count > 1.usize()
+                if path_count == 1.usize():
+                    separator: (found: bool, start: usize, after: usize) = progress_catch_path_scope_separator(selected_path, true)
+                    return progress_catch_explicit_family_module(selected_path, family, declaration_offset, function_module, table) if separator.found
+                return progress_catch_family_module_in_scope(family, function_module, table)
+
+        # Subset rows immediately follow the family/path pair that introduced them.
+        # Keying only by the short family leaf merges `First::Fault{Busy}` with an
+        # unrestricted `Second::Fault` in the same declaration.
+        def progress_catch_family_row_has_subset(family_row_index: usize, family: sview, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if family_row_index + 2.usize() >= table.protocol_annotations.count
+                family_row: Ast::EnumAnnotation = table.protocol_annotations[family_row_index]
+                path_row: Ast::EnumAnnotation = table.protocol_annotations[family_row_index + 1.usize()]
+                subset_row: Ast::EnumAnnotation = table.protocol_annotations[family_row_index + 2.usize()]
+                return false if family_row.owner != "__error_set_family" or family_row.name != family or family_row.line != declaration_line or family_row.offset != declaration_offset
+                return false if declaration_identity_id != 0 and family_row.identity_id != declaration_identity_id
+                return false if path_row.owner != "__error_set_family_path" or path_row.line != family_row.line or path_row.offset != family_row.offset or path_row.identity_id != family_row.identity_id
+                return subset_row.owner == "__error_variant_family" and subset_row.name == family and subset_row.line == declaration_line and subset_row.offset == declaration_offset and subset_row.identity_id == family_row.identity_id
+
+        # A malformed marker/allow pair must not be treated as a valid subset that
+        # happens to exclude every variant. Check the full row sequence before using
+        # `allows_variant`, whose false result means a valid exclusion.
+        def progress_catch_family_row_subset_metadata_valid(family_row_index: usize, family: sview, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if family_row_index + 1.usize() >= table.protocol_annotations.count
+                family_row: Ast::EnumAnnotation = table.protocol_annotations[family_row_index]
+                path_row: Ast::EnumAnnotation = table.protocol_annotations[family_row_index + 1.usize()]
+                return false if family_row.owner != "__error_set_family" or family_row.name != family or family_row.line != declaration_line or family_row.offset != declaration_offset
+                return false if declaration_identity_id != 0 and family_row.identity_id != declaration_identity_id
+                return false if path_row.owner != "__error_set_family_path" or path_row.line != family_row.line or path_row.offset != family_row.offset or path_row.identity_id != family_row.identity_id
+                marker_index: mutable usize = family_row_index + 2.usize()
+                return true if marker_index >= table.protocol_annotations.count
+                first_marker: Ast::EnumAnnotation = table.protocol_annotations[marker_index]
+                return true if first_marker.owner != "__error_variant_family"
+                valid_pair_found: mutable bool = false
+                while marker_index < table.protocol_annotations.count |marker_index, table, family, declaration_line, declaration_offset, family_row, valid_pair_found|:
+                    marker_row: Ast::EnumAnnotation = table.protocol_annotations[marker_index]
+                    break if marker_row.owner == "__error_set_family" and marker_row.line == declaration_line and marker_row.offset == declaration_offset
+                    return false if marker_row.owner != "__error_variant_family" or marker_row.name != family or marker_row.line != declaration_line or marker_row.offset != declaration_offset or marker_row.identity_id != family_row.identity_id
+                    return false if marker_index + 1.usize() >= table.protocol_annotations.count
+                    allow_row: Ast::EnumAnnotation = table.protocol_annotations[marker_index + 1.usize()]
+                    return false if allow_row.owner != "__error_variant_allow" or allow_row.line != declaration_line or allow_row.offset != declaration_offset or allow_row.identity_id != family_row.identity_id
+                    valid_pair_found <- true
+                    marker_index <- marker_index + 2.usize()
+                return valid_pair_found
+
+        def progress_catch_family_row_allows_variant(family_row_index: usize, family: sview, variant: sview, declaration_line: u32, declaration_offset: u32, declaration_identity_id: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return true if not progress_catch_family_row_has_subset(family_row_index, family, declaration_line, declaration_offset, declaration_identity_id, table)
+                marker_index: mutable usize = family_row_index + 2.usize()
+                while marker_index < table.protocol_annotations.count |marker_index, table, family, variant, declaration_line, declaration_offset, declaration_identity_id|:
+                    marker_row: Ast::EnumAnnotation = table.protocol_annotations[marker_index]
+                    break if marker_row.owner == "__error_set_family" and marker_row.line == declaration_line and marker_row.offset == declaration_offset
+                    break if marker_row.owner != "__error_variant_family" or marker_row.name != family or marker_row.line != declaration_line or marker_row.offset != declaration_offset or marker_row.identity_id != declaration_identity_id
+                    break if marker_index + 1.usize() >= table.protocol_annotations.count
+                    allow_row: Ast::EnumAnnotation = table.protocol_annotations[marker_index + 1.usize()]
+                    break if allow_row.owner != "__error_variant_allow" or allow_row.line != declaration_line or allow_row.offset != declaration_offset or allow_row.identity_id != declaration_identity_id
+                    return true if allow_row.name == variant
+                    marker_index <- marker_index + 2.usize()
+                return false
+
+        def progress_catch_declared_variant_short_name_is_ambiguous(module: sview, variant: sview, family: sview, family_row_index: usize, declaration_line: u32, declaration_offset: u32, function_module: sview, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                candidate_tag: darray[u8] = progress_catch_declared_tag_bytes(module, family, variant)
+                for other_family_row_index in 0..<table.protocol_annotations.count |candidate_tag, family, family_row_index, other_family_row_index, declaration_line, declaration_offset, function_module, table|:
+                    continue if other_family_row_index == family_row_index
+                    other_family_row: Ast::EnumAnnotation = table.protocol_annotations[other_family_row_index]
+                    continue if other_family_row.owner != "__error_set_family" or other_family_row.line != declaration_line or other_family_row.offset != declaration_offset
+                    other_family: sview = other_family_row.name
+                    other_family_offset: u32 = other_family_row.offset
+                    other_family_identity: u32 = other_family_row.identity_id
+                    return true if not progress_catch_family_row_subset_metadata_valid(other_family_row_index, other_family, declaration_line, declaration_offset, other_family_identity, table)
+                    other_module: (known: bool, module: sview @source) = progress_catch_declared_family_module_for_row(other_family_row_index, other_family, declaration_line, declaration_offset, function_module, table)
+                    return true if not other_module.known
+                    for index in 0..<table.enum_variant_owner.count |candidate_tag, other_family, other_module, other_family_row_index, other_family_offset, other_family_identity, declaration_line, table|:
+                        continue if table.enum_variant_owner[index] != other_family
+                        continue if index >= table.enum_variant_module.count or index >= table.enum_variant_name.count
+                        continue if table.enum_variant_module[index] != other_module.module
+                        continue if not progress_catch_family_row_allows_variant(other_family_row_index, other_family, table.enum_variant_name[index], declaration_line, other_family_offset, other_family_identity, table)
+                        other_tag: darray[u8] = progress_catch_declared_tag_bytes(other_module.module, other_family, table.enum_variant_name[index])
+                        return true if progress_catch_tag_short_names_equal(candidate_tag, other_tag)
+                return false
+
+        def progress_catch_declared_error_families_total(arms: darray[Ast::MatchArm], table: SymbolTable&, callee: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                declaration_line: mutable u32 = 0
+                declaration_offset: mutable u32 = 0
+                declaration_count: mutable usize = 0
+                for annotation in table.protocol_annotations |declaration_line, declaration_offset, declaration_count, table, callee|:
+                    if annotation.owner == callee and annotation.name == "__lsp_func_name":
+                        declaration_line <- annotation.line
+                        declaration_offset <- annotation.offset
+                        declaration_count <- declaration_count + 1.usize()
+                return false if declaration_count != 1.usize()
+                error_return_count: mutable usize = 0
+                for annotation in table.protocol_annotations |error_return_count, table, callee, declaration_line, declaration_offset|:
+                    if annotation.owner == callee and annotation.name == "__error_return" and annotation.line == declaration_line and annotation.offset == declaration_offset:
+                        error_return_count <- error_return_count + 1.usize()
+                return false if error_return_count != 1.usize()
+                function_module: (known: bool, module: sview @source) = progress_catch_function_module(declaration_line, declaration_offset, table)
+                return false if not function_module.known
+                family_count: mutable usize = 0
+                for family_row_index in 0..<table.protocol_annotations.count |family_count, table, declaration_line, declaration_offset|:
+                    family_row: Ast::EnumAnnotation = table.protocol_annotations[family_row_index]
+                    continue if family_row.owner != "__error_set_family" or family_row.line != declaration_line or family_row.offset != declaration_offset
+                    family: sview = family_row.name
+                    return false if not progress_catch_family_row_subset_metadata_valid(family_row_index, family, declaration_line, declaration_offset, family_row.identity_id, table)
+                    family_info: (known: bool, module: sview @source) = progress_catch_declared_family_module_for_row(family_row_index, family, declaration_line, declaration_offset, function_module.module, table)
+                    return false if not family_info.known
+                    family_module: mutable sview @source = family_info.module
+                    variant_index: mutable usize = 0
+                    while variant_index < table.enum_variant_owner.count |variant_index, arms, table, family, family_module, family_row_index, family_row, declaration_line, declaration_offset, function_module|:
+                        if table.enum_variant_owner[variant_index] == family:
+                            if variant_index < table.enum_variant_module.count:
+                                if table.enum_variant_module[variant_index] == family_module:
+                                    if progress_catch_family_row_allows_variant(family_row_index, family, table.enum_variant_name[variant_index], declaration_line, declaration_offset, family_row.identity_id, table):
+                                        variant: sview = table.enum_variant_name[variant_index]
+                                        allow_short_fallback: bool = not progress_catch_declared_variant_short_name_is_ambiguous(family_module, variant, family, family_row_index, declaration_line, declaration_offset, function_module.module, table)
+                                        variant_covered: mutable bool = false
+                                        arm_index: mutable usize = 1
+                                        while arm_index < arms.count |arm_index, arms, table, family, variant, family_module, allow_short_fallback, variant_covered|:
+                                            arm: Ast::MatchArm = arms[arm_index]
+                                            guard: (known: bool, value: bool) = progress_literal_bool(arm.guard)
+                                            unconditional: bool = arm.guard is Ast::Expr.Absent or (guard.known and guard.value)
+                                            variant_covered <- true if unconditional and progress_catch_pattern_covers_declared_variant(arm.pattern, family_module, family, variant, allow_short_fallback)
+                                            arm_index <- arm_index + 1.usize()
+                                        return false if not variant_covered
+                        variant_index <- variant_index + 1.usize()
+                    family_count <- family_count + 1.usize()
+                return family_count > 0.usize()

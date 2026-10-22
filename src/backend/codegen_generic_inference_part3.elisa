@@ -1,0 +1,386 @@
+extend Backend:
+    private:
+        def backend_is_trusted_pool_await_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if arguments.count != 1.usize()
+            callee_name: mutable sview = ""
+            explicit_types: mutable darray[ValueType] = []
+            match callee:
+                Expr.Ident(name, _):
+                    callee_name <- name
+                Expr.Index(Expr.Ident(name, _), type_expression, _):
+                    callee_name <- name
+                    explicit_types.push(annotation_value_type(type_expression, structs))
+                Expr.IndexN(Expr.Ident(name, _), type_expressions, _):
+                    callee_name <- name
+                    for type_expression in type_expressions |explicit_types, structs|:
+                        explicit_types.push(annotation_value_type(type_expression, structs))
+                _:
+                    return false
+            return false if:
+                callee_name != "pool_await"
+                lookup_slot(local_scope, "pool_await") is local_await_slot
+            trusted_slot: i64 = generic_index_of_owner(generics, "", "pool_await")
+            return false if:
+                trusted_slot < 0 or trusted_slot.usize() >= generics.param_count.count or trusted_slot.usize() >= generics.owners.count or trusted_slot.usize() >= generics.decls.count
+                generics.owners[trusted_slot.usize()] != "" or generics.param_count[trusted_slot.usize()] != 1
+                generic_index_of(generics, "pool_await") != trusted_slot
+            # A module/top-level monomorphic function of the same arity wins before generic
+            # lookup in the call emitter. Do not apply the generic consumer exception when
+            # that ordinary overload could be selected.
+            return false if:
+                function_index_of_arity(fns, "", "pool_await", 1.usize()) >= 0
+                structs.visibility.current_owner != "" and function_index_of_arity(fns, structs.visibility.current_owner, "pool_await", 1.usize()) >= 0
+            top_level_template_count: mutable usize = 0
+            template_scan: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, "pool_await")
+            while template_scan >= 0 |template_scan, generics, top_level_template_count|:
+                top_level_template_count <- top_level_template_count + 1.usize() if template_scan.usize() < generics.owners.count and generics.owners[template_scan.usize()] == ""
+                template_scan <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, "pool_await", template_scan)
+            return false if top_level_template_count != 1.usize()
+            trusted_runtime_line: mutable bool = false
+            match generics.decls[trusted_slot.usize()]:
+                Decl.Func(name: function_name, params: params, pos: function_pos, _):
+                    return false if function_name != "pool_await" or params.count != 1.usize()
+                    for trusted_line in structs.annotations.pool_await_runtime_lines |trusted_runtime_line, function_pos|:
+                        trusted_runtime_line <- true if trusted_line == function_pos.line
+                _:
+                    return false
+            return false if:
+                not trusted_runtime_line
+                not backend_pool_await_source_is_owned_task(arguments[0], local_scope, structs)
+            inferred_types: darray[ValueType] = infer_generic_args(trusted_slot.usize(), arguments, local_scope, fns, structs, generics)
+            return false if:
+                inferred_types.count != 1.usize()
+                explicit_types.count != 0.usize() and (explicit_types.count != inferred_types.count or not value_type_identity_equal(explicit_types[0], inferred_types[0]))
+            actual_task_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            return false if backend_expression_projects_pool_lifetime_handle(arguments[0], local_scope, fns, structs, generics, 0.usize())
+            expected_task_type: ValueType = instantiation_param_type_at(trusted_slot.usize(), inferred_types, 0.usize(), generics, structs)
+            return false if actual_task_type.kind != TypeKind.Struct or not value_type_identity_equal(actual_task_type, expected_task_type)
+            task_base: mutable sview = ""
+            task_arg_start: mutable usize = 0
+            task_arg_count: mutable usize = 0
+            return false if:
+                not generic_struct_instantiation_of(structs, actual_task_type, task_base, task_arg_start, task_arg_count) or task_base != "Task" or task_arg_count != 2.usize()
+                actual_task_type.bits.usize() >= structs.records.names.count or actual_task_type.bits.usize() >= structs.records.owners.count or structs.records.names[actual_task_type.bits.usize()] != "Task" or structs.records.owners[actual_task_type.bits.usize()] != ""
+                task_arg_start > structs.generics.generic_struct_inst_args.count or task_arg_count > structs.generics.generic_struct_inst_args.count - task_arg_start
+            result_type: ValueType = generic_return_type_at(trusted_slot.usize(), inferred_types, generics, structs)
+            return value_type_identity_equal(result_type, structs.generics.generic_struct_inst_args[task_arg_start])
+
+
+        # Explicit task_group_add consumes the Task and roots its completion state until the
+        # matching wait. Trust only the unique bundled generic API, a direct local TaskGroup
+        # reference, and a moved builtin Task argument.
+        def backend_is_trusted_task_group_add_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if:
+                arguments.count != 2.usize()
+                not submit_group_api_callee_matches(callee, "task_group_add", local_scope, fns, structs, generics)
+                local_scope.group_names.count == 0.usize() or local_scope.group_slots.count != local_scope.group_names.count
+            active_group_index: usize = local_scope.group_names.count - 1.usize()
+            return false if local_scope.group_manual_add.count != local_scope.group_names.count or not local_scope.group_manual_add[active_group_index]
+            active_group_name: sview = local_scope.group_names[active_group_index]
+            active_group_slot: LLVMValueRef = local_scope.group_slots[active_group_index]
+            return false if:
+                submit_group_argument_name(arguments[0]) != active_group_name or not (lookup_slot(local_scope, active_group_name) is active_group_slot)
+                not submit_group_runtime_apis_are_unique(fns, generics, structs)
+            generic_slot: i64 = submit_group_unique_generic_index("task_group_add", generics)
+            return false if generic_slot < 0 or generic_slot.usize() >= generics.decls.count
+            inferred_types: darray[ValueType] = infer_generic_args(generic_slot.usize(), arguments, local_scope, fns, structs, generics)
+            return false if inferred_types.count != 1.usize()
+            group_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            expected_group_type: ValueType = instantiation_param_type_at(generic_slot.usize(), inferred_types, 0.usize(), generics, structs)
+            return false if expected_group_type.kind != TypeKind.Ref or group_type.kind != TypeKind.Ref or not value_type_identity_equal(group_type, expected_group_type)
+            group_value_type: ValueType = ref_target_of(expected_group_type, structs)
+            return false if group_value_type.kind != TypeKind.Struct or group_value_type.bits.usize() >= structs.records.names.count or group_value_type.bits.usize() >= structs.records.owners.count or structs.records.names[group_value_type.bits.usize()] != "TaskGroup" or structs.records.owners[group_value_type.bits.usize()] != ""
+            task_type: ValueType = expression_type(arguments[1], local_scope, fns, structs, generics)
+            expected_task_type: ValueType = instantiation_param_type_at(generic_slot.usize(), inferred_types, 1.usize(), generics, structs)
+            return false if:
+                not value_type_identity_equal(task_type, expected_task_type)
+                backend_expression_projects_pool_lifetime_handle(arguments[1], local_scope, fns, structs, generics, 0.usize())
+            match arguments[1]:
+                Expr.Move(Expr.Ident(_, _), _):
+                    return true
+                _:
+                    return false
+
+
+        # A TaskGroup wait is a synchronous join, so it consumes the lifetime handle without
+        # letting it escape. Trust only the unique marked runtime API and a direct local group
+        # argument with the exact mutable TaskGroup reference type. Requiring a local identifier
+        # rules out calls that manufacture a handle through an untrusted expression.
+        def backend_is_trusted_task_group_wait_call(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if:
+                arguments.count != 1.usize()
+                not submit_group_api_callee_matches(callee, "task_group_wait_all", local_scope, fns, structs, generics)
+                not submit_group_runtime_apis_are_unique(fns, generics, structs)
+            group_name: sview = submit_group_argument_name(arguments[0])
+            return false if group_name == ""
+            if lookup_slot(local_scope, group_name) is direct_group_slot:
+                _ = direct_group_slot
+            else:
+                return false
+            wait_index: i64 = submit_group_unique_function_index("task_group_wait_all", 1.usize(), fns, generics)
+            return false if wait_index < 0 or wait_index.usize() >= fns.param_start.count or wait_index.usize() >= fns.param_count.count
+            wait_row: usize = wait_index.usize()
+            return false if fns.param_count[wait_row] != 1.usize()
+            parameter_index: usize = fns.param_start[wait_row]
+            return false if parameter_index >= fns.param_types.count
+            expected_group_type: ValueType = fns.param_types[parameter_index]
+            actual_group_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            return false if expected_group_type.kind != TypeKind.Ref or not value_type_identity_equal(actual_group_type, expected_group_type)
+            group_value_type: ValueType = ref_target_of(expected_group_type, structs)
+            return false if:
+                group_value_type.kind != TypeKind.Struct or group_value_type.bits.usize() >= structs.records.names.count or group_value_type.bits.usize() >= structs.records.owners.count
+                structs.records.names[group_value_type.bits.usize()] != "TaskGroup" or structs.records.owners[group_value_type.bits.usize()] != ""
+            return true
+
+
+
+        # Infer a generic function's full type-argument tuple from its call arguments, by
+        # unifying each parameter annotation against the argument's concrete type. Returns the
+        # inferred tuple, or an empty darray if any parameter stayed unbound (the caller then
+        # declines, or requires an explicit `f[K, V](…)`).
+        # A bare integer literal, or a unary +/- wrapping one — the forms that carry no
+        # expression type of their own but should default to i64 for generic inference.
+        def is_int_literal_expr(expression: Expr) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(literal_value, _):
+                        return true
+                    Expr.Unary(unary_operator, unary_operand, unary_line):
+                        return when unary_operator:
+                            TokenKind.Minus | TokenKind.Plus -> is_int_literal_expr(unary_operand)
+                            _ -> false
+                    Expr.Paren(paren_inner, paren_line):
+                        return is_int_literal_expr(paren_inner)
+                    _:
+                        return false
+
+
+
+        # Type arguments for a generic whose parameter appears ONLY in the RETURN type —
+        # `def new[T](api: FlagsNamespace) -> Flags[T]`. The argument-driven pass binds nothing
+        # there, so the DECLARATION's annotation is the only source; unify the template's
+        # return annotation against the expected type. Returns [] unless every parameter comes
+        # out bound, so a caller that cannot fully determine the instantiation declines rather
+        # than picking one.
+        def infer_generic_args_from_expected(slot: usize, expected: ValueType, generics: mutable GenericTable&, structs: mutable StructTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            count: usize = generics.param_count[slot]
+            bindings: mutable darray[ValueType] = [unmodeled_type() for _expected_slot in 0..<count]
+            bound_flags: mutable darray[bool] = [false for _expected_flag in 0..<count]
+            empty: darray[ValueType] = []
+            return empty if count == 0 or expected.kind == TypeKind.Unmodeled
+            match generics.decls[slot]:
+                Decl.Func(expected_fn_name, expected_params, expected_return_opt, expected_body, expected_effects, expected_decorators, expected_line):
+                    if expected_return_opt is expected_return_annotation:
+                        unify_annotation(expected_return_annotation, expected, generics, slot, structs, bindings, bound_flags)
+                _:
+                    pass
+            all_bound: mutable bool = true
+            for expected_flag in bound_flags |all_bound|:
+                all_bound <- false if not expected_flag
+            return empty if not all_bound
+            return bindings
+
+
+
+        def infer_generic_args(slot: usize, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> darray[ValueType] can[Abort.Panic, Memory.Allocate]:
+            count: usize = generics.param_count[slot]
+            bindings: mutable darray[ValueType] = [unmodeled_type() for _slot_index in 0..<count]
+            bound_flags: mutable darray[bool] = [false for _flag_index in 0..<count]
+            match generics.decls[slot]:
+                Decl.Func(function_name, params, return_type_opt, body, effects, decorators, line):
+                    limit: usize = params.count if params.count < arguments.count else arguments.count
+                    for position in 0..<limit |bindings, bound_flags, params, arguments, local_scope, fns, structs, generics, slot|:
+                        # `f: fn(A) -> R` against a FUNCTION-VALUED argument. unify_annotation takes
+                        # a ValueType, and matching a fn-type ANNOTATION against one needs the
+                        # actual's parameter and return types, so it is resolved here where the
+                        # argument expression is still in hand. Two sources, in order:
+                        #   - an interned Fn ValueType (a local or parameter of fn type) carries its
+                        #     signature in the fn_pool_* side-pools — this is the case pool_submit1
+                        #     needs, where `fn` is its own PARAMETER, not a named function;
+                        #   - a bare function NAME has no expression type of its own, so its
+                        #     declaration in the FnTable is the only source.
+                        # The annotation's own parameter type expressions are keyed by the fn
+                        # token offset, so same-line callback signatures remain distinct.
+                        lambda_handled: mutable bool = false
+                        match params[position].type_expression:
+                            Expr.Lambda(lam_names, lam_body, lam_line):
+                                lam_param_types: mutable darray[ValueType] = []
+                                lam_return_type: mutable ValueType = unmodeled_type()
+                                lam_actual_type: ValueType = expression_type(arguments[position], local_scope, fns, structs, generics)
+                                if lam_actual_type.kind == TypeKind.Fn and lam_actual_type.bits.usize() < structs.function_types.fn_pool_returns.count:
+                                    lambda_handled <- true
+                                    lam_pool_start: usize = structs.function_types.fn_pool_param_start[lam_actual_type.bits.usize()]
+                                    for lam_pool_i in 0..<structs.function_types.fn_pool_param_count[lam_actual_type.bits.usize()] |lam_param_types, lam_pool_start, structs|:
+                                        lam_param_types.push(copied_type(structs.function_types.fn_pool_params[lam_pool_start + lam_pool_i]))
+                                    lam_return_type <- fn_return_type_of(lam_actual_type, structs)
+                                else:
+                                    match arguments[position]:
+                                        Expr.Ident(lam_arg_name, _):
+                                            if function_index_of(fns, "", lam_arg_name) >= 0:
+                                                lambda_handled <- true
+                                                for lam_fn_i in 0..<param_type_count(fns, "", lam_arg_name) |lam_param_types, lam_arg_name, fns|:
+                                                    lam_param_types.push(param_type_of(fns, "", lam_arg_name, lam_fn_i))
+                                                lam_return_type <- lookup_return_type(fns, "", lam_arg_name)
+                                        _:
+                                            pass
+                                if lambda_handled:
+                                    lam_probe: mutable usize = 0
+                                    lam_index: mutable usize = 0
+                                    while lam_probe < structs.function_types.fn_type_param_lines.count |lam_probe, lam_index, lam_line, lam_param_types, bindings, bound_flags, generics, slot, structs|:
+                                        if structs.function_types.fn_type_param_lines[lam_probe] == lam_line.line and structs.function_types.fn_type_param_offsets[lam_probe] == lam_line.offset:
+                                            if lam_index < lam_param_types.count and lam_param_types[lam_index].kind != TypeKind.Unmodeled:
+                                                unify_annotation(structs.function_types.fn_type_param_exprs[lam_probe], lam_param_types[lam_index], generics, slot, structs, bindings, bound_flags)
+                                            lam_index <- lam_index + 1
+                                        lam_probe <- lam_probe + 1
+                                    lam_return_position: i64 = type_param_position(generics, slot, fn_return_head_at_offset(lam_line.offset, lam_line.line, structs))
+                                    if lam_return_position >= 0 and not bound_flags[lam_return_position.usize()] and lam_return_type.kind != TypeKind.Unmodeled:
+                                        bindings[lam_return_position.usize()] <- copied_type(lam_return_type)
+                                        bound_flags[lam_return_position.usize()] <- true
+                            _:
+                                pass
+                        continue if lambda_handled
+                        actual: mutable ValueType = expression_type(arguments[position], local_scope, fns, structs, generics)
+                        # An untyped int literal argument (`id(21)`) has no expression type of its
+                        # own — like stage0's inference, default it to i64 so a bare type-parameter
+                        # binds instead of leaving the call uninferable.
+                        actual <- ValueType{kind: TypeKind.Signed, bits: 64} if actual.kind == TypeKind.Unmodeled and is_int_literal_expr(arguments[position])
+                        continue if actual.kind == TypeKind.Unmodeled
+                        fixed_extent_status: i64 = unify_fixed_array_extent(params[position].type_expression, actual, slot, generics, structs, bindings, bound_flags)
+                        if fixed_extent_status == 0:
+                            bindings <- bindings.truncate(0)
+                            return bindings
+                        continue if fixed_extent_status == 1
+                        unify_annotation(params[position].type_expression, actual, generics, slot, structs, bindings, bound_flags)
+                _:
+                    pass
+            for flag_index in 0..<count |bound_flags, bindings|:
+                if not bound_flags[flag_index]:
+                    bindings <- bindings.truncate(0)
+                    return bindings
+            return bindings
+
+
+
+        # The index of generic template `name`, or -1.
+        # The template slot a bare name resolves to, in the order every other declaration
+        # kind uses: the enclosing module's own, then a top-level one, then the first of that
+        # name anywhere. It used to return the first slot by bare name alone, so `read_as(1)`
+        # written inside `module B:` picked module A's template when A was declared first —
+        # and since instantiations are memoized per slot, both modules then shared ONE body,
+        # which read A's private state for B's callers.
+        def generic_index_of(generics: GenericTable&, name: sview) -> i64 can[Abort.Panic]:
+            first: i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, name)
+            if generics.current_owner != "":
+                owned: mutable i64 = first
+                while owned >= 0 |owned, generics, name|:
+                    return owned if owned.usize() < generics.owners.count and generics.owners[owned.usize()] == generics.current_owner
+                    owned <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, name, owned)
+            top: mutable i64 = first
+            while top >= 0 |top, generics, name|:
+                return top if top.usize() >= generics.owners.count or generics.owners[top.usize()] == ""
+                top <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, name, top)
+            return first
+
+
+
+        # Exact owner lookup for a module-qualified generic reference. Unlike a bare name,
+        # `Module::f` must never fall through to a same-named template from another module or
+        # from the top level: doing so can compile successfully while instantiating the wrong
+        # body (and, for container methods, corrupt memory).
+        def generic_index_of_owner(generics: GenericTable&, owner: sview, name: sview) -> i64 can[Abort.Panic]:
+            index: mutable i64 = name_chain_first(generics.name_buckets, generics.name_next, generics.names, name)
+            while index >= 0 |index, generics, owner, name|:
+                return index if index.usize() < generics.owners.count and generics.owners[index.usize()] == owner
+                index <- name_chain_next(generics.name_buckets, generics.name_next, generics.names, name, index)
+            return -1
+
+
+
+        # The errorset parameter of generic template `slot`, or empty for a monomorphic
+        # error family. It is intentionally not part of GenericTable.param_count: callers
+        # never pass an error set as a runtime/type value.
+        def generic_error_param_at(generics: GenericTable&, slot: usize) -> sview can[Abort.Panic]:
+            return generics.error_params[slot] if slot < generics.error_params.count
+            return ""
+
+
+
+        def fn_error_family_of(fn_type: ValueType, structs: StructTable&) -> sview @source can[Abort.Panic]:
+            return structs.function_types.fn_pool_error_families[fn_type.bits.usize()] if fn_type.kind == TypeKind.Fn and fn_type.bits.usize() < structs.function_types.fn_pool_error_families.count
+            return ""
+
+
+
+        # The concrete error family carried by a callable expression. A bare function name
+        # is not itself a ValueType in the compact backend, so recover its declared family
+        # from FnTable; a local/function field already carries it in the Fn side-pool.
+        def concrete_error_family_of(expression: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> sview can[Abort.Panic, Memory.Allocate]:
+            actual: ValueType = expression_type(expression, local_scope, fns, structs, generics)
+            if actual.kind == TypeKind.ErrorUnion:
+                return error_union_family_of(actual, structs)
+            if actual.kind == TypeKind.Fn:
+                actual_family: sview = fn_error_family_of(actual, structs)
+                return actual_family if actual_family != ""
+            match expression:
+                Expr.Lambda(lambda_params, lambda_body, lambda_line):
+                    lambda_family: sview = fn_error_family_at_offset(lambda_line.offset, lambda_line.line, structs)
+                    return lambda_family if lambda_family != ""
+                Expr.Ident(callable_name, callable_line):
+                    callable_index: i64 = function_index_of(fns, "", callable_name)
+                    if callable_index >= 0 and fns.is_error[callable_index.usize()]:
+                        return line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_set_names, fns.lines[callable_index.usize()])
+                _:
+                    pass
+            return ""
+
+
+
+        # Infer the concrete family for an `errorset R` generic from an argument whose
+        # declared parameter mentions R. This is the errorset analogue of infer_generic_args:
+        # ordinary type bindings remain in the returned darray, while the family is kept as a
+        # source selector for specialization and ABI construction.
+        def infer_generic_error_family(slot: usize, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            wanted_family: sview = generic_error_param_at(generics, slot)
+            if wanted_family == "":
+                match generics.decls[slot]:
+                    Decl.Func(pos: declared_error_line, _):
+                        return line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_set_names, declared_error_line.line)
+                    _:
+                        return ""
+            match generics.decls[slot]:
+                Decl.Func(error_generic_name, error_generic_params, error_generic_return, error_generic_body, error_generic_effects, error_generic_decorators, error_generic_line):
+                    limit: usize = error_generic_params.count if error_generic_params.count < arguments.count else arguments.count
+                    for position in 0..<limit |wanted_family, arguments, local_scope, fns, structs, generics|:
+                        pattern: ValueType = parameter_decl_value_type(error_generic_params[position], error_generic_params, structs)
+                        pattern_family: mutable sview = ""
+                        pattern_family <- error_union_family_of(pattern, structs) if pattern.kind == TypeKind.ErrorUnion
+                        if pattern.kind == TypeKind.Fn:
+                            pattern_family <- fn_error_family_of(pattern, structs)
+                            pattern_return: ValueType = fn_return_type_of(pattern, structs)
+                            if pattern_family == "":
+                                pattern_family <- error_union_family_of(pattern_return, structs) if pattern_return.kind == TypeKind.ErrorUnion
+                        if pattern_family == wanted_family:
+                            actual_family: sview = concrete_error_family_of(arguments[position], local_scope, fns, structs, generics)
+                            return actual_family if actual_family != ""
+                _:
+                    pass
+            return ""
+
+
+
+        # The already-declared instantiation for (base, type-argument tuple), or null.
+        def instantiation_of(generics: GenericTable&, base: sview, type_args: darray[ValueType]&) -> LLVMValueRef? can[Abort.Panic]:
+            for index in 0..<generics.inst_bases.count |generics, base, type_args|:
+                continue if generics.inst_bases[index] != base
+                continue if generics.inst_arg_count[index] != type_args.count
+                astart: usize = generics.inst_arg_start[index]
+                matched: mutable bool = true
+                for k in 0..<type_args.count |generics, matched, astart, type_args|:
+                    stored: ValueType = generics.inst_args[astart + k]
+                    # Generic arguments are nominal identities, not merely ABI shapes. In
+                    # particular, distinct const-enum types can both be `u8`; collapsing them
+                    # here reuses the first specialization and can select the wrong static
+                    # effect handler later in that body's erased direct-call graph.
+                    matched <- false if not value_type_identity_equal(stored, type_args[k])
+                return generics.inst_handles[index] if matched
+            return null

@@ -1,0 +1,535 @@
+extend Semantic:
+    private:
+        def ga_index_inline_grants(state: mutable GlobalAuthority&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                # The sort buffers are temporary, while the indexed arrays belong to the
+                # caller's authority state. Keep buffers in an explicit region and copy
+                # their scalar elements back in place so no scratch container escapes.
+                region scratch:
+                    order: mutable darray[usize] = []
+                    scratch_order: mutable darray[usize] = []
+                    visited: mutable darray[bool] = []
+                    # Reserve all buffers before filling any of them, so later growth
+                    # cannot strand old capacities in the chained region.
+                    order.reserve(state.inline_spans.count)
+                    scratch_order.reserve(state.inline_spans.count)
+                    visited.reserve(state.inline_spans.count)
+                    for index in 0..<state.inline_spans.count |order, scratch_order, visited|:
+                        order.push(index)
+                        scratch_order.push(index)
+                        visited.push(false)
+                    width: mutable usize = 1
+                    while width < order.count |width, order, scratch_order, state|:
+                        start: mutable usize = 0
+                        while start < order.count |start, width, order, scratch_order, state|:
+                            middle: usize = start + width if start + width < order.count else order.count
+                            stop: usize = start + 2 * width if start + 2 * width < order.count else order.count
+                            left: mutable usize = start
+                            right: mutable usize = middle
+                            target: mutable usize = start
+                            while target < stop |target, left, right, middle, stop, order, scratch_order, state|:
+                                take_right: bool = right < stop and (left >= middle or state.inline_spans[order[right]].offset < state.inline_spans[order[left]].offset)
+                                if take_right:
+                                    scratch_order[target] <- order[right]
+                                    right <- right + 1
+                                else:
+                                    scratch_order[target] <- order[left]
+                                    left <- left + 1
+                                target <- target + 1
+                            start <- stop
+                        for index in 0..<order.count |order, scratch_order|:
+                            order[index] <- scratch_order[index]
+                        width <- width * 2
+                    # Apply the sorted permutation in place. Keeping only usize/Bool
+                    # scratch arrays avoids putting borrowed grant views in this region;
+                    # each value copied below comes directly from the caller-owned rows.
+                    for start in 0..<order.count |visited, order, state|:
+                        continue if visited[start]
+                        current: mutable usize = start
+                        saved_ref: sview = state.inline_refs[start]
+                        saved_span: Ast::Pos = state.inline_spans[start]
+                        saved_scope: usize = state.inline_scopes[start]
+                        while true |current, visited, order, state, saved_ref, saved_span, saved_scope|:
+                            visited[current] <- true
+                            source: usize = order[current]
+                            if source == start:
+                                state.inline_refs[current] <- saved_ref
+                                state.inline_spans[current] <- saved_span
+                                state.inline_scopes[current] <- saved_scope
+                                break
+                            state.inline_refs[current] <- state.inline_refs[source]
+                            state.inline_spans[current] <- state.inline_spans[source]
+                            state.inline_scopes[current] <- state.inline_scopes[source]
+                            current <- source
+                longest: mutable u32 = 0
+                for span in state.inline_spans |longest, state|:
+                    longest <- max(longest, span.end_offset)
+                    state.inline_prefix_ends.push(longest)
+
+        def ga_inline_limit(offset: u32, state: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                lower: mutable usize = 0
+                upper: mutable usize = state.inline_spans.count
+                while lower < upper |lower, upper|:
+                    middle: usize = lower + (upper - lower) / 2
+                    if state.inline_spans[middle].offset <= offset:
+                        lower <- middle + 1
+                    else:
+                        upper <- middle
+                return lower
+
+        def ga_granted(required: sview, at: Ast::Pos, state: GlobalAuthority&, required_scope: usize = 0) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if ga_refs_cover(state.grants, state.grant_scopes, required, required_scope, state)
+                while next_index > 0 |next_index: usize = ga_inline_limit(at.offset, state)|:
+                    index: usize = next_index - 1
+                    next_index <- index
+                    break if state.inline_prefix_ends[index] <= at.offset
+                    span: Ast::Pos = state.inline_spans[index]
+                    return true if at.offset < span.end_offset and ga_ref_covers(state.inline_refs[index], required, state.inline_scopes[index], required_scope, state, 0)
+                return false
+
+        # Positions contain exactly six scalar fields. Rebuild them by value so an
+        # expression's reference provenance cannot attach to diagnostic source spans.
+        def ga_position_value(line: u32, column: u32, offset: u32, end_line: u32, end_column: u32, end_offset: u32) -> Ast::Pos:
+            return Ast::Pos{line: line, column: column, offset: offset, end_line: end_line, end_column: end_column, end_offset: end_offset}
+
+        def ga_mark_walk_overflow(at: Ast::Pos, state: mutable GlobalAuthority&) -> void:
+            can Abort.Panic:
+                if not state.walk_overflow:
+                    state.walk_overflow_pos <- ga_position_value(at.line, at.column, at.offset, at.end_line, at.end_column, at.end_offset)
+                    state.walk_overflow <- true
+                    ga_mark_all_possible_global_effects(state)
+
+        def ga_mark_all_possible_global_effects(state: mutable GlobalAuthority&) -> void:
+            can Abort.Panic:
+                for function in 0..<min(state.reads.count, state.writes.count) |function, state|:
+                    state.reads[function] <- true
+                    state.writes[function] <- true
+
+        def ga_report_walk_overflow(state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if state.walk_overflow and not state.walk_depth_reported:
+                    already_reported: bool = any diagnostic in table.diagnostics where diagnostic.kind == DiagnosticKind.ExpressionAnalysisDepthExceeded
+                    if not already_reported:
+                        at: Ast::Pos = state.walk_overflow_pos
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ExpressionAnalysisDepthExceeded, name: "global authority", expected: "bounded expression depth", actual: "depth limit exceeded", line: at.line, pos: at})
+                    state.walk_depth_reported <- true
+
+        # Keep the recursive authority walk below the native stack limit. Truncating a
+        # subtree is never treated as a pure result: inference propagates both possible
+        # Global effects, and the reporting pass rejects the input with the same diagnostic
+        # used by the other bounded semantic walkers.
+        def ga_walk_enter(at: Ast::Pos, state: mutable GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                state.walk_depth <- state.walk_depth + 1
+                return true if state.walk_depth <= GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT
+                state.walk_depth <- state.walk_depth - 1
+                ga_mark_walk_overflow(at, state)
+                return false
+
+        def ga_statement_position(statement: Ast::Stmt) -> Ast::Pos:
+            can Abort.Panic:
+                match statement:
+                    Stmt.Expr(_, position):
+                        return position
+                    Stmt.Block(pos: position, _):
+                        return position
+                    Stmt.VarDecl(pos: position, _):
+                        return position
+                    Stmt.Assign(pos: position, _):
+                        return position
+                    Stmt.If(pos: position, _):
+                        return position
+                    Stmt.While(_, _, position):
+                        return position
+                    Stmt.For(pos: position, _):
+                        return position
+                    Stmt.Return(_, position):
+                        return position
+                    Stmt.Break(_, position) | Stmt.Continue(_, position):
+                        return position
+                    Stmt.Match(_, _, position):
+                        return position
+                    Stmt.Contract(_, _, position):
+                        return position
+                    _:
+                        return ga_position_value(0, 0, 0, 0, 0, 0)
+
+        def ga_access_slot(global_slot: usize, at: Ast::Pos, write: bool, mutable_path: bool, state: mutable GlobalAuthority&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if global_slot >= state.globals.count
+                if not state.writable[global_slot] and not mutable_path:
+                    if not state.report and not ga_refs_cover(state.firewalls, state.firewall_scopes, "Global.Read", 0, state):
+                        _ = ga_row_add(state.function, "Global.Read", false, state, 0) can Global{Read,Write}
+                    return
+                required: sview = "Global.Write" if write else "Global.Read"
+                if not ga_refs_cover(state.firewalls, state.firewall_scopes, required, 0, state):
+                    if not state.report:
+                        _ = ga_row_add(state.function, required, true, state) can Global{Read,Write}
+                    if write:
+                        state.writes[state.function] <- true
+                    else:
+                        state.reads[state.function] <- true
+                if state.report and not ga_granted(required, at, state):
+                    diagnostic_bytes: mutable darray[u8] = []
+                    diagnostic_bytes.extend(state.globals[global_slot])
+                    stable_global: sview = Parser::persist_name_bytes(&diagnostic_bytes, 0) can Global{Read,Write}
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.MutableGlobalPermissionUngranted, name: "write" if write else "read", expected: required, actual: stable_global, line: at.line, pos: ga_position_value(at.line, at.column, at.offset, at.end_line, at.end_column, at.end_offset)})
+
+        def ga_local_slot(name: sview, state: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                local_index: mutable usize = min(state.local_limit, state.locals.count)
+                while local_index > state.local_floor |local_index, name, state|:
+                    local_index <- local_index - 1
+                    return local_index if state.locals[local_index] == name
+                return GLOBAL_AUTHORITY_NONE
+
+        # Origin values below globals.count are global slots. Local roots occupy the
+        # remaining ordinary range and carry a monotonically assigned binding ID, so
+        # truncating and reusing a lexical local slot cannot retarget an old origin.
+        def ga_local_origin(local_index: usize, state: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if local_index >= state.locals.count or local_index >= state.local_origin_ids.count
+                identity: usize = state.local_origin_ids[local_index]
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if:
+                    identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS or state.globals.count >= GLOBAL_AUTHORITY_LOCAL_ALIAS
+                    identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS - state.globals.count
+                return state.globals.count + identity
+
+        def ga_local_origin_index(origin: usize, state: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                return state.locals.count if origin < state.globals.count or origin >= GLOBAL_AUTHORITY_LOCAL_ALIAS
+                identity: usize = origin - state.globals.count
+                for local_index in 0..<min(state.locals.count, state.local_origin_ids.count):
+                    return local_index if state.local_origin_ids[local_index] == identity
+                return state.locals.count
+
+        def ga_validate_local_origin(origin: usize, state: GlobalAuthority&) -> usize:
+            can Abort.Panic:
+                if origin >= state.globals.count and origin < GLOBAL_AUTHORITY_LOCAL_ALIAS:
+                    return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if ga_local_origin_index(origin, state) >= state.locals.count
+                return origin
+
+        def ga_push_local_origin_id(state: mutable GlobalAuthority&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if state.globals.count < GLOBAL_AUTHORITY_LOCAL_ALIAS and state.next_local_origin_id < GLOBAL_AUTHORITY_LOCAL_ALIAS - state.globals.count:
+                    state.local_origin_ids.push(state.next_local_origin_id)
+                    state.next_local_origin_id <- state.next_local_origin_id + 1
+                else:
+                    state.local_origin_ids.push(GLOBAL_AUTHORITY_LOCAL_ALIAS)
+
+        # A projection's type tells us whether this result can carry nested references.
+        # Use a recovered local-root summary when present; unknown/missing evidence stays
+        # fail-closed, while a known reference-free projection contributes no alias.
+        def ga_projected_reference_origin(expression: Ast::Expr, summary: usize, state: GlobalAuthority&) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                if ga_annotation(expression, state, 0) is type_expression:
+                    return GLOBAL_AUTHORITY_NONE if not ga_type_expression_contains_reference(type_expression, state, 0)
+                    if summary != GLOBAL_AUTHORITY_NONE:
+                        if summary >= state.globals.count and summary < GLOBAL_AUTHORITY_LOCAL_ALIAS:
+                            return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if ga_local_origin_index(summary, state) >= state.locals.count
+                        return summary
+                    return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+
+        def ga_local_reference_origin(expression: Ast::Expr, state: GlobalAuthority&, depth: u32) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT
+                if ga_cast_operand(expression) is cast_operand:
+                    return ga_local_reference_origin(cast_operand, state, depth + 1)
+                match expression:
+                    Expr.Ident(name, _):
+                        # `null` parses as a keyword identifier and names no storage.
+                        return GLOBAL_AUTHORITY_NONE if name == "null"
+                        local_index: usize = ga_local_slot(name, state)
+                        return ga_validate_local_origin(state.local_global_origins[local_index], state) if local_index < state.local_global_origins.count
+                        return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if local_index < state.locals.count
+                        # A global root is resolved by the place walk; any other name
+                        # (`result` in a contract) names detached storage.
+                        return GLOBAL_AUTHORITY_NONE if ga_global(expression, state) < state.globals.count
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS
+                    Expr.Field(base, _, _) | Expr.Index(base, _, _) | Expr.IndexN(base, _, _) | Expr.Slice(base, _, _, _):
+                        base_origin: usize = ga_local_reference_origin(base, state, depth + 1)
+                        # A projection through a reference reads a nested value from the
+                        # referenced local aggregate. A projection through a by-value
+                        # aggregate instead selects one of its contained references, so
+                        # preserve that content summary unchanged.
+                        # Whatever is reached through detached storage is detached too.
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if base_origin == GLOBAL_AUTHORITY_LOCAL_ALIAS
+                        if base_origin != GLOBAL_AUTHORITY_NONE and ga_expression_is_reference(base, state, 0):
+                            root_index: usize = ga_local_origin_index(base_origin, state)
+                            if base_origin >= state.globals.count and base_origin < GLOBAL_AUTHORITY_LOCAL_ALIAS:
+                                if root_index >= state.locals.count:
+                                    return ga_projected_reference_origin(expression, GLOBAL_AUTHORITY_NONE, state)
+                            if root_index < state.locals.count:
+                                # Whatever is reachable through a parameter is caller storage,
+                                # covered by the caller's grant (stage0's parameter rule), even
+                                # when the projection's type (a generic T) gives no evidence.
+                                if root_index < state.parameter_limit and root_index < state.local_global_origins.count:
+                                    return state.local_global_origins[root_index]
+                                if root_index < state.local_global_origins.count:
+                                    return ga_projected_reference_origin(expression, state.local_global_origins[root_index], state)
+                            return ga_projected_reference_origin(expression, GLOBAL_AUTHORITY_NONE, state)
+                        return base_origin if base_origin != GLOBAL_AUTHORITY_NONE
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_expression_is_reference(expression, state, 0)
+                        return base_origin
+                    Expr.Unary(operator, base, _) if operator == TokenKind.Ampersand:
+                        return ga_local_address_origin(base, state)
+                    Expr.Paren(base, _) | Expr.Move(base, _) | Expr.Unary(_, base, _):
+                        base_origin: usize = ga_local_reference_origin(base, state, depth + 1)
+                        return base_origin if base_origin != GLOBAL_AUTHORITY_NONE
+                        return GLOBAL_AUTHORITY_LOCAL_ALIAS if ga_expression_is_reference(expression, state, 0)
+                        return base_origin
+                    _:
+                        return GLOBAL_AUTHORITY_NONE
+
+        def ga_expression_is_reference(expression: Ast::Expr, state: GlobalAuthority&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if depth > 32
+                direct: RefSpelling = rbm_type_spelling(expression)
+                return true if (direct.flags & RBM_REF) != 0
+                lexical_scope: usize = ga_expression_type_scope(expression, state, depth + 1)
+                if ga_annotation(expression, state, depth + 1) is annotation:
+                    return true if lexical_scope == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                    return ga_reference_type(annotation, state, depth + 1, lexical_scope)
+                match expression:
+                    Expr.Ident(name, _):
+                        local_index: usize = ga_local_slot(name, state)
+                        if local_index < state.locals.count:
+                            # A declared by-value local is not a reference, whatever
+                            # references its contents carry: those are reached through
+                            # projections, each judged by its own type.
+                            if local_index < state.local_types.count and state.local_types[local_index] is declared_local_type:
+                                return ga_reference_type(declared_local_type, state, depth + 1, state.local_type_scopes[local_index] if local_index < state.local_type_scopes.count else GLOBAL_AUTHORITY_NONE)
+                            return true if local_index >= state.local_global_origins.count
+                            origin: usize = ga_validate_local_origin(state.local_global_origins[local_index], state)
+                            return true if SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin)
+                    _:
+                        pass
+                return true if lexical_scope == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                return false
+
+        def ga_reference_type(type_expression: Ast::Expr, state: GlobalAuthority&, depth: u32, origin: usize = GLOBAL_AUTHORITY_NONE) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if depth > 32
+                lexical_scope: usize = state.module_scope if origin == GLOBAL_AUTHORITY_NONE else origin
+                resolved: Ast::Expr = ga_type_alias_result(type_expression, lexical_scope, state, depth + 1)
+                return (rbm_type_spelling(resolved).flags & RBM_REF) != 0
+
+        # Opaque expressions may carry references inside tuples, containers or nominal
+        # values even when the expression itself is not a reference. Missing type evidence
+        # is unknown, so aggregate joins cannot accidentally erase that provenance.
+        def ga_expression_reference_origin(expression: Ast::Expr, state: GlobalAuthority&, depth: u32) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                if ga_annotation(expression, state, depth + 1) is annotation:
+                    return SemanticGlobalAuthorityOrigin::opaque_expression_origin(true, ga_type_expression_contains_reference(annotation, state, depth + 1))
+                return SemanticGlobalAuthorityOrigin::opaque_expression_origin(false, false)
+
+        # Named struct construction omits optional and defaulted fields. An omitted
+        # reference-bearing field may carry an alias not represented by the explicit
+        # initializer expressions, so only a complete reference-field inventory may keep
+        # the joined origin summary.
+        def ga_construct_omits_reference_field(type_expression: Ast::Expr, fields: darray[Ast::FieldInit], state: GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                owner: usize = ga_known_struct(type_expression, state.module_scope, state, 0)
+                return true if owner >= state.struct_names.count
+                field_index_cursor: mutable usize = ga_field_first(owner, state)
+                while field_index_cursor < state.field_owners.count |field_index_cursor|:
+                    field_index: usize = field_index_cursor
+                    field_index_cursor <- ga_field_after(field_index, state)
+                    continue if state.field_owners[field_index] != state.struct_names[owner] or state.field_scopes[field_index] != state.struct_scopes[owner]
+                    return true if state.field_scopes[field_index] != state.module_scope
+                    continue if not ga_type_expression_contains_reference(state.field_types[field_index], state, 0)
+                    found: mutable bool = false
+                    for initializer in fields:
+                        return true if initializer.name == "" and not initializer.is_copy_base
+                        found <- true if initializer.name == state.field_names[field_index]
+                    return true if not found
+                return false
+
+        # A variant constructor is the one call form whose result provenance is exactly
+        # the join of its explicit payload arguments. Match its lexical enum owner and
+        # declared variant before using that fact; arbitrary function returns stay opaque.
+        def ga_enum_variant_slot(callee: Ast::Expr, state: GlobalAuthority&) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Field(owner_expression, variant_name, _) | Expr.Scope(owner_expression, variant_name, _):
+                        match owner_expression:
+                            Expr.Ident(owner_name, _) if ga_local_slot(owner_name, state) < state.locals.count:
+                                return state.enum_variant_names.count
+                            _:
+                                pass
+                        enum_slot: usize = ga_resolve_indexed(ga_type_head(owner_expression), ga_type_scope(owner_expression, state), ga_type_qualified(owner_expression), state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state)
+                        return state.enum_variant_names.count if enum_slot >= state.enum_names.count
+                        variant_slot_cursor: mutable usize = ga_variant_first(enum_slot, state)
+                        while variant_slot_cursor < state.enum_variant_names.count |variant_slot_cursor|:
+                            variant_slot: usize = variant_slot_cursor
+                            variant_slot_cursor <- ga_variant_after(variant_slot, state)
+                            return variant_slot if state.enum_variant_owners[variant_slot] == state.enum_names[enum_slot] and state.enum_variant_scopes[variant_slot] == state.enum_scopes[enum_slot] and state.enum_variant_names[variant_slot] == variant_name
+                        return state.enum_variant_names.count
+                    _:
+                        return state.enum_variant_names.count
+
+        def ga_value_contains_mutable_reference(value: Ast::Expr, type_expression: Ast::Expr, state: mutable GlobalAuthority&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if depth > GLOBAL_AUTHORITY_WALK_DEPTH_LIMIT
+                # The expression scope is not reliable for nullary enum values:
+                # `Enum.Empty` is a scoped value, not a place with an annotation.
+                # Resolve the declared/inferred type in its own lexical scope.
+                type_scope: usize = ga_type_scope(type_expression, state)
+                resolved_type: Ast::Expr = ga_type_alias_result(type_expression, type_scope, state, depth + 1)
+                enum_owner: usize = ga_resolve_indexed(ga_type_head(resolved_type), type_scope, ga_type_qualified(resolved_type), state.enum_names, state.enum_scopes, state.enum_heads, state.enum_next, state)
+                variant_slot: mutable usize = state.enum_variant_names.count
+                match value:
+                    Expr.Call(callee: callee, _):
+                        variant_slot <- ga_enum_variant_slot(callee, state)
+                    Expr.Scope(_, _, _) | Expr.Field(_, _, _):
+                        variant_slot <- ga_enum_variant_slot(value, state)
+                    _:
+                        pass
+                if enum_owner < state.enum_names.count and variant_slot < state.enum_variant_names.count and state.enum_variant_owners[variant_slot] == state.enum_names[enum_owner] and state.enum_variant_scopes[variant_slot] == state.enum_scopes[enum_owner]:
+                    return true if variant_slot >= state.enum_variant_payload_counts.count or variant_slot >= state.enum_variant_payload_starts.count
+                    payload_start: usize = state.enum_variant_payload_starts[variant_slot]
+                    payload_count: usize = state.enum_variant_payload_counts[variant_slot]
+                    return true if payload_start > state.enum_variant_payload_types.count or payload_count > state.enum_variant_payload_types.count - payload_start
+                    for payload_index in payload_start..<payload_start + payload_count:
+                        return true if ga_type_expression_contains_mutable_reference(state.enum_variant_payload_types[payload_index], state, depth + 1, state.enum_variant_scopes[variant_slot])
+                    return false
+                return ga_type_expression_contains_mutable_reference(type_expression, state, depth + 1, type_scope)
+
+        def ga_enum_constructor_origin(variant_slot: usize, arguments: darray[Ast::Expr], labels: darray[sview], state: mutable GlobalAuthority&, depth: u32) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > 32 or variant_slot >= state.enum_variant_names.count
+                return SemanticGlobalAuthorityOrigin::constructor_origin(GLOBAL_AUTHORITY_NONE, false) if variant_slot >= state.enum_variant_payload_counts.count or arguments.count != state.enum_variant_payload_counts[variant_slot]
+                payload_start: usize = state.enum_variant_payload_starts[variant_slot]
+                payload_count: usize = state.enum_variant_payload_counts[variant_slot]
+                return SemanticGlobalAuthorityOrigin::constructor_origin(GLOBAL_AUTHORITY_NONE, false) if payload_start > state.enum_variant_payload_names.count or payload_count > state.enum_variant_payload_names.count - payload_start
+                for argument_index in 0..<arguments.count:
+                    label: sview = labels[argument_index] if argument_index < labels.count else sview("", 0, 0)
+                    if label != "":
+                        found: mutable bool = false
+                        for payload_index in payload_start..<payload_start + payload_count:
+                            found <- true if state.enum_variant_payload_names[payload_index] == label
+                        return SemanticGlobalAuthorityOrigin::constructor_origin(GLOBAL_AUTHORITY_NONE, false) if not found
+                origin: mutable usize = GLOBAL_AUTHORITY_NONE
+                for argument in arguments |origin, state| -> origin:
+                    argument_origin: usize = ga_reference_origin(argument, state, depth + 1)
+                    origin <- ga_join_origins(state, origin, argument_origin)
+                return SemanticGlobalAuthorityOrigin::constructor_origin(origin, true)
+
+        # An operand that can only be an integer: literals, the layout builtins, integer
+        # arithmetic over such operands, proven-scalar locals and non-reference types.
+        def ga_integer_valued(expression: Ast::Expr, state: mutable GlobalAuthority&, depth: u32) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if depth > 32
+                match expression:
+                    Expr.IntLit(_, _):
+                        return true
+                    Expr.Paren(inner, _):
+                        return ga_integer_valued(inner, state, depth + 1)
+                    Expr.Call(callee: callee, _):
+                        if callee is Expr.Ident(builtin_name, _):
+                            if builtin_name == "size_of" or builtin_name == "align_of" or builtin_name == "offset_of":
+                                return ga_named_callee_slot(callee, state) >= state.functions.count
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.Star or operator == TokenKind.Slash or operator == TokenKind.Percent or operator == TokenKind.LShift or operator == TokenKind.RShift or operator == TokenKind.Plus or operator == TokenKind.Minus:
+                            return true if ga_integer_valued(left, state, depth + 1) and ga_integer_valued(right, state, depth + 1)
+                    _:
+                        pass
+                if ga_annotation(expression, state, depth + 1) is annotation:
+                    return not ga_type_expression_contains_reference(annotation, state, depth + 1) and ga_expression_type_scope(expression, state, depth + 1) != GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                return false
+
+        # A call result aliases what its callee's summary says it may return. Every
+        # selected overload contributes; an argument-derived summary joins the origins
+        # of all actual arguments (the receiver included), which covers any parameter.
+        def ga_call_result_origin(callee: Ast::Expr, arguments: darray[Ast::Expr], labels: darray[sview], state: mutable GlobalAuthority&, depth: u32) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if depth > 32
+                slot: mutable usize = ga_named_callee_slot(callee, state)
+                method: mutable bool = false
+                actuals: mutable darray[Ast::Expr] = arguments
+                actual_labels: mutable darray[sview] = labels
+                match ga_callable_core(callee):
+                    Expr.Field(receiver, method_name, _):
+                        method <- true
+                        if ga_annotation(receiver, state, depth + 1) is receiver_type:
+                            slot <- ga_resolve_function(method_name, ga_receiver_scope(receiver_type, state), false, state)
+                        actuals <- [receiver]
+                        actual_labels <- [""]
+                        actuals.extend(arguments)
+                        actual_labels.extend(labels)
+                        slot <- ga_select_function(slot, actuals, actual_labels, state, true)
+                    _:
+                        slot <- ga_select_function(slot, actuals, actual_labels, state)
+                # stage0's rule: a returned reference was charged where the callee created
+                # it, so an opaque call result names detached storage, never a global.
+                return GLOBAL_AUTHORITY_LOCAL_ALIAS if slot >= state.functions.count or state.functions[slot] == ""
+                result: mutable usize = GLOBAL_AUTHORITY_NONE
+                found: mutable bool = false
+                while next_candidate < state.functions.count |next_candidate: usize = ga_candidate_head(slot, state), result, found, state|:
+                    candidate: usize = next_candidate
+                    next_candidate <- state.function_next[candidate]
+                    continue if not ga_candidate_selected(candidate, slot, actuals, actual_labels, state, method)
+                    found <- true
+                    # Slots registered after the summary walk (lambdas) have no summary.
+                    if state.summary_walk and state.summary_dependency_rounds and state.summary_function < state.return_origins.count and candidate < state.return_origins.count:
+                        # Record every summary read. A later round need only revisit callers
+                        # whose inputs changed, including newly discovered reads on that walk.
+                        # Duplicate edges are harmless and keep this bookkeeping local:
+                        # no hash callback or additional global authority is introduced.
+                        state.return_dep_callers.push(state.summary_function)
+                        state.return_dep_callees.push(candidate)
+                    summary: mutable usize = state.return_origins[candidate] if candidate < state.return_origins.count else GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                    summary <- GLOBAL_AUTHORITY_LOCAL_ALIAS if summary == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                    if summary == GLOBAL_AUTHORITY_ARGUMENT_RESULT:
+                        for actual in actuals |result, state| -> result:
+                            result <- ga_join_origins(state, result, ga_reference_origin(actual, state, depth + 1))
+                    else:
+                        result <- ga_join_origins(state, result, summary)
+                    return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if result == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                return result if found
+                return GLOBAL_AUTHORITY_LOCAL_ALIAS
+
+        # Fold one `return` into the current function's summary, in callee terms.
+        def ga_record_return_origin(returned: Ast::Expr, state: mutable GlobalAuthority&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                slot: usize = state.summary_function
+                return if slot >= state.return_origin_acc.count or state.lambda_depth != 0
+                origin: usize = ga_reference_origin(returned, state, 0)
+                summary: mutable usize = GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                if origin == GLOBAL_AUTHORITY_NONE or origin < state.globals.count or origin == GLOBAL_AUTHORITY_LOCAL_ALIAS:
+                    summary <- origin
+                elif origin < GLOBAL_AUTHORITY_LOCAL_ALIAS and ga_local_origin_index(origin, state) < state.parameter_limit:
+                    summary <- GLOBAL_AUTHORITY_ARGUMENT_RESULT
+                previous: usize = state.return_origin_acc[slot]
+                if previous == GLOBAL_AUTHORITY_NONE:
+                    state.return_origin_acc[slot] <- summary
+                elif previous != summary and summary != GLOBAL_AUTHORITY_NONE:
+                    state.return_origin_acc[slot] <- GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+
+        # stage0's rule: following a reference stored in a field or element reaches
+        # storage of its own, not the global that held the pointer. Authority is charged
+        # where an alias to a global is created (borrow, store, escape) and where the
+        # holding global itself is read, never again where the stored pointer is followed.
+        def ga_loaded_reference(expression: Ast::Expr, state: GlobalAuthority&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(_, _, _) | Expr.Index(_, _, _) | Expr.IndexN(_, _, _):
+                        type_expression: Ast::Expr = get ga_annotation(expression, state, 0) else return false
+                        loaded_scope: usize = ga_expression_type_scope(expression, state, 0)
+                        return false if loaded_scope == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+                        return ga_reference_type(type_expression, state, 0, loaded_scope)
+                    _:
+                        return false
+
+        # The proved policy join, refined for authority: two different origins that are
+        # each known not to be a global (local roots, detached storage) still name no
+        # global, so the join is detached rather than an unknown alias.
+        def ga_join_origins(state: GlobalAuthority&, left: usize, right: usize) -> usize:
+            joined: usize = SemanticGlobalAuthorityOrigin::join_reference_origins(left, right)
+            return joined if joined != GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+            return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if left == GLOBAL_AUTHORITY_UNKNOWN_ALIAS or right == GLOBAL_AUTHORITY_UNKNOWN_ALIAS
+            return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if left < state.globals.count or right < state.globals.count
+            return GLOBAL_AUTHORITY_LOCAL_ALIAS

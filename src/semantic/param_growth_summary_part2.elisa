@@ -1,0 +1,129 @@
+extend Semantic:
+    public:
+        # The least set fixpoint, computed incrementally. A function's rows depend only on its
+        # own body, the table, and the PRIOR rows of the callees it looks up (recorded in
+        # `looked_up`; the same names every round, since which calls consult the summary is
+        # fixed by the AST and the table). So a round re-summarises only the functions that
+        # looked up a name whose rows changed in the round before, and reuses the others'
+        # rows. Rows are assembled in declaration order and field rows are consumed as sets; a
+        # full re-walk per round gives the same summary relation, though flat order is not
+        # semantically significant. Rewalking every function each round was the costliest part
+        # of check_region_storage_stability.
+        def param_growth_rows(file: Ast::File&, table: SymbolTable&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                rows: mutable darray[sview] = []
+                functions: mutable darray[Ast::Decl] = []
+                pgs_functions(file.top_decls, functions)
+                # The markers-only pass never reads PRIOR. Each function's markers are its
+                # starting rows.
+                no_prior: mutable PgsPrior = PgsPrior{}
+                cache_starts: mutable darray[usize] = []
+                cache_counts: mutable darray[usize] = []
+                cache_starts.reserve(functions.count)
+                cache_counts.reserve(functions.count)
+                for marker_function in functions |rows, cache_starts, cache_counts, no_prior, table|:
+                    if marker_function is Decl.Func(marker_name, marker_params, _, marker_body, _, _, _):
+                        start: usize = rows.count
+                        pgs_function(marker_name, marker_params, marker_body, true, no_prior, table, rows) can Global{Read,Write}
+                        cache_starts.push(start)
+                        cache_counts.push(rows.count - start)
+                # Reverse dependency edges let later rounds schedule only callers whose
+                # summaries changed. The linked lists are keyed by the callee name hash.
+                reverse_heads: mutable dict[u64, u32] = {}
+                reverse_callers: mutable darray[u32] = []
+                reverse_next: mutable darray[u32] = []
+                changed_hashes: mutable darray[u64] = []
+                schedule_marks: mutable darray[u8] = []
+                schedule_marks.reserve(functions.count)
+                for schedule_seed in 0..<functions.count |schedule_marks|:
+                    schedule_marks.push(0)
+                prior: mutable PgsPrior = PgsPrior{}
+                prior <- pgs_index(rows, prior) can Global{Read,Write}
+                for round in 0..<64 |rows, prior, file, table, functions, cache_starts, cache_counts, reverse_heads, reverse_callers, reverse_next, changed_hashes, schedule_marks|:
+                    prior.collect_looked_up <- round == 0
+                    next: mutable darray[sview] = []
+                    next_changed: mutable dict[u64, bool] = {}
+                    next_changed_hashes: mutable darray[u64] = []
+                    next_prior: mutable PgsPrior = PgsPrior{}
+                    # The output contains all previous rows plus any newly discovered rows;
+                    # reserve the old row count as a lower bound before reassembling segments.
+                    next.reserve(rows.count)
+                    next_changed_hashes.reserve(functions.count)
+                    if round != 0:
+                        for changed_hash in changed_hashes |schedule_marks, reverse_heads, reverse_callers, reverse_next, round|:
+                            edge: mutable u32 = head if reverse_heads.get(changed_hash) is head else SYMBOL_INDEX_ROW_NONE
+                            while edge != SYMBOL_INDEX_ROW_NONE |edge, schedule_marks, reverse_callers, reverse_next|:
+                                caller_index: usize = reverse_callers[edge.usize()].usize()
+                                schedule_marks[caller_index] <- round.u8()
+                                edge <- reverse_next[edge.usize()]
+                    has_new_rows: mutable bool = false
+                    for function_index in 0..<functions.count |prior, next, next_changed, next_changed_hashes, schedule_marks, round, functions, cache_starts, cache_counts, reverse_heads, reverse_callers, reverse_next, rows, table, has_new_rows|:
+                        cached_start: usize = cache_starts[function_index]
+                        cached_count: usize = cache_counts[function_index]
+                        recompute: mutable bool = round == 0
+                        recompute <- schedule_marks[function_index] == round.u8() if not recompute
+                        start: usize = next.count
+                        if recompute:
+                            if functions[function_index] is Decl.Func(function_name, function_params, _, function_body, _, _, _):
+                                # Round zero collects dependencies. Reuse that scratch list
+                                # across functions without retaining stale lookups.
+                                prior.looked_up <- prior.looked_up.truncate(0) if round == 0
+                                pgs_function(function_name, function_params, function_body, false, prior, table, next) can Global{Read,Write}
+                                # Lookup sites depend only on this body and the fixed symbol
+                                # table, not on the prior summary values. Round zero visits
+                                # every function, so retain each distinct callee hash once in
+                                # the reverse index.
+                                if round == 0:
+                                    for looked in prior.looked_up |function_index, reverse_heads, reverse_callers, reverse_next|:
+                                        previous_edge: u32 = previous if reverse_heads.get(looked) is previous else SYMBOL_INDEX_ROW_NONE
+                                        # The head is the most recently seen caller for this
+                                        # hash, so repeated probes by this function need no
+                                        # separate dependency-owner map.
+                                        continue if previous_edge != SYMBOL_INDEX_ROW_NONE and reverse_callers[previous_edge.usize()] == function_index.u32()
+                                        edge: u32 = reverse_callers.count.u32()
+                                        reverse_callers.push(function_index.u32())
+                                        reverse_next.push(previous_edge)
+                                        reverse_heads <- reverse_heads.put(looked, edge) can Global{Read,Write}
+                                same_rows: mutable bool = next.count - start == cached_count
+                                for compare_index in 0..<cached_count |same_rows, next, rows, start, cached_start|:
+                                    same_rows <- false if same_rows and next[start + compare_index] != rows[cached_start + compare_index]
+                                if not same_rows:
+                                    # Reused segments are copied from ROWS and are already
+                                    # covered by PRIOR. Only changed segments can add triples.
+                                    if not pgs_segment_rows_covered(next, start, next.count, prior):
+                                        has_new_rows <- true
+                                        function_hash: u64 = name_hash(function_name)
+                                        if next_changed.get(function_hash) is already_changed:
+                                            pass
+                                        else:
+                                            next_changed <- next_changed.put(function_hash, true) can Global{Read,Write}
+                                            next_changed_hashes.push(function_hash)
+                                    else:
+                                        # The relation did not grow, even if this walk
+                                        # produced a different ordering. Reuse the cached
+                                        # encoding so another function's growth in this wave
+                                        # cannot publish a permutation of this segment.
+                                        next <- next.truncate(start)
+                                        for cached_index in 0..<cached_count |next, rows, cached_start|:
+                                            next.push(rows[cached_start + cached_index])
+                        else:
+                            for reuse_index in cached_start..<(cached_start + cached_count) |next, rows|:
+                                next.push(rows[reuse_index])
+                        cache_starts[function_index] <- start
+                        cache_counts[function_index] <- next.count - start
+                    # A round with no new triples reached the same monotone summary set.
+                    # Keep `rows` to preserve its stable declaration and traversal order.
+                    return rows if not has_new_rows
+                    rows <- next
+                    changed_hashes <- next_changed_hashes
+                    # Rebuild once for newly discovered triples and carry the index into the
+                    # next dependency wave.
+                    next_prior <- pgs_index(rows, next_prior) can Global{Read,Write}
+                    prior <- next_prior
+                empty: darray[sview] = []
+                return empty
+
+        # Whether (callee, position) is summarised; its grown fields go to FIELDS.
+        def param_growth_fields(table: SymbolTable&, callee: sview, position: usize, fields: mutable darray[sview]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return pgs_callee_fields_published(callee, position, table, fields) can Global{Read,Write}

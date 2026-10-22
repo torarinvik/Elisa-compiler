@@ -1,0 +1,193 @@
+extend Semantic:
+    private:
+        # Reconstruct one axis from direct observations collected from the current
+        # source. Direct-call subjects are decoded only after their source-path key has
+        # been checked against this snapshot. A malformed fact span falls back to the
+        # established AST walkers.
+        def gp_project_direct_facts[@snapshot_storage, @snapshot_borrow](record_index: usize, authority: GlobalAuthority&, want_write: bool, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, projected_direct: mutable bool&, caller: usize, out_from: mutable darray[usize]&, out_to: mutable darray[usize]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if record_index >= snapshot.functions.count
+                record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                return false if record.direct_fact_start > snapshot.direct_facts.count
+                return false if record.direct_fact_count > snapshot.direct_facts.count - record.direct_fact_start
+                for fact_index in record.direct_fact_start ..< record.direct_fact_start + record.direct_fact_count |snapshot, projected_direct|:
+                    fact: IncrementalDirectFact = snapshot.direct_facts[fact_index]
+                    return false if fact.owner != record_index
+                    if fact.kind == IncrementalFactKind.GlobalRead and not want_write:
+                        projected_direct <- true
+                    elif fact.kind == IncrementalFactKind.GlobalWrite and want_write:
+                        projected_direct <- true
+                    elif fact.kind == IncrementalFactKind.DirectCall:
+                        if incremental_direct_call_name(snapshot, fact) is callee:
+                            # The cold GP walk also reads the callee identifier when
+                            # its spelling names a global (including one nested in a
+                            # module). The collector's root-only name index cannot
+                            # disambiguate that case, so leave it to the AST walker.
+                            for global_name in authority.globals:
+                                return false if global_name == callee
+                            return false if gp_unique_function_slot(callee, authority.module_scope, false, authority) >= authority.functions.count
+                        else:
+                            return false
+                    elif fact.kind == IncrementalFactKind.GlobalRead or fact.kind == IncrementalFactKind.GlobalWrite:
+                        # The opposite Global axis does not affect this projection.
+                        # PanicSite still requires the cold call walker: it may carry
+                        # unknown-call closure edges in addition to Abort.Panic.
+                        pass
+                    else:
+                        return false
+                # Validate the complete record before publishing any call edges. If a
+                # fact is malformed, the caller can still take the AST fallback without
+                # leaving partial edges behind.
+                for fact_index in record.direct_fact_start ..< record.direct_fact_start + record.direct_fact_count |snapshot, out_from, out_to|:
+                    fact: IncrementalDirectFact = snapshot.direct_facts[fact_index]
+                    if fact.kind == IncrementalFactKind.DirectCall:
+                        if incremental_direct_call_name(snapshot, fact) is callee:
+                            out_from.push(caller)
+                            out_to.push(gp_unique_function_slot(callee, authority.module_scope, false, authority))
+                        else:
+                            return false
+                return true
+
+        # One axis (Read or Write) over the whole declaration tree: direct observations
+        # plus the call edges that can carry them. A verified current-source record can
+        # replace the body collectors; the function slot stays present for closure and
+        # row publication. Nested declarations stay cold because facts anchor only direct
+        # top-level functions.
+        def gp_axis_facts[@snapshot_storage, @snapshot_borrow](declarations: darray[Ast::Decl], module_scope: usize, authority: mutable GlobalAuthority&, want_write: bool, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: dict[u64, usize]&, axis_scans_skipped: mutable u64&, use_snapshot_facts: bool, out_names: mutable darray[sview @source]&, out_direct: mutable darray[bool]&, out_from: mutable darray[usize]&, out_to: mutable darray[usize]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |snapshot, offsets, axis_scans_skipped, use_snapshot_facts, out_names, out_direct, out_from, out_to|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            authority.module_scope <- module_scope
+                            caller_slot: usize = out_names.count
+                            out_names.push(name)
+                            projected: mutable bool = false
+                            record_index: mutable usize = snapshot.functions.count
+                            record_index <- incremental_current_body_record_index(line, snapshot, offsets) if use_snapshot_facts
+                            if record_index < snapshot.functions.count:
+                                record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                                if record.cacheable and record.direct_fact_count == 0:
+                                    # No global access or call can occur in this verified
+                                    # zero-fact body, even when it has literal local binds.
+                                    out_direct.push(false)
+                                    axis_scans_skipped <- axis_scans_skipped + 1
+                                    projected <- true
+                                elif record.cacheable and gp_fact_projection_body_safe(body):
+                                    direct: mutable bool = false
+                                    if gp_project_direct_facts(record_index, authority, want_write, snapshot, &direct, caller_slot, out_from, out_to):
+                                        out_direct.push(direct)
+                                        axis_scans_skipped <- axis_scans_skipped + 1
+                                        projected <- true
+                            if not projected:
+                                locals: mutable darray[sview] = []
+                                for parameter in parameters |locals|:
+                                    locals.push(parameter.name)
+                                # The cold walkers now extend this binding stack in
+                                # source order and copy it at branch/scope boundaries.
+                                # A function-wide pre-collection would let a nested local
+                                # hide a same-named global outside its lexical scope.
+                                out_direct.push(gp_body_writes(body, authority, locals, table) if want_write else gp_body_reads(body, authority, locals, table))
+                                call_locals: mutable darray[sview] = []
+                                for parameter in parameters |call_locals|:
+                                    call_locals.push(parameter.name)
+                                gp_body_calls(body, caller_slot, authority, call_locals, out_from, out_to, table)
+                        Decl.Module(module_name, module_body, module_line):
+                            child_scope: usize = ga_module_path(module_scope, module_name, authority)
+                            gp_axis_facts(module_body, child_scope, authority, want_write, snapshot, offsets, axis_scans_skipped, false, out_names, out_direct, out_from, out_to, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            gp_axis_facts(scoped_body, module_scope, authority, want_write, snapshot, offsets, axis_scans_skipped, false, out_names, out_direct, out_from, out_to, table)
+                        _:
+                            pass
+
+        # Close one axis over declaration-slot edges, preserving module identity even
+        # when separate modules export functions with the same spelling. Reverse adjacency
+        # lets each newly-effectful callee visit its callers once instead of rescanning every
+        # edge for every chain hop.
+        def gp_close_axis(direct: mutable darray[bool]&, edge_from: darray[usize]&, edge_to: darray[usize]&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                edge_visits: mutable u64 = 0
+                reverse_heads: mutable darray[usize] = []
+                reverse_heads.reserve(direct.count)
+                for _ in 0..<direct.count |reverse_heads|:
+                    reverse_heads.push(GLOBAL_AUTHORITY_NONE)
+                reverse_next: mutable darray[usize] = []
+                reverse_next.reserve(edge_from.count)
+                for _ in 0..<edge_from.count |reverse_next|:
+                    reverse_next.push(GLOBAL_AUTHORITY_NONE)
+                has_direct_effect: mutable bool = false
+                for effect in direct:
+                    has_direct_effect <- true if effect
+                for edge in 0..<edge_from.count |reverse_heads, reverse_next, edge_visits|:
+                    caller_slot: usize = edge_from[edge]
+                    callee_slot: usize = edge_to[edge]
+                    if caller_slot < direct.count and callee_slot < direct.count:
+                        reverse_next[edge] <- reverse_heads[callee_slot]
+                        reverse_heads[callee_slot] <- edge
+                    elif caller_slot < direct.count and has_direct_effect:
+                        direct[caller_slot] <- true
+                    edge_visits <- edge_visits + 1
+                worklist: mutable darray[usize] = []
+                worklist.reserve(direct.count)
+                for slot in 0..<direct.count |worklist|:
+                    worklist.push(slot) if direct[slot]
+                cursor: mutable usize = 0
+                while cursor < worklist.count |cursor, worklist, direct, edge_visits, reverse_heads, reverse_next|:
+                    callee_slot: usize = worklist[cursor]
+                    cursor <- cursor + 1
+                    edge: mutable usize = reverse_heads[callee_slot]
+                    while edge < edge_from.count |edge, worklist, direct, edge_visits, reverse_next|:
+                        caller_slot: usize = edge_from[edge]
+                        if caller_slot < direct.count and not direct[caller_slot]:
+                            direct[caller_slot] <- true
+                            worklist.push(caller_slot)
+                        edge_visits <- edge_visits + 1
+                        edge <- reverse_next[edge]
+                PhaseTimer::counter("global_permissions:closure_edge_visits", edge_visits) can Global{Read,Write}
+
+        # Register one inferred effect row, keeping the owner/ref arrays parallel and not
+        # duplicating a row the pass already added.
+        def gp_push_source_row(owner: sview @source, effect_ref: sview @source, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- index_effect_source_rows(table) can Global{Read,Write}
+                # The owner's own rows, through the owner chain (was a scan of every row).
+                probe: mutable u32 = effect_source_chain_head(table, owner)
+                while probe != SYMBOL_INDEX_ROW_NONE |probe, table, owner, effect_ref|:
+                    probe_row: usize = probe.usize()
+                    known: bool = table.function_effect_source_owner[probe_row] == owner and probe_row < table.function_effect_source_ref.count and table.function_effect_source_ref[probe_row] == effect_ref
+                    return if known
+                    probe <- table.effect_source_next[probe_row]
+                table.function_effect_source_owner <- table.function_effect_source_owner.push(owner)
+                table.function_effect_source_ref <- table.function_effect_source_ref.push(effect_ref)
+                table <- index_effect_source_rows(table) can Global{Read,Write}
+
+        # Infer the Global family for every function in the file. Runs between
+        # collect_effect_sources and check_ungranted_panic, so the rows are in place
+        # before any call site is judged against them.
+        def check_global_permissions[@snapshot_storage, @snapshot_borrow](file: Ast::File&, table: lmut SymbolTable, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: dict[u64, usize]&, axis_scans_skipped: mutable u64&, use_snapshot_facts: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                authority: mutable GlobalAuthority = GlobalAuthority{parents: [0], modules: [""], module_starts: [0], module_lengths: [0], annotations: file.enum_annotations, generic_lines: file.generic_param_lines, generic_names: file.generic_param_names, module_scope: 0}
+                ga_index_import_annotations(&authority)
+                ga_index_mutable_annotations(&authority) can Global{Read,Write}
+                ga_collect(file.top_decls, 0, &authority, 0, ga_position_value(0, 0, 0, 0, 0, 0)) can Global{Read,Write}
+                return if authority.globals.count == 0
+
+                read_names: mutable darray[sview @source] = []
+                read_direct: mutable darray[bool] = []
+                read_from: mutable darray[usize] = []
+                read_to: mutable darray[usize] = []
+                gp_axis_facts(file.top_decls, 0, &authority, false, snapshot, offsets, axis_scans_skipped, use_snapshot_facts, read_names, read_direct, read_from, read_to, table)
+                gp_close_axis(read_direct, read_from, read_to) can Global{Read,Write}
+
+                write_names: mutable darray[sview @source] = []
+                write_direct: mutable darray[bool] = []
+                write_from: mutable darray[usize] = []
+                write_to: mutable darray[usize] = []
+                gp_axis_facts(file.top_decls, 0, &authority, true, snapshot, offsets, axis_scans_skipped, use_snapshot_facts, write_names, write_direct, write_from, write_to, table)
+                gp_close_axis(write_direct, write_from, write_to) can Global{Read,Write}
+
+                while read_slot < read_names.count |read_slot: usize = 0, table| -> table:
+                    table <- gp_push_source_row(read_names[read_slot], "Global.Read", table) can Global{Read,Write} if read_direct[read_slot]
+                    read_slot <- read_slot + 1
+                while write_slot < write_names.count |write_slot: usize = 0, table| -> table:
+                    table <- gp_push_source_row(write_names[write_slot], "Global.Write", table) can Global{Read,Write} if write_direct[write_slot]
+                    write_slot <- write_slot + 1

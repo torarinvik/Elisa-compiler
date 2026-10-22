@@ -1,0 +1,198 @@
+extend Parser:
+    private:
+        def capture_typestate_postcondition(parser: lmut Parser, function_name: sview @source, params: darray[Ast::ParamDecl]&, function_line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                saved_position: usize = parser.position
+                machine over parser.position while parser.peek() != TokenKind.Newline and parser.peek() != TokenKind.Eof:
+                    state Scan
+                    start Scan
+
+                    Scan, _ if parser.peek() == TokenKind.Ident and parser.header_token_text(0) == "ensures" and parser.peek_at(1) == TokenKind.Return and (parser.peek_at(2) == TokenKind.True or parser.peek_at(2) == TokenKind.False):
+                        parser <- parser.append_ensures_return_bool(function_name, function_line)
+                        parser.position <- parser.position + 1
+                        -> Scan
+
+                    Scan, _ if parser.peek() == TokenKind.Ident and parser.header_token_text(0) == "ensures" and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.FatArrow and parser.peek_at(3) == TokenKind.Ident:
+                        parameter_name: sview = Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length)
+                        state_name: sview = Lexer::text_or_empty(parser.tokens[parser.position + 3], parser.source, parser.source_length)
+                        transition_target: Lexer::Token = parser.tokens[parser.position + 1]
+                        parser <- parser.record_typestate_transition(function_name, parameter_name, state_name, function_line, params, Ast::pos_of_token(transition_target))
+                        parser.position <- parser.position + 1
+                        -> Scan
+
+                    Scan, _ if parser.peek() == TokenKind.Ident and parser.header_token_text(0) == "ensures" and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.FatArrow and parser.peek_at(3) == TokenKind.Bang:
+                        consume_name: sview = Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length)
+                        consume_target: Lexer::Token = parser.tokens[parser.position + 1]
+                        parser <- parser.record_typestate_consume(function_name, consume_name, function_line, params, Ast::pos_of_token(consume_target))
+                        parser.position <- parser.position + 1
+                        -> Scan
+
+                    Scan, _:
+                        parser.position <- parser.position + 1
+                        -> Scan
+                parser.position <- saved_position
+
+
+        # Consume the trailing signature clauses of a function signature line, capturing
+        # effect-grant names and returning them. Effect grants (`can[...]` / bare
+        # `can E1, E2`) are structured; error sets (`raises …`) and contracts
+        # (`requires`/`ensures`) are consumed without modeling. Bracket/paren depth is
+        # tracked so a clause expression's inner `:`/newline never ends the loop early;
+        # the loop stops at the top-level block `:` or the line break.
+        def is_signature_clause_head(text: sview) -> bool:
+            return when text:
+                "can" | "requires" | "require" | "ensures" | "ensure" | "fulfills" | "changes" | "preserves" | "decreases" | "invariant" | "uses" | "raises" | "where" | "at" | "abi" -> true
+                _ -> false
+
+        def parse_signature_clauses(parser: lmut Parser, effects: mutable darray[sview]&) -> void:
+            # Reset the per-signature error-set flag; set below if a top-level `error[...]`
+            # return set is consumed. function_declaration reads it after this call.
+            parser.signature_has_error_set <- false
+            parser.signature_effect_clause_present <- false
+            parser.signature_error_set_name <- sview("", 0, 0)
+            parser.captured_contract_kinds <- parser.captured_contract_kinds.truncate(0)
+            parser.captured_contract_exprs <- parser.captured_contract_exprs.truncate(0)
+            parser.pending_fulfills <- parser.pending_fulfills.truncate(0)
+            parser.pending_fulfills_is_subject <- parser.pending_fulfills_is_subject.truncate(0)
+            parser.pending_fulfills_is_law <- parser.pending_fulfills_is_law.truncate(0)
+            depth: mutable int = 0
+            while parser.peek() != TokenKind.Eof |parser, depth|:
+                kind: TokenKind = parser.peek()
+                current_token: Token = parser.cursor()
+                # Stop at the block `:`, the line break, or a top-level `=` — the
+                # `=` opens an expression-bodied function (`-> T = EXPR`), which
+                # function_declaration consumes; it must not be eaten as a signature clause.
+                break if depth == 0 and (kind == TokenKind.Colon or kind == TokenKind.Newline or kind == TokenKind.Assign)
+                # Reuse the canonical trailing-`can` consumer so a bare `can E1, E2`
+                # after `)` (no return type) is captured with the same rules.
+                is_can_clause: bool = depth == 0 and kind == TokenKind.Ident and Lexer::text_or_empty(current_token, parser.source, parser.source_length) == "can"
+                parser <- parser.consume_signature_can_clause(effects) can Global{Read,Write} if is_can_clause
+                continue if is_can_clause
+                # `requires PRED` / `ensures PRED`: capture the predicate into the per-signature
+                # buffer (drained to the file side-channel by function_declaration).
+                clause_text: sview = Lexer::text_or_empty(current_token, parser.source, parser.source_length) if depth == 0 and kind == TokenKind.Ident else sview("", 0, 0)
+                clause_keyword: bool = when clause_text:
+                    "requires" | "ensures" | "ensure" | "require" -> true
+                    _ -> false
+                # The conditional-progress form `ensures return COND` is not a plain contract
+                # expression — leave it to the token-skip so contract_expression doesn't choke.
+                is_contract_clause: bool = clause_keyword and parser.peek_at(1) != TokenKind.Return
+                parser <- parser.capture_signature_contract(clause_text) can Global{Read,Write} if is_contract_clause
+                continue if is_contract_clause
+                # `-> T error[E]` (or a bare `error[E]` after `)`): the declared error
+                # return set. Its structure isn't modeled, but its PRESENCE exempts the
+                # function from RaiseWithoutErrorSet. The following `[...]` is consumed by
+                # the depth tracking on subsequent iterations.
+                parser.signature_has_error_set <- true if depth == 0 and kind == TokenKind.Error
+                # ...and the SET NAME, when the clause is the plain `error[Ident]` form. The
+                # backend needs it to pick the set's ABI (payload-carrying -> struct return,
+                # fieldless -> i32). Anything else leaves "" and the backend keeps i32.
+                names_error_set: bool = depth == 0 and kind == TokenKind.Error and parser.peek_at(1) == TokenKind.LBracket and parser.peek_at(2) == TokenKind.Ident
+                parser.signature_error_set_name <- parser.signature_error_set_tail(2, 0) if names_error_set
+                # `fulfills SUBJECT is PROTOCOL` where PROTOCOL is a whole-function constraint
+                # (NoBoundsChecks/Vectorizes) is malformed — those must be written `fulfills
+                # PROTOCOL`. Record (subject, protocol) under FULFILLS_WHOLE_FUNCTION_ROW.
+                fulfills_shape: bool = depth == 0 and clause_text == "fulfills" and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.Is and parser.peek_at(3) == TokenKind.Ident
+                fulfills_protocol: sview = Lexer::text_or_empty(parser.tokens[parser.position + 3], parser.source, parser.source_length) if fulfills_shape else sview("", 0, 0)
+                fulfills_whole_fn: bool = when fulfills_protocol:
+                    "NoBoundsChecks" | "Vectorizes" -> true
+                    _ -> false
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length), name: fulfills_protocol, line: FULFILLS_WHOLE_FUNCTION_ROW}) if fulfills_whole_fn
+                # Any `fulfills SUBJECT is PROTOCOL` — recorded under FULFILLS_SUBJECT_PROTOCOL_ROW so the
+                # effect-law check can flag an effect law wrongly written with a subject.
+                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length), name: fulfills_protocol, line: FULFILLS_SUBJECT_PROTOCOL_ROW}) if fulfills_shape
+                # ...and buffered as (subject, law) pairs for the frame-law conformance check
+                # (drained by function_declaration with the owning function name).
+                parser.pending_fulfills_is_subject <- parser.pending_fulfills_is_subject.push(Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length)) if fulfills_shape
+                parser.pending_fulfills_is_law <- parser.pending_fulfills_is_law.push(fulfills_protocol) if fulfills_shape
+                # A plain `fulfills LawName` (a bare law name, not the `SUBJECT is PROTOCOL`
+                # frame form) — record the law name for the effect-law fulfillment check.
+                plain_fulfills: bool = depth == 0 and clause_text == "fulfills" and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) != TokenKind.Is
+                parser.pending_fulfills <- parser.pending_fulfills.push(Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length)) if plain_fulfills
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket
+                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket
+                parser, _ <- parser.advance()
+            # A damaged signature can leave the bracket depth open and otherwise run
+            # recovery across subsequent declarations. That used to turn a malformed
+            # `error[Family...` return clause into a body-less function whose error ABI
+            # disagreed with its default `ret i32 0`, producing invalid LLVM instead of
+            # the syntax diagnostic stage0 gives. Report the missing closer at EOF while
+            # the parser still owns this signature's recovery state.
+            parser <- parser.error_at(Ast::ParseErrorKind.ExpectedToken, parser.cursor()) if depth > 0
+
+
+        # The error set NAMED by an `error[...]` return clause: the LAST segment of a `::`
+        # path. `error[Backend::SceneError]` names SceneError, not Backend.
+        #
+        # This clause is scanned token by token above, and reading only the token after `[`
+        # dropped the member: a nested module's qualified spelling came out as
+        # `error[Backend]`, so the backend picked the error ABI of a set that does not
+        # exist and `try` refused to propagate ("cannot propagate Backend from a function
+        # returning SceneError"). Measured against stage0, which accepts the qualified
+        # spelling -- and from inside a nested module accepts ONLY that spelling, so
+        # writing the bare name there is not a workaround but a second divergence.
+        #
+        # An error set is registered under its bare name, so the tail is what the rest of
+        # the compiler matches on. `peek_at` is the bounds-safe cursor; the raw
+        # `scan_token_*` helpers are not, and this walks off the end of a clause by design.
+        def signature_error_set_tail(parser: Parser&, offset: usize, depth: u32) -> sview:
+            qualified: bool = parser.peek_at(offset + 1) == TokenKind.Scope and parser.peek_at(offset + 2) == TokenKind.Ident
+            return Lexer::text_or_empty(parser.tokens[parser.position + offset], parser.source, parser.source_length) if depth > 8 or not qualified
+            return parser.signature_error_set_tail(offset + 2, depth + 1)
+
+
+        # Consume a signature `requires`/`ensures` keyword plus its predicate into the
+        # per-signature capture buffer (normalized kind "requires"/"ensure").
+        def capture_signature_contract(parser: lmut Parser, clause_text: sview) -> void:
+            parser, _ <- parser.advance()                                   # the keyword
+            normalized_kind: sview = when clause_text:
+                "requires" | "require" -> "requires"
+                _ -> "ensure"
+            rebind predicate: Ast::Expr, parser = parser.contract_expression() can Global{Read,Write}
+            parser.captured_contract_kinds <- parser.captured_contract_kinds.push(normalized_kind)
+            parser.captured_contract_exprs <- parser.captured_contract_exprs.push(predicate)
+
+        # Read a dotted identifier path (`Family` or `Family.Member`) starting at the
+        # current Ident and return its whole-span source text.
+        def parse_dotted_name(parser: lmut Parser, allow_scope: bool = false) -> sview:
+            start_token: Token = parser.cursor()
+            start: usize = start_token.start.usize()
+            parser, _ <- parser.advance()                              # first Ident
+            initial_end: usize = (start_token.start + start_token.length).usize()
+            machine over parser.position while true:
+                state Scan(end: usize)
+                start Scan(initial_end)
+
+                Scan(end), _ if (parser.peek() != TokenKind.Dot and (not allow_scope or parser.peek() != TokenKind.Scope)) or parser.peek_at(1) != TokenKind.Ident:
+                    return parser.span_view(start, end)
+
+                Scan(end), _:
+                    parser.position <- parser.position + 1
+                    rebind member: Token, parser = parser.advance()
+                    -> Scan((member.start + member.length).usize())
+            return parser.span_view(start, initial_end)
+
+
+        def record_generic_struct_metadata(parser: lmut Parser, declaration: Ast::Decl, name: sview @source, line: u32) -> void:
+            return if not parser.has_generic_parameter_line(line)
+            parser.generic_struct_decls <- parser.generic_struct_decls.push(declaration)
+            parser.generic_struct_decl_names <- parser.generic_struct_decl_names.push(name)
+            # Pushed in the same breath as the name: the two are index-parallel, and
+            # desynchronising them is an out-of-bounds read, not a wrong answer.
+            parser.generic_struct_decl_owners <- parser.generic_struct_decl_owners.push(parser.current_module)
+            parser.generic_struct_decl_lines <- parser.generic_struct_decl_lines.push(line)
+
+        def has_generic_parameter_line(parser: Parser&, line: u32) -> bool:
+            machine over parser.position:
+                state Scan(index: usize)
+                start Scan(0)
+
+                Scan(index), _ if index >= parser.generic_param_lines.count:
+                    return false
+
+                Scan(index), _ if parser.generic_param_lines[index] < GENERIC_PARAM_BOUND_FLAG and parser.generic_param_lines[index] == line:
+                    return true
+
+                Scan(index), _:
+                    -> Scan(index + 1)
+            return false

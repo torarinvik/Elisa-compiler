@@ -1,0 +1,477 @@
+extend Semantic:
+    private:
+        # A match-expression arm may compute its value through a local alias (`copied =
+        # load(); copied`). Analyze those statements in an arm-local snapshot before reading
+        # the final expression, so its source family is available without escaping the arm.
+        def try_noncall_block_source_facts(statements: darray[Ast::Stmt], params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&, annotations: darray[Ast::EnumAnnotation]&, block_value: Ast::Expr? = null) -> (family: sview @source, known_nonfallible: bool):
+            can Memory.Allocate, Abort.Panic:
+                return ("", false) if try_noncall_block_terminates(statements)
+                arm_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
+                last_facts: mutable (family: sview @source, known_nonfallible: bool) = ("", false)
+                for statement in statements |arm_environment, params, annotations, last_facts|:
+                    match statement:
+                        Stmt.VarDecl(name, type_expression, value, position):
+                            declared_family: mutable sview @source = try_noncall_local_error_family(annotations, position.offset)
+                            source_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(value, params, arm_environment, annotations)
+                            payload_facts: (family: sview @source, known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_assignment_catch_payload_facts(value, params, arm_environment, annotations)
+                            declared_type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(type_expression, arm_environment)
+                            declared_known_nonfallible: mutable bool = declared_type_facts.known_nonfallible
+                            declared_numeric: mutable bool = declared_type_facts.numeric
+                            declared_integer: mutable bool = declared_type_facts.integer
+                            if declared_family == "" and type_expression is Expr.Absent:
+                                declared_family <- source_facts.family
+                                declared_known_nonfallible <- source_facts.known_nonfallible
+                                declared_numeric <- try_noncall_numeric_value(value, params, arm_environment)
+                                declared_integer <- try_noncall_integer_value(value, params, arm_environment)
+                            try_noncall_family_bind(&arm_environment, name, declared_family, declared_known_nonfallible, declared_numeric, declared_integer, payload_facts.family, payload_facts.known_nonfallible, payload_facts.numeric, payload_facts.integer)
+                        Stmt.Assign(target, operator, value, position) if operator == TokenKind.Assign:
+                            source_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(arm_environment)
+                            assignment_updates: mutable TryNonCallAssignmentUpdates = TryNonCallAssignmentUpdates{}
+                            try_noncall_collect_assignment_targets(target, value, "", params, &assignment_updates, source_environment, annotations, position.line)
+                            try_noncall_apply_assignment_updates(assignment_updates, &arm_environment)
+                        Stmt.Expr(value, _):
+                            last_facts <- try_noncall_assignment_source_facts(value, params, arm_environment, annotations)
+                        _:
+                            last_facts <- ("", false)
+                return try_noncall_assignment_source_facts(present_block_value, params, arm_environment, annotations) if block_value is present_block_value
+                return last_facts if statements.count > 0 and statements[statements.count - 1] is Stmt.Expr(_, _)
+                return ("", false)
+
+        # Names introduced by a successful `is`/`as` test are visible only on the true
+        # path, and the right operand of `and` sees bindings from its left operand.
+        # `or` contributes only names bound by both alternatives; negation contributes
+        # none. Keep this syntactic and conservative, matching resolve_flow's scope rules.
+        def try_noncall_pattern_expression_binds_name(expression: Ast::Expr, candidate: sview) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name == candidate
+                    Expr.Paren(inner, _):
+                        return try_noncall_pattern_expression_binds_name(inner, candidate)
+                    Expr.Call(_, arguments, _, _):
+                        for argument in arguments:
+                            return true if try_noncall_pattern_expression_binds_name(argument, candidate)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements:
+                            return true if try_noncall_pattern_expression_binds_name(element, candidate)
+                    Expr.Construct(_, fields, _):
+                        for field in fields:
+                            return true if try_noncall_pattern_expression_binds_name(field.value, candidate)
+                    _:
+                        pass
+                return false
+
+        def try_noncall_expression_is_try_fallback(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&) -> bool:
+            can Abort.Panic:
+                position: Ast::Pos = Ast::expr_pos(expression)
+                return any annotation in annotations where annotation.owner == "__try_fallback_expression" and annotation.line == position.line and annotation.offset == position.offset
+
+        def try_noncall_variant_alias_binds_name(condition: Ast::Expr, candidate: sview, annotations: darray[Ast::EnumAnnotation]&) -> bool:
+            can Abort.Panic:
+                match condition:
+                    Expr.Binary(_, TokenKind.Is, Expr.Field(_, _, variant_line), _):
+                        return any annotation in annotations where annotation.owner == candidate and annotation.name == "__is_variant_alias" and annotation.line == variant_line.line
+                    _:
+                        return false
+
+        def try_noncall_truthy_condition_binds_name(condition: Ast::Expr, candidate: sview, annotations: darray[Ast::EnumAnnotation]&) -> bool:
+            can Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        return try_noncall_truthy_condition_binds_name(inner, candidate, annotations)
+                    Expr.Binary(left, operator, right, _):
+                        match operator:
+                            TokenKind.And:
+                                return try_noncall_truthy_condition_binds_name(left, candidate, annotations) or try_noncall_truthy_condition_binds_name(right, candidate, annotations)
+                            TokenKind.Or:
+                                return try_noncall_truthy_condition_binds_name(left, candidate, annotations) and try_noncall_truthy_condition_binds_name(right, candidate, annotations)
+                            TokenKind.Is:
+                                return try_noncall_pattern_expression_binds_name(right, candidate) or try_noncall_variant_alias_binds_name(condition, candidate, annotations)
+                            TokenKind.As:
+                                return try_noncall_pattern_expression_binds_name(right, candidate)
+                            _:
+                                pass
+                    _:
+                        pass
+                return false
+
+        def try_noncall_sequence_element_type_name(type_expression: Ast::Expr) -> sview @source:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Unary(operator, inner, _) if operator in {TokenKind.Mutable, TokenKind.Ampersand, TokenKind.Static, TokenKind.Heap, TokenKind.Stack, TokenKind.Tail}:
+                        return try_noncall_sequence_element_type_name(inner)
+                    Expr.Paren(inner, _):
+                        return try_noncall_sequence_element_type_name(inner)
+                    Expr.Index(head, element, _):
+                        if head is Expr.Ident(container, _) and container in {"darray", "view"}:
+                            return ident_name_of(element)
+                    _:
+                        pass
+                return ""
+
+        def try_noncall_parameter_sequence_element_type_name(expression: Ast::Expr, params: darray[Ast::ParamDecl]) -> sview @source:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        for parameter in params:
+                            if parameter.name == name:
+                                return try_noncall_sequence_element_type_name(parameter.type_expression)
+                    Expr.Paren(inner, _):
+                        return try_noncall_parameter_sequence_element_type_name(inner, params)
+                    _:
+                        pass
+                return ""
+
+        def try_noncall_condition_binding_facts(condition: Ast::Expr, candidate: sview, params: darray[Ast::ParamDecl], annotations: darray[Ast::EnumAnnotation]&) -> (known_nonfallible: bool, numeric: bool, integer: bool):
+            can Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        return try_noncall_condition_binding_facts(inner, candidate, params, annotations)
+                    Expr.Binary(left, TokenKind.And, right, _):
+                        return try_noncall_condition_binding_facts(left, candidate, params, annotations) if try_noncall_truthy_condition_binds_name(left, candidate, annotations)
+                        return try_noncall_condition_binding_facts(right, candidate, params, annotations)
+                    Expr.Binary(left, TokenKind.Or, right, _):
+                        return (false, false, false) if not try_noncall_truthy_condition_binds_name(left, candidate, annotations) or not try_noncall_truthy_condition_binds_name(right, candidate, annotations)
+                        left_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(left, candidate, params, annotations)
+                        right_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_condition_binding_facts(right, candidate, params, annotations)
+                        return left_facts if left_facts.known_nonfallible == right_facts.known_nonfallible and left_facts.numeric == right_facts.numeric and left_facts.integer == right_facts.integer
+                    Expr.Binary(left, operator, right, _) if operator in {TokenKind.Is, TokenKind.As}:
+                        return (false, false, false) if not try_noncall_pattern_expression_binds_name(right, candidate)
+                        match right:
+                            Expr.Array(_, _):
+                                element_type: sview @source = try_noncall_parameter_sequence_element_type_name(left, params)
+                                return try_noncall_type_name_facts(element_type) if element_type != ""
+                            _:
+                                pass
+                    _:
+                        pass
+                return (false, false, false)
+
+        def try_noncall_local_error_family(annotations: darray[Ast::EnumAnnotation]&, declaration_offset: u32) -> sview @source:
+            can Abort.Panic:
+                family: mutable sview @source = ""
+                count: mutable usize = 0
+                for candidate in annotations |family, count, declaration_offset|:
+                    if candidate.owner == "__local_error_union" and candidate.offset == declaration_offset:
+                        family <- candidate.name
+                        count <- count + 1.usize()
+                return family if count == 1
+                return ""
+
+        def try_noncall_lambda_error_family(annotations: darray[Ast::EnumAnnotation]&, lambda_offset: u32) -> sview @source:
+            can Abort.Panic:
+                family: mutable sview @source = ""
+                count: mutable usize = 0
+                for annotation in annotations |family, count, lambda_offset|:
+                    if annotation.owner == "__fn_error_union" and annotation.offset == lambda_offset:
+                        family <- annotation.name
+                        count <- count + 1.usize()
+                return family if count == 1
+                return ""
+
+        # Keep these sets aligned with resolve_types and scalar codegen. The parser's
+        # lexical iN/uN policy is broader, but i128/u128 are not lowered, and uint/byte
+        # are not recognized scalar names; treating them as numeric here would be unsound.
+        def try_noncall_numeric_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return name in {"i8", "i16", "i32", "i64", "int", "isize", "u8", "u16", "u32", "u64", "usize", "uintptr", "f32", "f64", "char"}
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Mutable or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail:
+                        return try_noncall_numeric_type(inner)
+                    Expr.Paren(inner, _):
+                        return try_noncall_numeric_type(inner)
+                    _:
+                        return false
+
+        def try_noncall_integer_type(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return name in {"i8", "i16", "i32", "i64", "int", "isize", "u8", "u16", "u32", "u64", "usize", "uintptr"}
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Mutable or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail:
+                        return try_noncall_integer_type(inner)
+                    Expr.Paren(inner, _):
+                        return try_noncall_integer_type(inner)
+                    _:
+                        return false
+
+        def try_noncall_numeric_value(expression: Ast::Expr, params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.CharLit(_, _):
+                        return true
+                    Expr.Paren(inner, _):
+                        return try_noncall_numeric_value(inner, params, environment)
+                    Expr.Unary(TokenKind.Minus, inner, _) | Expr.Unary(TokenKind.Plus, inner, _):
+                        return try_noncall_numeric_value(inner, params, environment)
+                    Expr.Binary(left, operator, right, _) if operator in {TokenKind.Plus, TokenKind.Minus, TokenKind.Star, TokenKind.Slash, TokenKind.Percent}:
+                        return try_noncall_numeric_value(left, params, environment) and try_noncall_numeric_value(right, params, environment)
+                    Expr.Ident(name, _):
+                        index: usize = try_noncall_family_index(environment, name)
+                        return try_noncall_family_known_numeric(environment, name) if index < environment.names.count
+                        for parameter in params:
+                            if parameter.name == name:
+                                parameter_type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(parameter.type_expression, environment)
+                                return parameter_type_facts.numeric
+                    Expr.Call(callee, _, _, _):
+                        callee_name: sview @source = try_noncall_unqualified_callable_name(callee)
+                        callee_qualifier: sview @source = try_noncall_callable_qualifier(callee)
+                        call_facts: (known: bool, family: sview @source, numeric: bool, integer: bool, return_nonfallible: bool, ambiguous: bool, generic_formal_name: sview @source, generic_formal_index: usize) = try_noncall_callable_cached_facts(callee_name, callee_qualifier, callee, environment)
+                        return call_facts.numeric if call_facts.known and call_facts.family == ""
+                    Expr.Catch(guarded, arms, _):
+                        catch_facts: (numeric: bool, integer: bool) = try_noncall_catch_result_facts(guarded, arms, params, environment)
+                        return catch_facts.numeric
+                    _:
+                        pass
+                return false
+
+        def try_noncall_integer_value(expression: Ast::Expr, params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(_, _):
+                        return true
+                    Expr.Paren(inner, _):
+                        return try_noncall_integer_value(inner, params, environment)
+                    Expr.Unary(TokenKind.Minus, inner, _) | Expr.Unary(TokenKind.Plus, inner, _):
+                        return try_noncall_integer_value(inner, params, environment)
+                    Expr.Binary(left, operator, right, _) if operator in {TokenKind.Plus, TokenKind.Minus, TokenKind.Star, TokenKind.Slash, TokenKind.Percent, TokenKind.Ampersand, TokenKind.Pipe, TokenKind.Caret, TokenKind.LShift, TokenKind.RShift}:
+                        return try_noncall_integer_value(left, params, environment) and try_noncall_integer_value(right, params, environment)
+                    Expr.Ident(name, _):
+                        index: usize = try_noncall_family_index(environment, name)
+                        return environment.integer[index] if index < environment.names.count
+                        for parameter in params:
+                            if parameter.name == name:
+                                parameter_type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(parameter.type_expression, environment)
+                                return parameter_type_facts.integer
+                    Expr.Call(callee, _, _, _):
+                        callee_name: sview @source = try_noncall_unqualified_callable_name(callee)
+                        callee_qualifier: sview @source = try_noncall_callable_qualifier(callee)
+                        call_facts: (known: bool, family: sview @source, numeric: bool, integer: bool, return_nonfallible: bool, ambiguous: bool, generic_formal_name: sview @source, generic_formal_index: usize) = try_noncall_callable_cached_facts(callee_name, callee_qualifier, callee, environment)
+                        return call_facts.integer if call_facts.known and call_facts.family == ""
+                    Expr.Catch(guarded, arms, _):
+                        catch_facts: (numeric: bool, integer: bool) = try_noncall_catch_result_facts(guarded, arms, params, environment)
+                        return catch_facts.integer
+                    _:
+                        pass
+                return false
+
+        def try_noncall_catch_cached_payload_facts(expression: Ast::Expr, environment: TryNonCallErrorFamilyEnv&) -> (known: bool, numeric: bool, integer: bool):
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        index: usize = try_noncall_family_index(environment, name)
+                        if index < environment.names.count and environment.families[index] != "":
+                            return (environment.numeric[index] or environment.integer[index], environment.numeric[index], environment.integer[index])
+                    Expr.Call(callee, _, _, _):
+                        callee_name: sview @source = try_noncall_unqualified_callable_name(callee)
+                        callee_qualifier: sview @source = try_noncall_callable_qualifier(callee)
+                        call_facts: (known: bool, family: sview @source, numeric: bool, integer: bool, return_nonfallible: bool, ambiguous: bool, generic_formal_name: sview @source, generic_formal_index: usize) = try_noncall_callable_cached_facts(callee_name, callee_qualifier, callee, environment)
+                        return (call_facts.return_nonfallible, call_facts.numeric, call_facts.integer) if call_facts.known and call_facts.family != ""
+                    Expr.Paren(inner, _):
+                        return try_noncall_catch_cached_payload_facts(inner, environment)
+                    _:
+                        pass
+                return (false, false, false)
+
+        def try_noncall_catch_result_facts(guarded: Ast::Expr, arms: darray[Ast::MatchArm], params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&) -> (numeric: bool, integer: bool):
+            can Memory.Allocate, Abort.Panic:
+                payload_facts: (known: bool, numeric: bool, integer: bool) = try_noncall_catch_cached_payload_facts(guarded, environment)
+                all_numeric: mutable bool = true
+                all_integer: mutable bool = true
+                has_continuing_arm: mutable bool = false
+                arm_index: mutable usize = 0.usize()
+                for arm in arms |all_numeric, all_integer, has_continuing_arm, payload_facts, arm_index, params, environment|:
+                    if try_noncall_guard_is_definitely_false(arm.guard) or try_noncall_expression_aborts(arm.guard):
+                        arm_index <- arm_index + 1.usize()
+                        continue
+                    arm_environment: mutable TryNonCallErrorFamilyEnv = try_noncall_family_clone(environment)
+                    arm_binders: mutable darray[sview @source] = []
+                    try_noncall_gather_catch_arm_pattern(arm.pattern, arm_index, arm_binders)
+                    for arm_binder in arm_binders |arm_environment, arm, payload_facts|:
+                        if arm_index == 0.usize() and arm.pattern is Pattern.Binding(success_name) and success_name == arm_binder and payload_facts.known:
+                            try_noncall_family_bind(&arm_environment, arm_binder, "", payload_facts.known, payload_facts.numeric, payload_facts.integer)
+                        else:
+                            try_noncall_family_bind(&arm_environment, arm_binder, "")
+                    arm_result: mutable Ast::Expr = Ast::Expr.Invalid
+                    arm_continues: mutable bool = true
+                    for statement in arm.body |arm_environment, params, arm_result, arm_continues|:
+                        match statement:
+                            Stmt.VarDecl(name, type_expression, value, _):
+                                type_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_type_facts_with_aliases(type_expression, arm_environment)
+                                local_numeric: bool = type_facts.numeric if type_facts.known_nonfallible else try_noncall_numeric_value(value, params, arm_environment)
+                                local_integer: bool = type_facts.integer if type_facts.known_nonfallible else try_noncall_integer_value(value, params, arm_environment)
+                                try_noncall_family_bind(&arm_environment, name, "", local_numeric or local_integer, local_numeric, local_integer)
+                                arm_result <- Ast::Expr.Invalid
+                            Stmt.Assign(target, operator, value, _):
+                                match target:
+                                    Expr.Ident(name, _) if operator == TokenKind.Assign:
+                                        local_numeric: bool = try_noncall_numeric_value(value, params, arm_environment)
+                                        local_integer: bool = try_noncall_integer_value(value, params, arm_environment)
+                                        try_noncall_family_bind(&arm_environment, name, "", local_numeric or local_integer, local_numeric, local_integer)
+                                    _:
+                                        pass
+                                arm_result <- Ast::Expr.Invalid
+                            Stmt.Expr(value, _):
+                                arm_result <- value
+                            Stmt.Return(value, _):
+                                arm_result <- Ast::Expr.Invalid
+                                arm_continues <- false
+                            _:
+                                arm_result <- Ast::Expr.Invalid
+                    if arm_continues:
+                        has_continuing_arm <- true
+                        all_numeric <- false if arm_result is Ast::Expr.Invalid or not try_noncall_numeric_value(arm_result, params, arm_environment)
+                        all_integer <- false if arm_result is Ast::Expr.Invalid or not try_noncall_integer_value(arm_result, params, arm_environment)
+                    arm_index <- arm_index + 1.usize()
+                return (has_continuing_arm and all_numeric, has_continuing_arm and all_integer)
+
+        def try_noncall_collect_unknown_assignment_target(target: Ast::Expr, candidate: sview, updates: mutable TryNonCallAssignmentUpdates&, source_environment: TryNonCallErrorFamilyEnv&, annotations: darray[Ast::EnumAnnotation]&, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, _) if name != candidate:
+                        source_index: usize = try_noncall_family_index(source_environment, name)
+                        preserve_existing: bool = try_noncall_rebind_claimed_target(annotations, line, name) and source_index < source_environment.names.count
+                        if preserve_existing:
+                            try_noncall_assignment_update_add(updates, name, source_environment.families[source_index], source_environment.known_nonfallible[source_index], source_environment.origins[source_index], source_environment.numeric[source_index], source_environment.integer[source_index], source_environment.catch_payload_families[source_index], source_environment.catch_payload_known_nonfallible[source_index], source_environment.catch_payload_numeric[source_index], source_environment.catch_payload_integer[source_index])
+                        else:
+                            try_noncall_assignment_update_add(updates, name, "", false, source_environment.names.count + updates.names.count, false, false)
+                    Expr.Paren(inner, _):
+                        try_noncall_collect_unknown_assignment_target(inner, candidate, updates, source_environment, annotations, line)
+                    Expr.Tuple(targets, _) | Expr.Array(targets, _):
+                        for element in targets:
+                            try_noncall_collect_unknown_assignment_target(element, candidate, updates, source_environment, annotations, line)
+                    _:
+                        pass
+
+        # Update ordinary assignment facts for every lexical target. The candidate-specific
+        # path below also tracks shadow/family diagnostics; these sibling bindings still need
+        # fresh numeric and family facts so a later alias cannot inherit a stale type.
+        def try_noncall_collect_assignment_targets(target: Ast::Expr, value: Ast::Expr, candidate: sview, params: darray[Ast::ParamDecl], updates: mutable TryNonCallAssignmentUpdates&, source_environment: TryNonCallErrorFamilyEnv&, annotations: darray[Ast::EnumAnnotation]&, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, _) if name != candidate:
+                        source_index: usize = try_noncall_family_index(source_environment, name)
+                        preserve_existing: bool = try_noncall_rebind_claimed_target(annotations, line, name) and source_index < source_environment.names.count
+                        if preserve_existing:
+                            try_noncall_assignment_update_add(updates, name, source_environment.families[source_index], source_environment.known_nonfallible[source_index], source_environment.origins[source_index], source_environment.numeric[source_index], source_environment.integer[source_index], source_environment.catch_payload_families[source_index], source_environment.catch_payload_known_nonfallible[source_index], source_environment.catch_payload_numeric[source_index], source_environment.catch_payload_integer[source_index])
+                        else:
+                            # Read every RHS against the pre-assignment snapshot. Elisa
+                            # destructuring evaluates its values before storing any target.
+                            source_facts: (family: sview @source, known_nonfallible: bool) = try_noncall_assignment_source_facts(value, params, source_environment, annotations)
+                            payload_facts: (family: sview @source, known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_assignment_catch_payload_facts(value, params, source_environment, annotations)
+                            assigned_numeric: bool = try_noncall_numeric_value(value, params, source_environment)
+                            assigned_integer: bool = try_noncall_integer_value(value, params, source_environment)
+                            assigned_origin: usize = source_environment.names.count + updates.names.count
+                            try_noncall_assignment_update_add(updates, name, source_facts.family, source_facts.known_nonfallible, assigned_origin, assigned_numeric, assigned_integer, payload_facts.family, payload_facts.known_nonfallible, payload_facts.numeric, payload_facts.integer)
+                    Expr.Paren(inner, _):
+                        try_noncall_collect_assignment_targets(inner, value, candidate, params, updates, source_environment, annotations, line)
+                    Expr.Tuple(targets, _) | Expr.Array(targets, _):
+                        match value:
+                            Expr.Tuple(values, _) | Expr.Array(values, _):
+                                if targets.count == values.count:
+                                    for index in 0..<targets.count:
+                                        try_noncall_collect_assignment_targets(targets[index], values[index], candidate, params, updates, source_environment, annotations, line)
+                                else:
+                                    try_noncall_collect_unknown_assignment_target(target, candidate, updates, source_environment, annotations, line)
+                            _:
+                                try_noncall_collect_unknown_assignment_target(target, candidate, updates, source_environment, annotations, line)
+                    _:
+                        pass
+
+        # Apply only after the source-fact pass has returned, so no annotation or
+        # snapshot borrow flows into the mutable destination environment.
+        def try_noncall_apply_assignment_updates(updates: TryNonCallAssignmentUpdates, environment: mutable TryNonCallErrorFamilyEnv&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                environment.names.extend(updates.names)
+                environment.families.extend(updates.families)
+                environment.catch_payload_families.extend(updates.catch_payload_families)
+                for index in 0..<updates.names.count |environment, updates|:
+                    environment.catch_payload_known_nonfallible.push(updates.catch_payload_known_nonfallible[index])
+                    environment.catch_payload_numeric.push(updates.catch_payload_numeric[index])
+                    environment.catch_payload_integer.push(updates.catch_payload_integer[index])
+                    environment.known_nonfallible.push(updates.known_nonfallible[index])
+                    environment.numeric.push(updates.numeric[index])
+                    environment.integer.push(updates.integer[index])
+                    environment.origins.push(updates.origins[index])
+
+        def try_noncall_target_numeric_value(target: Ast::Expr, value: Ast::Expr, candidate: sview, params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&) -> (found: bool, numeric: bool):
+            can Abort.Panic:
+                match target:
+                    Expr.Ident(name, _):
+                        return (false, false) if name != candidate
+                        return (true, try_noncall_numeric_value(value, params, environment))
+                    Expr.Paren(inner, _):
+                        return try_noncall_target_numeric_value(inner, value, candidate, params, environment)
+                    Expr.Tuple(targets, _) | Expr.Array(targets, _):
+                        match value:
+                            Expr.Tuple(values, _) | Expr.Array(values, _):
+                                return (true, false) if targets.count != values.count and try_noncall_target_binds_name(target, candidate)
+                                for index in 0..<targets.count:
+                                    if try_noncall_target_binds_name(targets[index], candidate):
+                                        return try_noncall_target_numeric_value(targets[index], values[index], candidate, params, environment) if index < values.count
+                                        return (true, false)
+                            _:
+                                pass
+                        return (true, false) if try_noncall_target_binds_name(target, candidate)
+                    _:
+                        pass
+                return (false, false)
+
+        def try_noncall_target_integer_value(target: Ast::Expr, value: Ast::Expr, candidate: sview, params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&) -> (found: bool, integer: bool):
+            can Abort.Panic:
+                match target:
+                    Expr.Ident(name, _):
+                        return (false, false) if name != candidate
+                        return (true, try_noncall_integer_value(value, params, environment))
+                    Expr.Paren(inner, _):
+                        return try_noncall_target_integer_value(inner, value, candidate, params, environment)
+                    Expr.Tuple(targets, _) | Expr.Array(targets, _):
+                        match value:
+                            Expr.Tuple(values, _) | Expr.Array(values, _):
+                                return (true, false) if targets.count != values.count and try_noncall_target_binds_name(target, candidate)
+                                for index in 0..<targets.count:
+                                    if try_noncall_target_binds_name(targets[index], candidate):
+                                        return try_noncall_target_integer_value(targets[index], values[index], candidate, params, environment) if index < values.count
+                                        return (true, false)
+                            _:
+                                pass
+                        return (true, false) if try_noncall_target_binds_name(target, candidate)
+                    _:
+                        pass
+                return (false, false)
+
+        def try_noncall_expression_is_known_nonfallible(expression: Ast::Expr, params: darray[Ast::ParamDecl], environment: TryNonCallErrorFamilyEnv&) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.IntLit(_, _):
+                        return true
+                    Expr.FloatLit(_, _):
+                        return true
+                    Expr.StringLit(_, _):
+                        return true
+                    Expr.CharLit(_, _):
+                        return true
+                    Expr.BoolLit(_, _):
+                        return true
+                    Expr.Unary(TokenKind.Minus, _, _) | Expr.Unary(TokenKind.Plus, _, _):
+                        return try_noncall_numeric_value(expression, params, environment)
+                    Expr.Unary(TokenKind.Not, _, _):
+                        return true
+                    Expr.Paren(inner, _):
+                        return try_noncall_expression_is_known_nonfallible(inner, params, environment)
+                    Expr.Binary(left, operator, right, _) if operator in {TokenKind.Plus, TokenKind.Minus, TokenKind.Star, TokenKind.Slash, TokenKind.Percent}:
+                        # Built-in arithmetic on primitive numeric operands cannot return an
+                        # error union. Keep user-defined operator overloads unknown.
+                        return try_noncall_numeric_value(left, params, environment) and try_noncall_numeric_value(right, params, environment)
+                    Expr.Binary(left, operator, right, _) if operator in {TokenKind.Ampersand, TokenKind.Pipe, TokenKind.Caret, TokenKind.LShift, TokenKind.RShift}:
+                        # Bitwise and shift operations are built-in only for integer
+                        # operands; do not classify floating or overloaded expressions here.
+                        return try_noncall_integer_value(left, params, environment) and try_noncall_integer_value(right, params, environment)
+                    Expr.If(_, then_value, else_value, _):
+                        # The conditional expression's result comes from its value branches;
+                        # any nested `try` in the condition has its own annotation and is
+                        # checked independently.
+                        return try_noncall_expression_is_known_nonfallible(then_value, params, environment) and try_noncall_expression_is_known_nonfallible(else_value, params, environment)
+                    _:
+                        return false

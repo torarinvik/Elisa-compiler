@@ -1,0 +1,199 @@
+extend Semantic:
+    private:
+        # Publish graph values only after ifc_session_store has made this exact snapshot
+        # authoritative. Query handles are reacquired under the committed context.
+        def ifc_publish_query_graph_once[@session, @snapshot_region, @identity_region, @path_region, @metrics_region, @hits_region](session: mutable IncrementalSemanticSession[session]& @session, snapshot: IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region, identity_key: darray[u8]& @identity_region, source_path: sview @path_region, request_metrics: mutable IncrementalFunctionFactsRequestMetrics& @metrics_region, validated_body_query_hits: darray[IncrementalSemanticBodyQueryHitMarker]& @hits_region) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast:
+                return false if not session.enabled or not session.query_graph_enabled or not session.valid or not snapshot.declaration_surface_valid
+                return false if snapshot.declaration_surface_start > snapshot.bytes.count or snapshot.declaration_surface_length > snapshot.bytes.count - snapshot.declaration_surface_start
+                return false if not incremental_semantic_query_begin_request(session)
+                requires_source_input: mutable bool = false
+                for record_index in 0..<snapshot.functions.count |requires_source_input|:
+                    requires_source_input <- true if snapshot.functions[record_index].cacheable and not snapshot.functions[record_index].complete_empty_body and not ifc_record_is_zero_fact_surface_independent(snapshot, record_index)
+                source_input_available: mutable bool = false
+                source_input_hit_current: mutable bool = false
+                source_handle: mutable IncrementalSemanticQueryHandle = ifq_query_handle_invalid()
+                if requires_source_input and ifq_source_query_key_fits(identity_key, source_path) and ifq_source_query_value_fits(snapshot.options_key.count, snapshot.declaration_surface_length):
+                    session.query_probe_key_scratch.truncate(0)
+                    ifq_source_query_key_into(session.query_probe_key_scratch, identity_key, source_path)
+                    source_value: mutable darray[u8] @snapshot_region = []
+                    if ifq_source_query_value_from_span_into(source_value, snapshot.options_key, snapshot.bytes, snapshot.declaration_surface_start, snapshot.declaration_surface_length):
+                        source_handle <- incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.SourceInput, session.query_probe_key_scratch)
+                        session.query_probe_key_scratch.truncate(0)
+                        session.query_dependencies_scratch.truncate(0)
+                        source_evaluation: IncrementalSemanticQueryEvaluation = ifq_query_evaluate(session, source_handle, source_value, session.query_dependencies_scratch)
+                        source_input_hit_current <- source_evaluation.hit and ifq_query_value_equals(session, source_evaluation.result_start, source_evaluation.result_length, source_value)
+                        if source_input_hit_current or ifq_query_commit(session, source_handle, source_value, session.query_dependencies_scratch, source_value):
+                            source_input_available <- true
+                        else:
+                            return false
+                session.query_dependencies_scratch.truncate(0)
+                body_query_publish_skips: mutable u32 = 0
+                complete_empty_body_publish_skips: mutable u32 = 0
+                complete_empty_body_commits: mutable u32 = 0
+                zero_fact_body_publish_skips: mutable u32 = 0
+                zero_fact_body_commits: mutable u32 = 0
+                for record_index in 0..<snapshot.functions.count |session, snapshot, identity_key, source_path, source_handle, source_input_available, source_input_hit_current, request_metrics, body_query_publish_skips, complete_empty_body_publish_skips, complete_empty_body_commits, zero_fact_body_publish_skips, zero_fact_body_commits|:
+                    record: IncrementalFunctionFactRecord = snapshot.functions[record_index]
+                    continue if not record.cacheable
+                    zero_fact_body: bool = ifc_record_is_zero_fact_surface_independent(snapshot, record_index)
+                    source_independent_body: bool = record.complete_empty_body or zero_fact_body
+                    continue if not source_independent_body and not source_input_available
+                    continue if not ifq_function_query_key_fits(record)
+                    continue if record.body_length > INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT
+                    return false if record.body_start > snapshot.bytes.count or record.body_length > snapshot.bytes.count - record.body_start
+                    # Check the canonical value size before interning a key. An
+                    # unpublishable record must not leave a key-only FunctionBodyFacts
+                    # node in the graph, where it could consume node/key budget and be
+                    # mistaken for a reusable query on a later request.
+                    result_size: IncrementalSemanticQueryValueSize = ifq_direct_facts_result_size(snapshot, record_index)
+                    continue if not result_size.valid
+                    # Query values share one bounded append-only store. A body and
+                    # its canonical facts result must fit together before key
+                    # interning; otherwise commit would clear the whole graph and
+                    # force the caller through the cold fallback for every body.
+                    continue if result_size.byte_count > INCREMENTAL_SEMANTIC_QUERY_VALUE_BYTES_LIMIT - record.body_length
+                    continue if not ifq_function_query_key_into(session.query_probe_key_scratch, snapshot, record)
+                    query_handle: IncrementalSemanticQueryHandle = incremental_semantic_query_for_key(session, IncrementalSemanticQueryKind.FunctionBodyFacts, session.query_probe_key_scratch)
+                    session.query_dependencies_scratch.truncate(0)
+                    session.query_dependencies_scratch.push(source_handle) if not source_independent_body
+                    source_result_generation: mutable u64 = 0
+                    if not source_independent_body and source_input_available:
+                        source_node: IncrementalSemanticQueryNode = session.query_nodes[source_handle.node.value.usize()]
+                        source_result_generation <- source_node.result_generation
+                    skip_publish: bool = (source_independent_body or source_input_hit_current) and ifc_validated_body_query_hit_is_current[session, metrics_region, hits_region, session, session](session, request_metrics, validated_body_query_hits, record_index, record, session.query_probe_key_scratch, query_handle, session.query_dependencies_scratch, source_result_generation, not source_independent_body)
+                    session.query_probe_key_scratch.truncate(0)
+                    if skip_publish:
+                        if record.complete_empty_body:
+                            ifc_increment_candidate_metric(&complete_empty_body_publish_skips, snapshot.functions.count)
+                        elif zero_fact_body:
+                            ifc_increment_candidate_metric(&zero_fact_body_publish_skips, snapshot.functions.count)
+                        else:
+                            ifc_increment_candidate_metric(&body_query_publish_skips, snapshot.functions.count)
+                        continue
+                    query_evaluation: IncrementalSemanticQueryEvaluation = ifq_query_evaluate_span_with_hash(session, query_handle, snapshot.bytes, record.body_start, record.body_length, record.body_hash, session.query_dependencies_scratch)
+                    if not query_evaluation.hit:
+                        canonical_result: mutable darray[u8] @snapshot_region = []
+                        return false if not ifq_append_direct_facts_result(snapshot, record_index, &canonical_result)
+                        body_input: darray[u8] @snapshot_region = ifq_snapshot_span_copy(snapshot.bytes, record.body_start, record.body_length)
+                        if not ifq_query_commit(session, query_handle, body_input, session.query_dependencies_scratch, canonical_result):
+                            return false
+                        if record.complete_empty_body:
+                            ifc_increment_candidate_metric(&complete_empty_body_commits, snapshot.functions.count)
+                        elif zero_fact_body:
+                            ifc_increment_candidate_metric(&zero_fact_body_commits, snapshot.functions.count)
+                request_metrics.body_query_publish_skips <- body_query_publish_skips
+                request_metrics.complete_empty_body_publish_skips <- complete_empty_body_publish_skips
+                request_metrics.complete_empty_body_commits <- complete_empty_body_commits
+                request_metrics.zero_fact_body_publish_skips <- zero_fact_body_publish_skips
+                request_metrics.zero_fact_body_commits <- zero_fact_body_commits
+                return true
+
+        # query_value_bytes is append-only during a request. When historical values fill
+        # its logical budget, clear the graph and rebuild from the current committed
+        # snapshot once. If that working set itself does not fit, leave the graph empty;
+        # the exact semantic snapshot remains available to its existing cold-safe path.
+        def ifc_publish_query_graph[@session, @snapshot_region, @identity_region, @path_region, @metrics_region, @hits_region](session: mutable IncrementalSemanticSession[session]& @session, snapshot: IncrementalSemanticSnapshot[snapshot_region]& @snapshot_region, identity_key: darray[u8]& @identity_region, source_path: sview @path_region, request_metrics: mutable IncrementalFunctionFactsRequestMetrics& @metrics_region, validated_body_query_hits: darray[IncrementalSemanticBodyQueryHitMarker]& @hits_region) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe.PointerCast:
+                # Do not erase a healthy retained graph when this request can never
+                # publish SourceInput (for example, an over-budget declaration surface).
+                # The retry path below is reserved for graph admission/corruption failures
+                # after predictable request-shape checks have passed.
+                return false if not session.enabled or not session.query_graph_enabled or not session.valid
+                return false if not snapshot.declaration_surface_valid
+                return false if snapshot.declaration_surface_start > snapshot.bytes.count or snapshot.declaration_surface_length > snapshot.bytes.count - snapshot.declaration_surface_start
+                return true if ifc_publish_query_graph_once[session, snapshot_region, identity_region, path_region, metrics_region, hits_region](session, snapshot, identity_key, source_path, request_metrics, validated_body_query_hits)
+                ifq_clear_session_graph(session)
+                return true if ifc_publish_query_graph_once[session, snapshot_region, identity_region, path_region, metrics_region, hits_region](session, snapshot, identity_key, source_path, request_metrics, validated_body_query_hits)
+                ifq_clear_session_graph(session)
+                return false
+
+    public:
+        # This is the only API that can advance trusted process-local provenance. The prior
+        # snapshot is private and reaches allow_session_reuse only after its exact context
+        # has matched. Sidecar snapshots continue through the rescan-only API.
+        def incremental_collect_function_facts_with_session[@session, @input_source, @output](file: Ast::File& @input_source, source: u8& @input_source, source_length: usize, tokens: darray[Lexer::Token]& @input_source, source_path: sview @output, semantic_fingerprint: u64, options_fingerprint: u64, options_key: darray[u8]&, identity_key: darray[u8]& @output, generated_input: bool, session: mutable IncrementalSemanticSession[session]& @session) -> IncrementalSessionCollectionResult[output] @output:
+            can Memory.Allocate, Abort.Panic, Unsafe.PointerArithmetic, Global{Read,Write}, Unsafe.PointerCast:
+                if not session.enabled:
+                    return IncrementalSessionCollectionResult[output]{snapshot: incremental_empty_snapshot[output](), prior_valid: false, exact_hit: false, body_facts_reused: false, function_body_facts_restored: 0, body_query_publish_skips: 0, prior_snapshot_fact_fallbacks: 0, cold_body_scans: 0, source_input_admitted: false, complete_empty_body_eligible: 0, complete_empty_body_restored: 0, complete_empty_body_publish_skips: 0, complete_empty_body_commits: 0, zero_fact_body_eligible: 0, zero_fact_body_restored: 0, zero_fact_body_publish_skips: 0, zero_fact_body_commits: 0}
+                context_matches: mutable bool = session.valid
+                context_matches <- false if session.semantic_fingerprint != semantic_fingerprint or session.generated_input != generated_input
+                context_matches <- false if not ifc_session_key_matches(session.options_key, options_key)
+                context_matches <- false if not ifc_session_key_matches(session.identity_key, identity_key)
+                context_matches <- false if session.snapshot.schema_version != INCREMENTAL_FUNCTION_FACTS_SCHEMA
+                context_matches <- false if session.snapshot.semantic_fingerprint != semantic_fingerprint or session.snapshot.options_fingerprint != options_fingerprint
+                context_matches <- false if not ifc_session_key_matches(session.snapshot.options_key, options_key)
+                if not context_matches:
+                    incremental_semantic_session_reset(session)
+                else:
+                    prior_clone_span: PhaseTimer::Span = PhaseTimer::begin_span()
+                    prior_slots: mutable darray[IncrementalSemanticSnapshot[output]] @output = [ifc_clone_session_snapshot[session, output](&session.snapshot)]
+                    PhaseTimer::end_span("incremental-session-prior-clone", prior_clone_span)
+                    if ifc_session_source_matches(session, source, source_length):
+                        if ifc_equal_view(prior_slots[0].bytes, prior_slots[0].source_path_start, prior_slots[0].source_path_length, source_path):
+                            exact_reanchor_span: PhaseTimer::Span = PhaseTimer::begin_span()
+                            exact_reanchored: mutable bool = false
+                            region reanchor_plan_scratch:
+                                # Keep the O(function/fact) plan arrays in this call-local
+                                # region. After validation, copy only scalar records into the
+                                # request-owned snapshot, then reclaim the scratch before any
+                                # later backend work retains the output region.
+                                reanchor_plan_slots: mutable darray[IncrementalExactReanchorPlan[reanchor_plan_scratch]] @reanchor_plan_scratch = [IncrementalExactReanchorPlan[reanchor_plan_scratch]{reset_self_assignment_stream: false, current_anchors: [], current_self_assignment_anchors: [], self_assignment_ranges: [], bodies_matched: 0, bodies_rejected: 0, self_assignment_bodies_reused: 0, surface_compatible: false}]
+                                if incremental_build_exact_reanchor_plan[output, input_source, reanchor_plan_scratch](file, tokens, &prior_slots[0], &reanchor_plan_slots[0]):
+                                    in output:
+                                        assert prior_slots[0].current_anchors.count == 0
+                                        assert prior_slots[0].current_self_assignment_anchors.count == 0
+                                        prior_slots[0].current_anchors.reserve(reanchor_plan_slots[0].current_anchors.count)
+                                        for anchor in reanchor_plan_slots[0].current_anchors |prior_slots, reanchor_plan_slots|:
+                                            prior_slots[0].current_anchors.push(anchor)
+                                        prior_slots[0].current_self_assignment_anchors.reserve(reanchor_plan_slots[0].current_self_assignment_anchors.count)
+                                        for anchor in reanchor_plan_slots[0].current_self_assignment_anchors |prior_slots, reanchor_plan_slots|:
+                                            prior_slots[0].current_self_assignment_anchors.push(anchor)
+                                        prior_slots[0].self_assignment_ranges.truncate(0)
+                                        prior_slots[0].self_assignment_ranges.reserve(reanchor_plan_slots[0].self_assignment_ranges.count)
+                                        for range in reanchor_plan_slots[0].self_assignment_ranges |prior_slots, reanchor_plan_slots|:
+                                            prior_slots[0].self_assignment_ranges.push(range)
+                                        if reanchor_plan_slots[0].reset_self_assignment_stream:
+                                            prior_slots[0].self_assignment_facts.truncate(0)
+                                        for record_index in 0..<prior_slots[0].functions.count |prior_slots|:
+                                            prior_slots[0].functions[record_index].matched_previous <- prior_slots[0].functions[record_index].cacheable
+                                        prior_slots[0].bodies_visited <- 0
+                                        prior_slots[0].bodies_matched <- reanchor_plan_slots[0].bodies_matched
+                                        prior_slots[0].bodies_rejected <- reanchor_plan_slots[0].bodies_rejected
+                                        prior_slots[0].self_assignment_bodies_scanned <- 0
+                                        prior_slots[0].self_assignment_bodies_reused <- reanchor_plan_slots[0].self_assignment_bodies_reused
+                                        prior_slots[0].surface_compatible <- reanchor_plan_slots[0].surface_compatible
+                                    exact_reanchored <- true
+                            PhaseTimer::end_span("incremental-session-exact-reanchor", exact_reanchor_span)
+                            if exact_reanchored:
+                                return ifc_session_collection_result[output](prior_slots[0], true, true, false, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0)
+                    else:
+                        if session.query_graph_enabled:
+                            if session.query_graph_poisoned:
+                                ifq_clear_session_graph(session)
+                            if not incremental_semantic_query_begin_request(session):
+                                ifq_clear_session_graph(session)
+                                incremental_semantic_query_begin_request(session)
+                        request_metrics_hits: mutable darray[IncrementalSemanticBodyQueryHitMarker] @input_source = []
+                        request_metrics_slots: mutable darray[IncrementalFunctionFactsRequestMetrics] @output = [IncrementalFunctionFactsRequestMetrics{function_body_facts_restored: 0, body_query_publish_skips: 0, prior_snapshot_fact_fallbacks: 0, cold_body_scans: 0, source_input_admitted: false, validated_body_query_generation: 0, complete_empty_body_eligible: 0, complete_empty_body_restored: 0, complete_empty_body_publish_skips: 0, complete_empty_body_commits: 0, zero_fact_body_eligible: 0, zero_fact_body_restored: 0, zero_fact_body_publish_skips: 0, zero_fact_body_commits: 0}]
+                        current_slots: mutable darray[IncrementalSemanticSnapshot[output]] @output = [ifc_collect_function_facts[session, input_source, output, output, output, output, input_source](file, source, source_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, identity_key, &prior_slots[0], true, true, &request_metrics_slots[0], request_metrics_hits, session)]
+                        reused: bool = current_slots[0].bodies_matched > 0 and current_slots[0].bodies_visited < current_slots[0].functions.count
+                        stored: bool = ifc_session_store[session, output](session, source, source_length, identity_key, options_key, generated_input, semantic_fingerprint, &current_slots[0])
+                        if not stored:
+                            incremental_semantic_session_reset(session)
+                            ifc_self_assignment_forget[output](&current_slots[0])
+                        else:
+                            ifc_publish_query_graph[session, output, output, output, output, input_source](session, &current_slots[0], identity_key, source_path, &request_metrics_slots[0], request_metrics_hits)
+                        return ifc_session_collection_result[output](current_slots[0], true, false, reused, request_metrics_slots[0].function_body_facts_restored, request_metrics_slots[0].body_query_publish_skips, request_metrics_slots[0].prior_snapshot_fact_fallbacks, request_metrics_slots[0].cold_body_scans, request_metrics_slots[0].source_input_admitted, request_metrics_slots[0].complete_empty_body_eligible, request_metrics_slots[0].complete_empty_body_restored, request_metrics_slots[0].complete_empty_body_publish_skips, request_metrics_slots[0].complete_empty_body_commits, request_metrics_slots[0].zero_fact_body_eligible, request_metrics_slots[0].zero_fact_body_restored, request_metrics_slots[0].zero_fact_body_publish_skips, request_metrics_slots[0].zero_fact_body_commits)
+                    incremental_semantic_session_reset(session)
+                request_metrics_hits: mutable darray[IncrementalSemanticBodyQueryHitMarker] @input_source = []
+                request_metrics_slots: mutable darray[IncrementalFunctionFactsRequestMetrics] @output = [IncrementalFunctionFactsRequestMetrics{function_body_facts_restored: 0, body_query_publish_skips: 0, prior_snapshot_fact_fallbacks: 0, cold_body_scans: 0, source_input_admitted: false, validated_body_query_generation: 0, complete_empty_body_eligible: 0, complete_empty_body_restored: 0, complete_empty_body_publish_skips: 0, complete_empty_body_commits: 0, zero_fact_body_eligible: 0, zero_fact_body_restored: 0, zero_fact_body_publish_skips: 0, zero_fact_body_commits: 0}]
+                empty_snapshot_slots: mutable darray[IncrementalSemanticSnapshot[output]] @output = [incremental_empty_snapshot[output]()]
+                cold_slots: mutable darray[IncrementalSemanticSnapshot[output]] @output = [ifc_collect_function_facts[session, input_source, output, output, output, output, input_source](file, source, source_length, tokens, source_path, semantic_fingerprint, options_fingerprint, options_key, identity_key, &empty_snapshot_slots[0], false, false, &request_metrics_slots[0], request_metrics_hits, session)]
+                stored: bool = ifc_session_store[session, output](session, source, source_length, identity_key, options_key, generated_input, semantic_fingerprint, &cold_slots[0])
+                if not stored:
+                    incremental_semantic_session_reset(session)
+                    ifc_self_assignment_forget[output](&cold_slots[0])
+                else:
+                    ifc_publish_query_graph[session, output, output, output, output, input_source](session, &cold_slots[0], identity_key, source_path, &request_metrics_slots[0], request_metrics_hits)
+                return ifc_session_collection_result[output](cold_slots[0], false, false, false, request_metrics_slots[0].function_body_facts_restored, request_metrics_slots[0].body_query_publish_skips, request_metrics_slots[0].prior_snapshot_fact_fallbacks, request_metrics_slots[0].cold_body_scans, request_metrics_slots[0].source_input_admitted, request_metrics_slots[0].complete_empty_body_eligible, request_metrics_slots[0].complete_empty_body_restored, request_metrics_slots[0].complete_empty_body_publish_skips, request_metrics_slots[0].complete_empty_body_commits, request_metrics_slots[0].zero_fact_body_eligible, request_metrics_slots[0].zero_fact_body_restored, request_metrics_slots[0].zero_fact_body_publish_skips, request_metrics_slots[0].zero_fact_body_commits)
