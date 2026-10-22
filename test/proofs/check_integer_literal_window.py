@@ -138,11 +138,11 @@ cast_path = (
     "postfix_window:(found:bool,low:i64,high:i64)=cast_integer_window(method_name)",
     "ifpostfix_window.found:",
     "base_value:(found:bool,value:i64)=fold_const_int(base)",
-    "(true,base_value.value,method_name)returnifSemanticIntegerLiteral::value_is_outside_window_if_known(postfix_window.found,base_value.found,base_value.value,postfix_window.low,postfix_window.high)",
+    "return(true,base_value.value,method_name)ifSemanticIntegerLiteral::value_is_outside_window_if_known(postfix_window.found,base_value.found,base_value.value,postfix_window.low,postfix_window.high)",
     "prefix_window:(found:bool,low:i64,high:i64)=cast_integer_window(callee_name)",
     "ifprefix_window.foundandarguments.count==1:",
     "argument_value:(found:bool,value:i64)=fold_const_int(arguments[0])",
-    "(true,argument_value.value,callee_name)returnifSemanticIntegerLiteral::value_is_outside_window_if_known(prefix_window.found,argument_value.found,argument_value.value,prefix_window.low,prefix_window.high)",
+    "return(true,argument_value.value,callee_name)ifSemanticIntegerLiteral::value_is_outside_window_if_known(prefix_window.found,argument_value.found,argument_value.value,prefix_window.low,prefix_window.high)",
 )
 if not ordered_fragments(cast_text, cast_path):
     raise AssertionError("postfix and one-argument prefix casts must use the proved range predicate only for folded constants")

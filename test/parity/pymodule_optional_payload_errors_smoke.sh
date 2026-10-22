@@ -51,8 +51,14 @@ assert raised(module.fail_int, None) is None
 assert raised(module.fail_int, 5) == 5
 assert raised(module.fail_text, None) is None
 assert raised(module.fail_text, "hé") == "hé"
+assert raised(module.fail_text) == "borrowed text payload default"
 assert raised(module.fail_cstr, None) is None
 assert raised(module.fail_cstr, "hé") == "hé"
+assert raised(module.fail_cstr) == "borrowed cstr payload default"
+
+for _ in range(1000):
+    assert raised(module.fail_text) == "borrowed text payload default"
+    assert raised(module.fail_cstr) == "borrowed cstr payload default"
 
 value = {"ok": True}
 assert raised(module.fail_object, None) is None

@@ -118,6 +118,85 @@ grep -q '^D 0$' <<< "$fallible_call_alias"
 pure_call_alias_nonfallible=$(printf 'def pure() -> i64:\n    return 1\ndef bad() -> i64:\n    value = pure()\n    return try value\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$pure_call_alias_nonfallible"
 
+unqualified_sibling_module_callable='error E:
+    Bad
+module Alpha:
+    public:
+        def pure() -> i64:
+            return 1
+        def bad() -> i64:
+            value = pure()
+            return try value
+module Beta:
+    public:
+        def pure() -> i64 error[E]:
+            return 2'
+unqualified_sibling_module_callable_report=$(printf '%s\n' "$unqualified_sibling_module_callable" | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$unqualified_sibling_module_callable_report" || {
+    echo "try_fallible FAILED: unqualified Alpha::pure resolved to its fallible Beta sibling: $unqualified_sibling_module_callable_report"
+    exit 1
+}
+
+imported_callable_fact_sources='error E:
+    Bad
+error F:
+    Other
+module Backend:
+    public:
+        def load() -> i64 error[E]:
+            return 1
+module Selective:
+    public:
+        using Backend::load
+        def mismatch() -> i64 error[F]:
+            copied = load()
+            return try copied
+module Wildcard:
+    public:
+        using Backend
+        def mismatch() -> i64 error[F]:
+            copied = load()
+            return try copied'
+imported_callable_fact_sources_report=$(printf '%s\n' "$imported_callable_fact_sources" | "$RPT")
+[[ $(grep -c 'cannot propagate E from a function returning F' <<< "$imported_callable_fact_sources_report") -eq 2 ]] || {
+    echo "try_fallible FAILED: unqualified calls through selective or wildcard imports lost their error family: $imported_callable_fact_sources_report"
+    exit 1
+}
+
+nested_wildcard_callable_sources='error E:
+    Bad
+error F:
+    Other
+module BackendE:
+    public:
+        def load() -> i64 error[E]:
+            return 1
+module BackendF:
+    public:
+        def load() -> i64 error[F]:
+            return 2
+module Alpha:
+    public:
+        using BackendE
+        def mismatch() -> i64 error[F]:
+            copied = load()
+            return try copied
+module Beta:
+    public:
+        using BackendF
+        def mismatch() -> i64 error[E]:
+            copied = load()
+            return try copied'
+nested_wildcard_callable_sources_report=$(printf '%s\n' "$nested_wildcard_callable_sources" | "$RPT")
+[[ $(grep -c 'cannot propagate E from a function returning F' <<< "$nested_wildcard_callable_sources_report") -eq 1 && $(grep -c 'cannot propagate F from a function returning E' <<< "$nested_wildcard_callable_sources_report") -eq 1 ]] || {
+    echo "try_fallible FAILED: sibling wildcard imports did not retain their lexical module scopes: $nested_wildcard_callable_sources_report"
+    exit 1
+}
+grep -q '^P 0$' <<< "$nested_wildcard_callable_sources_report"
+
+alias_only_using_does_not_import_unqualified_callable=$(printf 'error E:\n    Bad\nerror F:\n    Other\nmodule Backend:\n    public:\n        def load() -> i64 error[E]:\n            return 1\nusing Backend as B\ndef mismatch() -> i64 error[F]:\n    copied = load()\n    return try copied\n' | "$RPT")
+! grep -q 'cannot propagate E from a function returning F' <<< "$alias_only_using_does_not_import_unqualified_callable"
+
 qualified_pure_call_alias_nonfallible=$(printf 'error E:\n    Bad\nmodule Backend:\n    public:\n        def pure() -> i64:\n            return 1\nmodule Other:\n    public:\n        def pure() -> i64 error[E]:\n            return 2\ndef bad() -> i64:\n    value = Backend::pure()\n    return try value\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$qualified_pure_call_alias_nonfallible"
 
@@ -167,6 +246,21 @@ grep -q '^D 0$' <<< "$using_alias_assignment" || {
     exit 1
 }
 
+using_alias_prefix_declarations='error E:
+    Bad
+module Outer:
+    public:
+        module Inner:
+            public:
+                def load() -> i64 error[E]:
+                    return 1
+using Outer as O'
+using_alias_prefix_catch=$(printf '%s\ndef bad() -> i64:\n    result = catch O::Inner::load():\n        success: success\n        error problem: 0\n    return try result\n' "$using_alias_prefix_declarations" | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$using_alias_prefix_catch" || {
+    echo "try_fallible FAILED: alias prefix O::Inner did not resolve the cached callable: $using_alias_prefix_catch"
+    exit 1
+}
+
 root_using_alias_nested_module='error E:
     Bad
 module Backend:
@@ -212,26 +306,182 @@ grep -q 'try requires a fallible expression' <<< "$catch_success_arithmetic_alia
 catch_success_bool_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load_flag() -> bool error[E]:\n    return true\ndef bad() -> bool:\n    result = catch load_flag():\n        success:\n            success\n        error problem:\n            false\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$catch_success_bool_alias_nonfallible"
 
+catch_success_bool_arm_try_nonfallible=$(printf 'error E:\n    Bad\ndef load_flag() -> bool error[E]:\n    return true\ndef bad() -> bool:\n    return catch load_flag():\n        success:\n            try success\n        error problem:\n            false\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$catch_success_bool_arm_try_nonfallible"
+
 catch_success_identifier_string_alias_nonfallible=$(printf 'error E:\n    Bad\ndef load_text() -> string error[E]:\n    return "loaded"\ndef bad() -> string:\n    cached = load_text()\n    result = catch cached:\n        success:\n            success\n        error problem:\n            "fallback"\n    return try result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$catch_success_identifier_string_alias_nonfallible"
 
 catch_success_arm_try_nonfallible=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    result = catch load():\n        success:\n            try success\n        error problem:\n            0\n    return result\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$catch_success_arm_try_nonfallible"
 
+catch_variant_name_does_not_bind_success_payload=$(printf 'error E:\n    Problem\nerror F:\n    Other\ndef mismatch(Problem: i64 error[E]) -> i64 error[F]:\n    return catch Problem:\n        success:\n            1\n        Problem:\n            return try Problem\n' | "$RPT")
+grep -q 'cannot propagate E from a function returning F' <<< "$catch_variant_name_does_not_bind_success_payload" || {
+    echo "try_fallible FAILED: fieldless Catch error variant shadowed the outer fallible value: $catch_variant_name_does_not_bind_success_payload"
+    exit 1
+}
+! grep -q 'try requires a fallible expression' <<< "$catch_variant_name_does_not_bind_success_payload"
+
+typed_local_error_union_catch_payload=$(printf 'error E:\n    Bad\ndef load() -> i64 error[E]:\n    return 1\ndef bad() -> i64:\n    wrapped: i64 error[E] = load()\n    result = catch wrapped:\n        success:\n            success\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q 'try requires a fallible expression' <<< "$typed_local_error_union_catch_payload" || {
+    echo "try_fallible FAILED: typed error-union local lost its nonfallible success-payload fact: $typed_local_error_union_catch_payload"
+    exit 1
+}
+
+catch_terminated_arm_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad() -> i64 error[E]:\n    result = catch load_e():\n        success:\n            return 1\n            copied = load_f()\n            copied\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_terminated_arm_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$catch_terminated_arm_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: terminating Catch arm failed to leave only the reachable nonfallible result: $catch_terminated_arm_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning E' <<< "$catch_terminated_arm_ignores_unreachable_family"
+
+catch_terminated_boolean_match_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad() -> i64 error[E]:\n    result = catch load_e():\n        success:\n            match true:\n                true:\n                    return 1\n                false:\n                    return 2\n            copied = load_f()\n            copied\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_terminated_boolean_match_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$catch_terminated_boolean_match_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: exhaustive terminating boolean Match failed to exclude its unreachable Catch-arm tail: $catch_terminated_boolean_match_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning E' <<< "$catch_terminated_boolean_match_ignores_unreachable_family"
+
+catch_literal_true_if_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad() -> i64 error[E]:\n    result = catch load_e():\n        success:\n            if true:\n                return 1\n            copied = load_f()\n            copied\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_literal_true_if_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$catch_literal_true_if_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: literal-true terminating If failed to exclude its unreachable Catch-arm tail: $catch_literal_true_if_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning E' <<< "$catch_literal_true_if_ignores_unreachable_family"
+
+catch_terminated_scoped_block_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad() -> i64 error[E]:\n    result = catch load_e():\n        success:\n            can Abort.Panic:\n                return 1\n            copied = load_f()\n            copied\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_terminated_scoped_block_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$catch_terminated_scoped_block_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: terminating scoped block failed to exclude its unreachable Catch-arm tail: $catch_terminated_scoped_block_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning E' <<< "$catch_terminated_scoped_block_ignores_unreachable_family"
+
+catch_aborting_call_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad() -> i64 error[E] can[Abort.Panic]:\n    result = catch load_e():\n        success:\n            panic()\n            copied = load_f()\n            copied\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_aborting_call_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$catch_aborting_call_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: aborting Catch-arm expression failed to exclude its unreachable tail: $catch_aborting_call_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning E' <<< "$catch_aborting_call_ignores_unreachable_family"
+
+# A Catch expression whose guarded expression aborts has no value, so its dead tail
+# must not contribute a fallible source family to the surrounding Catch result.
+catch_nested_aborting_expression_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad() -> i64 error[E] can[Abort.Panic]:\n    result = catch load_e():\n        success:\n            nested = catch panic():\n                result:\n                    0\n                error problem:\n                    return 1\n            copied = load_f()\n            copied\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_nested_aborting_expression_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$catch_nested_aborting_expression_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: terminating nested Catch failed to exclude its unreachable tail: $catch_nested_aborting_expression_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning E' <<< "$catch_nested_aborting_expression_ignores_unreachable_family"
+
+catch_nested_terminating_all_handlers_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\n    More\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad() -> i64 error[E] can[Abort.Panic]:\n    result = catch load_e():\n        success:\n            nested = catch load_f():\n                result:\n                    panic()\n                F.Other:\n                    panic()\n                F.More:\n                    panic()\n            copied = load_f()\n            copied\n        error problem:\n            0\n    return try result\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_nested_terminating_all_handlers_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$catch_nested_terminating_all_handlers_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: terminating Catch success and error handlers failed to exclude their unreachable tail: $catch_nested_terminating_all_handlers_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning E' <<< "$catch_nested_terminating_all_handlers_ignores_unreachable_family"
+
+match_aborting_guard_ignores_unreachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_f() -> i64 error[F]:\n    return 2\ndef bad(flag: bool) -> i64 can[Abort.Panic]:\n    value = match flag:\n        true if panic(): load_f()\n        false: 1\n    return try value\n' | "$RPT")
+grep -q '^P 0$' <<< "$match_aborting_guard_ignores_unreachable_family"
+grep -q 'try requires a fallible expression' <<< "$match_aborting_guard_ignores_unreachable_family" || {
+    echo "try_fallible FAILED: aborting Match guard contributed an unreachable family: $match_aborting_guard_ignores_unreachable_family"
+    exit 1
+}
+! grep -q 'cannot propagate F from a function returning' <<< "$match_aborting_guard_ignores_unreachable_family"
+
+catch_raise_recovery_guard_keeps_match_arm_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef bad() -> i64 error[E]:\n    value = match true:\n        true if catch raise E.Bad:\n            success:\n                false\n            error problem:\n                true\n            : load_e()\n        false: 0\n    return try value\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_raise_recovery_guard_keeps_match_arm_family"
+! grep -q 'try requires a fallible expression' <<< "$catch_raise_recovery_guard_keeps_match_arm_family" || {
+    echo "try_fallible FAILED: a Catch that recovers from raise was treated as an aborting Match guard: $catch_raise_recovery_guard_keeps_match_arm_family"
+    exit 1
+}
+
+catch_raise_selected_if_recovery_guard_keeps_match_arm_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef bad() -> i64 error[E]:\n    value = match true:\n        true if catch (raise E.Bad if true else load_e()):\n            success:\n                false\n            error problem:\n                true\n            : load_e()\n        false: 0\n    return try value\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_raise_selected_if_recovery_guard_keeps_match_arm_family"
+! grep -q 'try requires a fallible expression' <<< "$catch_raise_selected_if_recovery_guard_keeps_match_arm_family" || {
+    echo "try_fallible FAILED: a Catch handler failed to recover from a statically selected raise branch: $catch_raise_selected_if_recovery_guard_keeps_match_arm_family"
+    exit 1
+}
+
+catch_mixed_raise_panic_recovery_guard_keeps_match_arm_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef bad(flag: bool) -> i64 error[E] can[Abort.Panic]:\n    value = match true:\n        true if catch (raise E.Bad if flag else panic()):\n            success:\n                false\n            error problem:\n                true\n            : load_e()\n        false: 0\n    return try value\n' | "$RPT")
+grep -q '^P 0$' <<< "$catch_mixed_raise_panic_recovery_guard_keeps_match_arm_family"
+! grep -q 'try requires a fallible expression' <<< "$catch_mixed_raise_panic_recovery_guard_keeps_match_arm_family" || {
+    echo "try_fallible FAILED: Catch recovery lost the raise path when another guarded path panics: $catch_mixed_raise_panic_recovery_guard_keeps_match_arm_family"
+    exit 1
+}
+
 catch_success_optional_payload_try=$(printf 'error E:\n    Bad\ndef load() -> i64? error[E]:\n    return 1\ndef good() -> i64? error[E]:\n    return catch load():\n        success:\n            try success\n        error problem:\n            null\n' | "$RPT")
 ! grep -q 'try requires a fallible expression' <<< "$catch_success_optional_payload_try"
 
+# Direct bare-T returns use the unique matching formal argument. Catch strips only the
+# wrapper's outer E family and preserves a fallible T payload.
 catch_success_generic_error_union_payload=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef wrap[T](value: T) -> T error[E]:\n    return value\ndef good(value: i64 error[F]) -> i64 error[F]:\n    return catch wrap(value):\n        success:\n            try success\n        error problem:\n            0\n' | "$RPT")
 ! grep -q 'try requires a fallible expression' <<< "$catch_success_generic_error_union_payload"
+grep -q '^D 0$' <<< "$catch_success_generic_error_union_payload"
+grep -q '^P 0$' <<< "$catch_success_generic_error_union_payload"
+
+catch_success_generic_error_union_payload_mismatch=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef wrap[T](value: T) -> T error[E]:\n    return value\ndef mismatch(value: i64 error[F]) -> i64 error[E]:\n    return catch wrap(value):\n        success:\n            try success\n        error problem:\n            0\n' | "$RPT")
+grep -q 'cannot propagate F from a function returning E' <<< "$catch_success_generic_error_union_payload_mismatch" || {
+    echo "try_fallible FAILED: generic Catch success payload lost its inner error family: $catch_success_generic_error_union_payload_mismatch"
+    exit 1
+}
+! grep -q 'try requires a fallible expression' <<< "$catch_success_generic_error_union_payload_mismatch"
+! grep -q 'cannot propagate E from a function returning E' <<< "$catch_success_generic_error_union_payload_mismatch"
+
+catch_success_generic_error_union_payload_alias_mismatch=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef wrap[T](value: T) -> T error[E]:\n    return value\ndef mismatch(value: i64 error[F]) -> i64 error[E]:\n    wrapped = wrap(value)\n    return catch wrapped:\n        success:\n            try success\n        error problem:\n            0\n' | "$RPT")
+grep -q 'cannot propagate F from a function returning E' <<< "$catch_success_generic_error_union_payload_alias_mismatch" || {
+    echo "try_fallible FAILED: generic Catch success payload lost its inner family through an alias: $catch_success_generic_error_union_payload_alias_mismatch"
+    exit 1
+}
+! grep -q 'try requires a fallible expression' <<< "$catch_success_generic_error_union_payload_alias_mismatch"
 
 generic_return_alias_try=$(printf 'error E:\n    Bad\ndef identity[T](value: T) -> T:\n    return value\ndef forward(value: i64 error[E]) -> i64 error[E]:\n    copied = identity(value)\n    return try copied\n' | "$RPT")
 ! grep -q 'try requires a fallible expression' <<< "$generic_return_alias_try"
+grep -q '^D 0$' <<< "$generic_return_alias_try"
+grep -q '^P 0$' <<< "$generic_return_alias_try"
+
+generic_return_alias_family_mismatch=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef identity[T](value: T) -> T:\n    return value\ndef mismatch(value: i64 error[E]) -> i64 error[F]:\n    copied = identity(value)\n    return try copied\n' | "$RPT")
+grep -q 'cannot propagate E from a function returning F' <<< "$generic_return_alias_family_mismatch" || {
+    echo "try_fallible FAILED: generic direct-T return lost its actual error family: $generic_return_alias_family_mismatch"
+    exit 1
+}
+! grep -q 'try requires a fallible expression' <<< "$generic_return_alias_family_mismatch"
+grep -q '^P 0$' <<< "$generic_return_alias_family_mismatch"
+
+generic_return_mixed_named_family_mismatch=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef select[T](prefix: i64, value: T, marker: i64) -> T:\n    return value\ndef mismatch(value: i64 error[E]) -> i64 error[F]:\n    copied = select(0, value, marker: 1)\n    return try copied\n' | "$RPT")
+grep -q 'cannot propagate E from a function returning F' <<< "$generic_return_mixed_named_family_mismatch" || {
+    echo "try_fallible FAILED: mixed positional/named generic return lost its actual error family: $generic_return_mixed_named_family_mismatch"
+    exit 1
+}
+! grep -q 'try requires a fallible expression' <<< "$generic_return_mixed_named_family_mismatch"
+grep -q '^P 0$' <<< "$generic_return_mixed_named_family_mismatch"
 
 conditional_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = load() if flag else load()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$conditional_fallible_alias"
 
 conditional_fallible_direct=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    return try (load() if flag else load())\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$conditional_fallible_direct"
+
+conditional_literal_true_ignores_dead_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_e() -> i64 error[E]:\n    return 1\ndef load_f() -> i64 error[F]:\n    return 2\ndef mismatch() -> i64 error[F]:\n    value = load_e() if true else load_f()\n    return try value\n' | "$RPT")
+grep -q 'cannot propagate E from a function returning F' <<< "$conditional_literal_true_ignores_dead_family" || {
+    echo "try_fallible FAILED: literal condition lost the reachable branch's error family: $conditional_literal_true_ignores_dead_family"
+    exit 1
+}
+! grep -q 'try requires a fallible expression' <<< "$conditional_literal_true_ignores_dead_family"
+grep -q '^P 0$' <<< "$conditional_literal_true_ignores_dead_family"
+
+conditional_aborting_arm_keeps_reachable_family=$(printf 'error E:\n    Bad\nerror F:\n    Other\ndef load_f() -> i64 error[F]:\n    return 2\ndef mismatch(flag: bool) -> i64 error[E] can[Abort.Panic]:\n    value = panic() if flag else load_f()\n    return try value\n' | "$RPT")
+grep -q 'cannot propagate F from a function returning E' <<< "$conditional_aborting_arm_keeps_reachable_family" || {
+    echo "try_fallible FAILED: aborting conditional arm erased the reachable family: $conditional_aborting_arm_keeps_reachable_family"
+    exit 1
+}
+! grep -q 'try requires a fallible expression' <<< "$conditional_aborting_arm_keeps_reachable_family"
+grep -q '^P 0$' <<< "$conditional_aborting_arm_keeps_reachable_family"
 
 match_fallible_alias=$(printf 'error E:\n    Bad\n\nerror F:\n    Other\ndef load() -> i64 error[E]:\n    return 1\ndef mismatch(flag: bool) -> i64 error[F]:\n    value = match flag:\n        true: load()\n        false: load()\n    return try value\n' | "$RPT")
 grep -q 'cannot propagate E from a function returning F' <<< "$match_fallible_alias"

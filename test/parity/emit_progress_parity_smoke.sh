@@ -5,9 +5,10 @@
 #   * `obligations=Loop:N` counts WHILE loops only — a bounded `for i in 0..<3` is finite by
 #     construction and contributes nothing.
 #   * `evidence=progress` when every loop advances: condition `var OP bound` with OP in
-#     {<, <=, >, >=} (NOT `!=`) and a TOP-LEVEL body assignment moving `var` toward it
-#     (`n <- n + k` / `n += k`, and the `-` forms for `>`). Nested inside an `if` does NOT
-#     count. `trusted Unsafe.NonProgress` gives `evidence=unsafe-nonprogress`;
+#     {<, <=, >, >=} (NOT `!=`) and every reachable path that continues the loop moves `var`
+#     toward the bound (`n <- n + k` / `n += k`, and the `-` forms for `>`). Updates nested
+#     inside `if`/`match` count when every continuing branch advances.
+#     `trusted Unsafe.NonProgress` gives `evidence=unsafe-nonprogress`;
 #     `trusted Unsafe.BlockMain` sets unsafe_block_main; `@main_thread` sets main_thread.
 #     A DECLARED `can[Unsafe.NonProgress]` sets nothing — only the trusted form.
 #   * summaries print ALPHABETICALLY, stable for overloads (which share a name and each get

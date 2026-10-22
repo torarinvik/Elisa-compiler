@@ -31,6 +31,21 @@ assert manifest["structs"] == [{
 }]
 PY
 
+bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
+    -o "$WORK/struct_optional_defaults.c" "$SOURCE" >/dev/null
+python3 - "$WORK/struct_optional_defaults.c" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text()
+start = source.index("static PyObject *elisa_pymodule_struct_Config_to_py(")
+end = source.index("static int elisa_pymodule_struct_Config_from_py(", start)
+converter = source[start:end]
+guard = converter.index("value.name.value.len < 0 || value.name.value.len > PY_SSIZE_T_MAX")
+decode = converter.index("PyUnicode_DecodeUTF8(value.name.value.data, (Py_ssize_t)value.name.value.len")
+assert guard < decode, "optional struct sview length is cast before checking PY_SSIZE_T_MAX"
+PY
+
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi \
     -o "$WORK/struct_optional_defaults.pyi" "$SOURCE" >/dev/null
 grep -Fq 'retries: NotRequired[int | None]' "$WORK/struct_optional_defaults.pyi"

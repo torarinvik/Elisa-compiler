@@ -28,6 +28,7 @@ import default_failure_cleanup as module
 
 assert module.bad_dict_before_optional() == 1234567890123456789
 assert module.bad_set_before_optional() == 1234567890123456789
+assert module.bad_set_range_before_aliased_optional() == 1234567890123456789
 
 def expect_type_error(call):
     try:
@@ -36,12 +37,24 @@ def expect_type_error(call):
         return
     raise AssertionError("invalid aggregate argument unexpectedly converted")
 
+def expect_overflow_error(call):
+    try:
+        call()
+    except OverflowError:
+        return
+    raise AssertionError("out-of-range set element unexpectedly converted")
+
 gc.collect()
 tracemalloc.start()
 before, _ = tracemalloc.get_traced_memory()
 for _ in range(3000):
+    assert module.bad_dict_before_optional() == 1234567890123456789
+    assert module.bad_set_before_optional() == 1234567890123456789
+    assert module.bad_set_range_before_aliased_optional() == 1234567890123456789
+for _ in range(3000):
     expect_type_error(lambda: module.bad_dict_before_optional(mapping=object()))
     expect_type_error(lambda: module.bad_set_before_optional(values=object()))
+    expect_overflow_error(lambda: module.bad_set_range_before_aliased_optional(values={300}))
 gc.collect()
 after, _ = tracemalloc.get_traced_memory()
 tracemalloc.stop()

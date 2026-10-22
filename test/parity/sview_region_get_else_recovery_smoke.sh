@@ -26,6 +26,7 @@ STAGE1_ONLY_STORE_SOURCES=(
     "$ROOT/test/repro/sview_region_statement_match_taint_join.neg.elisa"
     "$ROOT/test/repro/sview_region_for_taint_join.neg.elisa"
     "$ROOT/test/repro/sview_region_for_named_taint_join.neg.elisa"
+    "$ROOT/test/repro/sview_region_for_named_push_taint.neg.elisa"
     "$ROOT/test/repro/sview_region_comprehension_store.neg.elisa"
 )
 STAGE1_ONLY_POSITIVE_SOURCES=(
@@ -36,7 +37,9 @@ STAGE1_ONLY_POSITIVE_SOURCES=(
     "$ROOT/test/repro/sview_region_get_else_match_terminating_short_circuit.pos.elisa"
     "$ROOT/test/repro/sview_region_if_terminating_branch.pos.elisa"
     "$ROOT/test/repro/sview_region_match_terminating_branch.pos.elisa"
+    "$ROOT/test/repro/sview_region_statement_match_literal_reachability.pos.elisa"
     "$ROOT/test/repro/sview_region_get_else_while_false.pos.elisa"
+    "$ROOT/test/repro/sview_region_for_named_push_static.pos.elisa"
 )
 
 fail() { echo "sview GetElse recovery region smoke FAIL: $1" >&2; exit 1; }

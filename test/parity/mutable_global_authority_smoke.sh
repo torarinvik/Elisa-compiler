@@ -641,6 +641,38 @@ using Box as B
 def main() -> i64:
     return B::hot
 CASE
+run_case chained_alias_read 'accesses a global mutable binding without Global.Read' <<'CASE'
+module Outer:
+    module Inner:
+        public:
+            global mutable hot: i64 = 1
+using Outer as First
+using First as Second
+def main() -> i64:
+    return Second::Inner::hot
+CASE
+run_case chained_alias_from_import 'accesses a global mutable binding without Global.Read' <<'CASE'
+module Outer:
+    module Inner:
+        public:
+            global mutable hot: i64 = 1
+using Outer as First
+using First as Second
+from Second::Inner import hot
+def main() -> i64:
+    return hot
+CASE
+run_case chained_alias_wildcard_import 'accesses a global mutable binding without Global.Read' <<'CASE'
+module Outer:
+    module Inner:
+        public:
+            global mutable hot: i64 = 1
+using Outer as First
+using First as Second
+using Second::Inner
+def main() -> i64:
+    return hot
+CASE
 run_case index_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 global mutable slots: array[i64, 4] = [0, 0, 0, 0]
 global mutable cursor: i64 = 0

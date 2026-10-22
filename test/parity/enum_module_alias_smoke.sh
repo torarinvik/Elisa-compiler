@@ -37,4 +37,26 @@ for compiler in "${compilers[@]}"; do
         done
     done
 done
+for level in 0 2; do
+    "$STAGE1" -emit obj "-O$level" -o "$WORK/same-line.o" "$ROOT/test/repro/enum_module_alias_same_line.elisa"
+    "${ELISA_CLANG:-clang}" -fno-builtin -o "$WORK/same-line" "$WORK/same-line.o" "$RUNTIME" "$ROOT/scripts/pymodule_runtime_fallback.c" "$ROOT/test/parity/profile_hooks.c"
+    set +e
+    "$WORK/same-line"
+    status=$?
+    set -e
+    [[ "$status" == 42 ]] || { echo "enum_module_alias_same_line returned $status at O$level ($STAGE1)" >&2; exit 1; }
+    "$STAGE1" -emit llvm "-O$level" -o "$WORK/same-line.ll" "$ROOT/test/repro/enum_module_alias_same_line.elisa"
+    "${ELISA_OPT:-${ELISA_LLVM_OPT:-$ELISA_LLVM_BIN_DIR/opt}}" -passes=verify -disable-output "$WORK/same-line.ll"
+    # Stage1 enforces the documented `::`-only module rule through chained aliases.
+    # Stage0 currently misses this nested alias prefix, so keep this regression Stage1-only.
+    for mode in llvm obj; do
+        output="$WORK/chained-dot-type.$mode"
+        if "$STAGE1" -emit "$mode" "-O$level" -o "$output" "$ROOT/test/repro/enum_module_alias_chained_dot_type.elisa" > "$WORK/chained-dot-type.log" 2>&1; then
+            echo "accepted dotted nested module path through an alias chain at O$level ($STAGE1)" >&2
+            exit 1
+        fi
+        [[ ! -e "$output" ]] || { echo 'invalid chained module type path left an artifact' >&2; exit 1; }
+        rg -q 'is a namespace; write' "$WORK/chained-dot-type.log" || { cat "$WORK/chained-dot-type.log" >&2; exit 1; }
+    done
+done
 echo 'enum module alias smoke OK: declaration-specific payload tags, direct/alias construction, null variants, patterns and live reference extraction at O0/O2'
