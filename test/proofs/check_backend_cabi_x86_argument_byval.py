@@ -44,13 +44,13 @@ if not NEGATIVE.read_text().startswith('include "./backend_cabi_x86_argument_byv
 classifier = compact(section(CLASSIFIER.read_text(), "cabi_classify_arg"))
 ordered = (
     "arg_is_aggregate:bool=cabi_is_aggregate(value_type)",
-    "CabiArgPlan{direct:true,byval:false,aggregate:true,parts:scalar_parts,offsets:scalar_offsets,value_type:llvm_value}returnifsize==0",
+    "returnCabiArgPlan{direct:true,byval:false,aggregate:true,parts:scalar_parts,offsets:scalar_offsets,value_type:llvm_value}ifsize==0",
     "flat_ok:bool=cabi_flatten(llvm_value,0,leaves,structs)",
-    "CabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}returnifflat_ok==false",
+    "returnCabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}ifflat_ok==false",
     "target:i32=cabi_target(structs)",
     "iftarget==2:",
     "iftarget==0:",
-    "CabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}returnifsize>16",
+    "returnCabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}ifsize>16",
     "x86_parts:mutabledarray[LLVMTypeRef]=[]",
 )
 if any(part not in classifier for part in ordered) or [classifier.index(part) for part in ordered] != sorted(classifier.index(part) for part in ordered):
@@ -60,7 +60,8 @@ declare_steps = (
     "ifextern_is_exportandcabi_is_aggregate(param_value_type):",
     "export_arg_plan:CabiArgPlan=cabi_classify_arg(param_value_type,structs,ctx)",
     "ifexport_arg_plan.direct:",
-    "forexport_arg_partinexport_arg_plan.parts|extern_param_types|:extern_param_types.push(export_arg_part)",
+    "export_arg_part_count:usize=export_arg_plan.parts.count",
+    "forexport_arg_part_indexin0..<export_arg_part_count|extern_param_types|:extern_param_types.push(export_arg_plan.parts[export_arg_part_index])",
     "else:extern_param_types.push(LLVMPointerTypeInContext(ctx,0))",
 )
 if any(part not in declare for part in declare_steps) or [declare.index(part) for part in declare_steps] != sorted(declare.index(part) for part in declare_steps):

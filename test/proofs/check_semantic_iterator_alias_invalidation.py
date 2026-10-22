@@ -51,7 +51,7 @@ POSITIVE_SHAPES = {
 """,
     "two_alias_hops_resolve_to_the_iterated_source": """def two_alias_hops_resolve_to_the_iterated_source() -> bool:
     ensure result == true
-    alias_names: darray[sview] = ["alias2", "alias"]
+    alias_names: darray[sview] = ["alias2", "alias1"]
     alias_targets: darray[sview] = ["alias1", "xs"]
     return SemanticIteratorAliasResolution::resolve(alias_names, alias_targets, "alias2") == "xs"
 """,
@@ -207,6 +207,8 @@ expected_module = {
     "ambiguous_from": """ghost def ambiguous_from(alias_names: darray[sview]&, name: sview, index: usize, seen: bool) -> bool:
     requires index <= alias_names.count
     decreases alias_names.count - index
+    ensure index == alias_names.count implies result == false
+    ensure (index < alias_names.count and alias_names[index] == name and seen) implies result == true
     ensure (index < alias_names.count and not (alias_names[index] == name and seen)) implies result == ambiguous_from(alias_names, name, index + 1, seen or (index < alias_names.count and alias_names[index] == name))
     return false if index == alias_names.count
     return true if index < alias_names.count and alias_names[index] == name and seen
@@ -235,45 +237,42 @@ expected_module = {
     "resolve_from": """ghost def resolve_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, remaining: usize) -> sview:
     requires remaining <= alias_names.count
     decreases remaining
+    ensure ambiguous_from(alias_names, name, 0, false) implies result == ""
+    ensure (not ambiguous_from(alias_names, name, 0, false) and direct_target_index_from(alias_names, alias_targets, name, 0) >= alias_names.count) implies result == name
+    ensure (not ambiguous_from(alias_names, name, 0, false) and direct_target_index_from(alias_names, alias_targets, name, 0) < alias_names.count and direct_target_value_from(alias_names, alias_targets, name, 0) == name) implies result == ""
+    ensure (not ambiguous_from(alias_names, name, 0, false) and direct_target_index_from(alias_names, alias_targets, name, 0) < alias_names.count and direct_target_value_from(alias_names, alias_targets, name, 0) != name and remaining == 0) implies result == ""
+    ensure (not ambiguous_from(alias_names, name, 0, false) and direct_target_index_from(alias_names, alias_targets, name, 0) < alias_names.count and direct_target_value_from(alias_names, alias_targets, name, 0) != name and remaining > 0) implies result == resolve_from(alias_names, alias_targets, direct_target_value_from(alias_names, alias_targets, name, 0), remaining - 1)
     return "" if ambiguous_from(alias_names, name, 0, false)
     return name if direct_target_index_from(alias_names, alias_targets, name, 0) >= alias_names.count
-    return "" if alias_targets[direct_target_index_from(alias_names, alias_targets, name, 0)] == name
+    return "" if direct_target_value_from(alias_names, alias_targets, name, 0) == name
     return "" if remaining == 0
-    return resolve_from(alias_names, alias_targets, alias_targets[direct_target_index_from(alias_names, alias_targets, name, 0)], remaining - 1)
+    return resolve_from(alias_names, alias_targets, direct_target_value_from(alias_names, alias_targets, name, 0), remaining - 1)
 """,
     "resolve_runtime_from": """def resolve_runtime_from(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview, remaining: usize) -> sview:
     requires remaining <= alias_names.count
     decreases remaining
     ensure result == resolve_from(alias_names, alias_targets, name, remaining)
-    answer: mutable sview = ""
     if ambiguous(alias_names, name):
         assert "" == resolve_from(alias_names, alias_targets, name, remaining)
-        answer <- ""
-    else:
-        target_index: usize = direct_target_index(alias_names, alias_targets, name, 0)
-        assert target_index == direct_target_index_from(alias_names, alias_targets, name, 0)
-        if target_index >= alias_names.count:
-            assert name == resolve_from(alias_names, alias_targets, name, remaining)
-            answer <- name
-        else:
-            assert target_index < alias_targets.count
-            target_value: sview = alias_targets[target_index]
-            if target_value == name:
-                assert "" == resolve_from(alias_names, alias_targets, name, remaining)
-                answer <- ""
-            else:
-                if remaining == 0:
-                    assert "" == resolve_from(alias_names, alias_targets, name, remaining)
-                    answer <- ""
-                else:
-                    assert resolve_from(alias_names, alias_targets, name, remaining) == resolve_from(alias_names, alias_targets, target_value, remaining - 1)
-                    resolved: sview = resolve_runtime_from(alias_names, alias_targets, target_value, remaining - 1)
-                    assert resolved == resolve_from(alias_names, alias_targets, target_value, remaining - 1)
-                    assert resolved == resolve_from(alias_names, alias_targets, name, remaining)
-                    answer <- resolved
-    final_answer: sview = answer
-    assert final_answer == resolve_from(alias_names, alias_targets, name, remaining)
-    return final_answer
+        return ""
+    target_index: usize = direct_target_index(alias_names, alias_targets, name, 0)
+    assert target_index == direct_target_index_from(alias_names, alias_targets, name, 0)
+    if target_index >= alias_names.count:
+        assert name == resolve_from(alias_names, alias_targets, name, remaining)
+        return name
+    assert target_index < alias_targets.count
+    target_value: sview = alias_targets[target_index]
+    if target_value == name:
+        assert "" == resolve_from(alias_names, alias_targets, name, remaining)
+        return ""
+    if remaining == 0:
+        assert "" == resolve_from(alias_names, alias_targets, name, remaining)
+        return ""
+    assert resolve_from(alias_names, alias_targets, name, remaining) == resolve_from(alias_names, alias_targets, target_value, remaining - 1)
+    next_resolved: sview = resolve_runtime_from(alias_names, alias_targets, target_value, remaining - 1)
+    assert next_resolved == resolve_from(alias_names, alias_targets, target_value, remaining - 1)
+    assert next_resolved == resolve_from(alias_names, alias_targets, name, remaining)
+    return next_resolved
 """,
     "resolve": """def resolve(alias_names: darray[sview]&, alias_targets: darray[sview]&, name: sview) -> sview:
     ensure result == resolve_from(alias_names, alias_targets, name, alias_names.count)

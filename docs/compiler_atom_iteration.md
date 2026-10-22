@@ -21,11 +21,19 @@ registration/lookup, local shadows, scalar callback-result classification, and
 constant-pattern lowering. Indirect function values may require explicit references
 in a probe; this tool is a development aid rather than a general linker.
 
-The probes use `-permissive`: unrelated dependency contracts that cannot be proved
-in the sliced context retain their runtime checks. Source checking and SMT stay
-enabled. These results do **not** qualify a full strict compiler build or establish
-end-to-end incremental build time. Keep the complete self-compilation check as a
-separate gate, also capped at 30 seconds.
+The `pymodule_struct_typedef`, `try_fallback_source`, `authority_coverage`,
+`authority_annotation_index`, and `iterator_alias_resolution` atoms use `-strict`.
+All other atoms use `-permissive`, so unrelated dependency contracts that cannot
+be proved in the sliced context retain their runtime checks. Source checking and
+SMT stay enabled in both modes. These results do **not** qualify a full strict
+compiler build or establish end-to-end incremental build time. Keep the complete
+self-compilation check as a separate gate, also capped at 30 seconds.
+
+The `scalar_hash_native_smoke.sh` parity check compiles the production `ctx_hash_u64`
+and `ctx_unhash_u64` helpers, runs twelve boundary and representative vectors, and
+checks the unoptimized hash IR for the expected round operations so an inlined
+inverse witness cannot escape the helper-call check. It is discovered by the
+`test/parity/run_all.sh` smoke-file glob.
 
 For parser/backend integration (including native execution), run:
 

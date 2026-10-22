@@ -26,7 +26,7 @@ while i<len(lines):
  if line.strip() and not line.lstrip().startswith('#'):
   line_indent=len(line)-len(line.lstrip())
   while contexts and contexts[-1][0]>=line_indent:contexts.pop()
- m=re.match(r'^( *)(?:(?:private|public) )?def ([A-Za-z_]\w*)',lines[i])
+ m=re.match(r'^( *)(?:(?:private|public) )?(?:ghost )?def ([A-Za-z_]\w*)',lines[i])
  if not m:
   if lines[i].rstrip().endswith(':'):contexts.append((len(lines[i])-len(lines[i].lstrip()),lines[i].strip()))
   base.append(lines[i]);i+=1;continue
@@ -85,5 +85,15 @@ while changed:
     changed=True;continue
   result.append(l)
  ll=result
-out.write_text('\n'.join(result)+'\n'+harness)
+# Pruning the last function from a static branch must not leave an empty suite.
+# Keep its condition and else pairing intact with a compile-time-only anchor.
+anchored=[]
+for i,line in enumerate(result):
+ anchored.append(line)
+ if re.match(r'^ *static (?:if .+|elif .+|else):\s*$',line):
+  indent=len(line)-len(line.lstrip())
+  nxt=next((x for x in result[i+1:] if x.strip() and not x.lstrip().startswith('#')),None)
+  if nxt is None or len(nxt)-len(nxt.lstrip())<=indent:
+   anchored.append(' '*(indent+4)+f'const __compiler_atom_branch_anchor_{i}: u32 = 0')
+out.write_text('\n'.join(anchored)+'\n'+harness)
 print(f'{len(kept)}/{len(funcs)} functions; {len(s.splitlines())} lines; {out}')

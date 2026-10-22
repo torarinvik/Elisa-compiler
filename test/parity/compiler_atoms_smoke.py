@@ -3,8 +3,10 @@
 
 Uses the selected stage0 compiler (ELISACORE_BIN) to compile the current Elisa
 implementation. This checks runtime behavior of the sliced functions, not a
-complete stage1 build. -permissive retains runtime checks for dependency contracts
-that this isolated unit cannot prove; source checks and SMT remain enabled.
+complete stage1 build. Most probes use -permissive for dependency contracts that
+the isolated unit cannot prove; source checks and SMT remain enabled. The
+pymodule_struct_typedef, try_fallback_source, authority_coverage,
+authority_annotation_index, and iterator_alias_resolution probes use -strict.
 """
 import os
 from pathlib import Path
@@ -17,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = os.environ.get("ELISACORE_BIN", str(ROOT / "../../Go projects/Elisa-core/compiler/bin/elisac"))
 LLVM_CONFIG = os.environ.get("LLVM_CONFIG") or shutil.which("llvm-config") or "/opt/homebrew/opt/llvm/bin/llvm-config"
-ATOMS = ("semantic", "backend", "borrow_replay", "thread_shareability", "exclusivity", "readonly_ref", "error_union", "or_constants", "region_assignment", "incremental_empty_body", "firm_extern_index")
+ATOMS = ("semantic", "backend", "borrow_replay", "thread_shareability", "exclusivity", "readonly_ref", "error_union", "or_constants", "region_assignment", "incremental_empty_body", "firm_extern_index", "pymodule_struct_typedef", "try_fallback_source", "authority_coverage", "authority_annotation_index", "iterator_alias_resolution")
 selected_atoms = sys.argv[1:] or ATOMS
 if any(atom not in ATOMS for atom in selected_atoms):
     raise SystemExit(f"Choose atom names from: {', '.join(ATOMS)}")
@@ -45,12 +47,13 @@ with tempfile.TemporaryDirectory(prefix="elisa-compiler-atoms-") as work:
     env.setdefault("ELISACORE_SMT_CACHE_DECLINED", "1")
     for atom in selected_atoms:
         started = time.perf_counter()
-        unit = ROOT / ("src/backend/codegen.elisa" if atom == "backend" else "src/semantic/semantic.elisa")
+        unit = ROOT / ("src/backend/codegen.elisa" if atom == "backend" else "src/driver/elisac.elisa" if atom == "pymodule_struct_typedef" else "src/semantic/semantic.elisa")
         source, obj, binary = (work / f"{atom}{ext}" for ext in (".elisa", ".o", ""))
         probe = f"test/atoms/compiler_{atom}.elisa" if atom in ("semantic", "backend") else f"test/atoms/{atom}.elisa"
         run([sys.executable, str(ROOT / "scripts/compiler_atom_slice.py"), str(unit),
              str(ROOT / probe), str(source)])
-        run([COMPILER, "-emit", "obj", "-permissive", "-O0", "-o", str(obj), str(source)], env=env)
+        proof_mode = "-strict" if atom in ("pymodule_struct_typedef", "try_fallback_source", "authority_coverage", "authority_annotation_index", "iterator_alias_resolution") else "-permissive"
+        run([COMPILER, "-emit", "obj", proof_mode, "-O0", "-o", str(obj), str(source)], env=env)
         flags = ["-Wl,-dead_strip"] if sys.platform == "darwin" else ["-Wl,--gc-sections"]
         if atom == "backend":
             libdir = run([LLVM_CONFIG, "--libdir"]).strip()

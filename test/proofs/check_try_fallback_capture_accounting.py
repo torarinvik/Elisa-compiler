@@ -8,11 +8,11 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "src/semantic/check_try_fallible.elisa"
 text = SOURCE.read_text(encoding="utf-8")
 
+# Annotation arrays are read-only references. docs/119 E10 permits only
+# mutable bindings in a value-block capture list; those inputs stay ordinary reads.
 required = {
     "table",
-    "annotations",
     "module_index",
-    "module_annotations",
     "error_index",
     "function_positions",
 }
@@ -28,6 +28,9 @@ for item, sequence in (
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one {item} fallback traversal, found {len(matches)}")
     captures = {name.strip() for name in matches[0].split(",")}
+    readonly = captures & {"annotations", "module_annotations"}
+    if readonly:
+        raise SystemExit(f"{item} fallback traversal threads read-only inputs: {sorted(readonly)}")
     missing = required - captures
     if missing:
         raise SystemExit(f"{item} fallback traversal omits captures: {sorted(missing)}")

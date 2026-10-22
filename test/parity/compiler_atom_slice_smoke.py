@@ -40,4 +40,19 @@ def main() -> u32:
         assert "def discarded()" not in sliced, call
         assert sliced.count("def main()") == 1, call
 
+    source.write_text('''static if FIRST:\n    def first() -> u32:\n        return 1\nstatic elif SECOND:\n    def second() -> u32:\n        return 2\nstatic else:\n    def third() -> u32:\n        return 3\n''')
+    probe.write_text("def main() -> u32:\n    return 0\n")
+    subprocess.run(
+        [sys.executable, str(ROOT / "scripts/compiler_atom_slice.py"),
+         str(source), str(probe), str(output)],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    sliced_lines = output.read_text().splitlines()
+    static_headers = ("static if FIRST:", "static elif SECOND:", "static else:")
+    for header in static_headers:
+        index = sliced_lines.index(header)
+        assert sliced_lines[index + 1].startswith(
+            "    const __compiler_atom_branch_anchor_"
+        ), header
+
 print("compiler atom slice references: ok")

@@ -1,4 +1,5 @@
 """Admit source-linked proofs for ABI lint's ASCII and assembly token boundaries."""
+import argparse
 import hashlib
 import json
 import os
@@ -24,6 +25,11 @@ NEGATIVE = HERE / "abi_lint_byte_classification_rejected.elisa"
 
 if not __debug__:
     raise SystemExit("run without Python -O")
+
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source bindings and guard order without a proof product")
+arguments = argument_parser.parse_args()
 
 
 def compact(text: str) -> str:
@@ -77,14 +83,16 @@ if compact(f"ensure result == {lower_spec}") not in compact(lower_body):
 if compact(f"return {lower_spec}") not in compact(lower_body):
     raise SystemExit("ABI case-fold implementation differs from its ASCII contract")
 require_in_order(abi_text, "abi_span_is", "def abi_span_is(text: darray[u8]&, start: usize, needle: sview) -> bool:", (
-    "false return if start > text.count",
-    "false return if needle.len > text.count - start",
+    "return false if:",
+    "start > text.count",
+    "needle.len > text.count - start",
     "for index in 0..<needle.len |text, needle, start|",
     "text[start + index]",
 ))
 require_in_order(abi_text, "abi_span_is_ci", "def abi_span_is_ci(text: darray[u8]&, start: usize, needle: sview) -> bool:", (
-    "false return if start > text.count",
-    "false return if needle.len > text.count - start",
+    "return false if:",
+    "start > text.count",
+    "needle.len > text.count - start",
     "for index in 0..<needle.len |text, needle, start|",
     "text[start + index]",
 ))
@@ -125,13 +133,14 @@ for fragment in (
     "dot <- index if path[index] == 46",
     "for index in dot..<path.count |extension, path|",
     "extension.push(abi_lower(path[index]))",
-    'true return if bytes_equal_view(extension, ".c")',
-    'true return if bytes_equal_view(extension, ".cc")',
-    'true return if bytes_equal_view(extension, ".cpp")',
-    'true return if bytes_equal_view(extension, ".cxx")',
-    'true return if bytes_equal_view(extension, ".h")',
-    'true return if bytes_equal_view(extension, ".hpp")',
-    'true return if bytes_equal_view(extension, ".hh")',
+    "return true if:",
+    'bytes_equal_view(extension, ".c")',
+    'bytes_equal_view(extension, ".cc")',
+    'bytes_equal_view(extension, ".cpp")',
+    'bytes_equal_view(extension, ".cxx")',
+    'bytes_equal_view(extension, ".h")',
+    'bytes_equal_view(extension, ".hpp")',
+    'bytes_equal_view(extension, ".hh")',
     "return false",
 ):
     if compact(fragment) not in compact(native_body):
@@ -190,6 +199,10 @@ negative_names = {
 for name in negative_names:
     if f"def {name}(" not in negative_text:
         raise SystemExit(f"negative ABI-byte control is missing: {name}")
+
+if arguments.source_only:
+    print(f"source_bound=True positive={len(positive_names) - 2} false_controls={len(negative_names)}")
+    raise SystemExit(0)
 
 
 def include_closure(roots: list[Path]) -> list[Path]:
