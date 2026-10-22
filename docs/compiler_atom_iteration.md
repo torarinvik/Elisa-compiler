@@ -778,9 +778,29 @@ These local measurements do not establish a full-build speedup. The capped full
 compiler semantic check still timed out; its allocation profile identifies
 repeated call-filled element-state merges as a larger remaining source.
 
-Call-filled element states now gather argument provenance and merge it once.
+Call-filled element states now gather argument provenance and merge flat states
+with direct provenance once. Nested/field-only states retain the sequential
+fold, including its sticky unknown verdict and order-sensitive normalization.
 A deterministic 500-case comparison checks the result against the prior
 sequential fold, including nested fields and parameter dependencies. The
-eight-state merge benchmark reduced allocations from 2,800 bytes / 14 allocations
+flat eight-state merge benchmark reduced allocations from 2,800 bytes / 14 allocations
 to 400 bytes / 2 allocations (about 3.7 to 1.1 microseconds in that focused run).
 The source-gathering and full-build costs are outside that microbenchmark.
+
+The focused merge tests used a Go test build with inlining disabled to keep test
+compilation within the cap. A normally optimized bootstrap was then built in
+capped dependency stages from frozen Go inputs, and the current scope,
+holder-view wrapper, and program-view atoms passed against it. Fresh `-O0`
+Stage1 seed attempts with both four and two semantic workers still timed out
+during analysis at 30 seconds. The worker default remains unchanged; profiles
+still show runtime page reuse and zeroing as the dominant costs. A fresh Stage1
+product and self-compilation remain unverified.
+
+Generic struct parameter-provenance layouts no longer reserve map slots for
+fixed numeric and boolean fields once type shapes are frozen. Unresolved and
+generic fields remain in the capacity hint, and substitution/traversal order is
+unchanged. On a 130-field generic fixture with one retained view, the focused
+benchmark fell from 27,527 bytes / 7 allocations to about 1,100 bytes / 5
+allocations. Tests cover scalar, view, and reference generic arguments with both
+frozen and unfrozen type shapes. This allocation result is not a fresh Stage1
+seed or an end-to-end build timing.

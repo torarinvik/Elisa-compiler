@@ -42,6 +42,7 @@ EXPECTED_SIDE_TABLE_FIELDS = {
 CHV_FLOW_NAMES = (
     "flow", "then_flow", "else_flow", "merged_flow", "arm_flow", "guarded_flow",
     "entry_flow", "recovery_flow", "comprehension_flow", "lambda_flow", "loop_flow",
+    "left_flow", "right_flow",
 )
 
 
@@ -441,11 +442,12 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("if not index_receiver_is_type_application(object):", "for argument in arguments |table|:", 1),
     ("for argument in arguments |table|:", "table <- chv_walk_expression(argument, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, binary_operator, right, _):", "table <- chv_walk_expression(left, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Expr.Binary(left, binary_operator, right, _):", "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_rhs_is_runtime_value: bool = not chv_binary_operator_has_non_runtime_target(binary_operator)"),
+    ("if binary_operator != TokenKind.And:", "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
-    ("Expr.Binary(left, binary_operator, right, _):", "if binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
+    ("Expr.Binary(left, binary_operator, right, _):", "if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
     ("Expr.Unary(operator, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Move(operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.RegionNew(operand, _, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
@@ -484,9 +486,27 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Block(block_statements, block_value, _, _):", "table <- chv_walk_expression(block_value, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
 )
 
+BINARY_AND_RIGHT_WALK_EDGE = (
+    "if binary_operator == TokenKind.And:",
+    "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, right_flow, summary, table)",
+)
+
+BINARY_RIGHT_VIEW_EDGES = (
+    ("if binary_operator == TokenKind.And:", "right_may_be_owned_view <- right_flow.last_value_may_be_owned_view"),
+    ("if binary_operator != TokenKind.And:", "right_may_be_owned_view <- flow.last_value_may_be_owned_view"),
+)
+
 BINARY_OPERATOR_FALLBACK_EDGES = (
-    ("Expr.Binary(left, binary_operator, right, _):", "if binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
-    ("if binary_operator != TokenKind.And and binary_operator != TokenKind.Or:", "table <- chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
+    ("if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:", "table <- chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+)
+
+BINARY_NON_RUNTIME_TARGET_EDGES = (
+    ("can Abort.Panic:", "return operator == TokenKind.Is or operator == TokenKind.As"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_rhs_is_runtime_value: bool = not chv_binary_operator_has_non_runtime_target(binary_operator)"),
 )
 
 CONSTRUCT_VIEW_TAINT_EDGES = (
@@ -694,7 +714,7 @@ UNARY_NEGATION_EDGES = (
 
 BINARY_VIEW_WALK_EDGES = (
     ("Expr.Binary(left, binary_operator, right, _):", "left_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
-    ("Expr.Binary(left, binary_operator, right, _):", "right_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
+    ("Expr.Binary(left, binary_operator, right, _):", "right_may_be_owned_view: mutable bool = false"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_result_is_bool: bool = chv_binary_operator_returns_bool(binary_operator, right)"),
     ("Expr.Binary(left, binary_operator, right, _):", "flow.last_value_may_be_owned_view <- (left_may_be_owned_view or right_may_be_owned_view) if not binary_result_is_bool else false"),
 )
@@ -1076,8 +1096,14 @@ theorem_routes = {
     },
     "proof_chv_binary_operator_checks_both_operands": {
         "receiver_checked": (HOLDER_WALK_EXPRESSION_EDGES[21],),
-        "operand_checked": (HOLDER_WALK_EXPRESSION_EDGES[22],),
-        "fallback_checked": BINARY_OPERATOR_FALLBACK_EDGES,
+        "operand_checked": (BINARY_NON_RUNTIME_TARGET_EDGES[0], BINARY_NON_RUNTIME_TARGET_EDGES[1], HOLDER_WALK_EXPRESSION_EDGES[23], BINARY_AND_RIGHT_WALK_EDGE),
+        "fallback_checked": (BINARY_NON_RUNTIME_TARGET_EDGES[0], BINARY_NON_RUNTIME_TARGET_EDGES[1]) + BINARY_OPERATOR_FALLBACK_EDGES,
+    },
+    "proof_chv_binary_target_operators_skip_runtime_value_path": {
+        "target_operator": (BINARY_NON_RUNTIME_TARGET_EDGES[0],),
+        "target_classified": (BINARY_NON_RUNTIME_TARGET_EDGES[1],),
+        "right_walk_guarded": (HOLDER_WALK_EXPRESSION_EDGES[22], HOLDER_WALK_EXPRESSION_EDGES[23], BINARY_AND_RIGHT_WALK_EDGE),
+        "fallback_guarded": (HOLDER_WALK_EXPRESSION_EDGES[22],) + BINARY_OPERATOR_FALLBACK_EDGES,
     },
     "proof_chv_binary_operator_result_tracks_reference_operands": {
         "boolean_result": (REF_ALIAS_HELPER_EDGES[5], BINARY_BOOLEAN_RESULT_EDGES[1], BINARY_BOOLEAN_RESULT_EDGES[2]) + REINTERPRET_TARGET_MARKER_EDGES,
@@ -1087,7 +1113,9 @@ theorem_routes = {
     "proof_chv_binary_operator_result_tracks_view_operands": {
         "boolean_result": BINARY_BOOLEAN_RESULT_EDGES + REINTERPRET_TARGET_MARKER_EDGES,
         "left_may_be_view": (BINARY_VIEW_WALK_EDGES[0], BINARY_VIEW_WALK_EDGES[3]),
-        "right_may_be_view": (BINARY_VIEW_WALK_EDGES[1], BINARY_VIEW_WALK_EDGES[3]),
+        "right_may_be_view": (HOLDER_WALK_EXPRESSION_EDGES[22], BINARY_AND_RIGHT_WALK_EDGE,
+                               BINARY_RIGHT_VIEW_EDGES[0], HOLDER_WALK_EXPRESSION_EDGES[23],
+                               BINARY_RIGHT_VIEW_EDGES[1], BINARY_VIEW_WALK_EDGES[3]),
     },
     "proof_chv_binary_boolean_result_clears_view_taint": {
         "boolean_result_classified": BINARY_BOOLEAN_RESULT_EDGES[:3] + REINTERPRET_TARGET_MARKER_EDGES,
@@ -1173,8 +1201,21 @@ for name, routes in theorem_routes.items():
     elif name == "proof_chv_comprehension_scope_masks_shadowed_reference":
         proof_source, proof_edges = holder_walk_expressions, HOLDER_WALK_EXPRESSION_EDGES
     elif name == "proof_chv_binary_operator_checks_both_operands":
-        proof_source = holder_walk_expressions
-        proof_edges = HOLDER_WALK_EXPRESSION_EDGES + BINARY_OPERATOR_FALLBACK_EDGES
+        source_route_sources = {
+            "walker": holder_walk_expressions,
+            "target": function_section(holder_text, "chv_binary_operator_has_non_runtime_target"),
+        }
+        source_route_edges = {
+            "receiver_checked": (("walker", HOLDER_WALK_EXPRESSION_EDGES[21]),),
+            "operand_checked": (("target", BINARY_NON_RUNTIME_TARGET_EDGES[0]),
+                                ("walker", BINARY_NON_RUNTIME_TARGET_EDGES[1]),
+                                ("walker", HOLDER_WALK_EXPRESSION_EDGES[23]),
+                                ("walker", BINARY_AND_RIGHT_WALK_EDGE)),
+            "fallback_checked": (("target", BINARY_NON_RUNTIME_TARGET_EDGES[0]),
+                                 ("walker", BINARY_NON_RUNTIME_TARGET_EDGES[1])) + tuple(
+                                     ("walker", edge) for edge in BINARY_OPERATOR_FALLBACK_EDGES),
+        }
+        proof_source, proof_edges = "", ()
     elif name == "proof_chv_binary_operator_result_tracks_reference_operands":
         source_route_sources = {
             "alias": function_section(holder_text, "chv_expression_may_alias_ref"),
@@ -1204,8 +1245,27 @@ for name, routes in theorem_routes.items():
             "boolean_result": boolean_result_route,
             "left_may_be_view": (("walker", BINARY_VIEW_WALK_EDGES[0]),
                                  ("walker", BINARY_VIEW_WALK_EDGES[3])),
-            "right_may_be_view": (("walker", BINARY_VIEW_WALK_EDGES[1]),
+            "right_may_be_view": (("walker", HOLDER_WALK_EXPRESSION_EDGES[22]),
+                                  ("walker", BINARY_AND_RIGHT_WALK_EDGE),
+                                  ("walker", BINARY_RIGHT_VIEW_EDGES[0]),
+                                  ("walker", HOLDER_WALK_EXPRESSION_EDGES[23]),
+                                  ("walker", BINARY_RIGHT_VIEW_EDGES[1]),
                                   ("walker", BINARY_VIEW_WALK_EDGES[3])),
+        }
+        proof_source, proof_edges = "", ()
+    elif name == "proof_chv_binary_target_operators_skip_runtime_value_path":
+        source_route_sources = {
+            "walker": holder_walk_expressions,
+            "target": function_section(holder_text, "chv_binary_operator_has_non_runtime_target"),
+        }
+        source_route_edges = {
+            "target_operator": (("target", BINARY_NON_RUNTIME_TARGET_EDGES[0]),),
+            "target_classified": (("walker", BINARY_NON_RUNTIME_TARGET_EDGES[1]),),
+            "right_walk_guarded": (("walker", HOLDER_WALK_EXPRESSION_EDGES[22]),
+                                   ("walker", HOLDER_WALK_EXPRESSION_EDGES[23]),
+                                   ("walker", BINARY_AND_RIGHT_WALK_EDGE)),
+            "fallback_guarded": (("walker", HOLDER_WALK_EXPRESSION_EDGES[22]),) + tuple(
+                ("walker", edge) for edge in BINARY_OPERATOR_FALLBACK_EDGES),
         }
         proof_source, proof_edges = "", ()
     elif name == "proof_chv_binary_boolean_result_clears_view_taint":
@@ -1331,10 +1391,12 @@ for name, routes in theorem_routes.items():
         proof_source, proof_edges = collect_source, EXPRESSION_EDGES
     if source_route_edges is not None:
         boolean_expressions = {
+            "proof_chv_binary_operator_checks_both_operands": "receiver_checked and operand_checked and fallback_checked",
             "proof_chv_binary_operator_result_tracks_reference_operands": "not boolean_result and (left_alias or right_alias)",
             "proof_chv_binary_operator_result_tracks_view_operands": "not boolean_result and (left_may_be_view or right_may_be_view)",
             "proof_chv_binary_boolean_result_clears_view_taint": "boolean_result_classified and result_taint_cleared",
             "proof_chv_call_result_tracks_argument_view": "direct_result_may_be_owned or argument_may_be_owned",
+            "proof_chv_binary_target_operators_skip_runtime_value_path": "target_operator and target_classified and right_walk_guarded and fallback_guarded",
         }
         validate_exact_boolean_theorem_source_routes(
             positive_text, name, tuple(routes), boolean_expressions[name],
@@ -1416,6 +1478,7 @@ for source, edges, label in (
 ):
     validate_edge_set(source, edges, label)
 validate_edge_set(holder_walk_expressions, BINARY_OPERATOR_FALLBACK_EDGES, "holder-view binary operator fallback")
+validate_edge_set(function_section(holder_text, "chv_binary_operator_has_non_runtime_target"), (BINARY_NON_RUNTIME_TARGET_EDGES[0],), "holder-view non-runtime binary target classification")
 validate_edge_set(holder_walk_expressions, ARRAY_VIEW_TAINT_EDGES, "holder-view array and tuple taint")
 validate_edge_set(holder_walk_expressions, DICT_VIEW_TAINT_EDGES, "holder-view dictionary taint")
 validate_edge_set(holder_walk_expressions, COMPREHENSION_VIEW_TAINT_EDGES, "holder-view comprehension result taint")
@@ -1471,6 +1534,7 @@ validate_edge_set(function_section(holder_text, "chv_check_unknown_call"), UNKNO
 validate_edge_set(holder_walk_expressions, INDEX_OPERATOR_EDGES, "holder-view overloaded index fallback")
 validate_edge_set(holder_walk_expressions, UNARY_NEGATION_EDGES, "holder-view unary negation fallback")
 validate_edge_set(holder_walk_expressions, BINARY_VIEW_WALK_EDGES, "holder-view binary result provenance")
+validate_edge_set(holder_walk_expressions, BINARY_RIGHT_VIEW_EDGES, "holder-view binary RHS provenance")
 validate_edge_set(holder_walk_expressions, (BINARY_BOOLEAN_RESULT_EDGES[0], BINARY_BOOLEAN_RESULT_EDGES[3]), "holder-view boolean-result taint flow")
 validate_edge_set(function_section(holder_text, "chv_binary_operator_returns_bool"), BINARY_BOOLEAN_RESULT_EDGES[1:3], "holder-view boolean operator classification")
 validate_edge_set(function_section(holder_text, "chv_is_reinterpret_target_marker"), REINTERPRET_TARGET_MARKER_EDGES, "reinterpret target marker classification")
