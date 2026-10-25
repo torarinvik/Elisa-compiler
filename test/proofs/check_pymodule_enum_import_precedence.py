@@ -146,17 +146,21 @@ defaults_source = (ROOT / "src/driver/pymodule/defaults.elisa").read_text(encodi
 visible_alias = compact_function(defaults_source, "pymodule_default_visible_module_alias")
 if not (
     'annotation.name!="__using_alias"orannotation.owner!=name' in visible_alias
-    and "return(index,false)" in visible_alias
+    and "pymodule_default_module_alias_branch_selection(file,index)" in visible_alias
+    and "pymodule_default_module_alias_registration_precedes(file,index,selected_index)" in visible_alias
+    and "return(selected_index,false)" in visible_alias
     and "pymodule_default_alias_scope_matches" not in visible_alias
 ):
-    raise SystemExit("module alias lookup must be global and retain Core's first declaration")
+    raise SystemExit("module alias lookup must be global, branch-aware, and retain Core registration precedence")
 prior_alias = compact_function(defaults_source, "pymodule_default_visible_prior_module_alias")
 if not (
     "annotation.offset>=before_offset" in prior_alias
+    and "pymodule_default_module_alias_branch_selection(file,index)" in prior_alias
+    and "pymodule_default_module_alias_registration_precedes(file,index,selected_index)" in prior_alias
     and "pymodule_default_alias_scope_matches" not in prior_alias
-    and "return(index,false)" in prior_alias
+    and "return(selected_index,false)" in prior_alias
 ):
-    raise SystemExit("alias target canonicalization must use the first earlier global alias")
+    raise SystemExit("alias target canonicalization must use the first active earlier global alias")
 sibling_alias = (ROOT / "test/repro/pymodule_sibling_module_alias_qualifier.elisa").read_text(encoding="utf-8")
 if not all(fragment in sibling_alias for fragment in (
     "module AliasDecl:",

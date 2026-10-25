@@ -21,7 +21,9 @@ extend Semantic:
 
         struct PrivateImportSourceIndex:
             heads: mutable dict[u64, u32]
+            modules: mutable darray[sview @source]
             lines: mutable darray[u32]
+            offsets: mutable darray[u32]
             source_annotations: mutable darray[usize]
             next: mutable darray[u32]
 
@@ -44,16 +46,25 @@ extend Semantic:
             can Abort.Panic:
                 return head if index.import_heads.get(hash) is head else SYMBOL_INDEX_ROW_NONE
 
-        def pma_import_source_head(index: PrivateImportSourceIndex&, line: u32) -> u32:
+        def pma_import_source_hash(module: sview, line: u32, offset: u32) -> u64:
             can Abort.Panic:
-                return row if index.heads.get(line.u64()) is row else SYMBOL_INDEX_ROW_NONE
+                hash: mutable u64 = name_hash(module)
+                hash <- (hash ^ PMA_HASH_COMPONENT_SEPARATOR) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ line.u64()) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ PMA_HASH_COMPONENT_SEPARATOR) * SEMANTIC_HASH_PRIME
+                hash <- (hash ^ offset.u64()) * SEMANTIC_HASH_PRIME
+                return hash
 
-        def pma_import_source_contains(index: PrivateImportSourceIndex&, annotations: darray[Ast::EnumAnnotation]&, line: u32, owner: sview) -> bool:
+        def pma_import_source_head(index: PrivateImportSourceIndex&, module: sview, line: u32, offset: u32) -> u32:
             can Abort.Panic:
-                row: mutable u32 = pma_import_source_head(index, line)
-                while row != SYMBOL_INDEX_ROW_NONE |row, index, annotations, line, owner|:
+                return row if index.heads.get(pma_import_source_hash(module, line, offset)) is row else SYMBOL_INDEX_ROW_NONE
+
+        def pma_import_source_contains(index: PrivateImportSourceIndex&, annotations: darray[Ast::EnumAnnotation]&, module: sview, line: u32, offset: u32, source_module: sview) -> bool:
+            can Abort.Panic:
+                row: mutable u32 = pma_import_source_head(index, module, line, offset)
+                while row != SYMBOL_INDEX_ROW_NONE |row, index, annotations, module, line, offset, source_module|:
                     source_annotation: Ast::EnumAnnotation = annotations[index.source_annotations[row.usize()]]
-                    return true if index.lines[row.usize()] == line and source_annotation.name == owner
+                    return true if index.modules[row.usize()] == module and index.lines[row.usize()] == line and index.offsets[row.usize()] == offset and source_annotation.name == source_module
                     row <- index.next[row.usize()]
                 return false
 
@@ -83,10 +94,10 @@ extend Semantic:
 
         def pma_build_selective_import_index(annotations: darray[Ast::EnumAnnotation]&, index: mutable PrivateMemberIndex&) -> void:
             can Memory.Allocate, Abort.Panic:
-                sources: mutable PrivateImportSourceIndex = PrivateImportSourceIndex{heads: {}, lines: [], source_annotations: [], next: []}
-                # Build a line index once. The source/member relation is defined by the parser's
-                # paired source line, not by adjacency, so multiple annotations on one line keep
-                # the same conservative matching behavior as the previous checker.
+                sources: mutable PrivateImportSourceIndex = PrivateImportSourceIndex{heads: {}, modules: [], lines: [], offsets: [], source_annotations: [], next: []}
+                # Build an exact import-position index once. Multiple imports can share a
+                # logical #line value, so source/member pairing includes lexical module and
+                # token offset rather than joining every row with the same line.
                 for source_index in 0..<annotations.count |source_index, annotations, sources|:
                     annotation: Ast::EnumAnnotation = annotations[source_index]
                     continue if annotation.owner != "__from_src"
@@ -94,19 +105,21 @@ extend Semantic:
                     # for every member. Store its source row once rather than creating a
                     # quadratic cross-product when projecting its members. Keep an integer
                     # back-reference so the temporary index never owns borrowed source text.
-                    continue if pma_import_source_contains(sources, annotations, annotation.line, annotation.name)
-                    hash: u64 = annotation.line.u64()
-                    previous: u32 = pma_import_source_head(sources, annotation.line)
+                    continue if pma_import_source_contains(sources, annotations, annotation.module, annotation.line, annotation.offset, annotation.name)
+                    hash: u64 = pma_import_source_hash(annotation.module, annotation.line, annotation.offset)
+                    previous: u32 = pma_import_source_head(sources, annotation.module, annotation.line, annotation.offset)
                     row: u32 = sources.source_annotations.count.u32()
+                    sources.modules.push(annotation.module)
                     sources.lines.push(annotation.line)
+                    sources.offsets.push(annotation.offset)
                     sources.source_annotations.push(source_index)
                     sources.next.push(previous)
                     sources.heads <- sources.heads.put(hash, row) can Global{Read,Write}
                 for annotation in annotations |annotations, sources, index|:
                     continue if annotation.owner != "__from_member"
-                    row: mutable u32 = pma_import_source_head(sources, annotation.line)
+                    row: mutable u32 = pma_import_source_head(sources, annotation.module, annotation.line, annotation.offset)
                     while row != SYMBOL_INDEX_ROW_NONE |row, annotations, sources, annotation, index|:
-                        if sources.lines[row.usize()] == annotation.line:
+                        if sources.modules[row.usize()] == annotation.module and sources.lines[row.usize()] == annotation.line and sources.offsets[row.usize()] == annotation.offset:
                             source_annotation: Ast::EnumAnnotation = annotations[sources.source_annotations[row.usize()]]
                             pma_add_selective_import(index, source_annotation.name, annotation.name) can Global{Read,Write}
                         row <- sources.next[row.usize()]
@@ -205,35 +218,132 @@ extend Semantic:
                 return true if import_scope == ""
                 return pma_within_module(current_module, import_scope)
 
-        def pma_static_if_named_constant_value(name: sview, current_module: sview, table: SymbolTable&, depth: u32) -> (known: bool, value: i64):
+        # A source const nested in an unselected static-if arm is not a candidate for the
+        # backend's folded condition. Branch identity is emitted beside the declaration so
+        # same-scope sibling consts can be filtered before name resolution.
+        def pma_static_if_const_branch_selection(file: Ast::File&, name: sview, symbol: Symbol, table: SymbolTable&, depth: u32) -> (known: bool, active: bool):
+            can Abort.Panic:
+                return (false, false) if depth >= 64
+                found_marker: mutable bool = false
+                unknown: mutable bool = false
+                for marker in file.enum_annotations |found_marker, unknown, file, name, symbol, table, depth|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__const_static_branch" or marker.detail_name != name or marker.module != symbol.module_owner or marker.line != symbol.line or marker.offset != symbol.offset
+                    found_marker <- true
+                    branch: mutable (known: bool, selected: bool) = (false, false)
+                    branch <- pma_static_if_row_selection(file, marker.identity_id.usize(), symbol.module_owner, table, depth + 1) if marker.identity_id != 4294967295
+                    return (true, false) if branch.known and not branch.selected
+                    unknown <- true if marker.identity_id == 4294967295 or not branch.known
+                return (true, true) if not found_marker
+                return (false, false) if unknown
+                return (true, true)
+
+        # Public overload ranking may suppress a private candidate only when this
+        # declaration's static-if ancestry proves it active. Unknown markers are not
+        # evidence that a public sibling wins the call.
+        def pma_static_if_function_branch_selection(file: Ast::File&, name: sview, symbol: Symbol, table: SymbolTable&, depth: u32) -> (known: bool, active: bool):
+            can Abort.Panic:
+                return (false, false) if depth >= 64
+                found_marker: mutable bool = false
+                unknown: mutable bool = false
+                for marker in file.enum_annotations |found_marker, unknown, file, name, symbol, table, depth|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__function_static_branch" or marker.detail_name != name or marker.module != symbol.module_owner or marker.line != symbol.line or marker.offset != symbol.offset
+                    found_marker <- true
+                    branch: mutable (known: bool, selected: bool) = (false, false)
+                    branch <- pma_static_if_row_selection(file, marker.identity_id.usize(), symbol.module_owner, table, depth + 1) if marker.identity_id != 4294967295
+                    return (true, false) if branch.known and not branch.selected
+                    unknown <- true if marker.identity_id == 4294967295 or not branch.known
+                return (true, true) if not found_marker
+                return (false, false) if unknown
+                return (true, true)
+
+        # Match direct module-qualified constant paths against the declaration owner.
+        # Try the full spelling first, then the caller's module and lexical parents, as
+        # ordinary qualified lookup does. Aliases that cannot be proven here stay unknown.
+        def pma_static_if_qualified_module_matches(base: Ast::Expr, owner: sview, current_module: sview) -> bool:
+            can Abort.Panic:
+                return true if pma_chain_ends_at(base, owner, owner.len)
+                candidate_scope: mutable sview = current_module
+                while candidate_scope != "" |candidate_scope, base, owner|:
+                    prefix_length: usize = candidate_scope.len
+                    matches_prefix: mutable bool = owner.len > prefix_length + 2.usize()
+                    for index in 0..<prefix_length |index, matches_prefix, candidate_scope, owner|:
+                        matches_prefix <- false if owner[index] != candidate_scope[index]
+                    if matches_prefix and owner[prefix_length] == 58 and owner[prefix_length + 1.usize()] == 58:
+                        suffix: sview = string_view_slice(owner, (prefix_length + 2.usize()).i64(), owner.len.i64())
+                        return pma_chain_ends_at(base, suffix, suffix.len)
+                    parent_end: mutable usize = 0
+                    for index in 0..<candidate_scope.len |index, parent_end, candidate_scope|:
+                        parent_end <- index if index + 1.usize() < candidate_scope.len and candidate_scope[index] == 58 and candidate_scope[index + 1.usize()] == 58
+                    candidate_scope <- string_view_slice(candidate_scope, 0, parent_end.i64()) if parent_end > 0
+                    candidate_scope <- "" if parent_end == 0
+                return false
+
+        def pma_static_if_named_constant_value(name: sview, current_module: sview, file: Ast::File&, table: SymbolTable&, depth: u32, qualifier: Ast::Expr? = null) -> (known: bool, value: i64):
             can Abort.Panic:
                 return (false, 0) if depth >= 64
                 selected_row: mutable usize = table.immutable_const_values.count
                 selected_scope_length: mutable usize = 0.usize()
-                for const_index in 0..<table.immutable_const_values.count |selected_row, selected_scope_length, name, current_module, table|:
+                selected_module: mutable sview = ""
+                selected_ambiguous: mutable bool = false
+                unknown_scope_length: mutable usize = 0.usize()
+                found_unknown: mutable bool = false
+                for const_index in 0..<table.immutable_const_values.count |selected_row, selected_scope_length, selected_module, selected_ambiguous, unknown_scope_length, found_unknown, name, current_module, file, table, depth|:
                     continue if const_index >= table.immutable_const_names.count or const_index >= table.immutable_const_rows.count
                     continue if table.immutable_const_names[const_index] != name
                     symbol_row: usize = table.immutable_const_rows[const_index].usize()
                     continue if symbol_row >= table.symbols.count
                     symbol: Symbol = table.symbols[symbol_row]
-                    continue if symbol.name != name or (symbol.module_owner != "" and not SemanticPrivateModuleBoundary::within_module(current_module, symbol.module_owner))
+                    if qualifier is qualified_base:
+                        continue if symbol.name != name or not pma_static_if_qualified_module_matches(qualified_base, symbol.module_owner, current_module)
+                    else:
+                        continue if symbol.name != name or (symbol.module_owner != "" and not SemanticPrivateModuleBoundary::within_module(current_module, symbol.module_owner))
+                    branch: (known: bool, active: bool) = pma_static_if_const_branch_selection(file, name, symbol, table, depth + 1)
+                    continue if branch.known and not branch.active
+                    if not branch.known:
+                        found_unknown <- true
+                        unknown_scope_length <- symbol.module_owner.len if symbol.module_owner.len > unknown_scope_length
+                        continue
                     if selected_row >= table.immutable_const_values.count or symbol.module_owner.len > selected_scope_length:
                         selected_row <- const_index
                         selected_scope_length <- symbol.module_owner.len
+                        selected_module <- symbol.module_owner
+                        selected_ambiguous <- false
                     elif symbol.module_owner.len == selected_scope_length:
-                        # Sibling static-if arms can contribute same-scope const rows
-                        # before the backend prunes inactive declarations. Do not pick
-                        # the fallback value for that ambiguous source view: it may differ
-                        # from the value of the sole active declaration after branch
-                        # selection.
-                        return (false, 0)
+                        selected_ambiguous <- true
+                # The backend resolves exact-module constants before top-level fallback.
+                # Unknown rows in a less-specific scope cannot make that winner uncertain.
+                return (false, 0) if found_unknown and (selected_row >= table.immutable_const_values.count or unknown_scope_length >= selected_scope_length)
+                return (false, 0) if selected_ambiguous
+                return (false, 0) if selected_row >= table.immutable_const_values.count and qualifier is qualified_base
                 return (true, 0) if selected_row >= table.immutable_const_values.count
-                return pma_static_if_condition_value(table.immutable_const_values[selected_row], current_module, table, depth + 1)
+                return pma_static_if_condition_value(table.immutable_const_values[selected_row], selected_module, file, table, depth + 1)
+
+        def pma_static_if_char_value(text: sview) -> (known: bool, value: i64):
+            can Abort.Panic:
+                return (false, 0) if text.len == 0
+                start: usize = 1 if text.len >= 3 and text[0] == 39 and text[text.len - 1] == 39 else 0
+                end: usize = text.len - 1 if start == 1 else text.len
+                return (false, 0) if start >= end
+                first: u8 = text[start]
+                if first == 92:
+                    return (false, 0) if end - start != 2
+                    escaped: u8 = text[start + 1]
+                    return (true, 10) if escaped == 110
+                    return (true, 9) if escaped == 116
+                    return (true, 13) if escaped == 114
+                    return (true, 0) if escaped == 48
+                    return (true, 92) if escaped == 92
+                    return (true, 39) if escaped == 39
+                    return (false, 0)
+                return (false, 0) if end - start != 1
+                return (true, first.i64())
 
         # The backend treats a condition it cannot fold as false and continues through
-        # later arms/fallback. Resolve target constants and source consts before filtering
-        # annotations so private visibility follows the branch the backend will emit.
-        def pma_static_if_condition_value(expression: Ast::Expr, current_module: sview, table: SymbolTable&, depth: u32) -> (known: bool, value: i64):
+        # later arms/fallback. Preserve unknown for backend-foldable AST forms this checker
+        # does not model, including qualified constants, enum members, string lengths, and
+        # postfix casts, floats, and strings, so they cannot silently select the wrong
+        # private-import arm.
+        def pma_static_if_condition_value(expression: Ast::Expr, current_module: sview, file: Ast::File&, table: SymbolTable&, depth: u32) -> (known: bool, value: i64):
             can Abort.Panic:
                 return (false, 0) if depth >= 64
                 match expression:
@@ -241,15 +351,19 @@ extend Semantic:
                         return (true, 1 if value else 0)
                     Expr.IntLit(value, _):
                         return (true, value)
+                    Expr.CharLit(value, _):
+                        return pma_static_if_char_value(value)
                     Expr.Paren(inner, _):
-                        return pma_static_if_condition_value(inner, current_module, table, depth + 1)
+                        return pma_static_if_condition_value(inner, current_module, file, table, depth + 1)
                     Expr.Ident(name, _):
                         target: (known: bool, value: i64) = ga_static_if_target_constant(name)
                         return target if target.known
                         return (false, 0) if ga_static_if_target_predicate(name)
-                        return pma_static_if_named_constant_value(name, current_module, table, depth + 1)
+                        return pma_static_if_named_constant_value(name, current_module, file, table, depth + 1)
+                    Expr.Scope(base, name, _):
+                        return pma_static_if_named_constant_value(name, current_module, file, table, depth + 1, base)
                     Expr.Unary(operator, operand, _):
-                        inner: (known: bool, value: i64) = pma_static_if_condition_value(operand, current_module, table, depth + 1)
+                        inner: (known: bool, value: i64) = pma_static_if_condition_value(operand, current_module, file, table, depth + 1)
                         return inner if not inner.known
                         if operator == TokenKind.Plus:
                             return inner
@@ -259,8 +373,8 @@ extend Semantic:
                         if operator == TokenKind.Tilde:
                             return (true, ~inner.value)
                     Expr.Binary(left, operator, right, _):
-                        left_value: (known: bool, value: i64) = pma_static_if_condition_value(left, current_module, table, depth + 1)
-                        right_value: (known: bool, value: i64) = pma_static_if_condition_value(right, current_module, table, depth + 1)
+                        left_value: (known: bool, value: i64) = pma_static_if_condition_value(left, current_module, file, table, depth + 1)
+                        right_value: (known: bool, value: i64) = pma_static_if_condition_value(right, current_module, file, table, depth + 1)
                         return left_value if not left_value.known
                         return right_value if not right_value.known
                         if operator == TokenKind.EqEq:
@@ -306,13 +420,14 @@ extend Semantic:
                         if operator == TokenKind.RShift:
                             return (true, 0) if not BackendConstArithmetic::shift_count_is_safe(right_value.value)
                             return (true, left_value.value >> right_value.value)
+                    Expr.Scope(_, _, _) | Expr.Field(_, _, _) | Expr.Call(_, _, _, _):
+                        return (false, 0)
                     _:
-                        pass
-                return (true, 0)
+                        return (false, 0)
 
-        def pma_static_if_row_selection(file: Ast::File&, branch_row: usize, current_module: sview, table: SymbolTable&) -> (known: bool, selected: bool):
+        def pma_static_if_row_selection(file: Ast::File&, branch_row: usize, current_module: sview, table: SymbolTable&, depth: u32 = 0) -> (known: bool, selected: bool):
             can Abort.Panic:
-                return (false, false) if branch_row >= file.static_if_lines.count or branch_row >= file.static_if_kinds.count
+                return (false, false) if depth >= 64 or branch_row >= file.static_if_lines.count or branch_row >= file.static_if_kinds.count
                 branch_depth: u32 = file.static_if_depths[branch_row] if branch_row < file.static_if_depths.count else StaticIfBranch::TOP_LEVEL_DEPTH
                 chain_start: mutable usize = file.static_if_lines.count
                 row: mutable usize = branch_row + 1.usize()
@@ -328,13 +443,26 @@ extend Semantic:
                     branch_kind: StaticIfBranch::Kind = file.static_if_kinds[row]
                     if branch_kind == StaticIfBranch::Kind.Fallback:
                         return (true, row == branch_row)
-                    return (false, false) if row >= file.static_if_conds.count
-                    condition: (known: bool, value: i64) = pma_static_if_condition_value(file.static_if_conds[row], current_module, table, 0)
+                    return (false, false) if row >= file.static_if_conds.count or row >= file.static_if_modules.count
+                    condition_module: sview = file.static_if_modules[row]
+                    condition: (known: bool, value: i64) = pma_static_if_condition_value(file.static_if_conds[row], condition_module, file, table, depth + 1)
                     return (false, false) if not condition.known
                     if condition.known and condition.value != 0:
                         return (true, row == branch_row)
                     return (true, false) if row == branch_row
                 return (true, false)
+
+        # Statement static-if blocks retain the source line used by the parser's
+        # condition-row projection. Refuse duplicate matches rather than filtering a
+        # block with another branch's selection result.
+        def pma_static_if_row_for_position(file: Ast::File&, position: Ast::Pos) -> usize:
+            can Abort.Panic:
+                selected: mutable usize = file.static_if_lines.count
+                for row in 0..<file.static_if_lines.count |selected, position, file|:
+                    if row < file.static_if_offsets.count and file.static_if_lines[row] == position.line and file.static_if_offsets[row] == position.offset:
+                        return file.static_if_lines.count if selected < file.static_if_lines.count
+                        selected <- row
+                return selected
 
         def pma_import_member_for_branch_annotation(annotation: Ast::EnumAnnotation, annotations: darray[Ast::EnumAnnotation]&) -> (found: bool, member: sview, module: sview):
             can Abort.Panic:
@@ -357,15 +485,44 @@ extend Semantic:
                     branch: mutable (known: bool, selected: bool) = (false, false)
                     branch <- pma_static_if_row_selection(file, marker.identity_id.usize(), module, table) if marker.identity_id != 4294967295
                     return (true, false) if branch.known and not branch.selected
-                    unknown <- true if not branch.known
+                    unknown <- true if marker.identity_id == 4294967295 or not branch.known
                 return (true, true) if not found_marker
                 return (false, false) if unknown
                 return (true, true)
+
+        def pma_using_alias_for_using_row(annotations: darray[Ast::EnumAnnotation]&, using_row: Ast::EnumAnnotation) -> (found: bool, alias: sview, alias_offset: u32):
+            can Abort.Panic:
+                next_using_offset: mutable u32 = 4294967295
+                for candidate in annotations |next_using_offset, using_row|:
+                    continue if candidate.name != "__using" or candidate.module != using_row.module or candidate.line != using_row.line or candidate.offset <= using_row.offset
+                    next_using_offset <- candidate.offset if candidate.offset < next_using_offset
+                selected_alias: mutable sview = ""
+                selected_alias_offset: mutable u32 = 4294967295
+                for target_row in annotations |selected_alias, selected_alias_offset, using_row, next_using_offset|:
+                    continue if target_row.name != "__using_alias_target" or target_row.owner != using_row.owner or target_row.module != using_row.module or target_row.line != using_row.line or target_row.offset <= using_row.offset or target_row.offset >= next_using_offset
+                    for alias_row in annotations |selected_alias, selected_alias_offset, target_row|:
+                        if alias_row.name == "__using_alias" and alias_row.module == target_row.module and alias_row.line == target_row.line and alias_row.offset == target_row.offset and target_row.offset < selected_alias_offset:
+                            selected_alias <- alias_row.owner
+                            selected_alias_offset <- target_row.offset
+                return (selected_alias != "", selected_alias, selected_alias_offset)
 
         def pma_import_annotation_branch_selection(annotation: Ast::EnumAnnotation, annotations: darray[Ast::EnumAnnotation]&, file: Ast::File&, table: SymbolTable&) -> (known: bool, active: bool):
             can Abort.Panic:
                 if annotation.name == "__binding_wildcard_import":
                     return pma_import_branch_selection(annotations, file, table, "__static_if_branch", "__binding_wildcard_import_static_branch", annotation.owner, annotation.module, annotation.line, annotation.offset)
+                if annotation.name == "__using":
+                    alias_pair: (found: bool, alias: sview, alias_offset: u32) = pma_using_alias_for_using_row(annotations, annotation)
+                    if alias_pair.found:
+                        return pma_import_branch_selection(annotations, file, table, "__static_if_branch", "__using_alias_static_branch", alias_pair.alias, annotation.module, annotation.line, alias_pair.alias_offset)
+                    return pma_import_branch_selection(annotations, file, table, "__static_if_branch", "__binding_wildcard_import_static_branch", annotation.owner, annotation.module, annotation.line, annotation.offset)
+                if annotation.name == "__using_alias":
+                    return pma_import_branch_selection(annotations, file, table, "__static_if_branch", "__using_alias_static_branch", annotation.owner, annotation.module, annotation.line, annotation.offset)
+                if annotation.name == "__using_alias_target":
+                    alias_name: mutable sview = ""
+                    for alias in annotations |alias_name, annotation|:
+                        alias_name <- alias.owner if alias.name == "__using_alias" and alias.module == annotation.module and alias.line == annotation.line and alias.offset == annotation.offset
+                    return (true, true) if alias_name == ""
+                    return pma_import_branch_selection(annotations, file, table, "__static_if_branch", "__using_alias_static_branch", alias_name, annotation.module, annotation.line, annotation.offset)
                 if annotation.owner == "__private_member":
                     member_module: mutable sview @source = ""
                     found_module: mutable bool = false
@@ -392,15 +549,15 @@ extend Semantic:
         def pma_active_import_annotations(file: Ast::File&, table: SymbolTable&) -> darray[Ast::EnumAnnotation]:
             can Memory.Allocate, Abort.Panic:
                 active: mutable darray[Ast::EnumAnnotation] = []
-                for annotation in file.enum_annotations |active, file|:
-                    import_row: bool = annotation.owner == "__from_member" or annotation.owner == "__from_src" or annotation.name == "__using_member" or annotation.name == "__binding_wildcard_import"
+                for annotation in file.enum_annotations |active, file, table|:
+                    import_row: bool = annotation.owner == "__from_member" or annotation.owner == "__from_src" or annotation.name == "__using_member" or annotation.name == "__using" or annotation.name == "__binding_wildcard_import" or annotation.name == "__using_alias" or annotation.name == "__using_alias_target"
                     private_member_row: bool = annotation.owner == "__private_member"
                     branch_row: bool = import_row or private_member_row
                     branch: mutable (known: bool, active: bool) = (true, true)
                     branch <- pma_import_annotation_branch_selection(annotation, file.enum_annotations, file, table) if branch_row
                     continue if branch_row and branch.known and not branch.active
                     active.push(annotation)
-                    if import_row and not branch.known and (annotation.owner == "__from_member" or annotation.name == "__binding_wildcard_import"):
+                    if import_row and not branch.known:
                         active.push(Ast::EnumAnnotation{owner: "__pma_unknown_static_import", name: annotation.owner, detail_name: annotation.name, module: annotation.module, line: annotation.line, offset: annotation.offset})
                 return active
 
@@ -421,7 +578,7 @@ extend Semantic:
                     continue if not pma_import_scope_visible(current_module, member_annotation.module)
                     known_order <- false if pma_import_row_branch_uncertain(annotations, "__from_member", member_annotation.name, member_annotation.module, member_annotation.line, member_annotation.offset)
                     for source_annotation in annotations |annotations, current_module, owner, member, member_annotation|:
-                        continue if source_annotation.owner != "__from_src" or source_annotation.line != member_annotation.line or source_annotation.module != member_annotation.module
+                        continue if source_annotation.owner != "__from_src" or source_annotation.line != member_annotation.line or source_annotation.offset != member_annotation.offset or source_annotation.module != member_annotation.module
                         found_owner <- true if source_annotation.name == owner
                         candidate_is_using: bool = pma_selective_annotation_is_using_member(annotations, member_annotation, source_annotation, member)
                         if selected_owner == "":
@@ -615,33 +772,32 @@ extend Semantic:
                     found <- true
                 return found
 
-        # Core retains defaulted and variadic signatures in its receiver-ranking pass;
-        # later call validation diagnoses an invalid final argument count.
-        def pma_symbol_core_accepts_receiver_arity(table: SymbolTable&, symbol: Symbol, argument_count: usize) -> bool:
+        # Mirror Core's receiver-ranking arity range exactly. Defaulted parameters lower
+        # arity_min; they do not make every argument count viable, and variadic signatures
+        # still require their non-defaulted minimum.
+        def pma_symbol_core_accepts_receiver_arity(symbol: Symbol, argument_count: usize) -> bool:
             can Abort.Panic:
-                return true if symbol.arity_max == 4294967295
-                for row in 0..<table.function_param_declaration_id.count |table, symbol|:
-                    continue if table.function_param_declaration_id[row].value != symbol.id.value
-                    return true if row < table.function_param_has_default.count and table.function_param_has_default[row]
-                return symbol.arity_max == argument_count.u32()
+                return argument_count.u32() >= symbol.arity_min and argument_count.u32() <= symbol.arity_max
 
         # Rank only the public cases this checker can prove from source facts: an exact
         # known builtin or uniquely-spelled named formal, or Core's untyped-int-to-integral
         # receiver case, outranks a bare type parameter. A generic formal can still be the
         # only visible sibling; unknown conversions fail closed.
-        def pma_public_call_sibling_rank(index: PrivateMemberIndex&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, owner: sview, member: sview, current_module: sview, unqualified_call: bool, arguments: darray[Ast::Expr], bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> (found: bool, rank: usize):
+        def pma_public_call_sibling_rank(file: Ast::File&, index: PrivateMemberIndex&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, owner: sview, member: sview, current_module: sview, unqualified_call: bool, arguments: darray[Ast::Expr], bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> (found: bool, rank: usize):
             can Abort.Panic:
                 return (false, 0.usize()) if arguments.count == 0.usize()
                 actual_type: sview @source = pma_argument_type_name(arguments[0], bound, bound_types)
                 return (false, 0.usize()) if actual_type == ""
                 best_found: mutable bool = false
                 best_rank: mutable usize = 0.usize()
-                for symbol in table.symbols |best_found, best_rank, index, table, annotations, owner, member, current_module, unqualified_call, arguments, actual_type|:
+                for symbol in table.symbols |best_found, best_rank, file, index, table, annotations, owner, member, current_module, unqualified_call, arguments, actual_type|:
                     continue if symbol.kind != SymbolKind.Func or symbol.name != member or pma_symbol_has_private_marker(index, symbol)
+                    branch: (known: bool, active: bool) = pma_static_if_function_branch_selection(file, member, symbol, table, 0)
+                    continue if not branch.known or not branch.active
                     if not unqualified_call:
                         continue if symbol.module_owner != owner
                     continue if unqualified_call and not pma_unqualified_candidate_module_visible(index, annotations, current_module, symbol.module_owner, member)
-                    continue if not pma_symbol_core_accepts_receiver_arity(table, symbol, arguments.count)
+                    continue if not pma_symbol_core_accepts_receiver_arity(symbol, arguments.count)
                     first_parameter: (found: bool, kind: SemTypeKind, name: sview @source) = pma_symbol_first_parameter_type(table, symbol)
                     continue if not first_parameter.found
                     candidate_rank: mutable usize = 0.usize()
@@ -681,10 +837,10 @@ extend Semantic:
         # overload is ineligible by Core's coarse fixed-arity filter, mismatches a known
         # bool-vs-primitive pair, or is a generic receiver outranked by an exact public type.
         # Unknown conversions and concrete ties preserve the privacy diagnostic.
-        def pma_private_call_overloads_excluded(index: PrivateMemberIndex&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, owner: sview, member: sview, current_module: sview, unqualified_call: bool, arguments: darray[Ast::Expr], argument_names: darray[sview @source], bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> bool:
+        def pma_private_call_overloads_excluded(file: Ast::File&, index: PrivateMemberIndex&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, owner: sview, member: sview, current_module: sview, unqualified_call: bool, arguments: darray[Ast::Expr], argument_names: darray[sview @source], bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> bool:
             can Abort.Panic:
                 return false if any argument_name in argument_names where argument_name != ""
-                public_rank: (found: bool, rank: usize) = pma_public_call_sibling_rank(index, table, annotations, owner, member, current_module, unqualified_call, arguments, bound, bound_types)
+                public_rank: (found: bool, rank: usize) = pma_public_call_sibling_rank(file, index, table, annotations, owner, member, current_module, unqualified_call, arguments, bound, bound_types)
                 return false if not public_rank.found
                 actual_type: sview @source = pma_argument_type_name(arguments[0], bound, bound_types) if arguments.count > 0.usize() else ""
                 return false if actual_type == ""
@@ -693,7 +849,7 @@ extend Semantic:
                 for symbol in table.symbols |private_candidates, all_excluded, index, table, annotations, owner, member, arguments, actual_type, public_rank|:
                     continue if symbol.kind != SymbolKind.Func or symbol.name != member or symbol.module_owner != owner or not pma_symbol_has_private_marker(index, symbol)
                     private_candidates <- private_candidates + 1.usize()
-                    candidate_excluded: bool = not pma_symbol_core_accepts_receiver_arity(table, symbol, arguments.count) or pma_private_candidate_excluded_by_public_rank(table, annotations, symbol, public_rank.rank, actual_type)
+                    candidate_excluded: bool = not pma_symbol_core_accepts_receiver_arity(symbol, arguments.count) or pma_private_candidate_excluded_by_public_rank(table, annotations, symbol, public_rank.rank, actual_type)
                     all_excluded <- false if not candidate_excluded
                 return private_candidates > 0.usize() and all_excluded
 
@@ -721,17 +877,114 @@ extend Semantic:
                     owner[start - 1.usize()] != 58 or owner[start - 2.usize()] != 58
                 return pma_chain_ends_at(inner, owner, start - 2.usize())
 
+        def pma_using_alias_target(annotations: darray[Ast::EnumAnnotation]&, alias: Ast::EnumAnnotation) -> sview:
+            can Abort.Panic:
+                for target in annotations:
+                    return target.owner if target.name == "__using_alias_target" and target.module == alias.module and target.line == alias.line and target.offset == alias.offset
+                return ""
+
+        def pma_using_alias_is_static_branch(annotations: darray[Ast::EnumAnnotation]&, alias: Ast::EnumAnnotation) -> bool:
+            can Abort.Panic:
+                return any marker in annotations where marker.owner == "__static_if_branch" and marker.name == "__using_alias_static_branch" and marker.detail_name == alias.owner and marker.module == alias.module and marker.line == alias.line and marker.offset == alias.offset
+
+        # Match Core's alias registration precedence: a more-specific lexical scope
+        # wins; in one scope an unconditional alias wins over a static-branch alias;
+        # aliases of the same class retain source order.
+        def pma_using_alias_precedes(annotations: darray[Ast::EnumAnnotation]&, left: Ast::EnumAnnotation, right: Ast::EnumAnnotation) -> bool:
+            can Abort.Panic:
+                if left.module != right.module:
+                    return left.module.len > right.module.len
+                left_is_branch: bool = pma_using_alias_is_static_branch(annotations, left)
+                right_is_branch: bool = pma_using_alias_is_static_branch(annotations, right)
+                return false if left_is_branch and not right_is_branch
+                return true if not left_is_branch and right_is_branch
+                return left.offset < right.offset
+
+        # An alias can establish a private owner only when it is the winning,
+        # definitely-selected alias at its visible scope. An unresolved branch alias
+        # may be public or private, so it must not cause a definite privacy diagnostic.
+        def pma_using_alias_is_shadowed(annotations: darray[Ast::EnumAnnotation]&, file: Ast::File&, table: SymbolTable&, current_module: sview, alias: Ast::EnumAnnotation) -> bool:
+            can Abort.Panic:
+                for earlier_alias in annotations |file, table, current_module, alias|:
+                    continue if earlier_alias.name != "__using_alias" or earlier_alias.owner != alias.owner or earlier_alias.module == alias.module and earlier_alias.line == alias.line and earlier_alias.offset == alias.offset
+                    continue if not pma_import_scope_visible(current_module, earlier_alias.module) or not pma_using_alias_precedes(annotations, earlier_alias, alias)
+                    earlier_branch: (known: bool, active: bool) = pma_import_annotation_branch_selection(earlier_alias, annotations, file, table)
+                    return true if not earlier_branch.known or earlier_branch.active
+                return false
+
+        # Resolve a simple alias-to-alias target at the alias declaration's lexical
+        # scope. Ambiguous or unresolved branch choices return empty so PMA declines
+        # rather than claiming a private owner from a possible target.
+        def pma_resolved_using_alias_target(annotations: darray[Ast::EnumAnnotation]&, file: Ast::File&, table: SymbolTable&, alias: Ast::EnumAnnotation, depth: u32 = 0) -> sview @source:
+            can Abort.Panic:
+                return "" if depth >= 32
+                target: sview = pma_using_alias_target(annotations, alias)
+                return "" if target == ""
+                selected_index: mutable usize = annotations.count
+                for target_index in 0..<annotations.count |selected_index, alias, target, target_index, file, table, annotations|:
+                    candidate_alias: Ast::EnumAnnotation = annotations[target_index]
+                    continue if candidate_alias.name != "__using_alias" or candidate_alias.owner != target or not pma_import_scope_visible(alias.module, candidate_alias.module)
+                    continue if not pma_using_alias_precedes(annotations, candidate_alias, alias)
+                    candidate_branch: (known: bool, active: bool) = pma_import_annotation_branch_selection(candidate_alias, annotations, file, table)
+                    continue if candidate_branch.known and not candidate_branch.active
+                    if not candidate_branch.known:
+                        continue if pma_using_alias_is_shadowed(annotations, file, table, alias.module, candidate_alias)
+                        return ""
+                    continue if pma_using_alias_is_shadowed(annotations, file, table, alias.module, candidate_alias)
+                    return "" if selected_index < annotations.count
+                    selected_index <- target_index
+                return target if selected_index >= annotations.count
+                return pma_resolved_using_alias_target(annotations, file, table, annotations[selected_index], depth + 1)
+
+        def pma_alias_chain_ends_at(base: Ast::Expr, owner: sview, end: usize, alias_name: sview, alias_target: sview) -> bool:
+            can Abort.Panic:
+                return match base:
+                    Expr.Ident(head_name, _):
+                        return false if head_name != alias_name or end != alias_target.len
+                        return string_view_slice(owner, 0, end.i64()) == alias_target
+                    Expr.Scope(inner, last_name, _):
+                        pma_alias_chain_prefix_ends_at(inner, owner, end, last_name, alias_name, alias_target)
+                    _:
+                        false
+
+        def pma_alias_chain_prefix_ends_at(inner: Ast::Expr, owner: sview, end: usize, last_name: sview, alias_name: sview, alias_target: sview) -> bool:
+            can Abort.Panic:
+                last_length: usize = last_name.len
+                return false if end < last_length + 2.usize()
+                start: usize = end - last_length
+                return false if:
+                    not sview_slice_equals(owner, start, last_name)
+                    owner[start - 1.usize()] != 58 or owner[start - 2.usize()] != 58
+                return pma_alias_chain_ends_at(inner, owner, start - 2.usize(), alias_name, alias_target)
+
+        def pma_chain_head_name(base: Ast::Expr) -> sview:
+            can Abort.Panic:
+                return match base:
+                    Expr.Ident(head_name, _): head_name
+                    Expr.Scope(inner, _, _): pma_chain_head_name(inner)
+                    Expr.Paren(inner, _): pma_chain_head_name(inner)
+                    _: ""
+
         # The module that hides `member` when `base` spells that module's path, or "" when
         # this access is not a private one. The owner comes OUT of the recorded row rather
         # than being assembled from the chain, which is what lets a nested owner
         # (`Geo::Scalar`) be compared without materialising it.
-        def pma_scope_owner(index: PrivateMemberIndex&, table: SymbolTable&, base: Ast::Expr, member: sview) -> sview @source:
+        def pma_scope_owner(file: Ast::File&, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, table: SymbolTable&, base: Ast::Expr, member: sview) -> sview @source:
             can Abort.Panic:
                 private_index: mutable u32 = pma_member_head(index, member)
-                while private_index != SYMBOL_INDEX_ROW_NONE |private_index, index, base, member|:
+                alias_name: sview = pma_chain_head_name(base)
+                while private_index != SYMBOL_INDEX_ROW_NONE |private_index, file, index, annotations, current_module, table, base, member, alias_name|:
                     candidate: sview @source = index.modules[private_index.usize()]
-                    if index.names[private_index.usize()] == member and pma_chain_ends_at(base, candidate, candidate.len):
-                        return candidate
+                    if index.names[private_index.usize()] == member:
+                        return candidate if pma_chain_ends_at(base, candidate, candidate.len)
+                        for alias in annotations |file, index, annotations, current_module, table, base, member, candidate, alias_name|:
+                            continue if alias.name != "__using_alias" or alias.owner != alias_name or not pma_import_scope_visible(current_module, alias.module)
+                            branch: (known: bool, active: bool) = pma_import_annotation_branch_selection(alias, annotations, file, table)
+                            continue if not branch.known or not branch.active
+                            continue if pma_using_alias_is_shadowed(annotations, file, table, current_module, alias)
+                            alias_target: sview = pma_resolved_using_alias_target(annotations, file, table, alias)
+                            continue if alias_target == ""
+                            return candidate if pma_alias_chain_ends_at(base, candidate, candidate.len, alias.owner, alias_target)
                     private_index <- index.name_next[private_index.usize()]
                 return ""
 
@@ -745,21 +998,21 @@ extend Semantic:
                     _:
                         Ast::expr_pos(base)
 
-        def pma_call_target_identity(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> (member: sview @source, owner: sview @source):
+        def pma_call_target_identity(file: Ast::File&, expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> (member: sview @source, owner: sview @source):
             can Abort.Panic:
                 return match expression:
                     Expr.Ident(member, _):
                         (member, pma_unqualified_call_owner(table, current_module, index, annotations, bound, member))
                     Expr.Scope(base, member, _):
-                        (member, pma_scope_owner(index, table, base, member))
+                        (member, pma_scope_owner(file, index, annotations, current_module, table, base, member))
                     Expr.Paren(inner, _):
-                        pma_call_target_identity(inner, current_module, index, annotations, table, bound)
+                        pma_call_target_identity(file, inner, current_module, index, annotations, table, bound)
                     _:
                         ("", "")
 
-        def pma_is_private_function_target(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> bool:
+        def pma_is_private_function_target(file: Ast::File&, expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> bool:
             can Abort.Panic:
-                identity: (member: sview @source, owner: sview @source) = pma_call_target_identity(expression, current_module, index, annotations, table, bound)
+                identity: (member: sview @source, owner: sview @source) = pma_call_target_identity(file, expression, current_module, index, annotations, table, bound)
                 return false if identity.member == "" or identity.owner == ""
                 return any symbol in table.symbols where symbol.kind == SymbolKind.Func and symbol.name == identity.member and symbol.module_owner == identity.owner and pma_symbol_has_private_marker(index, symbol)
 
@@ -767,36 +1020,36 @@ extend Semantic:
         # `(f)(...)` arrives as Paren. Normalize only a declaration-backed private
         # function target; ordinary subscripts and function-value expressions keep the
         # existing recursive expression walk below.
-        def pma_normalize_call_callee(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> Ast::Expr:
+        def pma_normalize_call_callee(file: Ast::File&, expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> Ast::Expr:
             can Abort.Panic:
                 return match expression:
                     Expr.Paren(inner, _):
-                        pma_normalize_call_callee(inner, current_module, index, annotations, table, bound)
-                    Expr.Index(object, _, _) if pma_is_private_function_target(object, current_module, index, annotations, table, bound):
-                        pma_normalize_call_callee(object, current_module, index, annotations, table, bound)
-                    Expr.IndexN(object, _, _) if pma_is_private_function_target(object, current_module, index, annotations, table, bound):
-                        pma_normalize_call_callee(object, current_module, index, annotations, table, bound)
+                        pma_normalize_call_callee(file, inner, current_module, index, annotations, table, bound)
+                    Expr.Index(object, _, _) if pma_is_private_function_target(file, object, current_module, index, annotations, table, bound):
+                        pma_normalize_call_callee(file, object, current_module, index, annotations, table, bound)
+                    Expr.IndexN(object, _, _) if pma_is_private_function_target(file, object, current_module, index, annotations, table, bound):
+                        pma_normalize_call_callee(file, object, current_module, index, annotations, table, bound)
                     _:
                         expression
 
         # Once a generic callee has been normalized, still visit its type/index arguments
         # so private type names inside `f[Hidden]` retain their own diagnostics.
-        def pma_report_call_callee_indices(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> void:
+        def pma_report_call_callee_indices(file: Ast::File&, expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Paren(inner, _):
-                        table <- pma_report_call_callee_indices(inner, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report_call_callee_indices(file, inner, current_module, index, annotations, table, bound, bound_types)
                     Expr.Index(object, argument, _):
-                        table <- pma_report_call_callee_indices(object, current_module, index, annotations, table, bound, bound_types)
-                        table <- pma_report(argument, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report_call_callee_indices(file, object, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, argument, current_module, index, annotations, table, bound, bound_types)
                     Expr.IndexN(object, arguments, _):
-                        table <- pma_report_call_callee_indices(object, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report_call_callee_indices(file, object, current_module, index, annotations, table, bound, bound_types)
                         for argument in arguments |table| -> table:
-                            table <- pma_report(argument, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, argument, current_module, index, annotations, table, bound, bound_types)
                     _:
                         pass
 
-        def pma_report(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> void:
+        def pma_report(file: Ast::File&, expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Ident(member, ident_line):
@@ -809,23 +1062,23 @@ extend Semantic:
                         # errors for one closed door, so the leaf is only judged once the whole
                         # base path came back clean.
                         reported_before: usize = table.diagnostics.count
-                        table <- pma_report(base, current_module, index, annotations, table, bound, bound_types)
-                        table <- pma_report_scope_member(base, member, scope_line, current_module, index, annotations, table) if table.diagnostics.count == reported_before
+                        table <- pma_report(file, base, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report_scope_member(file, base, member, scope_line, current_module, index, annotations, table) if table.diagnostics.count == reported_before
                     Expr.Construct(type_expression, fields, _):
-                        table <- pma_report(type_expression, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, type_expression, current_module, index, annotations, table, bound, bound_types)
                         for field in fields |table|:
-                            table <- pma_report(field.value, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, field.value, current_module, index, annotations, table, bound, bound_types)
                     Expr.Block(statements, value, _, _):
                         block_bound: mutable darray[sview @source] = []
                         block_bound.extend(bound)
                         block_bound_types: mutable darray[sview @source] = []
                         block_bound_types.extend(bound_types)
-                        table <- pma_walk_stmts(statements, current_module, index, annotations, table, block_bound, block_bound_types)
-                        table <- pma_report(value, current_module, index, annotations, table, block_bound, block_bound_types)
+                        table <- pma_walk_stmts(statements, file, current_module, index, annotations, table, block_bound, block_bound_types)
+                        table <- pma_report(file, value, current_module, index, annotations, table, block_bound, block_bound_types)
                     Expr.Field(object, field, field_line):
-                        table <- pma_report(object, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, object, current_module, index, annotations, table, bound, bound_types)
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        normalized_callee: Ast::Expr = pma_normalize_call_callee(callee, current_module, index, annotations, table, bound)
+                        normalized_callee: Ast::Expr = pma_normalize_call_callee(file, callee, current_module, index, annotations, table, bound)
                         normalized_callee_is_path: mutable bool = false
                         match normalized_callee:
                             Expr.Ident(callee_name, callee_line):
@@ -833,61 +1086,61 @@ extend Semantic:
                                 owner: sview @source = pma_unqualified_call_owner(table, current_module, index, annotations, bound, callee_name)
                                 private_candidates_excluded: mutable bool = false
                                 if owner != "":
-                                    private_candidates_excluded <- pma_private_call_overloads_excluded(index, table, annotations, owner, callee_name, current_module, true, arguments, argument_names, bound, bound_types)
+                                    private_candidates_excluded <- pma_private_call_overloads_excluded(file, index, table, annotations, owner, callee_name, current_module, true, arguments, argument_names, bound, bound_types)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: callee_name, pos: callee_line, line: callee_line.line, expected: "", actual: owner}) if owner != "" and not private_candidates_excluded
                             Expr.Scope(base, callee_name, callee_line):
                                 normalized_callee_is_path <- true
                                 reported_before: usize = table.diagnostics.count
-                                table <- pma_report(base, current_module, index, annotations, table, bound, bound_types)
+                                table <- pma_report(file, base, current_module, index, annotations, table, bound, bound_types)
                                 if table.diagnostics.count == reported_before:
-                                    owner: sview @source = pma_scope_owner(index, table, base, callee_name)
+                                    owner: sview @source = pma_scope_owner(file, index, annotations, current_module, table, base, callee_name)
                                     private_candidates_excluded: mutable bool = false
                                     if owner != "":
-                                        private_candidates_excluded <- pma_private_call_overloads_excluded(index, table, annotations, owner, callee_name, current_module, false, arguments, argument_names, bound, bound_types)
+                                        private_candidates_excluded <- pma_private_call_overloads_excluded(file, index, table, annotations, owner, callee_name, current_module, false, arguments, argument_names, bound, bound_types)
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: callee_name, pos: pma_chain_head_pos(base), line: callee_line.line, expected: "", actual: owner}) if owner != "" and not pma_within_module(current_module, owner) and not private_candidates_excluded
                             _:
-                                table <- pma_report(callee, current_module, index, annotations, table, bound, bound_types)
-                        table <- pma_report_call_callee_indices(callee, current_module, index, annotations, table, bound, bound_types) if normalized_callee_is_path
+                                table <- pma_report(file, callee, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report_call_callee_indices(file, callee, current_module, index, annotations, table, bound, bound_types) if normalized_callee_is_path
                         for argument in arguments |table| -> table:
-                            table <- pma_report(argument, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, argument, current_module, index, annotations, table, bound, bound_types)
                     Expr.Binary(left, operator, right, binary_line):
-                        table <- pma_report(left, current_module, index, annotations, table, bound, bound_types)
-                        table <- pma_report(right, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, left, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, right, current_module, index, annotations, table, bound, bound_types)
                     Expr.Unary(operator, operand, unary_line):
-                        table <- pma_report(operand, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, operand, current_module, index, annotations, table, bound, bound_types)
                     Expr.Paren(inner, paren_line):
-                        table <- pma_report(inner, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, inner, current_module, index, annotations, table, bound, bound_types)
                     Expr.Index(object, index_argument, index_line):
-                        table <- pma_report(object, current_module, index, annotations, table, bound, bound_types)
-                        table <- pma_report(index_argument, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, object, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(file, index_argument, current_module, index, annotations, table, bound, bound_types)
                     _:
                         pass
 
-        def pma_report_scope_member(base: Ast::Expr, member: sview @source, scope_line: Ast::Pos, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        def pma_report_scope_member(file: Ast::File&, base: Ast::Expr, member: sview @source, scope_line: Ast::Pos, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                owner: sview @source = pma_scope_owner(index, table, base, member)
+                owner: sview @source = pma_scope_owner(file, index, annotations, current_module, table, base, member)
                 return if owner == "" or pma_within_module(current_module, owner)
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: member, pos: pma_chain_head_pos(base), line: scope_line.line, expected: "", actual: owner})
 
-        def pma_walk_stmts(statements: darray[Ast::Stmt], current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: mutable darray[sview @source]&, bound_types: mutable darray[sview @source]&) -> void:
+        def pma_walk_stmts(statements: darray[Ast::Stmt], file: Ast::File&, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: mutable darray[sview @source]&, bound_types: mutable darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table, bound, bound_types| -> table, bound, bound_types:
                     match statement:
                         Stmt.Return(value, line):
-                            table <- pma_report(returned, current_module, index, annotations, table, bound, bound_types) if value is returned
+                            table <- pma_report(file, returned, current_module, index, annotations, table, bound, bound_types) if value is returned
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- pma_report(type_expression, current_module, index, annotations, table, bound, bound_types)
-                            table <- pma_report(value, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, type_expression, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, value, current_module, index, annotations, table, bound, bound_types)
                             if name != "":
                                 bound.push(name)
                                 bound_types.push(bare_type_name(type_expression))
                         Stmt.Assign(target, operator, value, line):
-                            table <- pma_report(target, current_module, index, annotations, table, bound, bound_types)
-                            table <- pma_report(value, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, target, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, value, current_module, index, annotations, table, bound, bound_types)
                         Stmt.Expr(expression, line):
-                            table <- pma_report(expression, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, expression, current_module, index, annotations, table, bound, bound_types)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- pma_report(condition, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, condition, current_module, index, annotations, table, bound, bound_types)
                             then_bound: mutable darray[sview @source] = []
                             then_bound.extend(bound)
                             then_bound_types: mutable darray[sview @source] = []
@@ -896,17 +1149,17 @@ extend Semantic:
                             else_bound.extend(bound)
                             else_bound_types: mutable darray[sview @source] = []
                             else_bound_types.extend(bound_types)
-                            table <- pma_walk_stmts(then_body, current_module, index, annotations, table, then_bound, then_bound_types)
-                            table <- pma_walk_stmts(else_body, current_module, index, annotations, table, else_bound, else_bound_types)
+                            table <- pma_walk_stmts(then_body, file, current_module, index, annotations, table, then_bound, then_bound_types)
+                            table <- pma_walk_stmts(else_body, file, current_module, index, annotations, table, else_bound, else_bound_types)
                         Stmt.While(condition, while_body, while_line):
-                            table <- pma_report(condition, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, condition, current_module, index, annotations, table, bound, bound_types)
                             while_bound: mutable darray[sview @source] = []
                             while_bound.extend(bound)
                             while_bound_types: mutable darray[sview @source] = []
                             while_bound_types.extend(bound_types)
-                            table <- pma_walk_stmts(while_body, current_module, index, annotations, table, while_bound, while_bound_types)
+                            table <- pma_walk_stmts(while_body, file, current_module, index, annotations, table, while_bound, while_bound_types)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
-                            table <- pma_report(iterable, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, iterable, current_module, index, annotations, table, bound, bound_types)
                             for_bound: mutable darray[sview @source] = []
                             for_bound.extend(bound)
                             for_bound_types: mutable darray[sview @source] = []
@@ -914,8 +1167,13 @@ extend Semantic:
                             for variable in variables:
                                 for_bound.push(variable)
                                 for_bound_types.push("")
-                            table <- pma_walk_stmts(for_body, current_module, index, annotations, table, for_bound, for_bound_types)
+                            table <- pma_walk_stmts(for_body, file, current_module, index, annotations, table, for_bound, for_bound_types)
                         Stmt.Block(kind, clause, binding, body, block_line):
+                            if kind == "static":
+                                branch_row: usize = pma_static_if_row_for_position(file, block_line)
+                                if branch_row < file.static_if_lines.count:
+                                    branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                                    continue if branch.known and not branch.selected
                             block_bound: mutable darray[sview @source] = []
                             block_bound.extend(bound)
                             block_bound_types: mutable darray[sview @source] = []
@@ -923,19 +1181,19 @@ extend Semantic:
                             if binding != "":
                                 block_bound.push(binding)
                                 block_bound_types.push("")
-                            table <- pma_walk_stmts(body, current_module, index, annotations, table, block_bound, block_bound_types)
+                            table <- pma_walk_stmts(body, file, current_module, index, annotations, table, block_bound, block_bound_types)
                         Stmt.Match(scrutinee, arms, match_line):
-                            table <- pma_report(scrutinee, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(file, scrutinee, current_module, index, annotations, table, bound, bound_types)
                             for arm in arms |table| -> table:
                                 arm_bound: mutable darray[sview @source] = []
                                 arm_bound.extend(bound)
                                 arm_bound_types: mutable darray[sview @source] = []
                                 arm_bound_types.extend(bound_types)
-                                table <- pma_walk_stmts(arm.body, current_module, index, annotations, table, arm_bound, arm_bound_types)
+                                table <- pma_walk_stmts(arm.body, file, current_module, index, annotations, table, arm_bound, arm_bound_types)
                         _:
                             pass
 
-        def pma_walk_declarations(declarations: darray[Ast::Decl], current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        def pma_walk_declarations(declarations: darray[Ast::Decl], file: Ast::File&, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -943,15 +1201,19 @@ extend Semantic:
                             function_bound: mutable darray[sview @source] = []
                             function_bound_types: mutable darray[sview @source] = []
                             for parameter in parameters |table|:
-                                table <- pma_report(parameter.type_expression, current_module, index, annotations, table, function_bound, function_bound_types)
+                                table <- pma_report(file, parameter.type_expression, current_module, index, annotations, table, function_bound, function_bound_types)
                                 function_bound.push(parameter.name)
                                 function_bound_types.push(bare_type_name(parameter.type_expression))
-                            table <- pma_report(result_type, current_module, index, annotations, table, function_bound, function_bound_types) if return_type is result_type
-                            table <- pma_walk_stmts(body, current_module, index, annotations, table, function_bound, function_bound_types)
+                            table <- pma_report(file, result_type, current_module, index, annotations, table, function_bound, function_bound_types) if return_type is result_type
+                            table <- pma_walk_stmts(body, file, current_module, index, annotations, table, function_bound, function_bound_types)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- pma_walk_declarations(module_body, module_name, index, annotations, table)
+                            table <- pma_walk_declarations(module_body, file, module_name, index, annotations, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- pma_walk_declarations(scoped_body, current_module, index, annotations, table)
+                            branch_row: usize = pma_static_if_row_for_position(file, scoped_line)
+                            if branch_row < file.static_if_lines.count:
+                                branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                                continue if branch.known and not branch.selected
+                            table <- pma_walk_declarations(scoped_body, file, current_module, index, annotations, table)
                         _:
                             pass
 
@@ -963,4 +1225,4 @@ extend Semantic:
                 private_index: mutable PrivateMemberIndex = PrivateMemberIndex{names: [], modules: [], declaration_offsets: [], name_heads: {}, name_next: [], import_heads: {}, import_owners: [], import_members: [], import_next: []}
                 pma_build_index(annotations, private_index) can Global{Read,Write} if has_private
                 pma_build_selective_import_index(annotations, private_index) can Global{Read,Write} if has_private
-                table <- pma_walk_declarations(file.top_decls, "", private_index, annotations, table) if has_private
+                table <- pma_walk_declarations(file.top_decls, file, "", private_index, annotations, table) if has_private

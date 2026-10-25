@@ -36,6 +36,11 @@ PIPELINE_FILES = [
 ]
 PARSER_ARGUMENT_SOURCE = ROOT / "src/parser/parser_expr_query.elisa"
 PARSER_VISIBILITY_SOURCE = ROOT / "src/parser/parser_decl_module.elisa"
+PARSER_CATCH_SOURCE = ROOT / "src/parser/parser_stmt_pattern_arms.elisa"
+PARSER_NOMINAL_SOURCES = [
+    ROOT / "src/parser/parser_types_aggregate.elisa",
+    ROOT / "src/parser/parser_export_surface.elisa",
+]
 POSITIVE = HERE / "try_enclosing_function_index.elisa"
 NEGATIVE = HERE / "try_enclosing_function_index_rejected.elisa"
 PROOF_PROCESS_TIMEOUT_SECONDS = 60
@@ -272,7 +277,7 @@ if not contains_contiguous_block(rows_function, expected_dispatch):
 if compact_inline(rows_function).count("enclosing_try_function_indexed(") != 1 or \
         compact_inline(rows_function).count("enclosing_try_function(") != 1:
     raise SystemExit("try rows must retain exactly one indexed and one linear enclosing-function dispatch arm")
-propagation_call = "table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, try_named_arguments, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable, error_set_annotations, error_set_family_paths, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, row_arity.known, row_arity.value, first_class_error_family, noncall_lambda_error_family, noncall_inside_lambda)"
+propagation_call = "table <- check_try_propagation_row(file, annotation, row_enclosing, row_module, row_qualifier, annotations, try_named_arguments, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable, error_set_annotations, error_set_family_paths, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, row_arity.known, row_arity.value, first_class_error_family, noncall_lambda_error_family, noncall_inside_lambda)"
 if compact_inline(propagation_call) not in compact_inline(rows_function):
     raise SystemExit("resolved enclosing function must flow into try-propagation diagnostics")
 
@@ -284,12 +289,33 @@ if not all(fragment in argument_types for fragment in (
         "declared.binding_id.serial != binding.binding_id.serial",
         'marker.owner != "__try_callee_argument_direct_call"',
         "ownership_binding_at_position(table, caller, nested_call_position)",
+        "callable_try_static_binding_uncertain(annotations, nested_call_name, caller_module, \"\", table)",
+        "callable_row_in_scope_indexed(module_index, module_annotations, annotations, nested_call_name, symbol.offset, symbol.line, caller_module, \"\", table)",
         "symbol.return_type_id",
         "type_id_contains_function_generic(call_return_type_id, call_return_function_line, table)",
         "type_id_contains_region(call_return_type_id, table)",
         "call_return_conflict",
         "argument_type_firm or argument_type_ambiguous")):
-    raise SystemExit("Try argument types must use exact bindings or a unique unshadowed same-module concrete call result, and fail closed on generic or region schemes")
+    raise SystemExit("Try argument types must use exact bindings or one visible unshadowed concrete call result, and fail closed on unresolved imports, generic or region schemes")
+imported_argument_fixture = (ROOT / "test/repro/try_overload_imported_argument_type_id.elisa").read_text()
+if not all(fragment in imported_argument_fixture for fragment in (
+        "module Helpers:",
+        "def make_flag() -> bool",
+        "module Consumer:",
+        "from Helpers import make_flag",
+        "def choose(value: bool)",
+        "def choose(value: i64)",
+        "def caller() -> i64 error[Consumer::IntegerFault]",
+        "def caller_correct_family() -> i64 error[Consumer::BoolFault]",
+        "return try choose(make_flag())")):
+    raise SystemExit("Try imported-call argument coverage must bind receiver overload ranking to one visible imported function's concrete return type")
+imported_argument_smoke = (ROOT / "test/parity/try_overload_imported_argument_type_id_smoke.sh").read_text()
+if not all(fragment in imported_argument_smoke for fragment in (
+        "try_overload_imported_argument_type_id.elisa",
+        "expected_rows=$'L24'",
+        "cannot propagate BoolFault from a function returning IntegerFault",
+        "grep -q '^D 1$'")):
+    raise SystemExit("Try imported-call parity smoke must reject the wrong ErrorSet and preserve the correct-family control")
 generic_parameter = compact_inline(function_section(source_text, "try_overload_type_is_generic_parameter"))
 if not all(fragment in generic_parameter for fragment in (
         'annotation.name == "__generic_param_identity"',
@@ -301,11 +327,11 @@ type_selection = compact_inline(function_section(source_text, "callable_symbol_t
 if not all(fragment in type_selection for fragment in (
         'argument.owner == "__try_callee_named_arg"',
         "actual_receiver_type_id: u32 = argument_type_ids[0]",
-        "try_overload_type_is_firm_in_module(actual_receiver_type_id, enclosing_module, annotations, table)",
+        "try_overload_type_is_firm_in_module(file, actual_receiver_type_id, enclosing_module, annotations, table)",
         "callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)",
         "callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)",
         "continue if not receiver.found and not callable_symbol_has_parameter_rows(table, symbol) and symbol.arity_min == 0 and (symbol.arity_max == 0 or symbol.arity_max == 4294967295)",
-        "try_overload_receiver_pattern_matches(receiver.type_id, actual_receiver_type_id, symbol.id, enclosing_module, annotations, table, 0)",
+        "try_overload_receiver_pattern_matches(file, receiver.type_id, actual_receiver_type_id, symbol.id, enclosing_module, annotations, table, 0)",
         "if actual_receiver_is_ref and not formal_receiver_is_ref and not try_overload_type_is_generic_parameter(receiver.type_id, symbol.id, annotations, table):",
         "return invalid if actual_receiver_base_kind == SemTypeKind.Int or actual_receiver_base_kind == SemTypeKind.Float or actual_receiver_base_kind == SemTypeKind.Bool",
         "continue if receiver.mutable_ref and not receiver_ref_mutable",
@@ -424,9 +450,13 @@ if not all(fragment in noncall_import_builder for fragment in (
         "environment.callable_imported_member_names.push(import_annotation.name)")):
     raise SystemExit("Try non-call cached facts must retain only Core's first selective import for each bare name")
 noncall_module_path = compact_inline(function_section(source_text, "try_noncall_module_path"))
-if 'return child if parent == ""' not in noncall_module_path or \
-        "module_path_has_scope_separator(child)" in noncall_module_path:
-    raise SystemExit("Try nested module and import paths must qualify multi-segment children relative to their parent")
+if not all(fragment in noncall_module_path for fragment in (
+        'return child if parent == ""',
+        "already_parent_qualified: mutable bool",
+        "child.len > parent.len + 1.usize()",
+        "child[parent.len + 1.usize()] == 58",
+        "return child if already_parent_qualified")):
+    raise SystemExit("Try module path joins must preserve already-qualified declaration children while keeping relative joins")
 noncall_assignment_facts = compact_inline(function_section(source_text, "try_noncall_assignment_source_facts"))
 if 'return (call_facts.family, call_facts.return_nonfallible and call_facts.family == "") if call_facts.known' not in noncall_assignment_facts:
     raise SystemExit("Try non-call assignment facts must preserve known infallible callable returns")
@@ -479,13 +509,42 @@ if not all(fragment in cached_candidate_set for fragment in (
 cached_lookup_signature = compact_inline(function_section(source_text, "try_noncall_callable_cached_facts"))
 if "arguments: darray[Ast::Expr]&" not in cached_lookup_signature or "try_noncall_cached_hidden_candidate_blocks(callable_index, callee_name, callee_qualifier, callee, arguments, argument_names, params, environment)" not in cached_lookup_signature or "try_noncall_callable_cached_facts(callee_name, callee_qualifier, callee, environment)" in source_text:
     raise SystemExit("Every Try cached callable lookup must receive call arguments and caller parameter types before returning ErrorSet facts")
+cached_static_binding = compact_inline(function_section(source_text, "try_noncall_static_binding_may_affect_call"))
+if not all(fragment in cached_static_binding for fragment in (
+        'unresolved.name == "__from_member"',
+        'unresolved.name == "__binding_wildcard_import"',
+        'unresolved.name == "__using_alias"',
+        "environment.callable_modules[index] == target_module",
+        "try_noncall_static_alias_call_matches_module(callee, unresolved.detail_name, target_module, environment.callable_modules[callable_index])")) or "continue if not try_noncall_module_is_ancestor(unresolved.module, environment.current_module)" in cached_static_binding or not all(fragment in cached_lookup_signature for fragment in (
+        "try_noncall_static_binding_may_affect_call(callee_name, callee_qualifier, callee, environment)",
+        'return (false, "", false, false, false, true, "", 0.usize())')):
+    raise SystemExit("Try cached callable facts must fail closed only when an unresolved static import or alias can reach a same-name candidate")
+if cached_lookup_signature.find("try_noncall_static_binding_may_affect_call") > cached_lookup_signature.find("match_count: mutable usize"):
+    raise SystemExit("Try must reject an unresolved static candidate before selecting cached callable facts")
+static_alias_path_uncertain = compact_inline(function_section(source_text, "callable_static_alias_path_uncertain"))
+if not all(fragment in static_alias_path_uncertain for fragment in (
+        "callable_using_alias_visible_target(annotations, current_scope, segments[0])",
+        'unresolved.name == "__using_alias"',
+        "try_noncall_module_is_ancestor(unresolved.module, lexical_module)",
+        "return segments.count > 0.usize()")):
+    raise SystemExit("Try direct callable lookup must keep uncertainty when an alias target path crosses a visible or unresolved alias head")
+if not all(fragment in noncall_import_builder for fragment in (
+        "environment.unresolved_static_bindings.push(unresolved)",
+        "environment.unresolved_static_binding_targets.push(target_module)",
+        "try_noncall_module_path(unresolved.module, source.name, table)",
+        "try_noncall_module_path(unresolved.module, alias_target.owner, table)",
+        'candidate_alias.name == "__using_alias" and candidate_alias.detail_name == target_head',
+        "visible_target_alias.count == 0.usize() and not unresolved_target_alias")):
+    raise SystemExit("Try non-call environments must retain unresolved marker targets through branch clones")
 cached_env_clone = compact_inline(function_section(source_text, "try_noncall_family_clone"))
 if not all(fragment in cached_env_clone for fragment in (
         "clone.callable_first_param_type_names.extend(environment.callable_first_param_type_names)",
         "clone.callable_first_param_generic.extend(environment.callable_first_param_generic)",
         "clone.callable_max_param_counts.extend(environment.callable_max_param_counts)",
         "clone.callable_has_default_params.extend(environment.callable_has_default_params)",
-        "clone.callable_variadic.extend(environment.callable_variadic)")):
+        "clone.callable_variadic.extend(environment.callable_variadic)",
+        "clone.unresolved_static_bindings.extend(environment.unresolved_static_bindings)",
+        "clone.unresolved_static_binding_targets.extend(environment.unresolved_static_binding_targets)")):
     raise SystemExit("Try branch clones must preserve cached overload signature facts")
 selected_receiver_acceptance = compact_inline(function_section(source_text, "callable_symbol_accepts_arity"))
 if not all(fragment in selected_receiver_acceptance for fragment in (
@@ -527,8 +586,8 @@ if not all(fragment in unresolved_private_candidate for fragment in (
         "callable_symbol_core_accepts_receiver_arity",
         "callable_symbol_accepts_named_arguments",
         "or callable_function_declaration_visible",
-        "try_overload_receiver_pattern_matches(receiver.type_id, argument_type_ids[0]",
-        "try_overload_type_shared_ambiguous_match_state(receiver.type_id, argument_type_ids[0]",
+        "try_overload_receiver_pattern_matches(file, receiver.type_id, argument_type_ids[0]",
+        "try_overload_type_shared_ambiguous_match_state(file, receiver.type_id, argument_type_ids[0]",
         "receiver_ref_mutability_known",
         "receiver.mutable_ref and not receiver_ref_mutable")):
     raise SystemExit("Try unresolved private-candidate checks must model Core's overload set, receiver compatibility, and reference mutability")
@@ -563,8 +622,12 @@ if not all(fragment in receiver_match for fragment in (
     raise SystemExit("Receiver matching must support exact generic parameters, compatible concrete types, and structural receiver shapes")
 cached_integer_type = compact_inline(function_section(source_text, "try_noncall_cached_integer_type"))
 cached_builtin_type = compact_inline(function_section(source_text, "try_noncall_cached_builtin_type"))
-if '"char"' not in cached_integer_type or '"uintptr"' not in cached_integer_type or '"uintptr"' not in cached_builtin_type:
+if '"char"' not in cached_integer_type or '"uintptr"' not in cached_integer_type or '"char"' not in cached_builtin_type or '"uintptr"' not in cached_builtin_type:
     raise SystemExit("Try cached receiver ranking must treat char and uintptr as integral storage for an untyped int actual")
+primitive_type_facts = compact_inline(function_section(source_text, "try_noncall_type_name_facts"))
+primitive_integer_facts = primitive_type_facts.split("integer: bool =", 1)
+if len(primitive_integer_facts) != 2 or '"char"' not in primitive_integer_facts[0] or '"uintptr"' not in primitive_integer_facts[1] or "known_nonfallible: bool = numeric" not in primitive_integer_facts[1]:
+    raise SystemExit("Try non-call primitive facts must keep char numeric and uintptr integral and known non-fallible")
 receiver_specificity = compact_inline(function_section(source_text, "try_overload_receiver_specificity"))
 if not all(fragment in receiver_specificity for fragment in (
         "return (true, 0.usize()) if try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)",
@@ -585,74 +648,100 @@ if not all(fragment in argument_types for fragment in (
 firm_type = compact_inline(function_section(source_text, "try_overload_type_is_firm"))
 if not all(fragment in firm_type for fragment in (
         "try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)",
-        "try_overload_nominal_type_owner(name, declaration, annotations, table)",
+        "try_overload_nominal_type_owner(file, name, declaration, annotations, table)",
         "return identity.found")):
     raise SystemExit("Try firm named receiver types must resolve one nominal owner in the declaration's lexical scope")
 module_firm_type = compact_inline(function_section(source_text, "try_overload_type_is_firm_in_module"))
 if not all(fragment in module_firm_type for fragment in (
         "depth > 64",
-        "try_overload_nominal_type_owner_for_module(name, lexical_module, annotations, table)",
-        "try_overload_type_is_firm_in_module(interned_elem(type_id, element_position.u32(), table), lexical_module, annotations, table, depth + 1)")):
+        "try_overload_nominal_type_owner_for_module(file, name, lexical_module, annotations, table)",
+        "try_overload_type_is_firm_in_module(file, interned_elem(type_id, element_position.u32(), table), lexical_module, annotations, table, depth + 1)")):
     raise SystemExit("Try receiver ranking must resolve named actual types in the call-site module, including nested type shapes")
 type_visibility = compact_inline(function_section(source_text, "try_overload_type_declaration_visible"))
 if not all(fragment in type_visibility for fragment in (
         "try_error_alias_module_visible(annotations, declaration_module, lexical_module)",
+        "type_symbol_is_alias",
+        "try_noncall_type_alias_declaration_is_static_inactive(file, annotations, name, declaration_module, declaration_line, declaration_offset, table)",
+        "try_overload_nominal_type_declaration_is_static_inactive(file, annotations, name, declaration_module, declaration_line, declaration_offset, table)",
         'annotation.owner != "__section_private"',
         "exact_offset",
         "try_noncall_module_is_ancestor(declaration_module, lexical_module)")):
     raise SystemExit("Try nominal owner lookup must filter inaccessible modules and declaration-specific private type markers")
+nominal_static_activity = compact_inline(function_section(source_text, "try_overload_nominal_type_declaration_is_static_inactive"))
+nominal_type_classifier = compact_inline(function_section(source_text, "try_overload_type_symbol_is_nominal"))
+if not all(fragment in nominal_type_classifier for fragment in (
+        "symbol.kind == SymbolKind.Struct",
+        "symbol.kind == SymbolKind.Enum",
+        "symbol.kind == SymbolKind.Alias",
+        "symbol.kind == SymbolKind.Extern and symbol.opaque_extern_type")):
+    raise SystemExit("Try nominal owner lookup must classify structs, enums, aliases, and opaque extern types")
+if not all(fragment in nominal_static_activity for fragment in (
+        'marker.owner != "__static_if_branch"',
+        'marker.name != "__nominal_type_static_branch"',
+        "marker.detail_name != name",
+        "marker.module != declaration_module",
+        "marker.line != declaration_line",
+        "marker.offset != declaration_offset",
+        "continue if marker.identity_id == 4294967295",
+        "pma_static_if_row_selection(file, marker.identity_id.usize(), declaration_module, table)",
+        "return true if branch.known and not branch.selected")):
+    raise SystemExit("Try nominal owner lookup must exclude only exact, proven-inactive non-alias type declarations")
 type_owner_module = compact_inline(function_section(source_text, "try_overload_type_owner_in_module"))
 if not all(fragment in type_owner_module for fragment in (
         "try_overload_type_symbol_is_nominal(symbol)",
-        "try_overload_type_declaration_visible(annotations, name, declaration_module, symbol.line, symbol.offset, lexical_module)",
+        "try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, declaration_module, symbol.line, symbol.offset, lexical_module, table)",
         "return (count > 0.usize(), false, declaration_module)")):
     raise SystemExit("Try nominal owner lookup must recognize a visible owner within one module and leave duplicate declarations to Core")
 nominal_type_identity = compact_inline(function_section(source_text, "try_overload_nominal_type_owner_for_module"))
 if not all(fragment in nominal_type_identity for fragment in (
-        "try_overload_type_owner_in_module(name, scope_module, lexical_module, annotations, table)",
+        "try_overload_type_owner_in_module(file, name, scope_module, lexical_module, annotations, table)",
         "return local if local.found or local.ambiguous",
         "scope_module <- try_noncall_module_parent(scope_module)",
         'binding.owner != "__from_member"',
         'source.owner != "__from_src"',
-        "callable_module_path_matches_suffix(symbol.module_owner, binding.module, source.name)",
+        "callable_import_module_matches_target(symbol.module_owner, binding.module, source.name)",
         'binding.name != "__binding_wildcard_import"',
         "binding.module.len > wildcard_scope_length",
-        "try_overload_type_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)")):
+        "try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module, table)")):
     raise SystemExit("Try nominal identity must follow local and ancestor declarations, selective imports, then the nearest visible wildcard import")
 nominal_type_owner = compact_inline(function_section(source_text, "try_overload_nominal_type_owner"))
-if "table.symbols[declaration.value.usize()].module_owner" not in nominal_type_owner:
+if not all(fragment in nominal_type_owner for fragment in (
+        "table.symbols[declaration.value.usize()].module_owner",
+        "try_overload_nominal_type_owner_for_module(file, name, table.symbols[declaration.value.usize()].module_owner, annotations, table)")):
     raise SystemExit("Try formal nominal identities must be resolved from the owning declaration's module")
 ambiguous_type_identity = compact_inline(function_section(source_text, "try_overload_type_has_ambiguous_nominal_identity"))
 if not all(fragment in ambiguous_type_identity for fragment in (
         "try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)",
-        "try_overload_nominal_type_owner(name, declaration, annotations, table)",
+        "try_overload_nominal_type_owner(file, name, declaration, annotations, table)",
         "identity.ambiguous",
         "interned_elem(type_id, element_position.u32(), table)")):
     raise SystemExit("Try ambiguous nominal receiver detection must preserve generic identity and recurse through structural types")
 if not all(fragment in receiver_match for fragment in (
-        "try_overload_nominal_type_owner(name, declaration, annotations, table)",
-        "try_overload_nominal_type_owner_for_module(name, actual_module, annotations, table)",
+        "try_overload_nominal_type_owner(file, name, declaration, annotations, table)",
+        "try_overload_nominal_type_owner_for_module(file, name, actual_module, annotations, table)",
         "formal_identity.ambiguous or actual_identity.ambiguous",
         "formal_identity.owner == actual_identity.owner")):
     raise SystemExit("Try named receiver matching must compare lexical nominal owners and fail closed on ambiguity")
 argument_types = compact_inline(function_section(source_text, "try_call_argument_type_ids"))
-if "try_overload_type_has_ambiguous_nominal_identity(argument_type_id, caller, annotations, table, 0)" not in argument_types or "argument_type_firm or argument_type_ambiguous" not in argument_types:
+if "try_overload_type_has_ambiguous_nominal_identity(file, argument_type_id, caller, annotations, table, 0)" not in argument_types or "argument_type_firm or argument_type_ambiguous" not in argument_types:
     raise SystemExit("Try argument typing must preserve ambiguous nominal identity for candidate lookup to fail closed")
 shared_ambiguous_match = compact_inline(function_section(source_text, "try_overload_type_shared_ambiguous_match_state"))
 if not all(fragment in shared_ambiguous_match for fragment in (
-        "try_overload_nominal_type_owner_for_module(name, actual_module, annotations, table)",
-        "try_overload_nominal_type_owner(name, formal_declaration, annotations, table)",
+        "try_overload_nominal_type_owner_for_module(file, name, actual_module, annotations, table)",
+        "try_overload_nominal_type_owner(file, name, formal_declaration, annotations, table)",
         "actual_identity.owner != formal_identity.owner",
+        'formal_kind == SemTypeKind.Int and actual_kind == SemTypeKind.Int and interned_name(actual_type_id, table) == "int"',
+        'formal_kind == SemTypeKind.Char and actual_kind == SemTypeKind.Int and interned_name(actual_type_id, table) == "int"',
         "element_count != interned_elem_count(formal_type_id, table)",
         "has_ambiguous_element <- true if element_state.ambiguous")):
-    raise SystemExit("Try ambiguity overlap must distinguish known different owners and recurse through potentially matching structural receiver shapes")
+    raise SystemExit("Try ambiguity overlap must include Core's int-to-integer and int-to-char receiver coercions, distinguish known different owners, and recurse through structural shapes")
 ambiguous_receiver_candidate = compact_inline(function_section(source_text, "callable_overload_has_ambiguous_nominal_receiver_candidate"))
 if not all(fragment in ambiguous_receiver_candidate for fragment in (
         "callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)",
         "callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)",
         "callable_symbol_core_accepts_receiver_arity(table, symbol, arity)",
         "callable_symbol_receiver_type(table, symbol)",
-        "try_overload_type_shared_ambiguous_match_state(receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0)",
+        "try_overload_type_shared_ambiguous_match_state(file, receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0)",
         "ambiguous_match.potential_match and ambiguous_match.ambiguous")):
     raise SystemExit("Try ambiguity rejection must be limited to a visible, arity-eligible receiver candidate with a shared ambiguous nominal spelling")
 if "return false if callable_overload_has_ambiguous_nominal_receiver_candidate" not in selected_receiver_acceptance or "return 0.usize() if callable_overload_has_ambiguous_nominal_receiver_candidate" not in selected_receiver_count:
@@ -660,6 +749,11 @@ if "return false if callable_overload_has_ambiguous_nominal_receiver_candidate" 
 parser_source = PARSER_ARGUMENT_SOURCE.read_text()
 if 'owner: "__try_callee_argument_position"' not in parser_source or "pos: Ast::expr_pos(arguments[index])" not in parser_source:
     raise SystemExit("Try calls must retain each actual argument's exact AST position for resolved type lookup")
+parser_nominal_text = [path.read_text() for path in PARSER_NOMINAL_SOURCES]
+if parser_nominal_text[0].count('record_static_if_branch_rows("__nominal_type_static_branch", name_text, token)') != 2 or \
+        'record_static_if_branch_rows("__nominal_type_static_branch", target_name, token)' not in parser_nominal_text[1] or \
+        'record_static_if_branch_rows("__nominal_type_static_branch", name, token)' not in parser_nominal_text[1]:
+    raise SystemExit("Try nominal lookup must receive exact static-branch markers for structs, enums, opaque externs, and exported types")
 parser_try_expression = compact_inline(function_section(parser_source, "get_expression"))
 parser_call_arity = compact_inline(function_section(parser_source, "try_expression_call_arity"))
 parser_try_arguments = compact_inline(function_section(parser_source, "try_expression_record_named_arguments"))
@@ -708,6 +802,9 @@ if not all(fragment in section_marker for fragment in (
         "offset: member_position.offset",
         "module: owning_module")):
     raise SystemExit("Try declaration visibility requires parser section markers with exact line, offset, and module identity")
+parser_catch_source = compact_inline(function_section(PARSER_CATCH_SOURCE.read_text(), "catch_statement"))
+if 'owner: "__catch_match", name: "__catch_match", line: catch_token.line, offset: catch_token.start, module: parser.current_module' not in parser_catch_source:
+    raise SystemExit("statement-catch markers must preserve module identity alongside exact token line and offset")
 
 family_module = compact_inline(function_section(source_text, "try_error_set_decl_module_for_annotation"))
 root_precedence = 'return (true, family_annotation.name, "", false) if not qualified and try_error_set_decl_has_owner(annotations, family_annotation.name, "")'
@@ -869,11 +966,11 @@ if not all(fragment in private_visibility_fixture for fragment in (
         "def address[T](value: T) -> i64 error[CharProvider::GenericFault]",
         "def address(value: uintptr) -> i64 error[CharProvider::ConcreteFault]",
         "def int_char_private_winner_direct(value: int) -> i64 error[Consumer::Destination]",
-        "return try CharProvider::narrow(value)",
+        "def int_char_private_winner_direct(value: int) -> i64 error[Consumer::Destination]:\n            return try CharProvider::narrow(value)",
         "def int_char_private_winner_cached(value: int) -> i64 error[Consumer::Destination]",
-        "payload = CharProvider::narrow(value)",
+        "def int_char_private_winner_cached(value: int) -> i64 error[Consumer::Destination]:\n            payload = CharProvider::narrow(value)\n            return try payload",
         "def int_uintptr_private_winner_cached(value: int) -> i64 error[Consumer::Destination]",
-        "payload = CharProvider::address(value)")) or not all(fragment in private_visibility_smoke for fragment in (
+        "def int_uintptr_private_winner_cached(value: int) -> i64 error[Consumer::Destination]:\n            payload = CharProvider::address(value)\n            return try payload")) or not all(fragment in private_visibility_smoke for fragment in (
         "grep -cF 'cannot propagate'",
         "== 8",
         "grep -cF 'is private to module'",
@@ -930,15 +1027,28 @@ if not all(fragment in nominal_identity_controls_fixture for fragment in (
         "def generic_only_same_name(value: Widget)",
         "def concrete_overload_same_name(value: Widget)",
         "def concrete_overload_wrong_family(value: Widget)",
+        "static if false:",
+        "type Widget = bool",
+        "def inactive_alias_direct(value: Widget) -> i64 error[Provider::Fault]",
+        "def inactive_alias_cached(value: Widget) -> i64 error[Provider::Fault]",
+        "module InactiveStructShadow:",
+        "struct Widget:",
+        "module InactiveEnumShadow:",
+        "enum Widget:",
+        "module InactiveExternShadow:",
+        "extern Widget",
+        "def direct(value: Widget) -> i64 error[Provider::Fault]",
         "return try Provider::singleton(value)",
         "return try Provider::generic_only(value)",
-        "return try Provider::overloaded(value)")) or not all(fragment in nominal_identity_controls_smoke for fragment in (
+        "return try Provider::overloaded(value)",
+        "payload = Provider::singleton(value)",
+        "return try payload")) or not all(fragment in nominal_identity_controls_smoke for fragment in (
         "try_overload_nominal_identity_controls.elisa",
         "wrong-family concrete-overload control",
         "^D 1$",
         "cannot propagate",
         "expected_rows=$'L51'")):
-    raise SystemExit("Try nominal identity controls must preserve singleton, generic-only, and visible concrete winners despite an inaccessible same-spelled type")
+    raise SystemExit("Try nominal identity controls must preserve selected families despite private or statically inactive same-spelled type declarations")
 nested_forward_fixture = (ROOT / "test/repro/try_overload_nested_and_forwarded_calls.elisa").read_text()
 nested_forward_smoke = (ROOT / "test/parity/try_overload_nested_and_forwarded_calls_smoke.sh").read_text()
 if not all(fragment in nested_forward_fixture for fragment in (
@@ -990,6 +1100,26 @@ if not all(fragment in static_import_fixture for fragment in (
     raise SystemExit("Try static-import coverage must select the active static-else provider's ErrorSet over the earlier inactive import")
 if not (static_import_fixture.index("from InactiveProvider import origin") < static_import_fixture.index("from ActiveProvider import origin")):
     raise SystemExit("Try static-import coverage must put the inactive import before the active fallback import")
+static_alias_fixture = (ROOT / "test/repro/try_overload_static_alias_family.elisa").read_text()
+static_alias_smoke = (ROOT / "test/parity/try_overload_static_alias_family_smoke.sh").read_text()
+if not all(fragment in static_alias_fixture for fragment in (
+        "const USE_INACTIVE_PROVIDER: bool = false",
+        "static if USE_INACTIVE_PROVIDER:",
+        "using InactiveProvider as Selected",
+        "static else:",
+        "using ActiveProvider as BaseProvider",
+        "using BaseProvider as Selected",
+        "error InactiveFault:",
+        "error ActiveFault:",
+        "def caller(value: bool) -> i64 error[ActiveProvider::ActiveFault]",
+        "return try Selected::origin(value)")):
+    raise SystemExit("Try static-alias coverage must select the active static-else provider's ErrorSet for a qualified call")
+if not all(fragment in static_alias_smoke for fragment in (
+        "try_overload_static_alias_family.elisa",
+        "Stage0 selected the inactive alias provider's ErrorSet",
+        "Stage1 selected the inactive alias provider's ErrorSet",
+        "cannot propagate")):
+    raise SystemExit("Try static-alias smoke must check both compiler stages against the inactive provider's ErrorSet")
 if "try_error_alias_name_visible(annotations, name, declaration_module, function_module)" not in alias_visibility or not all(fragment in private_alias_path for fragment in (
         'row.owner == "__section_private"',
         "row.name == segment",
@@ -1136,7 +1266,7 @@ if not all(fragment in unresolved_static_binding for fragment in (
         'unresolved.name == "__binding_wildcard_import"',
         'unresolved.name == "__using_alias"')):
     raise SystemExit("Try callable resolution must decline a family when an unresolved static binding could affect the call")
-rows_call = "table <- check_try_fallible_rows(file.top_decls, try_annotations, projection.try_named_arguments, projection.try_argument_positions, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, projection.try_arities, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
+rows_call = "table <- check_try_fallible_rows(file, file.top_decls, try_annotations, projection.try_named_arguments, projection.try_argument_positions, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, projection.try_arities, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
 if compact_inline(main_try_check).count(compact_inline(rows_call)) != 1:
     raise SystemExit("check_try_fallible must invoke the source-row checker when at least one try site exists")
 if 'try_annotations: darray[Ast::EnumAnnotation] = try_static_binding_filtered_annotations(file, table)' not in compact_inline(main_try_check):
@@ -1248,7 +1378,7 @@ for raw_value in ("middle: usize = low + (high - low) / 2", "low <- middle + 1",
         raise SystemExit(f"proof model contains a raw position-search value: {raw_value}")
 
 if args.source_only:
-    print(json.dumps({"source_bound": True, "theorems": len(POSITIVE_NAMES), "try_source_files": len(SOURCE_FILES), "pipeline_source_files": len(PIPELINE_FILES), "parser_argument_source": 1, "parser_visibility_source": 1}))
+    print(json.dumps({"source_bound": True, "theorems": len(POSITIVE_NAMES), "try_source_files": len(SOURCE_FILES), "pipeline_source_files": len(PIPELINE_FILES), "parser_argument_source": 1, "parser_visibility_source": 1, "parser_nominal_sources": len(PARSER_NOMINAL_SOURCES)}))
     raise SystemExit(0)
 
 try:
@@ -1278,13 +1408,19 @@ inputs = list(dict.fromkeys([
     *PIPELINE_FILES,
     PARSER_ARGUMENT_SOURCE,
     PARSER_VISIBILITY_SOURCE,
+    PARSER_CATCH_SOURCE,
+    *PARSER_NOMINAL_SOURCES,
     ROOT / "test/atoms/try_fallback_source.elisa",
     ROOT / "test/repro/try_overload_private_same_named_module_types.elisa",
     ROOT / "test/parity/try_overload_private_same_named_module_types_smoke.sh",
     ROOT / "test/repro/try_overload_nominal_identity_controls.elisa",
     ROOT / "test/parity/try_overload_nominal_identity_controls_smoke.sh",
     ROOT / "test/repro/try_overload_static_import_family.elisa",
+    ROOT / "test/repro/try_overload_static_alias_family.elisa",
+    ROOT / "test/repro/try_overload_imported_argument_type_id.elisa",
+    ROOT / "test/parity/try_overload_imported_argument_type_id_smoke.sh",
     ROOT / "test/parity/try_overload_static_import_family_smoke.sh",
+    ROOT / "test/parity/try_overload_static_alias_family_smoke.sh",
     POSITIVE,
     NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),

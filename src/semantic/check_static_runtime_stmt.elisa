@@ -6,107 +6,197 @@
 #       static:
 #           keep()          # error: must evaluate at compile time
 #
-# SOUND subset: flag a `Stmt.Expr` inside a `static:` block whose callee is a declared
-# NON-static user function. A call to a static function, a builtin, or an extern (none in the
-# user-function set) is a conservative miss, never a false positive.
+# This check is intentionally conservative. It reports only direct calls whose nearest
+# visible declaration scope contains runtime functions and no same-name static overload.
 extend Semantic:
     private:
-        def srs_name_in(names: darray[sview]&, wanted: sview) -> bool:
+        def srs_module_contains(current_module: sview, owner: sview) -> bool:
             can Abort.Panic:
-                return any name in names where name == wanted
+                return true if owner == ""
+                return false if owner.len > current_module.len
+                for index in 0..<owner.len |current_module, owner|:
+                    return false if current_module[index] != owner[index]
+                return true if owner.len == current_module.len
+                return owner.len + 1.usize() < current_module.len and current_module[owner.len] == 58 and current_module[owner.len + 1.usize()] == 58
 
-        # Statement-position `static if` branches share the AST block kind `static`
-        # with a bare compile-time `static:` block. Only the latter evaluates its body
-        # at compile time; selected static-if bodies are ordinary runtime code. The
-        # parser records branch-head lines in the file side table, which disambiguates
-        # the two without changing the AST representation.
-        def srs_is_static_if_branch(static_if_lines: darray[u32]&, target_line: u32) -> bool:
+        def srs_static_function_at(file: Ast::File&, current_module: sview, name: sview, position: Ast::Pos) -> bool:
             can Abort.Panic:
-                return any branch_line in static_if_lines where branch_line == target_line
+                return any annotation in file.enum_annotations where annotation.owner == "__static_fn" and annotation.name == name and annotation.module == current_module and annotation.line == position.line and annotation.offset == position.offset
 
-        def srs_collect_user_fns(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+        # Resolve the collected AST declaration back to its exact symbol row, then use
+        # the shared import-aware visibility policy. Branch rows remain a separate fact:
+        # unresolved function branches are possible candidates and must keep the result
+        # uncertain instead of turning into a definite runtime call.
+        def srs_function_candidate_visibility(file: Ast::File&, table: lmut SymbolTable, name: sview, module: sview, line: u32, offset: u32, current_module: sview) -> (found: bool, known: bool, visible: bool, lexical: bool, branch_known: bool, branch_active: bool):
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |out|:
+                for symbol in table.symbols |file, table, name, module, line, offset, current_module|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != name or symbol.module_owner != module or symbol.line != line or symbol.offset != offset
+                    visibility: (known: bool, visible: bool, lexical: bool) = sgi_function_visible(file, file.enum_annotations, table, symbol, current_module)
+                    branch: (known: bool, active: bool) = pma_static_if_function_branch_selection(file, name, symbol, table, 0)
+                    return (true, visibility.known, visibility.visible, visibility.lexical, branch.known, branch.active)
+                return (false, false, false, false, false, false)
+
+        def srs_static_if_branch_selection(file: Ast::File&, position: Ast::Pos, current_module: sview, table: SymbolTable&) -> (found: bool, known: bool, active: bool):
+            can Abort.Panic:
+                branch_row: mutable usize = file.static_if_lines.count
+                for row in 0..<file.static_if_lines.count |branch_row, position, file|:
+                    if row < file.static_if_offsets.count and file.static_if_lines[row] == position.line and file.static_if_offsets[row] == position.offset:
+                        return (true, false, false) if branch_row < file.static_if_lines.count
+                        branch_row <- row
+                return (false, false, false) if branch_row >= file.static_if_lines.count
+                branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                return (true, branch.known, branch.selected)
+
+        def srs_collect_functions(declarations: darray[Ast::Decl], current_module: sview, file: Ast::File&, table: SymbolTable&, names: mutable darray[sview]&, modules: mutable darray[sview]&, lines: mutable darray[u32]&, offsets: mutable darray[u32]&, is_static: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |current_module, file, table, names, modules, lines, offsets, is_static|:
                     match declaration:
-                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            out.push(function_name)
-                        Decl.Module(module_name, module_body, module_line):
-                            srs_collect_user_fns(module_body, out)
-                        Decl.Scoped(scoped_body, scoped_line):
-                            srs_collect_user_fns(scoped_body, out)
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, position):
+                            names <- names.push(function_name)
+                            modules <- modules.push(current_module)
+                            lines <- lines.push(position.line)
+                            offsets <- offsets.push(position.offset)
+                            is_static <- is_static.push(srs_static_function_at(file, current_module, function_name, position))
+                        Decl.Module(module_name, module_body, module_position):
+                            srs_collect_functions(module_body, module_name, file, table, names, modules, lines, offsets, is_static)
+                        Decl.Scoped(scoped_body, scoped_position):
+                            branch: (found: bool, known: bool, active: bool) = srs_static_if_branch_selection(file, scoped_position, current_module, table)
+                            continue if branch.found and branch.known and not branch.active
+                            srs_collect_functions(scoped_body, current_module, file, table, names, modules, lines, offsets, is_static)
                         _:
                             pass
 
-        # Walk a compile-time (static) statement subtree, flagging runtime-function call
-        # statements.
-        def srs_walk_static(statements: darray[Ast::Stmt], user_fns: darray[sview]&, static_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        # Resolve an unqualified call at the most-specific visible module scope. If that
+        # scope has both static and runtime overloads, the lightweight checker declines.
+        def srs_function_kind(file: Ast::File&, table: lmut SymbolTable, names: darray[sview]&, modules: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, is_static: darray[bool]&, current_module: sview, wanted: sview) -> (found: bool, known: bool, static: bool):
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
+                best_scope: mutable sview = ""
+                lexical_found: mutable bool = false
+                lexical_count: mutable u32 = 0
+                lexical_static: mutable bool = false
+                lexical_runtime: mutable bool = false
+                lexical_uncertain: mutable bool = false
+                for row in 0..<names.count |best_scope, lexical_found, lexical_count, lexical_static, lexical_runtime, lexical_uncertain, names, modules, lines, offsets, is_static, current_module, wanted, file, table|:
+                    continue if row >= modules.count or row >= lines.count or row >= offsets.count or row >= is_static.count or names[row] != wanted or not srs_module_contains(current_module, modules[row])
+                    candidate: (found: bool, known: bool, visible: bool, lexical: bool, branch_known: bool, branch_active: bool) = srs_function_candidate_visibility(file, table, wanted, modules[row], lines[row], offsets[row], current_module)
+                    continue if not candidate.found or not candidate.visible or not candidate.lexical or (candidate.branch_known and not candidate.branch_active)
+                    if not lexical_found or modules[row].len > best_scope.len:
+                        best_scope <- modules[row]
+                        lexical_found <- true
+                        lexical_count <- 0
+                        lexical_static <- false
+                        lexical_runtime <- false
+                        lexical_uncertain <- false
+                    if modules[row] == best_scope:
+                        lexical_count <- lexical_count + 1
+                        lexical_static <- true if is_static[row]
+                        lexical_runtime <- true if not is_static[row]
+                        lexical_uncertain <- true if not candidate.known or not candidate.branch_known
+                return (true, false, false) if lexical_found and (lexical_uncertain or (lexical_static and lexical_runtime))
+                return (true, true, lexical_static) if lexical_found
+
+                # Imports participate only when lexical scopes supplied no candidate.
+                # Treat multiple visible import targets conservatively: if every
+                # possible candidate has the same static/runtime kind, the classification
+                # is still sound; unresolved import or declaration branches decline.
+                imported_found: mutable bool = false
+                imported_static: mutable bool = false
+                imported_runtime: mutable bool = false
+                imported_uncertain: mutable bool = false
+                for row in 0..<names.count |imported_found, imported_static, imported_runtime, imported_uncertain, names, modules, lines, offsets, is_static, current_module, wanted, file, table|:
+                    continue if row >= modules.count or row >= lines.count or row >= offsets.count or row >= is_static.count or names[row] != wanted
+                    candidate: (found: bool, known: bool, visible: bool, lexical: bool, branch_known: bool, branch_active: bool) = srs_function_candidate_visibility(file, table, wanted, modules[row], lines[row], offsets[row], current_module)
+                    continue if not candidate.found or not candidate.visible or candidate.lexical or (candidate.branch_known and not candidate.branch_active)
+                    imported_found <- true
+                    imported_uncertain <- true if not candidate.known or not candidate.branch_known
+                    imported_static <- true if is_static[row]
+                    imported_runtime <- true if not is_static[row]
+                return (false, false, false) if not imported_found
+                return (true, false, false) if imported_uncertain or (imported_static and imported_runtime)
+                return (true, true, imported_static)
+
+        # A static-if branch is runtime code when selected. Unknown selection is traversed
+        # conservatively, but a branch proven inactive must not expose nested static blocks.
+        def srs_walk_static(statements: darray[Ast::Stmt], file: Ast::File&, current_module: sview, names: darray[sview]&, modules: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, is_static: darray[bool]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |file, current_module, names, modules, lines, offsets, is_static, table| -> table:
                     match statement:
-                        Stmt.Expr(expression, line):
+                        Stmt.Expr(expression, position):
                             match expression:
-                                Expr.Call(callee, arguments, argument_names, call_line):
+                                Expr.Call(callee, arguments, argument_names, call_position):
                                     callee_name: sview = ident_name_of(callee)
-                                    is_runtime_user_call: bool = callee_name != "" and srs_name_in(user_fns, callee_name) and not srs_name_in(static_fns, callee_name)
-                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticRuntimeStatement, name: callee_name, line: line.line, expected: "", actual: ""}) if is_runtime_user_call
+                                    target: (found: bool, known: bool, static: bool) = srs_function_kind(file, table, names, modules, lines, offsets, is_static, current_module, callee_name) if callee_name != "" else (false, false, false)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticRuntimeStatement, name: callee_name, line: position.line, expected: "", actual: ""}) if target.found and target.known and not target.static
                                 _:
                                     pass
-                        Stmt.If(condition, then_body, else_body, if_line):
-                            table <- srs_walk_static(then_body, user_fns, static_fns, table)
-                            table <- srs_walk_static(else_body, user_fns, static_fns, table)
-                        Stmt.While(condition, while_body, while_line):
-                            table <- srs_walk_static(while_body, user_fns, static_fns, table)
-                        Stmt.For(bind, variables, iterable, for_body, for_line):
-                            table <- srs_walk_static(for_body, user_fns, static_fns, table)
-                        Stmt.Block(kind, clause, binding, body, block_line):
-                            table <- srs_walk_static(body, user_fns, static_fns, table)
-                        Stmt.Match(scrutinee, arms, match_line):
-                            for arm in arms |table| -> table:
-                                table <- srs_walk_static(arm.body, user_fns, static_fns, table)
+                        Stmt.If(condition, then_body, else_body, position):
+                            table <- srs_walk_static(then_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                            table <- srs_walk_static(else_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                        Stmt.While(condition, while_body, position):
+                            table <- srs_walk_static(while_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                        Stmt.For(bind, variables, iterable, for_body, position):
+                            table <- srs_walk_static(for_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                        Stmt.Block(kind, clause, binding, body, position):
+                            branch: (found: bool, known: bool, active: bool) = srs_static_if_branch_selection(file, position, current_module, table) if kind == "static" else (false, false, false)
+                            if branch.found:
+                                table <- srs_walk(body, file, current_module, names, modules, lines, offsets, is_static, table) if not branch.known or branch.active
+                            else:
+                                table <- srs_walk_static(body, file, current_module, names, modules, lines, offsets, is_static, table) if kind == "static"
+                                table <- srs_walk(body, file, current_module, names, modules, lines, offsets, is_static, table) if kind != "static"
+                        Stmt.Match(scrutinee, arms, position):
+                            for arm in arms |file, current_module, names, modules, lines, offsets, is_static, table| -> table:
+                                table <- srs_walk_static(arm.body, file, current_module, names, modules, lines, offsets, is_static, table)
                         _:
                             pass
 
-        # Walk ordinary (runtime) statements, entering static-block subtrees.
-        def srs_walk(statements: darray[Ast::Stmt], user_fns: darray[sview]&, static_fns: darray[sview]&, static_if_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+        # Walk ordinary runtime code, entering bare static blocks and pruning only
+        # static-if arms proven inactive by the same fold used by other semantic checks.
+        def srs_walk(statements: darray[Ast::Stmt], file: Ast::File&, current_module: sview, names: darray[sview]&, modules: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, is_static: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
+                for statement in statements |file, current_module, names, modules, lines, offsets, is_static, table| -> table:
                     match statement:
-                        Stmt.Block(kind, clause, binding, body, block_line):
-                            is_static_if: bool = kind == "static" and srs_is_static_if_branch(static_if_lines, block_line.line)
-                            table <- srs_walk_static(body, user_fns, static_fns, table) if kind == "static" and not is_static_if
-                            table <- srs_walk(body, user_fns, static_fns, static_if_lines, table) if kind != "static" or is_static_if
-                        Stmt.If(condition, then_body, else_body, if_line):
-                            table <- srs_walk(then_body, user_fns, static_fns, static_if_lines, table)
-                            table <- srs_walk(else_body, user_fns, static_fns, static_if_lines, table)
-                        Stmt.While(condition, while_body, while_line):
-                            table <- srs_walk(while_body, user_fns, static_fns, static_if_lines, table)
-                        Stmt.For(bind, variables, iterable, for_body, for_line):
-                            table <- srs_walk(for_body, user_fns, static_fns, static_if_lines, table)
-                        Stmt.Match(scrutinee, arms, match_line):
-                            for arm in arms |table| -> table:
-                                table <- srs_walk(arm.body, user_fns, static_fns, static_if_lines, table)
+                        Stmt.Block(kind, clause, binding, body, position):
+                            branch: (found: bool, known: bool, active: bool) = srs_static_if_branch_selection(file, position, current_module, table) if kind == "static" else (false, false, false)
+                            if branch.found:
+                                table <- srs_walk(body, file, current_module, names, modules, lines, offsets, is_static, table) if not branch.known or branch.active
+                            else:
+                                table <- srs_walk_static(body, file, current_module, names, modules, lines, offsets, is_static, table) if kind == "static"
+                                table <- srs_walk(body, file, current_module, names, modules, lines, offsets, is_static, table) if kind != "static"
+                        Stmt.If(condition, then_body, else_body, position):
+                            table <- srs_walk(then_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                            table <- srs_walk(else_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                        Stmt.While(condition, while_body, position):
+                            table <- srs_walk(while_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                        Stmt.For(bind, variables, iterable, for_body, position):
+                            table <- srs_walk(for_body, file, current_module, names, modules, lines, offsets, is_static, table)
+                        Stmt.Match(scrutinee, arms, position):
+                            for arm in arms |file, current_module, names, modules, lines, offsets, is_static, table| -> table:
+                                table <- srs_walk(arm.body, file, current_module, names, modules, lines, offsets, is_static, table)
                         _:
                             pass
 
-        def srs_check_declarations(declarations: darray[Ast::Decl], user_fns: darray[sview]&, static_fns: darray[sview]&, static_if_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+        def srs_check_declarations(declarations: darray[Ast::Decl], current_module: sview, file: Ast::File&, names: darray[sview]&, modules: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, is_static: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |table| -> table:
+                for declaration in declarations |current_module, file, names, modules, lines, offsets, is_static, table| -> table:
                     match declaration:
-                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            table <- srs_walk(body, user_fns, static_fns, static_if_lines, table)
-                        Decl.Module(module_name, module_body, module_line):
-                            table <- srs_check_declarations(module_body, user_fns, static_fns, static_if_lines, table)
-                        Decl.Scoped(scoped_body, scoped_line):
-                            table <- srs_check_declarations(scoped_body, user_fns, static_fns, static_if_lines, table)
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, position):
+                            table <- srs_walk(body, file, current_module, names, modules, lines, offsets, is_static, table)
+                        Decl.Module(module_name, module_body, module_position):
+                            table <- srs_check_declarations(module_body, module_name, file, names, modules, lines, offsets, is_static, table)
+                        Decl.Scoped(scoped_body, scoped_position):
+                            branch: (found: bool, known: bool, active: bool) = srs_static_if_branch_selection(file, scoped_position, current_module, table)
+                            continue if branch.found and branch.known and not branch.active
+                            table <- srs_check_declarations(scoped_body, current_module, file, names, modules, lines, offsets, is_static, table)
                         _:
                             pass
 
     public:
         def check_static_runtime_stmt(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                user_fns: mutable darray[sview] = []
-                srs_collect_user_fns(file.top_decls, user_fns)
-                static_fns: mutable darray[sview] = []
-                for annotation in file.enum_annotations |static_fns|:
-                    static_fns.push(annotation.name) if annotation.owner == "__static_fn"
-                table <- srs_check_declarations(file.top_decls, user_fns, static_fns, file.static_if_lines, table)
+                function_names: mutable darray[sview] = []
+                function_modules: mutable darray[sview] = []
+                function_lines: mutable darray[u32] = []
+                function_offsets: mutable darray[u32] = []
+                function_is_static: mutable darray[bool] = []
+                srs_collect_functions(file.top_decls, "", file, table, function_names, function_modules, function_lines, function_offsets, function_is_static)
+                table <- srs_check_declarations(file.top_decls, "", file, function_names, function_modules, function_lines, function_offsets, function_is_static, table)

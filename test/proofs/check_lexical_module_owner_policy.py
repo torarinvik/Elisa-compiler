@@ -113,6 +113,13 @@ for function_name, source in (
         raise SystemExit(f"{function_name} must retain the proved lexical visibility predicate")
 if "named_type_owner_is_lexical(" not in static_string_text:
     raise SystemExit("static string alias resolution must retain the proved lexical visibility predicate")
+static_alias_lookup = compact(function_section(static_string_text, "static_module_name_is_alias"))
+if not all(fragment in static_alias_lookup for fragment in (
+        "table.definite_import_annotations",
+        "table.possible_import_annotations",
+        "named_type_owner_is_lexical(alias.module,lexical_module)",
+        "returnfalse")) or "table.using_alias_rows" in static_alias_lookup:
+    raise SystemExit("static string alias lookup must exclude proven-inactive rows and retain unresolved aliases conservatively")
 
 positive_names = {
     "implementation_matches_the_lexical_prefix_contract",

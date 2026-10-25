@@ -12,6 +12,11 @@ extend Semantic:
                     return false if candidate_module[base_module.len + 2.usize() + offset] != suffix[offset]
                 return true
 
+        def callable_import_module_matches_target(candidate_module: sview, import_module: sview, imported_module: sview) -> bool:
+            can Abort.Panic:
+                return candidate_module == imported_module if import_module == ""
+                return callable_module_path_matches_suffix(candidate_module, import_module, imported_module)
+
         def callable_module_path_segments_append(segments: mutable darray[sview]&, path: sview) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if path == ""
@@ -67,14 +72,63 @@ extend Semantic:
                         return candidate_end == candidate_module.len
                 return false
 
-        def callable_named_declaration_in_module(table: SymbolTable&, name: sview, module: sview) -> bool:
+        # Alias targets may themselves begin with an alias. A target whose first
+        # segment names an unresolved static alias, or whose visible alias chain is
+        # ambiguous/cyclic, cannot be treated as a definite nonmatch for a candidate.
+        def callable_static_alias_path_uncertain(annotations: darray[Ast::EnumAnnotation]&, alias_scope: sview, target_path: sview, suffix: sview, lexical_module: sview) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                segments: mutable darray[sview] = []
+                callable_module_path_segments_append(segments, target_path)
+                callable_module_path_segments_append(segments, suffix)
+                current_scope: mutable sview = alias_scope
+                remaining: mutable usize = annotations.count + 1.usize()
+                while segments.count > 0.usize() and remaining > 0.usize() |segments, remaining, annotations, current_scope, lexical_module|:
+                    visible_alias: (count: usize, target: sview, scope: sview) = callable_using_alias_visible_target(annotations, current_scope, segments[0])
+                    return true if visible_alias.count > 1.usize()
+                    if visible_alias.count == 0.usize():
+                        for unresolved in annotations |segments, current_scope, lexical_module|:
+                            return true if unresolved.owner == "__try_unresolved_static_binding" and unresolved.name == "__using_alias" and unresolved.detail_name == segments[0] and try_noncall_module_is_ancestor(unresolved.module, current_scope) and try_noncall_module_is_ancestor(unresolved.module, lexical_module)
+                        return false
+                    expanded_alias: mutable darray[sview] = []
+                    callable_module_path_segments_append(expanded_alias, visible_alias.target)
+                    for index in 1..<segments.count |expanded_alias, segments|:
+                        expanded_alias.push(segments[index])
+                    segments <- expanded_alias
+                    current_scope <- visible_alias.scope
+                    remaining <- remaining - 1.usize()
+                return segments.count > 0.usize()
+
+        def callable_named_declaration_in_module(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, name: sview, module: sview) -> bool:
             can Abort.Panic:
-                for symbol in table.symbols |table, name, module|:
-                    return true if symbol.kind == SymbolKind.Func and symbol.name == name and symbol.module_owner == module
+                for symbol in table.symbols |table, annotations, name, module|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != name or symbol.module_owner != module
+                    return true if not callable_function_declaration_is_static_inactive(annotations, name, module, symbol.line, symbol.offset)
                 return false
+
+        # The parser retains declarations from every static-if arm. Try adds an exact
+        # source-position marker only for function declarations whose branch ancestry
+        # has been proven inactive; unresolved branch selection remains conservative.
+        def callable_function_declaration_is_static_inactive(annotations: darray[Ast::EnumAnnotation]&, name: sview, candidate_module: sview, declaration_line: u32, declaration_offset: u32) -> bool:
+            can Abort.Panic:
+                return any marker in annotations where marker.owner == "__try_inactive_function" and marker.name == name and marker.module == candidate_module and marker.line == declaration_line and marker.offset == declaration_offset
+
+        # Unknown static branches keep their declarations as possible lookup candidates,
+        # but cached facts and ErrorSet family selection must not treat one arm as certain.
+        def callable_function_declaration_is_static_unresolved(annotations: darray[Ast::EnumAnnotation]&, name: sview, candidate_module: sview, declaration_line: u32, declaration_offset: u32) -> bool:
+            can Abort.Panic:
+                return any marker in annotations where marker.owner == "__try_unresolved_function" and marker.name == name and marker.module == candidate_module and marker.line == declaration_line and marker.offset == declaration_offset
+
+        def callable_active_direct_function_count(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, name: sview) -> usize:
+            can Abort.Panic:
+                count: mutable usize = 0.usize()
+                for symbol in table.symbols |count, annotations, name|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != name
+                    count <- count + 1.usize() if not callable_function_declaration_is_static_inactive(annotations, name, symbol.module_owner, symbol.line, symbol.offset)
+                return count
 
         def callable_function_declaration_visible(annotations: darray[Ast::EnumAnnotation]&, name: sview, candidate_module: sview, declaration_line: u32, declaration_offset: u32, lexical_module: sview) -> bool:
             can Abort.Panic:
+                return false if callable_function_declaration_is_static_inactive(annotations, name, candidate_module, declaration_line, declaration_offset)
                 return false if not try_error_alias_module_visible(annotations, candidate_module, lexical_module)
                 exact_private: mutable bool = false
                 exact_public: mutable bool = false
@@ -148,12 +202,26 @@ extend Semantic:
         def try_overload_type_symbol_is_nominal(symbol: Symbol) -> bool:
             return symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum or symbol.kind == SymbolKind.Alias or (symbol.kind == SymbolKind.Extern and symbol.opaque_extern_type)
 
+        # Non-alias nominal types retain exact declaration markers for static-if rows.
+        # A declaration is excluded only when one of those exact rows proves it inactive;
+        # missing and unresolved markers remain possible candidates.
+        def try_overload_nominal_type_declaration_is_static_inactive(file: Ast::File&, annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_module: sview, declaration_line: u32, declaration_offset: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for marker in annotations |file, name, declaration_module, declaration_line, declaration_offset, table|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__nominal_type_static_branch" or marker.detail_name != name or marker.module != declaration_module or marker.line != declaration_line or marker.offset != declaration_offset
+                    continue if marker.identity_id == 4294967295
+                    branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, marker.identity_id.usize(), declaration_module, table)
+                    return true if branch.known and not branch.selected
+                return false
+
         # Unlike callable declarations, nominal type visibility is used only to recover
         # an identity already selected by Core's type resolver. A private declaration is
         # visible in its own module and descendants, but unrelated private modules must
         # not poison a same-spelled local or imported type.
-        def try_overload_type_declaration_visible(annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_module: sview, declaration_line: u32, declaration_offset: u32, lexical_module: sview) -> bool:
+        def try_overload_type_declaration_visible(file: Ast::File&, annotations: darray[Ast::EnumAnnotation]&, type_symbol_is_alias: bool, name: sview, declaration_module: sview, declaration_line: u32, declaration_offset: u32, lexical_module: sview, table: SymbolTable&) -> bool:
             can Abort.Panic:
+                return false if type_symbol_is_alias and try_noncall_type_alias_declaration_is_static_inactive(file, annotations, name, declaration_module, declaration_line, declaration_offset, table)
+                return false if not type_symbol_is_alias and try_overload_nominal_type_declaration_is_static_inactive(file, annotations, name, declaration_module, declaration_line, declaration_offset, table)
                 return false if not try_error_alias_module_visible(annotations, declaration_module, lexical_module)
                 exact_private: mutable bool = false
                 exact_public: mutable bool = false
@@ -174,34 +242,85 @@ extend Semantic:
                 return false if legacy_private_marker
                 return true
 
-        def try_overload_type_owner_in_module(name: sview, declaration_module: sview, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, ambiguous: bool, owner: sview):
+        def try_overload_type_owner_in_module(file: Ast::File&, name: sview, declaration_module: sview, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, ambiguous: bool, owner: sview):
             can Abort.Panic:
                 count: mutable usize = 0.usize()
                 for symbol in table.symbols |count, name, declaration_module, lexical_module, annotations|:
                     continue if symbol.name != name or symbol.module_owner != declaration_module or not try_overload_type_symbol_is_nominal(symbol)
-                    continue if not try_overload_type_declaration_visible(annotations, name, declaration_module, symbol.line, symbol.offset, lexical_module)
+                    continue if not try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, declaration_module, symbol.line, symbol.offset, lexical_module, table)
                     count <- count + 1.usize()
                 # Duplicate declarations in one module share the same nominal owner;
                 # Core reports that declaration error separately. Ambiguity here means
                 # different visible modules can own the same bare spelling.
                 return (count > 0.usize(), false, declaration_module)
 
+        def try_overload_unresolved_wildcard_type_owner(file: Ast::File&, name: sview, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, ambiguous: bool, owner: sview, scope_length: usize):
+            can Abort.Panic:
+                found: mutable bool = false
+                ambiguous: mutable bool = false
+                owner: mutable sview = ""
+                scope_length: mutable usize = 0.usize()
+                for binding in annotations |found, ambiguous, owner, scope_length, annotations, table, name, lexical_module|:
+                    continue if binding.owner != "__try_unresolved_static_binding" or binding.name != "__binding_wildcard_import" or not try_noncall_module_is_ancestor(binding.module, lexical_module)
+                    candidate_count: mutable usize = 0.usize()
+                    candidate_owner: mutable sview = ""
+                    candidate_ambiguous: mutable bool = false
+                    for symbol in table.symbols |candidate_count, candidate_owner, candidate_ambiguous, annotations, binding, name, lexical_module|:
+                        continue if symbol.name != name or not try_overload_type_symbol_is_nominal(symbol)
+                        # The sentinel's detail_name is already the canonical target
+                        # assembled while filtering the original relative using row.
+                        continue if symbol.module_owner != binding.detail_name
+                        continue if not try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module, table)
+                        candidate_ambiguous <- true if candidate_count > 0.usize() and candidate_owner != symbol.module_owner
+                        candidate_count <- candidate_count + 1.usize()
+                        candidate_owner <- symbol.module_owner
+                    continue if candidate_count == 0.usize()
+                    if not found or binding.module.len > scope_length:
+                        found <- true
+                        ambiguous <- candidate_ambiguous
+                        owner <- candidate_owner
+                        scope_length <- binding.module.len
+                    elif binding.module.len == scope_length:
+                        ambiguous <- true if candidate_ambiguous or owner != candidate_owner
+                return (found, ambiguous, owner, scope_length)
+
+        def try_overload_unresolved_selective_import_can_bind_type(file: Ast::File&, binding: Ast::EnumAnnotation, name: sview, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                # A function/value import cannot change nominal type identity. Pair the
+                # unresolved import with its exact source row and require a visible type
+                # declaration before making owner lookup uncertain.
+                source_found: mutable bool = false
+                source_name: mutable sview = ""
+                for source in annotations |source_found, source_name, binding, annotations|:
+                    if source.owner == "__from_src" and source.module == binding.module and source.line == binding.line and source.offset == binding.offset:
+                        source_found <- true
+                        source_name <- source.name
+                        break
+                return false if not source_found or source_name == ""
+                for symbol in table.symbols |binding, name, source_name, lexical_module, annotations|:
+                    continue if symbol.name != name or not try_overload_type_symbol_is_nominal(symbol)
+                    continue if not callable_import_module_matches_target(symbol.module_owner, binding.module, source_name)
+                    return true if try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module, table)
+                return false
+
         # Reconstruct Core's type-name owner from the declaration's lexical scope. Local
         # and ancestor declarations precede imports; selective imports precede wildcard
         # imports. This keeps an unimported same-named declaration in a private module out
         # of the decision while still returning unknown for genuinely colliding imports.
-        def try_overload_nominal_type_owner_for_module(name: sview, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, ambiguous: bool, owner: sview):
+        def try_overload_nominal_type_owner_for_module(file: Ast::File&, name: sview, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, ambiguous: bool, owner: sview):
             can Abort.Panic:
                 return (false, false, "") if name == ""
                 scope_module: mutable sview = lexical_module
                 while true |scope_module, annotations, table, name, lexical_module|:
-                    local: (found: bool, ambiguous: bool, owner: sview) = try_overload_type_owner_in_module(name, scope_module, lexical_module, annotations, table)
+                    local: (found: bool, ambiguous: bool, owner: sview) = try_overload_type_owner_in_module(file, name, scope_module, lexical_module, annotations, table)
                     return local if local.found or local.ambiguous
                     break if scope_module == ""
                     scope_module <- try_noncall_module_parent(scope_module)
 
                 selective_seen: mutable bool = false
                 for binding in annotations |selective_seen, annotations, name, lexical_module, table|:
+                    if binding.owner == "__try_unresolved_static_binding" and binding.name == "__from_member" and binding.detail_name == name and try_noncall_module_is_ancestor(binding.module, lexical_module):
+                        return (false, true, "") if try_overload_unresolved_selective_import_can_bind_type(file, binding, name, lexical_module, annotations, table)
                     continue if selective_seen or binding.owner != "__from_member" or binding.name != name
                     for source in annotations |selective_seen, binding, annotations, name, lexical_module, table|:
                         continue if source.owner != "__from_src" or source.module != binding.module or source.line != binding.line or source.offset != binding.offset
@@ -210,8 +329,8 @@ extend Semantic:
                         selected_owner: mutable sview = ""
                         for symbol in table.symbols |count, selected_owner, annotations, binding, source, name, lexical_module|:
                             continue if symbol.name != name or not try_overload_type_symbol_is_nominal(symbol)
-                            continue if not callable_module_path_matches_suffix(symbol.module_owner, binding.module, source.name)
-                            if not try_overload_type_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module):
+                            continue if not callable_import_module_matches_target(symbol.module_owner, binding.module, source.name)
+                            if not try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module, table):
                                 continue
                             count <- count + 1.usize()
                             selected_owner <- symbol.module_owner
@@ -226,8 +345,8 @@ extend Semantic:
                     continue if binding.name != "__binding_wildcard_import" or not try_noncall_module_is_ancestor(binding.module, lexical_module)
                     for symbol in table.symbols |wildcard_found, wildcard_ambiguous, wildcard_scope_length, wildcard_owner, binding, annotations, name, lexical_module|:
                         continue if symbol.name != name or not try_overload_type_symbol_is_nominal(symbol)
-                        continue if not callable_module_path_matches_suffix(symbol.module_owner, binding.module, binding.owner)
-                        continue if not try_overload_type_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)
+                        continue if not callable_import_module_matches_target(symbol.module_owner, binding.module, binding.owner)
+                        continue if not try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module, table)
                         if not wildcard_found or binding.module.len > wildcard_scope_length:
                             wildcard_found <- true
                             wildcard_ambiguous <- false
@@ -235,16 +354,19 @@ extend Semantic:
                             wildcard_owner <- symbol.module_owner
                         elif binding.module.len == wildcard_scope_length:
                             wildcard_ambiguous <- true if wildcard_owner != symbol.module_owner
+                unresolved_wildcard: (found: bool, ambiguous: bool, owner: sview, scope_length: usize) = try_overload_unresolved_wildcard_type_owner(file, name, lexical_module, annotations, table)
+                unresolved_wildcard_can_change_owner: bool = unresolved_wildcard.found and (not wildcard_found or unresolved_wildcard.scope_length > wildcard_scope_length or (unresolved_wildcard.scope_length == wildcard_scope_length and (unresolved_wildcard.ambiguous or unresolved_wildcard.owner != wildcard_owner)))
+                return (false, true, "") if unresolved_wildcard_can_change_owner
                 return (wildcard_found and not wildcard_ambiguous, wildcard_ambiguous, wildcard_owner)
 
-        def try_overload_nominal_type_owner(name: sview, declaration: DeclId, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, ambiguous: bool, owner: sview):
+        def try_overload_nominal_type_owner(file: Ast::File&, name: sview, declaration: DeclId, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> (found: bool, ambiguous: bool, owner: sview):
             can Abort.Panic:
                 return (false, false, "") if declaration.value == INVALID_DECL_ID_VALUE or declaration.value.usize() >= table.symbols.count
-                return try_overload_nominal_type_owner_for_module(name, table.symbols[declaration.value.usize()].module_owner, annotations, table)
+                return try_overload_nominal_type_owner_for_module(file, name, table.symbols[declaration.value.usize()].module_owner, annotations, table)
 
         # Preserve a known-but-unqualified nominal receiver so callers can fail closed
         # instead of falling back to a visible overload after its owner became ambiguous.
-        def try_overload_type_has_ambiguous_nominal_identity(type_id: u32, declaration: DeclId,
+        def try_overload_type_has_ambiguous_nominal_identity(file: Ast::File&, type_id: u32, declaration: DeclId,
                 annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32) -> bool:
             can Abort.Panic:
                 return false if type_id == 0
@@ -254,19 +376,19 @@ extend Semantic:
                     return false if try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)
                     name: sview = interned_name(type_id, table)
                     return false if name == ""
-                    identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(name, declaration, annotations, table)
+                    identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, name, declaration, annotations, table)
                     return identity.ambiguous
                 if kind == SemTypeKind.Container:
                     container_name: sview = interned_name(type_id, table)
                     builtin_container: bool = container_name == "array" or container_name == "darray" or container_name == "dict" or container_name == "set"
                     if not builtin_container:
-                        container_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(container_name, declaration, annotations, table)
+                        container_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, container_name, declaration, annotations, table)
                         return true if container_identity.ambiguous
                 for element_position in 0..<interned_elem_count(type_id, table) |type_id, declaration, annotations, table, depth|:
-                    return true if try_overload_type_has_ambiguous_nominal_identity(interned_elem(type_id, element_position.u32(), table), declaration, annotations, table, depth + 1)
+                    return true if try_overload_type_has_ambiguous_nominal_identity(file, interned_elem(type_id, element_position.u32(), table), declaration, annotations, table, depth + 1)
                 return false
 
-        def try_overload_type_shared_ambiguous_match_state(formal_type_id: u32, actual_type_id: u32,
+        def try_overload_type_shared_ambiguous_match_state(file: Ast::File&, formal_type_id: u32, actual_type_id: u32,
                 formal_declaration: DeclId, actual_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32) -> (potential_match: bool, ambiguous: bool):
             can Abort.Panic:
                 return (true, true) if depth > 64
@@ -276,19 +398,19 @@ extend Semantic:
                 if formal_kind == SemTypeKind.Ref or actual_kind == SemTypeKind.Ref:
                     if formal_kind == SemTypeKind.Ref and actual_kind == SemTypeKind.Ref:
                         return (false, false) if interned_elem_count(formal_type_id, table) != 1 or interned_elem_count(actual_type_id, table) != 1
-                        return try_overload_type_shared_ambiguous_match_state(interned_elem(formal_type_id, 0, table), interned_elem(actual_type_id, 0, table), formal_declaration, actual_module, annotations, table, depth + 1)
+                        return try_overload_type_shared_ambiguous_match_state(file, interned_elem(formal_type_id, 0, table), interned_elem(actual_type_id, 0, table), formal_declaration, actual_module, annotations, table, depth + 1)
                     if formal_kind == SemTypeKind.Ref:
                         return (false, false) if interned_elem_count(formal_type_id, table) != 1
-                        return try_overload_type_shared_ambiguous_match_state(interned_elem(formal_type_id, 0, table), actual_type_id, formal_declaration, actual_module, annotations, table, depth + 1)
+                        return try_overload_type_shared_ambiguous_match_state(file, interned_elem(formal_type_id, 0, table), actual_type_id, formal_declaration, actual_module, annotations, table, depth + 1)
                     return (false, false) if interned_elem_count(actual_type_id, table) != 1
-                    return try_overload_type_shared_ambiguous_match_state(formal_type_id, interned_elem(actual_type_id, 0, table), formal_declaration, actual_module, annotations, table, depth + 1)
+                    return try_overload_type_shared_ambiguous_match_state(file, formal_type_id, interned_elem(actual_type_id, 0, table), formal_declaration, actual_module, annotations, table, depth + 1)
                 return (false, false) if formal_kind != actual_kind
                 if formal_kind == SemTypeKind.Named:
                     name: sview = interned_name(actual_type_id, table)
                     return (false, false) if name == "" or name != interned_name(formal_type_id, table)
                     return (true, false) if try_overload_type_is_generic_parameter(formal_type_id, formal_declaration, annotations, table)
-                    actual_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(name, actual_module, annotations, table)
-                    formal_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(name, formal_declaration, annotations, table)
+                    actual_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(file, name, actual_module, annotations, table)
+                    formal_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, name, formal_declaration, annotations, table)
                     return (false, false) if actual_identity.found and formal_identity.found and actual_identity.owner != formal_identity.owner
                     return (true, true) if actual_identity.ambiguous or formal_identity.ambiguous or not actual_identity.found or not formal_identity.found
                     return (true, false)
@@ -305,20 +427,20 @@ extend Semantic:
                     container_name: sview = interned_name(actual_type_id, table)
                     builtin_container: bool = container_name == "array" or container_name == "darray" or container_name == "dict" or container_name == "set"
                     if not builtin_container:
-                        actual_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(container_name, actual_module, annotations, table)
-                        formal_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(container_name, formal_declaration, annotations, table)
+                        actual_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(file, container_name, actual_module, annotations, table)
+                        formal_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, container_name, formal_declaration, annotations, table)
                         return (false, false) if actual_container.found and formal_container.found and actual_container.owner != formal_container.owner
                         return (true, true) if actual_container.ambiguous or formal_container.ambiguous or not actual_container.found or not formal_container.found
                 element_count: u32 = interned_elem_count(actual_type_id, table)
                 return (false, false) if element_count != interned_elem_count(formal_type_id, table)
                 has_ambiguous_element: mutable bool = false
                 for element_position in 0..<element_count.usize() |element_count, formal_type_id, actual_type_id, formal_declaration, actual_module, annotations, table, depth|:
-                    element_state: (potential_match: bool, ambiguous: bool) = try_overload_type_shared_ambiguous_match_state(interned_elem(formal_type_id, element_position.u32(), table), interned_elem(actual_type_id, element_position.u32(), table), formal_declaration, actual_module, annotations, table, depth + 1)
+                    element_state: (potential_match: bool, ambiguous: bool) = try_overload_type_shared_ambiguous_match_state(file, interned_elem(formal_type_id, element_position.u32(), table), interned_elem(actual_type_id, element_position.u32(), table), formal_declaration, actual_module, annotations, table, depth + 1)
                     return (false, false) if not element_state.potential_match
                     has_ambiguous_element <- true if element_state.ambiguous
                 return (true, has_ambiguous_element)
 
-        def try_overload_type_is_firm(type_id: u32, declaration: DeclId, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> bool:
+        def try_overload_type_is_firm(file: Ast::File&, type_id: u32, declaration: DeclId, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 kind: SemTypeKind = interned_kind(type_id, table)
                 return true if kind == SemTypeKind.Int or kind == SemTypeKind.Float or kind == SemTypeKind.Bool or kind == SemTypeKind.Char or kind == SemTypeKind.String
@@ -326,28 +448,28 @@ extend Semantic:
                     return false if try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)
                     name: sview = interned_name(type_id, table)
                     return false if name == ""
-                    identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(name, declaration, annotations, table)
+                    identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, name, declaration, annotations, table)
                     return identity.found
                 if kind == SemTypeKind.Optional or kind == SemTypeKind.Ref:
                     return false if interned_elem_count(type_id, table) != 1
-                    return try_overload_type_is_firm(interned_elem(type_id, 0, table), declaration, annotations, table)
+                    return try_overload_type_is_firm(file, interned_elem(type_id, 0, table), declaration, annotations, table)
                 if kind == SemTypeKind.Tuple or kind == SemTypeKind.Container:
                     if kind == SemTypeKind.Container:
                         container_name: sview = interned_name(type_id, table)
                         return false if container_name == ""
                         builtin_container: bool = container_name == "array" or container_name == "darray" or container_name == "dict" or container_name == "set"
                         if not builtin_container:
-                            identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(container_name, declaration, annotations, table)
+                            identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, container_name, declaration, annotations, table)
                             return false if not identity.found
                     for element_position in 0..<interned_elem_count(type_id, table) |type_id, declaration, annotations, table|:
-                        return false if not try_overload_type_is_firm(interned_elem(type_id, element_position.u32(), table), declaration, annotations, table)
+                        return false if not try_overload_type_is_firm(file, interned_elem(type_id, element_position.u32(), table), declaration, annotations, table)
                     return true
                 return false
 
         # The receiver selector already knows the call-site module even when its exact
         # enclosing function row is unavailable. Use that lexical scope for nominal TypeIds
         # so a named receiver can still be ranked after the binding lookup has succeeded.
-        def try_overload_type_is_firm_in_module(type_id: u32, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32 = 0) -> bool:
+        def try_overload_type_is_firm_in_module(file: Ast::File&, type_id: u32, lexical_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32 = 0) -> bool:
             can Abort.Panic:
                 return false if type_id == 0 or depth > 64
                 kind: SemTypeKind = interned_kind(type_id, table)
@@ -355,34 +477,34 @@ extend Semantic:
                 if kind == SemTypeKind.Named:
                     name: sview = interned_name(type_id, table)
                     return false if name == ""
-                    identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(name, lexical_module, annotations, table)
+                    identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(file, name, lexical_module, annotations, table)
                     return identity.found
                 if kind == SemTypeKind.Optional or kind == SemTypeKind.Ref:
                     return false if interned_elem_count(type_id, table) != 1
-                    return try_overload_type_is_firm_in_module(interned_elem(type_id, 0, table), lexical_module, annotations, table, depth + 1)
+                    return try_overload_type_is_firm_in_module(file, interned_elem(type_id, 0, table), lexical_module, annotations, table, depth + 1)
                 if kind == SemTypeKind.Tuple or kind == SemTypeKind.Container:
                     if kind == SemTypeKind.Container:
                         container_name: sview = interned_name(type_id, table)
                         return false if container_name == ""
                         builtin_container: bool = container_name == "array" or container_name == "darray" or container_name == "dict" or container_name == "set"
                         if not builtin_container:
-                            identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(container_name, lexical_module, annotations, table)
+                            identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(file, container_name, lexical_module, annotations, table)
                             return false if not identity.found
                     for element_position in 0..<interned_elem_count(type_id, table) |type_id, lexical_module, annotations, table, depth|:
-                        return false if not try_overload_type_is_firm_in_module(interned_elem(type_id, element_position.u32(), table), lexical_module, annotations, table, depth + 1)
+                        return false if not try_overload_type_is_firm_in_module(file, interned_elem(type_id, element_position.u32(), table), lexical_module, annotations, table, depth + 1)
                     return true
                 return false
 
-        # Simple identifiers reuse their exact binding type. A unique same-module direct
-        # call can contribute its concrete return TypeId; overloads, generic schemes,
-        # shadowed values, and unresolved declarations remain unknown.
-        def try_call_argument_type_ids(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, argument_positions: darray[Ast::EnumAnnotation]&, caller: DeclId, try_offset: u32, arity: u32, receiver_ref_mutability_known: mutable bool&, receiver_ref_mutable: mutable bool&) -> darray[u32]:
+        # Simple identifiers reuse their exact binding type. A direct call can contribute
+        # its return TypeId only when ordinary lookup selects one visible declaration;
+        # overloads, generic schemes, shadowed values, and unresolved imports remain unknown.
+        def try_call_argument_type_ids(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, argument_positions: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, caller: DeclId, try_offset: u32, arity: u32, receiver_ref_mutability_known: mutable bool&, receiver_ref_mutable: mutable bool&) -> darray[u32]:
             can Memory.Allocate, Abort.Panic:
                 result: mutable darray[u32] = []
                 receiver_ref_mutability_known <- false
                 receiver_ref_mutable <- false
                 argument_index: mutable usize = 0.usize()
-                while argument_index < arity.usize() |result, argument_index, table, argument_positions, caller, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable, annotations|:
+                while argument_index < arity.usize() |result, argument_index, table, argument_positions, module_index, module_annotations, caller, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable, annotations|:
                     position_found: mutable bool = false
                     position_conflict: mutable bool = false
                     argument_position: mutable Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
@@ -431,33 +553,35 @@ extend Semantic:
                             call_binding: OwnershipBindingLookupResult = ownership_binding_at_position(table, caller, nested_call_position)
                             if not call_binding.known:
                                 caller_module: sview = table.symbols[caller.value.usize()].module_owner
-                                call_return_found: mutable bool = false
-                                call_return_conflict: mutable bool = false
-                                call_return_type_id: mutable u32 = 0
-                                call_return_function_line: mutable u32 = 0
-                                for symbol in table.symbols |call_return_found, call_return_conflict, call_return_type_id, call_return_function_line, nested_call_name, caller_module|:
-                                    continue if symbol.kind != SymbolKind.Func or symbol.name != nested_call_name or symbol.module_owner != caller_module
-                                    if not call_return_found:
-                                        call_return_type_id <- symbol.return_type_id
-                                        call_return_function_line <- symbol.line
-                                        call_return_found <- true
-                                    else:
-                                        call_return_conflict <- true
-                                call_return_is_generic: bool = type_id_contains_function_generic(call_return_type_id, call_return_function_line, table) if call_return_found and not call_return_conflict else false
-                                call_return_has_region: bool = type_id_contains_region(call_return_type_id, table) if call_return_found and not call_return_conflict else false
-                                if call_return_type_id != 0 and not call_return_conflict and not call_return_is_generic and not call_return_has_region:
-                                    argument_type_id <- call_return_type_id
-                                    type_found <- true
+                                if not callable_try_static_binding_uncertain(annotations, nested_call_name, caller_module, "", table):
+                                    call_return_found: mutable bool = false
+                                    call_return_conflict: mutable bool = false
+                                    call_return_type_id: mutable u32 = 0
+                                    call_return_function_line: mutable u32 = 0
+                                    for symbol in table.symbols |call_return_found, call_return_conflict, call_return_type_id, call_return_function_line, nested_call_name, caller_module, module_index, module_annotations, annotations, table|:
+                                        continue if symbol.kind != SymbolKind.Func or symbol.name != nested_call_name
+                                        continue if not callable_row_in_scope_indexed(module_index, module_annotations, annotations, nested_call_name, symbol.offset, symbol.line, caller_module, "", table)
+                                        if not call_return_found:
+                                            call_return_type_id <- symbol.return_type_id
+                                            call_return_function_line <- symbol.line
+                                            call_return_found <- true
+                                        else:
+                                            call_return_conflict <- true
+                                    call_return_is_generic: bool = type_id_contains_function_generic(call_return_type_id, call_return_function_line, table) if call_return_found and not call_return_conflict else false
+                                    call_return_has_region: bool = type_id_contains_region(call_return_type_id, table) if call_return_found and not call_return_conflict else false
+                                    if call_return_type_id != 0 and not call_return_conflict and not call_return_is_generic and not call_return_has_region:
+                                        argument_type_id <- call_return_type_id
+                                        type_found <- true
                     receiver_ref_mutability_known <- false if argument_index == 0 and (type_conflict or receiver_ref_conflict)
                     receiver_ref_mutability_resolved: bool = receiver_ref_mutability_known
                     receiver_ref_mutable <- false if argument_index == 0 and not receiver_ref_mutability_resolved
-                    argument_type_firm: bool = try_overload_type_is_firm(argument_type_id, caller, annotations, table) if type_found and not type_conflict else false
-                    argument_type_ambiguous: bool = try_overload_type_has_ambiguous_nominal_identity(argument_type_id, caller, annotations, table, 0) if type_found and not type_conflict else false
+                    argument_type_firm: bool = try_overload_type_is_firm(file, argument_type_id, caller, annotations, table) if type_found and not type_conflict else false
+                    argument_type_ambiguous: bool = try_overload_type_has_ambiguous_nominal_identity(file, argument_type_id, caller, annotations, table, 0) if type_found and not type_conflict else false
                     result.push(argument_type_id if type_found and not type_conflict and (argument_type_firm or argument_type_ambiguous) else 0)
                     argument_index <- argument_index + 1.usize()
                 return result
 
-        def try_overload_receiver_pattern_matches(formal_type_id: u32, actual_type_id: u32, declaration: DeclId, actual_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32) -> (known: bool, matches: bool):
+        def try_overload_receiver_pattern_matches(file: Ast::File&, formal_type_id: u32, actual_type_id: u32, declaration: DeclId, actual_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32) -> (known: bool, matches: bool):
             can Abort.Panic:
                 return (false, false) if formal_type_id == 0 or actual_type_id == 0 or depth > 64
                 return (true, true) if try_overload_type_is_generic_parameter(formal_type_id, declaration, annotations, table)
@@ -467,12 +591,12 @@ extend Semantic:
                 if formal_kind == SemTypeKind.Ref or actual_kind == SemTypeKind.Ref:
                     if formal_kind == SemTypeKind.Ref and actual_kind == SemTypeKind.Ref:
                         return (false, false) if interned_elem_count(formal_type_id, table) != 1 or interned_elem_count(actual_type_id, table) != 1
-                        return try_overload_receiver_pattern_matches(interned_elem(formal_type_id, 0, table), interned_elem(actual_type_id, 0, table), declaration, actual_module, annotations, table, depth + 1)
+                        return try_overload_receiver_pattern_matches(file, interned_elem(formal_type_id, 0, table), interned_elem(actual_type_id, 0, table), declaration, actual_module, annotations, table, depth + 1)
                     if formal_kind == SemTypeKind.Ref:
                         return (false, false) if interned_elem_count(formal_type_id, table) != 1
-                        return try_overload_receiver_pattern_matches(interned_elem(formal_type_id, 0, table), actual_type_id, declaration, actual_module, annotations, table, depth + 1)
+                        return try_overload_receiver_pattern_matches(file, interned_elem(formal_type_id, 0, table), actual_type_id, declaration, actual_module, annotations, table, depth + 1)
                     return (false, false) if interned_elem_count(actual_type_id, table) != 1
-                    return try_overload_receiver_pattern_matches(formal_type_id, interned_elem(actual_type_id, 0, table), declaration, actual_module, annotations, table, depth + 1)
+                    return try_overload_receiver_pattern_matches(file, formal_type_id, interned_elem(actual_type_id, 0, table), declaration, actual_module, annotations, table, depth + 1)
                 numeric: bool = (formal_kind == SemTypeKind.Int or formal_kind == SemTypeKind.Float) and (actual_kind == SemTypeKind.Int or actual_kind == SemTypeKind.Float)
                 if numeric:
                     return (true, true) if formal_type_id == actual_type_id
@@ -486,8 +610,8 @@ extend Semantic:
                 if formal_kind == SemTypeKind.Named or actual_kind == SemTypeKind.Named:
                     return (true, false) if formal_kind != actual_kind or interned_name(formal_type_id, table) != interned_name(actual_type_id, table)
                     name: sview = interned_name(formal_type_id, table)
-                    formal_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(name, declaration, annotations, table)
-                    actual_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(name, actual_module, annotations, table)
+                    formal_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, name, declaration, annotations, table)
+                    actual_identity: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(file, name, actual_module, annotations, table)
                     return (false, false) if formal_identity.ambiguous or actual_identity.ambiguous
                     return (false, false) if not formal_identity.found or not actual_identity.found
                     return (true, formal_identity.owner == actual_identity.owner)
@@ -498,35 +622,35 @@ extend Semantic:
                         container_name: sview = interned_name(formal_type_id, table)
                         builtin_container: bool = container_name == "array" or container_name == "darray" or container_name == "dict" or container_name == "set"
                         if not builtin_container:
-                            formal_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(container_name, declaration, annotations, table)
-                            actual_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(container_name, actual_module, annotations, table)
+                            formal_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner(file, container_name, declaration, annotations, table)
+                            actual_container: (found: bool, ambiguous: bool, owner: sview) = try_overload_nominal_type_owner_for_module(file, container_name, actual_module, annotations, table)
                             return (false, false) if formal_container.ambiguous or actual_container.ambiguous or not formal_container.found or not actual_container.found
                             return (true, false) if formal_container.owner != actual_container.owner
                     element_count: u32 = interned_elem_count(formal_type_id, table)
                     return (true, false) if element_count != interned_elem_count(actual_type_id, table)
                     for element_position in 0..<element_count.usize() |element_count, formal_type_id, actual_type_id, declaration, annotations, table, depth|:
-                        element_match: (known: bool, matches: bool) = try_overload_receiver_pattern_matches(interned_elem(formal_type_id, element_position.u32(), table), interned_elem(actual_type_id, element_position.u32(), table), declaration, actual_module, annotations, table, depth + 1)
+                        element_match: (known: bool, matches: bool) = try_overload_receiver_pattern_matches(file, interned_elem(formal_type_id, element_position.u32(), table), interned_elem(actual_type_id, element_position.u32(), table), declaration, actual_module, annotations, table, depth + 1)
                         return (false, false) if not element_match.known
                         return (true, false) if not element_match.matches
                     return (true, true)
                 return (true, type_ids_compatible(formal_type_id, actual_type_id, table))
 
-        def try_overload_receiver_specificity(type_id: u32, declaration: DeclId, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32) -> (known: bool, score: usize):
+        def try_overload_receiver_specificity(file: Ast::File&, type_id: u32, declaration: DeclId, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, depth: u32) -> (known: bool, score: usize):
             can Abort.Panic:
                 return (false, 0.usize()) if type_id == 0 or depth > 64
                 return (true, 0.usize()) if try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)
                 kind: SemTypeKind = interned_kind(type_id, table)
                 if kind == SemTypeKind.Ref:
                     return (false, 0.usize()) if interned_elem_count(type_id, table) != 1
-                    return try_overload_receiver_specificity(interned_elem(type_id, 0, table), declaration, annotations, table, depth + 1)
+                    return try_overload_receiver_specificity(file, interned_elem(type_id, 0, table), declaration, annotations, table, depth + 1)
                 if kind == SemTypeKind.Optional or kind == SemTypeKind.Tuple or kind == SemTypeKind.Container:
                     score: mutable usize = 1.usize()
                     for element_position in 0..<interned_elem_count(type_id, table) |score, type_id, declaration, annotations, table, depth|:
-                        element_score: (known: bool, score: usize) = try_overload_receiver_specificity(interned_elem(type_id, element_position.u32(), table), declaration, annotations, table, depth + 1)
+                        element_score: (known: bool, score: usize) = try_overload_receiver_specificity(file, interned_elem(type_id, element_position.u32(), table), declaration, annotations, table, depth + 1)
                         return (false, 0.usize()) if not element_score.known
                         score <- score + element_score.score
                     return (true, score)
-                return (false, 0.usize()) if not try_overload_type_is_firm(type_id, declaration, annotations, table)
+                return (false, 0.usize()) if not try_overload_type_is_firm(file, type_id, declaration, annotations, table)
                 return (true, 1.usize())
 
         def callable_symbol_receiver_type(table: SymbolTable&, symbol: Symbol) -> (found: bool, type_id: u32, mutable_ref: bool, mutable_ref_known: bool):
@@ -561,13 +685,13 @@ extend Semantic:
         # Mirror Core's UFCS lookup across the full visible-name candidate set: filter
         # by Core's coarse arity rule, then rank only the first parameter. Later argument
         # compatibility is checked after the selected declaration is known.
-        def callable_symbol_type_selected_candidate(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview, try_offset: u32, arity: u32, argument_type_ids: darray[u32]&, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool) -> DeclId:
+        def callable_symbol_type_selected_candidate(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview, try_offset: u32, arity: u32, argument_type_ids: darray[u32]&, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool) -> DeclId:
             can Abort.Panic:
                 invalid: DeclId = DeclId{value: INVALID_DECL_ID_VALUE}
                 return invalid if callable_try_call_forwards_arguments(annotations, try_offset)
                 return invalid if argument_type_ids.count != arity.usize() or argument_type_ids.count == 0.usize()
                 actual_receiver_type_id: u32 = argument_type_ids[0]
-                return invalid if not try_overload_type_is_firm_in_module(actual_receiver_type_id, enclosing_module, annotations, table)
+                return invalid if not try_overload_type_is_firm_in_module(file, actual_receiver_type_id, enclosing_module, annotations, table)
                 actual_receiver_is_ref: bool = interned_kind(actual_receiver_type_id, table) == SemTypeKind.Ref
                 return invalid if actual_receiver_is_ref and not receiver_ref_mutability_known
                 return invalid if not callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)
@@ -585,7 +709,7 @@ extend Semantic:
                     continue if not receiver.found and not callable_symbol_has_parameter_rows(table, symbol) and symbol.arity_min == 0 and (symbol.arity_max == 0 or symbol.arity_max == 4294967295)
                     return invalid if not receiver.found or receiver.type_id == 0
                     formal_receiver_is_ref: bool = interned_kind(receiver.type_id, table) == SemTypeKind.Ref
-                    receiver_match: (known: bool, matches: bool) = try_overload_receiver_pattern_matches(receiver.type_id, actual_receiver_type_id, symbol.id, enclosing_module, annotations, table, 0)
+                    receiver_match: (known: bool, matches: bool) = try_overload_receiver_pattern_matches(file, receiver.type_id, actual_receiver_type_id, symbol.id, enclosing_module, annotations, table, 0)
                     return invalid if not receiver_match.known
                     continue if not receiver_match.matches
                     if actual_receiver_is_ref and not formal_receiver_is_ref and not try_overload_type_is_generic_parameter(receiver.type_id, symbol.id, annotations, table):
@@ -600,7 +724,7 @@ extend Semantic:
                         return invalid if not receiver.mutable_ref_known
                         continue if receiver.mutable_ref and not receiver_ref_mutable
                     formal_base: u32 = interned_elem(receiver.type_id, 0, table) if interned_kind(receiver.type_id, table) == SemTypeKind.Ref and interned_elem_count(receiver.type_id, table) == 1 else receiver.type_id
-                    rank: (known: bool, score: usize) = try_overload_receiver_specificity(formal_base, symbol.id, annotations, table, 0)
+                    rank: (known: bool, score: usize) = try_overload_receiver_specificity(file, formal_base, symbol.id, annotations, table, 0)
                     return invalid if not rank.known
                     rank_score: usize = rank.score + 1.usize() if formal_receiver_is_ref and actual_receiver_is_ref and receiver.mutable_ref == receiver_ref_mutable else rank.score
                     if best_count == 0.usize() or rank_score > best_rank:
@@ -612,17 +736,17 @@ extend Semantic:
                 return selected if best_count == 1.usize()
                 return invalid
 
-        def callable_symbol_accepts_arity(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, module: sview, declaration_offset: u32, declaration_line: u32, try_offset: u32, arity_known: bool, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool, enclosing_module: sview, callee_qualifier: sview) -> bool:
+        def callable_symbol_accepts_arity(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, module: sview, declaration_offset: u32, declaration_line: u32, try_offset: u32, arity_known: bool, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool, enclosing_module: sview, callee_qualifier: sview) -> bool:
             can Abort.Panic:
                 return false if callable_try_call_forwards_arguments(annotations, try_offset) and callable_name_has_ufcs_overload_set_candidate(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, table)
-                return false if callable_overload_has_ambiguous_nominal_receiver_candidate(table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, try_offset, arity, enclosing_module, callee_qualifier)
+                return false if callable_overload_has_ambiguous_nominal_receiver_candidate(file, table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, try_offset, arity, enclosing_module, callee_qualifier)
                 exact_found: mutable bool = false
                 exact_accepts: mutable bool = false
                 unknown_offset_count: mutable usize = 0.usize()
                 unknown_offset_accepts: mutable bool = false
                 matching_symbol_count: mutable usize = 0.usize()
-                selected_type_candidate: DeclId = callable_symbol_type_selected_candidate(table, annotations, try_named_arguments, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable) if arity_known else DeclId{value: INVALID_DECL_ID_VALUE}
-                return false if selected_type_candidate.value == INVALID_DECL_ID_VALUE and arity_known and callable_overload_has_inaccessible_arity_candidate(table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable)
+                selected_type_candidate: DeclId = callable_symbol_type_selected_candidate(file, table, annotations, try_named_arguments, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable) if arity_known else DeclId{value: INVALID_DECL_ID_VALUE}
+                return false if selected_type_candidate.value == INVALID_DECL_ID_VALUE and arity_known and callable_overload_has_inaccessible_arity_candidate(file, table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable)
                 for symbol in table.symbols |table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, module, declaration_offset, declaration_line, try_offset, arity_known, arity, selected_type_candidate, exact_found, exact_accepts, unknown_offset_count, unknown_offset_accepts, matching_symbol_count|:
                     continue if symbol.kind != SymbolKind.Func or symbol.name != name or symbol.module_owner != module
                     continue if symbol.line != declaration_line
@@ -643,17 +767,17 @@ extend Semantic:
                 # and let duplicate visible declarations remain ambiguous.
                 return true
 
-        def callable_symbol_arity_candidate_count(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, try_offset: u32, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool, enclosing_module: sview, callee_qualifier: sview) -> usize:
+        def callable_symbol_arity_candidate_count(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, try_offset: u32, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool, enclosing_module: sview, callee_qualifier: sview) -> usize:
             can Abort.Panic:
                 return 0.usize() if callable_try_call_forwards_arguments(annotations, try_offset) and callable_name_has_ufcs_overload_set_candidate(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, table)
-                return 0.usize() if callable_overload_has_ambiguous_nominal_receiver_candidate(table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, try_offset, arity, enclosing_module, callee_qualifier)
-                selected_type_candidate: DeclId = callable_symbol_type_selected_candidate(table, annotations, try_named_arguments, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable)
+                return 0.usize() if callable_overload_has_ambiguous_nominal_receiver_candidate(file, table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, try_offset, arity, enclosing_module, callee_qualifier)
+                selected_type_candidate: DeclId = callable_symbol_type_selected_candidate(file, table, annotations, try_named_arguments, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable)
                 if selected_type_candidate.value != INVALID_DECL_ID_VALUE:
                     return 0.usize() if selected_type_candidate.value.usize() >= table.symbols.count
                     selected_symbol: Symbol = table.symbols[selected_type_candidate.value.usize()]
                     return 1.usize() if callable_function_declaration_visible(annotations, name, selected_symbol.module_owner, selected_symbol.line, selected_symbol.offset, enclosing_module)
                     return 0.usize()
-                return 0.usize() if callable_overload_has_inaccessible_arity_candidate(table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable)
+                return 0.usize() if callable_overload_has_inaccessible_arity_candidate(file, table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable)
                 candidate_count: mutable usize = 0.usize()
                 for symbol in table.symbols |table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, try_offset, arity, candidate_count, enclosing_module, callee_qualifier|:
                     continue if symbol.kind != SymbolKind.Func or symbol.name != name
@@ -685,7 +809,7 @@ extend Semantic:
             can Abort.Panic:
                 for binding in annotations |annotations, table, name, candidate_module, scope_module|:
                     if binding.name == "__binding_wildcard_import" and binding.owner == candidate_module and binding.module == scope_module:
-                        return callable_named_declaration_in_module(table, name, candidate_module)
+                        return callable_named_declaration_in_module(table, annotations, name, candidate_module)
                 return false
 
         # Core keeps selective imports in a program-level alias map, including imports
@@ -722,17 +846,36 @@ extend Semantic:
         def callable_try_static_binding_uncertain(annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 alias_head: mutable sview = callee_qualifier
+                alias_separator: mutable usize = callee_qualifier.len
                 for offset in 0..<callee_qualifier.len |alias_head, callee_qualifier|:
                     if offset + 1.usize() < callee_qualifier.len and callee_qualifier[offset] == 58 and callee_qualifier[offset + 1.usize()] == 58:
+                        alias_separator <- offset
                         alias_head <- callee_qualifier[0:offset]
                         break
+                alias_suffix: sview = callee_qualifier[alias_separator + 2.usize():callee_qualifier.len] if alias_separator < callee_qualifier.len else ""
                 for unresolved in annotations:
                     continue if unresolved.owner != "__try_unresolved_static_binding"
                     if unresolved.name == "__from_member" and callee_qualifier == "" and unresolved.detail_name == name:
-                        return true
-                    if unresolved.name == "__binding_wildcard_import" and callee_qualifier == "" and try_noncall_module_is_ancestor(unresolved.module, enclosing_module) and callable_named_declaration_in_module(table, name, unresolved.detail_name):
-                        return true
-                    return true if unresolved.name == "__using_alias" and callee_qualifier != "" and unresolved.detail_name == alias_head and try_noncall_module_is_ancestor(unresolved.module, enclosing_module)
+                        target_found: mutable bool = false
+                        for source in annotations |unresolved, name, table, target_found|:
+                            continue if source.owner != "__from_src" or source.module != unresolved.module or source.line != unresolved.line or source.offset != unresolved.offset
+                            target_found <- true
+                            target_module: sview = try_noncall_module_path(unresolved.module, source.name, table)
+                            return true if callable_named_visible_declaration_in_module(table, annotations, name, target_module, enclosing_module)
+                        return true if not target_found and any symbol in table.symbols where symbol.kind == SymbolKind.Func and symbol.name == name and callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, enclosing_module)
+                    if unresolved.name == "__binding_wildcard_import" and callee_qualifier == "" and try_noncall_module_is_ancestor(unresolved.module, enclosing_module):
+                        return true if callable_named_visible_declaration_in_module(table, annotations, name, unresolved.detail_name, enclosing_module)
+                    if unresolved.name == "__using_alias" and callee_qualifier != "" and unresolved.detail_name == alias_head and try_noncall_module_is_ancestor(unresolved.module, enclosing_module):
+                        target_found: mutable bool = false
+                        for target in annotations |unresolved, name, table, alias_suffix, target_found|:
+                            continue if target.name != "__using_alias_target" or target.module != unresolved.module or target.line != unresolved.line or target.offset != unresolved.offset
+                            target_found <- true
+                            for symbol in table.symbols |annotations, unresolved, target, name, alias_suffix, enclosing_module, table|:
+                                continue if symbol.kind != SymbolKind.Func or symbol.name != name
+                                continue if not callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, enclosing_module)
+                                return true if callable_alias_path_matches_candidate(annotations, unresolved.module, target.owner, alias_suffix, symbol.module_owner)
+                            return true if callable_static_alias_path_uncertain(annotations, unresolved.module, target.owner, alias_suffix, enclosing_module) and any symbol in table.symbols where symbol.kind == SymbolKind.Func and symbol.name == name and callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, enclosing_module)
+                        return true if not target_found and any symbol in table.symbols where symbol.kind == SymbolKind.Func and symbol.name == name and callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, enclosing_module)
                 return false
 
         def callable_qualified_module_matches_candidate(annotations: darray[Ast::EnumAnnotation]&, candidate_module: sview, enclosing_module: sview, callee_qualifier: sview) -> bool:
@@ -776,12 +919,13 @@ extend Semantic:
         def callable_row_in_ufcs_candidate_set_indexed(module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, annotations: darray[Ast::EnumAnnotation]&, name: sview, declaration_offset: u32, declaration_line: u32, enclosing_module: sview, callee_qualifier: sview, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 candidate_module: sview = fallible_fn_module_indexed(module_index, module_annotations, declaration_offset, declaration_line)
+                return false if callable_function_declaration_is_static_inactive(annotations, name, candidate_module, declaration_line, declaration_offset)
                 if callee_qualifier != "":
                     return false if not try_error_alias_module_visible(annotations, candidate_module, enclosing_module)
                     return callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier)
                 scope_module: mutable sview = enclosing_module
                 while true |scope_module, annotations, name, candidate_module, table|:
-                    return true if candidate_module == scope_module and callable_named_declaration_in_module(table, name, scope_module)
+                    return true if candidate_module == scope_module and callable_named_declaration_in_module(table, annotations, name, scope_module)
                     break if scope_module == ""
                     scope_module <- try_noncall_module_parent(scope_module)
                 # Receiver ranking gathers the overload set after ordinary lexical
@@ -806,14 +950,16 @@ extend Semantic:
             can Abort.Panic:
                 for symbol in table.symbols |module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, table|:
                     continue if symbol.kind != SymbolKind.Func or symbol.name != name
+                    continue if callable_function_declaration_is_static_inactive(annotations, name, symbol.module_owner, symbol.line, symbol.offset)
                     continue if not callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)
                     candidate_count: mutable usize = 0.usize()
-                    for other in table.symbols |symbol, candidate_count, table|:
-                        candidate_count <- candidate_count + 1.usize() if other.kind == SymbolKind.Func and other.name == name and other.module_owner == symbol.module_owner
+                    for other in table.symbols |symbol, candidate_count, table, annotations, name|:
+                        continue if other.kind != SymbolKind.Func or other.name != name or other.module_owner != symbol.module_owner
+                        candidate_count <- candidate_count + 1.usize() if not callable_function_declaration_is_static_inactive(annotations, name, other.module_owner, other.line, other.offset)
                     return true if candidate_count >= 2.usize()
                 return false
 
-        def callable_overload_declaration_is_inaccessible_arity_candidate(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, candidate_module: sview, declaration_offset: u32, declaration_line: u32, enclosing_module: sview, callee_qualifier: sview, try_offset: u32, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool) -> bool:
+        def callable_overload_declaration_is_inaccessible_arity_candidate(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, candidate_module: sview, declaration_offset: u32, declaration_line: u32, enclosing_module: sview, callee_qualifier: sview, try_offset: u32, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool) -> bool:
             can Abort.Panic:
                 return false if not callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)
                 for symbol in table.symbols |table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, candidate_module, declaration_offset, declaration_line, enclosing_module, callee_qualifier, try_offset, arity|:
@@ -824,7 +970,7 @@ extend Semantic:
                     return true if argument_type_ids.count == 0.usize() or argument_type_ids[0] == 0
                     receiver: (found: bool, type_id: u32, mutable_ref: bool, mutable_ref_known: bool) = callable_symbol_receiver_type(table, symbol)
                     return true if not receiver.found or receiver.type_id == 0
-                    receiver_match: (known: bool, matches: bool) = try_overload_receiver_pattern_matches(receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0)
+                    receiver_match: (known: bool, matches: bool) = try_overload_receiver_pattern_matches(file, receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0)
                     return false if receiver_match.known and not receiver_match.matches
                     if receiver_match.matches:
                         formal_receiver_is_ref: bool = interned_kind(receiver.type_id, table) == SemTypeKind.Ref
@@ -838,11 +984,11 @@ extend Semantic:
                             return true if not receiver.mutable_ref_known or not receiver_ref_mutability_known
                             return false if receiver.mutable_ref and not receiver_ref_mutable
                         return true
-                    possible_match: (potential_match: bool, ambiguous: bool) = try_overload_type_shared_ambiguous_match_state(receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0)
+                    possible_match: (potential_match: bool, ambiguous: bool) = try_overload_type_shared_ambiguous_match_state(file, receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0)
                     return possible_match.potential_match
                 return false
 
-        def callable_overload_has_inaccessible_arity_candidate(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview, try_offset: u32, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool) -> bool:
+        def callable_overload_has_inaccessible_arity_candidate(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, enclosing_module: sview, callee_qualifier: sview, try_offset: u32, arity: u32, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool) -> bool:
             can Abort.Panic:
                 return false if not callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)
                 for symbol in table.symbols |table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, enclosing_module, callee_qualifier, try_offset, arity|:
@@ -850,14 +996,14 @@ extend Semantic:
                     continue if not callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)
                     continue if not callable_symbol_core_accepts_receiver_arity(table, symbol, arity)
                     continue if not callable_symbol_accepts_named_arguments(table, try_named_arguments, symbol, try_offset)
-                    return true if callable_overload_declaration_is_inaccessible_arity_candidate(table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, symbol.module_owner, symbol.offset, symbol.line, enclosing_module, callee_qualifier, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable)
+                    return true if callable_overload_declaration_is_inaccessible_arity_candidate(file, table, annotations, try_named_arguments, argument_type_ids, module_index, module_annotations, name, symbol.module_owner, symbol.offset, symbol.line, enclosing_module, callee_qualifier, try_offset, arity, receiver_ref_mutability_known, receiver_ref_mutable)
                 return false
 
         # An ambiguous TypeId should stop family inference only if receiver ranking is
         # active and an eligible concrete candidate could match that same bare spelling.
         # Singleton calls, named-argument calls, and generic-only sets retain their normal
         # ErrorSet lookup behavior.
-        def callable_overload_has_ambiguous_nominal_receiver_candidate(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, try_offset: u32, arity: u32, enclosing_module: sview, callee_qualifier: sview) -> bool:
+        def callable_overload_has_ambiguous_nominal_receiver_candidate(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, name: sview, try_offset: u32, arity: u32, enclosing_module: sview, callee_qualifier: sview) -> bool:
             can Abort.Panic:
                 return false if callable_try_call_forwards_arguments(annotations, try_offset)
                 return false if argument_type_ids.count == 0.usize()
@@ -867,7 +1013,7 @@ extend Semantic:
                     continue if not callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)
                     continue if not callable_symbol_core_accepts_receiver_arity(table, symbol, arity)
                     receiver: (found: bool, type_id: u32, mutable_ref: bool, mutable_ref_known: bool) = callable_symbol_receiver_type(table, symbol)
-                    ambiguous_match: (potential_match: bool, ambiguous: bool) = try_overload_type_shared_ambiguous_match_state(receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0) if receiver.found else (false, false)
+                    ambiguous_match: (potential_match: bool, ambiguous: bool) = try_overload_type_shared_ambiguous_match_state(file, receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0) if receiver.found else (false, false)
                     return true if receiver.found and ambiguous_match.potential_match and ambiguous_match.ambiguous
                 return false
 
@@ -1139,7 +1285,7 @@ extend Semantic:
                     return true if error_family_covers(annotations, source, destination, table)
                 return false
 
-        def check_try_propagation_row(annotation: Ast::EnumAnnotation&, enclosing: (line: u32, offset: u32), enclosing_module: sview, callee_qualifier: sview, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool, error_set_annotations: darray[Ast::EnumAnnotation]&, error_set_family_paths: darray[Ast::EnumAnnotation]&, error_set_index: mutable TryErrorSetIndex&, propagation_site_count: usize, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, error_index: CallableErrorAnnotationIndex&, table: lmut SymbolTable, call_arity_known: bool, call_arity: u32, first_class_error_family: sview @source = "", lambda_error_family: sview @source = "", inside_lambda: bool = false) -> void:
+        def check_try_propagation_row(file: Ast::File&, annotation: Ast::EnumAnnotation&, enclosing: (line: u32, offset: u32), enclosing_module: sview, callee_qualifier: sview, annotations: darray[Ast::EnumAnnotation]&, try_named_arguments: darray[Ast::EnumAnnotation]&, argument_type_ids: darray[u32]&, receiver_ref_mutability_known: bool, receiver_ref_mutable: bool, error_set_annotations: darray[Ast::EnumAnnotation]&, error_set_family_paths: darray[Ast::EnumAnnotation]&, error_set_index: mutable TryErrorSetIndex&, propagation_site_count: usize, module_index: FallibleFunctionModuleIndex&, module_annotations: darray[Ast::EnumAnnotation]&, error_index: CallableErrorAnnotationIndex&, table: lmut SymbolTable, call_arity_known: bool, call_arity: u32, first_class_error_family: sview @source = "", lambda_error_family: sview @source = "", inside_lambda: bool = false) -> void:
             can Memory.Allocate, Abort.Panic, Global.Read:
                 return if first_class_error_family == "" and annotation.owner != "__noncall" and callable_try_static_binding_uncertain(annotations, annotation.owner, enclosing_module, callee_qualifier, table)
                 scope_known: bool = enclosing.line != 0 or enclosing.offset != 0 or enclosing_module != "" or callee_qualifier != ""
@@ -1148,11 +1294,11 @@ extend Semantic:
                 if first_class_error_family != "":
                     sources.push(TryErrorFamilyRef{family: first_class_error_family, module: "", module_known: false, family_path: "", source_name: "", variant_override: "", declaration_line: 0, declaration_offset: 0, declaration_identity_id: 0, occurrence_offset: 0})
                 else:
-                    selected_sources: (families: darray[TryErrorFamilyRef], ambiguous: bool) = callable_error_indexed_family_refs(error_index, annotations, try_named_arguments, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known, annotation.offset, call_arity_known, call_arity, table)
+                    selected_sources: (families: darray[TryErrorFamilyRef], ambiguous: bool) = callable_error_indexed_family_refs(file, error_index, annotations, try_named_arguments, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known, annotation.offset, call_arity_known, call_arity, table)
                     sources <- selected_sources.families
                     source_ambiguous <- selected_sources.ambiguous
                     if sources.count == 0 and not source_ambiguous:
-                        fallback_source: TryErrorFamilyRef = callable_error_indexed_family_ref(error_index, annotations, try_named_arguments, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known, annotation.offset, call_arity_known, call_arity, table)
+                        fallback_source: TryErrorFamilyRef = callable_error_indexed_family_ref(file, error_index, annotations, try_named_arguments, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable, module_index, module_annotations, annotation.owner, enclosing_module, callee_qualifier, scope_known, annotation.offset, call_arity_known, call_arity, table)
                         sources.push(fallback_source) if fallback_source.family != ""
                 return if sources.count == 0
                 function_line: u32 = enclosing.line
@@ -1462,11 +1608,35 @@ extend Semantic:
                     _:
                         return ""
 
-        def try_noncall_type_alias_facts_add(declarations: darray[Ast::Decl], environment: mutable TryNonCallErrorFamilyEnv&, current_module: sview, table: mutable SymbolTable&) -> void:
+        def try_noncall_type_alias_declaration_is_static_inactive(file: Ast::File&, annotations: darray[Ast::EnumAnnotation]&, alias_name: sview, current_module: sview, declaration_line: u32, declaration_offset: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                unresolved_branch: mutable bool = false
+                # One marker is emitted per ancestor, outer-to-inner. A selected or
+                # unknown outer row cannot decide whether a later inner row is inactive.
+                for marker in annotations |file, table, alias_name, current_module, declaration_line, declaration_offset, unresolved_branch|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__type_alias_static_branch" or marker.detail_name != alias_name or marker.module != current_module or marker.line != declaration_line or marker.offset != declaration_offset
+                    if marker.identity_id == 4294967295:
+                        unresolved_branch <- true
+                        continue
+                    branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, marker.identity_id.usize(), marker.module, table)
+                    return true if branch.known and not branch.selected
+                    unresolved_branch <- true if not branch.known
+                return false if unresolved_branch
+                return false
+
+        def try_noncall_static_scope_is_inactive(file: Ast::File&, scope_position: Ast::Pos, current_module: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                branch_row: usize = pma_static_if_row_for_position(file, scope_position)
+                return false if branch_row >= file.static_if_lines.count
+                branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                return branch.known and not branch.selected
+
+        def try_noncall_type_alias_facts_add(file: Ast::File&, declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, environment: mutable TryNonCallErrorFamilyEnv&, current_module: sview, table: mutable SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |environment, current_module, table|:
+                for declaration in declarations |file, annotations, environment, current_module, table|:
                     match declaration:
-                        Decl.Alias(alias_name, target, _) if target is not Expr.Invalid:
+                        Decl.Alias(alias_name, target, alias_position) if target is not Expr.Invalid:
+                            continue if try_noncall_type_alias_declaration_is_static_inactive(file, annotations, alias_name, current_module, alias_position.line, alias_position.offset, table)
                             target_facts: (known_nonfallible: bool, numeric: bool, integer: bool) = try_noncall_declared_type_facts(target)
                             environment.type_alias_names.push(alias_name)
                             environment.type_alias_modules.push(current_module)
@@ -1481,10 +1651,13 @@ extend Semantic:
                             environment.non_alias_type_names.push(type_name)
                             environment.non_alias_type_modules.push(current_module)
                         Decl.Module(module_name, module_body, _):
-                            nested_module: sview @source = try_noncall_module_path(current_module, module_name, table)
-                            try_noncall_type_alias_facts_add(module_body, environment, nested_module, table)
-                        Decl.Scoped(scoped_body, _):
-                            try_noncall_type_alias_facts_add(scoped_body, environment, current_module, table)
+                            # Decl.Module names are canonical qualified AST paths;
+                            # try_noncall_module_path remains for relative imports.
+                            nested_module: sview @source = module_name
+                            try_noncall_type_alias_facts_add(file, module_body, annotations, environment, nested_module, table)
+                        Decl.Scoped(scoped_body, scope_position):
+                            continue if try_noncall_static_scope_is_inactive(file, scope_position, current_module, table)
+                            try_noncall_type_alias_facts_add(file, scoped_body, annotations, environment, current_module, table)
                         _:
                             pass
 
@@ -1568,13 +1741,15 @@ extend Semantic:
                 for declaration in declarations |annotations, environment, current_module, table|:
                     match declaration:
                         Decl.Func(name, params, return_type, _, _, _, function_position):
+                            continue if callable_function_declaration_is_static_inactive(annotations, name, current_module, function_position.line, function_position.offset)
+                            unresolved_static_branch: bool = callable_function_declaration_is_static_unresolved(annotations, name, current_module, function_position.line, function_position.offset)
                             family: mutable sview @source = ""
                             family_rows: mutable usize = 0
                             for row in 0..<annotations.count |family, family_rows, annotations, name, function_position|:
                                 marker: Ast::EnumAnnotation = annotations[row]
                                 same_declaration: bool = marker.offset == function_position.offset if marker.offset != 0 and function_position.offset != 0 else marker.line == function_position.line
                                 if marker.owner == name and marker.name == "__error_return" and same_declaration and row + 1.usize() < annotations.count and callable_error_family_row(annotations, row + 1.usize()):
-                                    family <- annotations[row + 1.usize()].name if family_rows == 0
+                                    family <- annotations[row + 1.usize()].name if family_rows == 0 and not unresolved_static_branch
                                     family_rows <- family_rows + 1.usize()
                             return_facts: mutable (known_nonfallible: bool, numeric: bool, integer: bool) = (false, false, false)
                             if return_type is function_return_type and not try_noncall_function_return_is_generic(annotations, function_return_type, function_position, current_module):
@@ -1607,7 +1782,7 @@ extend Semantic:
                             # block legacy name-only fallback without blocking a later
                             # visible candidate. A visible function with ambiguous
                             # ErrorSet rows remains an unknown candidate.
-                            environment.callable_facts_known.push(family_rows <= 1.usize())
+                            environment.callable_facts_known.push(not unresolved_static_branch and family_rows <= 1.usize())
                             environment.callable_return_nonfallible.push(return_facts.known_nonfallible)
                             environment.callable_numeric.push(return_facts.numeric)
                             environment.callable_integer.push(return_facts.integer)
@@ -1620,7 +1795,9 @@ extend Semantic:
                             environment.callable_generic_return_formal_names.push(generic_return_formal.name)
                             environment.callable_generic_return_formal_indices.push(generic_return_formal.index)
                         Decl.Module(module_name, module_body, _):
-                            nested_module: sview @source = try_noncall_module_path(current_module, module_name, table)
+                            # Decl.Module names are canonical qualified AST paths;
+                            # try_noncall_module_path remains for relative imports.
+                            nested_module: sview @source = module_name
                             try_noncall_callable_facts_add(module_body, annotations, environment, nested_module, table)
                         Decl.Scoped(scoped_body, _):
                             try_noncall_callable_facts_add(scoped_body, annotations, environment, current_module, table)

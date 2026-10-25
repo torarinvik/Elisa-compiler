@@ -293,6 +293,26 @@ if not all(fragment in visible_overload_scope for fragment in (
         "ewr_visible_callable_overload_set_in_scope(module_body, name, qualifier, nested_module, caller_module, annotations, table)")):
     raise SystemExit("EWR overload gate must require two registrations under one visible qualified name")
 
+# Decl.Module names in the AST are already fully qualified. Recursive EWR walkers
+# must keep that canonical path instead of joining it to the current scope again.
+canonical_module_walkers = {
+    "ewr_raw_callable_in_module": "ewr_raw_callable_in_module(module_body, name, target_module, nested_module, table)",
+    "ewr_raw_callable_matches_import_path": "ewr_raw_callable_matches_import_path(module_body, name, base_module, suffix, nested_module, table)",
+    "ewr_callable_binding_in_scope": "ewr_callable_binding_in_scope(module_body, name, qualifier, nested_module, caller_module, annotations, table, binding)",
+    "ewr_callable_declared_in_module": "ewr_callable_declared_in_module(module_body, name, target_module, nested_module, caller_module, annotations, table)",
+    "ewr_inaccessible_callable_binding_in_scope": "ewr_inaccessible_callable_binding_in_scope(module_body, name, qualifier, nested_module, caller_module",
+    "ewr_visible_callable_overload_set_in_scope": "ewr_visible_callable_overload_set_in_scope(module_body, name, qualifier, nested_module, caller_module, annotations, table)",
+    "ewr_infallible_callable_scope": "ewr_infallible_callable_scope(module_body, name, qualifier, nested_module, caller_module",
+    "ewr_find_function_parameters": "ewr_find_function_parameters(module_body, family, nested_module, annotations, table)",
+}
+for helper, recursive_call in canonical_module_walkers.items():
+    source = function_source(EWR, helper)
+    if not all(fragment in source for fragment in (
+            "Decl.Module(module_name, module_body",
+            "nested_module: sview @source = module_name",
+            recursive_call)) or "try_noncall_module_path(current_module, module_name" in source:
+        raise SystemExit(f"{helper} must recurse with the parser's canonical module name")
+
 fallible_selection = function_source(EWR, "ewr_callable_family")
 if not all(fragment in fallible_selection for fragment in (
         "ewr_receiver_rank_gate(all_declarations, name, qualifier, caller_module",
@@ -605,11 +625,16 @@ if "extern_params: darray[Ast::ExternParam]" not in callable_family_signature or
 
 static_alias_fixture = (ROOT / "test/repro/errorset_wrapper_return_static_alias_branch.elisa").read_text()
 static_alias_unknown_fixture = (ROOT / "test/repro/errorset_wrapper_return_static_alias_unknown.elisa").read_text()
+static_const_fixture = (ROOT / "test/repro/errorset_wrapper_return_static_const_branch.elisa").read_text()
+static_const_smoke = (ROOT / "test/parity/errorset_wrapper_return_static_const_branch_smoke.sh").read_text()
 static_import_filter = function_source(EWR, "ewr_static_import_annotations")
 static_import_selection = function_source(EWR, "ewr_static_import_annotation_selection")
 static_branch_selection = function_source(EWR, "ewr_static_import_branch_selection")
+static_const_branch = function_source(EWR, "ewr_static_if_const_branch_selection")
 static_const_value = function_source(EWR, "ewr_static_if_named_constant_value")
 static_condition_value = function_source(EWR, "ewr_static_if_condition_value")
+static_row_selection = function_source(EWR, "ewr_static_if_row_selection")
+static_branch_markers = function_source(PARSER, "record_static_if_branch_markers")
 unknown_static_import = function_source(EWR, "ewr_unknown_static_import_affects_call")
 if not all(fragment in static_alias_fixture for fragment in (
         "const USE_INACTIVE_PROVIDER: bool = false",
@@ -630,7 +655,8 @@ if not all(fragment in static_import_selection for fragment in (
         "marker.owner != \"__static_if_branch\"",
         "marker.identity_id.usize()",
         "branch.known and not branch.selected",
-        "return (false, false) if unknown")):
+        "return (false, false) if unknown",
+        "ewr_static_if_row_selection(file, marker.identity_id.usize(), module, table)")):
     raise SystemExit("EWR static import filtering must use each generic parser marker and fail closed for unresolved branch ancestry")
 if not all(fragment in static_import_filter for fragment in (
         "continue if branch.known and not branch.active",
@@ -645,10 +671,44 @@ if not all(fragment in static_const_value for fragment in (
         "table.immutable_const_names",
         "table.immutable_const_rows",
         "SemanticPrivateModuleBoundary::within_module",
-        "ewr_static_if_condition_value(table.immutable_const_values[selected_row]")) or not all(fragment in static_condition_value for fragment in (
+        "ewr_static_if_const_branch_selection(file, name, symbol, table, depth + 1)",
+        "continue if branch.known and not branch.active",
+        "found_unknown",
+        "ewr_static_if_condition_value(table.immutable_const_values[selected_row]")) or not all(fragment in static_const_branch for fragment in (
+        'marker.name != "__const_static_branch"',
+        "marker.detail_name != name",
+        "marker.identity_id.usize()",
+        "ewr_static_if_row_selection(file, marker.identity_id.usize(), symbol.module_owner, table, depth + 1)",
+        "branch.known and not branch.selected")) or not all(fragment in static_condition_value for fragment in (
         "Expr.Ident(name, _):",
-        "ewr_static_if_named_constant_value(name, current_module, table")):
-    raise SystemExit("EWR must fold visible immutable boolean/integer constants and keep unknown conditions conservative")
+        "ewr_static_if_named_constant_value(name, current_module, file, table")) or not all(fragment in static_row_selection for fragment in (
+        "depth: u32 = 0",
+        "depth >= 64",
+        "row >= file.static_if_modules.count",
+        "condition_module: sview = file.static_if_modules[row]",
+        "ewr_static_if_condition_value(file.static_if_conds[row], condition_module, file, table, depth + 1")):
+    raise SystemExit("EWR must fold conditions in their recorded lexical modules and keep missing or unknown rows conservative")
+if not all(fragment in static_branch_markers for fragment in (
+        "parser.static_if_branch_rows.count.u32() != parser.static_if_depth",
+        "identity_id: 4294967295",
+        "for branch_identity in parser.static_if_branch_rows",
+        "identity_id: branch_identity")):
+    raise SystemExit("EWR nested const selection depends on parser markers retaining every enclosing branch row")
+if not all(fragment in static_const_fixture for fragment in (
+        "const CHOOSE_A: bool = true",
+        "static if false:",
+        "static if true:",
+        "const CHOOSE_A: bool = false",
+        "static if CHOOSE_A:",
+        "module App:\n    module ProviderA:",
+        "using ProviderA as Pick",
+        "using ProviderB as Pick",
+        "def caller() -> i64 error[App::ProviderA::FaultA]",
+        "return Pick::origin()")) or not all(fragment in static_const_smoke for fragment in (
+        "errorset_wrapper_return_static_const_branch.elisa",
+        "Stage1 let the inactive nested const select ProviderB",
+        "cannot propagate")):
+    raise SystemExit("EWR must ignore a deeper inactive const when selecting a static-import callable family")
 if not all(fragment in entrypoint for fragment in (
         "lookup_annotations: mutable darray[Ast::EnumAnnotation] = ewr_static_import_annotations(file, table)",
         "callable_error_index_build(lookup_annotations",

@@ -1,4 +1,4 @@
-"""Bind ErrorSet alias fallback resolution to Core's candidate order."""
+"""Bind ErrorSet alias resolution and imported-parameter lookup to source contracts."""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +13,7 @@ parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 ESH = ROOT / "src/semantic/check_errorset_shadow.elisa"
 TRY = ROOT / "src/semantic/check_try_fallible.elisa"
+ERRORSET_PARAM = ROOT / "src/semantic/check_errorset_param_inference.elisa"
 
 
 def function_source(name: str, path: Path = ESH) -> str:
@@ -74,6 +75,65 @@ for probe in (
     if probe not in atom:
         raise SystemExit(f"ErrorSet import atom is missing Core-compatible raw-path probe {probe}")
 
+param_import_filter = function_source("errorset_active_import_annotations", ERRORSET_PARAM)
+param_import_entrypoint = function_source("check_errorset_param_inference", ERRORSET_PARAM)
+if not all(fragment in param_import_filter for fragment in (
+        "pma_import_annotation_branch_selection(annotation, file.enum_annotations, file, table)",
+        "continue if branch.known and not branch.active",
+        "active.push(annotation)")):
+    raise SystemExit("ErrorSet parameter inference must drop known-inactive imports while retaining unresolved branch rows")
+if not all(fragment in param_import_entrypoint for fragment in (
+        "errorset_active_import_annotations(file, table)",
+        "errorset_collect_candidates(file.top_decls, annotations, names, params, modules, file, table)",
+        "errorset_walk_decls(file.top_decls, names, params, modules, annotations, \"\", file, table)")):
+    raise SystemExit("ErrorSet parameter inference must use branch-filtered imports for candidate lookup and call walking")
+static_import_fixture = (ROOT / "test/repro/errorset_param_static_import_branch.elisa").read_text()
+static_import_smoke = (ROOT / "test/parity/errorset_param_static_import_branch_smoke.sh").read_text()
+if not all(fragment in static_import_fixture for fragment in (
+        "def wrap[errorset R]() -> i64 error[R]",
+        "def wrap[errorset S]() -> i64 error[S]",
+        "static if USE_INACTIVE_PROVIDER:",
+        "from InactiveProvider import wrap",
+        "static else:",
+        "from ActiveProvider import wrap",
+        "return wrap()")) or not all(fragment in static_import_smoke for fragment in (
+        "errorset_param_static_import_branch.elisa",
+        "cannot infer error-set parameter",
+        'L22 cannot infer error-set parameter "S" for call to "wrap"')):
+    raise SystemExit("ErrorSet parameter coverage must keep the active else-arm diagnostic despite an earlier inactive import")
+
+param_static_scope = function_source("errorset_static_scope_is_inactive", ERRORSET_PARAM)
+param_candidate_walk = function_source("errorset_collect_candidates_from", ERRORSET_PARAM)
+param_diagnostic_walk = function_source("errorset_walk_decls", ERRORSET_PARAM)
+param_statement_walk = function_source("errorset_walk_statements", ERRORSET_PARAM)
+if not all(fragment in param_static_scope for fragment in (
+        "position: Ast::Pos",
+        "pma_static_if_row_for_position(file, position)",
+        "pma_static_if_row_selection(file, branch_row, current_module, table)",
+        "branch.known and not branch.selected")) or \
+        not all(fragment in param_candidate_walk for fragment in (
+        "errorset_static_scope_is_inactive(file, scoped_line, current_module, table)",
+        "continue if errorset_static_scope_is_inactive")) or \
+        not all(fragment in param_diagnostic_walk for fragment in (
+        "errorset_static_scope_is_inactive(file, scoped_line, current_module, table)",
+        "continue if errorset_static_scope_is_inactive")) or \
+        not all(fragment in param_statement_walk for fragment in (
+        'kind == "static" and errorset_static_scope_is_inactive(file, line, current_module, table)',
+        "file, table")):
+    raise SystemExit("ErrorSet candidate collection and diagnostic traversal must skip only proven-inactive declaration and statement branches")
+static_scope_fixture = (ROOT / "test/repro/errorset_param_static_scope.elisa").read_text()
+static_scope_smoke = (ROOT / "test/parity/errorset_param_static_scope_smoke.sh").read_text()
+if not all(fragment in static_scope_fixture for fragment in (
+        "static if false:",
+        "def hidden_wrap[errorset H]()",
+        "return hidden_wrap()",
+        "def inactive_statement_call()",
+        "active_wrap()",
+        "def active_call()")) or not all(fragment in static_scope_smoke for fragment in (
+        "errorset_param_static_scope.elisa",
+        'L22 cannot infer error-set parameter "A" for call to "active_wrap"')):
+    raise SystemExit("ErrorSet static-scope coverage must keep only its active call diagnostic")
+
 print(
-    '{"source_bound": true, "candidate_order": 5, "declaration_id_cycle_guard": true, "raw_import_path": true}'
+    '{"source_bound": true, "candidate_order": 5, "declaration_id_cycle_guard": true, "raw_import_path": true, "static_import_branch": true}'
 )

@@ -61,20 +61,49 @@ extend Backend:
         # The unsafe report also walks statement bodies. Expose the exact branch heads selected
         # by the same target-constant fold used by code generation, so it never audits a dead
         # static branch merely because the parser retained it in the AST.
-        def selected_static_lines_for_report(file: Ast::File&) -> darray[u32] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def selected_static_offsets_for_report(file: Ast::File&) -> darray[u32] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             ctx: LLVMContextRef = LLVMContextCreate()
-            module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_unsafe_lines", ctx)
+            module_handle: LLVMModuleRef = LLVMModuleCreateWithNameInContext("elisac_stage1_unsafe_offsets", ctx)
             machine: void& = configure_module_target_for(module_handle, "")
             target_data: LLVMTargetDataRef = LLVMCreateTargetDataLayout(machine)
             structs: mutable StructTable = new_struct_table(ctx, target_data)
             _ = select_module_declarations(file, &structs)
-            return structs.annotations.static_taken_lines
+            return structs.annotations.static_taken_offsets
+
+
+        def declaration_is_static_function(annotations: darray[Ast::EnumAnnotation]&, declaration: Decl) -> bool can[Abort.Panic]:
+            return match declaration:
+                Decl.Func(function_name, params, return_type, body, effects, decorators, position):
+                    any annotation in annotations where annotation.owner == "__static_fn" and annotation.name == function_name and annotation.line == position.line and annotation.offset == position.offset
+                _:
+                    false
+
+
+        # Static functions can appear inside module and impl scopes. Strip them
+        # recursively after static-if flattening, using their declaration-head offset
+        # so repeated #line values and same-name functions cannot cross-filter.
+        def declaration_without_static_functions(annotations: darray[Ast::EnumAnnotation]&, declaration: Decl) -> Decl can[Abort.Panic, Memory.Allocate]:
+            match declaration:
+                Decl.Module(module_name, module_body, module_pos):
+                    filtered_module: mutable darray[Decl] @source = []
+                    for nested in module_body |filtered_module, annotations|:
+                        continue if declaration_is_static_function(annotations, nested)
+                        filtered_module.push(declaration_without_static_functions(annotations, nested))
+                    return Decl.Module(module_name, filtered_module, module_pos)
+                Decl.Scoped(scoped_body, scoped_pos):
+                    filtered_scope: mutable darray[Decl] @source = []
+                    for nested in scoped_body |filtered_scope, annotations|:
+                        continue if declaration_is_static_function(annotations, nested)
+                        filtered_scope.push(declaration_without_static_functions(annotations, nested))
+                    return Decl.Scoped(filtered_scope, scoped_pos)
+                _:
+                    declaration
 
 
         def select_module_declarations(file: Ast::File&, structs: mutable StructTable&) -> darray[Decl] can[Abort.Panic, Memory.Allocate]:
             register_target_consts(structs)
             register_fn_signatures(file, structs)
-            static_branch_lines: darray[u32] = file.static_if_lines
+            static_branch_offsets: darray[u32] = file.static_if_offsets
             # Impl membership must be captured BEFORE flattening erases the Scoped nodes.
             record_impl_member_lines(file.top_decls, file.enum_annotations, structs)
             structs.annotations.decl_line_rows <- file.func_decl_lines
@@ -82,10 +111,10 @@ extend Backend:
             structs.annotations.panic_line_rows <- file.panic_lines
             structs.annotations.panic_column_rows <- file.panic_columns
             top: mutable darray[Decl] = []
-            for _selection_round in 0..<(file.static_if_lines.count + 1) |top, structs, file, static_branch_lines|:
-                round_taken: darray[u32] = selected_static_if_lines(file, structs)
+            for _selection_round in 0..<(file.static_if_lines.count + 1) |top, structs, file, static_branch_offsets|:
+                round_taken_offsets: darray[u32] = selected_static_if_offsets(file, structs)
                 round_top: mutable darray[Decl] = []
-                flatten_static_branches(file.top_decls, static_branch_lines, round_taken, round_top)
+                flatten_static_branches(file.top_decls, static_branch_offsets, round_taken_offsets, round_top)
                 hoisted_top: mutable darray[Decl] = []
                 hoist_nested_modules(round_top, hoisted_top)
                 settled: bool = hoisted_top.count == top.count
@@ -100,25 +129,20 @@ extend Backend:
                         register_const(round_declaration, "", file.enum_annotations, structs)
                 fold_consts(file, top, structs)
             structs.annotations.static_branch_lines <- file.static_if_lines
+            structs.annotations.static_branch_offsets <- file.static_if_offsets
             # `static def` functions are COMPILE-TIME ONLY (evaluated during static
             # execution; stage0 emits no runtime code for them). Dropping them here keeps
             # both the declare and the body pass from seeing them, so an exotic static-only
             # body (reflection, static comprehensions) cannot decline anything. The parser
-            # records each as a `__static_fn` annotation (name + line).
-            # The `__static_fn` rows are collected once: testing each declaration against the
-            # whole annotation table was declarations x annotations.
+            # records each as a `__static_fn` annotation (name, line, and declaration offset).
+            # The `__static_fn` rows are collected once before recursively filtering the
+            # declaration tree; matching only the top-level list missed module/impl bodies.
             static_fn_rows: darray[Ast::EnumAnnotation] = annotations_owned_by(file.enum_annotations, "__static_fn")
             if static_fn_rows.count > 0:
                 static_fn_filtered: mutable darray[Decl] = []
                 for kept_declaration in top |static_fn_filtered, static_fn_rows|:
-                    kept_is_static: mutable bool = false
-                    match kept_declaration:
-                        Decl.Func(kept_name, kept_params, kept_return, kept_body, kept_effects, kept_decorators, kept_line):
-                            for static_annotation in static_fn_rows |kept_is_static, kept_name, kept_line|:
-                                kept_is_static <- true if static_annotation.name == kept_name and static_annotation.line == kept_line.line
-                        _:
-                            pass
-                    static_fn_filtered.push(kept_declaration) if not kept_is_static
+                    continue if declaration_is_static_function(static_fn_rows, kept_declaration)
+                    static_fn_filtered.push(declaration_without_static_functions(static_fn_rows, kept_declaration))
                 top <- static_fn_filtered
             effect_template_annotations: mutable darray[Ast::EnumAnnotation] = []
             for annotation in file.enum_annotations |effect_template_annotations|:
@@ -128,10 +152,13 @@ extend Backend:
                 for kept_declaration in top |effect_template_filtered, effect_template_annotations|:
                     effect_template_filtered.push(declaration_without_effect_templates(effect_template_annotations, kept_declaration)) if not declaration_is_effect_template(effect_template_annotations, kept_declaration)
                 top <- effect_template_filtered
-            selected_lines: darray[u32] = selected_static_if_lines(file, structs)
+            selected_rows: darray[u32] = selected_static_if_rows(file, structs)
             structs.annotations.static_taken_lines <- structs.annotations.static_taken_lines.truncate(0)
-            for selected_line in selected_lines |structs|:
-                structs.annotations.static_taken_lines <- structs.annotations.static_taken_lines.push(selected_line)
+            structs.annotations.static_taken_offsets <- structs.annotations.static_taken_offsets.truncate(0)
+            for selected_row in selected_rows |structs, file|:
+                continue if selected_row.usize() >= file.static_if_lines.count or selected_row.usize() >= file.static_if_offsets.count
+                structs.annotations.static_taken_lines <- structs.annotations.static_taken_lines.push(file.static_if_lines[selected_row.usize()])
+                structs.annotations.static_taken_offsets <- structs.annotations.static_taken_offsets.push(file.static_if_offsets[selected_row.usize()])
             return top
 
         def register_module_types(file: Ast::File&, top: darray[Decl]&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:

@@ -25,6 +25,8 @@ RESOLVER = ROOT / "src/semantic/resolve_expr_walk.elisa"
 BINDING_RESOLVER = ROOT / "src/semantic/resolve_binding_capabilities.elisa"
 POSITIVE = HERE / "module_symbol_path_matcher.elisa"
 NEGATIVE = HERE / "module_symbol_path_matcher_rejected.elisa"
+ALIAS_BRANCH_FIXTURE = ROOT / "test/repro/type_path_alias_static_branch.elisa"
+ALIAS_BRANCH_SMOKE = ROOT / "test/parity/type_path_alias_static_branch_smoke.sh"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--source-only", action="store_true",
@@ -163,6 +165,53 @@ def module_symbol_matches_relative(candidate: sview, enclosing: sview, names: da
         raise SystemExit(f"semantic {wrapper} no longer delegates to its proved matcher")
 if semantic_text.count('include "./check_type_path_separator.elisa"') != 1:
     raise SystemExit("semantic root must include the matcher wrappers exactly once")
+alias_visibility = compact(function_section(consumer_text, "type_path_prefix_is_module"))
+alias_canonicalization = compact(function_section(consumer_text, "type_path_canonical_alias_target"))
+alias_selection = compact(function_section(consumer_text, "type_path_alias_selection"))
+alias_setup = compact(function_section(consumer_text, "check_type_path_separator"))
+alias_fixture = ALIAS_BRANCH_FIXTURE.read_text()
+alias_smoke = ALIAS_BRANCH_SMOKE.read_text()
+if not all(fragment in alias_visibility for fragment in (
+        "alias_scopes:darray[sview]&",
+        "type_path_alias_selection(names[0],enclosing,alias_names,alias_targets,alias_scopes)",
+        "module_symbol_matches(symbol_name,alias_targets[alias.row],names,1,count)")) or not all(fragment in alias_canonicalization for fragment in (
+        "alias_scopes:darray[sview]&",
+        "type_path_alias_selection(first,declaration_scope,alias_names,alias_targets,alias_scopes)")) or not all(fragment in alias_selection for fragment in (
+        "semantic_import_scope_visible(alias_scopes[alias_index],current_scope)",
+        "alias_scopes[alias_index].len>selected_scope_length",
+        "alias_targets[alias_index]!=alias_targets[selected_row]",
+        "return(false,false,alias_names.count)ifselected_row>=alias_names.count",
+        "return(true,false,alias_names.count)ifambiguous")) or "returnpathifalias.found" not in alias_canonicalization or not all(fragment in alias_setup for fragment in (
+        "for target_row in table.definite_import_annotations",
+        "for alias_row in table.definite_import_annotations",
+        "alias_scopes.push(target_row.module)")):
+    raise SystemExit("type-path namespace detection must use only definite aliases visible from the lexical module")
+if not all(fragment in alias_fixture for fragment in (
+        "using TypePathAliasProvider as ActiveAlias",
+        "using TypePathAliasProvider as InactiveAlias",
+        "using TypePathAliasProvider as PossibleAlias",
+        "static if false:",
+        "static if ELISA_TARGET_OS_WASI:",
+        "ActiveAlias.Item",
+        "ActiveAlias::Nested.Item",
+        "InactiveAlias.Item",
+        "PossibleAlias.Item",
+        "module AliasShadowing:",
+        "using OuterProvider as Choice",
+        "using InnerProvider as Choice",
+        "using OtherProvider as Choice",
+        "static if ELISA_TARGET_OS_WASI:",
+        "Choice::Nested.Item")) or not all(fragment in alias_smoke for fragment in (
+        "type_path_alias_static_branch.elisa",
+        "ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown",
+        '"ActiveAlias" is a namespace; write ActiveAlias::',
+        '"ActiveAlias::Nested" is a namespace; write ActiveAlias::Nested::',
+        '"InactiveAlias" is a namespace; write InactiveAlias::',
+        '"PossibleAlias" is a namespace; write PossibleAlias::',
+        '"Choice::Nested" is a namespace; write Choice::Nested::',
+        'check_report native "$("$RPT" < "$FIXTURE")" 1',
+        'check_report unknown-target "$(ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT" < "$FIXTURE")" 0')):
+    raise SystemExit("type-path alias regression must retain definite aliases and ignore inactive or unresolved aliases")
 qualified_candidate = compact(function_section(binding_resolver_text, "binding_nominal_qualified_candidate"))
 nominal_lookup = compact(function_section(binding_resolver_text, "binding_nominal_declaration"))
 if "module_symbol_matches(" not in qualified_candidate or "module_symbol_matches_relative(" not in qualified_candidate:
@@ -220,7 +269,7 @@ for name, claim in negative_claims.items():
     if "ensureresult==true" not in section or compact(claim) not in section:
         raise SystemExit(f"false-claim control {name} no longer asserts the rejected claim")
 
-source_closure = source_include_closure([POSITIVE, NEGATIVE])
+source_closure = source_include_closure([POSITIVE, NEGATIVE, ALIAS_BRANCH_FIXTURE])
 if ARGS.source_only:
     print(json.dumps({"source_bound": True, "positive": len(positive_names),
                       "false_claim_controls": len(negative_names)}, sort_keys=True))
@@ -239,7 +288,7 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1, provenance, Path(__file__),
     HERE / "proof_product_gate.py", POLICY, CONSUMER, SEMANTIC, RESOLVER, BINDING_RESOLVER,
-    POSITIVE, NEGATIVE, *source_closure,
+    POSITIVE, NEGATIVE, ALIAS_BRANCH_FIXTURE, ALIAS_BRANCH_SMOKE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

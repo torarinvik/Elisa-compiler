@@ -1,80 +1,219 @@
 # Static-function call context (stage0 static-evaluation). A `static def` function is compile-time
 # only; calling it from ordinary runtime code is rejected ("static function X can only be called
-# from a static context"). The parser records each static function's name (owner "__static_fn").
+# from a static context"). The parser records each static function's declaration identity in
+# `__static_fn` (name, source position, and lexical module).
 #
-# SOUND subset: a call to a static function from a function that is NOT itself a static function is
-# flagged. Calls from another static function are fine (both compile-time). Static-if/static-generate
-# bodies inside a runtime function are a rarer static context left to the full evaluator.
+# SOUND subset: a call to a visible static function from a function that is NOT itself a static
+# function is flagged. Calls from another static function are fine (both compile-time). Static-if/
+# static-generate bodies inside a runtime function are a rarer static context left to the full
+# evaluator. Bare calls are scoped to the current module and lexical parents; import aliases and
+# overload resolution are not modeled here.
 extend Semantic:
     private:
-        def is_static_function(static_fns: darray[sview]&, name: sview) -> bool:
+        def is_static_function_declaration(static_fns: darray[Ast::EnumAnnotation]&, function_name: sview, function_position: Ast::Pos, current_module: sview) -> bool:
             can Abort.Panic:
-                return any static_name in static_fns where static_name == name
+                for annotation in static_fns:
+                    continue if annotation.owner != "__static_fn"
+                    return true if annotation.name == function_name and annotation.line == function_position.line and annotation.offset == function_position.offset and annotation.module == current_module
+                return false
 
-        def static_call_check_expression(expression: Ast::Expr, static_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def static_call_function_branch_selection(annotation: Ast::EnumAnnotation, file: Ast::File&, table: SymbolTable&) -> (known: bool, active: bool):
+            can Abort.Panic:
+                row: mutable u32 = symbol_chain_head(table, annotation.name)
+                while row != 4294967295 |row, annotation, file, table|:
+                    symbol: Symbol = table.symbols[row.usize()]
+                    if symbol.kind == SymbolKind.Func and symbol.name == annotation.name and symbol.module_owner == annotation.module and symbol.line == annotation.line and symbol.offset == annotation.offset:
+                        return pma_static_if_function_branch_selection(file, annotation.name, symbol, table, 0)
+                    row <- table.symbol_name_next[row.usize()]
+                return (false, false)
+
+        def is_visible_static_function(file: Ast::File&, static_fns: darray[Ast::EnumAnnotation]&, function_name: sview, current_module: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for annotation in static_fns:
+                    continue if annotation.owner != "__static_fn" or annotation.name != function_name
+                    continue if not try_noncall_module_is_ancestor(annotation.module, current_module)
+                    # A closer runtime overload can win lookup. Unknown branch activity is
+                    # therefore enough to suppress a definite static-call diagnostic.
+                    continue if static_call_nearer_runtime_function_shadows(file, annotation.module, current_module, function_name, table)
+                    branch: (known: bool, active: bool) = static_call_function_branch_selection(annotation, file, table)
+                    return true if not branch.known or branch.active
+                return false
+
+        # This check has only the callee spelling, not overload ranking. A same-scope or
+        # nearer runtime overload may be the selected target, so suppress the static-call
+        # diagnostic unless every such runtime declaration is proven inactive.
+        def static_call_nearer_runtime_function_shadows(file: Ast::File&, static_module: sview, current_module: sview, function_name: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for symbol in table.symbols |file, static_module, current_module, function_name, table|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != function_name
+                    continue if symbol.module_owner != static_module and not try_noncall_module_is_ancestor(static_module, symbol.module_owner)
+                    continue if not try_noncall_module_is_ancestor(symbol.module_owner, current_module)
+                    is_static: bool = any annotation in file.enum_annotations where annotation.owner == "__static_fn" and annotation.name == symbol.name and annotation.module == symbol.module_owner and annotation.line == symbol.line and annotation.offset == symbol.offset
+                    continue if is_static
+                    branch: (known: bool, active: bool) = pma_static_if_function_branch_selection(file, function_name, symbol, table, 0)
+                    return true if not branch.known or branch.active
+                return false
+
+        def static_call_scope_is_inactive(file: Ast::File&, scope_position: Ast::Pos, current_module: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                branch_row: usize = pma_static_if_row_for_position(file, scope_position)
+                return false if branch_row >= file.static_if_lines.count
+                branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                return branch.known and not branch.selected
+
+        def static_call_check_expression(file: Ast::File&, expression: Ast::Expr, static_fns: darray[Ast::EnumAnnotation]&, current_module: sview, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
                         callee_name: sview = ident_name_of(callee)
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticCallContext, name: callee_name, line: line.line, expected: "", actual: ""}) if callee_name != "" and is_static_function(static_fns, callee_name)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticCallContext, name: callee_name, line: line.line, expected: "", actual: ""}) if callee_name != "" and is_visible_static_function(file, static_fns, callee_name, current_module, table)
+                        table <- static_call_check_expression(file, callee, static_fns, current_module, table)
                         for argument in arguments |table| -> table:
-                            table <- static_call_check_expression(argument, static_fns, table)
+                            table <- static_call_check_expression(file, argument, static_fns, current_module, table)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, pos):
+                        for candidate in candidates |table| -> table:
+                            for capture in candidate.captures |table| -> table:
+                                table <- static_call_check_expression(file, capture, static_fns, current_module, table)
+                        for argument in arguments |table| -> table:
+                            table <- static_call_check_expression(file, argument, static_fns, current_module, table)
+                    Expr.Field(object, field, pos):
+                        table <- static_call_check_expression(file, object, static_fns, current_module, table)
+                    Expr.Scope(base, name, pos):
+                        table <- static_call_check_expression(file, base, static_fns, current_module, table)
+                    Expr.Index(object, index, pos):
+                        table <- static_call_check_expression(file, object, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, index, static_fns, current_module, table)
+                    Expr.Slice(object, low, high, pos):
+                        table <- static_call_check_expression(file, object, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, low, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, high, static_fns, current_module, table)
+                    Expr.IndexN(object, arguments, pos):
+                        table <- static_call_check_expression(file, object, static_fns, current_module, table)
+                        for argument in arguments |table| -> table:
+                            table <- static_call_check_expression(file, argument, static_fns, current_module, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- static_call_check_expression(left, static_fns, table)
-                        table <- static_call_check_expression(right, static_fns, table)
+                        table <- static_call_check_expression(file, left, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, right, static_fns, current_module, table) if operator != TokenKind.Is and operator != TokenKind.As
                     Expr.Unary(operator, operand, line):
-                        table <- static_call_check_expression(operand, static_fns, table)
+                        table <- static_call_check_expression(file, operand, static_fns, current_module, table)
+                    Expr.Move(operand, pos):
+                        table <- static_call_check_expression(file, operand, static_fns, current_module, table)
+                    Expr.RegionNew(operand, region, pos):
+                        table <- static_call_check_expression(file, operand, static_fns, current_module, table)
                     Expr.Paren(inner, line):
-                        table <- static_call_check_expression(inner, static_fns, table)
+                        table <- static_call_check_expression(file, inner, static_fns, current_module, table)
+                    Expr.Array(elements, pos) | Expr.Tuple(elements, pos) | Expr.SetLit(elements, pos):
+                        for element in elements |table| -> table:
+                            table <- static_call_check_expression(file, element, static_fns, current_module, table)
+                    Expr.DictLit(entries, pos):
+                        for entry in entries |table| -> table:
+                            table <- static_call_check_expression(file, entry.key, static_fns, current_module, table)
+                            table <- static_call_check_expression(file, entry.value, static_fns, current_module, table)
+                    Expr.Construct(type_expression, fields, pos):
+                        for field in fields |table| -> table:
+                            table <- static_call_check_expression(file, field.value, static_fns, current_module, table)
+                    Expr.RecordUpdate(base, fields, pos):
+                        table <- static_call_check_expression(file, base, static_fns, current_module, table)
+                        for field in fields |table| -> table:
+                            table <- static_call_check_expression(file, field.value, static_fns, current_module, table)
+                    Expr.If(condition, then_expr, else_expr, pos):
+                        table <- static_call_check_expression(file, condition, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, then_expr, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, else_expr, static_fns, current_module, table)
+                    Expr.Match(scrutinee, arms, pos) | Expr.Catch(scrutinee, arms, pos):
+                        table <- static_call_check_expression(file, scrutinee, static_fns, current_module, table)
+                        for arm in arms |table| -> table:
+                            table <- static_call_check_expression(file, arm.guard, static_fns, current_module, table)
+                            table <- static_call_check_statements(file, arm.body, static_fns, current_module, table)
+                    Expr.Comprehension(variable, iterable, condition, body, pos, _):
+                        table <- static_call_check_expression(file, iterable, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, condition, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, body, static_fns, current_module, table)
+                    Expr.Refinement(base, predicate, pos):
+                        table <- static_call_check_expression(file, base, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, predicate, static_fns, current_module, table)
+                    Expr.GetElse(guarded, recovery, pos):
+                        table <- static_call_check_expression(file, guarded, static_fns, current_module, table)
+                        table <- static_call_check_statements(file, recovery, static_fns, current_module, table)
+                    Expr.Lambda(parameters, body, pos):
+                        table <- static_call_check_statements(file, body, static_fns, current_module, table)
+                    Expr.Block(statements, value, captures, pos):
+                        table <- static_call_check_statements(file, statements, static_fns, current_module, table)
+                        table <- static_call_check_expression(file, value, static_fns, current_module, table)
                     _:
                         pass
 
-        def static_call_check_statements(statements: darray[Ast::Stmt], static_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def static_call_check_statements(file: Ast::File&, statements: darray[Ast::Stmt], static_fns: darray[Ast::EnumAnnotation]&, current_module: sview, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- static_call_check_expression(expression, static_fns, table)
+                            table <- static_call_check_expression(file, expression, static_fns, current_module, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- static_call_check_expression(value, static_fns, table)
+                            table <- static_call_check_expression(file, value, static_fns, current_module, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- static_call_check_expression(value, static_fns, table)
+                            table <- static_call_check_expression(file, target, static_fns, current_module, table)
+                            table <- static_call_check_expression(file, value, static_fns, current_module, table)
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- static_call_check_expression(returned, static_fns, table)
+                                table <- static_call_check_expression(file, returned, static_fns, current_module, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- static_call_check_expression(condition, static_fns, table)
-                            table <- static_call_check_statements(then_body, static_fns, table)
-                            table <- static_call_check_statements(else_body, static_fns, table)
+                            table <- static_call_check_expression(file, condition, static_fns, current_module, table)
+                            table <- static_call_check_statements(file, then_body, static_fns, current_module, table)
+                            table <- static_call_check_statements(file, else_body, static_fns, current_module, table)
                         Stmt.While(condition, while_body, line):
-                            table <- static_call_check_expression(condition, static_fns, table)
-                            table <- static_call_check_statements(while_body, static_fns, table)
+                            table <- static_call_check_expression(file, condition, static_fns, current_module, table)
+                            table <- static_call_check_statements(file, while_body, static_fns, current_module, table)
                         Stmt.For(bind, variables, iterable, for_body, line):
-                            table <- static_call_check_statements(for_body, static_fns, table)
+                            table <- static_call_check_expression(file, iterable, static_fns, current_module, table)
+                            table <- static_call_check_statements(file, for_body, static_fns, current_module, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- static_call_check_expression(file, scrutinee, static_fns, current_module, table)
+                            for arm in arms |table| -> table:
+                                table <- static_call_check_expression(file, arm.guard, static_fns, current_module, table)
+                                table <- static_call_check_statements(file, arm.body, static_fns, current_module, table)
+                        Stmt.Contract(kind, expression, line):
+                            # Executable contracts are evaluated as runtime guards or at returns.
+                            # Loop/frame proof clauses have no runtime expression evaluation.
+                            table <- static_call_check_expression(file, expression, static_fns, current_module, table) if kind == "requires" or kind == "require" or kind == "assert" or kind == "ensure" or kind == "ensures"
                         Stmt.Block(kind, clause, binding, body, line):
                             # A `static:` block is itself a compile-time (static) context, so
                             # calls to static functions inside it are fine — don't walk it.
-                            table <- static_call_check_statements(body, static_fns, table) if kind != "static"
+                            table <- static_call_check_statements(file, body, static_fns, current_module, table) if kind != "static"
                         _:
                             pass
 
-        def check_static_call_context_walk(declarations: darray[Ast::Decl], static_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_static_call_context_walk(file: Ast::File&, declarations: darray[Ast::Decl], static_fns: darray[Ast::EnumAnnotation]&, current_module: sview, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
-                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            # A static function is itself a static context — its calls to statics are fine.
-                            table <- static_call_check_statements(body, static_fns, table) if not is_static_function(static_fns, function_name)
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, function_position):
+                            # Only this exact declaration is a static context. A same-named static
+                            # function in another module must not suppress this runtime body.
+                            if not is_static_function_declaration(static_fns, function_name, function_position, current_module):
+                                for parameter in parameters |table| -> table:
+                                    table <- static_call_check_expression(file, parameter.default_value, static_fns, current_module, table) if parameter.has_default
+                                table <- static_call_check_statements(file, body, static_fns, current_module, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_static_call_context_walk(module_body, static_fns, table)
+                            # Parsed module names are already canonical paths such as
+                            # `Outer::Inner`; joining them to the parent duplicates the
+                            # prefix and breaks ancestor visibility checks.
+                            nested_module: sview @source = module_name
+                            table <- check_static_call_context_walk(file, module_body, static_fns, nested_module, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_static_call_context_walk(scoped_body, static_fns, table)
+                            # Impl and other scoped declarations retain their lexical module.
+                            table <- check_static_call_context_walk(file, scoped_body, static_fns, current_module, table) if not static_call_scope_is_inactive(file, scoped_line, current_module, table)
+                        Decl.Struct(struct_name, members, affinity, has_named_states, has_derive, invariants, struct_position):
+                            # Field defaults are emitted at construction sites, so calls inside
+                            # them inherit the runtime context of the constructor.
+                            for member in members |table| -> table:
+                                table <- static_call_check_expression(file, member.default_value, static_fns, current_module, table) if member.has_default
                         _:
                             pass
 
         def check_static_call_context(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                static_fns: mutable darray[sview] = []
+                static_fns: mutable darray[Ast::EnumAnnotation] = []
                 for annotation in file.enum_annotations |static_fns|:
-                    static_fns.push(annotation.name) if annotation.owner == "__static_fn"
-                table <- check_static_call_context_walk(file.top_decls, static_fns, table) if static_fns.count > 0
+                    static_fns.push(annotation) if annotation.owner == "__static_fn"
+                table <- check_static_call_context_walk(file, file.top_decls, static_fns, "", table) if static_fns.count > 0

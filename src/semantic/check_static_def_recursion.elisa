@@ -8,15 +8,84 @@
 # function's body, collecting the static functions it calls and inspecting its self-calls.
 extend Semantic:
     private:
-        def sdr_name_in(names: darray[sview]&, wanted: sview) -> bool:
+        # Static declarations stay in the AST after static-if selection. Only remove a
+        # declaration when one of its exact function-branch markers proves an enclosing
+        # arm inactive; missing and unresolved markers remain conservative.
+        def sdr_static_fn_branch_selection(annotation: Ast::EnumAnnotation, annotations: darray[Ast::EnumAnnotation]&, file: Ast::File&, table: SymbolTable&, depth: u32 = 0) -> (known: bool, active: bool):
             can Abort.Panic:
-                for entry in names:
-                    return true if entry == wanted
-                return false
+                return (false, false) if depth >= 64
+                found_marker: mutable bool = false
+                unknown: mutable bool = false
+                for marker in annotations |found_marker, unknown, annotation, file, table, depth|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__function_static_branch" or marker.detail_name != annotation.name
+                    continue if marker.module != annotation.module or marker.line != annotation.line or marker.offset != annotation.offset
+                    found_marker <- true
+                    branch: mutable (known: bool, selected: bool) = (false, false)
+                    branch <- pma_static_if_row_selection(file, marker.identity_id.usize(), annotation.module, table, depth + 1) if marker.identity_id != 4294967295
+                    return (true, false) if branch.known and not branch.selected
+                    unknown <- true if marker.identity_id == 4294967295 or not branch.known
+                return (true, true) if not found_marker
+                return (false, false) if unknown
+                return (true, true)
 
-        def sdr_collect_static_fns(annotations: darray[Ast::EnumAnnotation]&, out: mutable darray[sview]&) -> void:
+        def sdr_static_scope_is_inactive(file: Ast::File&, position: Ast::Pos, current_module: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                branch_row: usize = pma_static_if_row_for_position(file, position)
+                return false if branch_row >= file.static_if_lines.count
+                branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                return branch.known and not branch.selected
+
+        def sdr_collect_static_fn_annotations(file: Ast::File&, out: mutable darray[Ast::EnumAnnotation]&, table: SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
-                out.extend([annotation.name for annotation in annotations if annotation.owner == "__static_fn" and not sdr_name_in(out, annotation.name)])
+                for annotation in file.enum_annotations |out, file, table|:
+                    if annotation.owner == "__static_fn":
+                        branch: (known: bool, active: bool) = sdr_static_fn_branch_selection(annotation, file.enum_annotations, file, table)
+                        out.push(annotation) if not branch.known or branch.active
+
+        # A declaration is static only when its exact parser row agrees on module,
+        # name, and source position. This prevents a same-spelled runtime function in
+        # another module from inheriting the static function's recursion rules.
+        def sdr_static_fn_declaration_index(static_fns: darray[Ast::EnumAnnotation]&, function_name: sview, function_position: Ast::Pos, current_module: sview) -> i64:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < static_fns.count |index, static_fns, function_name, function_position, current_module|:
+                    annotation: Ast::EnumAnnotation = static_fns[index]
+                    if annotation.name == function_name and annotation.module == current_module and annotation.line == function_position.line and annotation.offset == function_position.offset:
+                        return index.i64()
+                    index <- index + 1
+                return -1
+
+        # Bare recursive calls are resolved only when one function with that spelling
+        # exists in the exact lexical module and it is an exact static declaration.
+        # Overloads, parent/imported calls, and qualified forms are left to the full
+        # evaluator rather than guessed from a same-spelled declaration elsewhere.
+        def sdr_static_fn_call_index(file: Ast::File&, static_fns: darray[Ast::EnumAnnotation]&, function_name: sview, current_module: sview, table: SymbolTable&) -> i64:
+            can Abort.Panic:
+                function_count: mutable u32 = 0
+                static_index: mutable i64 = -1
+                row: mutable u32 = symbol_chain_head(table, function_name)
+                while row != 4294967295 |row, function_count, static_index, table, static_fns, function_name, current_module, file|:
+                    symbol: Symbol = table.symbols[row.usize()]
+                    if symbol.kind == SymbolKind.Func and symbol.name == function_name and symbol.module_owner == current_module:
+                        branch: (known: bool, active: bool) = pma_static_if_function_branch_selection(file, function_name, symbol, table, 0)
+                        if not branch.known or branch.active:
+                            function_count <- function_count + 1
+                            index: mutable usize = 0
+                            while index < static_fns.count |index, static_index, static_fns, symbol, function_name, current_module|:
+                                annotation: Ast::EnumAnnotation = static_fns[index]
+                                if annotation.name == function_name and annotation.module == current_module and annotation.line == symbol.line and annotation.offset == symbol.offset:
+                                    static_index <- index.i64()
+                                    break
+                                index <- index + 1
+                    row <- table.symbol_name_next[row.usize()]
+                return static_index if function_count == 1 and static_index >= 0
+                return -1
+
+        def sdr_index_in(indices: darray[i64]&, wanted: i64) -> bool:
+            can Abort.Panic:
+                for index in indices:
+                    return true if index == wanted
+                return false
         # A valid decrease argument: `param - positive_int_literal` or `param - CONST` (a
         # named positive step constant, e.g. `n - Step`).
         def sdr_is_decrease(argument: Ast::Expr, param: sview) -> bool:
@@ -42,72 +111,80 @@ extend Semantic:
                     _:
                         return false
 
-        # Collect calls to static functions in an expression: the callee names into
-        # `called`, and — for self-calls — whether any had a valid decrease.
-        def sdr_scan_calls(expression: Ast::Expr, static_fns: darray[sview]&, self_name: sview, self_param: sview, called: mutable darray[sview]&, self_calls: mutable bool&, self_decreases: mutable bool&) -> void:
+        # Collect exact static-function indices called in an expression; for self-calls,
+        # also record whether any call had a valid decrease.
+        def sdr_scan_calls(expression: Ast::Expr, file: Ast::File&, static_fns: darray[Ast::EnumAnnotation]&, self_index: i64, current_module: sview, self_param: sview, called: mutable darray[i64]&, self_calls: mutable bool&, self_decreases: mutable bool&, table: SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        callee_name: sview = ident_name_of(callee)
-                        if sdr_name_in(static_fns, callee_name):
-                            called.push(callee_name) if not sdr_name_in(called, callee_name)
-                            if callee_name == self_name:
+                        callee_name: sview = ""
+                        match callee:
+                            Expr.Ident(name, _):
+                                callee_name <- name
+                            _:
+                                pass
+                        callee_index: i64 = sdr_static_fn_call_index(file, static_fns, callee_name, current_module, table) if callee_name != "" else -1
+                        if callee_index >= 0:
+                            called.push(callee_index) if not sdr_index_in(called, callee_index)
+                            if callee_index == self_index:
                                 self_calls <- true
                                 self_decreases <- true if arguments.count > 0 and sdr_is_decrease(arguments[0], self_param)
-                        for argument in arguments |static_fns, called, self_calls, self_decreases|:
-                            sdr_scan_calls(argument, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                        for argument in arguments |file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table|:
+                            sdr_scan_calls(argument, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
                     Expr.Binary(left, operator, right, binary_line):
-                        sdr_scan_calls(left, static_fns, self_name, self_param, called, self_calls, self_decreases)
-                        sdr_scan_calls(right, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                        sdr_scan_calls(left, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
+                        sdr_scan_calls(right, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
                     Expr.Unary(operator, operand, unary_line):
-                        sdr_scan_calls(operand, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                        sdr_scan_calls(operand, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
                     Expr.Paren(inner, paren_line):
-                        sdr_scan_calls(inner, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                        sdr_scan_calls(inner, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
                     _:
                         pass
 
-        def sdr_scan_body(statements: darray[Ast::Stmt], static_fns: darray[sview]&, self_name: sview, self_param: sview, called: mutable darray[sview]&, self_calls: mutable bool&, self_decreases: mutable bool&) -> void:
+        def sdr_scan_body(statements: darray[Ast::Stmt], static_fns: darray[Ast::EnumAnnotation]&, self_index: i64, current_module: sview, self_param: sview, called: mutable darray[i64]&, self_calls: mutable bool&, self_decreases: mutable bool&, file: Ast::File&, table: SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |static_fns, called, self_calls, self_decreases|:
+                for statement in statements |static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table|:
                     match statement:
                         Stmt.Return(value, line):
-                            sdr_scan_calls(returned, static_fns, self_name, self_param, called, self_calls, self_decreases) if value is returned
+                            sdr_scan_calls(returned, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table) if value is returned
                         Stmt.Expr(expression, line):
-                            sdr_scan_calls(expression, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            sdr_scan_calls(expression, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            sdr_scan_calls(value, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            sdr_scan_calls(value, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
                         Stmt.Assign(target, operator, value, line):
-                            sdr_scan_calls(value, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            sdr_scan_calls(value, file, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            sdr_scan_body(then_body, static_fns, self_name, self_param, called, self_calls, self_decreases)
-                            sdr_scan_body(else_body, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            sdr_scan_body(then_body, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table)
+                            sdr_scan_body(else_body, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table)
                         Stmt.While(condition, while_body, while_line):
-                            sdr_scan_body(while_body, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            sdr_scan_body(while_body, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
-                            sdr_scan_body(for_body, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            sdr_scan_body(for_body, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table)
                         Stmt.Block(kind, clause, binding, body, block_line):
-                            sdr_scan_body(body, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            sdr_scan_body(body, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table) if not sdr_static_scope_is_inactive(file, block_line, current_module, table)
                         Stmt.Match(scrutinee, arms, match_line):
-                            for arm in arms |static_fns, called, self_calls, self_decreases|:
-                                sdr_scan_body(arm.body, static_fns, self_name, self_param, called, self_calls, self_decreases)
+                            for arm in arms |static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table|:
+                                sdr_scan_body(arm.body, static_fns, self_index, current_module, self_param, called, self_calls, self_decreases, file, table)
                         _:
                             pass
 
         # Whether static function `callee` (in program order) calls `target`.
-        def sdr_calls(declarations: darray[Ast::Decl]&, static_fns: darray[sview]&, caller: sview, target: sview) -> bool:
+        def sdr_calls(file: Ast::File&, declarations: darray[Ast::Decl]&, current_module: sview, static_fns: darray[Ast::EnumAnnotation]&, caller_index: i64, target_index: i64, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations:
+                for declaration in declarations |file, current_module, static_fns, caller_index, target_index, table|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
-                            if name == caller:
-                                called: mutable darray[sview] = []
+                            if sdr_static_fn_declaration_index(static_fns, name, line, current_module) == caller_index:
+                                called: mutable darray[i64] = []
                                 self_calls: mutable bool = false
                                 self_decreases: mutable bool = false
                                 first_param: sview = params[0].name if params.count > 0 else sview("", 0, 0)
-                                sdr_scan_body(body, static_fns, caller, first_param, called, self_calls, self_decreases)
-                                return sdr_name_in(called, target)
-                        Decl.Module(module_name, module_body, module_line) | Decl.Scoped(module_body, module_line):
-                            return true if sdr_calls(module_body, static_fns, caller, target)
+                                sdr_scan_body(body, static_fns, caller_index, current_module, first_param, called, self_calls, self_decreases, file, table)
+                                return sdr_index_in(called, target_index)
+                        Decl.Module(module_name, module_body, module_line):
+                            return true if sdr_calls(file, module_body, module_name, static_fns, caller_index, target_index, table)
+                        Decl.Scoped(module_body, scoped_line):
+                            return true if not sdr_static_scope_is_inactive(file, scoped_line, current_module, table) and sdr_calls(file, module_body, current_module, static_fns, caller_index, target_index, table)
                         _:
                             pass
                 return false
@@ -146,36 +223,37 @@ extend Semantic:
                     _:
                         pass
 
-        def sdr_scan_guards(statements: darray[Ast::Stmt], param: sview, has_eq_zero: mutable bool&, has_lower: mutable bool&) -> void:
+        def sdr_scan_guards(statements: darray[Ast::Stmt], param: sview, has_eq_zero: mutable bool&, has_lower: mutable bool&, file: Ast::File&, current_module: sview, table: SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |param, has_eq_zero, has_lower|:
+                for statement in statements |param, has_eq_zero, has_lower, file, current_module, table|:
                     match statement:
                         Stmt.If(condition, then_body, else_body, line):
                             sdr_note_guard(condition, param, has_eq_zero, has_lower)
-                            sdr_scan_guards(then_body, param, has_eq_zero, has_lower)
-                            sdr_scan_guards(else_body, param, has_eq_zero, has_lower)
+                            sdr_scan_guards(then_body, param, has_eq_zero, has_lower, file, current_module, table)
+                            sdr_scan_guards(else_body, param, has_eq_zero, has_lower, file, current_module, table)
                         Stmt.While(condition, while_body, while_line):
                             sdr_note_guard(condition, param, has_eq_zero, has_lower)
-                            sdr_scan_guards(while_body, param, has_eq_zero, has_lower)
+                            sdr_scan_guards(while_body, param, has_eq_zero, has_lower, file, current_module, table)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
-                            sdr_scan_guards(for_body, param, has_eq_zero, has_lower)
+                            sdr_scan_guards(for_body, param, has_eq_zero, has_lower, file, current_module, table)
                         Stmt.Block(kind, clause, binding, body, block_line):
-                            sdr_scan_guards(body, param, has_eq_zero, has_lower)
+                            sdr_scan_guards(body, param, has_eq_zero, has_lower, file, current_module, table) if not sdr_static_scope_is_inactive(file, block_line, current_module, table)
                         _:
                             pass
 
-        def sdr_check_declarations(all_declarations: darray[Ast::Decl]&, declarations: darray[Ast::Decl], static_fns: darray[sview]&, reported_cycle: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def sdr_check_declarations(file: Ast::File&, all_declarations: darray[Ast::Decl]&, declarations: darray[Ast::Decl], current_module: sview, static_fns: darray[Ast::EnumAnnotation]&, reported_cycle: mutable darray[i64]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 reported_cycle.reserve(reported_cycle.count + declarations.count)
-                for declaration in declarations |reported_cycle, table| -> table:
+                for declaration in declarations |file, all_declarations, current_module, static_fns, reported_cycle, table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            if sdr_name_in(static_fns, function_name):
-                                called: mutable darray[sview] = []
+                            function_index: i64 = sdr_static_fn_declaration_index(static_fns, function_name, line, current_module)
+                            if function_index >= 0:
+                                called: mutable darray[i64] = []
                                 self_calls: mutable bool = false
                                 self_decreases: mutable bool = false
                                 first_param: sview = parameters[0].name if parameters.count > 0 else sview("", 0, 0)
-                                sdr_scan_body(body, static_fns, function_name, first_param, called, self_calls, self_decreases)
+                                sdr_scan_body(body, static_fns, function_index, current_module, first_param, called, self_calls, self_decreases, file, table)
                                 # Partial self-recursion: self-calls with no valid decrease.
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticPartialRecursion, name: function_name, line: line.line, expected: "", actual: ""}) if self_calls and not self_decreases
                                 # A DECREASING signed recursion whose only base case is `== 0`
@@ -184,27 +262,28 @@ extend Semantic:
                                 if self_calls and self_decreases and parameters.count > 0 and sdr_is_signed_int(parameters[0].type_expression):
                                     has_eq_zero: mutable bool = false
                                     has_lower: mutable bool = false
-                                    sdr_scan_guards(body, first_param, has_eq_zero, has_lower)
+                                    sdr_scan_guards(body, first_param, has_eq_zero, has_lower, file, current_module, table)
                                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticSignedBaseCase, name: function_name, line: line.line, expected: first_param, actual: ""}) if has_eq_zero and not has_lower
                                 # Indirect recursion: this fn calls B and B calls back here.
-                                for callee in called |reported_cycle, table| -> table:
-                                    is_cycle: bool = callee != function_name and sdr_calls(all_declarations, static_fns, callee, function_name) and not sdr_name_in(reported_cycle, function_name) and not sdr_name_in(reported_cycle, callee)
+                                for callee_index in called |reported_cycle, table, file, all_declarations, static_fns, function_index| -> table:
+                                    is_cycle: bool = callee_index != function_index and sdr_calls(file, all_declarations, "", static_fns, callee_index, function_index, table) and not sdr_index_in(reported_cycle, function_index) and not sdr_index_in(reported_cycle, callee_index)
                                     if is_cycle:
-                                        reported_cycle.push(function_name)
-                                        reported_cycle.push(callee)
-                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticIndirectRecursion, name: function_name, line: line.line, expected: "", actual: callee})
+                                        reported_cycle.push(function_index)
+                                        reported_cycle.push(callee_index)
+                                        callee_name: sview = static_fns[callee_index.usize()].name
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticIndirectRecursion, name: function_name, line: line.line, expected: "", actual: callee_name})
                         Decl.Module(module_name, module_body, module_line):
-                            table <- sdr_check_declarations(all_declarations, module_body, static_fns, reported_cycle, table)
+                            table <- sdr_check_declarations(file, all_declarations, module_body, module_name, static_fns, reported_cycle, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- sdr_check_declarations(all_declarations, scoped_body, static_fns, reported_cycle, table)
+                            table <- sdr_check_declarations(file, all_declarations, scoped_body, current_module, static_fns, reported_cycle, table) if not sdr_static_scope_is_inactive(file, scoped_line, current_module, table)
                         _:
                             pass
 
     public:
         def check_static_def_recursion(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                static_fns: mutable darray[sview] = []
-                sdr_collect_static_fns(file.enum_annotations, static_fns)
+                static_fns: mutable darray[Ast::EnumAnnotation] = []
+                sdr_collect_static_fn_annotations(file, static_fns, table)
                 if static_fns.count > 0:
-                    reported_cycle: mutable darray[sview] = []
-                    table <- sdr_check_declarations(file.top_decls, file.top_decls, static_fns, reported_cycle, table)
+                    reported_cycle: mutable darray[i64] = []
+                    table <- sdr_check_declarations(file, file.top_decls, file.top_decls, "", static_fns, reported_cycle, table)

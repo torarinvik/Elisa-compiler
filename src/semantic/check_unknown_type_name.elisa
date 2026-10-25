@@ -1,13 +1,78 @@
 # Unknown type-name checking: a type annotation (parameter, return, local `VarDecl`, or
-# `const`) that names a type which does not exist. Reuses the conservative, proven
-# `is_unresolved_type` predicate (from resolve_struct_layout) that the struct-field
-# `UnknownFieldType` check uses: it flags every bare name that is neither a declared generic,
-# primitive, region, nor registered struct/enum. Empty names and single-letter generics (`T`)
-# remain exempt; structured expressions (`darray[T]`, `T&`, `T?`, qualified `A::B`) are handled
-# by the element walk or their qualified-name checks. Parity: stage0's `unknown type`.
+# `const`) that names a type which does not exist. It follows the same conservative rules as
+# `is_unresolved_type` in resolve_struct_layout, while filtering alias declarations that occur
+# only in proven-inactive static branches. Empty names and single-letter generics (`T`) remain exempt;
+# structured expressions (`darray[T]`, `T&`, `T?`, qualified `A::B`) are handled by the element
+# walk or their qualified-name checks. Parity: stage0's `unknown type`.
 
 extend Semantic:
     private:
+        def unknown_type_static_scope_is_inactive(file: Ast::File&, position: Ast::Pos, current_module: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                branch_row: usize = pma_static_if_row_for_position(file, position)
+                return false if branch_row >= file.static_if_lines.count
+                branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                return branch.known and not branch.selected
+
+        # Alias symbols are collected before this pass, including declarations in static
+        # branches. Their parser marker carries the exact alias identity and every enclosing
+        # static-if row. Unknown rows remain possible for type lookup but cannot prove a cycle.
+        def unknown_type_alias_declaration_activity(file: Ast::File&, alias_name: sview, alias_module: sview, position: Ast::Pos, table: SymbolTable&) -> (known: bool, active: bool):
+            can Abort.Panic:
+                unknown: mutable bool = false
+                for marker in file.enum_annotations |unknown, file, table, alias_name, alias_module, position|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__type_alias_static_branch" or marker.detail_name != alias_name or marker.module != alias_module or marker.line != position.line or marker.offset != position.offset
+                    if marker.identity_id == 4294967295:
+                        unknown <- true
+                        continue
+                    branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, marker.identity_id.usize(), marker.module, table)
+                    return (true, false) if branch.known and not branch.selected
+                    unknown <- true if not branch.known
+                return (false, false) if unknown
+                return (true, true)
+
+        def unknown_type_alias_index_activity(alias_index: usize, file: Ast::File&, table: SymbolTable&) -> (known: bool, active: bool):
+            can Abort.Panic:
+                return (false, true) if alias_index >= table.type_alias_name.count or alias_index >= table.type_alias_module.count or alias_index >= table.type_alias_declarations.count
+                declaration: TypeAliasDeclaration = table.type_alias_declarations[alias_index]
+                return (false, true) if declaration.module_owner != table.type_alias_module[alias_index]
+                return unknown_type_alias_declaration_activity(file, table.type_alias_name[alias_index], declaration.module_owner, declaration.pos, table)
+
+        def unknown_type_alias_index_is_inactive(alias_index: usize, file: Ast::File&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                activity: (known: bool, active: bool) = unknown_type_alias_index_activity(alias_index, file, table)
+                return activity.known and not activity.active
+
+        # Same classification as `is_registered_type`, with the source-owned exception
+        # this pass can prove: aliases in inactive static branches do not make an otherwise
+        # unknown type name valid. Unresolved aliases remain conservatively known.
+        def unknown_type_is_registered(name: sview, file: Ast::File&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                row: mutable u32 = symbol_chain_head(table, name)
+                while row != SYMBOL_INDEX_ROW_NONE |row, name, file, table|:
+                    symbol: Symbol = table.symbols[row.usize()]
+                    if symbol.name == name:
+                        if symbol.kind == SymbolKind.Extern:
+                            return true
+                        if symbol.kind == SymbolKind.Alias:
+                            alias_found: mutable bool = false
+                            for index in 0..<table.type_alias_declarations.count |index, alias_found, symbol, file, table|:
+                                if table.type_alias_declarations[index].declaration_id.value == symbol.id.value:
+                                    alias_found <- true
+                                    return true if not unknown_type_alias_index_is_inactive(index, file, table)
+                            return true if not alias_found
+                    row <- table.symbol_name_next[row.usize()]
+                return false
+
+        def unknown_type_is_unresolved(name: sview, file: Ast::File&, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if:
+                    any region_name in table.region_names where region_name == name
+                    name == ""
+                    any generic_name in table.generic_param_names where generic_name == name
+                return false if name.len == 1 or is_primitive_type(name) or unknown_type_is_registered(name, file, table)
+                return true
+
         def is_protocol_constraint_name(name: sview, table: SymbolTable&) -> bool:
             return false if name == ""
             if table.generic_param_name_index_count == table.generic_param_names.count:
@@ -29,7 +94,7 @@ extend Semantic:
         # stack growth on long valid chains; completed nodes memoize whether following
         # their unique same-module targets reaches a cycle. Duplicate declarations and
         # non-bare targets intentionally terminate a path instead of guessing.
-        def type_alias_cycle_info(table: SymbolTable&) -> darray[bool]:
+        def type_alias_cycle_info(file: Ast::File&, table: SymbolTable&) -> darray[bool]:
             can Memory.Allocate, Abort.Panic:
                 count: usize = table.type_alias_name.count
                 cycles: mutable darray[bool] = []
@@ -37,13 +102,15 @@ extend Semantic:
                 for index in 0..<count |cycles, state|:
                     cycles.push(false)
                     state.push(0)
-                for root in 0..<count |cycles, state, count, table|:
+                for root in 0..<count |cycles, state, count, file, table|:
+                    root_activity: (known: bool, active: bool) = unknown_type_alias_index_activity(root, file, table)
+                    continue if not root_activity.known or not root_activity.active
                     continue if state[root] == 2
                     path: mutable darray[usize] = []
                     current: mutable usize = root
                     reaches_cycle: mutable bool = false
                     walking: mutable bool = true
-                    while walking |current, reaches_cycle, walking, path, cycles, state, count, table|:
+                    while walking |current, reaches_cycle, walking, path, cycles, state, count, file, table|:
                         if current >= count:
                             walking <- false
                         elif state[current] == 2:
@@ -59,13 +126,18 @@ extend Semantic:
                             current_module: sview = table.type_alias_module[current] if current < table.type_alias_module.count else ""
                             selected: mutable usize = count
                             matches: mutable usize = 0
+                            uncertain: mutable bool = false
                             if target != "":
-                                for candidate in 0..<count |selected, matches, target, current_module, table|:
+                                for candidate in 0..<count |selected, matches, uncertain, target, current_module, file, table|:
                                     candidate_module: sview = table.type_alias_module[candidate] if candidate < table.type_alias_module.count else ""
                                     if table.type_alias_name[candidate] == target and candidate_module == current_module:
-                                        selected <- candidate
-                                        matches <- matches + 1.usize()
-                            if matches == 1 and selected < count and selected < table.type_alias_target.count:
+                                        candidate_activity: (known: bool, active: bool) = unknown_type_alias_index_activity(candidate, file, table)
+                                        if not candidate_activity.known:
+                                            uncertain <- true
+                                        elif candidate_activity.active:
+                                            selected <- candidate
+                                            matches <- matches + 1.usize()
+                            if matches == 1 and not uncertain and selected < count and selected < table.type_alias_target.count:
                                 current <- selected
                             else:
                                 walking <- false
@@ -76,32 +148,37 @@ extend Semantic:
                 return cycles
 
 
-        def type_alias_name_is_cyclic(name: sview, current_module: sview, cycles: darray[bool]&, table: SymbolTable&) -> bool:
+        def type_alias_name_is_cyclic(name: sview, current_module: sview, cycles: darray[bool]&, file: Ast::File&, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 selected: mutable usize = table.type_alias_name.count
                 matches: mutable usize = 0
-                for index in 0..<table.type_alias_name.count |selected, matches, name, current_module, table|:
+                uncertain: mutable bool = false
+                for index in 0..<table.type_alias_name.count |selected, matches, uncertain, name, current_module, cycles, file, table|:
                     alias_module: sview = table.type_alias_module[index] if index < table.type_alias_module.count else ""
                     if table.type_alias_name[index] == name and alias_module == current_module:
-                        selected <- index
-                        matches <- matches + 1.usize()
-                return false if matches != 1 or selected >= cycles.count
+                        activity: (known: bool, active: bool) = unknown_type_alias_index_activity(index, file, table)
+                        if not activity.known:
+                            uncertain <- true
+                        elif activity.active:
+                            selected <- index
+                            matches <- matches + 1.usize()
+                return false if uncertain or matches != 1 or selected >= cycles.count
                 return cycles[selected]
 
         # `Self` is a compiler-defined receiver type, but only inside an impl scope. Keeping
         # the context explicit matters: a free `def f(x: Self)` and a struct field `x: Self`
         # are still unknown types, while `impl P for T: def f(self: Self)` is well-formed.
-        def check_type_annotation(type_expression: Ast::Expr, allow_self: bool, current_module: sview, alias_cycles: darray[bool]&, table: lmut SymbolTable) -> void:
+        def check_type_annotation(type_expression: Ast::Expr, allow_self: bool, current_module: sview, alias_cycles: darray[bool]&, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 type_name: sview = bare_type_name(type_expression)
                 return if allow_self and type_name == "Self"
-                if type_alias_name_is_cyclic(type_name, current_module, alias_cycles, table):
+                if type_alias_name_is_cyclic(type_name, current_module, alias_cycles, file, table):
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: type_name, pos: ident_extent_or_line(type_expression, expr_line(type_expression)), line: expr_line(type_expression), expected: "", actual: ""})
                     return
                 if is_protocol_constraint_name(type_name, table):
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProtocolRequiresConcreteType, name: type_name, pos: Ast::expr_pos(type_expression), line: expr_line(type_expression), expected: "", actual: ""})
                     return
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: type_name, pos: ident_extent_or_line(type_expression, expr_line(type_expression)), line: expr_line(type_expression), expected: "", actual: ""}) if is_unresolved_type(type_name, table)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: type_name, pos: ident_extent_or_line(type_expression, expr_line(type_expression)), line: expr_line(type_expression), expected: "", actual: ""}) if unknown_type_is_unresolved(type_name, file, table)
 
 
         def check_ordinary_enum_variant_type(type_expression: Ast::Expr, table: lmut SymbolTable) -> void:
@@ -148,19 +225,19 @@ extend Semantic:
         # check_type_annotation above — no double report). Covers statement AND
         # parameter positions (param payload lists read correctly since stage0
         # da3fb1c6 fixed brace-grower region inference).
-        def check_annotation_element_types(type_expression: Ast::Expr, line: u32, allow_self: bool, table: lmut SymbolTable) -> void:
+        def check_annotation_element_types(type_expression: Ast::Expr, line: u32, allow_self: bool, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 no_siblings: darray[sview] = []
-                table <- check_annotation_element_types_with(type_expression, line, no_siblings, allow_self, table) can Global{Read,Write}
+                table <- check_annotation_element_types_with(type_expression, line, no_siblings, allow_self, file, table) can Global{Read,Write}
 
 
         # Parameter positions pass the SIBLING parameter names: `i: IndexOf[xs]` uses
         # `xs` (a sibling param) as a VALUE argument to a dependent refinement, and
         # `SlotIndex[cap128]` uses a declared const — neither is a type name.
-        def check_annotation_element_types_with(type_expression: Ast::Expr, line: u32, sibling_params: darray[sview]&, allow_self: bool, table: lmut SymbolTable) -> void:
+        def check_annotation_element_types_with(type_expression: Ast::Expr, line: u32, sibling_params: darray[sview]&, allow_self: bool, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 type_id: u32 = annotation_type_id(type_expression, table) can Global{Read,Write}
-                table <- check_interned_elements(type_id, type_expression, line, 0, sibling_params, allow_self, table)
+                table <- check_interned_elements(type_id, type_expression, line, 0, sibling_params, allow_self, file, table)
 
 
         # Whether NAME is a VALUE in scope (a declared const, or a sibling parameter) —
@@ -182,11 +259,11 @@ extend Semantic:
         # declines here too. A tag with nothing to parameterize (`x: Held`, `Frozen?`) stays
         # unknown - stage0 rejects those as well - and any other name is still checked:
         # `Guard[Missing]` is an unknown type in both compilers.
-        def is_protocol_state_argument(type_id: u32, element_position: u32, name: sview, table: SymbolTable&) -> bool:
+        def is_protocol_state_argument(type_id: u32, element_position: u32, name: sview, file: Ast::File&, table: SymbolTable&) -> bool:
             can Abort.Panic:
                 head: sview = interned_name(type_id, table)
                 return true if element_position == 0 and any typestate_name in table.typestate_struct_names where typestate_name == head
-                return is_builtin_type_name(name) and (head in {"Thread", "Task", "MutexGuard"} or is_registered_type(head, table))
+                return is_builtin_type_name(name) and (head in {"Thread", "Task", "MutexGuard"} or unknown_type_is_registered(head, file, table))
 
         # Recursively flag unresolved Named ELEMENT rows of an interned type. Depth-
         # bounded defensively (interned rows are acyclic by construction).
@@ -213,16 +290,16 @@ extend Semantic:
                         return Ast::pos_at_line(line)
 
 
-        def check_interned_elements(type_id: u32, annotation: Ast::Expr, line: u32, depth: u32, sibling_params: darray[sview]&, allow_self: bool, table: lmut SymbolTable) -> void:
+        def check_interned_elements(type_id: u32, annotation: Ast::Expr, line: u32, depth: u32, sibling_params: darray[sview]&, allow_self: bool, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if type_id == 0 or depth > 16
                 element_count: u32 = interned_elem_count(type_id, table)
                 while element_position < element_count |element_position: u32 = 0, table|:
                     element_id: u32 = interned_elem(type_id, element_position, table)
                     element_name: sview = interned_name(element_id, table) if interned_kind(element_id, table) == SemTypeKind.Named else ""
-                    flagged: bool = element_name != "" and is_unresolved_type(element_name, table) and not (allow_self and element_name == "Self") and not type_arg_is_value_name(element_name, sibling_params, table) and not is_protocol_state_argument(type_id, element_position, element_name, table)
+                    flagged: bool = element_name != "" and unknown_type_is_unresolved(element_name, file, table) and not (allow_self and element_name == "Self") and not type_arg_is_value_name(element_name, sibling_params, table) and not is_protocol_state_argument(type_id, element_position, element_name, file, table)
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: element_name, pos: type_ident_pos_in(annotation, element_name, line), line: line, expected: "", actual: ""}) if flagged
-                    table <- check_interned_elements(element_id, annotation, line, depth + 1, sibling_params, allow_self, table)
+                    table <- check_interned_elements(element_id, annotation, line, depth + 1, sibling_params, allow_self, file, table)
                     element_position <- element_position + 1
 
         # Local `VarDecl` annotations, recursing into nested statement bodies. The
@@ -230,7 +307,7 @@ extend Semantic:
         # value-form type argument that names a param (`head: Expr[owner]`, where `owner`
         # is a value binding filling a region/dependent parameter of `Expr`) is recognized
         # as a VALUE, not flagged as an unknown type — mirrors the parameter-position path.
-        def check_unknown_types_in_body(statements: darray[Ast::Stmt], sibling_params: darray[sview]&, allow_self: bool, current_module: sview, alias_cycles: darray[bool]&, table: lmut SymbolTable) -> void:
+        def check_unknown_types_in_body(statements: darray[Ast::Stmt], sibling_params: darray[sview]&, allow_self: bool, current_module: sview, alias_cycles: darray[bool]&, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 # LOCALS join the value-name set as the walk passes their declarations: a
                 # region-parameterized application `Expr[arena]` names the LOCAL `arena:
@@ -243,37 +320,38 @@ extend Semantic:
                 for statement in statements |table, scoped_names| -> table, scoped_names:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- check_type_annotation(type_expression, allow_self, current_module, alias_cycles, table)
+                            table <- check_type_annotation(type_expression, allow_self, current_module, alias_cycles, file, table)
                             table <- check_ordinary_enum_variant_type(type_expression, table)
-                            table <- check_annotation_element_types_with(type_expression, line.line, scoped_names, allow_self, table) can Global{Read,Write}
+                            table <- check_annotation_element_types_with(type_expression, line.line, scoped_names, allow_self, file, table) can Global{Read,Write}
                             scoped_names.push(name)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_unknown_types_in_body(then_body, scoped_names, allow_self, current_module, alias_cycles, table) can Global{Read,Write}
-                            table <- check_unknown_types_in_body(else_body, scoped_names, allow_self, current_module, alias_cycles, table) can Global{Read,Write}
+                            table <- check_unknown_types_in_body(then_body, scoped_names, allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
+                            table <- check_unknown_types_in_body(else_body, scoped_names, allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
                         Stmt.While(condition, body, line):
-                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, current_module, alias_cycles, table) can Global{Read,Write}
+                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, current_module, alias_cycles, table) can Global{Read,Write}
+                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
                         Stmt.Block(kind, clause, binding, body, line):
+                            continue if kind == "static" and unknown_type_static_scope_is_inactive(file, line, current_module, table)
                             scoped_names.push(binding) if binding != ""
-                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, current_module, alias_cycles, table) can Global{Read,Write}
+                            table <- check_unknown_types_in_body(body, scoped_names, allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table, scoped_names| -> table:
-                                table <- check_unknown_types_in_body(arm.body, scoped_names, allow_self, current_module, alias_cycles, table) can Global{Read,Write}
+                                table <- check_unknown_types_in_body(arm.body, scoped_names, allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
                         _:
                             pass
 
         # A type-alias RHS `type NameId = TARGET` must name a KNOWN type. The only legitimate
         # capitalized bare names here are the alias's own type-params (`type Foo[Elem] = Elem`).
         # Bare targets only (non-bare `darray[T]` return "").
-        def alias_target_unresolved(name: sview, alias_params: darray[sview]&, table: SymbolTable&) -> bool:
+        def alias_target_unresolved(name: sview, alias_params: darray[sview]&, file: Ast::File&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return false if:
                     name == "" or name.len == 1
                     any param in alias_params where param == name
                     any region_name in table.region_names where region_name == name
                     is_primitive_type(name)
-                    is_registered_type(name, table)
+                    unknown_type_is_registered(name, file, table)
                 return true
 
         # New parser rows bind each alias formal list to its declaration token by exact
@@ -344,19 +422,23 @@ extend Semantic:
 
         # Check every alias RHS, keeping module scope so same-spelled names in separate
         # declaration owners cannot create a fabricated local cycle.
-        def check_alias_target_declarations(declarations: darray[Ast::Decl], alias_params: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, alias_names: darray[sview]&, alias_lines: darray[u32]&, alias_offsets: darray[u32]&, alias_identities: darray[u32]&, alias_param_starts: darray[usize]&, alias_param_counts: darray[usize]&, alias_formals: darray[sview]&, alias_identity_present: bool, current_module: sview, alias_cycles: darray[bool]&, table: lmut SymbolTable) -> void:
+        def check_alias_target_declarations(declarations: darray[Ast::Decl], alias_params: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, alias_names: darray[sview]&, alias_lines: darray[u32]&, alias_offsets: darray[u32]&, alias_identities: darray[u32]&, alias_param_starts: darray[usize]&, alias_param_counts: darray[usize]&, alias_formals: darray[sview]&, alias_identity_present: bool, current_module: sview, alias_cycles: darray[bool]&, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Alias(alias_name, target, alias_position):
                             target_name: sview = bare_type_name(target)
                             local_params: darray[sview] = alias_params_for_declaration(alias_name, alias_position, alias_names, alias_lines, alias_offsets, alias_identities, alias_param_starts, alias_param_counts, alias_formals, alias_identity_present, alias_params)
-                            cyclic: bool = target_name != "" and type_alias_name_is_cyclic(target_name, current_module, alias_cycles, table)
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: target_name, pos: ident_extent_or_line(target, expr_line(target)), line: expr_line(target), expected: "", actual: ""}) if alias_target_unresolved(target_name, local_params, table) or cyclic
+                            cyclic: bool = target_name != "" and type_alias_name_is_cyclic(target_name, current_module, alias_cycles, file, table)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.UnknownTypeName, name: target_name, pos: ident_extent_or_line(target, expr_line(target)), line: expr_line(target), expected: "", actual: ""}) if alias_target_unresolved(target_name, local_params, file, table) or cyclic
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_alias_target_declarations(module_body, alias_params, annotations, alias_names, alias_lines, alias_offsets, alias_identities, alias_param_starts, alias_param_counts, alias_formals, alias_identity_present, module_name, alias_cycles, table)
+                            # Decl.Module names are already canonical qualified paths in
+                            # the parser AST; do not join them to the current path again.
+                            nested_module: sview @source = module_name
+                            table <- check_alias_target_declarations(module_body, alias_params, annotations, alias_names, alias_lines, alias_offsets, alias_identities, alias_param_starts, alias_param_counts, alias_formals, alias_identity_present, nested_module, alias_cycles, file, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_alias_target_declarations(scoped_body, alias_params, annotations, alias_names, alias_lines, alias_offsets, alias_identities, alias_param_starts, alias_param_counts, alias_formals, alias_identity_present, current_module, alias_cycles, table)
+                            continue if unknown_type_static_scope_is_inactive(file, scoped_line, current_module, table)
+                            table <- check_alias_target_declarations(scoped_body, alias_params, annotations, alias_names, alias_lines, alias_offsets, alias_identities, alias_param_starts, alias_param_counts, alias_formals, alias_identity_present, current_module, alias_cycles, file, table)
                         _:
                             pass
 
@@ -366,7 +448,7 @@ extend Semantic:
         def check_alias_target_type(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 alias_params: mutable darray[sview] = []
-                alias_cycles: mutable darray[bool] = type_alias_cycle_info(table)
+                alias_cycles: mutable darray[bool] = type_alias_cycle_info(file, table)
                 for annotation in file.enum_annotations |alias_params|:
                     alias_params.push(annotation.name) if annotation.owner == "__alias_param"
                 alias_names: mutable darray[sview] = []
@@ -386,7 +468,7 @@ extend Semantic:
                     alias_param_starts.clear()
                     alias_param_counts.clear()
                     alias_formals.clear()
-                table <- check_alias_target_declarations(file.top_decls, alias_params, file.enum_annotations, alias_names, alias_lines, alias_offsets, alias_identities, alias_param_starts, alias_param_counts, alias_formals, alias_identity_present, "", alias_cycles, table)
+                table <- check_alias_target_declarations(file.top_decls, alias_params, file.enum_annotations, alias_names, alias_lines, alias_offsets, alias_identities, alias_param_starts, alias_param_counts, alias_formals, alias_identity_present, "", alias_cycles, file, table)
 
     private:
         # Source offsets identify the actual scope even when #line resets line numbers in
@@ -396,7 +478,7 @@ extend Semantic:
 
         # Entry point: check parameter, return, local, and const type annotations across all
         # declarations (recursing into modules and scoped blocks).
-        def check_unknown_type_name_in(declarations: darray[Ast::Decl], allow_self: bool, current_module: sview, alias_cycles: darray[bool]&, table: lmut SymbolTable) -> void:
+        def check_unknown_type_name_in(declarations: darray[Ast::Decl], allow_self: bool, current_module: sview, alias_cycles: darray[bool]&, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -405,33 +487,37 @@ extend Semantic:
                             for parameter in params |sibling_params|:
                                 sibling_params.push(parameter.name)
                             for parameter in params |table| -> table:
-                                table <- check_type_annotation(parameter.type_expression, allow_self, current_module, alias_cycles, table)
+                                table <- check_type_annotation(parameter.type_expression, allow_self, current_module, alias_cycles, file, table)
                                 table <- check_ordinary_enum_variant_type(parameter.type_expression, table)
-                                table <- check_annotation_element_types_with(parameter.type_expression, line.line, sibling_params, allow_self, table) can Global{Read,Write}
+                                table <- check_annotation_element_types_with(parameter.type_expression, line.line, sibling_params, allow_self, file, table) can Global{Read,Write}
                             if return_type is return_type_expr:
-                                table <- check_type_annotation(return_type_expr, allow_self, current_module, alias_cycles, table)
+                                table <- check_type_annotation(return_type_expr, allow_self, current_module, alias_cycles, file, table)
                                 table <- check_ordinary_enum_variant_type(return_type_expr, table)
-                            table <- check_unknown_types_in_body(body, sibling_params, allow_self, current_module, alias_cycles, table) can Global{Read,Write}
+                            table <- check_unknown_types_in_body(body, sibling_params, allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
                         Decl.Const(const_name, type_expression, value, is_mutable, const_line):
-                            table <- check_type_annotation(type_expression, allow_self, current_module, alias_cycles, table)
+                            table <- check_type_annotation(type_expression, allow_self, current_module, alias_cycles, file, table)
                         Decl.Enum(enum_name, enum_variants, enum_is_const, enum_storage, enum_line):
                             # A variant PAYLOAD names a type like any annotation does; nothing
                             # checked these, so `A(Thing)` was accepted silently while stage0
                             # reported it.
                             for enum_variant in enum_variants |table| -> table:
                                 for payload_type in enum_variant.fields |table| -> table:
-                                    table <- check_type_annotation(payload_type, allow_self, current_module, alias_cycles, table)
+                                    table <- check_type_annotation(payload_type, allow_self, current_module, alias_cycles, file, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_unknown_type_name_in(module_body, allow_self, module_name, alias_cycles, table) can Global{Read,Write}
+                            # Decl.Module names are already canonical qualified paths in
+                            # the parser AST; do not join them to the current path again.
+                            nested_module: sview @source = module_name
+                            table <- check_unknown_type_name_in(module_body, allow_self, nested_module, alias_cycles, file, table) can Global{Read,Write}
                         Decl.Scoped(scoped_body, scoped_line):
+                            continue if unknown_type_static_scope_is_inactive(file, scoped_line, current_module, table)
                             nested_allow_self: bool = allow_self or is_impl_scope(scoped_line, table)
-                            table <- check_unknown_type_name_in(scoped_body, nested_allow_self, current_module, alias_cycles, table) can Global{Read,Write}
+                            table <- check_unknown_type_name_in(scoped_body, nested_allow_self, current_module, alias_cycles, file, table) can Global{Read,Write}
                         _:
                             pass
 
     public:
         # Free functions and ordinary scopes have no implicit receiver type.
-        def check_unknown_type_name(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def check_unknown_type_name(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                alias_cycles: mutable darray[bool] = type_alias_cycle_info(table)
-                table <- check_unknown_type_name_in(declarations, false, "", alias_cycles, table) can Global{Read,Write}
+                alias_cycles: mutable darray[bool] = type_alias_cycle_info(file, table)
+                table <- check_unknown_type_name_in(file.top_decls, false, "", alias_cycles, file, table) can Global{Read,Write}

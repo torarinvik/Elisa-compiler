@@ -157,7 +157,9 @@ if not all(fragment in static_target_fold for fragment in (
 if not all(fragment in static_row_selection for fragment in (
         "static_if_depths[row]!=branch_depth",
         "branch_kind==StaticIfBranch::Kind.Fallback",
-        "ga_static_if_condition_value(state.static_if_conds[row],current_module,state,depth+1)",
+        "row>=state.static_if_modules.count",
+        "condition_module:sview=state.static_if_modules[row]",
+        "ga_static_if_condition_value(state.static_if_conds[row],condition_module,state,depth+1)",
         "condition.backend_folds",
         "return(false,false)ifcondition.backend_folds",
         "return(true,row==branch_row)",
@@ -186,12 +188,32 @@ if not all(fragment in import_branch_selection for fragment in (
 import_uncertainty = compact((ROOT / "src/semantic/check_global_authority/incremental.elisa").read_text())
 if "ga_mark_all_possible_global_effects(&state)ifstate.static_import_uncertain" not in import_uncertainty:
     raise SystemExit("uncertain static imports must conservatively retain possible global effects")
+if "static_if_modules:file.static_if_modules" not in import_uncertainty:
+    raise SystemExit("GlobalAuthority must receive per-row lexical modules for static-if folding")
 if not all(fragment in import_uncertainty for fragment in (
         "forconst_indexin0..<table.immutable_const_names.count",
         "state.static_const_names.push(table.immutable_const_names[const_index])",
         "state.static_const_values.push(table.immutable_const_values[const_index]ifconst_index<table.immutable_const_values.countelseAst::Expr.Absent)",
-        "state.static_const_owners.push(table.symbols[const_row].module_ownerifconst_row<table.symbols.countelse\"\")")):
+        "state.static_const_owners.push(table.symbols[const_row].module_ownerifconst_row<table.symbols.countelse\"\")",
+        "state.static_const_lines.push(table.symbols[const_row].lineifconst_row<table.symbols.countelse0)",
+        "state.static_const_offsets.push(table.symbols[const_row].offsetifconst_row<table.symbols.countelse4294967295)")):
     raise SystemExit("GlobalAuthority must receive source-constant values and lexical owners for static-if folding")
+const_branch_selection = compact(function_section(authority_text, "ga_static_if_const_branch_selection"))
+named_const_fold = compact(function_section(authority_text, "ga_static_if_named_constant_value"))
+if not all(fragment in const_branch_selection for fragment in (
+        'marker.owner!="__static_if_branch"',
+        'marker.name!="__const_static_branch"',
+        "marker.detail_name!=state.static_const_names[const_index]",
+        "marker.module!=state.static_const_owners[const_index]",
+        "marker.line!=state.static_const_lines[const_index]",
+        "marker.offset!=state.static_const_offsets[const_index]",
+        "ga_static_if_row_selection(marker.identity_id.usize(),state.static_const_owners[const_index],state,depth+1)")) or not all(fragment in named_const_fold for fragment in (
+        "ga_static_if_const_branch_selection(index,state,depth+1)",
+        "continueifnotbranch.active",
+        "exact_unknown",
+        "top_unknown",
+        "any_unknown")):
+    raise SystemExit("GlobalAuthority source-constant folding must select only the active static-branch declaration")
 alias_registration_index = compact(function_section(authority_text, "ga_module_alias_registration_index"))
 if 'alias.name!="__using_alias"' not in alias_registration_index or \
         "alias.offset!=offset" not in alias_registration_index or \
@@ -360,7 +382,11 @@ for probe in (
     'return 77 if not branch_imports.static_import_uncertain',
     'arithmetic_static_condition: Ast::Expr = Ast::Expr.Binary(Ast::Expr.Binary(Ast::Expr.IntLit(1, alias_branch_at), TokenKind.Plus, Ast::Expr.IntLit(1, alias_branch_at), alias_branch_at), TokenKind.EqEq, Ast::Expr.IntLit(2, alias_branch_at), alias_branch_at)',
     'return 73 if not folded_static_condition.known or folded_static_condition.value != 1 or not folded_static_condition.backend_folds',
-    'static_const_names: ["SOURCE_FLAG"]',
+    'Ast::EnumAnnotation{owner: "__static_if_branch", name: "__const_static_branch", detail_name: "SOURCE_FLAG", line: 106, module: "", offset: 106, identity_id: 0}',
+    'Ast::EnumAnnotation{owner: "__static_if_branch", name: "__const_static_branch", detail_name: "SOURCE_FLAG", line: 107, module: "", offset: 107, identity_id: 1}',
+    'static_const_names: ["SOURCE_FLAG", "SOURCE_FLAG"]',
+    'static_const_lines: [106, 107]',
+    'static_const_offsets: [106, 107]',
     'return 76 if not source_const_condition.known or source_const_condition.value != 1 or not source_const_condition.backend_folds',
 ):
     if probe not in alias_atom:

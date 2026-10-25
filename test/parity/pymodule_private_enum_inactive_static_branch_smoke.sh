@@ -21,11 +21,15 @@ assert functions["selected_public_enum"]["parameters"] == [
 assert functions["selected_public_enum_qualified"]["parameters"] == [
     {"name": "value", "type": "i64", "default": "22"}
 ]
+assert functions["selected_static_alias"]["parameters"] == [
+    {"name": "value", "type": "i64", "default": "52"}
+]
 PY
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi -o "$WORK/private_enum_inactive_static_branch.pyi" "$SOURCE" >/dev/null
 grep -Fq 'def selected_public_enum(value: int = 22) -> int: ...' "$WORK/private_enum_inactive_static_branch.pyi"
 grep -Fq 'def selected_public_enum_qualified(value: int = 22) -> int: ...' "$WORK/private_enum_inactive_static_branch.pyi"
+grep -Fq 'def selected_static_alias(value: int = 52) -> int: ...' "$WORK/private_enum_inactive_static_branch.pyi"
 python3 -m py_compile "$WORK/private_enum_inactive_static_branch.pyi"
 
 echo "pymodule inactive-private-enum static-branch smoke OK"

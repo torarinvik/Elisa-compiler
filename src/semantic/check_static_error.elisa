@@ -5,17 +5,51 @@
 #
 # SOUND SUBSET: fire only when the called static function's body UNCONDITIONALLY calls
 # `error("literal")` at the top level — a conditional or computed error is left to the full
-# static evaluator (a sound miss). Only DIRECT calls in the assert condition are followed.
+# static evaluator (a sound miss). Only bare direct calls in the assert condition are followed.
 extend Semantic:
     private:
-        # If DECLARATIONS contains a `def TARGET` whose body's TOP LEVEL unconditionally calls
-        # `error("literal")`, report its message and line.
-        def static_def_body_error(declarations: darray[Ast::Decl], target: sview, out_message: mutable sview&, out_line: mutable u32&) -> bool:
+        # Static-assert conditions keep their lexical module in the parser side table.
+        # This branch selector pairs a same-module declaration with its exact static-if
+        # marker; proven-inactive declarations do not make the call ambiguous.
+        def static_error_function_branch_selection(file: Ast::File&, name: sview, current_module: sview, position: Ast::Pos, table: SymbolTable&) -> (known: bool, active: bool):
+            can Abort.Panic:
+                found_marker: mutable bool = false
+                unknown: mutable bool = false
+                for marker in file.enum_annotations |found_marker, unknown, file, name, current_module, position, table|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__function_static_branch" or marker.detail_name != name
+                    continue if marker.module != current_module or marker.line != position.line or marker.offset != position.offset
+                    found_marker <- true
+                    branch: mutable (known: bool, selected: bool) = (false, false)
+                    branch <- pma_static_if_row_selection(file, marker.identity_id.usize(), current_module, table) if marker.identity_id != 4294967295
+                    return (true, false) if branch.known and not branch.selected
+                    unknown <- true if marker.identity_id == 4294967295 or not branch.known
+                return (true, true) if not found_marker
+                return (false, false) if unknown
+                return (true, true)
+
+        def static_error_count_function_candidates(file: Ast::File&, declarations: darray[Ast::Decl], current_module: sview, target_module: sview, target: sview, count: mutable u32&, table: SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |target, out_message, out_line|:
+                for declaration in declarations |file, current_module, target_module, target, count, table|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
-                            if name == target:
+                            if name == target and current_module == target_module:
+                                branch: (known: bool, active: bool) = static_error_function_branch_selection(file, name, current_module, line, table)
+                                count <- count + 1 if not branch.known or branch.active
+                        Decl.Module(module_name, module_body, module_line):
+                            static_error_count_function_candidates(file, module_body, module_name, target_module, target, count, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            static_error_count_function_candidates(file, scoped_body, current_module, target_module, target, count, table) if not sdr_static_scope_is_inactive(file, scoped_line, current_module, table)
+                        _:
+                            pass
+
+        # If DECLARATIONS contains a visible static `def TARGET` whose body's TOP LEVEL
+        # unconditionally calls `error("literal")`, report its message and line.
+        def static_def_body_error(file: Ast::File&, declarations: darray[Ast::Decl], current_module: sview, static_fns: darray[Ast::EnumAnnotation]&, target_index: i64, out_message: mutable sview&, out_line: mutable u32&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |file, current_module, static_fns, target_index, out_message, out_line, table|:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, line):
+                            if sdr_static_fn_declaration_index(static_fns, name, line, current_module) == target_index:
                                 for statement in body |out_message, out_line|:
                                     match statement:
                                         Stmt.Expr(expression, stmt_line):
@@ -38,44 +72,55 @@ extend Semantic:
                                         _:
                                             pass
                         Decl.Module(module_name, module_body, module_line):
-                            return true if static_def_body_error(module_body, target, out_message, out_line)
+                            return true if static_def_body_error(file, module_body, module_name, static_fns, target_index, out_message, out_line, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            return true if static_def_body_error(scoped_body, target, out_message, out_line)
+                            return true if not sdr_static_scope_is_inactive(file, scoped_line, current_module, table) and static_def_body_error(file, scoped_body, current_module, static_fns, target_index, out_message, out_line, table)
                         _:
                             pass
                 return false
 
-        # Collect the names of static functions DIRECTLY called in an expression.
-        def static_error_scan_calls(expression: Ast::Expr, static_fns: darray[sview]&, out: mutable darray[sview]&) -> void:
+        # Collect exact static-function annotation indices DIRECTLY called in an expression.
+        def static_error_scan_calls(expression: Ast::Expr, file: Ast::File&, static_fns: darray[Ast::EnumAnnotation]&, current_module: sview, out: mutable darray[i64]&, table: SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
-                        name: sview = ident_name_of(callee)
-                        out.push(name) if name != "" and (any s in static_fns where s == name)
-                        for argument in arguments |static_fns, out|:
-                            static_error_scan_calls(argument, static_fns, out)
+                        name: sview = ""
+                        match callee:
+                            Expr.Ident(callee_name, _):
+                                name <- callee_name
+                            _:
+                                pass
+                        target_index: i64 = sdr_static_fn_call_index(file, static_fns, name, current_module, table) if name != "" else -1
+                        out.push(target_index) if target_index >= 0 and not sdr_index_in(out, target_index)
+                        for argument in arguments |file, static_fns, current_module, out, table|:
+                            static_error_scan_calls(argument, file, static_fns, current_module, out, table)
                     Expr.Binary(left, operator, right, line):
-                        static_error_scan_calls(left, static_fns, out)
-                        static_error_scan_calls(right, static_fns, out)
+                        static_error_scan_calls(left, file, static_fns, current_module, out, table)
+                        static_error_scan_calls(right, file, static_fns, current_module, out, table)
                     Expr.Unary(operator, operand, line):
-                        static_error_scan_calls(operand, static_fns, out)
+                        static_error_scan_calls(operand, file, static_fns, current_module, out, table)
                     Expr.Paren(inner, line):
-                        static_error_scan_calls(inner, static_fns, out)
+                        static_error_scan_calls(inner, file, static_fns, current_module, out, table)
                     _:
                         pass
 
         def check_static_error(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                static_fns: mutable darray[sview] = []
-                sdr_collect_static_fns(file.enum_annotations, static_fns)
+                static_fns: mutable darray[Ast::EnumAnnotation] = []
+                sdr_collect_static_fn_annotations(file, static_fns, table)
                 return if static_fns.count == 0
                 while index < file.static_assert_conds.count |table, index: usize = 0| -> table:
                     condition: Ast::Expr = file.static_assert_conds[index]
-                    called: mutable darray[sview] = []
-                    static_error_scan_calls(condition, static_fns, called)
-                    for name in called |table| -> table:
-                        message: mutable sview = ""
-                        error_line: mutable u32 = 0
-                        found: bool = static_def_body_error(file.top_decls, name, message, error_line)
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticError, name: message, line: error_line, expected: "", actual: ""}) if found
+                    current_module: sview = file.static_assert_modules[index] if index < file.static_assert_modules.count else ""
+                    if not static_assert_is_in_inactive_branch(file, index, current_module, table):
+                        called: mutable darray[i64] = []
+                        static_error_scan_calls(condition, file, static_fns, current_module, called, table)
+                        for target_index in called |table, static_fns, file, current_module| -> table:
+                            name: sview = static_fns[target_index.usize()].name
+                            message: mutable sview = ""
+                            error_line: mutable u32 = 0
+                            candidates: mutable u32 = 0
+                            static_error_count_function_candidates(file, file.top_decls, "", current_module, name, candidates, table)
+                            found: bool = candidates == 1 and static_def_body_error(file, file.top_decls, "", static_fns, target_index, message, error_line, table)
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.StaticError, name: message, line: error_line, expected: "", actual: ""}) if found
                     index <- index + 1
