@@ -21,6 +21,9 @@ POLICY = ROOT / "src/semantic/match_scrutinee_policy.elisa"
 CONSUMER = ROOT / "src/semantic/check_void_match_scrutinee.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_LATE_CHECKS = ROOT / "src/semantic/semantic_late_checks.elisa"
+SEMANTIC_PIPELINE = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
+SEMANTIC_DIAGNOSTICS = ROOT / "src/semantic/semantic_api/diagnostic_output.elisa"
 DRIVER = ROOT / "src/driver/elisac.elisa"
 DRIVER_PROBES = ROOT / "src/driver/elisac_source_probes.elisa"
 INCREMENTAL_GATE = ROOT / "src/driver/elisac_incremental_cache.elisa"
@@ -68,6 +71,9 @@ policy_text = POLICY.read_text()
 consumer_text = CONSUMER.read_text()
 semantic_text = SEMANTIC.read_text()
 semantic_api_text = SEMANTIC_API.read_text()
+semantic_late_checks_text = SEMANTIC_LATE_CHECKS.read_text()
+semantic_pipeline_text = SEMANTIC_PIPELINE.read_text()
+semantic_diagnostics_text = SEMANTIC_DIAGNOSTICS.read_text()
 driver_text = DRIVER.read_text()
 driver_probes_text = DRIVER_PROBES.read_text()
 incremental_gate_text = INCREMENTAL_GATE.read_text()
@@ -90,11 +96,17 @@ if consumer_text.count('include "./match_scrutinee_policy.elisa"') != 1:
     raise SystemExit("match-scrutinee checker must include its proved policy exactly once")
 if semantic_text.count('include "./semantic_types.elisa"') != 1 or \
         semantic_text.count('include "./check_void_match_scrutinee.elisa"') != 1 or \
-        semantic_text.count('include "./semantic_api.elisa"') != 1:
-    raise SystemExit("semantic types, match checker, and API must each be included exactly once")
+        semantic_text.count('include "./semantic_late_checks.elisa"') != 1:
+    raise SystemExit("semantic types, match checker, and late pipeline must each be included exactly once")
+if semantic_late_checks_text.count('include "./semantic_api.elisa"') != 1 or \
+        semantic_late_checks_text.count('include "./semantic_api/full_pipeline.elisa"') != 1 or \
+        semantic_late_checks_text.count('include "./semantic_api/diagnostic_output.elisa"') != 1:
+    raise SystemExit("semantic API, full pipeline, and diagnostic output must each be included exactly once")
 if not (semantic_text.index('include "./semantic_types.elisa"') <
         semantic_text.index('include "./check_void_match_scrutinee.elisa"') <
-        semantic_text.index('include "./semantic_api.elisa"')):
+        semantic_text.index('include "./semantic_late_checks.elisa"')) or \
+        not (semantic_late_checks_text.index('include "./semantic_api.elisa"') <
+             semantic_late_checks_text.index('include "./semantic_api/full_pipeline.elisa"')):
     raise SystemExit("match policy must follow semantic types and precede its public pipeline")
 
 if compact(function_section(consumer_text, "match_scrutinee_is_unmatchable")) != compact('''
@@ -141,38 +153,59 @@ entry = compact(function_section(consumer_text, "check_void_match_scrutinee"))
 if "table<-check_void_match_scrutinee_declarations(declarations,table)" not in entry:
     raise SystemExit("public match-scrutinee checker no longer enters its declaration traversal")
 
-pipeline = compact(function_section(semantic_api_text, "check_full_into_pipeline"))
+pipeline = compact(function_section(semantic_pipeline_text, "check_full_into_pipeline"))
 if pipeline.count("check_void_match_scrutinee(loop_view.top_decls,table)") != 1 or \
         pipeline.count('PhaseTimer::minor("sem:check_void_match_scrutinee")') != 1:
     raise SystemExit("public semantic pipeline no longer runs the match-scrutinee checker exactly once")
 
-diagnostics_api = compact(function_section(semantic_api_text,
-                                            "check_full_diagnostics_with_incremental_snapshot"))
-if "check_full_into_with_incremental_snapshot(file,table," not in diagnostics_api:
+diagnostics_wrapper = compact(function_section(semantic_diagnostics_text,
+                                                "check_full_diagnostics_with_incremental_snapshot"))
+diagnostics_api = compact(function_section(semantic_diagnostics_text,
+                                            "check_full_diagnostics_with_incremental_snapshot_and_lookup_context"))
+if "check_full_diagnostics_with_incremental_snapshot_and_lookup_context[" not in diagnostics_wrapper or \
+        "check_full_into_with_incremental_snapshot_and_lookup_context[" not in diagnostics_api:
     raise SystemExit("driver-facing semantic diagnostics no longer enter the full semantic pipeline")
 driver_probe_gate = compact(function_section(driver_probes_text, "run_semantic_gate_with_snapshot"))
 require_fragments(driver_probe_gate, (
-    "Semantic::check_full_diagnostics_with_incremental_snapshot(",
-    "ifseverity==1:semantic_errors<-semantic_errors+1",
+    "Semantic::check_full_diagnostics_with_incremental_snapshot[",
+    "report_semantic_gate_diagnostics[semantic_gate]",
     "returnsemantic_errors",
 ), "driver semantic gate no longer counts emitted semantic errors from the full checker")
+diagnostic_reporter = compact(function_section(driver_probes_text, "report_semantic_gate_diagnostics"))
+require_fragments(diagnostic_reporter, (
+    "ifseverity==1:",
+    "semantic_errors<-semantic_errors+1",
+    "report_diagnostic(diagnostic)",
+), "driver diagnostics no longer increment the semantic error count for error-severity rows")
 incremental_gate = compact(function_section(incremental_gate_text, "run_semantic_gate_incremental"))
 require_fragments(incremental_gate, (
-    "semantic_errors:i64=run_semantic_gate_with_snapshot(",
+    "returnrun_semantic_gate_incremental_with_session[",
+), "incremental semantic gate no longer enters its session-aware checker")
+incremental_session_gate = compact(function_section(
+    incremental_gate_text, "run_semantic_gate_incremental_with_session"))
+require_fragments(incremental_session_gate, (
+    "semantic_errors:mutablei64=0",
+    "semantic_errors<-run_semantic_gate_with_lookup_context[",
     "returnsemantic_errors",
 ), "incremental semantic gate no longer returns the checked diagnostic count")
 
-driver = compact(function_section(driver_text, "main"))
+driver_main = compact(function_section(driver_text, "main"))
+if "returnrun_compile_request_with_session(" not in driver_main:
+    raise SystemExit("driver main no longer delegates source compilation to the gated request path")
+driver = compact(function_section(driver_text, "run_compile_request_with_session"))
 driver_order = (
-    "expanded_semantic_errors:i64=run_semantic_gate_incremental(",
-    "1returnifexpanded_semantic_errors>0",
+    "expanded_semantic_errors:mutablei64=0",
+    "expanded_semantic_errors<-run_semantic_gate_incremental_with_session[",
+    "return1ifexpanded_semantic_errors>0",
     "semantic_gate_already_run<-true",
-    "pymodule_semantic_errors:i64=run_semantic_gate_incremental(",
-    "1returnifpymodule_semantic_errors>0",
+    "pymodule_semantic_errors:mutablei64=0",
+    "pymodule_semantic_errors<-run_semantic_gate_incremental_with_session[",
+    "return1ifpymodule_semantic_errors>0",
     "semantic_gate_already_run<-true",
-    "ifnotsemantic_gate_already_run:semantic_errors:i64=run_semantic_gate_incremental(",
-    "1returnifsemantic_errors>0",
-    "Backend::emit_module_with_debug_trace(",
+    "ifnotsemantic_gate_already_run:semantic_errors:mutablei64=0",
+    "semantic_errors<-run_semantic_gate_incremental_with_session[",
+    "return1ifsemantic_errors>0",
+    "returnrun_llvm_compile_request_with_cleanup(",
 )
 driver_positions: list[int] = []
 driver_cursor = 0
@@ -242,7 +275,8 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", POLICY, CONSUMER,
-    SEMANTIC, SEMANTIC_API, DRIVER, DRIVER_PROBES, INCREMENTAL_GATE,
+    SEMANTIC, SEMANTIC_API, SEMANTIC_LATE_CHECKS, SEMANTIC_PIPELINE,
+    SEMANTIC_DIAGNOSTICS, DRIVER, DRIVER_PROBES, INCREMENTAL_GATE,
     POSITIVE, NEGATIVE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

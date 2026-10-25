@@ -41,8 +41,8 @@ if not NEGATIVE.read_text().startswith('include "./backend_cabi_target.elisa"'):
     raise SystemExit("false controls must import the target-selection model")
 body = compact(section(SOURCE.read_text(), "cabi_target_from_environment"))
 ordered = (
-    "2returniftarget_triple_is_wasm()",
-    '1returnifgetenv("ELISA_STAGE1_X86_64")isx86_target',
+    "return2iftarget_triple_is_wasm()",
+    'return1ifgetenv("ELISA_STAGE1_X86_64")isx86_target',
     "return0",
 )
 if any(part not in body for part in ordered) or [body.index(part) for part in ordered] != sorted(body.index(part) for part in ordered):

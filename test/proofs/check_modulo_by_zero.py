@@ -5,17 +5,18 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from proof_product_gate import require_current_product, source_include_closure
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE = ROOT / "src/semantic/check_modulo_by_zero.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
-SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_API = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 PARALLEL_PASSES = ROOT / "src/semantic/semantic_parallel_passes.elisa"
 AST_NODES = ROOT / "src/parser/ast_nodes.elisa"
 AST_SIDE_TABLES = ROOT / "src/parser/ast_side_tables.elisa"
@@ -88,7 +89,7 @@ if 'include "./check_modulo_by_zero.elisa"' not in SEMANTIC.read_text():
 parallel = compact(PARALLEL_PASSES.read_text())
 if "ifpass_id==39:table<-check_modulo_by_zero(loop_view.top_decls,table)" not in parallel:
     raise SystemExit("parallel semantic dispatch no longer calls modulo-by-zero at pass id 39")
-if "par_pass_run(file,&loop_view,flags,table,shared_pool,35,8)" not in compact(SEMANTIC_API.read_text()):
+if "par_pass_run(file,flags,table,shared_pool,loop_view,35,8)" not in compact(SEMANTIC_API.read_text()):
     raise SystemExit("semantic pipeline no longer schedules the modulo-by-zero pass")
 
 mutations = (
@@ -254,6 +255,10 @@ for path, shapes in ((POSITIVE, positive_shapes), (NEGATIVE, negative_shapes)):
     for name, shape in shapes.items():
         if compact(shape) not in compact(function_section(text, name)):
             raise SystemExit(f"{name} no longer states its exact modulo-by-zero claim")
+
+if "--source-only" in sys.argv[1:]:
+    print(json.dumps({"admitted": True, "source_only": True}, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)

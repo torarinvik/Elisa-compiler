@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from proof_product_gate import require_current_product, source_include_closure
 
@@ -18,7 +19,7 @@ PARSER_HEADER = ROOT / "src/parser/parser_law_header.elisa"
 SEMANTIC_PASS = ROOT / "src/semantic/check_law_subject.elisa"
 SEMANTIC_ROOT = ROOT / "src/semantic/semantic.elisa"
 PARALLEL_PASSES = ROOT / "src/semantic/semantic_parallel_passes.elisa"
-SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_API = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 DIAGNOSTIC_MESSAGE = ROOT / "src/semantic/diagnostic_messages/proofs.elisa"
 POSITIVE = HERE / "law_subject_sentinel.elisa"
 NEGATIVE = HERE / "law_subject_sentinel_rejected.elisa"
@@ -120,7 +121,7 @@ parallel = compact(PARALLEL_PASSES.read_text())
 if f"ifpass_id=={LAW_SUBJECT_PASS_ID}:table<-check_law_subject(loop_view,table)" not in parallel:
     raise SystemExit("parallel semantic dispatcher no longer calls the law-subject pass at its assigned id")
 pipeline = compact(SEMANTIC_API.read_text())
-if f"par_pass_run(file,&loop_view,flags,table,shared_pool,{LAW_SUBJECT_BATCH_START},{LAW_SUBJECT_BATCH_SIZE})" not in pipeline:
+if f"par_pass_run(file,flags,table,shared_pool,loop_view,{LAW_SUBJECT_BATCH_START},{LAW_SUBJECT_BATCH_SIZE})" not in pipeline:
     raise SystemExit("semantic pipeline no longer schedules the law-subject pass")
 expected_message = 'DiagnosticKind.LawNeedsSubject: buffer.extend(f"law \\"{diagnostic.name}\\" needs a subject: give it at least one value parameter (conventionally `self`)")'
 if compact(expected_message) not in compact(DIAGNOSTIC_MESSAGE.read_text()):
@@ -165,6 +166,10 @@ for label, original, mutation, validator in mutations:
         raise SystemExit(f"law-subject mutation fixture did not change the {label}")
     if validator(mutation):
         raise SystemExit(f"law-subject source checker accepted the {label} mutation")
+
+if "--source-only" in sys.argv[1:]:
+    print("law-subject sentinel source binding passed")
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)

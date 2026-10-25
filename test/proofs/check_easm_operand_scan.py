@@ -19,6 +19,7 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POSITIVE = HERE / "easm_operand_scan.elisa"
 NEGATIVE = HERE / "easm_operand_scan_rejected.elisa"
 POLICY = ROOT / "src/backend/easm_operand_scan.elisa"
+INSTRUCTION_SCAN = ROOT / "src/backend/easm_operand_scan_instruction.elisa"
 TEXT_SCAN = ROOT / "src/backend/easm_text_scan.elisa"
 ENV = ROOT / "src/backend/codegen_env.elisa"
 PROVENANCE = ROOT / "src/backend/easm_verify_provenance.elisa"
@@ -64,6 +65,7 @@ def proof_body(source: str, name: str) -> str:
 
 
 policy = POLICY.read_text()
+instruction_scan = INSTRUCTION_SCAN.read_text()
 expected_result_type = """
 struct InstructionScanResult:
     start: usize
@@ -93,11 +95,13 @@ expected_policy_inventory = {
     "needs_arity_rejection", "is_zero_operand_instruction", "is_one_operand_instruction", "is_two_operand_instruction",
     "is_shift_instruction", "operand_arity_supported", "is_aarch64_mrs_form", "exact_register_form", "is_direct_control_target",
     "rejects_unmodeled_operand_form", "rejects_return_immediate", "rejects_unresolved_conditional_target", "first_operand_byte",
-    "next_top_level_separator", "scan_instruction",
+    "next_top_level_separator", "invalid_scan_result", "empty_scan_result", "scan_instruction",
 }
-actual_policy_inventory = set(re.findall(r"(?m)^\s*def ([A-Za-z_][A-Za-z0-9_]*)\(", policy))
+actual_policy_inventory = set(re.findall(r"(?m)^\s*def ([A-Za-z_][A-Za-z0-9_]*)\(", policy + "\n" + instruction_scan))
 if actual_policy_inventory != expected_policy_inventory:
     raise SystemExit("operand scanner declaration inventory changed")
+if policy.count('include "./easm_operand_scan_instruction.elisa"') != 1:
+    raise SystemExit("operand scanner must include its instruction scanner exactly once")
 
 expected_arity = """
 def needs_arity_rejection(operand_count: usize) -> bool:
@@ -106,6 +110,31 @@ def needs_arity_rejection(operand_count: usize) -> bool:
 """
 if compact(function_section(policy, "needs_arity_rejection")) != compact(expected_arity):
     raise SystemExit("operand arity policy no longer rejects exactly counts above the modeled limit")
+
+for name, required in {
+    "invalid_scan_result": (
+        "requires start <= text_length",
+        "ensure result.start == start",
+        "ensure result.count == 0",
+        "ensure result.first_separator == text_length and result.last_separator == text_length",
+        "ensure not result.has_address_group",
+        "ensure result.address_open == text_length and result.address_close == text_length",
+        "ensure not result.valid",
+        "return InstructionScanResult{start: start, count: 0, first_separator: text_length, last_separator: text_length, has_address_group: false, address_open: text_length, address_close: text_length, valid: false}",
+    ),
+    "empty_scan_result": (
+        "ensure result.start == text_length",
+        "ensure result.count == 0",
+        "ensure result.first_separator == text_length and result.last_separator == text_length",
+        "ensure not result.has_address_group",
+        "ensure result.address_open == text_length and result.address_close == text_length",
+        "ensure result.valid",
+        "return InstructionScanResult{start: text_length, count: 0, first_separator: text_length, last_separator: text_length, has_address_group: false, address_open: text_length, address_close: text_length, valid: true}",
+    ),
+}.items():
+    section = compact(function_section(policy, name))
+    if any(compact(fragment) not in section for fragment in required):
+        raise SystemExit(f"{name} no longer constructs its canonical instruction-scan sentinel")
 
 classifier_groups = {
     "is_zero_operand_instruction": (
@@ -134,16 +163,10 @@ classifier_groups = {
 for name, groups in classifier_groups.items():
     mnemonics = tuple(mnemonic for group in groups for mnemonic in group)
     expression = " or ".join(f'op == "{mnemonic}"' for mnemonic in mnemonics)
-    match_rows = "\n".join(
-        "                " + " | ".join(f'"{mnemonic}"' for mnemonic in group) + ": true"
-        for group in groups
-    )
     expected = f"""
 def {name}(op: sview) -> bool:
     ensure result == ( {expression} )
-    return match op:
-{match_rows}
-                _: false
+    return ( {expression} )
 """
     if compact(function_section(policy, name)) != compact(expected):
         raise SystemExit(f"{name} changed from its specified closed opcode set")
@@ -156,15 +179,12 @@ def operand_arity_supported(op: sview, operand_count: usize) -> bool:
         (not is_zero_operand_instruction(op) and not is_one_operand_instruction(op) and is_two_operand_instruction(op) and operand_count == 2) or
         (not is_zero_operand_instruction(op) and not is_one_operand_instruction(op) and not is_two_operand_instruction(op) and is_shift_instruction(op) and (operand_count == 1 or operand_count == 2))
     )
-    if is_zero_operand_instruction(op):
-        return operand_count == 0
-    if is_one_operand_instruction(op):
-        return operand_count == 1
-    if is_two_operand_instruction(op):
-        return operand_count == 2
-    if is_shift_instruction(op):
-        return operand_count == 1 or operand_count == 2
-    return false
+    return (
+        (is_zero_operand_instruction(op) and operand_count == 0) or
+        (not is_zero_operand_instruction(op) and is_one_operand_instruction(op) and operand_count == 1) or
+        (not is_zero_operand_instruction(op) and not is_one_operand_instruction(op) and is_two_operand_instruction(op) and operand_count == 2) or
+        (not is_zero_operand_instruction(op) and not is_one_operand_instruction(op) and not is_two_operand_instruction(op) and is_shift_instruction(op) and (operand_count == 1 or operand_count == 2))
+    )
 """
 if compact(function_section(policy, "operand_arity_supported")) != compact(expected_operand_arity):
     raise SystemExit("instruction operand arity no longer matches the closed operation inventory")
@@ -186,17 +206,17 @@ def is_aarch64_mrs_form(result_register: sview, system_register: sview) -> bool:
                     (result_register[1] == ASCII_THREE and result_register[2] == ASCII_ZERO)))
         )
     )
-    if system_register != "cntvct_el0":
-        return false
-    if result_register == "xzr":
-        return true
-    if result_register.len == 2 and result_register[0] == ASCII_X:
-        return result_register[1] >= ASCII_ZERO and result_register[1] <= ASCII_NINE
-    if result_register.len == 3 and result_register[0] == ASCII_X:
-        return ((result_register[1] == ASCII_ONE and result_register[2] >= ASCII_ZERO and result_register[2] <= ASCII_NINE) or
-            (result_register[1] == ASCII_TWO and result_register[2] >= ASCII_ZERO and result_register[2] <= ASCII_NINE) or
-            (result_register[1] == ASCII_THREE and result_register[2] == ASCII_ZERO))
-    return false
+    return (
+        system_register == "cntvct_el0" and
+        (result_register == "xzr" or
+            (result_register.len == 2 and result_register[0] == ASCII_X and
+                result_register[1] >= ASCII_ZERO and result_register[1] <= ASCII_NINE) or
+            (result_register.len == 3 and result_register[0] == ASCII_X and
+                (((result_register[1] == ASCII_ONE or result_register[1] == ASCII_TWO) and
+                    result_register[2] >= ASCII_ZERO and result_register[2] <= ASCII_NINE) or
+                    (result_register[1] == ASCII_THREE and result_register[2] == ASCII_ZERO)))
+        )
+    )
 """
 if compact(function_section(policy, "is_aarch64_mrs_form")) != compact(expected_mrs_form):
     raise SystemExit("AArch64 MRS policy must accept only cntvct_el0 and canonical X0-X30/XZR registers")
@@ -268,14 +288,19 @@ def is_direct_control_target(op: sview, operand: sview, is_final_operand: bool) 
 if compact(function_section(policy, "is_direct_control_target")) != compact(expected_direct_target):
     raise SystemExit("direct control-target classifier no longer matches its exact target syntax and opcode set")
 
-scanner = compact(function_section(policy, "scan_instruction"))
+scanner = compact(function_section(instruction_scan, "scan_instruction"))
 if compact("def scan_instruction(text: sview) -> InstructionScanResult:") not in scanner:
     raise SystemExit("instruction scan must return its named result record")
 for required in (
-    "start: usize = first_operand_byte(text, EasmTextScan::first_space(text).usize())",
+    "first_space: i64 = EasmTextScan::first_space(text)",
+    "assert first_space >= 0 and first_space <= text_length.i64()",
+    "first_space_offset: usize = first_space.usize()",
+    "assert first_space_offset <= text_length",
+    "start: usize = first_operand_byte(text, first_space_offset)",
     "open_relative: usize = EasmTextScan::find_byte(operands, ASCII_LEFT_PAREN)",
     "close_relative: usize = EasmTextScan::find_byte(operands, ASCII_RIGHT_PAREN)",
-    "if close_relative >= operands.len: return InstructionScanResult{start: start, count: 0, first_separator: text_length, last_separator: text_length, has_address_group: false, address_open: text_length, address_close: text_length, valid: false}",
+    "return empty_scan_result(text_length)",
+    "return invalid_scan_result(text_length, start)",
     "close_after_open: usize = EasmTextScan::find_byte(after_open, ASCII_RIGHT_PAREN)",
     "EasmTextScan::find_byte(address_contents, ASCII_LEFT_PAREN) < address_contents.len",
     "EasmTextScan::find_byte(trailing, ASCII_LEFT_PAREN) < trailing.len",
@@ -319,7 +344,7 @@ for required in (
     "assert many_scan.address_open == open",
     "assert many_scan.address_close == close",
     "assert not many_scan.valid or many_scan.count != TOO_MANY_OPERANDS_SENTINEL or ( many_scan.first_separator < many_scan.last_separator and many_scan.last_separator < text.len",
-    "return InstructionScanResult{start: start, count: TOO_MANY_OPERANDS_SENTINEL, first_separator: first_separator, last_separator: second_separator, has_address_group: has_address, address_open: open, address_close: close, valid: true}",
+    "return many_scan",
     "ensure result.valid or ( result.count == 0 and result.first_separator == text.len and result.last_separator == text.len and not result.has_address_group and result.address_open == text.len and result.address_close == text.len )",
     "ensure result.valid and not result.has_address_group implies ( forall candidate in result.start..<text.len: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
     "ensure result.valid and result.has_address_group implies ( forall candidate in result.start..<result.address_open: text[candidate] != ASCII_LEFT_PAREN and text[candidate] != ASCII_RIGHT_PAREN )",
@@ -333,20 +358,34 @@ for required in (
     if compact(required) not in scanner:
         raise SystemExit(f"operand scanner lost fail-closed grouping logic: {required}")
 first_operand_scan = compact(function_section(policy, "first_operand_byte"))
-if compact("decreases text_length - index") not in first_operand_scan or compact("invariant from <= index and index <= text_length") not in first_operand_scan:
-    raise SystemExit("leading-whitespace scan no longer has a bounded progress argument")
+for required in (
+    "requires from <= text.len",
+    "ensure result >= from and result <= text.len",
+    "ensure result == text.len or (text[result] != ASCII_SPACE and text[result] != ASCII_TAB)",
+    "ensure (forall candidate in from..<result: text[candidate] == ASCII_SPACE or text[candidate] == ASCII_TAB)",
+    "suffix: sview = text[from:text_length]",
+    "bounds: (start: usize, end: usize) = EasmTextScan::trim_bounds(suffix)",
+    "offset: usize = bounds.start",
+    "assert from + offset <= text_length",
+    "return from + offset",
+):
+    if compact(required) not in first_operand_scan:
+        raise SystemExit("leading-whitespace scanner no longer refines the bounded trim span")
 next_separator = compact(function_section(policy, "next_top_level_separator"))
 for required in (
     "ensure result >= from",
     "result >= from and text[result] == ASCII_COMMA",
     "forall candidate in from..<result",
-    "while index < text_length",
-    "invariant from <= index and index <= text_length",
-    "invariant (forall candidate in from..<index",
-    "return index if text[index] == ASCII_COMMA and (not has_address or index < open or index > close)",
+    "if from == text_length: return text_length",
+    "EasmTextScan::find_byte(suffix, ASCII_COMMA)",
+    "EasmTextScan::find_byte(before_address, ASCII_COMMA)",
+    "EasmTextScan::find_byte(after_address, ASCII_COMMA)",
+    "return found_before",
+    "return found_after",
+    "return text_length",
 ):
     if compact(required) not in next_separator:
-        raise SystemExit(f"top-level separator search lost its first-match contract: {required}")
+        raise SystemExit(f"top-level separator search lost its bounded first-match composition: {required}")
 
 environment = ENV.read_text()
 if environment.index('include "easm_text_scan.elisa"') > environment.index('include "easm_operand_scan.elisa"') or \
@@ -460,18 +499,18 @@ if instruction_code.index(compact("target_is_local: bool = easm_label_index(fn.i
     raise SystemExit("conditional target validation must derive local-target status from the function's labels")
 label_index = compact(function_section(MODEL.read_text(), "easm_label_index"))
 required_label_lookup = (
-    "return -1 if count_signed < 0 or count_signed.usize() != count",
-    "assert count_signed >= 0",
-    "assert count_signed.usize() == count",
-    "assert count_signed == instructions.count.i64()",
-    "for index in 0..<count_signed |instructions, target|:",
-    "invariant index >= 0",
-    "invariant index <= count_signed",
-    "invariant forall prior in 0..<index: prior < count_signed and not easm_equal(easm_label_name(instructions[prior.usize()]), target)",
-    "if easm_equal(easm_label_name(instructions[index.usize()]), target):",
-    "assert index < count_signed",
-    "assert index.usize().i64() == index",
-    "return index",
+    "ensure result >= -1",
+    "ensure target.len == 0 implies result == -1",
+    "ensure result >= 0 implies result.usize() < instructions.count",
+    "ensure result >= 0 implies instructions[result.usize()].op == \"label\" and easm_equal(easm_label_name(instructions[result.usize()]), target)",
+    "ensure result >= 0 implies (forall prior in 0..<result.usize(): instructions[prior].op != \"label\" or not easm_equal(easm_label_name(instructions[prior]), target))",
+    "ensure (instructions.count.i64() >= 0 and instructions.count.i64().usize() == instructions.count and result == -1 and target.len > 0) implies (forall candidate in 0..<instructions.count: instructions[candidate].op != \"label\" or not easm_equal(easm_label_name(instructions[candidate]), target))",
+    "return -1 if target.len == 0 or count_signed < 0 or count_signed.usize() != count",
+    "for index in 0..<count |count, instructions, target|:",
+    "invariant forall prior in 0..<index: instructions[prior].op != \"label\" or not easm_equal(easm_label_name(instructions[prior]), target)",
+    "if instructions[index].op == \"label\" and easm_equal(easm_label_name(instructions[index]), target):",
+    "return found_index",
+    "assert forall candidate in 0..<count: instructions[candidate].op != \"label\" or not easm_equal(easm_label_name(instructions[candidate]), target)",
 )
 if any(compact(fragment) not in label_index for fragment in required_label_lookup) or not label_index.endswith("return-1"):
     raise SystemExit("conditional target lookup lost its bounded first-match or unresolved-label behavior")
@@ -854,7 +893,7 @@ inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE,
-    POLICY, ENV, PROVENANCE, FUNCTION, MEMORY, MODEL, MASKS,
+    POLICY, INSTRUCTION_SCAN, ENV, PROVENANCE, FUNCTION, MEMORY, MODEL, MASKS,
 ]
 inputs.extend(source_closure)
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

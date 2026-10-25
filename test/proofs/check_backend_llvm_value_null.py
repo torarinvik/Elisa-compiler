@@ -30,9 +30,9 @@ for name, digest in EXPECTED.items():
     if hashlib.sha256(compact(section(proof, name)).encode()).hexdigest() != digest:
         raise SystemExit(f"{name} proof changed since source binding")
 body = compact(section(SOURCE.read_text(), "llvm_value_is_null"))
-if "truereturnifvalue==zeroed" not in body or "returnLLVMIsNull(value)!=0" not in body:
+if "returntrueifvalue==zeroed" not in body or "returnLLVMIsNull(value)!=0" not in body:
     raise SystemExit("LLVM null check must recognize absent handles and live LLVM null constants")
-if body.index("truereturnifvalue==zeroed") > body.index("returnLLVMIsNull(value)!=0"):
+if body.index("returntrueifvalue==zeroed") > body.index("returnLLVMIsNull(value)!=0"):
     raise SystemExit("absent handle must be handled before querying LLVM")
 if args.source_only:
     print("source_bound=True cases=3")

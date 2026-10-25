@@ -21,6 +21,7 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 LOWERING = ROOT / "src/backend/codegen_stmt_for_shapes.elisa"
+ITERABLE_LOWERING = ROOT / "src/backend/codegen_stmt_for_shapes_iterable.elisa"
 TYPE_SIZES = ROOT / "src/backend/codegen_type_sizes.elisa"
 ABI_FACTS = ROOT / "src/backend/codegen_abi_facts.elisa"
 BENCHMARK = ROOT / "test/bench/codegen_perf/darray_sum.elisa"
@@ -186,8 +187,9 @@ if 'include "./backend_darray_pointer_walk.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("pointer-walk false controls no longer inherit the positive claims")
 
 lowering = LOWERING.read_text()
-lowering_compact = compact(lowering)
-lowering_body = compact(function_section(lowering, "emit_statement_for_iterable_shapes"))
+iterable_lowering = ITERABLE_LOWERING.read_text()
+lowering_compact = compact(lowering) + compact(iterable_lowering)
+lowering_body = compact(function_section(iterable_lowering, "emit_statement_for_iterable_shapes"))
 guard = "pointer_walk:bool=named_darray_sourceandfor_bind==\"\"andnotfor_reversedandnotdrainsandmutable_source_array.kind!=TypeKind.Arrayandloop_scratch_scalar_type(element_type)"
 if guard not in lowering_body:
     raise SystemExit("production pointer-walk selection no longer matches its proved dispatch policy")
@@ -201,9 +203,9 @@ type_sizes = compact(TYPE_SIZES.read_text())
 if "defdarray_type_behind(local_scope:mutableScope&,name:sview,structs:mutableStructTable&)" not in type_sizes:
     raise SystemExit("named DArray source typing no longer resolves through darray_type_behind")
 for fragment in (
-    "unmodeled_type()returnifbound.kind!=TypeKind.Ref",
+    "returnunmodeled_type()ifbound.kind!=TypeKind.Ref",
     "target:ValueType=ref_target_of(bound,structs)",
-    "targetreturniftarget.kind==TypeKind.DArray",
+    "returntargetiftarget.kind==TypeKind.DArray",
 ):
     if fragment not in type_sizes:
         raise SystemExit("borrowed DArray reference no longer resolves to its DArray target")
@@ -307,7 +309,7 @@ manifest = BIN.with_name(BIN.name + ".manifest.json")
 inputs = list(dict.fromkeys([
     BIN, manifest, manifest.with_name(manifest.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", LOWERING, TYPE_SIZES, ABI_FACTS, POSITIVE, NEGATIVE,
+    Path(__file__), HERE / "proof_product_gate.py", LOWERING, ITERABLE_LOWERING, TYPE_SIZES, ABI_FACTS, POSITIVE, NEGATIVE,
     *source_closure, BENCHMARK,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

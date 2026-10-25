@@ -22,7 +22,7 @@ from proof_product_gate import require_current_product, source_include_closure
 
 POSITIVE = HERE / "ownership_binding_lookup.elisa"
 NEGATIVE = HERE / "ownership_binding_lookup_rejected.elisa"
-TABLE_SOURCE = ROOT / "src/semantic/semantic_types.elisa"
+TABLE_SOURCE = ROOT / "src/semantic/semantic_types_symbol_table.elisa"
 POS_SOURCE = ROOT / "src/parser/parser_tokens.elisa"
 LOOKUP_SOURCE = ROOT / "src/semantic/ownership_binding_lookup.elisa"
 IDENTITY_SOURCE = ROOT / "src/semantic/binding_identity_types.elisa"

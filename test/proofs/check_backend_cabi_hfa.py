@@ -42,11 +42,11 @@ if not NEGATIVE.read_text().startswith('include "./backend_cabi_hfa.elisa"'):
     raise SystemExit("false controls must import the HFA policy model")
 hfa = compact(section(SOURCE.read_text(), "cabi_hfa_count"))
 ordered = (
-    "0returnifleaves.count==0orleaves.count>4",
+    "return0ifleaves.count==0orleaves.count>4",
     "leaf_kind:i32=leaves[0].kind",
-    "0returnifleaf_kind==0",
+    "return0ifleaf_kind==0",
     "forleaf_indexin0..<leaves.count|leaves,leaf_kind|:",
-    "0returnifleaves[leaf_index].kind!=leaf_kindorleaves[leaf_index].offset!=leaf_index.u64()*leaves[leaf_index].size",
+    "return0ifleaves[leaf_index].kind!=leaf_kindorleaves[leaf_index].offset!=leaf_index.u64()*leaves[leaf_index].size",
     "returnleaves.count",
 )
 if any(part not in hfa for part in ordered) or [hfa.index(part) for part in ordered] != sorted(hfa.index(part) for part in ordered):

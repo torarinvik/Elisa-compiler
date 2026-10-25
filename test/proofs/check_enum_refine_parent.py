@@ -5,20 +5,21 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 PARSER = ROOT / "src/parser/parser_types_aggregate.elisa"
 PARSER_ROOT = ROOT / "src/parser/parser.elisa"
 PASS = ROOT / "src/semantic/check_enum_refine_parent.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 DISPATCH = ROOT / "src/semantic/semantic_parallel_passes.elisa"
-PIPELINE = ROOT / "src/semantic/semantic_api.elisa"
+PIPELINE = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 POSITIVE = HERE / "enum_refine_parent.elisa"
 NEGATIVE = HERE / "enum_refine_parent_rejected.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
@@ -149,9 +150,9 @@ if 'include "./parser_types_aggregate.elisa"' not in PARSER_ROOT.read_text():
 if 'include "./check_enum_refine_parent.elisa"' not in SEMANTIC.read_text():
     raise SystemExit("semantic root no longer includes the enum-refinement check")
 dispatch_text = DISPATCH.read_text()
-if not direct_child(dispatch_text, f"elif pass_id == {PASS_ID}:", "table <- check_enum_refine_parent(loop_view, table)"):
+if not direct_child(dispatch_text, f"if pass_id == {PASS_ID}:", "table <- check_enum_refine_parent(loop_view, table)"):
     raise SystemExit("parallel semantic dispatcher no longer invokes the enum-refinement check")
-if f"par_pass_run(file, &loop_view, flags, table, shared_pool, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in PIPELINE.read_text():
+if f"par_pass_run(file, flags, table, shared_pool, loop_view, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in PIPELINE.read_text():
     raise SystemExit("semantic pipeline no longer schedules the enum-refinement pass batch")
 
 expected_positive = {
@@ -182,6 +183,10 @@ expected_model = """def should_report(annotation_row: u32, enum_name: sview, par
 """
 if compact(model_function) != compact(expected_model):
     raise SystemExit("proof model no longer mirrors the source-gated enum-refinement predicate")
+
+if "--source-only" in sys.argv[1:]:
+    print(json.dumps({"admitted": True, "source_only": True}, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     manifest = require_current_product(BIN, PROVER)

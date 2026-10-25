@@ -18,11 +18,12 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POSITIVE = HERE / "sview_index_bounds.elisa"
 NEGATIVE = HERE / "sview_index_bounds_rejected.elisa"
-INDEX_READ = ROOT / "src/backend/codegen_expr_index_read.elisa"
+INDEX_READ = ROOT / "src/backend/codegen_expr_index_read_emit.elisa"
+INDEX_HELPERS = ROOT / "src/backend/codegen_expr_index_read.elisa"
 SHORT_CIRCUIT = ROOT / "src/backend/codegen_match_arm_facts.elisa"
 BINARY_TAIL = ROOT / "src/backend/codegen_expr_binary_tail.elisa"
 FIELD_READ = ROOT / "src/backend/codegen_expr_field_read.elisa"
-TYPE_PLACE = ROOT / "src/backend/codegen_expression_type_place.elisa"
+TYPE_PLACE = ROOT / "src/backend/codegen_expression_type_place_of.elisa"
 LLVM_BINDINGS = ROOT / "src/backend/llvm_c.elisa"
 RUNTIME_DECL = ROOT / "src/backend/codegen_runtime_decl.elisa"
 INFER = ROOT / "src/semantic/resolve_types_infer.elisa"
@@ -57,7 +58,7 @@ def function_body(source: str, name: str) -> str:
 
 
 index_source = INDEX_READ.read_text()
-inline = compact(function_body(index_source, "emit_inline_sview_index"))
+inline = compact(function_body(INDEX_HELPERS.read_text(), "emit_inline_sview_index"))
 index_emitter = compact(function_body(index_source, "emit_expression_index_read"))
 short_circuit = compact(function_body(SHORT_CIRCUIT.read_text(), "emit_short_circuit"))
 binary_tail = compact(BINARY_TAIL.read_text())
@@ -134,10 +135,10 @@ if any(position < 0 for position in short_positions) or short_positions != sorte
 # Pin the source-level alias to the actual StringView length member, its inferred
 # and backend scalar type, and the aggregate field extracted by code generation.
 if '"len"|"length"->true' not in infer_source or \
-        'InferType{kind:SemTypeKind.Int,name:"i64"}returnifobject_type.kind==SemTypeKind.Stringandobject_type.name=="sview"andis_sview_size_field' not in infer_source:
+        'returnInferType{kind:SemTypeKind.Int,name:"i64"}ifobject_type.kind==SemTypeKind.Stringandobject_type.name=="sview"andis_sview_size_field' not in infer_source:
     raise SystemExit("semantic inference no longer types StringView.len as i64")
 if '"len"|"length"->true' not in place_type or \
-        'ValueType{kind:TypeKind.Signed,bits:64}returnifindexed_type.kind==TypeKind.CStrorindexed_type.kind==TypeKind.SView' not in place_type:
+        'returnValueType{kind:TypeKind.Signed,bits:64}ifindexed_type.kind==TypeKind.CStrorindexed_type.kind==TypeKind.SView' not in place_type:
     raise SystemExit("backend expression typing no longer exposes StringView.len as signed i64")
 if '"data"|"len"|"length"->true' not in field_emitter or \
         'LLVMBuildExtractValue(builder,sview_value,1,"sview.len")' not in field_emitter:
@@ -158,12 +159,12 @@ if 'iftext.len>0andtext[0]==EasmCheckedDecimal::ASCII_MINUS:' not in decimal_par
         'returnEasmCheckedDecimal::parse_signed(text)' not in parser:
     raise SystemExit("checked-decimal parser no longer guards its first-byte read with text.len")
 runtime_steps = (
-    '0returnifview.len<0',
+    'return0ifview.len<0',
     'view_len:usize=view.len.usize()',
     '0returnifview_len.i64()!=view.len',
     '0returnifindex<0orindex>=view.len',
     'index_usize:usize=index.usize()',
-    '0returnifindex_usize.i64()!=index',
+    'return0ifindex_usize.i64()!=index',
     'returnview.data[index_usize].i64()',
 )
 positions = [runtime_index.find(step) for step in runtime_steps]
@@ -255,6 +256,7 @@ inputs = [
     POSITIVE,
     NEGATIVE,
     INDEX_READ,
+    INDEX_HELPERS,
     SHORT_CIRCUIT,
     BINARY_TAIL,
     FIELD_READ,

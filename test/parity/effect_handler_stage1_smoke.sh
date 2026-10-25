@@ -177,6 +177,7 @@ run_direct_equivalence() {
 
 run_positive "static_handler_bare.elisa"
 run_positive "grouped_permission_family_rows.elisa"
+run_positive "qualified_permission_using_alias.elisa"
 run_positive "static_handler_capture.elisa"
 run_positive "static_handler_scope_named.elisa"
 run_positive "static_handler_qualified.elisa"
@@ -390,5 +391,6 @@ run_negative "helper_mixed_unhandled.neg.elisa" 'effectful helper "emit_tick" re
 run_interpret_warning "deep_permission_alias_uncovered.warn.elisa" 'requires can[Deep00]'
 run_negative "helper_generic_specialization_mismatch.neg.elisa" 'abstract effect specialization mismatch'
 run_negative "helper_clone_private.neg.elisa" 'is private'
+run_negative "global_authority_nested_alias_conflict.elisa" 'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "Parent.NestedTarget"'
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"

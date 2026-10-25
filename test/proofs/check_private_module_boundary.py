@@ -21,8 +21,14 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE = ROOT / "src/semantic/private_module_boundary.elisa"
 CONSUMER = ROOT / "src/semantic/check_private_member_access.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
+PARSER = ROOT / "src/parser/parser_decl_module.elisa"
+SYMBOLS = ROOT / "src/semantic/symbols.elisa"
 POSITIVE = HERE / "private_module_boundary.elisa"
 NEGATIVE = HERE / "private_module_boundary_rejected.elisa"
+CALL_SHAPES = ROOT / "test/repro/private_call_overload_visibility_shapes.elisa"
+CALL_SHAPES_SMOKE = ROOT / "test/parity/private_call_overload_visibility_shapes_smoke.sh"
+ROOT_OVERLOADS = ROOT / "test/repro/private_call_root_overload_hidden_import.elisa"
+ROOT_OVERLOADS_SMOKE = ROOT / "test/parity/private_call_root_overload_hidden_import_smoke.sh"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--source-only", action="store_true",
@@ -55,8 +61,14 @@ def declarations(source: str) -> set[str]:
 source_text = SOURCE.read_text()
 consumer_text = CONSUMER.read_text()
 semantic_text = SEMANTIC.read_text()
+parser_text = PARSER.read_text()
+symbols_text = SYMBOLS.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
+call_shapes_text = CALL_SHAPES.read_text()
+call_shapes_smoke_text = CALL_SHAPES_SMOKE.read_text()
+root_overloads_text = ROOT_OVERLOADS.read_text()
+root_overloads_smoke_text = ROOT_OVERLOADS_SMOKE.read_text()
 
 expected_prefix = '''
 def prefix_matches(text: sview, prefix: sview) -> bool:
@@ -118,9 +130,204 @@ def pma_within_module(current_module: sview, owner: sview) -> bool:
         return SemanticPrivateModuleBoundary::within_module(current_module, owner)
 '''):
     raise SystemExit("production private-member boundary wrapper no longer delegates to the proved helper")
-if "pma_within_module(current_module,owner)" not in compact(function_section(consumer_text, "pma_unqualified_owner")) or \
-        "pma_within_module(current_module,owner)" not in compact(function_section(consumer_text, "pma_report_scope_member")):
+unqualified_owner = compact(function_section(consumer_text, "pma_unqualified_owner"))
+unqualified_call_owner = compact(function_section(consumer_text, "pma_unqualified_call_owner"))
+private_import_owner = compact(function_section(consumer_text, "pma_unqualified_private_import_owner"))
+scope_member = compact(function_section(consumer_text, "pma_report_scope_member"))
+if not all(fragment in unqualified_owner for fragment in (
+        "pma_has_global_value(table,member)",
+        "pma_unqualified_private_import_owner(table,current_module,private_index,annotations,member)",
+        "pma_has_public_imported_function_value(table,private_index,annotations,current_module,member,owner)")) or \
+        not all(fragment in unqualified_call_owner for fragment in (
+        "pma_has_global_non_callable_value(table,member)",
+        "pma_unqualified_private_import_owner(table,current_module,private_index,annotations,member)")) or \
+        "pma_within_module(current_module,owner)" not in private_import_owner or \
+        "pma_within_module(current_module,owner)" not in scope_member:
     raise SystemExit("qualified and unqualified private-member checks must share the proved boundary predicate")
+
+# Parser markers and semantic symbols share declaration-head offsets. Identifier token
+# positions are a distinct span and must not be used to recover per-overload visibility.
+private_position = compact(function_section(parser_text, "private_member_declaration_position"))
+private_record = compact(function_section(parser_text, "record_private_member_if"))
+collect_functions = compact(function_section(symbols_text, "collect_range_with_variadics"))
+if "head_offset:usize=parser.private_declaration_head_offset()" not in private_position or \
+        "returnAst::pos_of_token(token)" not in private_position or \
+        "offset:member_position.offset" not in private_record:
+    raise SystemExit("private-member annotation must preserve the parser's declaration-head offset")
+if "Decl.Func(name,params,return_type,body,effects,decorators,line)" not in collect_functions or \
+        "SymbolKind.Func,line.line,required" not in collect_functions or \
+        "line.offset,function_pos" not in collect_functions:
+    raise SystemExit("function symbols must retain the declaration-head offset from the parsed function position")
+
+# Overload visibility must be tied to the exact private declaration. Calls may skip a
+# spelling-only private report only when a visible sibling can win Core's call ranking
+# and every exact private candidate is ineligible, incompatible, or outranked under the
+# subset this checker can prove; unknown call shapes remain fail-closed.
+private_index_build = compact(function_section(consumer_text, "pma_build_index"))
+private_symbol_marker = compact(function_section(consumer_text, "pma_symbol_has_private_marker"))
+public_call_sibling_rank = compact(function_section(consumer_text, "pma_public_call_sibling_rank"))
+private_candidate_rank = compact(function_section(consumer_text, "pma_private_candidate_excluded_by_public_rank"))
+core_arity_filter = compact(function_section(consumer_text, "pma_symbol_core_accepts_receiver_arity"))
+private_call_exclusion = compact(function_section(consumer_text, "pma_private_call_overloads_excluded"))
+global_value_lookup = compact(function_section(consumer_text, "pma_has_global_value"))
+global_non_callable_lookup = compact(function_section(consumer_text, "pma_has_global_non_callable_value"))
+bare_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_owner"))
+call_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_call_owner"))
+private_import_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_private_import_owner"))
+public_imported_value = compact(function_section(consumer_text, "pma_has_public_imported_function_value"))
+private_import_visibility = compact(function_section(consumer_text, "pma_private_imported_module_member_visible"))
+public_import_visibility = compact(function_section(consumer_text, "pma_public_imported_module_member_visible"))
+imported_member_visibility = compact(function_section(consumer_text, "pma_imported_module_member_visible"))
+candidate_module_visibility = compact(function_section(consumer_text, "pma_unqualified_candidate_module_visible"))
+selective_import_status = compact(function_section(consumer_text, "pma_selective_import_target_status"))
+using_member_registration = compact(function_section(consumer_text, "pma_selective_annotation_is_using_member"))
+import_scope_visibility = compact(function_section(consumer_text, "pma_import_scope_visible"))
+argument_type_probe = compact(function_section(consumer_text, "pma_argument_type_name"))
+call_target_normalizer = compact(function_section(consumer_text, "pma_normalize_call_callee"))
+call_index_walker = compact(function_section(consumer_text, "pma_report_call_callee_indices"))
+private_report = compact(function_section(consumer_text, "pma_report"))
+private_index_init = compact(consumer_text)
+if not all(fragment in private_index_build for fragment in (
+        "index.declaration_offsets.push(annotation.offset)",
+        "index.modules.push(module_annotation.name)")) or not all(fragment in private_symbol_marker for fragment in (
+        "index.declaration_offsets[index_position]==symbol.offset",
+        "index.names[index_position]==symbol.name",
+        "index.modules[index_position]==symbol.module_owner")):
+    raise SystemExit("private overload visibility must match the parser's declaration-position marker to its exact symbol")
+if not all(fragment in private_call_exclusion for fragment in (
+        'returnfalseifanyargument_nameinargument_nameswhereargument_name!=""',
+        "pma_public_call_sibling_rank(index,table,annotations,owner,member,current_module,unqualified_call,arguments,bound,bound_types)",
+        "pma_symbol_core_accepts_receiver_arity(table,symbol,arguments.count)",
+        "pma_private_candidate_excluded_by_public_rank(table,annotations,symbol,public_rank.rank,actual_type)",
+        "returnprivate_candidates>0.usize()andall_excluded")) or not all(fragment in core_arity_filter for fragment in (
+        "symbol.arity_max==4294967295",
+        "table.function_param_has_default[row]",
+        "symbol.arity_max==argument_count.u32()")):
+    raise SystemExit("private-call suppression must match Core's coarse arity filter and remain fail-closed for named or unknown calls")
+if not all(fragment in global_value_lookup for fragment in (
+        'symbol.kind!=SymbolKind.Moduleandsymbol.module_owner==""',
+        "returnfalse")) or not all(fragment in global_non_callable_lookup for fragment in (
+        'symbol.kind!=SymbolKind.Moduleandsymbol.kind!=SymbolKind.Funcandsymbol.module_owner==""',
+        "returnfalse")):
+    raise SystemExit("global-name shadowing must use explicit root ownership, not counts that conflate imported overloads")
+if not all(fragment in bare_owner_lookup for fragment in (
+        "pma_has_global_value(table,member)",
+        "pma_unqualified_private_import_owner(table,current_module,private_index,annotations,member)",
+        "pma_has_public_imported_function_value(table,private_index,annotations,current_module,member,owner)")) or not all(fragment in call_owner_lookup for fragment in (
+        "pma_has_global_non_callable_value(table,member)",
+        "pma_unqualified_private_import_owner(table,current_module,private_index,annotations,member)")) or \
+        "pma_has_global_value" in call_owner_lookup or "pma_has_global_non_callable_value" in bare_owner_lookup or \
+        "pma_is_private" not in private_import_owner_lookup:
+    raise SystemExit("bare global functions must shadow values while call lookup still checks imported private overloads")
+if not all(fragment in public_imported_value for fragment in (
+        "symbol.kind!=SymbolKind.Func",
+        "pma_module_owns(table,symbol.module_owner,member)",
+        "pma_unqualified_candidate_module_visible(index,annotations,current_module,symbol.module_owner,member)",
+        "notpma_symbol_has_private_marker(index,symbol)")) or "pma_has_public_imported_function_value(table,private_index,annotations,current_module,member,owner)" not in bare_owner_lookup:
+    raise SystemExit("a visible public callable import must keep a same-name private wildcard function from blocking its value")
+if "pma_public_imported_module_member_visible(index,annotations,current_module,owner,member)" not in imported_member_visibility or not all(fragment in candidate_module_visibility for fragment in (
+        "pma_imported_module_member_visible(index,annotations,current_module,candidate_module,member)",
+        "pma_is_private(index,owner,segment)",
+        "notpma_within_module(current_module,owner)")):
+    raise SystemExit("public import alternatives must be visible in scope and outside every private module path")
+if not all(fragment in private_import_visibility for fragment in (
+        "__binding_wildcard_import",
+        "pma_selective_import_target_status(annotations,current_module,owner,member)",
+        "target.foundand(nottarget.knownortarget.first)")) or not all(fragment in public_import_visibility for fragment in (
+        "__binding_wildcard_import",
+        "target.foundandtarget.knownandtarget.first")) or not all(fragment in selective_import_status for fragment in (
+        "member_annotation.offset",
+        "member_annotation.module",
+        "source_annotation.name==owner",
+        "candidate_is_using",
+        "known_order")) or not all(fragment in using_member_registration for fragment in (
+        'annotation.name=="__using_member"',
+        "annotation.offset==member_annotation.offset")) or "returntrueifimport_scope==\"\"" not in import_scope_visibility:
+    raise SystemExit("import visibility must preserve root/ancestor scope, first selective target, and Core's using-member registration order")
+if not all(fragment in public_call_sibling_rank for fragment in (
+        "pma_argument_type_name(arguments[0],bound,bound_types)",
+        "pma_symbol_has_private_marker(index,symbol)",
+        "ifnotunqualified_call:continueifsymbol.module_owner!=owner",
+        "pma_unqualified_candidate_module_visible(index,annotations,current_module,symbol.module_owner,member)",
+        "first_parameter.name==actual_type",
+        "actual_type==\"int\"and(first_parameter.kind==SemTypeKind.Intorfirst_parameter.kind==SemTypeKind.Char)",
+        "pma_generic_parameter_identity(annotations,first_parameter.name,symbol)")) or not all(fragment in candidate_module_visibility for fragment in (
+        'candidate_module==""orpma_within_module(current_module,candidate_module)',
+        "pma_imported_module_member_visible(index,annotations,current_module,candidate_module,member)")) or not all(fragment in private_candidate_rank for fragment in (
+        'actual_type=="bool"',
+        "public_rank>0.usize()",
+        "pma_generic_parameter_identity(annotations,first_parameter.name,symbol)")):
+    raise SystemExit("private-call suppression must prove exact public formals outrank private generic candidates while ties stay fail-closed")
+if not all(fragment in argument_type_probe for fragment in (
+        "Expr.IntLit(_,_)",
+        'return"int"',
+        "Expr.FloatLit(_,_)",
+        'return"f64"')):
+    raise SystemExit("PMA must recognize Core's untyped integer and default float receiver types before suppressing a private generic winner")
+if not all(fragment in call_target_normalizer for fragment in (
+        "Expr.Paren(inner,_)",
+        "Expr.Index(object,_,_)ifpma_is_private_function_target(object,current_module,index,annotations,table,bound)",
+        "Expr.IndexN(object,_,_)ifpma_is_private_function_target(object,current_module,index,annotations,table,bound)")) or not all(fragment in call_index_walker for fragment in (
+        "Expr.Index(object,argument,_)",
+        "Expr.IndexN(object,arguments,_)",
+        "pma_report(argument,current_module,index,annotations,table,bound,bound_types)")):
+    raise SystemExit("parenthesized and explicit-generic private call targets must normalize without dropping index-argument checks")
+bare_call = private_report.index("Expr.Ident(callee_name,callee_line):")
+qualified_call = private_report.index("Expr.Scope(base,callee_name,callee_line):")
+qualified_body = private_report[qualified_call:]
+qualified_order = (
+    "pma_report(base,current_module,index,annotations,table,bound,bound_types)",
+    "owner:sview@source=pma_scope_owner(index,table,base,callee_name)",
+    "pma_private_call_overloads_excluded(index,table,annotations,owner,callee_name,current_module,false,arguments,argument_names,bound,bound_types)",
+    "table.diagnostics<-table.diagnostics.push(Diagnostic{kind:DiagnosticKind.PrivateMemberAccess,name:callee_name",
+)
+if bare_call > qualified_call or not all(fragment in private_report for fragment in (
+        "normalized_callee:Ast::Expr=pma_normalize_call_callee(callee,current_module,index,annotations,table,bound)",
+        "matchnormalized_callee:",
+        "pma_unqualified_call_owner(table,current_module,index,annotations,bound,callee_name)",
+        "pma_private_call_overloads_excluded(index,table,annotations,owner,callee_name,current_module,true,arguments,argument_names,bound,bound_types)",
+        "pma_report_call_callee_indices(callee,current_module,index,annotations,table,bound,bound_types)ifnormalized_callee_is_path")) or \
+        not all(fragment in qualified_body for fragment in qualified_order) or \
+        sorted(qualified_body.index(fragment) for fragment in qualified_order) != [qualified_body.index(fragment) for fragment in qualified_order] or \
+        "notpma_within_module(current_module,owner)andnotprivate_candidates_excluded" not in qualified_body:
+    raise SystemExit("call checking must normalize private call forms, preserve private base barriers, and check selected overload families")
+if "declaration_offsets:mutabledarray[u32]" not in private_index_init or \
+        "declaration_offsets:[]" not in private_index_init:
+    raise SystemExit("private declaration offsets must be initialized alongside the member index")
+if not all(fragment in call_shapes_text for fragment in (
+        "return (Provider::dispatch)(value)",
+        "return Provider::dispatch[bool](value)",
+        "return dispatch(value)",
+        "return dispatch[bool](value)",
+        "return Provider::sealed(value)",
+        "return BroadProvider::prefer(value)",
+        "return LiteralProvider::choose(7)",
+        "return wrap(fetch)",
+        "return wrap(retrieve)",
+        "def public_concrete_over_private_generic(value: i64)",
+        "def public_concrete_literal_winner()",
+        "def public_selective_function_value()")) or not all(fragment in call_shapes_smoke_text for fragment in (
+        'private_call_overload_visibility_shapes.elisa',
+        '[[ $(grep -cF \'is private to module\' <<< "$stage0_output") == 1 ]]',
+        '[[ $(grep -cF \'is private to module\' <<< "$stage1_output") == 1 ]]')):
+    raise SystemExit("call-shape fixture must cover parenthesized, explicit-generic, and private-only visibility controls")
+
+if not all(fragment in root_overloads_text for fragment in (
+        "def choose(value: i64)",
+        "def prefer[T](value: T)",
+        "def choose[T](value: T)",
+        "def prefer(value: bool)",
+        "return choose(value)",
+        "return prefer(value)",
+        "def local_rank[T](value: T)",
+        "from Provider import local_rank",
+        "def local_rank(value: bool)",
+        "def local_concrete_wins(value: bool)",
+        "return local_rank(value)")) or not all(fragment in root_overloads_smoke_text for fragment in (
+        'private_call_root_overload_hidden_import.elisa',
+        'grep -q \'^P 0$\' <<< "$stage1_output"',
+        'is private to module')):
+    raise SystemExit("root/local overload fixture must bind generic and concrete visible winners against private imported candidates")
 
 if 'include "../../src/semantic/private_module_boundary.elisa"' not in positive_text or \
         'include "./private_module_boundary.elisa"' not in negative_text:

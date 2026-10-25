@@ -5,20 +5,22 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
-PARSER = ROOT / "src/parser/parser_types_signature.elisa"
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
+PARSER = ROOT / "src/parser/parser_types_signature_clauses.elisa"
+PARSER_SUPPORT = ROOT / "src/parser/parser_types_signature.elisa"
 PARSER_ROOT = ROOT / "src/parser/parser.elisa"
 PASS = ROOT / "src/semantic/check_fulfills_whole_function.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 DISPATCH = ROOT / "src/semantic/semantic_parallel_passes.elisa"
-PIPELINE = ROOT / "src/semantic/semantic_api.elisa"
+PIPELINE = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 POSITIVE = HERE / "fulfills_whole_function.elisa"
 NEGATIVE = HERE / "fulfills_whole_function_rejected.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
@@ -110,6 +112,7 @@ def wrap_direct_child(source: str, parent: str, child_prefix: str) -> str:
 
 
 parser_text = PARSER.read_text()
+parser_support_text = PARSER_SUPPORT.read_text()
 pass_text = PASS.read_text()
 parser_constant = f"const FULFILLS_WHOLE_FUNCTION_ROW: u32 = {MARKER}"
 pass_constant = f"const FULFILLS_WHOLE_FUNCTION_ROW: u32 = {MARKER}"
@@ -117,13 +120,14 @@ subject_protocol_constant = f"const FULFILLS_SUBJECT_PROTOCOL_ROW: u32 = {SUBJEC
 
 
 def source_matches(parser_candidate: str, pass_candidate: str) -> bool:
-    if compact(parser_candidate).count(compact(parser_constant)) != 1:
+    parser_source = parser_support_text + "\n" + parser_candidate
+    if compact(parser_source).count(compact(parser_constant)) != 1:
         return False
-    if len(re.findall(rf"(?<!\d){MARKER}(?!\d)", parser_candidate)) != 1:
+    if len(re.findall(rf"(?<!\d){MARKER}(?!\d)", parser_source)) != 1:
         return False
-    if compact(parser_candidate).count(compact(subject_protocol_constant)) != 1:
+    if compact(parser_source).count(compact(subject_protocol_constant)) != 1:
         return False
-    if len(re.findall(rf"(?<!\d){SUBJECT_PROTOCOL_MARKER}(?!\d)", parser_candidate)) != 1:
+    if len(re.findall(rf"(?<!\d){SUBJECT_PROTOCOL_MARKER}(?!\d)", parser_source)) != 1:
         return False
     if compact(pass_candidate).count(compact(pass_constant)) != 1:
         return False
@@ -134,10 +138,12 @@ def source_matches(parser_candidate: str, pass_candidate: str) -> bool:
     parser_compact = compact(parser_function)
     parser_anchors = (
         "fulfills_shape:bool=depth==0andclause_text==\"fulfills\"andparser.peek_at(1)==TokenKind.Identandparser.peek_at(2)==TokenKind.Isandparser.peek_at(3)==TokenKind.Ident",
-        'fulfills_protocol:sview=Lexer::text_or_empty(parser.tokens[parser.position+3],parser.source)if fulfills_shape else sview("",0,0)',
+        'fulfills_protocol:sview=Lexer::text_or_empty(parser.tokens[parser.position+3],parser.source,parser.source_length)if fulfills_shape else sview("",0,0)',
         'fulfills_whole_fn:bool=when fulfills_protocol:"NoBoundsChecks"|"Vectorizes"->true_->false',
-        'parser.enum_annotations<-parser.enum_annotations.push(Ast::EnumAnnotation{owner:Lexer::text_or_empty(parser.tokens[parser.position+1],parser.source),name:fulfills_protocol,line:FULFILLS_WHOLE_FUNCTION_ROW})if fulfills_whole_fn',
-        'parser.enum_annotations<-parser.enum_annotations.push(Ast::EnumAnnotation{owner:Lexer::text_or_empty(parser.tokens[parser.position+1],parser.source),name:fulfills_protocol,line:FULFILLS_SUBJECT_PROTOCOL_ROW})if fulfills_shape',
+        'parser.enum_annotations<-parser.enum_annotations.push(Ast::EnumAnnotation{owner:Lexer::text_or_empty(parser.tokens[parser.position+1],parser.source,parser.source_length),name:fulfills_protocol,line:FULFILLS_WHOLE_FUNCTION_ROW})if fulfills_whole_fn',
+        'parser.enum_annotations<-parser.enum_annotations.push(Ast::EnumAnnotation{owner:Lexer::text_or_empty(parser.tokens[parser.position+1],parser.source,parser.source_length),name:fulfills_protocol,line:FULFILLS_SUBJECT_PROTOCOL_ROW})if fulfills_shape',
+        'parser.pending_fulfills_is_subject<-parser.pending_fulfills_is_subject.push(Lexer::text_or_empty(parser.tokens[parser.position+1],parser.source,parser.source_length))if fulfills_shape',
+        'parser.pending_fulfills_is_law<-parser.pending_fulfills_is_law.push(fulfills_protocol)if fulfills_shape',
     )
     positions = [parser_compact.find(compact(anchor)) for anchor in parser_anchors]
     if any(position < 0 for position in positions) or positions != sorted(positions):
@@ -147,18 +153,22 @@ def source_matches(parser_candidate: str, pass_candidate: str) -> bool:
         "fulfills_shape:",
         "fulfills_protocol:",
         "fulfills_whole_fn:",
-        "parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source), name: fulfills_protocol, line: FULFILLS_WHOLE_FUNCTION_ROW})",
-        "parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source), name: fulfills_protocol, line: FULFILLS_SUBJECT_PROTOCOL_ROW})",
+        "parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length), name: fulfills_protocol, line: FULFILLS_WHOLE_FUNCTION_ROW})",
+        "parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length), name: fulfills_protocol, line: FULFILLS_SUBJECT_PROTOCOL_ROW})",
+        "parser.pending_fulfills_is_subject <- parser.pending_fulfills_is_subject.push(Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length))",
+        "parser.pending_fulfills_is_law <- parser.pending_fulfills_is_law.push(fulfills_protocol)",
     )
     if not all(direct_child(parser_function, while_header, child)
                for child in parser_direct_children):
         return False
     parser_statement_sequence = (
         'fulfills_shape: bool = depth == 0 and clause_text == "fulfills" and parser.peek_at(1) == TokenKind.Ident and parser.peek_at(2) == TokenKind.Is and parser.peek_at(3) == TokenKind.Ident',
-        'fulfills_protocol: sview = Lexer::text_or_empty(parser.tokens[parser.position + 3], parser.source) if fulfills_shape else sview("", 0, 0)',
+        'fulfills_protocol: sview = Lexer::text_or_empty(parser.tokens[parser.position + 3], parser.source, parser.source_length) if fulfills_shape else sview("", 0, 0)',
         'fulfills_whole_fn: bool = when fulfills_protocol:',
-        'parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source), name: fulfills_protocol, line: FULFILLS_WHOLE_FUNCTION_ROW}) if fulfills_whole_fn',
-        'parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source), name: fulfills_protocol, line: FULFILLS_SUBJECT_PROTOCOL_ROW}) if fulfills_shape',
+        'parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length), name: fulfills_protocol, line: FULFILLS_WHOLE_FUNCTION_ROW}) if fulfills_whole_fn',
+        'parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length), name: fulfills_protocol, line: FULFILLS_SUBJECT_PROTOCOL_ROW}) if fulfills_shape',
+        'parser.pending_fulfills_is_subject <- parser.pending_fulfills_is_subject.push(Lexer::text_or_empty(parser.tokens[parser.position + 1], parser.source, parser.source_length)) if fulfills_shape',
+        'parser.pending_fulfills_is_law <- parser.pending_fulfills_is_law.push(fulfills_protocol) if fulfills_shape',
     )
     direct_statements = direct_child_statements(parser_function, while_header)
     starts = [index for index, statement in enumerate(direct_statements)
@@ -196,12 +206,14 @@ for parser_mutation, pass_mutation in mutations:
 
 if 'include "./check_fulfills_whole_function.elisa"' not in SEMANTIC.read_text():
     raise SystemExit("semantic root no longer includes the whole-function fulfills check")
-if 'include "./parser_types_signature.elisa"' not in PARSER_ROOT.read_text():
+parser_root_text = PARSER_ROOT.read_text()
+if ('include "./parser_types_signature.elisa"' not in parser_root_text or
+        'include "./parser_types_signature_clauses.elisa"' not in parser_root_text):
     raise SystemExit("parser root no longer includes the whole-function fulfills producer")
 dispatch_text = DISPATCH.read_text()
-if not direct_child(dispatch_text, f"elif pass_id == {PASS_ID}:", "table <- check_fulfills_whole_function(loop_view, table)"):
+if not direct_child(dispatch_text, f"if pass_id == {PASS_ID}:", "table <- check_fulfills_whole_function(loop_view, table)"):
     raise SystemExit("parallel semantic dispatch no longer invokes the whole-function fulfills check")
-if f"par_pass_run(file, &loop_view, flags, table, shared_pool, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in PIPELINE.read_text():
+if f"par_pass_run(file, flags, table, shared_pool, loop_view, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in PIPELINE.read_text():
     raise SystemExit("semantic pipeline no longer schedules the pass containing the whole-function fulfills check")
 
 expected_positive = {
@@ -226,15 +238,14 @@ for path, expected in ((POSITIVE, expected_positive), (NEGATIVE, expected_negati
         raise SystemExit(f"{path.name} theorem inventory changed")
 
 protocol_pattern = 'whenprotocol:"NoBoundsChecks"|"Vectorizes"->true_->false'
+protocol_ensure_pattern = 'ensurewhenprotocol:"NoBoundsChecks"|"Vectorizes"->result==(true)_->result==(false)'
 proof_text = POSITIVE.read_text()
 proof_compact = compact(proof_text)
 model_functions = {
     "is_whole_function_protocol": """def is_whole_function_protocol(protocol: sview) -> bool:
-    ensure result == (
-        when protocol:
-            "NoBoundsChecks" | "Vectorizes" -> true
-            _ -> false
-    )
+    ensure when protocol:
+        "NoBoundsChecks" | "Vectorizes" -> result == (true)
+        _ -> result == (false)
     return when protocol:
         "NoBoundsChecks" | "Vectorizes" -> true
         _ -> false
@@ -251,11 +262,15 @@ model_functions = {
 for name, expected in model_functions.items():
     if compact(function_section(proof_text, name)) != compact(expected):
         raise SystemExit(f"proof model function {name} no longer mirrors the source-gated rule")
-if f"ensureresult==({protocol_pattern})" not in compact(function_section(proof_text, "is_whole_function_protocol")) or \
+if protocol_ensure_pattern not in compact(function_section(proof_text, "is_whole_function_protocol")) or \
         f"return{protocol_pattern}" not in compact(function_section(proof_text, "is_whole_function_protocol")):
     raise SystemExit("proof model no longer uses the source's exact pattern-matched protocol set")
 if not source_matches(parser_text, pass_text):
     raise SystemExit("production source changed during whole-function fulfills admission")
+
+if "--source-only" in sys.argv[1:]:
+    print(json.dumps({"admitted": True, "source_only": True}, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     manifest = require_current_product(BIN, PROVER)
@@ -269,7 +284,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    PARSER, PARSER_ROOT, PASS, SEMANTIC, DISPATCH, PIPELINE, POSITIVE, NEGATIVE,
+    PARSER, PARSER_SUPPORT, PARSER_ROOT, PASS, SEMANTIC, DISPATCH, PIPELINE, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

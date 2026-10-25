@@ -307,6 +307,39 @@ def scan(total: mutable i64) -> i64:
     return total
 EOF
 
+# A catch annotation on the same logical line must not exempt the ordinary Match node.
+run_case "same-line catch does not exempt a match" illegal <<'EOF'
+error LoadError:
+    Failed
+
+def load() -> i64 error[LoadError]:
+    raise LoadError.Failed
+
+#line 100 catch-site.elisa
+def unrelated() -> i64:
+    catch load():
+        value:
+            value
+        LoadError.Failed:
+            0
+
+#line 96 match-site.elisa
+def scan(total: mutable i64) -> i64:
+    machine over total while total < 2:
+        state Run
+        start Run
+        Run, _:
+            match total:
+                0:
+                    pass
+                _:
+                    pass
+            -> Run
+    return total
+EOF
+same_line_report=$("$RPT" < "$CASE")
+grep -q "machine arms cannot branch or loop" <<< "$same_line_report" || fail "same-line ordinary match lacked the arm-law diagnostic: $same_line_report"
+
 run_case "while loop in arm body" illegal <<'EOF'
 def scan(total: mutable i64) -> i64:
     machine over total while total < 2:

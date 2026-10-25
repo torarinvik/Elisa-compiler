@@ -44,7 +44,7 @@ FUNCTION_SHA256 = {
     ("backend", "hex_escape_value"): "5f7db2bb2b8a54e6ea70df157056148316da91cff221efc63cf781159fa3774a",
     ("backend", "utf16_surrogate_pair_codepoint"): "4dc66116af2c3f7bd69939116e10b83ee5ac5b7a671a959ab7e45201a3e2f04b",
     ("backend", "decode_string_escapes"): "45fea57369382104303b0e5bde8812f92ccba34c8d672e3ecea87495e1e687fe",
-    ("backend", "decoded_literal_byte_count"): "43d7e7d396d281b64d685930657722a43c5cedfa56c2d5105280e5aca8c59588",
+    ("backend", "decoded_literal_byte_count"): "676ede9ce04af6c170349b64f2e7630e6f813bc3de635589ba48dd7537c114d9",
     ("fixture", "frontend_surrogate_pair_codepoint"): "419f247a1fe86e5c01984fb2f6dbcf7ddd9f9de061ad3f37914dc082726ebbf6",
     ("fixture", "frontend_is_high_surrogate"): "f3769c64344527b1990890508777da5abae3973695a38c0e95ed80675e60e339",
     ("fixture", "frontend_is_low_surrogate"): "bc6916ae72b6ae0662c23989e17e34db7b132be3b44ab11315d031e537d4b3a9",
@@ -159,7 +159,7 @@ if "ifcodepoint<128:" not in utf8_backend or "ifcodepoint<2048:" not in utf8_bac
         "storage.push((240+(codepoint/262144)).u8())" not in utf8_backend:
     raise SystemExit("backend UTF-8 encoder must retain its 1/2/3/4-byte scalar branches")
 count_backend = compact(function_section(backend_text, "decoded_literal_byte_count"))
-if "count<-count+4" not in count_backend or "-1returnifnext_byte==117andhex_value>=56320andhex_value<=57343" not in count_backend:
+if "count<-count+4" not in count_backend or "return-1ifnext_byte==117andhex_value>=56320andhex_value<=57343" not in count_backend:
     raise SystemExit("backend byte counter must count pairs once and refuse isolated surrogate units")
 
 positive_shapes = {

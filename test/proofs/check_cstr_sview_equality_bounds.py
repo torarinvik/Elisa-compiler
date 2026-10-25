@@ -62,7 +62,7 @@ contracts = (
 if any(compact(contract) not in compare for contract in contracts):
     raise SystemExit("ctx_cstr_eq_sview lost its invalid-extent or expected-length contract")
 steps = (
-    "false return if view.len < 0",
+    "return false if view.len < 0",
     "len: usize = view.len.usize()",
     "false return if len.i64() != view.len",
     "false return if expected_length != view.len",
@@ -70,11 +70,11 @@ steps = (
     "view_byte: u8 = view[i].u8()",
     "text_byte: mutable u8 = 0",
     "trusted Unsafe.UncheckedIndex: text_byte <- text[i].u8()",
-    "false return if text_byte == 0",
-    "false return if text_byte != view_byte",
+    "return false if text_byte == 0",
+    "return false if text_byte != view_byte",
     "terminator: mutable u8 = 1",
     "trusted Unsafe.UncheckedIndex: terminator <- text[len].u8()",
-    "false return if terminator != 0",
+    "return false if terminator != 0",
 )
 positions = [compare.find(compact(step)) for step in steps]
 if any(position < 0 for position in positions) or positions != sorted(positions) \

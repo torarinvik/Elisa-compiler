@@ -36,4 +36,11 @@ grep -q "^P 0$" <<< "$out" && fail "hidden while in arm body NOT refused: $out"
 out=$(printf 'error LoadError:\n    Failed\n\ndef load(fail: bool) -> i64 error[LoadError]:\n    raise LoadError.Failed if fail\n    7\n\nconst enum St of u8:\n    Step\n    Stop\n\ndef down(x: i64) -> i64:\n    n: mutable i64 = x\n    total: i64 = machine from St.Step decreases n:\n        St.Step:\n            catch load(false):\n                loaded:\n                    n <- n - loaded\n                    true\n                error failure:\n                    n <- 0\n                    true\n            next St.Stop\n        St.Stop:\n            done n\n    return total\n' | "$RPT")
 grep -q "^P 0$" <<< "$out" || fail "catch in arm body flagged: $out"
 
-echo "machine-from arm-law smoke OK: straight-line + catch legal; hidden if/while + return escape refused by stage1"
+# 6. A prior catch with the same logical #line must not exempt this ordinary match.
+# The catch token and match statement have distinct source offsets even though both are
+# reported on line 101; the marker lookup must use both fields.
+out=$(printf 'error LoadError:\n    Failed\n\ndef load() -> i64 error[LoadError]:\n    raise LoadError.Failed\n\n#line 100 catch-source.elisa\ndef unrelated() -> i64:\n    catch load():\n        value:\n            value\n        LoadError.Failed:\n            0\n\nconst enum St of u8:\n    Step\n    Stop\n\n#line 98 match-source.elisa\ndef invalid() -> i64:\n    total: i64 = machine from St.Step:\n        St.Step:\n            match true:\n                true:\n                    pass\n                false:\n                    pass\n            next St.Stop\n        St.Stop:\n            done 0\n    return total\n' | "$RPT")
+grep -q "^P 0$" <<< "$out" && fail "same-line ordinary match was misclassified as catch: $out"
+grep -q "machine arms cannot branch or loop" <<< "$out" || fail "same-line match did not trigger the machine arm law: $out"
+
+echo "machine-from arm-law smoke OK: straight-line + catch legal; hidden if/match/while + return escape refused by stage1"

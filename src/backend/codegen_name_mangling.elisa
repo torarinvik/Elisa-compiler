@@ -26,9 +26,131 @@ extend Backend:
 
 
 
+        # Whether one lexical module contains another. The empty module is file scope and
+        # therefore an ancestor of every module.
+        def module_alias_scope_is_ancestor(candidate: sview, module: sview) -> bool:
+            return true if candidate == module or candidate == ""
+            return false if candidate.len + 2.usize() >= module.len
+            for index in 0..<candidate.len |candidate, module|:
+                return false if candidate[index] != module[index]
+            return module[candidate.len] == 58 and module[candidate.len + 1.usize()] == 58
+
+
+        # Pick the nearest visible alias declaration before the queried source offset. The
+        # scope and offset columns come directly from the parser's __using_alias annotation;
+        # flattened alias order alone lets another module's same-named alias win.
+        def module_alias_row_target(name: sview, lexical_module: sview, before_offset: u32, structs: StructTable&) -> (found: bool, ambiguous: bool, target: sview @source, scope: sview @source, offset: u32) can[Abort.Panic]:
+            paired: mutable usize = structs.aliases.module_alias_names.count
+            paired <- structs.aliases.module_alias_targets.count if structs.aliases.module_alias_targets.count < paired
+            paired <- structs.aliases.module_alias_scopes.count if structs.aliases.module_alias_scopes.count < paired
+            paired <- structs.aliases.module_alias_offsets.count if structs.aliases.module_alias_offsets.count < paired
+            selected_target: mutable sview @source = ""
+            selected_scope: mutable sview @source = ""
+            selected_scope_length: mutable usize = 0
+            selected_offset: mutable u32 = 0
+            found: mutable bool = false
+            ambiguous: mutable bool = false
+            for index in 0..<paired |selected_target, selected_scope, selected_scope_length, selected_offset, found, ambiguous, structs, name, lexical_module, before_offset|:
+                continue if structs.aliases.module_alias_names[index] != name
+                alias_offset: u32 = structs.aliases.module_alias_offsets[index]
+                continue if before_offset != 0 and alias_offset >= before_offset
+                alias_scope: sview = structs.aliases.module_alias_scopes[index]
+                continue if not module_alias_scope_is_ancestor(alias_scope, lexical_module)
+                alias_target: sview = structs.aliases.module_alias_targets[index]
+                if not found or alias_scope.len > selected_scope_length or (alias_scope == selected_scope and alias_offset > selected_offset):
+                    selected_target <- alias_target
+                    selected_scope <- alias_scope
+                    selected_scope_length <- alias_scope.len
+                    selected_offset <- alias_offset
+                    found <- true
+                    ambiguous <- false
+                elif alias_scope == selected_scope and alias_offset == selected_offset:
+                    ambiguous <- true if alias_target != selected_target
+            return (found, ambiguous, selected_target, selected_scope, selected_offset)
+
+
+        # Compare one spelling of a module-path suffix with a canonical `::` path prefix.
+        # The source spelling can use either `.` or `::` between module components.
+        def module_alias_path_compare_prefix(path: sview, path_start: usize, owner: sview, owner_start: usize) -> (matched: bool, end: usize) can[Abort.Panic]:
+            path_index: mutable usize = path_start
+            owner_index: mutable usize = owner_start
+            while path_index < path.len |path_index, owner_index, path, owner|:
+                if path[path_index] == 46:
+                    return (false, owner_index) if owner_index + 1.usize() >= owner.len or owner[owner_index] != 58 or owner[owner_index + 1.usize()] != 58
+                    path_index <- path_index + 1.usize()
+                    owner_index <- owner_index + 2.usize()
+                elif path_index + 1.usize() < path.len and path[path_index] == 58 and path[path_index + 1.usize()] == 58:
+                    return (false, owner_index) if owner_index + 1.usize() >= owner.len or owner[owner_index] != 58 or owner[owner_index + 1.usize()] != 58
+                    path_index <- path_index + 2.usize()
+                    owner_index <- owner_index + 2.usize()
+                else:
+                    return (false, owner_index) if owner_index >= owner.len or path[path_index] != owner[owner_index]
+                    path_index <- path_index + 1.usize()
+                    owner_index <- owner_index + 1.usize()
+            return (true, owner_index)
+
+
+        # Resolve aliases recursively in the path head while matching against a canonical
+        # owner. This handles `using Root::Nested as N` even when `Root` is itself an alias.
+        def module_alias_path_prefix_end(path: sview, owner: sview, lexical_module: sview, before_offset: u32, structs: StructTable&, depth: u32 = 0) -> (matched: bool, end: usize) can[Abort.Panic]:
+            return (false, 0) if depth >= 16
+            root_end: mutable usize = 0
+            while root_end < path.len |root_end, path|:
+                break if path[root_end] == 58 or path[root_end] == 46
+                root_end <- root_end + 1.usize()
+            return (false, 0) if root_end == 0
+            root: sview = string_view_slice(path, 0, root_end.i64())
+            alias: (found: bool, ambiguous: bool, target: sview @source, scope: sview @source, offset: u32) = module_alias_row_target(root, lexical_module, before_offset, structs)
+            return (false, 0) if alias.ambiguous
+            return module_alias_path_compare_prefix(path, 0, owner, 0) if not alias.found
+            target_prefix: (matched: bool, end: usize) = module_alias_path_prefix_end(alias.target, owner, alias.scope, alias.offset, structs, depth + 1)
+            return (false, 0) if not target_prefix.matched
+            return module_alias_path_compare_prefix(path, root_end, owner, target_prefix.end)
+
+
+        def module_alias_path_matches_owner(path: sview, owner: sview, lexical_module: sview, before_offset: u32, structs: StructTable&) -> bool can[Abort.Panic]:
+            resolved: (matched: bool, end: usize) = module_alias_path_prefix_end(path, owner, lexical_module, before_offset, structs)
+            return resolved.matched and resolved.end == owner.len
+
+
+        # Append a qualified module path after recursively expanding its root alias. Alias
+        # targets can themselves contain a path (`using Root::Nested as N`), and Root may be
+        # another source-scoped alias. Keep lookup at each hop anchored to that alias's
+        # declaration scope and offset so a later shadow cannot affect an earlier target.
+        def append_module_alias_path(path: sview, lexical_module: sview, before_offset: u32, structs: StructTable&, storage: mutable darray[u8]&, depth: u32 = 0) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if depth >= 16
+            root_end: mutable usize = 0
+            while root_end < path.len |root_end, path|:
+                break if path[root_end] == 58 or path[root_end] == 46
+                root_end <- root_end + 1.usize()
+            return false if root_end == 0
+            root: sview = string_view_slice(path, 0, root_end.i64())
+            alias: (found: bool, ambiguous: bool, target: sview @source, scope: sview @source, offset: u32) = module_alias_row_target(root, lexical_module, before_offset, structs)
+            return false if alias.ambiguous
+            if alias.found:
+                return false if not append_module_alias_path(alias.target, alias.scope, alias.offset, structs, storage, depth + 1)
+            else:
+                for index in 0..<root_end |storage, path|:
+                    storage.push(path[index])
+            path_index: mutable usize = root_end
+            while path_index < path.len |path_index, storage, path|:
+                if path[path_index] == 46:
+                    storage.push(58)
+                    storage.push(58)
+                    path_index <- path_index + 1.usize()
+                elif path_index + 1.usize() < path.len and path[path_index] == 58 and path[path_index + 1.usize()] == 58:
+                    storage.push(58)
+                    storage.push(58)
+                    path_index <- path_index + 2.usize()
+                else:
+                    storage.push(path[path_index])
+                    path_index <- path_index + 1.usize()
+            return true
+
+
         # The module a `using Mod as M` alias stands for, or the name unchanged when it is not
-        # an alias. The pools are parallel and pushed in the parser's order, so an entry only
-        # counts when both halves are present.
+        # an alias. Source-backed expressions (defaults in particular) use scoped rows;
+        # callers without a source offset retain the established first-match lookup.
         def module_alias_target(name: sview, structs: StructTable&) -> sview can[Abort.Panic]:
             is_alias: mutable bool = false
             target: sview = module_alias_chain_target(name, structs, is_alias)
@@ -41,6 +163,25 @@ extend Backend:
         def module_alias_chain_target(name: sview, structs: StructTable&, is_alias: mutable bool&) -> sview @source can[Abort.Panic]:
             hopped: mutable bool = false
             target: mutable sview @source = ""
+            if structs.visibility.current_source_offset != 0:
+                lookup_name: mutable sview = name
+                lexical_module: mutable sview = structs.visibility.current_owner
+                before_offset: mutable u32 = structs.visibility.current_source_offset
+                for step in 0..=structs.aliases.module_alias_names.count |lookup_name, lexical_module, before_offset, target, hopped, is_alias, structs|:
+                    selected: (found: bool, ambiguous: bool, target: sview @source, scope: sview @source, offset: u32) = module_alias_row_target(lookup_name, lexical_module, before_offset, structs)
+                    if selected.ambiguous:
+                        is_alias <- true
+                        return sview("", 0, 0)
+                    if not selected.found:
+                        is_alias <- hopped
+                        return target
+                    target <- selected.target
+                    lexical_module <- selected.scope
+                    before_offset <- selected.offset
+                    lookup_name <- target
+                    hopped <- true
+                    is_alias <- true
+                return sview("", 0, 0)
             # Each step follows a recorded alias. Bound traversal by the row count
             # so malformed cycles cannot hang or select an unrelated declaration.
             for step in 0..=structs.aliases.module_alias_names.count |structs, target, hopped, is_alias|:
@@ -81,6 +222,10 @@ extend Backend:
             can Abort.Panic, Memory.Allocate:
                 match head:
                     Expr.Ident(root_name, _):
+                        source_offset: mutable u32 = Ast::expr_pos(head).offset
+                        source_offset <- structs.visibility.current_source_offset if source_offset == 0
+                        if source_offset != 0:
+                            return append_module_alias_path(root_name, structs.visibility.current_owner, source_offset, structs, storage)
                         root_owner: sview = module_alias_target(root_name, structs)
                         for root_index in 0..<root_owner.len |root_owner, storage|:
                             storage.push(root_owner[root_index])

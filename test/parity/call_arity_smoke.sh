@@ -77,7 +77,12 @@ grep -q "function \"get\" expects 1 arguments, got 3" <<< "$out" || fail "call t
 out=$(printf 'def find(k: i64) -> i64?:\n    return 42 if k > 0 else null\n\ndef g() -> i64:\n    v: i64 = get find(1) else return 0\n    return v\n' | "$RPT")
 grep -q "expects.*arguments, got" <<< "$out" && fail "false positive on the get-else form: $out"
 
-# 16. 0 FP across frontend + stdlib.
+# 16. A forwarding marker belongs to its exact call, not every call on the same line.
+# `inner(..)` is valid; the outer call still has only one argument and must fail arity.
+out=$(printf 'def inner(left: i64, right: i64) -> i64:\n    return left + right\n\ndef outer(first: i64, second: i64, third: i64) -> void:\n    return\n\ndef caller(left: i64, right: i64, third: i64) -> void:\n    outer(inner(..))\n' | "$RPT")
+grep -q 'function "outer" expects 3 arguments, got 1' <<< "$out" || fail "same-line nested call inherited the inner forwarding marker: $out"
+
+# 17. 0 FP across frontend + stdlib.
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "expects.*arguments, got" || true)

@@ -19,7 +19,7 @@ HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not args.source_only)
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 ABI_REGIONS = ROOT / "src/backend/codegen_abi_regions.elisa"
-REGION_FORWARDING = ROOT / "src/backend/codegen_region_forwarding.elisa"
+REGION_FORWARDING = ROOT / "src/backend/codegen_region_forwarding/root_scan.elisa"
 POSITIVE = HERE / "backend_region_alias_scratch.elisa"
 NEGATIVE = HERE / "backend_region_alias_scratch_rejected.elisa"
 POSITIVE_NAMES = {

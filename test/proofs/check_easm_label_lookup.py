@@ -109,7 +109,6 @@ required_body = (
     'assert forall prior in 0..<index: instructions[prior].op != "label" or not easm_equal(easm_label_name(instructions[prior]), target)',
     "return found_index",
     'assert instructions[index].op != "label" or not easm_equal(easm_label_name(instructions[index]), target)',
-    'assert forall prior in 0..<(index + 1): instructions[prior].op != "label" or not easm_equal(easm_label_name(instructions[prior]), target)',
     'assert forall candidate in 0..<count: instructions[candidate].op != "label" or not easm_equal(easm_label_name(instructions[candidate]), target)',
 )
 positions = [lookup.find(compact(fragment)) for fragment in required_body]

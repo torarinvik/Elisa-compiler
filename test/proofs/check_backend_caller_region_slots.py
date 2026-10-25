@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
-SOURCE = ROOT / "src/backend/codegen_call.elisa"
+SOURCE = ROOT / "src/backend/codegen_call_direct.elisa"
+CALL_FACADE = ROOT / "src/backend/codegen_call.elisa"
 POSITIVE = HERE / "backend_caller_region_slots.elisa"
 NEGATIVE = HERE / "backend_caller_region_slots_rejected.elisa"
 POSITIVE_HASHES = {
@@ -24,10 +25,10 @@ NEGATIVE_HASHES = {
 def compact(text: str) -> str:
     return "".join("".join(line.split("#", 1)[0].split()) for line in text.splitlines())
 def section(text: str, name: str) -> str:
-    match = re.search(rf"(?m)^[ \t]*def {re.escape(name)}\(", text)
+    match = re.search(rf"(?m)^[ \t]*def {re.escape(name)}(?:\[[^\n]*?\])?\(", text)
     if not match:
         raise SystemExit(f"missing {name}")
-    following = re.search(r"(?m)^[ \t]*def [A-Za-z_]\w*\(", text[match.end():])
+    following = re.search(r"(?m)^[ \t]*def [A-Za-z_]\w*(?:\[[^\n]*?\])?\(", text[match.end():])
     return text[match.start():match.end() + following.start() if following else len(text)]
 for path, expected in ((POSITIVE, POSITIVE_HASHES), (NEGATIVE, NEGATIVE_HASHES)):
     text = path.read_text()
@@ -37,9 +38,11 @@ for path, expected in ((POSITIVE, POSITIVE_HASHES), (NEGATIVE, NEGATIVE_HASHES))
 if not NEGATIVE.read_text().startswith('include "./backend_caller_region_slots.elisa"'):
     raise SystemExit("false control must include the positive region-slot policy")
 body = compact(section(SOURCE.read_text(), "emit_direct_call_indexed"))
+if 'include "./codegen_call_direct.elisa"' not in CALL_FACADE.read_text():
+    raise SystemExit("direct-call implementation is no longer included by the production call facade")
 ordered = (
     "continueifnotfunction_parameter_has_region(fns,fn_index,parameter_position)",
-    "nullreturnifllvm_value_is_null(direct_arena)",
+    "returnnullifllvm_value_is_null(direct_arena)",
     "argument_values.push(direct_arena)",
     "direct_arena_slot<-direct_arena_slot+1",
     "whiledirect_arena_slot<arena_count|argument_values,direct_arena_slot,call_threaded_arena|:argument_values.push(call_threaded_arena)",
@@ -52,7 +55,7 @@ if args.source_only:
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":
     raise SystemExit("caller-region slot proof requires strict Elisa-Proof build")
-inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", SOURCE, POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
+inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", SOURCE, CALL_FACADE, POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
 before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 def run(path: Path):
     result = subprocess.run([str(BIN), "--json", str(path)], capture_output=True, text=True, timeout=60)

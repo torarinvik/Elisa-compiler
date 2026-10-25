@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
-SOURCE = ROOT / "src/backend/codegen_call.elisa"
+SOURCE = ROOT / "src/backend/codegen_call_direct.elisa"
+CALL_FACADE = ROOT / "src/backend/codegen_call.elisa"
 POSITIVE = HERE / "backend_call_declared_arity.elisa"
 NEGATIVE = HERE / "backend_call_declared_arity_rejected.elisa"
 POSITIVE_HASHES = {
@@ -28,10 +29,10 @@ NEGATIVE_HASHES = {
 def compact(text: str) -> str:
     return "".join("".join(line.split("#", 1)[0].split()) for line in text.splitlines())
 def section(text: str, name: str) -> str:
-    match = re.search(rf"(?m)^[ \t]*def {re.escape(name)}\(", text)
+    match = re.search(rf"(?m)^[ \t]*def {re.escape(name)}(?:\[[^\n]*?\])?\(", text)
     if not match:
         raise SystemExit(f"missing {name}")
-    following = re.search(r"(?m)^[ \t]*def [A-Za-z_]\w*\(", text[match.end():])
+    following = re.search(r"(?m)^[ \t]*def [A-Za-z_]\w*(?:\[[^\n]*?\])?\(", text[match.end():])
     return text[match.start():match.end() + following.start() if following else len(text)]
 for path, expected in ((POSITIVE, POSITIVE_HASHES), (NEGATIVE, NEGATIVE_HASHES)):
     text = path.read_text()
@@ -41,6 +42,8 @@ for path, expected in ((POSITIVE, POSITIVE_HASHES), (NEGATIVE, NEGATIVE_HASHES))
 if not NEGATIVE.read_text().startswith('include "./backend_call_declared_arity.elisa"'):
     raise SystemExit("false controls must import the call-arity model")
 body = compact(section(SOURCE.read_text(), "emit_direct_call_indexed"))
+if 'include "./codegen_call_direct.elisa"' not in CALL_FACADE.read_text():
+    raise SystemExit("direct-call implementation is no longer included by the production call facade")
 ordered = (
     "uses_defaults:bool=notvariadic_callandtotal_arguments<fixed_arguments",
     "expected_params:mutableusize=fixed_arguments+arena_count+(1ifwants_storeelse0)+(1ifsret_returnelse0)ifvariadic_calloruses_defaultselsetotal_arguments+arena_count+(1ifwants_storeelse0)+(1ifsret_returnelse0)",
@@ -56,7 +59,7 @@ if args.source_only:
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":
     raise SystemExit("call arity proof requires strict Elisa-Proof build")
-inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", SOURCE, POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
+inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", SOURCE, CALL_FACADE, POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
 before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 def run(path: Path):
     result = subprocess.run([str(BIN), "--json", str(path)], capture_output=True, text=True, timeout=60)

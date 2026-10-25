@@ -163,9 +163,12 @@ def module_symbol_matches_relative(candidate: sview, enclosing: sview, names: da
         raise SystemExit(f"semantic {wrapper} no longer delegates to its proved matcher")
 if semantic_text.count('include "./check_type_path_separator.elisa"') != 1:
     raise SystemExit("semantic root must include the matcher wrappers exactly once")
+qualified_candidate = compact(function_section(binding_resolver_text, "binding_nominal_qualified_candidate"))
 nominal_lookup = compact(function_section(binding_resolver_text, "binding_nominal_declaration"))
-if "module_symbol_matches(" not in nominal_lookup or "module_symbol_matches_relative(" not in nominal_lookup:
-    raise SystemExit("qualified nominal resolver must retain both proven module-path matchers")
+if "module_symbol_matches(" not in qualified_candidate or "module_symbol_matches_relative(" not in qualified_candidate:
+    raise SystemExit("qualified nominal candidate must retain both proven module-path matchers")
+if "binding_nominal_qualified_candidate(" not in nominal_lookup:
+    raise SystemExit("qualified nominal resolver must route through the proved candidate matcher")
 
 positive_names = {
     "absolute_module_path_matches_all_segments",

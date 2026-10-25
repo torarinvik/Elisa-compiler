@@ -1,5 +1,49 @@
 extend Backend:
     private:
+        # The extern marker is declaration metadata. A name-only lookup lets a fallible
+        # extern in one module mark every same-named extern in this file as fallible too,
+        # which changes the latter's C ABI by adding a status/out-value convention. The
+        # parser records the declaration position on this row, so use the same key here.
+        def extern_is_error_returning(annotations: darray[Ast::EnumAnnotation]&, extern_name: sview, extern_pos: Ast::Pos) -> bool can[Abort.Panic]:
+            can Abort.Panic:
+                for annotation in annotations |annotations, extern_name, extern_pos|:
+                    return true if annotation.owner == extern_name and annotation.name == "__error_return" and annotation.line == extern_pos.line and annotation.offset == extern_pos.offset
+                return false
+
+
+        # Recover the family from the same return occurrence. The parallel line table is
+        # retained for older parser payloads, but `#line` and included source can reuse line
+        # numbers, so it must not choose the ABI family when exact annotation rows exist.
+        def extern_error_family_name(structs: StructTable&, annotations: darray[Ast::EnumAnnotation]&, extern_name: sview, extern_pos: Ast::Pos) -> sview @source can[Abort.Panic]:
+            can Abort.Panic:
+                return_identity: mutable u32 = 0
+                return_occurrence: mutable u32 = 0
+                exact_marker_count: mutable usize = 0.usize()
+                line_marker_count: mutable usize = 0.usize()
+                for marker in annotations |return_identity, return_occurrence, exact_marker_count, line_marker_count, annotations, extern_name, extern_pos|:
+                    continue if marker.name != "__error_return" or marker.line != extern_pos.line
+                    line_marker_count <- line_marker_count + 1.usize()
+                    if marker.owner == extern_name and marker.offset == extern_pos.offset:
+                        return_identity <- marker.identity_id
+                        return_occurrence <- marker.occurrence_offset
+                        exact_marker_count <- exact_marker_count + 1.usize()
+                return "" if exact_marker_count != 1.usize()
+                registered_name: sview @source = line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_offsets, structs.errors.error_fn_set_names, extern_pos.line, extern_pos.offset + 1)
+                for candidate in annotations |return_identity, return_occurrence, extern_pos|:
+                    return registered_name if registered_name != "" and candidate.owner == "__error_set_key" and candidate.line == extern_pos.line and candidate.offset == extern_pos.offset and candidate.identity_id == return_identity and candidate.occurrence_offset == return_occurrence
+                    return candidate.name if candidate.owner == "__error_set_key" and candidate.line == extern_pos.line and candidate.offset == extern_pos.offset and candidate.identity_id == return_identity and candidate.occurrence_offset == return_occurrence
+                for candidate in annotations |return_identity, return_occurrence, extern_name, extern_pos|:
+                    return registered_name if registered_name != "" and candidate.owner == extern_name and candidate.name != "__error_return" and candidate.line == extern_pos.line and candidate.offset == extern_pos.offset and candidate.identity_id == return_identity and candidate.occurrence_offset == return_occurrence
+                    return candidate.name if candidate.owner == extern_name and candidate.name != "__error_return" and candidate.line == extern_pos.line and candidate.offset == extern_pos.offset and candidate.identity_id == return_identity and candidate.occurrence_offset == return_occurrence
+                for candidate in annotations |return_identity, return_occurrence, extern_pos|:
+                    return registered_name if registered_name != "" and candidate.owner == "__error_set_family" and candidate.line == extern_pos.line and candidate.offset == extern_pos.offset and candidate.identity_id == return_identity and candidate.occurrence_offset == return_occurrence
+                    return candidate.name if candidate.owner == "__error_set_family" and candidate.line == extern_pos.line and candidate.offset == extern_pos.offset and candidate.identity_id == return_identity and candidate.occurrence_offset == return_occurrence
+                # A unique return marker on this line is a safe compatibility fallback for
+                # older serialized annotations that lack the exact family occurrence rows.
+                return line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_offsets, structs.errors.error_fn_set_names, extern_pos.line, extern_pos.offset + 1) if line_marker_count == 1.usize()
+                return ""
+
+
         def declare_extern(declaration: Decl, extern_params: darray[ExternParam]&, extern_global_type_names: darray[sview]&, extern_global_type_exprs: darray[Expr]&, annotation_args: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, return_is_pointer: bool, fns: mutable FnTable&, structs: mutable StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             if declaration is Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
                 # `export pymodule NAME:` is a frontend-only export contract. Its declaration
@@ -313,14 +357,10 @@ extend Backend:
                 # against a stage0-built implementation passes no out-pointer and reads the
                 # status as the value.
                 #
-                # Detected from the parser's `__error_return` annotation (recorded per extern
-                # NAME in parse_extern_signature_and_body), NOT from
-                # File.error_set_func_lines: that table only ever receives `def` lines,
-                # because its push is guarded by `signature_has_error_set`, which
-                # parse_signature_clauses sets and resets and which ONLY the `def` path
-                # calls. For an extern that flag is stale from the previous `def`, so keying
-                # on it would mark arbitrary externs error-returning.
-                extern_is_error: bool = annotation_pair_present(structs, annotations, extern_name, "__error_return")
+                # Detected from the parser's `__error_return` annotation at this exact
+                # declaration position. The File side table also contains some extern/export
+                # rows, but it is not the source of truth for this declaration's ABI identity.
+                extern_is_error: bool = extern_is_error_returning(annotations, extern_name, extern_line)
                 if extern_is_error:
                     extern_error_params: mutable darray[LLVMTypeRef] = []
                     extern_error_params.push(LLVMPointerTypeInContext(ctx, 0))
@@ -338,7 +378,7 @@ extend Backend:
                 # return their full `%ErrSet` aggregate. Declaring these as i32 makes the
                 # call value incompatible with catch's status/payload extracts (and can
                 # make LLVMBuildExtractValue return null for a scalar result).
-                extern_error_family: sview = resolved_error_family(line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_set_names, extern_line.line), structs) if extern_is_error else ""
+                extern_error_family: sview = resolved_error_family(extern_error_family_name(structs, annotations, extern_name, extern_line), structs) if extern_is_error else ""
                 llvm_return <- error_set_llvm_type(structs, extern_error_family, ctx) if extern_is_error and error_set_has_payload(structs, extern_error_family)
                 extern_error_sret: mutable bool = false
                 # At a native C boundary the error-set aggregate itself follows the target C
@@ -474,6 +514,7 @@ extend Backend:
                 fns.names <- fns.names.push(extern_name)
                 index_appended_function_names(fns)
                 fns.lines <- fns.lines.push(extern_line.line)
+                fns.offsets <- fns.offsets.push(extern_line.offset + 1)
                 fns.owners <- fns.owners.push("")
                 fns.needs_arena <- fns.needs_arena.push(false)
                 fns.arena_counts <- fns.arena_counts.push(0)
@@ -514,6 +555,7 @@ extend Backend:
                     fns.names <- fns.names.push("pool_shutdown")
                     index_appended_function_names(fns)
                     fns.lines <- fns.lines.push(extern_line.line)
+                    fns.offsets <- fns.offsets.push(extern_line.offset + 1)
                     fns.owners <- fns.owners.push("")
                     fns.needs_arena <- fns.needs_arena.push(false)
                     fns.arena_counts <- fns.arena_counts.push(0)

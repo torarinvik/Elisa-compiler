@@ -1,29 +1,116 @@
 extend Semantic:
     private:
+        # A no-argument call can select a declaration whose parameters all have defaults.
+        def progress_parameters_allow_zero_arguments(parameters: darray[Ast::ParamDecl]) -> bool:
+            can Abort.Panic:
+                for parameter in parameters:
+                    return false if not parameter.has_default
+                return true
+
+        # The graph uses name-only call edges, so include a node only when exactly one
+        # declaration with that name can accept zero arguments. Required-parameter overloads
+        # are ineligible; multiple defaulted/empty overloads stay ambiguous and unproved.
+        def progress_zero_arg_callable_declaration_count(declarations: darray[Ast::Decl], target_name: sview) -> usize:
+            can Abort.Panic:
+                count: mutable usize = 0
+                for declaration in declarations:
+                    match declaration:
+                        Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
+                            count <- count + 1.usize() if function_name == target_name and progress_parameters_allow_zero_arguments(parameters)
+                        _:
+                            pass
+                return count
+
+        def progress_collect_default_zero_arg_calls(parameters: darray[Ast::ParamDecl], out: mutable darray[sview]&, protected_edges: mutable darray[bool]&, table: SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                uncovered: mutable bool = true
+                covered: mutable bool = false
+                for parameter in parameters |out, protected_edges, uncovered, covered, table|:
+                    if parameter.has_default and (uncovered or covered):
+                        # Progress evidence belongs to the lexical scope that supplies it.
+                        # Defaults are evaluated one after another, but a `can Progress.Tick`
+                        # block in one default cannot protect a recursive call in the next.
+                        default_uncovered: mutable bool = uncovered or covered
+                        default_covered: mutable bool = false
+                        progress_collect_zero_arg_calls_expr(parameter.default_value, out, protected_edges, default_uncovered, default_covered, table)
+                        # Keep only whether evaluation can continue into the next default;
+                        # discard any hatch state when leaving this initializer.
+                        uncovered <- default_uncovered or default_covered
+                        covered <- false
+
+        # A call with omitted arguments evaluates the callee's defaults before entering its
+        # body. Body decreases evidence therefore cannot hide a cycle through default edges.
+        def progress_reaches_self_with_defaults(origin: usize, current: usize, names: darray[sview]&, has_evidence: darray[bool]&, default_start: darray[usize]&, default_count: darray[usize]&, default_callees: darray[sview]&, body_start: darray[usize]&, body_count: darray[usize]&, body_callees: darray[sview]&, visited: mutable darray[bool]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                edge: mutable usize = 0
+                while edge < default_count[current] |edge, origin, current, names, has_evidence, default_start, default_count, default_callees, body_start, body_count, body_callees, visited|:
+                    callee_name: sview = default_callees[default_start[current] + edge]
+                    target: mutable i64 = -1
+                    probe: mutable usize = 0
+                    while probe < names.count |target, probe, callee_name, names|:
+                        target <- probe.i64() if names[probe] == callee_name and target < 0
+                        probe <- probe + 1
+                    if target >= 0:
+                        return true if target.usize() == origin
+                        if not visited[target.usize()]:
+                            visited[target.usize()] <- true
+                            return true if progress_reaches_self_with_defaults(origin, target.usize(), names, has_evidence, default_start, default_count, default_callees, body_start, body_count, body_callees, visited)
+                    edge <- edge + 1
+                if not has_evidence[current]:
+                    edge <- 0
+                    while edge < body_count[current] |edge, origin, current, names, has_evidence, default_start, default_count, default_callees, body_start, body_count, body_callees, visited|:
+                        callee_name: sview = body_callees[body_start[current] + edge]
+                        target: mutable i64 = -1
+                        probe: mutable usize = 0
+                        while probe < names.count |target, probe, callee_name, names|:
+                            target <- probe.i64() if names[probe] == callee_name and target < 0
+                            probe <- probe + 1
+                        if target >= 0:
+                            return true if target.usize() == origin
+                            if not visited[target.usize()]:
+                                visited[target.usize()] <- true
+                                return true if progress_reaches_self_with_defaults(origin, target.usize(), names, has_evidence, default_start, default_count, default_callees, body_start, body_count, body_callees, visited)
+                        edge <- edge + 1
+                return false
+
         # File-level pass: functions in a zero-arg recursive cycle with no progress evidence.
         def progress_recursive_cycles(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 names: mutable darray[sview] = []
                 lines: mutable darray[u32] = []
                 has_evidence: mutable darray[bool] = []
-                callee_start: mutable darray[usize] = []
-                callee_count: mutable darray[usize] = []
-                all_callees: mutable darray[sview] = []
-                for declaration in declarations |names, lines, has_evidence, callee_start, callee_count, all_callees|:
+                body_start: mutable darray[usize] = []
+                body_count: mutable darray[usize] = []
+                all_body_callees: mutable darray[sview] = []
+                default_start: mutable darray[usize] = []
+                default_count: mutable darray[usize] = []
+                all_default_callees: mutable darray[sview] = []
+                for declaration in declarations |names, lines, has_evidence, body_start, body_count, all_body_callees, default_start, default_count, all_default_callees, declarations|:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             # The edge collector records calls with no arguments. Keep only
-                            # declarations that can be selected by that arity; otherwise an
-                            # earlier overload with parameters can steal the name-only edge
-                            # from a later recursive zero-argument declaration.
-                            if parameters.count == 0:
+                            # declarations that can be selected by that arity. Required
+                            # overloads do not count; competing defaulted/empty overloads do.
+                            if progress_parameters_allow_zero_arguments(parameters) and progress_zero_arg_callable_declaration_count(declarations, function_name) == 1.usize():
                                 names.push(function_name)
                                 lines.push(line.line)
                                 # Hatches are edge-local: a budget only covers calls inside its
                                 # lexical block. A function-level decreases contract covers its
-                                # recursive edges as a whole.
+                                # body-recursive edges as a whole.
                                 has_evidence.push(progress_body_has_decreases(body))
-                                callee_start.push(all_callees.count)
+                                default_start.push(all_default_callees.count)
+                                local_default_callees: mutable darray[sview] = []
+                                local_default_protection: mutable darray[bool] = []
+                                progress_collect_default_zero_arg_calls(parameters, local_default_callees, local_default_protection, table)
+                                kept_default_edges: mutable usize = 0
+                                default_edge: mutable usize = 0
+                                while default_edge < local_default_callees.count |default_edge, kept_default_edges, local_default_callees, local_default_protection, all_default_callees|:
+                                    if not local_default_protection[default_edge]:
+                                        all_default_callees.push(local_default_callees[default_edge])
+                                        kept_default_edges <- kept_default_edges + 1
+                                    default_edge <- default_edge + 1
+                                default_count.push(kept_default_edges)
+                                body_start.push(all_body_callees.count)
                                 local_callees: mutable darray[sview] = []
                                 local_protection: mutable darray[bool] = []
                                 local_uncovered: mutable bool = true
@@ -31,19 +118,18 @@ extend Semantic:
                                 progress_collect_zero_arg_calls_body(body, local_callees, local_protection, local_uncovered, local_covered, table)
                                 kept_edges: mutable usize = 0
                                 edge: mutable usize = 0
-                                while edge < local_callees.count |edge, kept_edges, local_callees, local_protection, all_callees|:
+                                while edge < local_callees.count |edge, kept_edges, local_callees, local_protection, all_body_callees|:
                                     if not local_protection[edge]:
-                                        all_callees.push(local_callees[edge])
+                                        all_body_callees.push(local_callees[edge])
                                         kept_edges <- kept_edges + 1
                                     edge <- edge + 1
-                                callee_count.push(kept_edges)
+                                body_count.push(kept_edges)
                         _:
                             pass
                 index: mutable usize = 0
-                while index < names.count |index, names, lines, has_evidence, callee_start, callee_count, all_callees, table|:
-                    if not has_evidence[index]:
-                        visited: mutable darray[bool] = [false for _ in names]
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProgressRecursiveCycle, name: names[index], line: lines[index], expected: "", actual: ""}) if progress_reaches_self(index, index, names, has_evidence, callee_start, callee_count, all_callees, visited)
+                while index < names.count |index, names, lines, has_evidence, default_start, default_count, all_default_callees, body_start, body_count, all_body_callees, table|:
+                    visited: mutable darray[bool] = [false for _ in names]
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ProgressRecursiveCycle, name: names[index], line: lines[index], expected: "", actual: ""}) if progress_reaches_self_with_defaults(index, index, names, has_evidence, default_start, default_count, all_default_callees, body_start, body_count, all_body_callees, visited)
                     index <- index + 1
 
         def check_progress_safety(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:

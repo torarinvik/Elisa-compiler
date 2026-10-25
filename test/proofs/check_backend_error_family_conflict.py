@@ -1,6 +1,7 @@
 """Admit the source-linked duplicate-family conflict gate for function error metadata."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,10 +12,13 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 SOURCE = ROOT / "src/backend/codegen_fn_types.elisa"
 POSITIVE = HERE / "backend_error_family_conflict.elisa"
 NEGATIVE = HERE / "backend_error_family_conflict_rejected.elisa"
@@ -120,7 +124,7 @@ def require_conflict_source_layout(source: str) -> None:
     function_indent = len(header) - len(header.lstrip(" \t"))
     function_children = direct_children(lines, header_index, function_indent)
     expected_function_children = [
-        "paired: usize = structs.function_types.fn_error_lines.count if structs.function_types.fn_error_lines.count < structs.function_types.fn_error_families.count else structs.function_types.fn_error_families.count",
+        "paired: mutable usize = structs.function_types.fn_error_lines.count if structs.function_types.fn_error_lines.count < structs.function_types.fn_error_families.count else structs.function_types.fn_error_families.count",
         "paired <- structs.function_types.fn_error_offsets.count if structs.function_types.fn_error_offsets.count < paired",
         'found: mutable sview = ""',
         "for index in 0..<paired |found, offset, line, structs|:",
@@ -166,8 +170,8 @@ else:
 bound_mutations = (
     (
         "zero paired-row bound",
-        "paired: usize = structs.function_types.fn_error_lines.count if structs.function_types.fn_error_lines.count < structs.function_types.fn_error_families.count else structs.function_types.fn_error_families.count",
-        "paired: usize = 0",
+        "paired: mutable usize = structs.function_types.fn_error_lines.count if structs.function_types.fn_error_lines.count < structs.function_types.fn_error_families.count else structs.function_types.fn_error_families.count",
+        "paired: mutable usize = 0",
     ),
     (
         "missing offset-row clamp",
@@ -196,6 +200,10 @@ for name, shape in POSITIVE_SHAPES.items():
         raise SystemExit(f"{name} no longer states its intended conflict-gate property")
 if 'include "./backend_error_family_conflict.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer include the positive source-linked model")
+
+if args.source_only:
+    print(json.dumps({"source_bound": True, "positive_shapes": len(POSITIVE_SHAPES), "negative_controls": len(NEGATIVE_NAMES)}, sort_keys=True))
+    raise SystemExit(0)
 
 
 try:

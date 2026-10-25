@@ -45,19 +45,19 @@ if not NEGATIVE.read_text().startswith('include "./backend_cabi_arm64_return.eli
     raise SystemExit("false controls must import the arm64 return model")
 classifier = compact(section(CLASSIFIER.read_text(), "cabi_classify_ret_llvm"))
 ordered = (
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifnotret_is_aggregate",
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifsize==0",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifnotret_is_aggregate",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifsize==0",
     "flat_ok:bool=cabi_flatten(llvm_value,0,leaves,structs)",
-    "CabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}returnifflat_ok==false",
+    "returnCabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}ifflat_ok==false",
     "target:i32=cabi_target(structs)",
     "iftarget==0:",
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifcabi_hfa_count(leaves)>0",
-    "CabiRetPlan{direct:true,sret:false,ret_type:LLVMIntTypeInContext(ctx,(size*8).u32()),value_type:llvm_value}returnifsize<=8",
-    "CabiRetPlan{direct:true,sret:false,ret_type:LLVMArrayType(LLVMInt64TypeInContext(ctx),2),value_type:llvm_value}returnifsize<=16",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifcabi_hfa_count(leaves)>0",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:LLVMIntTypeInContext(ctx,(size*8).u32()),value_type:llvm_value}ifsize<=8",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:LLVMArrayType(LLVMInt64TypeInContext(ctx),2),value_type:llvm_value}ifsize<=16",
 )
 if any(part not in classifier for part in ordered) or [classifier.index(part) for part in ordered] != sorted(classifier.index(part) for part in ordered):
     raise SystemExit("arm64 return classifier no longer matches HFA and size branches")
-size16_position = classifier.index("CabiRetPlan{direct:true,sret:false,ret_type:LLVMArrayType(LLVMInt64TypeInContext(ctx),2),value_type:llvm_value}returnifsize<=16")
+size16_position = classifier.index("returnCabiRetPlan{direct:true,sret:false,ret_type:LLVMArrayType(LLVMInt64TypeInContext(ctx),2),value_type:llvm_value}ifsize<=16")
 if classifier.find("returnCabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}", size16_position) < 0:
     raise SystemExit("arm64 aggregate returns above sixteen bytes must use sret")
 wrapper = compact(section(WRAPPER.read_text(), "emit_export_wrapper_to"))

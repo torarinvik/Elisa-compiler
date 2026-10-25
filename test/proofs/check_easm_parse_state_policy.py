@@ -165,24 +165,35 @@ for source_path in [*ROOT.joinpath("src").rglob("*.elisa"), *ROOT.joinpath("test
     source_text = source_path.read_text()
     if re.search(r"parse_(?:layout_)?module\s*\(\s*\(&", source_text):
         raise SystemExit(f"raw pointer passed to the bounded EASM parser at {source_path.relative_to(ROOT)}")
-required_invariants = (
-    "invariant cursor <= length",
-    "invariant easm_declaration_index_valid(current_kind, current_index, out.functions.count, out.fragments.count, out.protocols.count, out.templates.count)",
-    "invariant active_layout >= -1",
-    "invariant (current_kind == EasmDeclarationKind.Layout) == (active_layout >= 0)",
-    "invariant active_layout < 0 or active_layout.usize() < out.layouts.count",
-    "invariant active_target == -1 or (active_target >= 0 and current_kind == EasmDeclarationKind.Function and current_index >= 0 and current_index.usize() < out.functions.count and active_target.usize() < out.functions[current_index.usize()].targets.count)",
-    "invariant easm_body_routing_valid(body_mode, current_kind, active_target)",
+required_state_guards = (
+    "state_valid:bool=easm_declaration_index_valid(current_kind,current_index,out.functions.count,out.fragments.count,out.protocols.count,out.templates.count)",
+    "andactive_layout>=-1",
+    "(current_kind==EasmDeclarationKind.Layout)==(active_layout>=0)",
+    "active_layout<0oractive_layout.usize()<out.layouts.count",
+    "active_target.usize()<out.functions[current_index.usize()].targets.count",
+    "andeasm_body_routing_valid(body_mode,current_kind,active_target)",
+    "ifnotstate_valid:",
+    "current_kind<-EasmDeclarationKind.None",
+    "current_index<--1",
+    "active_layout<--1",
+    "active_target<--1",
+    "body_mode<-EasmBodyMode.None",
+    "section<-\"\"",
+    "assert(easm_declaration_index_valid(current_kind,current_index,out.functions.count,out.fragments.count,out.protocols.count,out.templates.count))",
+    "assert(active_layout>=-1)",
+    "assert(active_target==-1or",
+    "assert(easm_body_routing_valid(body_mode,current_kind,active_target))",
 )
-if any(compact(fragment) not in parse_body for fragment in required_invariants):
-    raise SystemExit("line-parser routing state lost an index-domain invariant")
-declaration_invariant = parse_body.find("invarianteasm_declaration_index_valid(")
-target_invariant = parse_body.find("invariantactive_target==-1or")
+if "invariantcursor<=length" not in parse_body or any(
+        compact(fragment) not in parse_body for fragment in required_state_guards):
+    raise SystemExit("line-parser routing state lost its fail-closed index-domain guards")
+declaration_guard = parse_body.find("state_valid:bool=easm_declaration_index_valid(")
+state_reset = parse_body.find("ifnotstate_valid:")
+target_assert = parse_body.find("assert(active_target==-1or", state_reset)
 line_scan = parse_body.find("line_start:usize=cursor")
-last_invariant = max(parse_body.find(compact(fragment)) for fragment in required_invariants)
-if declaration_invariant < 0 or target_invariant < declaration_invariant \
-        or line_scan <= last_invariant:
-    raise SystemExit("collection-index invariants must dominate target indexing and source-line parsing")
+if declaration_guard < 0 or state_reset <= declaration_guard or target_assert <= state_reset \
+        or line_scan <= target_assert:
+    raise SystemExit("state reset and index guards must dominate source-line parsing")
 project_body = compact(function_section(parser_text, "parse_project"))
 if not all(fragment in project_body for fragment in (
         "bytes:darray[u8]&=&source.bytes",

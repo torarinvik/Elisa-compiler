@@ -5,18 +5,549 @@
 # error-returning-ness comes from the `__error_return` side-table annotation (owner = fn name).
 extend Semantic:
     private:
-        # If EXPRESSION (through a paren) is a direct call to an error-union-returning function,
-        # its callee name, else "".
-        def error_call_name(expression: Ast::Expr, fallible_callables: NameSet&) -> sview @source:
+        # Local and parameter type facts used by this checker. Keep these separate
+        # from Ast::ParamDecl so the append-only pass never constructs nodes in the
+        # submitting scope's shared Ast::Node store.
+        struct ErrorUnionBindingFact:
+            name: sview @source
+            type_name: sview @source
+
+        # A qualified callee's prefix (`Provider::Inner::load` -> `Provider::Inner`).
+        def error_call_module_path(expression: Ast::Expr, table: mutable SymbolTable&) -> sview @source:
             can Memory.Allocate, Abort.Panic:
                 match expression:
-                    Expr.Call(callee, arguments, argument_names, call_line):
-                        callee_name: sview @source = ident_name_of(callee)
-                        if callee_name != "" and name_set_contains(fallible_callables, callee_name):
-                            return callee_name
+                    Expr.Ident(module_name, _):
+                        return module_name
+                    Expr.Scope(parent, child, _):
+                        parent_path: sview @source = error_call_module_path(parent, table)
+                        return try_noncall_module_path(parent_path, child, table)
+                    Expr.Paren(inner, _):
+                        return error_call_module_path(inner, table)
+                    _:
                         return sview("", 0, 0)
-                    Expr.Paren(inner, paren_line):
-                        return error_call_name(inner, fallible_callables)
+
+        # A local value with the same spelling as a module name shadows a qualified
+        # module path (`Provider::load`). Keep the root segment so the call classifier
+        # can decline that expression when a parameter or local binds it.
+        def error_call_module_root(expression: Ast::Expr) -> sview @source:
+            can Abort.Panic:
+                match expression:
+                    Expr.Ident(module_name, _):
+                        return module_name
+                    Expr.Scope(parent, _, _):
+                        return error_call_module_root(parent)
+                    Expr.Paren(inner, _):
+                        return error_call_module_root(inner)
+                    _:
+                        return sview("", 0, 0)
+
+        # A selective import makes an otherwise unqualified call resolve to the source
+        # module. Pick the closest visible import that precedes this call. At the same
+        # lexical depth, Core keeps the first target for a duplicated bare import.
+        def error_imported_module(annotations: darray[Ast::EnumAnnotation]&, callee_name: sview, lexical_module: sview, call_pos: Ast::Pos, table: mutable SymbolTable&) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                selected_module: mutable sview @source = ""
+                selected_scope_length: mutable usize = 0
+                selected_offset: mutable u32 = 0
+                selected_line: mutable u32 = 0
+                for imported in annotations |selected_module, selected_scope_length, selected_offset, selected_line, annotations, callee_name, lexical_module, call_pos, table|:
+                    continue if imported.owner != "__from_member" or imported.name != callee_name
+                    continue if not catch_module_is_ancestor(imported.module, lexical_module)
+                    visible_before_call: bool = imported.offset < call_pos.offset if imported.offset != 0 and call_pos.offset != 0 else imported.line < call_pos.line
+                    continue if not visible_before_call
+                    source_module: mutable sview @source = ""
+                    for source in annotations |source_module, imported|:
+                        source_module <- source.name if source.owner == "__from_src" and source.module == imported.module and source.line == imported.line and source.offset == imported.offset
+                    continue if source_module == ""
+                    resolved_source_module: sview @source = try_noncall_module_path(imported.module, source_module, table)
+                    earlier_same_scope: bool = imported.offset < selected_offset if imported.offset != 0 and selected_offset != 0 else imported.line < selected_line
+                    if selected_module == "" or imported.module.len > selected_scope_length or (imported.module.len == selected_scope_length and earlier_same_scope):
+                        selected_module <- resolved_source_module
+                        selected_scope_length <- imported.module.len
+                        selected_offset <- imported.offset
+                        selected_line <- imported.line
+                return selected_module
+
+        def error_union_forwarded_param_supplies(caller_params: darray[ErrorUnionBindingFact], name: sview) -> bool:
+            can Abort.Panic:
+                return true if any parameter in caller_params where parameter.name == name
+                return false
+
+
+        def error_union_type_expression_name(type_expression: Ast::Expr) -> sview @source:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return name
+                    _:
+                        return ""
+
+
+        # The semantic pass does not retain a selected call-target row. It can still
+        # reject a candidate when a caller parameter and callee parameter have plainly
+        # different primitive types: backend overload matching requires exact value-type
+        # identity. Unknown, aliased, generic, and non-primitive types remain conservative.
+        def error_union_primitive_types_compatible(actual_type: sview, expected_type: sview) -> bool:
+            can Abort.Panic:
+                return true if actual_type == "" or expected_type == ""
+                return true if not is_bare_primitive_type(actual_type) or not is_bare_primitive_type(expected_type)
+                return actual_type == expected_type
+
+
+        def error_union_argument_matches_type_name(argument: Ast::Expr, expected_type: sview, caller_params: darray[ErrorUnionBindingFact], local_shadowed: NameSet&) -> bool:
+            can Abort.Panic:
+                return true if expected_type == ""
+                match argument:
+                    Expr.Paren(inner, _):
+                        return error_union_argument_matches_type_name(inner, expected_type, caller_params, local_shadowed)
+                    Expr.IntLit(_, _):
+                        return is_integer_type_name(expected_type) if is_bare_primitive_type(expected_type)
+                    Expr.FloatLit(_, _):
+                        return is_float_type_name(expected_type) if is_bare_primitive_type(expected_type)
+                    Expr.BoolLit(_, _):
+                        return expected_type == "bool" if is_bare_primitive_type(expected_type)
+                    Expr.CharLit(_, _):
+                        return expected_type == "char" if is_bare_primitive_type(expected_type)
+                    Expr.Ident(argument_name, _):
+                        actual_type: mutable sview = ""
+                        found_parameter: mutable bool = false
+                        for caller_parameter in caller_params |argument_name, local_shadowed|:
+                            if caller_parameter.name == argument_name:
+                                actual_type <- caller_parameter.type_name
+                                found_parameter <- true
+                        return true if name_set_contains(local_shadowed, argument_name) and not found_parameter
+                        return error_union_primitive_types_compatible(actual_type, expected_type) if found_parameter
+                    _:
+                        pass
+                return true
+
+
+        def error_union_argument_matches_parameter_type(argument: Ast::Expr, parameter: Ast::ParamDecl, caller_params: darray[ErrorUnionBindingFact], local_shadowed: NameSet&) -> bool:
+            can Abort.Panic:
+                return error_union_argument_matches_type_name(argument, error_union_type_expression_name(parameter.type_expression), caller_params, local_shadowed)
+
+
+        # Core's free-call receiver ranking examines only formal zero. Mirror that
+        # shape here; later formals still participate in viability checks above but
+        # cannot break a tie. Nominal aliases and structural first formals need
+        # resolved type evidence that this pass does not retain.
+        def error_union_type_generic_specificity(type_expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, declaration_module: sview, declaration_line: u32, declaration_offset: u32) -> (known: bool, generic_count: usize):
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Ident(name, _):
+                        return (true, 1.usize()) if any annotation in annotations where annotation.owner == name and annotation.name == "__generic_param_identity" and annotation.detail_line == declaration_line and annotation.offset == declaration_offset and annotation.module == declaration_module
+                        return (is_bare_primitive_type(name), 0.usize())
+                    Expr.Unary(_, operand, _) | Expr.Paren(operand, _) | Expr.Move(operand, _) | Expr.Refinement(operand, _, _):
+                        return error_union_type_generic_specificity(operand, annotations, declaration_module, declaration_line, declaration_offset)
+                    _:
+                        return (false, 0.usize())
+
+
+        def error_union_function_generic_specificity(params: darray[Ast::ParamDecl], annotations: darray[Ast::EnumAnnotation]&, declaration_module: sview, declaration_line: u32, declaration_offset: u32) -> (known: bool, generic_count: usize):
+            can Abort.Panic:
+                return (true, 0.usize()) if params.count == 0
+                return error_union_type_generic_specificity(params[0].type_expression, annotations, declaration_module, declaration_line, declaration_offset)
+
+
+        # Only primitive parameters and bool/char literals provide enough argument
+        # evidence for concrete-over-generic ranking here. Calls, fields, nominal
+        # bindings and untyped numeric literals retain the resolver's conservative tie.
+        def error_union_argument_has_primitive_evidence(argument: Ast::Expr, caller_params: darray[ErrorUnionBindingFact]) -> bool:
+            can Abort.Panic:
+                match argument:
+                    Expr.Paren(inner, _):
+                        return error_union_argument_has_primitive_evidence(inner, caller_params)
+                    Expr.BoolLit(_, _) | Expr.CharLit(_, _):
+                        return true
+                    Expr.Ident(name, _):
+                        actual_type: mutable sview = ""
+                        found: mutable bool = false
+                        for parameter in caller_params |actual_type, found, name|:
+                            if parameter.name == name:
+                                actual_type <- parameter.type_name
+                                found <- true
+                        return found and is_bare_primitive_type(actual_type)
+                    _:
+                        return false
+
+
+        def error_union_call_has_primitive_type_evidence(arguments: darray[Ast::Expr], caller_params: darray[ErrorUnionBindingFact]) -> bool:
+            can Abort.Panic:
+                return false if arguments.count == 0
+                return error_union_argument_has_primitive_evidence(arguments[0], caller_params)
+
+
+        # Call-forwarding walks visible bindings from the innermost scope out. The
+        # environment here stores shadowing locals after function parameters, so retain
+        # the last matching name when checking which overload receives the value.
+        def error_union_forwarded_type_matches(name: sview, expected_type: sview, caller_params: darray[ErrorUnionBindingFact]) -> bool:
+            can Abort.Panic:
+                return true if expected_type == ""
+                actual_type: mutable sview = ""
+                found_parameter: mutable bool = false
+                for caller_parameter in caller_params |expected_type|:
+                    if caller_parameter.name == name:
+                        actual_type <- caller_parameter.type_name
+                        found_parameter <- true
+                return error_union_primitive_types_compatible(actual_type, expected_type) if found_parameter
+                return true
+
+
+        def error_union_forwarded_parameter_matches_type(parameter: Ast::ParamDecl, caller_params: darray[ErrorUnionBindingFact]) -> bool:
+            can Abort.Panic:
+                return error_union_forwarded_type_matches(parameter.name, error_union_type_expression_name(parameter.type_expression), caller_params)
+
+
+        def error_union_call_forwards_args(annotations: darray[Ast::EnumAnnotation]&, call_pos: Ast::Pos) -> bool:
+            can Abort.Panic:
+                for marker in annotations |call_pos|:
+                    continue if marker.owner != "__arg_forward" or marker.name != "__arg_forward" or marker.line != call_pos.line
+                    continue if marker.offset != 0 and call_pos.offset != 0 and marker.offset != call_pos.offset
+                    return true
+                return false
+
+
+        def error_union_function_accepts_call(params: darray[Ast::ParamDecl], decorators: darray[Ast::Annotation], arguments: darray[Ast::Expr], argument_names: darray[sview @source], caller_params: darray[ErrorUnionBindingFact], local_shadowed: NameSet&, forwards_arguments: bool) -> bool:
+            can Abort.Panic:
+                variadic: bool = any decorator in decorators where decorator.name == "c_variadic"
+                return false if forwards_arguments and variadic
+                assigned: mutable darray[bool] = []
+                for _ in 0..<params.count |assigned|:
+                    assigned.push(false)
+                positional_index: mutable usize = 0.usize()
+                seen_named: mutable bool = false
+                for argument_index in 0..<arguments.count |assigned, positional_index, seen_named, argument_names, arguments, params, variadic, caller_params, local_shadowed|:
+                    argument_name: sview = argument_names[argument_index] if argument_index < argument_names.count else ""
+                    if argument_name == "":
+                        return false if seen_named
+                        if positional_index >= params.count:
+                            return false if not variadic
+                        else:
+                            return false if assigned[positional_index]
+                            return false if not error_union_argument_matches_parameter_type(arguments[argument_index], params[positional_index], caller_params, local_shadowed)
+                            assigned[positional_index] <- true
+                            positional_index <- positional_index + 1.usize()
+                    else:
+                        seen_named <- true
+                        parameter_index: mutable i64 = -1
+                        for index in 0..<params.count |parameter_index, params, argument_name|:
+                            parameter_index <- index.i64() if params[index].name == argument_name
+                        return false if parameter_index < 0 or assigned[parameter_index.usize()]
+                        return false if not error_union_argument_matches_parameter_type(arguments[argument_index], params[parameter_index.usize()], caller_params, local_shadowed)
+                        assigned[parameter_index.usize()] <- true
+                for index in 0..<params.count |assigned, params, caller_params, forwards_arguments|:
+                    if not assigned[index] and not params[index].has_default and forwards_arguments and error_union_forwarded_param_supplies(caller_params, params[index].name):
+                        return false if not error_union_forwarded_parameter_matches_type(params[index], caller_params)
+                    return false if not assigned[index] and not params[index].has_default and not (forwards_arguments and error_union_forwarded_param_supplies(caller_params, params[index].name))
+                return true
+
+
+        def error_union_extern_accepts_call(param_start: u32, arity: u32, variadic: bool, arguments: darray[Ast::Expr], argument_names: darray[sview @source], extern_params: darray[Ast::ExternParam], caller_params: darray[ErrorUnionBindingFact], local_shadowed: NameSet&, forwards_arguments: bool) -> bool:
+            can Abort.Panic:
+                return false if forwards_arguments and variadic
+                assigned: mutable darray[bool] = []
+                for _ in 0..<arity.usize() |assigned|:
+                    assigned.push(false)
+                positional_index: mutable usize = 0.usize()
+                seen_named: mutable bool = false
+                for argument_index in 0..<arguments.count |assigned, positional_index, seen_named, argument_names, arguments, extern_params, param_start, arity, variadic, caller_params, local_shadowed|:
+                    argument_name: sview = argument_names[argument_index] if argument_index < argument_names.count else ""
+                    if argument_name == "":
+                        return false if seen_named
+                        if positional_index >= arity.usize():
+                            return false if not variadic
+                        else:
+                            return false if assigned[positional_index]
+                            slot: usize = param_start.usize() + positional_index
+                            return false if slot < extern_params.count and not error_union_argument_matches_type_name(arguments[argument_index], extern_params[slot].type_name, caller_params, local_shadowed)
+                            assigned[positional_index] <- true
+                            positional_index <- positional_index + 1.usize()
+                    else:
+                        seen_named <- true
+                        parameter_index: mutable i64 = -1
+                        for index in 0..<arity.usize() |parameter_index, extern_params, param_start, argument_name|:
+                            slot: usize = param_start.usize() + index
+                            parameter_index <- index.i64() if slot < extern_params.count and extern_params[slot].name == argument_name
+                        return false if parameter_index < 0 or assigned[parameter_index.usize()]
+                        slot: usize = param_start.usize() + parameter_index.usize()
+                        return false if slot < extern_params.count and not error_union_argument_matches_type_name(arguments[argument_index], extern_params[slot].type_name, caller_params, local_shadowed)
+                        assigned[parameter_index.usize()] <- true
+                for index in 0..<arity.usize() |assigned, param_start, extern_params, caller_params, forwards_arguments|:
+                    slot: usize = param_start.usize() + index
+                    forwarded_name: sview = extern_params[slot].name if slot < extern_params.count else ""
+                    forwarded_type: sview = extern_params[slot].type_name if slot < extern_params.count else ""
+                    return false if not assigned[index] and forwards_arguments and forwarded_name != "" and error_union_forwarded_param_supplies(caller_params, forwarded_name) and not error_union_forwarded_type_matches(forwarded_name, forwarded_type, caller_params)
+                    return false if not assigned[index] and not (forwards_arguments and forwarded_name != "" and error_union_forwarded_param_supplies(caller_params, forwarded_name))
+                return true
+
+
+        # Resolve the nearest visible declaration scope first, then count only overloads
+        # whose positional/named arguments fit their required/defaulted parameters.
+        # `required_module` selects an import without changing lexical shadowing.
+        def error_union_visible_callable_module(declarations: darray[Ast::Decl], callee_name: sview, lexical_module: sview @source, current_module: sview @source, arguments: darray[Ast::Expr], argument_names: darray[sview @source], caller_params: darray[ErrorUnionBindingFact], local_shadowed: NameSet&, forwards_arguments: bool, generic_ranking_known: bool, annotations: darray[Ast::EnumAnnotation]&, extern_params: darray[Ast::ExternParam], required_module: sview, selected_module: mutable sview& @source, selected_length: mutable usize&, selected_count: mutable usize&, selected_viable_count: mutable usize&, selected_generic_specificity: mutable usize&, selected_raw_viable_count: mutable usize&, selected_specificity_safe: mutable bool&, selected_line: mutable u32&, selected_offset: mutable u32&, table: mutable SymbolTable&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |callee_name, lexical_module, current_module, arguments, argument_names, caller_params, local_shadowed, forwards_arguments, generic_ranking_known, annotations, extern_params, required_module, selected_module, selected_length, selected_count, selected_viable_count, selected_generic_specificity, selected_raw_viable_count, selected_specificity_safe, selected_line, selected_offset, table|:
+                    match declaration:
+                        Decl.Func(name, params, return_type, body, effects, decorators, position):
+                            if name == callee_name and (current_module == required_module if required_module != "" else catch_module_is_ancestor(current_module, lexical_module)):
+                                viable: bool = error_union_function_accepts_call(params, decorators, arguments, argument_names, caller_params, local_shadowed, forwards_arguments)
+                                generic_specificity: (known: bool, generic_count: usize) = error_union_function_generic_specificity(params, annotations, current_module, position.line, position.offset)
+                                if required_module != "":
+                                    selected_module <- current_module
+                                    selected_count <- selected_count + 1.usize()
+                                    if viable:
+                                        selected_raw_viable_count <- selected_raw_viable_count + 1.usize()
+                                        selected_specificity_safe <- false if not generic_ranking_known or not generic_specificity.known
+                                        if selected_specificity_safe == false:
+                                            selected_viable_count <- selected_raw_viable_count
+                                            selected_generic_specificity <- 0.usize()
+                                            selected_line <- position.line
+                                            selected_offset <- position.offset
+                                        elif selected_viable_count == 0.usize() or generic_specificity.generic_count < selected_generic_specificity:
+                                            selected_viable_count <- 1.usize()
+                                            selected_generic_specificity <- generic_specificity.generic_count
+                                            selected_line <- position.line
+                                            selected_offset <- position.offset
+                                        elif generic_specificity.generic_count == selected_generic_specificity:
+                                            selected_viable_count <- selected_viable_count + 1.usize()
+                                elif current_module.len > selected_length:
+                                    selected_module <- current_module
+                                    selected_length <- current_module.len
+                                    selected_count <- 1.usize()
+                                    selected_raw_viable_count <- 1.usize() if viable else 0.usize()
+                                    selected_viable_count <- 1.usize() if viable else 0.usize()
+                                    selected_specificity_safe <- generic_ranking_known and generic_specificity.known if viable else true
+                                    selected_generic_specificity <- generic_specificity.generic_count if viable and (selected_specificity_safe == true) else 0.usize()
+                                    selected_line <- position.line if viable
+                                    selected_offset <- position.offset if viable
+                                elif current_module.len == selected_length and current_module == selected_module:
+                                    selected_count <- selected_count + 1.usize()
+                                    if viable:
+                                        selected_raw_viable_count <- selected_raw_viable_count + 1.usize()
+                                        selected_specificity_safe <- false if not generic_ranking_known or not generic_specificity.known
+                                        if selected_specificity_safe == false:
+                                            selected_viable_count <- selected_raw_viable_count
+                                            selected_generic_specificity <- 0.usize()
+                                            selected_line <- position.line
+                                            selected_offset <- position.offset
+                                        elif selected_viable_count == 0.usize() or generic_specificity.generic_count < selected_generic_specificity:
+                                            selected_viable_count <- 1.usize()
+                                            selected_generic_specificity <- generic_specificity.generic_count
+                                            selected_line <- position.line
+                                            selected_offset <- position.offset
+                                        elif generic_specificity.generic_count == selected_generic_specificity:
+                                            selected_viable_count <- selected_viable_count + 1.usize()
+                        Decl.Extern(name, param_start, arity, variadic, callable, return_type, decorators, position):
+                            if callable and name == callee_name and (current_module == required_module if required_module != "" else catch_module_is_ancestor(current_module, lexical_module)):
+                                viable: bool = error_union_extern_accepts_call(param_start, arity, variadic, arguments, argument_names, extern_params, caller_params, local_shadowed, forwards_arguments)
+                                if required_module != "":
+                                    selected_module <- current_module
+                                    selected_count <- selected_count + 1.usize()
+                                    if viable:
+                                        selected_raw_viable_count <- selected_raw_viable_count + 1.usize()
+                                        selected_specificity_safe <- false
+                                        selected_viable_count <- selected_raw_viable_count
+                                        selected_generic_specificity <- 0.usize()
+                                        selected_line <- position.line
+                                        selected_offset <- position.offset
+                                elif current_module.len > selected_length:
+                                    selected_module <- current_module
+                                    selected_length <- current_module.len
+                                    selected_count <- 1.usize()
+                                    selected_raw_viable_count <- 1.usize() if viable else 0.usize()
+                                    selected_viable_count <- 1.usize() if viable else 0.usize()
+                                    selected_specificity_safe <- false if viable else true
+                                    selected_generic_specificity <- 0.usize()
+                                    selected_line <- position.line if viable
+                                    selected_offset <- position.offset if viable
+                                elif current_module.len == selected_length and current_module == selected_module:
+                                    selected_count <- selected_count + 1.usize()
+                                    if viable:
+                                        selected_raw_viable_count <- selected_raw_viable_count + 1.usize()
+                                        selected_specificity_safe <- false
+                                        selected_viable_count <- selected_raw_viable_count
+                                        selected_generic_specificity <- 0.usize()
+                                        selected_line <- position.line
+                                        selected_offset <- position.offset
+                        Decl.Module(module_name, module_body, module_line):
+                            nested_module: sview @source = try_noncall_module_path(current_module, module_name, table)
+                            error_union_visible_callable_module(module_body, callee_name, lexical_module, nested_module, arguments, argument_names, caller_params, local_shadowed, forwards_arguments, generic_ranking_known, annotations, extern_params, required_module, selected_module, selected_length, selected_count, selected_viable_count, selected_generic_specificity, selected_raw_viable_count, selected_specificity_safe, selected_line, selected_offset, table)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            error_union_visible_callable_module(scoped_body, callee_name, lexical_module, current_module, arguments, argument_names, caller_params, local_shadowed, forwards_arguments, generic_ranking_known, annotations, extern_params, required_module, selected_module, selected_length, selected_count, selected_viable_count, selected_generic_specificity, selected_raw_viable_count, selected_specificity_safe, selected_line, selected_offset, table)
+                        _:
+                            pass
+
+        def error_union_declaration_is_fallible_at(annotations: darray[Ast::EnumAnnotation]&, callee_name: sview, declaration_module: sview, declaration_line: u32, declaration_offset: u32) -> bool:
+            can Abort.Panic:
+                for marker in annotations |callee_name, declaration_module|:
+                    continue if marker.owner != callee_name or marker.name != "__error_return" or marker.line != declaration_line
+                    continue if declaration_offset != 0 and marker.offset != declaration_offset
+                    module_found: mutable bool = false
+                    for module_row in annotations |module_found, marker, declaration_module|:
+                        same_declaration: bool = module_row.offset == marker.offset if module_row.offset != 0 and marker.offset != 0 else module_row.line == marker.line
+                        same_identity: bool = marker.identity_id == 0 or module_row.identity_id == marker.identity_id
+                        if module_row.owner == "__fn_module" and module_row.name == declaration_module and same_declaration and same_identity and module_row.occurrence_offset == marker.occurrence_offset:
+                            module_found <- true
+                    return true if module_found or (declaration_module == "" and marker.occurrence_offset == 0)
+                return false
+
+        def error_union_shadow_copy(shadowed: NameSet&) -> NameSet:
+            can Memory.Allocate, Abort.Panic:
+                copied: mutable NameSet = empty_name_set()
+                for name in shadowed.names |copied|:
+                    name_set_add(&copied, name)
+                return copied
+
+        def error_union_binding_facts(parameters: darray[Ast::ParamDecl]) -> darray[ErrorUnionBindingFact]:
+            can Memory.Allocate, Abort.Panic:
+                updated: mutable darray[ErrorUnionBindingFact] = []
+                for parameter in parameters |updated|:
+                    updated.push(ErrorUnionBindingFact{name: parameter.name, type_name: error_union_type_expression_name(parameter.type_expression)})
+                return updated
+
+        def error_union_binding_with_local(parameters: darray[ErrorUnionBindingFact], name: sview @source, type_name: sview @source) -> darray[ErrorUnionBindingFact]:
+            can Memory.Allocate, Abort.Panic:
+                updated: mutable darray[ErrorUnionBindingFact] = []
+                for parameter in parameters |updated|:
+                    updated.push(parameter)
+                updated.push(ErrorUnionBindingFact{name: name, type_name: type_name}) if name != "" and name != "_"
+                return updated
+
+        def error_union_pattern_parameters(pattern: Ast::Pattern, parameters: darray[ErrorUnionBindingFact]) -> darray[ErrorUnionBindingFact]:
+            can Memory.Allocate, Abort.Panic:
+                updated: mutable darray[ErrorUnionBindingFact] = []
+                for parameter in parameters |updated|:
+                    updated.push(parameter)
+                match pattern:
+                    Ast::Pattern.Binding(name):
+                        updated.push(ErrorUnionBindingFact{name: name, type_name: ""}) if name != "" and name != "_"
+                    Ast::Pattern.TypeBind(type_name, binder):
+                        updated.push(ErrorUnionBindingFact{name: binder, type_name: ""}) if binder != "" and binder != "_"
+                    Ast::Pattern.Variant(path, fields) | Ast::Pattern.Struct(path, fields):
+                        for field in fields |updated|:
+                            updated <- error_union_pattern_parameters(field, updated)
+                    Ast::Pattern.Field(selector, inner):
+                        for nested in inner |updated|:
+                            updated <- error_union_pattern_parameters(nested, updated)
+                    Ast::Pattern.Tuple(elements) | Ast::Pattern.Or(elements):
+                        for element in elements |updated|:
+                            updated <- error_union_pattern_parameters(element, updated)
+                    Ast::Pattern.As(name, inner):
+                        updated.push(ErrorUnionBindingFact{name: name, type_name: ""}) if name != "" and name != "_"
+                        for nested in inner |updated|:
+                            updated <- error_union_pattern_parameters(nested, updated)
+                    Ast::Pattern.Rest(name):
+                        updated.push(ErrorUnionBindingFact{name: name, type_name: ""}) if name != "" and name != "_"
+                    _:
+                        pass
+                return updated
+
+        def error_union_pattern_shadow_names(pattern: Ast::Pattern, shadowed: mutable NameSet&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match pattern:
+                    Ast::Pattern.Binding(name):
+                        name_set_add(shadowed, name) if name != "" and name != "_"
+                    Ast::Pattern.TypeBind(type_name, binder):
+                        name_set_add(shadowed, binder) if binder != "" and binder != "_"
+                    Ast::Pattern.Variant(path, fields) | Ast::Pattern.Struct(path, fields):
+                        for field in fields |shadowed|:
+                            error_union_pattern_shadow_names(field, shadowed)
+                    Ast::Pattern.Field(selector, inner):
+                        for nested in inner |shadowed|:
+                            error_union_pattern_shadow_names(nested, shadowed)
+                    Ast::Pattern.Tuple(elements) | Ast::Pattern.Or(elements):
+                        for element in elements |shadowed|:
+                            error_union_pattern_shadow_names(element, shadowed)
+                    Ast::Pattern.As(name, inner):
+                        name_set_add(shadowed, name) if name != "" and name != "_"
+                        for nested in inner |shadowed|:
+                            error_union_pattern_shadow_names(nested, shadowed)
+                    Ast::Pattern.Rest(name):
+                        name_set_add(shadowed, name) if name != "" and name != "_"
+                    _:
+                        pass
+
+        # If EXPRESSION (through a paren) is a direct call to an error-union-returning
+        # function, return its name. Resolve the declaration by module and call position
+        # so a same-leaf function in a different module does not make this call fallible.
+        def error_call_name_from_parts(callee: Ast::Expr, arguments: darray[Ast::Expr], argument_names: darray[sview @source], call_pos: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam], lexical_module: sview @source, shadowed: NameSet&, local_shadowed: NameSet&, caller_params: darray[ErrorUnionBindingFact], table: mutable SymbolTable&) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                callee_name: mutable sview @source = ""
+                qualifier: mutable sview @source = ""
+                match callee:
+                    Expr.Ident(name, _):
+                        callee_name <- name
+                        return sview("", 0, 0) if name_set_contains(shadowed, name)
+                    Expr.Scope(base, name, _):
+                        module_root: sview = error_call_module_root(base)
+                        return sview("", 0, 0) if module_root != "" and name_set_contains(shadowed, module_root)
+                        callee_name <- name
+                        qualifier <- error_call_module_path(base, table)
+                    Expr.Paren(inner, _):
+                        return error_call_name_from_parts(inner, arguments, argument_names, call_pos, annotations, declarations, extern_params, lexical_module, shadowed, local_shadowed, caller_params, table)
+                    _:
+                        return sview("", 0, 0)
+                return sview("", 0, 0) if callee_name == ""
+                forwards_arguments: bool = error_union_call_forwards_args(annotations, call_pos)
+                generic_ranking_known: bool = error_union_call_has_primitive_type_evidence(arguments, caller_params)
+                if qualifier != "":
+                    alias_target: (found: bool, module: sview @source, suffix: sview @source) = catch_module_qualifier_alias_target(annotations, qualifier, lexical_module, call_pos.line, call_pos.offset)
+                    requested_module: mutable sview @source = qualifier
+                    if alias_target.found:
+                        requested_module <- alias_target.module
+                        requested_module <- try_noncall_module_path(alias_target.module, alias_target.suffix, table) if alias_target.suffix != ""
+                    else:
+                        declaration: (known: bool, module: sview @source, line: u32, offset: u32, identity_id: u32) = catch_error_declaration(annotations, callee_name, lexical_module, qualifier, call_pos.line, call_pos.offset)
+                        requested_module <- declaration.module if declaration.known
+                    selected_module: mutable sview @source = ""
+                    selected_length: mutable usize = 0.usize()
+                    selected_count: mutable usize = 0.usize()
+                    selected_viable_count: mutable usize = 0.usize()
+                    selected_generic_specificity: mutable usize = 0.usize()
+                    selected_raw_viable_count: mutable usize = 0.usize()
+                    selected_specificity_safe: mutable bool = true
+                    selected_line: mutable u32 = 0
+                    selected_offset: mutable u32 = 0
+                    error_union_visible_callable_module(declarations, callee_name, lexical_module, "", arguments, argument_names, caller_params, local_shadowed, forwards_arguments, generic_ranking_known, annotations, extern_params, requested_module, selected_module, selected_length, selected_count, selected_viable_count, selected_generic_specificity, selected_raw_viable_count, selected_specificity_safe, selected_line, selected_offset, table)
+                    return callee_name if selected_viable_count == 1.usize() and error_union_declaration_is_fallible_at(annotations, callee_name, selected_module, selected_line, selected_offset)
+                    return sview("", 0, 0)
+                selected_module: mutable sview @source = ""
+                selected_length: mutable usize = 0.usize()
+                selected_count: mutable usize = 0.usize()
+                selected_viable_count: mutable usize = 0.usize()
+                selected_generic_specificity: mutable usize = 0.usize()
+                selected_raw_viable_count: mutable usize = 0.usize()
+                selected_specificity_safe: mutable bool = true
+                selected_line: mutable u32 = 0
+                selected_offset: mutable u32 = 0
+                error_union_visible_callable_module(declarations, callee_name, lexical_module, "", arguments, argument_names, caller_params, local_shadowed, forwards_arguments, generic_ranking_known, annotations, extern_params, "", selected_module, selected_length, selected_count, selected_viable_count, selected_generic_specificity, selected_raw_viable_count, selected_specificity_safe, selected_line, selected_offset, table)
+                if selected_count > 0.usize():
+                    return callee_name if selected_viable_count == 1.usize() and error_union_declaration_is_fallible_at(annotations, callee_name, selected_module, selected_line, selected_offset)
+                    return sview("", 0, 0)
+                if selected_count == 0.usize():
+                    imported_module: sview = error_imported_module(annotations, callee_name, lexical_module, call_pos, table)
+                    if imported_module != "":
+                        imported_selected_module: mutable sview @source = ""
+                        imported_selected_length: mutable usize = 0.usize()
+                        imported_selected_count: mutable usize = 0.usize()
+                        imported_viable_count: mutable usize = 0.usize()
+                        imported_generic_specificity: mutable usize = 0.usize()
+                        imported_raw_viable_count: mutable usize = 0.usize()
+                        imported_specificity_safe: mutable bool = true
+                        imported_line: mutable u32 = 0
+                        imported_offset: mutable u32 = 0
+                        error_union_visible_callable_module(declarations, callee_name, lexical_module, "", arguments, argument_names, caller_params, local_shadowed, forwards_arguments, generic_ranking_known, annotations, extern_params, imported_module, imported_selected_module, imported_selected_length, imported_selected_count, imported_viable_count, imported_generic_specificity, imported_raw_viable_count, imported_specificity_safe, imported_line, imported_offset, table)
+                        return callee_name if imported_viable_count == 1.usize() and error_union_declaration_is_fallible_at(annotations, callee_name, imported_selected_module, imported_line, imported_offset)
+                return sview("", 0, 0)
+
+
+        def error_call_name(expression: Ast::Expr, annotations: darray[Ast::EnumAnnotation]&, declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam], lexical_module: sview @source, shadowed: NameSet&, local_shadowed: NameSet&, caller_params: darray[ErrorUnionBindingFact], table: mutable SymbolTable&) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        return error_call_name_from_parts(callee, arguments, argument_names, call_pos, annotations, declarations, extern_params, lexical_module, shadowed, local_shadowed, caller_params, table)
+                    Expr.Paren(inner, _):
+                        return error_call_name(inner, annotations, declarations, extern_params, lexical_module, shadowed, local_shadowed, caller_params, table)
                     _:
                         return sview("", 0, 0)
 
@@ -28,60 +559,95 @@ extend Semantic:
                 return true if try_lines.get(line.u64()) is marker
                 return false
 
-        def error_union_unhandled_statements(statements: darray[Ast::Stmt], fallible_callables: NameSet&, try_lines: dict[u64, u8]&, table: lmut SymbolTable) -> void:
+        def error_union_unhandled_statements(statements: darray[Ast::Stmt], annotations: darray[Ast::EnumAnnotation]&, declarations: darray[Ast::Decl], extern_params: darray[Ast::ExternParam], lexical_module: sview @source, shadowed: mutable NameSet&, local_shadowed: mutable NameSet&, caller_params: darray[ErrorUnionBindingFact], try_lines: dict[u64, u8]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
+                visible_params: mutable darray[ErrorUnionBindingFact] = caller_params
+                for statement in statements |table, visible_params, shadowed, local_shadowed| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            bare_name: sview @source = error_call_name(expression, fallible_callables) if not line_is_try_wrapped(try_lines, line.line) else sview("", 0, 0)
+                            bare_name: sview @source = error_call_name(expression, annotations, declarations, extern_params, lexical_module, shadowed, local_shadowed, visible_params, table) if not line_is_try_wrapped(try_lines, line.line) else sview("", 0, 0)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ErrorUnionUnhandled, name: bare_name, line: line.line, expected: "", actual: "bare"}) if bare_name != ""
                         Stmt.Assign(target, operator, value, line):
-                            discard_name: sview @source = error_call_name(value, fallible_callables) if ident_name_of(target) == "_" and not line_is_try_wrapped(try_lines, line.line) else sview("", 0, 0)
+                            discard_name: sview @source = error_call_name(value, annotations, declarations, extern_params, lexical_module, shadowed, local_shadowed, visible_params, table) if ident_name_of(target) == "_" and not line_is_try_wrapped(try_lines, line.line) else sview("", 0, 0)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ErrorUnionUnhandled, name: discard_name, line: line.line, expected: "", actual: "discard"}) if discard_name != ""
                         Stmt.VarDecl(name, type_expression, value, line):
-                            decl_discard: sview @source = error_call_name(value, fallible_callables) if name == "_" and not line_is_try_wrapped(try_lines, line.line) else sview("", 0, 0)
+                            decl_discard: sview @source = error_call_name(value, annotations, declarations, extern_params, lexical_module, shadowed, local_shadowed, visible_params, table) if name == "_" and not line_is_try_wrapped(try_lines, line.line) else sview("", 0, 0)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ErrorUnionUnhandled, name: decl_discard, line: line.line, expected: "", actual: "discard"}) if decl_discard != ""
+                            name_set_add(shadowed, name) if name != "_" and name != ""
+                            name_set_add(local_shadowed, name) if name != "_" and name != ""
+                            visible_params <- error_union_binding_with_local(visible_params, name, error_union_type_expression_name(type_expression))
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- error_union_unhandled_statements(then_body, fallible_callables, try_lines, table)
-                            table <- error_union_unhandled_statements(else_body, fallible_callables, try_lines, table)
+                            then_shadowed: mutable NameSet = error_union_shadow_copy(shadowed)
+                            else_shadowed: mutable NameSet = error_union_shadow_copy(shadowed)
+                            then_local_shadowed: mutable NameSet = error_union_shadow_copy(local_shadowed)
+                            else_local_shadowed: mutable NameSet = error_union_shadow_copy(local_shadowed)
+                            table <- error_union_unhandled_statements(then_body, annotations, declarations, extern_params, lexical_module, then_shadowed, then_local_shadowed, visible_params, try_lines, table)
+                            table <- error_union_unhandled_statements(else_body, annotations, declarations, extern_params, lexical_module, else_shadowed, else_local_shadowed, visible_params, try_lines, table)
                         Stmt.While(condition, body, line):
-                            table <- error_union_unhandled_statements(body, fallible_callables, try_lines, table)
+                            loop_shadowed: mutable NameSet = error_union_shadow_copy(shadowed)
+                            loop_local_shadowed: mutable NameSet = error_union_shadow_copy(local_shadowed)
+                            table <- error_union_unhandled_statements(body, annotations, declarations, extern_params, lexical_module, loop_shadowed, loop_local_shadowed, visible_params, try_lines, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- error_union_unhandled_statements(body, fallible_callables, try_lines, table)
+                            loop_shadowed: mutable NameSet = error_union_shadow_copy(shadowed)
+                            loop_local_shadowed: mutable NameSet = error_union_shadow_copy(local_shadowed)
+                            loop_params: mutable darray[ErrorUnionBindingFact] = visible_params
+                            name_set_add(loop_shadowed, bind) if bind != "" and bind != "_"
+                            name_set_add(loop_local_shadowed, bind) if bind != "" and bind != "_"
+                            loop_params <- error_union_binding_with_local(loop_params, bind, "") if bind != "" and bind != "_"
+                            for variable in variables |loop_shadowed, loop_local_shadowed, loop_params|:
+                                name_set_add(loop_shadowed, variable) if variable != "" and variable != "_"
+                                name_set_add(loop_local_shadowed, variable) if variable != "" and variable != "_"
+                                loop_params <- error_union_binding_with_local(loop_params, variable, "") if variable != "" and variable != "_"
+                            table <- error_union_unhandled_statements(body, annotations, declarations, extern_params, lexical_module, loop_shadowed, loop_local_shadowed, loop_params, try_lines, table)
                         Stmt.Block(block_kind, clause, binding, body, line):
-                            table <- error_union_unhandled_statements(body, fallible_callables, try_lines, table)
+                            block_shadowed: mutable NameSet = error_union_shadow_copy(shadowed)
+                            block_local_shadowed: mutable NameSet = error_union_shadow_copy(local_shadowed)
+                            block_params: mutable darray[ErrorUnionBindingFact] = visible_params
+                            name_set_add(block_shadowed, binding) if binding != "" and binding != "_"
+                            name_set_add(block_local_shadowed, binding) if binding != "" and binding != "_"
+                            block_params <- error_union_binding_with_local(block_params, binding, "") if binding != "" and binding != "_"
+                            table <- error_union_unhandled_statements(body, annotations, declarations, extern_params, lexical_module, block_shadowed, block_local_shadowed, block_params, try_lines, table)
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms |table| -> table:
-                                table <- error_union_unhandled_statements(arm.body, fallible_callables, try_lines, table)
+                            for arm in arms |table, visible_params| -> table:
+                                arm_shadowed: mutable NameSet = error_union_shadow_copy(shadowed)
+                                arm_local_shadowed: mutable NameSet = error_union_shadow_copy(local_shadowed)
+                                arm_params: mutable darray[ErrorUnionBindingFact] = error_union_pattern_parameters(arm.pattern, visible_params)
+                                error_union_pattern_shadow_names(arm.pattern, arm_shadowed)
+                                error_union_pattern_shadow_names(arm.pattern, arm_local_shadowed)
+                                table <- error_union_unhandled_statements(arm.body, annotations, declarations, extern_params, lexical_module, arm_shadowed, arm_local_shadowed, arm_params, try_lines, table)
                         _:
                             pass
 
-        def check_error_union_unhandled_decls(declarations: darray[Ast::Decl], fallible_callables: NameSet&, try_lines: dict[u64, u8]&, table: lmut SymbolTable) -> void:
+        def check_error_union_unhandled_decls(declarations: darray[Ast::Decl], all_declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, extern_params: darray[Ast::ExternParam], current_module: sview @source, try_lines: dict[u64, u8]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
-                            table <- error_union_unhandled_statements(body, fallible_callables, try_lines, table)
+                            shadowed: mutable NameSet = empty_name_set()
+                            local_shadowed: mutable NameSet = empty_name_set()
+                            caller_params: darray[ErrorUnionBindingFact] = error_union_binding_facts(params)
+                            for parameter in params |shadowed|:
+                                name_set_add(shadowed, parameter.name) if parameter.name != "" and parameter.name != "_"
+                            table <- error_union_unhandled_statements(body, annotations, all_declarations, extern_params, current_module, shadowed, local_shadowed, caller_params, try_lines, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_error_union_unhandled_decls(module_body, fallible_callables, try_lines, table)
+                            nested_module: sview @source = try_noncall_module_path(current_module, module_name, table)
+                            table <- check_error_union_unhandled_decls(module_body, all_declarations, annotations, extern_params, nested_module, try_lines, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_error_union_unhandled_decls(scoped_body, fallible_callables, try_lines, table)
+                            table <- check_error_union_unhandled_decls(scoped_body, all_declarations, annotations, extern_params, current_module, try_lines, table)
                         _:
                             pass
 
     public:
         def check_error_union_unhandled(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                # This call path ultimately accepts any exact-name __error_return marker;
-                # a name set preserves that result without a marker scan per discarded call.
-                fallible_callables: mutable NameSet = empty_name_set()
+                has_fallible_callable: mutable bool = false
                 try_lines: mutable dict[u64, u8] = {}
-                for annotation in file.enum_annotations |fallible_callables, try_lines|:
-                    name_set_add(fallible_callables, annotation.owner) if annotation.name == "__error_return"
+                for annotation in file.enum_annotations |has_fallible_callable, try_lines|:
+                    has_fallible_callable <- true if annotation.name == "__error_return"
                     if annotation.name == "__try_without_else":
                         if try_lines.get(annotation.line.u64()) is existing_marker:
                             pass
                         else:
                             try_lines <- try_lines.put(annotation.line.u64(), 1) can Global{Read,Write}
-                return if fallible_callables.names.count == 0
-                table <- check_error_union_unhandled_decls(file.top_decls, fallible_callables, try_lines, table)
+                return if not has_fallible_callable
+                table <- check_error_union_unhandled_decls(file.top_decls, file.top_decls, file.enum_annotations, file.extern_params, "", try_lines, table)

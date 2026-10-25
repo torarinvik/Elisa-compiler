@@ -15,7 +15,7 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
 SOURCE = ROOT / "src/backend/codegen_interned_types.elisa"
-LOOP = ROOT / "src/backend/codegen_stmt_for_shapes.elisa"
+LOOP = ROOT / "src/backend/codegen_stmt_for_shapes_iterable.elisa"
 POSITIVE = HERE / "backend_darray_pointer_countdown_64bit.elisa"
 NEGATIVE = HERE / "backend_darray_pointer_countdown_64bit_rejected.elisa"
 

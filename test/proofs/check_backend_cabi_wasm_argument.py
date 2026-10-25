@@ -43,18 +43,20 @@ if not NEGATIVE.read_text().startswith('include "./backend_cabi_wasm_argument.el
     raise SystemExit("false controls must import the wasm argument policy")
 body = compact(section(SOURCE.read_text(), "cabi_classify_arg"))
 ordered = (
-    "CabiArgPlan{direct:true,byval:false,aggregate:true,parts:scalar_parts,offsets:scalar_offsets,value_type:llvm_value}returnifsize==0",
+    "returnCabiArgPlan{direct:true,byval:false,aggregate:true,parts:scalar_parts,offsets:scalar_offsets,value_type:llvm_value}ifsize==0",
     "flat_ok:bool=cabi_flatten(llvm_value,0,leaves,structs)",
-    "CabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}returnifflat_ok==false",
+    "returnCabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}ifflat_ok==false",
     "iftarget==2:",
     "ifleaves.count==1:",
     "wasm_parts:darray[LLVMTypeRef]=[cabi_leaf_type(leaves[0],ctx)]",
     "wasm_offsets:darray[u64]=[leaves[0].offset]",
     "returnCabiArgPlan{direct:true,byval:false,aggregate:true,parts:wasm_parts,offsets:wasm_offsets,value_type:llvm_value}",
-    "returnCabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}",
 )
 if any(part not in body for part in ordered) or [body.index(part) for part in ordered] != sorted(body.index(part) for part in ordered):
     raise SystemExit("wasm aggregate argument rule or zero-size/flatten-failure handling changed")
+wasm_byval = "returnCabiArgPlan{direct:false,byval:true,aggregate:true,parts:no_parts,offsets:no_offsets,value_type:llvm_value}"
+if body.rfind(wasm_byval) <= body.index(ordered[-1]):
+    raise SystemExit("wasm aggregate arguments with multiple leaves must use byval")
 if args.source_only:
     print(f"source_bound=True positive={len(POSITIVE_HASHES)} false_controls={len(NEGATIVE_HASHES)}")
     raise SystemExit(0)

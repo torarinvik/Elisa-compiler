@@ -1,6 +1,7 @@
 """Source-bind conservative store-through collection to runtime-value AST children."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,12 +12,24 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not args.source_only)
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 SUMMARY = ROOT / "src/semantic/store_through_summary.elisa"
+SUMMARY_PARTS = [SUMMARY, ROOT / "src/semantic/store_through_summary_functions.elisa"]
 HOLDER_SOURCE = ROOT / "src/semantic/check_call_holder_view_store.elisa"
+HOLDER_PARTS = [
+    HOLDER_SOURCE,
+    ROOT / "src/semantic/check_call_holder_view_store/type_references.elisa",
+    ROOT / "src/semantic/check_call_holder_view_store/alias_expressions.elisa",
+    ROOT / "src/semantic/check_call_holder_view_store/flow_binders.elisa",
+    ROOT / "src/semantic/check_call_holder_view_store/walk.elisa",
+]
+SEMANTIC_ROOT = ROOT / "src/semantic/semantic.elisa"
 AST_NODES = ROOT / "src/parser/ast_nodes.elisa"
 AST_SIDE_TABLES = ROOT / "src/parser/ast_side_tables.elisa"
 EFFECT_SHAPE = ROOT / "src/parser/effect_type_shape.elisa"
@@ -1165,11 +1178,16 @@ def validate_exact_boolean_theorem_source_routes(
                 raise SystemExit(f"{name} route {parameter} is no longer source-bound")
 
 
-summary_text = SUMMARY.read_text()
+semantic_root_text = SEMANTIC_ROOT.read_text()
+for path in SUMMARY_PARTS[1:] + HOLDER_PARTS[1:]:
+    include = f'include "./{path.relative_to(SEMANTIC_ROOT.parent).as_posix()}"'
+    if semantic_root_text.count(include) != 1:
+        raise SystemExit(f"semantic root must include {include!r} exactly once")
+summary_text = "\n".join(path.read_text() for path in SUMMARY_PARTS)
 ast_text = AST_NODES.read_text()
 side_text = AST_SIDE_TABLES.read_text()
 effect_text = EFFECT_SHAPE.read_text()
-holder_text = HOLDER_SOURCE.read_text()
+holder_text = "\n".join(path.read_text() for path in HOLDER_PARTS)
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
@@ -2049,6 +2067,15 @@ for name, parameter in negative_parameters.items():
     if body != expected:
         raise SystemExit(f"{name} no longer expresses its rejected dropped-child claim")
 
+if args.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_theorems": len(positive_names),
+        "negative_controls": len(negative_names),
+        "source_closure_files": len(source_include_closure([POSITIVE, NEGATIVE])),
+    }, sort_keys=True))
+    raise SystemExit(0)
+
 if not __debug__:
     raise SystemExit("run without Python -O")
 
@@ -2065,7 +2092,8 @@ source_closure = source_include_closure([POSITIVE, NEGATIVE])
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    SUMMARY, HOLDER_SOURCE, AST_NODES, AST_SIDE_TABLES, EFFECT_SHAPE, POSITIVE, NEGATIVE, *source_closure,
+    SEMANTIC_ROOT, *SUMMARY_PARTS, *HOLDER_PARTS,
+    AST_NODES, AST_SIDE_TABLES, EFFECT_SHAPE, POSITIVE, NEGATIVE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

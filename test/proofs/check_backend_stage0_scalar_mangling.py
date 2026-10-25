@@ -65,7 +65,7 @@ body = compact(section(SOURCE.read_text(), "stage0_scalar_type_name"))
 for _, kind, bits, spelling, _ in CASES:
     check = f"value_type.kind=={kind}"
     if check not in body: raise SystemExit(f"missing production kind branch {kind}")
-    expected = f"{spelling}returnifvalue_type.bits=={bits}" if bits is not None else f"{spelling}returnifvalue_type.kind=={kind}"
+    expected = f"return{spelling}ifvalue_type.bits=={bits}" if bits is not None else f"return{spelling}ifvalue_type.kind=={kind}"
     if expected not in body: raise SystemExit(f"missing production spelling branch {spelling}")
 if not body.endswith('return""'):
     raise SystemExit("unsupported scalar types must still decline with an empty spelling")

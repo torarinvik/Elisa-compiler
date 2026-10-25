@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
@@ -20,7 +21,9 @@ SORTED = ROOT / "src/semantic/view_return_origins_sorted.elisa"
 CONSTANTS = ROOT / "src/semantic/view_return_origin_constants.elisa"
 ORIGIN_BUILDER = ROOT / "src/semantic/view_return_origins.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
+PIPELINE = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 CONSUMER = ROOT / "src/semantic/check_local_view_return_escape.elisa"
+SORTED_CONSUMER = ROOT / "src/semantic/check_local_view_return_escape_lambdas.elisa"
 POSITIVE = HERE / "view_return_origin_order.elisa"
 NEGATIVE = HERE / "view_return_origin_order_rejected.elisa"
 PROOF_PROCESS_TIMEOUT_SECONDS = 120
@@ -31,7 +34,9 @@ if not __debug__:
 source = SORTED.read_text()
 origin_builder = ORIGIN_BUILDER.read_text()
 semantic = SEMANTIC.read_text()
+pipeline = PIPELINE.read_text()
 consumer = CONSUMER.read_text()
+sorted_consumer = SORTED_CONSUMER.read_text()
 positive = POSITIVE.read_text()
 negative = NEGATIVE.read_text()
 if 'include "../../src/semantic/view_return_origins_sorted.elisa"' not in positive:
@@ -51,8 +56,40 @@ builder_include = semantic.find('include "./view_return_origins.elisa"')
 sort_include = semantic.find('include "./view_return_origins_sorted.elisa"')
 if not 0 <= constant_include < builder_include < sort_include:
     raise SystemExit("view-return-origin constants must load before the builder and sorted consumers")
-if "vro_sort_rows(origin_rows)" not in consumer:
+if semantic.count('include "./check_local_view_return_escape_lambdas.elisa"') != 1:
+    raise SystemExit("semantic module must include the sorted view-return consumer exactly once")
+consumer_matches = list(re.finditer(
+    r"(?m)^([ \t]*)def check_local_view_return_escape\(", sorted_consumer))
+if len(consumer_matches) != 1:
+    raise SystemExit("sorted view-return consumer must define check_local_view_return_escape exactly once")
+consumer_match = consumer_matches[0]
+consumer_indent = consumer_match.group(1)
+next_consumer_definition = re.search(
+    rf"(?m)^{re.escape(consumer_indent)}def [A-Za-z_][A-Za-z0-9_]*\(",
+    sorted_consumer[consumer_match.end():])
+consumer_end = consumer_match.end() + next_consumer_definition.start() if next_consumer_definition else len(sorted_consumer)
+consumer_body = sorted_consumer[consumer_match.start():consumer_end]
+if "vro_sort_rows(origin_rows)" not in consumer_body:
     raise SystemExit("view-return-origin consumer no longer uses the sorted row implementation")
+pipeline_matches = list(re.finditer(
+    r"(?m)^([ \t]*)def check_full_into_pipeline(?:\[[^\n]*\])?\(", pipeline))
+if len(pipeline_matches) != 1:
+    raise SystemExit("semantic pipeline must define check_full_into_pipeline exactly once")
+pipeline_match = pipeline_matches[0]
+indent = pipeline_match.group(1)
+next_definition = re.search(
+    rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*\])?\(",
+    pipeline[pipeline_match.end():])
+pipeline_end = pipeline_match.end() + next_definition.start() if next_definition else len(pipeline)
+pipeline_body = pipeline[pipeline_match.start():pipeline_end]
+pipeline_code = "".join(
+    "".join(line.split("#", 1)[0].split()) for line in pipeline_body.splitlines())
+origin_rows_call = (
+    "view_origin_rows:darray[sview@source]=view_return_origin_rows(loop_view)"
+    "table<-check_local_view_return_escape(loop_view,&view_origin_rows,table)canGlobal{Read,Write}")
+if pipeline_code.count("table<-check_local_view_return_escape(") != 1 or \
+        origin_rows_call not in pipeline_code:
+    raise SystemExit("full semantic pipeline must pass the computed origin rows to the sorted return-escape consumer")
 
 required_source = (
     "ghost def vro_text_compare_reference_from(",
@@ -180,7 +217,9 @@ inputs = [
     CONSTANTS,
     ORIGIN_BUILDER,
     SEMANTIC,
+    PIPELINE,
     CONSUMER,
+    SORTED_CONSUMER,
 ]
 inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

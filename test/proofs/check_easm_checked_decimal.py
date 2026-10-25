@@ -28,6 +28,7 @@ HELPER = ROOT / "src/backend/easm_checked_decimal.elisa"
 ENV = ROOT / "src/backend/codegen_env.elisa"
 PARSER = ROOT / "src/backend/easm_verify_function.elisa"
 MEMORY = ROOT / "src/backend/easm_verify_memory.elisa"
+MEMORY_EFFECTS = ROOT / "src/backend/easm_verify_memory_effects.elisa"
 MEMSTATE = ROOT / "src/backend/easm_memstate_domain.elisa"
 LAYOUT_PARSER = ROOT / "src/backend/easm_parse.elisa"
 INTEGRATION = ROOT / "test/breadth/easm_checked_decimal_parse_smoke.elisa"
@@ -83,6 +84,7 @@ arithmetic_compact = compact(arithmetic_text)
 env_text = ENV.read_text()
 parser_text = PARSER.read_text()
 memory_text = MEMORY.read_text()
+memory_effects_text = MEMORY_EFFECTS.read_text()
 if 'include "../../src/backend/easm_checked_decimal.elisa"' not in POSITIVE.read_text():
     raise SystemExit("positive proof no longer includes the production checked-digit helpers")
 if 'include "../../src/backend/easm_memstate_domain.elisa"' not in POSITIVE.read_text():
@@ -359,7 +361,7 @@ required_memory_fragments = (
     "def easm_immediate_after_dollar_checked(text: sview)",
     "return easm_immediate_operand_after_dollar_checked(easm_first_operand(text))",
 )
-if not all(fragment in memory_text for fragment in required_memory_fragments):
+if not all(fragment in memory_text + "\n" + memory_effects_text for fragment in required_memory_fragments):
     raise SystemExit("EASM memory and immediate decimal consumers no longer fail closed")
 if '"invalid-stack-adjustment"' not in parser_text or "easm_immediate_operand_after_dollar_checked(source_operand)" not in parser_text:
     raise SystemExit("stack adjustment verification no longer reports malformed immediates")
@@ -567,6 +569,7 @@ inputs = [
     ENV,
     PARSER,
     MEMORY,
+    MEMORY_EFFECTS,
     MEMSTATE,
     LAYOUT_PARSER,
     INTEGRATION,

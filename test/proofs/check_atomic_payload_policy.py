@@ -21,6 +21,7 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE = ROOT / "src/semantic/atomic_payload_policy.elisa"
 CONSUMER = ROOT / "src/semantic/check_atomic_payload.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
+SEMANTIC_LATE_CHECKS = ROOT / "src/semantic/semantic_late_checks.elisa"
 POSITIVE = HERE / "atomic_payload_policy.elisa"
 NEGATIVE = HERE / "atomic_payload_policy_rejected.elisa"
 
@@ -55,6 +56,7 @@ def declarations(source: str) -> set[str]:
 source_text = SOURCE.read_text()
 consumer_text = CONSUMER.read_text()
 semantic_text = SEMANTIC.read_text()
+semantic_late_checks_text = SEMANTIC_LATE_CHECKS.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
@@ -90,8 +92,9 @@ diagnostic_gate = 'table.diagnostics<-table.diagnostics.push(Diagnostic{kind:Dia
 if any(fragment not in consumer for fragment in (head_gate, struct_fact, policy_call, diagnostic_gate)) or \
         not consumer.index(head_gate) < consumer.index(struct_fact) < consumer.index(policy_call) < consumer.index(diagnostic_gate):
     raise SystemExit("atomic checker no longer supplies the resolved-struct fact to the proved shape policy")
-if semantic_text.count('include "./check_atomic_payload.elisa"') != 1:
-    raise SystemExit("semantic root must include the atomic payload checker exactly once")
+if semantic_text.count('include "./semantic_late_checks.elisa"') != 1 or \
+        semantic_late_checks_text.count('include "./check_atomic_payload.elisa"') != 1:
+    raise SystemExit("semantic root must load the atomic payload checker through late checks exactly once")
 if 'include "../../src/parser/parser_tokens.elisa"' not in positive_text or \
         'include "../../src/semantic/atomic_payload_policy.elisa"' not in positive_text or \
         'include "./atomic_payload_policy.elisa"' not in negative_text:
@@ -201,6 +204,7 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", SOURCE, CONSUMER, SEMANTIC,
+    SEMANTIC_LATE_CHECKS,
     POSITIVE, NEGATIVE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

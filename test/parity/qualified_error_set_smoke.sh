@@ -51,10 +51,42 @@ check_case() {
     fi
 }
 
+# RaiseDestinationMismatch and LambdaRaiseMismatch have custom Stage1 sentences outside
+# the shared try/impl diagnostic comparison above. Assert their precise source lines so
+# these regressions cannot silently pass without emitting a diagnostic.
+check_stage1_raise_mismatch() {
+    local name="$1" source="$2" expected_line="$3"
+    checked=$((checked + 1))
+    printf '%s' "$source" > "$WORK/$name.elisa"
+    local report
+    report="$("$REPO_ROOT/build/parse_report" < "$WORK/$name.elisa")"
+    if ! printf '%s\n' "$report" | grep -Eq "^[[:space:]]*L${expected_line} raise cannot propagate tag "; then
+        failed=$((failed + 1))
+        printf 'qualified-error-set missing raise mismatch: %s (expected line %s)\n' \
+            "$name" "$expected_line" >&2
+    fi
+}
+
+check_stage1_impl_subset_extra() {
+    local name="$1" source="$2" expected_line="$3"
+    checked=$((checked + 1))
+    printf '%s' "$source" > "$WORK/$name.elisa"
+    local report
+    report="$("$REPO_ROOT/build/parse_report" < "$WORK/$name.elisa")"
+    if ! printf '%s\n' "$report" | grep -Eq "^[[:space:]]*L${expected_line} impl method" \
+        || ! printf '%s\n' "$report" | grep -Fq 'raises error `Fault` not declared in the protocol'; then
+        failed=$((failed + 1))
+        printf 'qualified-error-set missing protocol subset diagnostic: %s (expected line %s)\n' \
+            "$name" "$expected_line" >&2
+    fi
+}
+
 # SILENT: the qualified spelling names the same set the bare one does.
 check_case nested_module_qualified $'module Backend:\n    public:\n        error SceneError:\n            Capacity\n\n    private:\n        module Recording:\n            public:\n                def record(n: i64) -> void error[Backend::SceneError]:\n                    raise Backend::SceneError.Capacity if n > 10\n\n    public:\n        def submit(n: i64) -> void error[SceneError]:\n            try Recording::record(n)\n\ndef main() -> i64:\n    return 0\n'
 check_case qualified_both_sides $'module Backend:\n    public:\n        error SceneError:\n            Capacity\n\n        def record(n: i64) -> void error[Backend::SceneError]:\n            raise Backend::SceneError.Capacity if n > 10\n\ndef submit(n: i64) -> void error[Backend::SceneError]:\n    try Backend::record(n)\n\ndef main() -> i64:\n    return 0\n'
 check_case qualified_multi_family $'module Net:\n    public:\n        error SendError:\n            Refused\n\n        error RecvError:\n            Empty\n\n        def send(n: i64) -> void error[Net::SendError]:\n            raise Net::SendError.Refused if n > 10\n\n        def recv(n: i64) -> void error[Net::RecvError]:\n            raise Net::RecvError.Empty if n > 10\n\ndef relay(n: i64) -> void error[Net::SendError, Net::RecvError]:\n    try Net::send(n)\n    try Net::recv(n)\n\ndef main() -> i64:\n    return 0\n'
+check_stage1_raise_mismatch qualified_single_family_raise_mismatch $'module Net:\n    public:\n        error SendError:\n            Refused\n\n        error RecvError:\n            Empty\n\n        def send(n: i64) -> void error[Net::SendError]:\n            raise Net::RecvError.Empty if n > 10\n\ndef main() -> i64:\n    return 0\n' 10
+check_stage1_raise_mismatch qualified_lambda_raise_identity $'module Provider:\n    public:\n        error Fault:\n            Bad\n\nmodule Peer:\n    public:\n        error Fault:\n            Bad\n\n        def consume(callback: fn() -> i64 error[Provider::Fault]) -> i64 error[Fault]:\n            return try callback()\n\ndef bad() -> i64 error[Peer::Fault]:\n    return Peer::consume((fn() => raise Provider::Fault.Bad))\n\ndef good() -> i64 error[Peer::Fault]:\n    return Peer::consume(fn() => raise Peer::Fault.Bad)\n\ndef main() -> i64:\n    return 0\n' 15
 check_case bare_unchanged $'error DiskError:\n    Full\n\ndef write_one(n: i64) -> void error[DiskError]:\n    raise DiskError.Full if n > 10\n\ndef write_all(n: i64) -> void error[DiskError]:\n    try write_one(n)\n\ndef main() -> i64:\n    return 0\n'
 
 # FIRES: family leaves alone must not equate Provider::Fault with Peer::Fault when
@@ -76,6 +108,24 @@ check_case wildcard_bare $'error SceneError:\n    Capacity\n\ndef go(n: i64) -> 
 check_case protocol_qualified_impl $'module Backend:\n    public:\n        error SceneError:\n            Capacity\n\n        protocol Sink:\n            def push(n: i64) -> void error[SceneError]\n\n        struct Log:\n            tag: i64\n\n        impl Sink for Log:\n            def push(n: i64) -> void error[Backend::SceneError]:\n                raise Backend::SceneError.Capacity if n > 10\n\ndef main() -> i64:\n    return 0\n'
 check_case protocol_extra_family $'module Backend:\n    public:\n        error SceneError:\n            Capacity\n\n        error OtherError:\n            Nope\n\n        protocol Sink:\n            def push(n: i64) -> void error[Backend::SceneError]\n\n        struct Log:\n            tag: i64\n\n        impl Sink for Log:\n            def push(n: i64) -> void error[Backend::OtherError]:\n                raise Backend::OtherError.Nope if n > 10\n\ndef main() -> i64:\n    return 0\n'
 check_case protocol_conforming $'module Backend:\n    public:\n        error SceneError:\n            Capacity\n\n        protocol Sink:\n            def push(n: i64) -> void error[Backend::SceneError]\n\n        struct Log:\n            tag: i64\n\n        impl Sink for Log:\n            def push(n: i64) -> void error[Backend::SceneError]:\n                raise Backend::SceneError.Capacity if n > 10\n\ndef main() -> i64:\n    return 0\n'
+check_case duplicate_protocol_method_error_sets $'error FirstError:\n    First\n\nerror SecondError:\n    Second\n\nprotocol FirstProtocol:\n    def push(n: i64) -> i64 error[FirstError]\n\nprotocol SecondProtocol:\n    def push(n: i64) -> i64 error[SecondError]\n\nstruct Log:\n    tag: i64\n\nimpl FirstProtocol for Log:\n    def push(n: i64) -> i64 error[SecondError]:\n        return n\n\ndef main() -> i64:\n    return 0\n'
+duplicate_protocol_report="$("$RPT" < "$WORK/duplicate_protocol_method_error_sets.elisa")"
+if ! grep -q 'impl method "push" for interface "FirstProtocol" raises error `SecondError` not declared in the protocol' <<< "$duplicate_protocol_report"; then
+    failed=$((failed + 1))
+    printf 'qualified-error-set missing expected duplicate-protocol diagnostic\n' >&2
+fi
+
+check_case protocol_same_leaf_different_modules $'module First:\n    public:\n        error Fault:\n            FirstOnly\n\nmodule Second:\n    public:\n        error Fault:\n            SecondOnly\n\nprotocol FirstSink:\n    def push(callback: fn() -> i64 error[Second::Fault]) -> i64 error[First::Fault]\n\nstruct Log:\n    tag: i64\n\nimpl FirstSink for Log:\n    def push(callback: fn() -> i64 error[Second::Fault]) -> i64 error[Second::Fault]:\n        return 0\n\ndef main() -> i64:\n    return 0\n'
+same_leaf_protocol_report="$("$RPT" < "$WORK/protocol_same_leaf_different_modules.elisa")"
+if ! grep -q 'impl method "push" for interface "FirstSink" raises error `Fault` not declared in the protocol' <<< "$same_leaf_protocol_report"; then
+    failed=$((failed + 1))
+    printf 'qualified-error-set missing expected same-leaf protocol module diagnostic\n' >&2
+fi
+
+check_case protocol_subset_narrow_impl $'error Fault:\n    Bad\n    Other\n\nprotocol Sink:\n    def push(n: i64) -> i64 error[Fault{Bad}]\n\nstruct Log:\n    tag: i64\n\nimpl Sink for Log:\n    def push(n: i64) -> i64 error[Fault{Bad}]:\n        return n\n\ndef main() -> i64:\n    return 0\n'
+check_stage1_impl_subset_extra protocol_subset_widened_impl $'error Fault:\n    Bad\n    Other\n\nprotocol Sink:\n    def push(n: i64) -> i64 error[Fault{Bad}]\n\nstruct Log:\n    tag: i64\n\nimpl Sink for Log:\n    def push(n: i64) -> i64 error[Fault{Bad, Other}]:\n        return n\n\ndef main() -> i64:\n    return 0\n' 12
+check_stage1_impl_subset_extra protocol_subset_unrestricted_impl $'error Fault:\n    Bad\n    Other\n\nprotocol Sink:\n    def push(n: i64) -> i64 error[Fault{Bad}]\n\nstruct Log:\n    tag: i64\n\nimpl Sink for Log:\n    def push(n: i64) -> i64 error[Fault]:\n        return n\n\ndef main() -> i64:\n    return 0\n' 12
+check_case protocol_dot_subset_widened_impl $'module First:\n    public:\n        error Fault:\n            Expected\n            Other\n\nprotocol ReaderProtocol:\n    def read() -> i64 error[First::Fault.Expected]\n\nstruct Reader:\n    tag: i64\n\nimpl ReaderProtocol for Reader:\n    def read() -> i64 error[First::Fault.Other]:\n        raise First::Fault.Other\n\ndef main() -> i64:\n    return 0\n'
 
 if [ "$failed" -ne 0 ]; then
     printf 'qualified-error-set smoke FAILED: %d/%d cases disagree\n' "$failed" "$checked" >&2

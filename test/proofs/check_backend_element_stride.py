@@ -28,9 +28,11 @@ CODEGEN_ENV = ROOT / "src/backend/codegen_env.elisa"
 BITFIELDS = ROOT / "src/backend/codegen_bitfields.elisa"
 PACKED_REG = ROOT / "src/backend/codegen_packed_reg.elisa"
 PAYLOAD_ENUM_REG = ROOT / "src/backend/codegen_payload_enum_reg.elisa"
+PAYLOAD_ENUM_METADATA = ROOT / "src/backend/codegen_payload_enum_reg_metadata.elisa"
 ANNOTATION_SCOPE = ROOT / "src/backend/codegen_annotation_scope.elisa"
 CONTAINER_OPS = ROOT / "src/backend/codegen_container_ops.elisa"
-COMPREHENSION = ROOT / "src/backend/codegen_comprehension.elisa"
+CONTAINER_GROWTH = ROOT / "src/backend/codegen_container_ops_darray_growth.elisa"
+COMPREHENSION = ROOT / "src/backend/codegen_comprehension_emit.elisa"
 CLONE = ROOT / "src/backend/codegen_clone.elisa"
 EXPR_LITERALS = ROOT / "src/backend/codegen_expr_literals.elisa"
 POSITIVE = HERE / "backend_element_stride.elisa"
@@ -158,11 +160,11 @@ def scalar_type_of_name(name: sview, target_bits: u32) -> ValueType:
     return when name:
         "cstr" -> ValueType{kind: TypeKind.CStr, bits: 0}
         "sview" -> ValueType{kind: TypeKind.SView, bits: 0}
-        "i8" -> ValueType{kind: TypeKind.Signed, bits: 8}
-        "i16" -> ValueType{kind: TypeKind.Signed, bits: 16}
-        "i32" -> ValueType{kind: TypeKind.Signed, bits: 32}
+        "i8" | "s8" -> ValueType{kind: TypeKind.Signed, bits: 8}
+        "i16" | "s16" -> ValueType{kind: TypeKind.Signed, bits: 16}
+        "i32" | "s32" -> ValueType{kind: TypeKind.Signed, bits: 32}
         "isize" | "int" -> ValueType{kind: TypeKind.Signed, bits: target_bits}
-        "i64" -> ValueType{kind: TypeKind.Signed, bits: 64}
+        "i64" | "s64" -> ValueType{kind: TypeKind.Signed, bits: 64}
         "u8" -> ValueType{kind: TypeKind.Unsigned, bits: 8}
         "u16" -> ValueType{kind: TypeKind.Unsigned, bits: 16}
         "u32" -> ValueType{kind: TypeKind.Unsigned, bits: 32}
@@ -228,7 +230,7 @@ if bit_group_width.count("return") != 1 or not bit_group_width.endswith(
         compact("member_type <- ValueType{kind: TypeKind.Unsigned, bits: bit_group_pack_bits(member, structs)}") not in compact(PACKED_REG.read_text()):
     raise SystemExit("bit-group storage no longer packs only byte-aligned 8/16/32/64-bit scalar widths")
 
-enum_registration = compact(function_section(PAYLOAD_ENUM_REG.read_text(), "register_enums_from_metadata"))
+enum_registration = compact(function_section(PAYLOAD_ENUM_METADATA.read_text(), "register_enums_from_metadata"))
 if "backing<-resolve_type_head(file.enum_decl_storage_heads[enum_index],structs)" not in enum_registration or \
         "ifbacking.kind==TypeKind.Unmodeled:backing<-sub_byte_backing_type(file.enum_decl_storage_heads[enum_index])" not in enum_registration or \
         "continueifnotis_integer_type(backing)" not in enum_registration:
@@ -242,6 +244,8 @@ if "enum_backing:ValueType=copied_type(structs.const_enums.enum_backings[enum_sl
 stride_call_sites = {
     CONTAINER_OPS: {
         "emit_darray_push": "stride:LLVMValueRef=element_stride(element_type,structs,ctx)",
+    },
+    CONTAINER_GROWTH: {
         "emit_darray_reserve": "stride:LLVMValueRef=element_stride(element_type,structs,ctx)",
         "emit_darray_append_copy": "stride:LLVMValueRef=element_stride(element_type,structs,ctx)",
     },
@@ -425,8 +429,8 @@ inputs = list(dict.fromkeys([
     BIN, manifest, manifest.with_name(manifest.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", SIZES, VALUE_TYPE, POLICY, CODEGEN,
-    CODEGEN_ENV, BITFIELDS, PACKED_REG, PAYLOAD_ENUM_REG, ANNOTATION_SCOPE,
-    CONTAINER_OPS, COMPREHENSION, CLONE, EXPR_LITERALS, POSITIVE, NEGATIVE,
+    CODEGEN_ENV, BITFIELDS, PACKED_REG, PAYLOAD_ENUM_REG, PAYLOAD_ENUM_METADATA, ANNOTATION_SCOPE,
+    CONTAINER_OPS, CONTAINER_GROWTH, COMPREHENSION, CLONE, EXPR_LITERALS, POSITIVE, NEGATIVE,
     *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

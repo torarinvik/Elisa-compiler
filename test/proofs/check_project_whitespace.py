@@ -71,9 +71,6 @@ def function_body(name: str, signature: str) -> str:
 trim_start_body = function_body(
     "bytes_trim_start", "def bytes_trim_start(value: darray[u8]&) -> usize:"
 )
-trim_end_body = function_body(
-    "bytes_trim_end", "def bytes_trim_end(value: darray[u8]&) -> usize:"
-)
 trim_end_from_body = function_body(
     "bytes_trim_end_from", "def bytes_trim_end_from(value: darray[u8]&, first: usize) -> usize:"
 )
@@ -119,14 +116,13 @@ for fragment in (
     "ensure forall suffix in result..<value.count: bytes_is_space(value[suffix])",
     "ensure result > first implies not bytes_is_space(value[result - 1.usize()])",
     "last: mutable usize = value.count",
-    "for reverse_offset in 0..<(value.count - first) |last, first, value|",
+    "while last > first |last, first, value|:",
+    "decreases last - first",
     "invariant first <= last",
     "invariant last <= value.count",
-    "invariant last == value.count - reverse_offset",
-    "invariant last > first",
     "invariant forall suffix in last..<value.count: bytes_is_space(value[suffix])",
     "if not bytes_is_space(value[last - 1.usize()]):",
-    "assert last > first",
+    "assert last == first",
     "return last",
     "last <- last - 1.usize()",
     "assert first <= last",
@@ -136,19 +132,6 @@ for fragment in (
 ):
     if compact(fragment) not in compact(trim_end_from_body):
         raise SystemExit(f"production trailing trim helper lost its bounded interval proof: {fragment}")
-for fragment in (
-    "ensure result >= bytes_trim_start(value)",
-    "ensure result <= value.count",
-    "ensure forall suffix in result..<value.count: bytes_is_space(value[suffix])",
-    "ensure result > bytes_trim_start(value) implies not bytes_is_space(value[result - 1.usize()])",
-    "first: usize = bytes_trim_start(value)",
-    "end: usize = bytes_trim_end_from(value, first)",
-    "assert end >= first",
-    "assert first == bytes_trim_start(value)",
-    "return end",
-):
-    if compact(fragment) not in compact(trim_end_body):
-        raise SystemExit(f"production trailing trim no longer preserves the nonspace interval: {fragment}")
 if compact("return bytes_trim_start(value) == value.count") not in compact(blank_body):
     raise SystemExit("production blank predicate no longer uses the leading trim boundary")
 if compact("can Memory.Allocate, Abort.Panic:") not in compact(strlist_extend_body) or \
@@ -157,7 +140,7 @@ if compact("can Memory.Allocate, Abort.Panic:") not in compact(strlist_extend_bo
     raise SystemExit("production StrList extension no longer grants the span-copy effects explicitly")
 for fragment in (
     "start: usize = bytes_trim_start(value)",
-    "end: usize = bytes_trim_end(value)",
+    "end: usize = bytes_trim_end_from(value, start)",
     "bytes_extend_span(&out, value, start, end - start)",
     "return out",
 ):
@@ -174,7 +157,7 @@ for name, required in (
     ("production_trim_boundaries_match_the_whitespace_spec", (
         "ensure result == true",
         "ProjectSystem::bytes_trim_start(value)",
-        "ProjectSystem::bytes_trim_end(value)",
+        "ProjectSystem::bytes_trim_end_from(value, start)",
         "assert start <= end", "assert end <= value.count",
         "assert forall prefix in 0..<start",
         "if start < value.count:",
@@ -201,10 +184,10 @@ for name, required in (
         raise SystemExit(f"production trim proof contract changed: {name}")
 for name, claim in (
     ("trim_start_can_exceed_the_source_length", "ProjectSystem::bytes_trim_start(value) > value.count"),
-    ("trim_end_can_exceed_the_source_length", "ProjectSystem::bytes_trim_end(value) > value.count"),
-    ("trim_end_can_precede_trim_start", "ProjectSystem::bytes_trim_end(value) < ProjectSystem::bytes_trim_start(value)"),
+    ("trim_end_can_exceed_the_source_length", "ProjectSystem::bytes_trim_end_from(value, start) > value.count"),
+    ("trim_end_can_precede_trim_start", "ProjectSystem::bytes_trim_end_from(value, start) < start"),
     ("trim_start_can_skip_a_non_whitespace_first_byte", "ProjectSystem::bytes_trim_start(value) > 0.usize()"),
-    ("trim_end_can_leave_a_non_whitespace_last_byte", "ProjectSystem::bytes_trim_end(value) < value.count"),
+    ("trim_end_can_leave_a_non_whitespace_last_byte", "ProjectSystem::bytes_trim_end_from(value, start) < value.count"),
     ("a_nonblank_trimmed_value_can_lose_all_bytes", "trimmed.count == 0.usize()"),
 ):
     marker = f"def {name}("
@@ -335,7 +318,7 @@ assert {
     "blank_project_value_uses_the_fallback",
     "nonblank_project_value_is_preserved",
     "bytes_trim_start",
-    "bytes_trim_end",
+    "bytes_trim_end_from",
     "production_trim_interval_is_bounded",
     "production_trim_boundaries_match_the_whitespace_spec",
     "production_trimmed_value_is_exactly_its_source_span",

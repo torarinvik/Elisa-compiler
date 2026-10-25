@@ -35,4 +35,10 @@ grep -q '^D 2$' <<< "$extra_prefix"
 grep -q 'catch arm "Wrong::Other::Fault.Broken" does not match the caught call' <<< "$extra_prefix"
 grep -q 'non-exhaustive catch over Fault; missing Fault.Broken' <<< "$extra_prefix"
 
+# A root caller can disambiguate same-leaf callees with an explicit module qualifier.
+qualified_callee=$("$RPT" < "$ROOT/test/repro/catch_qualified_callee_scope.elisa")
+grep -q '^D 2$' <<< "$qualified_callee"
+grep -q 'non-exhaustive catch over Fault; missing Fault.AlsoProvider' <<< "$qualified_callee"
+grep -q 'catch arm "Provider::Fault.AlsoProvider" does not match the caught call' <<< "$qualified_callee"
+
 echo "catch module-qualified variants smoke OK" >&2

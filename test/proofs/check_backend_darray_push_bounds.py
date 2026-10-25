@@ -19,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not args.source_only)
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 CONTAINER = ROOT / "src/backend/codegen_container_ops.elisa"
+CONTAINER_GROWTH = ROOT / "src/backend/codegen_container_ops_darray_growth.elisa"
 PRERESERVE = ROOT / "src/backend/codegen_loop_prereserve.elisa"
 SIZE_TYPES = ROOT / "src/backend/codegen_interned_types.elisa"
 LLVM_C = ROOT / "src/backend/llvm_c.elisa"
@@ -79,7 +80,7 @@ def ordered(source: str, name: str, steps: tuple[str, ...]) -> None:
         cursor = position + len(needle)
 
 
-container = CONTAINER.read_text()
+container = CONTAINER.read_text() + CONTAINER_GROWTH.read_text()
 prereserve = PRERESERVE.read_text()
 size_types = SIZE_TYPES.read_text()
 llvm_c = compact(LLVM_C.read_text())
@@ -175,7 +176,7 @@ if product.get("compile_mode") != "strict":
     raise SystemExit("DArray push bounds require a strict Elisa-Proof build")
 inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"),
     BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV",
-    Path(__file__), HERE / "proof_product_gate.py", CONTAINER, PRERESERVE, SIZE_TYPES, LLVM_C, POSITIVE,
+    Path(__file__), HERE / "proof_product_gate.py", CONTAINER, CONTAINER_GROWTH, PRERESERVE, SIZE_TYPES, LLVM_C, POSITIVE,
     NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
 before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

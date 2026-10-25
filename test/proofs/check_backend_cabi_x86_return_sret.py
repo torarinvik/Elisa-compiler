@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 CLASSIFIER = ROOT / "src/backend/codegen_c_abi.elisa"
-DECLARATION = ROOT / "src/backend/codegen_declare_extern.elisa"
+DECLARATION = ROOT / "src/backend/codegen_declare_extern_body.elisa"
 POSITIVE = HERE / "backend_cabi_x86_return_sret.elisa"
 NEGATIVE = HERE / "backend_cabi_x86_return_sret_rejected.elisa"
 POSITIVE_HASHES = {
@@ -43,14 +43,14 @@ if not NEGATIVE.read_text().startswith('include "./backend_cabi_x86_return_sret.
     raise SystemExit("false controls must import the x86 C return model")
 classifier = compact(section(CLASSIFIER.read_text(), "cabi_classify_ret_llvm"))
 ordered = (
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifnotret_is_aggregate",
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifsize==0",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifnotret_is_aggregate",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifsize==0",
     "flat_ok:bool=cabi_flatten(llvm_value,0,leaves,structs)",
-    "CabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}returnifflat_ok==false",
+    "returnCabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}ifflat_ok==false",
     "target:i32=cabi_target(structs)",
     "iftarget==2:",
     "iftarget==0:",
-    "CabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}returnifsize>16",
+    "returnCabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}ifsize>16",
 )
 if any(part not in classifier for part in ordered) or [classifier.index(part) for part in ordered] != sorted(classifier.index(part) for part in ordered):
     raise SystemExit("C ABI return classification no longer matches aggregate, flatten, target, and x86 size policy")

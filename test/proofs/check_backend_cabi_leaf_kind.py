@@ -47,14 +47,15 @@ flatten_steps = (
     "ifkind==2:leaves.push(CabiLeaf{offset:base,size:4,kind:1})",
     "ifkind==3:leaves.push(CabiLeaf{offset:base,size:8,kind:2})",
     "ifkind==8orkind==12:leaves.push(CabiLeaf{offset:base,size:LLVMABISizeOfType(structs.target.target_data,ty),kind:0})",
-    "returnfalse",
 )
 if any(part not in flatten for part in flatten_steps) or [flatten.index(part) for part in flatten_steps] != sorted(flatten.index(part) for part in flatten_steps):
     raise SystemExit("C ABI flattener scalar-kind mapping or unsupported-kind rejection changed")
+if not flatten.endswith("returnfalse"):
+    raise SystemExit("C ABI flattener must reject unsupported LLVM element kinds")
 leaf_type = compact(section(source_text, "cabi_leaf_type"))
 type_steps = (
-    "LLVMFloatTypeInContext(ctx)returnifleaf.kind==1",
-    "LLVMDoubleTypeInContext(ctx)returnifleaf.kind==2",
+    "returnLLVMFloatTypeInContext(ctx)ifleaf.kind==1",
+    "returnLLVMDoubleTypeInContext(ctx)ifleaf.kind==2",
     "returnLLVMIntTypeInContext(ctx,(leaf.size*8).u32())",
 )
 if any(part not in leaf_type for part in type_steps) or [leaf_type.index(part) for part in type_steps] != sorted(leaf_type.index(part) for part in type_steps):

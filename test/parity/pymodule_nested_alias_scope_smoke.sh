@@ -24,12 +24,20 @@ assert functions["nested_alias_fallback"]["parameters"] == [
 assert functions["nested_alias_local_target"]["parameters"] == [
     {"name": "value", "type": "i64", "default": "30"}
 ]
+assert functions["first_shared_alias"]["parameters"] == [
+    {"name": "value", "type": "i64", "default": "41"}
+]
+assert functions["second_shared_alias"]["parameters"] == [
+    {"name": "value", "type": "i64", "default": "52"}
+]
 PY
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi \
     -o "$WORK/nested_alias_scope.pyi" "$SOURCE" >/dev/null
 grep -Fq 'def nested_alias_fallback(value: int = 20) -> int: ...' "$WORK/nested_alias_scope.pyi"
 grep -Fq 'def nested_alias_local_target(value: int = 30) -> int: ...' "$WORK/nested_alias_scope.pyi"
+grep -Fq 'def first_shared_alias(value: int = 41) -> int: ...' "$WORK/nested_alias_scope.pyi"
+grep -Fq 'def second_shared_alias(value: int = 52) -> int: ...' "$WORK/nested_alias_scope.pyi"
 python3 -m py_compile "$WORK/nested_alias_scope.pyi"
 
 # A nested Target must win over the same-named root Target when Scope declares

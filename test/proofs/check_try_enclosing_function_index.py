@@ -1,6 +1,7 @@
 """Source-bind and admit the try-site enclosing-function predecessor proof."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -11,14 +12,30 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
-SOURCE = ROOT / "src/semantic/check_try_fallible.elisa"
+SOURCE_FILES = [
+    ROOT / "src/semantic/check_try_fallible.elisa",
+    ROOT / "src/semantic/check_try_fallible/using_aliases.elisa",
+    ROOT / "src/semantic/check_try_fallible/callable_rows.elisa",
+    ROOT / "src/semantic/check_try_fallible/direct_raises.elisa",
+    ROOT / "src/semantic/check_try_fallible/noncall_scan.elisa",
+    ROOT / "src/semantic/check_try_fallible/block_sources.elisa",
+    ROOT / "src/semantic/check_try_fallible/fallback_casts.elisa",
+]
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
-PIPELINE = ROOT / "src/semantic/semantic_api.elisa"
+PIPELINE_FILES = [
+    ROOT / "src/semantic/semantic_api.elisa",
+    ROOT / "src/semantic/semantic_api/full_pipeline.elisa",
+]
+PARSER_ARGUMENT_SOURCE = ROOT / "src/parser/parser_expr_query.elisa"
+PARSER_VISIBILITY_SOURCE = ROOT / "src/parser/parser_decl_module.elisa"
 POSITIVE = HERE / "try_enclosing_function_index.elisa"
 NEGATIVE = HERE / "try_enclosing_function_index_rejected.elisa"
 PROOF_PROCESS_TIMEOUT_SECONDS = 60
@@ -157,15 +174,15 @@ def constant_definitions(source: str) -> dict[str, tuple[str, str]]:
     }
 
 
-source_text = SOURCE.read_text()
+source_text = "\n".join(path.read_text() for path in SOURCE_FILES)
 semantic_text = SEMANTIC.read_text()
-pipeline_text = PIPELINE.read_text()
+pipeline_text = "\n".join(path.read_text() for path in PIPELINE_FILES)
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
 if not __debug__:
     raise SystemExit("run without Python -O")
-if not MANIFEST.is_file():
+if not args.source_only and not MANIFEST.is_file():
     raise SystemExit(f"missing proof build manifest: {MANIFEST}")
 source_constants = constant_definitions(source_text)
 if not source_constants:
@@ -255,12 +272,546 @@ if not contains_contiguous_block(rows_function, expected_dispatch):
 if compact_inline(rows_function).count("enclosing_try_function_indexed(") != 1 or \
         compact_inline(rows_function).count("enclosing_try_function(") != 1:
     raise SystemExit("try rows must retain exactly one indexed and one linear enclosing-function dispatch arm")
-propagation_call = "table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, error_set_annotations, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, first_class_error_family, noncall_lambda_error_family, noncall_inside_lambda)"
+propagation_call = "table <- check_try_propagation_row(annotation, row_enclosing, row_module, row_qualifier, annotations, try_named_arguments, argument_type_ids, receiver_ref_mutability_known, receiver_ref_mutable, error_set_annotations, error_set_family_paths, error_set_index, propagation_site_count, module_index, module_annotations, error_index, table, row_arity.known, row_arity.value, first_class_error_family, noncall_lambda_error_family, noncall_inside_lambda)"
 if compact_inline(propagation_call) not in compact_inline(rows_function):
     raise SystemExit("resolved enclosing function must flow into try-propagation diagnostics")
 
+argument_types = compact_inline(function_section(source_text, "try_call_argument_type_ids"))
+if not all(fragment in argument_types for fragment in (
+        'marker.owner != "__try_callee_argument_position"',
+        "ownership_binding_at_position(table, caller, argument_position)",
+        "declared.binding_id.owner.value != binding.binding_id.owner.value",
+        "declared.binding_id.serial != binding.binding_id.serial",
+        "try_overload_type_is_firm(argument_type_id, caller, annotations, table) else 0)")):
+    raise SystemExit("Try argument types must come from exact resolved binding positions and fail closed on unknown, generic, or conflicting rows")
+generic_parameter = compact_inline(function_section(source_text, "try_overload_type_is_generic_parameter"))
+if not all(fragment in generic_parameter for fragment in (
+        'annotation.name == "__generic_param_identity"',
+        "annotation.detail_line == declaration_symbol.line",
+        "annotation.offset == declaration_symbol.offset",
+        "annotation.module == declaration_symbol.module_owner")):
+    raise SystemExit("Try overload ranking must identify generic parameters by their exact declaration identity")
+type_selection = compact_inline(function_section(source_text, "callable_symbol_type_selected_candidate"))
+if not all(fragment in type_selection for fragment in (
+        'argument.owner == "__try_callee_named_arg"',
+        "actual_receiver_type_id: u32 = argument_type_ids[0]",
+        "try_overload_type_is_firm(actual_receiver_type_id, invalid, annotations, table)",
+        "callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)",
+        "callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)",
+        "continue if not receiver.found and not callable_symbol_has_parameter_rows(table, symbol) and symbol.arity_min == 0 and (symbol.arity_max == 0 or symbol.arity_max == 4294967295)",
+        "try_overload_receiver_pattern_matches(receiver.type_id, actual_receiver_type_id, symbol.id, annotations, table, 0)",
+        "if actual_receiver_is_ref and not formal_receiver_is_ref and not try_overload_type_is_generic_parameter(receiver.type_id, symbol.id, annotations, table):",
+        "return invalid if actual_receiver_base_kind == SemTypeKind.Int or actual_receiver_base_kind == SemTypeKind.Float or actual_receiver_base_kind == SemTypeKind.Bool",
+        "continue if receiver.mutable_ref and not receiver_ref_mutable",
+        "rank_score: usize = rank.score + 1.usize() if formal_receiver_is_ref and actual_receiver_is_ref and receiver.mutable_ref == receiver_ref_mutable else rank.score",
+        "if best_count == 0.usize() or rank_score > best_rank:",
+        "elif rank_score == best_rank:",
+        "return selected if best_count == 1.usize()")):
+    raise SystemExit("Try overload selection must use the known first argument, Core-compatible receiver ranking, and a unique top rank")
+if "for actual_type_id in argument_type_ids" in type_selection or "argument_type_ids[parameter_index]" in type_selection:
+    raise SystemExit("Later argument types must not affect Core's first-receiver overload selection")
+receiver_arity = compact_inline(function_section(source_text, "callable_symbol_core_accepts_receiver_arity"))
+if not all(fragment in receiver_arity for fragment in (
+        "symbol.arity_max == 4294967295",
+        "table.function_param_has_default[row]",
+        "return symbol.arity_max == arity")):
+    raise SystemExit("Try receiver candidate filtering must mirror Core's variadic, defaulted, and fixed-arity rules")
+if "declaration_id.value == symbol.id.value" not in compact_inline(function_section(source_text, "callable_symbol_has_parameter_rows")):
+    raise SystemExit("Try overload ranking must distinguish an actual zero-parameter function from incomplete formal metadata")
+visible_overloads = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_in_scope"))
+if not all(fragment in visible_overloads for fragment in (
+        "callable_row_in_ufcs_candidate_set_indexed",
+        "other.module_owner == symbol.module_owner",
+        "candidate_count >= 2.usize()")):
+    raise SystemExit("Try receiver ranking must detect Core overload sets across all visible module candidates")
+candidate_set = compact_inline(function_section(source_text, "callable_row_in_ufcs_candidate_set_indexed"))
+if not all(fragment in candidate_set for fragment in (
+        'if callee_qualifier != "": return false if not try_error_alias_module_visible(annotations, candidate_module, enclosing_module) return callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier)',
+        "candidate_module == scope_module and callable_named_declaration_in_module",
+        "callable_wildcard_imported_row_in_scope(annotations, table, name, candidate_module, scope_module)",
+        "return callable_program_selective_import_row(annotations, name, candidate_module)")):
+    raise SystemExit("Try receiver ranking must retain both lexical and imported functions in Core's visible candidate set")
+candidate_local = candidate_set.find("candidate_module == scope_module and callable_named_declaration_in_module")
+candidate_parent_walk = candidate_set.find("scope_module <- try_noncall_module_parent(scope_module)")
+candidate_wildcard = candidate_set.find("callable_wildcard_imported_row_in_scope")
+candidate_selective = candidate_set.find("return callable_program_selective_import_row(annotations, name, candidate_module)")
+if min(candidate_local, candidate_parent_walk, candidate_wildcard, candidate_selective) < 0 or not (
+        candidate_local < candidate_parent_walk < candidate_wildcard < candidate_selective):
+    raise SystemExit("Try receiver lookup must scan all lexical declarations before wildcard imports and selective aliases")
+wildcard_imported_row = compact_inline(function_section(source_text, "callable_wildcard_imported_row_in_scope"))
+if 'binding.name == "__binding_wildcard_import" and binding.owner == candidate_module and binding.module == scope_module' not in wildcard_imported_row:
+    raise SystemExit("Try wildcard imports must remain tied to their lexical using scope")
+ordinary_row = compact_inline(function_section(source_text, "callable_row_in_scope_indexed"))
+qualified_module_match = compact_inline(function_section(source_text, "callable_qualified_module_matches_candidate"))
+if not all(fragment in qualified_module_match for fragment in (
+        "callable_using_alias_visible_target(annotations, enclosing_module, alias_head)",
+        "callable_alias_path_matches_candidate(annotations, visible_prefix_alias.scope, visible_prefix_alias.target, alias_suffix, candidate_module)",
+        "candidate_module == callee_qualifier or module_last_segment(candidate_module) == callee_qualifier")):
+    raise SystemExit("Try qualified overload ranking must retain alias-aware module matching independently of member visibility")
+if 'return false if not try_error_alias_module_visible(annotations, candidate_module, enclosing_module) return false if not callable_function_declaration_visible(annotations, name, candidate_module, declaration_line, declaration_offset, enclosing_module) return callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier)' not in ordinary_row:
+    raise SystemExit("Try ordinary qualified lookup must reject private modules and exact private members while sharing the path matcher")
+ordinary_local = ordinary_row.find("if callable_named_visible_declaration_in_module(table, annotations, name, scope_module, enclosing_module): return candidate_module == scope_module")
+ordinary_parent_walk = ordinary_row.find("scope_module <- try_noncall_module_parent(scope_module)")
+ordinary_wildcard = ordinary_row.find("wildcard: (found: bool, matches: bool) = callable_first_wildcard_imported_row")
+ordinary_selective = ordinary_row.find("return callable_program_selective_import_row_visible(annotations, name, candidate_module, enclosing_module)")
+if min(ordinary_local, ordinary_parent_walk, ordinary_wildcard, ordinary_selective) < 0 or not (
+        ordinary_local < ordinary_parent_walk < ordinary_wildcard < ordinary_selective):
+    raise SystemExit("Try ordinary lookup must scan every visible lexical parent before wildcard imports and selective aliases")
+visible_lexical_declaration = compact_inline(function_section(source_text, "callable_named_visible_declaration_in_module"))
+if not all(fragment in visible_lexical_declaration for fragment in (
+        "callable_function_declaration_visible(annotations, name, module, symbol.line, symbol.offset, enclosing_module)",
+        "symbol.kind != SymbolKind.Func or symbol.name != name or symbol.module_owner != module")):
+    raise SystemExit("Try lexical lookup must skip inaccessible declarations instead of letting them shadow visible imports")
+callable_declaration_visibility = compact_inline(function_section(source_text, "callable_function_declaration_visible"))
+if not all(fragment in callable_declaration_visibility for fragment in (
+        "try_error_alias_module_visible(annotations, candidate_module, lexical_module)",
+        'annotation.owner != "__section_private" and annotation.owner != "__section_public"',
+        "annotation.offset == declaration_offset",
+        "annotation.line == declaration_line",
+        "return try_noncall_module_is_ancestor(candidate_module, lexical_module) if exact_private",
+        "return true if exact_public",
+        "return false if legacy_private_marker")):
+    raise SystemExit("Try callable visibility must match private/public markers to the exact declaration and module path")
+first_wildcard = compact_inline(function_section(source_text, "callable_first_wildcard_imported_row"))
+if not all(fragment in first_wildcard for fragment in (
+        'binding.name != "__binding_wildcard_import"',
+        "try_noncall_module_is_ancestor(binding.module, enclosing_module)",
+        "callable_named_visible_declaration_in_module(table, annotations, name, binding.owner, enclosing_module)",
+        "ambiguous_imports <- true if selected_found and selected_target != binding.owner",
+        "selected_scope_length: mutable usize = enclosing_module.len + 1.usize()",
+        "binding.module.len < selected_scope_length",
+        "selected_target <- binding.owner",
+        "return (true, false) if ambiguous_imports",
+        "return (selected_found, selected_target == candidate_module)")):
+    raise SystemExit("Try ordinary wildcard lookup must preserve Core's outer-to-inner order and private visibility")
+program_selective_import = compact_inline(function_section(source_text, "callable_program_selective_import_row"))
+if not all(fragment in program_selective_import for fragment in (
+        'binding.owner != "__from_member" or binding.name != name',
+        'source.owner != "__from_src" or source.module != binding.module or source.line != binding.line or source.offset != binding.offset',
+        'return candidate_module == source.name if binding.module == ""',
+        "return callable_module_path_matches_suffix(candidate_module, binding.module, source.name)")):
+    raise SystemExit("Try selective imports must match Core's raw source path relative to the importing namespace")
+program_selective_import_visible = compact_inline(function_section(source_text, "callable_program_selective_import_row_visible"))
+if not all(fragment in program_selective_import_visible for fragment in (
+        "path_matches and callable_named_visible_declaration_in_module(table, annotations, name, candidate_module, enclosing_module)")):
+    raise SystemExit("Try ordinary selective imports must reject private target modules and members")
+noncall_import_builder = compact_inline(function_section(source_text, "try_noncall_binding_at_site"))
+if not all(fragment in noncall_import_builder for fragment in (
+        "already_imported_name: mutable bool = false",
+        "environment.callable_imported_member_names[index] == import_annotation.name",
+        "try_noncall_module_path(import_annotation.module, source_annotation.name, table)",
+        "if imported_module != \"\" and not already_imported_name",
+        "environment.callable_imported_member_names.push(import_annotation.name)")):
+    raise SystemExit("Try non-call cached facts must retain only Core's first selective import for each bare name")
+noncall_module_path = compact_inline(function_section(source_text, "try_noncall_module_path"))
+if 'return child if parent == ""' not in noncall_module_path or \
+        "module_path_has_scope_separator(child)" in noncall_module_path:
+    raise SystemExit("Try nested module and import paths must qualify multi-segment children relative to their parent")
+noncall_assignment_facts = compact_inline(function_section(source_text, "try_noncall_assignment_source_facts"))
+if 'return (call_facts.family, call_facts.return_nonfallible and call_facts.family == "") if call_facts.known' not in noncall_assignment_facts:
+    raise SystemExit("Try non-call assignment facts must preserve known infallible callable returns")
+cached_lookup = compact_inline(function_section(source_text, "try_noncall_callable_cached_facts"))
+cached_local = cached_lookup.find("local_matches: mutable usize = 0")
+cached_parent_walk = cached_lookup.find("scope_module <- try_noncall_module_parent(scope_module)")
+cached_wildcard = cached_lookup.find("for import_index in 0..<environment.callable_wildcard_import_modules.count")
+cached_scope_rank = cached_lookup.find("import_scope.len < selected_import_scope_length")
+cached_selective = cached_lookup.find("for import_index in 0..<environment.callable_imported_member_names.count")
+if min(cached_local, cached_parent_walk, cached_wildcard, cached_scope_rank, cached_selective) < 0 or not (
+        cached_local < cached_parent_walk < cached_wildcard < cached_scope_rank < cached_selective):
+    raise SystemExit("Try cached lookup must scan all lexical declarations, then outer-to-inner wildcards, then selective aliases")
+if not all(fragment in cached_lookup for fragment in (
+        "wildcard_ambiguous: mutable bool = false",
+        "wildcard_ambiguous <- true if first_visible_import_module != \"\" and first_visible_import_module != environment.callable_wildcard_import_modules[import_index]",
+        'return (false, "", false, false, false, true, "", 0.usize()) if wildcard_ambiguous')):
+    raise SystemExit("Try cached lookup must fail closed when distinct visible wildcard targets make a bare name ambiguous")
+cached_fact_builder = compact_inline(function_section(source_text, "try_noncall_callable_facts_add"))
+if not all(fragment in cached_fact_builder for fragment in (
+        "callable_visible: bool = callable_function_declaration_visible(annotations, name, current_module, function_position.line, function_position.offset, environment.current_module)",
+        "environment.callable_names.push(name)",
+        "environment.callable_visible.push(callable_visible)",
+        "environment.callable_facts_known.push(family_rows <= 1.usize())",
+        "environment.callable_first_param_type_names.push(first_param_type_name)",
+        "environment.callable_first_param_generic.push(first_param_is_generic)",
+        "environment.callable_max_param_counts.push(params.count)",
+        "environment.callable_has_default_params.push(has_default_param)",
+        "environment.callable_variadic.push(variadic)")):
+    raise SystemExit("Try cached facts must retain visibility separately from known family facts")
+if cached_lookup.count("environment.callable_visible[index]") < 4:
+    raise SystemExit("Try cached local, wildcard, selective, and qualified lookup must filter inaccessible candidates")
+cached_hidden_rank = compact_inline(function_section(source_text, "try_noncall_cached_hidden_candidate_blocks"))
+if not all(fragment in cached_hidden_rank for fragment in (
+        "not environment.callable_visible[index]",
+        "environment.callable_max_param_counts[index] != arguments.count",
+        "try_noncall_cached_argument_type_name(arguments[selected_argument_index], params)",
+        "try_noncall_cached_argument_type_name(arguments[hidden_argument_index], params)",
+        "try_noncall_cached_callable_in_ufcs_set(callee_name, environment.callable_modules[index], callee_qualifier, callee, environment)",
+        "try_noncall_cached_receiver_type_matches(hidden_type, actual_type)",
+        "actual_type == \"int\" and try_noncall_cached_integer_type(hidden_type) and try_noncall_cached_integer_type(selected_type)",
+        "if selected_generic: return true")):
+    raise SystemExit("Try cached family inference must fail closed when a viable hidden overload can win, while using known argument types to rule out incompatible private siblings")
+cached_candidate_set = compact_inline(function_section(source_text, "try_noncall_cached_callable_in_ufcs_set"))
+if not all(fragment in cached_candidate_set for fragment in (
+        "try_noncall_module_is_ancestor(candidate_module, environment.current_module)",
+        "try_noncall_module_is_ancestor(environment.callable_wildcard_import_scopes[import_index], environment.current_module)",
+        "environment.callable_imported_member_names[import_index] != callee_name",
+        "try_noncall_callable_matches_using_alias(callee, alias_index, candidate_module, environment)")):
+    raise SystemExit("Try cached hidden-candidate checks must cover Core's lexical, wildcard, selective, and qualified receiver candidate modules")
+cached_lookup_signature = compact_inline(function_section(source_text, "try_noncall_callable_cached_facts"))
+if "arguments: darray[Ast::Expr]&" not in cached_lookup_signature or "try_noncall_cached_hidden_candidate_blocks(callable_index, callee_name, callee_qualifier, callee, arguments, argument_names, params, environment)" not in cached_lookup_signature or "try_noncall_callable_cached_facts(callee_name, callee_qualifier, callee, environment)" in source_text:
+    raise SystemExit("Every Try cached callable lookup must receive call arguments and caller parameter types before returning ErrorSet facts")
+cached_env_clone = compact_inline(function_section(source_text, "try_noncall_family_clone"))
+if not all(fragment in cached_env_clone for fragment in (
+        "clone.callable_first_param_type_names.extend(environment.callable_first_param_type_names)",
+        "clone.callable_first_param_generic.extend(environment.callable_first_param_generic)",
+        "clone.callable_max_param_counts.extend(environment.callable_max_param_counts)",
+        "clone.callable_has_default_params.extend(environment.callable_has_default_params)",
+        "clone.callable_variadic.extend(environment.callable_variadic)")):
+    raise SystemExit("Try branch clones must preserve cached overload signature facts")
+selected_receiver_acceptance = compact_inline(function_section(source_text, "callable_symbol_accepts_arity"))
+if not all(fragment in selected_receiver_acceptance for fragment in (
+        "symbol.id.value == selected_type_candidate.value",
+        "not callable_function_declaration_visible(annotations, name, module, symbol.line, symbol.offset, enclosing_module)")):
+    raise SystemExit("Try receiver family inference must reject the exact inaccessible winner after Core-compatible raw ranking")
+selected_receiver_count = compact_inline(function_section(source_text, "callable_symbol_arity_candidate_count"))
+if not all(fragment in selected_receiver_count for fragment in (
+        "selected_type_candidate.value.usize() >= table.symbols.count",
+        "callable_function_declaration_visible(annotations, name, selected_symbol.module_owner, selected_symbol.line, selected_symbol.offset, enclosing_module)",
+        "return 0.usize()")):
+    raise SystemExit("Try receiver candidate counting must fail closed for a selected inaccessible overload")
+cached_source_facts = compact_inline(function_section(source_text, "try_noncall_callable_source_facts"))
+if 'return (false, "", false, false, false) if cached_facts.ambiguous or callee_qualifier != ""' not in cached_source_facts:
+    raise SystemExit("Try cached source inference must not borrow a family from an ambiguous wildcard lookup")
+legacy_fallback = cached_source_facts.find("legacy_facts: (known: bool, family: sview @source) = try_noncall_callable_error_family(callee_name, annotations)")
+hidden_name_blocker = cached_source_facts.find("return (false, \"\", false, false, false) if any name in environment.callable_names where name == callee_name")
+if hidden_name_blocker < 0 or legacy_fallback < 0 or hidden_name_blocker > legacy_fallback:
+    raise SystemExit("Try cached hidden-name metadata must block the unscoped legacy ErrorSet fallback")
+receiver_match = compact_inline(function_section(source_text, "try_overload_receiver_pattern_matches"))
+if not all(fragment in receiver_match for fragment in (
+        "try_overload_type_is_generic_parameter(formal_type_id, declaration, annotations, table)",
+        "return (true, true) if formal_type_id == actual_type_id",
+        'interned_name(actual_type_id, table) == "int"',
+        "type_ids_compatible(formal_type_id, actual_type_id, table)",
+        "element_position in 0..<element_count.usize()")):
+    raise SystemExit("Receiver matching must support exact generic parameters, compatible concrete types, and structural receiver shapes")
+receiver_specificity = compact_inline(function_section(source_text, "try_overload_receiver_specificity"))
+if not all(fragment in receiver_specificity for fragment in (
+        "return (true, 0.usize()) if try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)",
+        "score <- score + element_score.score",
+        "return (true, 1.usize())")):
+    raise SystemExit("Receiver specificity must rank generic leaves below concrete leaves and add structural specificity")
+receiver_type = compact_inline(function_section(source_text, "callable_symbol_receiver_type"))
+if "table.function_param_mutable_ref[row]" not in receiver_type or "mutable_ref_known: bool" not in receiver_type:
+    raise SystemExit("Receiver ranking must retain the selected formal reference mutability")
+if "declared.writable_borrow" not in argument_types or "receiver_ref_mutability_known" not in argument_types:
+    raise SystemExit("Try receiver ranking must retain exact binding reference mutability when available")
+if not all(fragment in argument_types for fragment in (
+        "receiver_ref_mutability_seen: bool = receiver_ref_mutability_known",
+        "if not receiver_ref_mutability_seen:",
+        "receiver_ref_mutability_resolved: bool = receiver_ref_mutability_known",
+        "not receiver_ref_mutability_resolved")):
+    raise SystemExit("Try receiver mutability reads must snapshot the mutable output reference before boolean negation")
+firm_type = compact_inline(function_section(source_text, "try_overload_type_is_firm"))
+if "matches == 1.usize()" not in firm_type or "kind == SemTypeKind.Named" not in firm_type:
+    raise SystemExit("Named overload types may be used only when the symbol table proves a unique declaration spelling")
+parser_source = PARSER_ARGUMENT_SOURCE.read_text()
+if 'owner: "__try_callee_argument_position"' not in parser_source or "pos: Ast::expr_pos(arguments[index])" not in parser_source:
+    raise SystemExit("Try calls must retain each actual argument's exact AST position for resolved type lookup")
+parser_visibility_source = PARSER_VISIBILITY_SOURCE.read_text()
+section_marker = compact_inline(function_section(parser_visibility_source, "record_section_member"))
+if not all(fragment in section_marker for fragment in (
+        '"__section_private" if visibility_name == "private" else "__section_public"',
+        "line: member_position.line",
+        "offset: member_position.offset",
+        "module: owning_module")):
+    raise SystemExit("Try declaration visibility requires parser section markers with exact line, offset, and module identity")
+
+family_module = compact_inline(function_section(source_text, "try_error_set_decl_module_for_annotation"))
+root_precedence = 'return (true, family_annotation.name, "", false) if not qualified and try_error_set_decl_has_owner(annotations, family_annotation.name, "")'
+if root_precedence not in family_module or family_module.index(root_precedence) > family_module.index("for declaration in annotations"):
+    raise SystemExit("A bare root error-set declaration must win before Try scans lexical module candidates")
+root_nominal_precedence = 'return (false, family_annotation.name, "", false) if not qualified and function_module_known and try_error_local_nominal_type_shadows_family(annotations, family_annotation.name, function_module, table)'
+if root_nominal_precedence not in family_module or family_module.index(root_nominal_precedence) > family_module.index("try_error_alias_index(family_annotation.name, \"\", table)"):
+    raise SystemExit("A root nominal type must shadow lexical and imported same-name ErrorSets before alias candidate lookup")
+alias_target_path = compact_inline(function_section(source_text, "try_error_alias_target_path"))
+if not all(fragment in alias_target_path for fragment in ("Expr.Scope(base, name, _)", "Expr.Paren(inner, _)", "intern_joined_text(bytes, table)")):
+    raise SystemExit("Try alias lookup must retain complete qualified and parenthesized AST target paths")
+alias_cycle_guard = compact_inline(function_section(source_text, "try_error_alias_declaration_identity"))
+if not all(fragment in alias_cycle_guard for fragment in (
+        "declaration.declaration_id.value",
+        "any prior_id in visited where prior_id == declaration.declaration_id.value",
+        "visited <- visited.push(declaration.declaration_id.value)",
+        "try_error_alias_target_identity(annotations, declaration.target",
+        "_ = visited.pop()")):
+    raise SystemExit("Try alias resolution must follow TypeAliasDeclaration targets with declaration-identity cycle protection")
+alias_target_identity = compact_inline(function_section(source_text, "try_error_alias_target_identity"))
+if not all(fragment in alias_target_identity for fragment in (
+        "try_error_alias_module_path_matches(target_path, target_family",
+        "try_error_alias_declaration_identity(annotations, selected_alias, table, visited)",
+        "try_error_alias_index(target_family, \"\", table)",
+        "try_error_alias_imported_at_scope(annotations, target_family",
+        "return try_error_alias_declaration_identity(annotations, selected_imported_alias_index, table, visited) if selected_imported_alias_count == 1.usize()",
+        "return (true, selected_imported_family, selected_imported_module, false) if selected_imported_count == 1.usize()")):
+    raise SystemExit("Try alias targets must resolve qualified chains, root aliases, and selectively imported aliases to canonical ErrorSet identity")
+import_path_match = compact_inline(function_section(source_text, "try_error_set_import_path_matches"))
+direct_import_visibility = compact_inline(function_section(source_text, "try_error_set_decl_imported_at_scope"))
+alias_visibility = compact_inline(function_section(source_text, "try_error_alias_imported_at_scope"))
+private_alias_path = compact_inline(function_section(source_text, "try_error_alias_module_visible"))
+private_alias_name = compact_inline(function_section(source_text, "try_error_alias_name_visible"))
+generic_return_identity = compact_inline(function_section(source_text, "try_noncall_function_return_is_generic"))
+generic_return_facts = compact_inline(function_section(source_text, "try_noncall_callable_facts_add"))
+if not all(fragment in private_alias_path for fragment in (
+        "candidate_module: sview, lexical_module: sview) -> bool",
+        "segment: sview = candidate_module[segment_start:segment_end]",
+        "owner: sview = candidate_module[0:segment_start - 2.usize()] if segment_start >= 2.usize() else \"\"",
+        "private_scope: sview = candidate_module[0:segment_end]")) or "@source" in private_alias_path:
+    raise SystemExit("Try private-module visibility must compare temporary path slices without retaining source-region views")
+if "current_module: sview @source" not in generic_return_identity or \
+        "current_module: sview @source" not in generic_return_facts:
+    raise SystemExit("Try generic-return identity must keep its caller-guaranteed source-backed module through its annotation scan")
+if "scope_bound and not catch_module_is_ancestor(import_module, function_module)" not in import_path_match:
+    raise SystemExit("Try import path matching must distinguish lexical wildcard visibility from program-wide selective imports")
+wildcard_scope_filter = 'import_row.module != scope_module or import_row.name != "__binding_wildcard_import"'
+if not all(fragment in direct_import_visibility for fragment in (
+        "try_error_alias_module_visible(annotations, declaration.module, function_module)",
+        wildcard_scope_filter,
+        'if scope_module == ""',
+        'import_row.owner != "__from_member" or import_row.name != declaration.name',
+        "function_module, declaration.module, false)")) or direct_import_visibility.index('if scope_module == ""') < direct_import_visibility.index(wildcard_scope_filter):
+    raise SystemExit("Try direct ErrorSet lookup must search lexical wildcard imports before the first program-level selective import")
+direct_selective_start = direct_import_visibility.index('if scope_module == ""')
+direct_selective_member = direct_import_visibility.index('import_row.owner != "__from_member" or import_row.name != declaration.name', direct_selective_start)
+direct_selective_return = direct_import_visibility.index("return try_error_set_import_path_matches", direct_selective_member)
+if not all(fragment in alias_visibility for fragment in (
+        wildcard_scope_filter,
+        'if scope_module == ""',
+        'import_row.owner != "__from_member" or import_row.name != name',
+        "function_module, declaration_module, false)")) or alias_visibility.index('if scope_module == ""') < alias_visibility.index(wildcard_scope_filter):
+    raise SystemExit("Try type-alias lookup must search lexical wildcard imports before the first program-level selective import")
+alias_selective_start = alias_visibility.index('if scope_module == ""')
+alias_selective_member = alias_visibility.index('import_row.owner != "__from_member" or import_row.name != name', alias_selective_start)
+alias_selective_return = alias_visibility.index("return try_error_set_import_path_matches", alias_selective_member)
+if direct_selective_return < direct_selective_member or alias_selective_return < alias_selective_member:
+    raise SystemExit("Try selective import lookup must stop at the first program-level alias target")
+for fixture_name, smoke_name in (
+        ("try_bare_variant_sibling_selective_import.elisa", "try_bare_variant_sibling_selective_import_smoke.sh"),
+        ("try_bare_variant_sibling_imported_alias.elisa", "try_bare_variant_sibling_imported_alias_smoke.sh"),
+        ("try_bare_variant_imported_alias_chain.elisa", "try_bare_variant_imported_alias_chain_smoke.sh"),
+        ("try_bare_variant_conflicting_selective_import_first_target.elisa", "try_bare_variant_conflicting_selective_import_first_target_smoke.sh"),
+        ("try_bare_variant_duplicate_selective_import.elisa", "try_bare_variant_duplicate_selective_import_smoke.sh"),
+        ("try_direct_sibling_selective_import.elisa", "try_direct_sibling_selective_import_smoke.sh"),
+        ("try_noncall_cached_sibling_import.elisa", "try_noncall_cached_sibling_import_smoke.sh"),
+        ("try_noncall_cached_relative_selective_import.elisa", "try_noncall_cached_relative_selective_import_smoke.sh"),
+        ("try_noncall_cached_conflicting_selective_import_first_target.elisa", "try_noncall_cached_conflicting_selective_import_first_target_smoke.sh"),
+        ("try_noncall_cached_ancestor_precedes_selective_import.elisa", "try_noncall_cached_ancestor_precedes_selective_import_smoke.sh"),
+        ("try_noncall_cached_private_import_visibility.elisa", "try_noncall_cached_private_import_visibility_smoke.sh"),
+        ("try_overload_private_winner_visibility.elisa", "try_overload_private_winner_visibility_smoke.sh"),
+        ("try_wildcard_import_order_outer_before_nested.elisa", "try_wildcard_import_order_outer_before_nested_smoke.sh"),
+        ("try_private_outer_using_does_not_shadow_public_inner.elisa", "try_private_outer_using_does_not_shadow_public_inner_smoke.sh"),
+        ("try_wildcard_import_does_not_shadow_ancestor.elisa", "try_wildcard_import_does_not_shadow_ancestor_smoke.sh")):
+    fixture = ROOT / "test/repro" / fixture_name
+    smoke = ROOT / "test/parity" / smoke_name
+    if not fixture.is_file() or fixture_name not in smoke.read_text():
+        raise SystemExit(f"Try program-selective import coverage must retain its sibling fixture and parity smoke: {fixture_name}")
+wildcard_order_fixture = (ROOT / "test/repro/try_wildcard_import_order_outer_before_nested.elisa").read_text()
+wildcard_order_smoke = (ROOT / "test/parity/try_wildcard_import_order_outer_before_nested_smoke.sh").read_text()
+if not all(fragment in wildcard_order_fixture for fragment in (
+        "def direct_caller() -> i64 error[Consumer::Destination]",
+        "return try ping()",
+        "def cached_caller() -> i64 error[Consumer::Destination]",
+        "payload = ping()",
+        "return try payload",
+        "using OuterApi")) or not all(fragment in wildcard_order_smoke for fragment in (
+        'grep -qF \'ambiguous reference "ping"\'',
+        "cannot propagate|try requires a fallible expression")):
+    raise SystemExit("Try wildcard ambiguity regression must cover both direct and cached outer/nested using callers")
+parent_wildcard_fixture = (ROOT / "test/repro/try_wildcard_import_does_not_shadow_ancestor.elisa").read_text()
+parent_wildcard_smoke = (ROOT / "test/parity/try_wildcard_import_does_not_shadow_ancestor_smoke.sh").read_text()
+if not all(fragment in parent_wildcard_fixture for fragment in (
+        "def ping() -> i64 error[Consumer::LocalFault]",
+        "module Inner:",
+        "using Api",
+        "def caller() -> i64 error[Consumer::LocalFault]",
+        "return try ping()",
+        "def cached_caller() -> i64 error[Consumer::LocalFault]",
+        "payload = ping()",
+        "return try payload")) or not all(fragment in parent_wildcard_smoke for fragment in (
+        "direct-call path",
+        "cached assignment path",
+        "cached try path")):
+    raise SystemExit("Try ancestor-local precedence regression must retain both direct and cached nested-using callers")
+private_outer_fixture = (ROOT / "test/repro/try_private_outer_using_does_not_shadow_public_inner.elisa").read_text()
+root_using = private_outer_fixture.find("using HiddenApi")
+consumer_module = private_outer_fixture.find("module Consumer:")
+inner_module = private_outer_fixture.find("module Inner:", consumer_module)
+visible_module = private_outer_fixture.find("module VisibleApi:", inner_module)
+inner_using = private_outer_fixture.find("using VisibleApi", visible_module)
+if min(root_using, consumer_module, inner_module, visible_module, inner_using) < 0 or not (
+        root_using < consumer_module < inner_module < visible_module < inner_using) or not all(fragment in private_outer_fixture for fragment in (
+        "def direct_caller() -> i64 error[Consumer::Inner::VisibleApi::VisibleFault]",
+        "return try ping()",
+        "def cached_caller() -> i64 error[Consumer::Inner::VisibleApi::VisibleFault]",
+        "payload = ping()",
+        "return try payload")):
+    raise SystemExit("Try private-outer/nested-public fixture must preserve root and nested using scope placement for direct and cached calls")
+private_visibility_fixture = (ROOT / "test/repro/try_overload_private_winner_visibility.elisa").read_text()
+private_visibility_smoke = (ROOT / "test/parity/try_overload_private_winner_visibility_smoke.sh").read_text()
+if not all(fragment in private_visibility_fixture for fragment in (
+        "def origin[T](value: T) -> i64 error[Provider::GenericFault]",
+        "def origin(value: i64) -> i64 error[Provider::ConcreteFault]",
+        "def cached_private_winner(value: i64) -> i64 error[Consumer::Destination]",
+        "def qualified_private_winner_direct(value: i64) -> i64 error[Consumer::Destination]",
+        "return try Provider::origin(value)",
+        "def qualified_private_winner_cached(value: i64) -> i64 error[Consumer::Destination]",
+        "payload = Provider::origin(value)",
+        "def public_winner_direct(value: bool) -> i64 error[Consumer::Destination]",
+        "return try origin(value)",
+        "def public_winner_cached(value: bool) -> i64 error[Consumer::Destination]",
+        "payload = origin(value)",
+        "return try payload",
+        "def public_qualified_winner_direct(value: bool) -> i64 error[Consumer::Destination]",
+        "return try Provider::origin(value)",
+        "def public_qualified_winner_cached(value: bool) -> i64 error[Consumer::Destination]",
+        "payload = Provider::origin(value)",
+        "def typed_width_public_winner_direct(value: i32) -> i64 error[Consumer::Destination]",
+        "def typed_width_public_winner_cached(value: i32) -> i64 error[Consumer::Destination]",
+        "def char_public_winner_direct(value: char) -> i64 error[Consumer::Destination]",
+        "def char_public_winner_cached(value: char) -> i64 error[Consumer::Destination]",
+        "def root_callable_private_winner_direct(value: i64) -> i64 error[Consumer::Destination]",
+        "def root_callable_private_winner_cached(value: i64) -> i64 error[Consumer::Destination]",
+        "def origin(value: bool) -> i64 error[Provider::GenericFault]")) or not all(fragment in private_visibility_smoke for fragment in (
+        "grep -cF 'cannot propagate'",
+        "== 8",
+        "grep -cF 'is private to module'",
+        "== 6",
+        'L32 "Provider.origin" is private to module "Provider"',
+        'L35 "Provider.origin" is private to module "Provider"',
+        'L67 "Provider.origin" is private to module "Provider"',
+        'L70 "Provider.origin" is private to module "Provider"',
+        "  L25 \"Provider.origin\" is private to module \"Provider\"",
+        "  L28 \"Provider.origin\" is private to module \"Provider\"",
+        "root_callable_private_winner_direct",
+        "root_callable_private_winner_cached",
+        "^  L(39|42|46|49|53|56|60|63) .*is private to module ",
+        "grep -cF 'try requires a fallible expression'",
+        "== 6",
+        "private-winner invalid-call diagnostic")):
+    raise SystemExit("Try private-overload visibility control must preserve direct and cached public generic mismatch diagnostics")
+cross_module_private_fixture = (ROOT / "test/repro/try_overload_cross_module_private_cached_winner.elisa").read_text()
+cross_module_private_smoke = (ROOT / "test/parity/try_overload_cross_module_private_cached_winner_smoke.sh").read_text()
+if not all(fragment in cross_module_private_fixture for fragment in (
+        "def choose[T](receiver: T) -> i64 error[LibA::GenericFault]",
+        "from LibB import choose",
+        "def choose(receiver: i64) -> i64 error[AliasInstaller::LibB::ConcreteFault]",
+        "using LibA",
+        "def private_winner_direct(value: i64)",
+        "def private_winner_cached(value: i64)",
+        "payload = choose(value)",
+        "def public_winner_direct(value: bool)",
+        "def public_winner_cached(value: bool)")) or not all(fragment in cross_module_private_smoke for fragment in (
+        "try_overload_cross_module_private_cached_winner.elisa",
+        "grep -cF 'is private to module'",
+        "grep -cF 'try requires a fallible expression'",
+        "grep -cF 'cannot propagate'",
+        "== 2")):
+    raise SystemExit("Try cached winner coverage must include hidden private candidates from a different selective-import module and retain a public generic control")
+if "try_error_alias_name_visible(annotations, name, declaration_module, function_module)" not in alias_visibility or not all(fragment in private_alias_path for fragment in (
+        'row.owner == "__section_private"',
+        "row.name == segment",
+        "catch_module_is_ancestor(private_scope, lexical_module)")) or not all(fragment in private_alias_name for fragment in (
+        "try_error_alias_is_private(annotations, alias_name, alias_module)",
+        "catch_module_is_ancestor(alias_module, lexical_module)")):
+    raise SystemExit("Try alias candidates must respect private type aliases and private module boundaries")
+alias_ref_resolution = compact_inline(function_section(source_text, "try_error_family_ref_for_annotation"))
+if "family: declaration_module.family" not in alias_ref_resolution or "source_name: family" not in alias_ref_resolution:
+    raise SystemExit("Try family references must compare canonical alias identity while retaining source spelling for annotation metadata")
+alias_subset_status = compact_inline(function_section(source_text, "try_error_family_subset_status"))
+if "row.name == family.source_name" not in alias_subset_status:
+    raise SystemExit("Try subset markers must continue to match their source alias spelling after canonical family resolution")
+
+subset_status = compact_inline(function_section(source_text, "try_error_family_subset_status"))
+if not all(fragment in subset_status for fragment in (
+        "saw_unrestricted <- true if not candidate_restricted",
+        "return (true, saw_restricted and not saw_unrestricted, saw_unrestricted or allowed)",
+        "family_count == 0.usize()")):
+    raise SystemExit("Try subset coverage must union repeated family rows, with unrestricted rows covering the full family")
+empty_subset = compact_inline(function_section(source_text, "try_error_family_has_empty_subset"))
+if not all(fragment in empty_subset for fragment in (
+        'row.owner == "__error_variant_family"',
+        'allow.owner == "__error_variant_allow"',
+        "return true if not has_matching_allow")):
+    raise SystemExit("Try must recognize marker-only empty subsets as malformed metadata")
+family_covers = compact_inline(function_section(source_text, "error_family_covers"))
+if not all(fragment in family_covers for fragment in (
+        "try_error_family_has_empty_subset(annotations, source)",
+        "try_error_family_has_empty_subset(annotations, destination)")):
+    raise SystemExit("Try must suppress propagation cascades from malformed source or destination subsets")
+statement_catch_marker = compact_inline(function_section(source_text, "try_noncall_statement_match_is_catch"))
+if 'marker.owner == "__catch_match" and marker.name == "__catch_match" and marker.line == position.line and marker.offset == position.offset and marker.module == lexical_module' not in statement_catch_marker:
+    raise SystemExit("Try catchability must match statement Catch markers by exact source position and lexical module")
+single_statement_termination = compact_inline(function_section(source_text, "try_noncall_single_statement_terminates_with_annotations"))
+if not all(fragment in single_statement_termination for fragment in (
+        "try_noncall_statement_match_is_catch(position, annotations, lexical_module)",
+        "try_noncall_block_terminates_with_annotations(then_body, annotations, lexical_module)",
+        "try_noncall_block_terminates_with_annotations(else_body, annotations, lexical_module)",
+        "try_noncall_match_bool_arms_terminate_with_annotations(arms, scrutinee_bool.value, annotations, lexical_module)")):
+    raise SystemExit("Try statement termination must use the exact Catch-marker helper")
+block_termination = compact_inline(function_section(source_text, "try_noncall_block_terminates_with_annotations"))
+if "try_noncall_single_statement_terminates_with_annotations(statement, annotations, lexical_module)" not in block_termination:
+    raise SystemExit("Try block termination must preserve Catch marker annotations and lexical module context")
+bool_match_termination = compact_inline(function_section(source_text, "try_noncall_match_bool_arms_terminate_with_annotations"))
+if not all(fragment in bool_match_termination for fragment in (
+        "try_noncall_expression_aborts_with_annotations(arm.guard, annotations, lexical_module)",
+        "try_noncall_block_terminates_with_annotations(arm.body, annotations, lexical_module)")):
+    raise SystemExit("Try boolean-match termination must preserve Catch marker annotations and lexical module context")
+block_source_facts = compact_inline(function_section(source_text, "try_noncall_block_source_facts"))
+if "try_noncall_block_terminates_with_annotations(statements, annotations, environment.current_module)" not in block_source_facts:
+    raise SystemExit("Try block source facts must use module-aware statement termination")
+assignment_source_facts = compact_inline(function_section(source_text, "try_noncall_assignment_source_facts"))
+if not all(fragment in assignment_source_facts for fragment in (
+        "lexical_module: sview = environment.current_module",
+        "try_noncall_expression_aborts_with_annotations(condition, annotations, lexical_module)",
+        "try_noncall_expression_aborts_with_annotations(then_value, annotations, lexical_module)",
+        "try_noncall_expression_aborts_with_annotations(else_value, annotations, lexical_module)",
+        "try_noncall_expression_aborts_with_annotations(arm.guard, annotations, lexical_module)",
+        "try_noncall_block_terminates_with_annotations(arm.body, annotations, lexical_module)")):
+    raise SystemExit("Try assignment source facts must preserve Catch marker annotations and lexical module context through If, Match, and Catch branches")
+statement_catchability = compact_inline(function_section(source_text, "try_noncall_statements_may_raise_catchably_with_annotations"))
+if "try_noncall_statement_match_is_catch(match_position, annotations, lexical_module)" not in statement_catchability:
+    raise SystemExit("Try statement catchability must use the exact Catch-marker helper")
+
+abort_helper = compact_inline(function_section(source_text, "try_noncall_expression_aborts_with_annotations"))
+if not all(fragment in abort_helper for fragment in (
+        'lexical_module: sview = ""',
+        "try_noncall_expression_aborts_with_annotations(callee, annotations, lexical_module)",
+        "try_noncall_expression_aborts_with_annotations(guarded, annotations, lexical_module)",
+        "try_noncall_expression_may_raise_catchably_with_annotations(guarded, annotations, lexical_module)",
+        "try_noncall_block_terminates_with_annotations(statements, annotations, lexical_module)",
+        "try_noncall_catch_error_arms_terminate(arms, annotations, lexical_module)")):
+    raise SystemExit("Try abort analysis must preserve lexical module context through nested Catch expressions")
+catch_error_arms = compact_inline(function_section(source_text, "try_noncall_catch_error_arms_terminate"))
+if not all(fragment in catch_error_arms for fragment in (
+        "try_noncall_expression_aborts_with_annotations(arm.guard, annotations, lexical_module)",
+        "try_noncall_block_terminates_with_annotations(arm.body, annotations, lexical_module)")):
+    raise SystemExit("Try Catch-arm termination must preserve annotations and lexical module context")
+may_raise = compact_inline(function_section(source_text, "try_noncall_expression_may_raise_catchably_with_annotations"))
+if "try_noncall_expression_aborts_with_annotations(callee, annotations, lexical_module)" not in may_raise:
+    raise SystemExit("Try catchability analysis must pass lexical module context into abort analysis")
+may_raise_source = function_section(source_text, "try_noncall_expression_may_raise_catchably_with_annotations")
+call_argument_scan = """
+Expr.Call(callee, arguments, _, _):
+    direct_raise: bool = callee is Expr.Ident("raise", _)
+    if not direct_raise:
+        return true if try_noncall_expression_may_raise_catchably_with_annotations(callee, annotations, lexical_module)
+        return false if try_noncall_expression_aborts_with_annotations(callee, annotations, lexical_module)
+    for argument in arguments:
+        return true if try_noncall_expression_may_raise_catchably_with_annotations(argument, annotations, lexical_module)
+        return false if try_noncall_expression_aborts_with_annotations(argument, annotations, lexical_module)
+"""
+if not contains_contiguous_block(may_raise_source, call_argument_scan):
+    raise SystemExit("Try call catchability must scan ordinary arguments in evaluation order before callable metadata")
+
 main_try_check = function_section(source_text, "check_try_fallible")
-rows_call = "table <- check_try_fallible_rows(file.top_decls, file.enum_annotations, projection.error_set_annotations, module_index, projection.module_annotations, projection.try_qualifiers, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
+rows_call = "table <- check_try_fallible_rows(file.top_decls, file.enum_annotations, projection.try_named_arguments, projection.try_argument_positions, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, projection.try_arities, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
 if compact_inline(main_try_check).count(compact_inline(rows_call)) != 1:
     raise SystemExit("check_try_fallible must invoke the source-row checker when at least one try site exists")
 
@@ -369,6 +920,10 @@ for raw_value in ("middle: usize = low + (high - low) / 2", "low <- middle + 1",
     if raw_value in positive_text:
         raise SystemExit(f"proof model contains a raw position-search value: {raw_value}")
 
+if args.source_only:
+    print(json.dumps({"source_bound": True, "theorems": len(POSITIVE_NAMES), "try_source_files": len(SOURCE_FILES), "pipeline_source_files": len(PIPELINE_FILES), "parser_argument_source": 1, "parser_visibility_source": 1}))
+    raise SystemExit(0)
+
 try:
     product_manifest = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
@@ -391,9 +946,11 @@ inputs = list(dict.fromkeys([
     stage1_provenance,
     Path(__file__),
     HERE / "proof_product_gate.py",
-    SOURCE,
+    *SOURCE_FILES,
     SEMANTIC,
-    PIPELINE,
+    *PIPELINE_FILES,
+    PARSER_ARGUMENT_SOURCE,
+    PARSER_VISIBILITY_SOURCE,
     POSITIVE,
     NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),

@@ -58,9 +58,9 @@ if any(part not in argument for part in argument_steps) or [argument.index(part)
 returned = compact(section(source_text, "cabi_classify_ret_llvm"))
 return_steps = (
     "iftarget==0:",
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifcabi_hfa_count(leaves)>0",
-    "CabiRetPlan{direct:true,sret:false,ret_type:LLVMIntTypeInContext(ctx,(size*8).u32()),value_type:llvm_value}returnifsize<=8",
-    "CabiRetPlan{direct:true,sret:false,ret_type:LLVMArrayType(LLVMInt64TypeInContext(ctx),2),value_type:llvm_value}returnifsize<=16",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifcabi_hfa_count(leaves)>0",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:LLVMIntTypeInContext(ctx,(size*8).u32()),value_type:llvm_value}ifsize<=8",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:LLVMArrayType(LLVMInt64TypeInContext(ctx),2),value_type:llvm_value}ifsize<=16",
 )
 if any(part not in returned for part in return_steps) or [returned.index(part) for part in return_steps] != sorted(returned.index(part) for part in return_steps):
     raise SystemExit("arm64 return HFA/scalar/pair representations changed")

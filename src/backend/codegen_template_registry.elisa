@@ -14,11 +14,12 @@ extend Backend:
         # collision-safe bucket chain once enough rows exist to amortize its setup.
         struct GenericDeclarationLines:
             keys: mutable darray[u32] = []
+            offsets: mutable darray[u32] = []
             buckets: mutable darray[i64] = []
             next: mutable darray[i64] = []
 
-        def generic_declaration_line_bucket(line: u32) -> usize:
-            return (line.u64() * 2654435761 % GENERIC_DECLARATION_LINE_BUCKET_COUNT.u64()).usize()
+        def generic_declaration_line_bucket(line: u32, offset: u32) -> usize:
+            return ((line.u64() * 2654435761 + offset.u64() * 2246822519) % GENERIC_DECLARATION_LINE_BUCKET_COUNT.u64()).usize()
 
         # Membership is the only query this index serves, so prepend rows to each chain;
         # preserving the input order is unnecessary while exact equality remains decisive.
@@ -28,16 +29,20 @@ extend Backend:
             for _ in 0..<GENERIC_DECLARATION_LINE_BUCKET_COUNT |lines|:
                 lines.buckets.push(GENERIC_DECLARATION_LINE_NOT_FOUND)
             for row in 0..<lines.keys.count |lines|:
-                bucket: usize = generic_declaration_line_bucket(lines.keys[row])
+                bucket: usize = generic_declaration_line_bucket(lines.keys[row], lines.offsets[row])
                 lines.next.push(lines.buckets[bucket])
                 lines.buckets[bucket] <- row.i64()
 
         def generic_declaration_lines(file: Ast::File&) -> GenericDeclarationLines can[Abort.Panic, Memory.Allocate]:
-            lines: mutable GenericDeclarationLines = GenericDeclarationLines{keys: [], buckets: [], next: []}
-            for line in file.generic_param_lines |lines|:
-                lines.keys.push(line) if line < GENERIC_BOUND_ROW_START
+            lines: mutable GenericDeclarationLines = GenericDeclarationLines{keys: [], offsets: [], buckets: [], next: []}
+            for row in 0..<file.generic_param_lines.count |lines, file|:
+                continue if file.generic_param_lines[row] >= GENERIC_BOUND_ROW_START or row >= file.generic_param_owner_offsets.count
+                lines.keys.push(file.generic_param_lines[row])
+                lines.offsets.push(file.generic_param_owner_offsets[row])
             for annotation in file.enum_annotations |lines|:
-                lines.keys.push(annotation.line) if annotation.owner == "__errorset_param"
+                if annotation.owner == "__errorset_param":
+                    lines.keys.push(annotation.line)
+                    lines.offsets.push(annotation.offset)
             generic_declaration_lines_index(lines) if lines.keys.count >= GENERIC_DECLARATION_LINE_CHAIN_THRESHOLD
             return lines
 
@@ -49,12 +54,14 @@ extend Backend:
                 rows.push(annotation) if annotation.owner == owner
             return rows
 
-        def generic_declaration_line_present(lines: GenericDeclarationLines&, line: u32) -> bool can[Abort.Panic]:
-            if lines.buckets.count != GENERIC_DECLARATION_LINE_BUCKET_COUNT or lines.next.count != lines.keys.count:
-                return any present in lines.keys where present == line
-            row: mutable i64 = lines.buckets[generic_declaration_line_bucket(line)]
-            while row >= 0 |row, lines, line|:
-                return true if lines.keys[row.usize()] == line
+        def generic_declaration_line_present(lines: GenericDeclarationLines&, line: u32, offset: u32) -> bool can[Abort.Panic]:
+            if lines.buckets.count != GENERIC_DECLARATION_LINE_BUCKET_COUNT or lines.next.count != lines.keys.count or lines.offsets.count != lines.keys.count:
+                for row in 0..<lines.keys.count |lines, line, offset|:
+                    return true if lines.keys[row] == line and lines.offsets[row] == offset
+                return false
+            row: mutable i64 = lines.buckets[generic_declaration_line_bucket(line, offset)]
+            while row >= 0 |row, lines, line, offset|:
+                return true if lines.keys[row.usize()] == line and lines.offsets[row.usize()] == offset
                 row <- lines.next[row.usize()]
             return false
 
@@ -62,12 +69,14 @@ extend Backend:
         # `[N: usize]` is represented by an ordinary parameter row immediately followed
         # by the bound row for the same declaration. Keep that distinction in the generic
         # table so fixed-array inference never treats an arbitrary type parameter as a value.
-        def generic_row_is_usize_value(file: Ast::File&, row: usize, line: u32) -> bool can[Abort.Panic]:
+        def generic_row_is_usize_value(file: Ast::File&, row: usize, line: u32, offset: u32) -> bool can[Abort.Panic]:
             return false if:
                 file.generic_param_lines.count != file.generic_param_names.count
+                file.generic_param_lines.count != file.generic_param_owner_offsets.count
                 row >= file.generic_param_lines.count or line >= GENERIC_BOUND_ROW_START
                 file.generic_param_lines[row] != line or row + 1.usize() >= file.generic_param_lines.count
                 file.generic_param_lines[row + 1.usize()] != line + GENERIC_BOUND_ROW_START
+                file.generic_param_owner_offsets[row] != offset or file.generic_param_owner_offsets[row + 1.usize()] != offset
             return file.generic_param_names[row + 1.usize()] == "usize"
 
 
@@ -118,17 +127,17 @@ extend Backend:
         #
         # The line table is the same one record_generic_func_metadata keys on: a row with
         # the high bit SET is a BOUND (`[T: Ord]`), not a type parameter.
-        def decl_line_is_generic(file: Ast::File&, line: u32) -> bool can[Abort.Panic]:
+        def decl_line_is_generic(file: Ast::File&, line: u32, offset: u32) -> bool can[Abort.Panic]:
             for row in 0..<file.generic_param_lines.count |file, line|:
                 continue if file.generic_param_lines[row] >= GENERIC_BOUND_ROW_START
-                return true if file.generic_param_lines[row] == line
+                return true if file.generic_param_lines[row] == line and row < file.generic_param_owner_offsets.count and file.generic_param_owner_offsets[row] == offset
             # An `errorset R` parameter is intentionally absent from the ordinary generic
             # rows: it is an effect-family selector, not a runtime/type argument. It still
             # makes the declaration a template and must be kept out of the monomorphic
             # declaration/body passes, or the unspecialized function can win overload lookup
             # and be emitted with the wrong ABI.
             for annotation in file.enum_annotations |line|:
-                return true if annotation.owner == "__errorset_param" and annotation.line == line
+                return true if annotation.owner == "__errorset_param" and annotation.line == line and annotation.offset == offset
             return false
 
 
@@ -138,10 +147,10 @@ extend Backend:
         # source position is intentionally the typestate header. That header also records the
         # phantom `state` generic, so line-only generic filtering would silently omit the
         # constructor from FnTable and leave every `T.new(...)` call unresolved.
-        def declaration_is_generated_typestate(file: Ast::File&, name: sview, line: u32) -> bool can[Abort.Panic]:
+        def declaration_is_generated_typestate(file: Ast::File&, name: sview, line: u32, offset: u32) -> bool can[Abort.Panic]:
             row: mutable i64 = annotation_pair_find(file.enum_annotations, name, "__typestate_generated", -1) can Global{Read,Write}
-            while row >= 0 |row, file, name, line|:
-                return true if file.enum_annotations[row.usize()].line == line
+            while row >= 0 |row, file, name, line, offset|:
+                return true if file.enum_annotations[row.usize()].line == line and file.enum_annotations[row.usize()].offset == offset
                 row <- annotation_pair_find(file.enum_annotations, name, "__typestate_generated", row) can Global{Read,Write}
             return false
 
@@ -158,16 +167,19 @@ extend Backend:
                 for generic_index in 0..<file.generic_func_decls.count |generic_index, generics, file, errorset_rows|:
                     function_name: sview = file.generic_func_decl_names[generic_index]
                     line: u32 = file.generic_func_decl_lines[generic_index]
+                    source_offset: u32 = function_source_offset_of(file.generic_func_decls[generic_index])
+                    offset: u32 = function_offset_of(file.generic_func_decls[generic_index])
                     error_param: mutable sview = ""
-                    for annotation in errorset_rows |error_param, line|:
-                        error_param <- annotation.name if error_param == "" and annotation.line == line
+                    for annotation in errorset_rows |error_param, line, source_offset|:
+                        error_param <- annotation.name if error_param == "" and annotation.line == line and annotation.offset == source_offset
                     start: usize = generics.params.count
-                    for row in 0..<file.generic_param_lines.count |generics, file, line|:
+                    for row in 0..<file.generic_param_lines.count |generics, file, line, source_offset|:
                         # High bit set => a BOUND row (`[T: Ord]`), not a type parameter.
                         continue if file.generic_param_lines[row] >= 2147483648
                         continue if file.generic_param_lines[row] != line
+                        continue if row >= file.generic_param_owner_offsets.count or file.generic_param_owner_offsets[row] != source_offset
                         generics.params <- generics.params.push(file.generic_param_names[row])
-                        generics.param_is_usize_value <- generics.param_is_usize_value.push(generic_row_is_usize_value(file, row, line))
+                        generics.param_is_usize_value <- generics.param_is_usize_value.push(generic_row_is_usize_value(file, row, line, source_offset))
                     added: usize = generics.params.count - start
                     # An errorset-only generic such as `f[errorset R](...)` has no ordinary
                     # type arguments, but it is still a real template and must be registered.
@@ -177,7 +189,7 @@ extend Backend:
                     generics.decls <- generics.decls.push(file.generic_func_decls[generic_index])
                     generics.param_start <- generics.param_start.push(start)
                     generics.param_count <- generics.param_count.push(added)
-                    generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, line))
+                    generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, file.error_set_func_offsets, line, offset))
                     generics.error_params <- generics.error_params.push(error_param)
                     # Parallel to `names`: the module this template was written in. The body is
                     # emitted from a drain queue, so this is the only surviving record of it.
@@ -206,16 +218,17 @@ extend Backend:
                         source_line: u32 = line.line
                         for annotation in clone_rows |clone, function_name, source_line|:
                             clone <- true if annotation.name == function_name and annotation.line == source_line
-                        continue if not clone or not decl_line_is_generic(file, source_line)
+                        continue if not clone or not decl_line_is_generic(file, source_line, line.offset)
                         error_param: mutable sview = ""
-                        for annotation in errorset_rows |error_param, source_line|:
-                            error_param <- annotation.name if error_param == "" and annotation.line == source_line
+                        for annotation in errorset_rows |error_param, source_line, line|:
+                            error_param <- annotation.name if error_param == "" and annotation.line == source_line and annotation.offset == line.offset
                         start: usize = generics.params.count
-                        for row in 0..<file.generic_param_lines.count |generics, file, source_line|:
+                        for row in 0..<file.generic_param_lines.count |generics, file, source_line, line|:
                             continue if file.generic_param_lines[row] >= 2147483648
                             continue if file.generic_param_lines[row] != source_line
+                            continue if row >= file.generic_param_owner_offsets.count or file.generic_param_owner_offsets[row] != line.offset
                             generics.params <- generics.params.push(file.generic_param_names[row])
-                            generics.param_is_usize_value <- generics.param_is_usize_value.push(generic_row_is_usize_value(file, row, source_line))
+                            generics.param_is_usize_value <- generics.param_is_usize_value.push(generic_row_is_usize_value(file, row, source_line, line.offset))
                         added: usize = generics.params.count - start
                         continue if added == 0 and error_param == ""
                         generics.names <- generics.names.push(function_name)
@@ -223,7 +236,7 @@ extend Backend:
                         generics.decls <- generics.decls.push(declaration)
                         generics.param_start <- generics.param_start.push(start)
                         generics.param_count <- generics.param_count.push(added)
-                        generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, source_line))
+                        generics.is_error <- generics.is_error.push(line_is_error_returning(file.error_set_func_lines, file.error_set_func_offsets, source_line, line.offset + 1))
                         generics.error_params <- generics.error_params.push(error_param)
                         # Clones are emitted at file scope, even when their source helper lived in
                         # a module. Their body has already had all effectful helper calls rewritten

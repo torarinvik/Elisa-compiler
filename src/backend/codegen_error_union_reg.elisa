@@ -5,6 +5,17 @@
 extend Backend:
     private:
 
+        struct ErrorUnionFamilyOccurrence:
+            annotation_index: usize
+            family: sview @source
+            family_path: sview @source
+            family_order_key: sview @source
+            module: sview @source
+            variant_override: sview @source
+            error_set_parameter: bool
+            qualified: bool
+            resolved: bool
+
 
         def error_family_precedes(left: sview, right: sview) -> bool:
             left_length: usize = left.len
@@ -17,36 +28,667 @@ extend Backend:
 
 
 
-        def error_union_variant_allowed(file: Ast::File&, line: u32, family: sview, variant: sview) -> bool can[Abort.Panic]:
+        # A family row is followed by its path row and then, when restricted, its
+        # __error_variant_family/__error_variant_allow pairs. Keep the lookup inside that
+        # occurrence; matching by family leaf and line merges `First::Fault{A}` with
+        # `Second::Fault{B}` when both declarations are on one line.
+        def error_union_variant_allowed(file: Ast::File&, family_row_index: usize, variant: sview) -> bool can[Abort.Panic]:
+            return true if family_row_index >= file.enum_annotations.count
+            family_row: Ast::EnumAnnotation = file.enum_annotations[family_row_index]
             restricted: mutable bool = false
-            for annotation in file.enum_annotations |restricted, line, family|:
-                restricted <- true if annotation.owner == "__error_variant_family" and annotation.line == line and annotation.name == family
-            return true if not restricted
-            for annotation_index in 0..<file.enum_annotations.count |file, line, family, variant|:
-                annotation: Ast::EnumAnnotation = file.enum_annotations[annotation_index]
-                continue if annotation.owner != "__error_variant_family" or annotation.line != line or annotation.name != family
-                continue if annotation_index + 1 >= file.enum_annotations.count
-                allowed: Ast::EnumAnnotation = file.enum_annotations[annotation_index + 1]
-                return true if allowed.owner == "__error_variant_allow" and allowed.line == line and allowed.name == variant
+            cursor: mutable usize = family_row_index + 1.usize()
+            while cursor < file.enum_annotations.count |cursor, file, family_row, restricted, variant|:
+                annotation: Ast::EnumAnnotation = file.enum_annotations[cursor]
+                break if annotation.owner == "__error_set_family"
+                if annotation.owner == "__error_variant_family" and annotation.line == family_row.line and annotation.offset == family_row.offset and annotation.identity_id == family_row.identity_id and annotation.occurrence_offset == family_row.occurrence_offset and annotation.name == family_row.name:
+                    restricted <- true
+                    if cursor + 1.usize() < file.enum_annotations.count:
+                        allowed: Ast::EnumAnnotation = file.enum_annotations[cursor + 1.usize()]
+                        return true if allowed.owner == "__error_variant_allow" and allowed.line == family_row.line and allowed.offset == family_row.offset and allowed.identity_id == family_row.identity_id and allowed.occurrence_offset == family_row.occurrence_offset and allowed.name == variant
+                elif annotation.owner == "__error_variant_family":
+                    return false
+                cursor <- cursor + 1.usize()
+            return not restricted
+
+
+        # Parser path rows preserve the original source span, so `M :: E` and `M #...
+        # :: E` contain trivia even though the token path is canonical. Keep path matching
+        # source-backed and allocation-free by skipping the same whitespace/comments as the
+        # Catch family resolver.
+        def error_union_skip_path_trivia(path: sview, start: usize) -> usize can[Abort.Panic]:
+            cursor: mutable usize = start
+            while cursor < path.len:
+                if path[cursor] == 32 or path[cursor] == 9 or path[cursor] == 10 or path[cursor] == 13:
+                    cursor <- cursor + 1.usize()
+                elif path[cursor] == 35:
+                    while cursor < path.len and path[cursor] != 10 and path[cursor] != 13 |cursor, path|:
+                        cursor <- cursor + 1.usize()
+                elif path[cursor] == 34 and cursor + 2.usize() < path.len and path[cursor + 1.usize()] == 34 and path[cursor + 2.usize()] == 34:
+                    comment_cursor: mutable usize = cursor + 3.usize()
+                    comment_closed: mutable bool = false
+                    while comment_cursor + 2.usize() < path.len |comment_cursor, comment_closed, path|:
+                        if path[comment_cursor] == 34 and path[comment_cursor + 1.usize()] == 34 and path[comment_cursor + 2.usize()] == 34:
+                            cursor <- comment_cursor + 3.usize()
+                            comment_closed <- true
+                            break
+                        comment_cursor <- comment_cursor + 1.usize()
+                    return path.len if not comment_closed
+                else:
+                    break
+            return cursor
+
+
+        def error_union_family_separator_start(path: sview, family_start: usize) -> usize can[Abort.Panic]:
+            cursor: mutable usize = 0
+            separator: mutable usize = path.len
+            while cursor < family_start |cursor, separator, path, family_start|:
+                cursor <- error_union_skip_path_trivia(path, cursor)
+                break if cursor >= family_start
+                if path[cursor] == 58:
+                    next_colon: usize = error_union_skip_path_trivia(path, cursor + 1.usize())
+                    if next_colon < family_start and path[next_colon] == 58:
+                        separator <- cursor
+                        cursor <- next_colon + 1.usize()
+                    else:
+                        cursor <- cursor + 1.usize()
+                else:
+                    cursor <- cursor + 1.usize()
+            return separator
+
+
+        def error_union_family_path_info(path: sview, family: sview) -> (valid: bool, qualified: bool, module_end: usize) can[Abort.Panic]:
+            return (false, false, 0) if path.len < family.len
+            family_start: usize = path.len - family.len
+            for offset in 0..<family.len |path, family, family_start|:
+                return (false, false, 0) if path[family_start + offset] != family[offset]
+            separator: usize = error_union_family_separator_start(path, family_start)
+            return (true, false, 0) if separator == path.len and family_start == 0
+            return (false, false, 0) if separator == path.len
+            return (true, true, separator)
+
+
+        def error_union_module_path_matches_text(raw_path: sview, canonical_path: sview) -> bool can[Abort.Panic]:
+            raw_index: mutable usize = 0
+            canonical_index: mutable usize = 0
+            while raw_index < raw_path.len or canonical_index < canonical_path.len |raw_index, canonical_index, raw_path, canonical_path|:
+                raw_index <- error_union_skip_path_trivia(raw_path, raw_index)
+                return canonical_index == canonical_path.len if raw_index >= raw_path.len
+                return false if canonical_index >= canonical_path.len
+                if raw_path[raw_index] == 58:
+                    return false if canonical_index + 1.usize() >= canonical_path.len or canonical_path[canonical_index] != 58 or canonical_path[canonical_index + 1.usize()] != 58
+                    raw_index <- error_union_skip_path_trivia(raw_path, raw_index + 1.usize())
+                    return false if raw_index >= raw_path.len or raw_path[raw_index] != 58
+                    raw_index <- raw_index + 1.usize()
+                    canonical_index <- canonical_index + 2.usize()
+                else:
+                    return false if raw_path[raw_index] != canonical_path[canonical_index]
+                    raw_index <- raw_index + 1.usize()
+                    canonical_index <- canonical_index + 1.usize()
+            return true
+
+
+        def error_union_module_path_prefix_end(raw_path: sview, canonical_path: sview) -> (matched: bool, end: usize) can[Abort.Panic]:
+            raw_index: mutable usize = 0
+            canonical_index: mutable usize = 0
+            while raw_index < raw_path.len |raw_index, canonical_index, raw_path, canonical_path|:
+                raw_index <- error_union_skip_path_trivia(raw_path, raw_index)
+                return (true, canonical_index) if raw_index >= raw_path.len
+                return (false, canonical_index) if canonical_index >= canonical_path.len
+                if raw_path[raw_index] == 58:
+                    return (false, canonical_index) if canonical_index + 1.usize() >= canonical_path.len or canonical_path[canonical_index] != 58 or canonical_path[canonical_index + 1.usize()] != 58
+                    raw_index <- error_union_skip_path_trivia(raw_path, raw_index + 1.usize())
+                    return (false, canonical_index) if raw_index >= raw_path.len or raw_path[raw_index] != 58
+                    raw_index <- raw_index + 1.usize()
+                    canonical_index <- canonical_index + 2.usize()
+                else:
+                    return (false, canonical_index) if raw_path[raw_index] != canonical_path[canonical_index]
+                    raw_index <- raw_index + 1.usize()
+                    canonical_index <- canonical_index + 1.usize()
+            return (true, canonical_index)
+
+
+        def error_union_module_is_ancestor(candidate: sview, module: sview) -> bool:
+            return true if candidate == module or candidate == ""
+            return false if candidate.len + 2.usize() >= module.len
+            for index in 0..<candidate.len |candidate, module|:
+                return false if candidate[index] != module[index]
+            return module[candidate.len] == 58 and module[candidate.len + 1.usize()] == 58
+
+
+        # Select the nearest source-visible `using Target as Alias` and pair its target
+        # by declaration scope and source offset. The flattened alias pool cannot
+        # distinguish same-named aliases in separate modules.
+        def error_union_module_alias_target(file: Ast::File&, alias_name: sview, lexical_module: sview, before_offset: u32) -> (found: bool, ambiguous: bool, target: sview @source, scope: sview @source, line: u32, offset: u32) can[Abort.Panic]:
+            selected_target: mutable sview @source = ""
+            selected_scope: mutable sview @source = ""
+            selected_scope_length: mutable usize = 0
+            selected_line: mutable u32 = 0
+            selected_offset: mutable u32 = 0
+            found: mutable bool = false
+            ambiguous: mutable bool = false
+            for alias in file.enum_annotations |selected_target, selected_scope, selected_scope_length, selected_line, selected_offset, found, ambiguous, alias_name, lexical_module, before_offset|:
+                continue if alias.name != "__using_alias" or alias.owner != alias_name
+                continue if before_offset != 0 and alias.offset >= before_offset
+                continue if not error_union_module_is_ancestor(alias.module, lexical_module)
+                target: mutable sview = ""
+                target_count: mutable usize = 0
+                for target_row in file.enum_annotations |target, target_count, alias|:
+                    continue if target_row.name != "__using_alias_target" or target_row.module != alias.module or target_row.line != alias.line or target_row.offset != alias.offset
+                    target <- target_row.owner
+                    target_count <- target_count + 1.usize()
+                if not found or alias.module.len > selected_scope_length or (alias.module == selected_scope and alias.offset > selected_offset):
+                    selected_target <- target
+                    selected_scope <- alias.module
+                    selected_scope_length <- alias.module.len
+                    selected_line <- alias.line
+                    selected_offset <- alias.offset
+                    found <- true
+                    ambiguous <- target_count != 1.usize()
+                elif alias.module == selected_scope and alias.offset == selected_offset:
+                    ambiguous <- true if target_count != 1.usize() or selected_target != target
+            return (found, ambiguous, selected_target, selected_scope, selected_line, selected_offset)
+
+
+        # Resolve aliases at the head of a module path while comparing it against a
+        # registered owner. Recursing into an alias target's own head handles chains such
+        # as `using Root as R; using R::Nested as N` without allocating joined paths.
+        def error_union_module_path_resolved_prefix_end(raw_path: sview, canonical_path: sview, lexical_module: sview, before_offset: u32, file: Ast::File&, depth: u32 = 0) -> (matched: bool, end: usize) can[Abort.Panic]:
+            return (false, 0) if depth >= 16
+            root_start: usize = error_union_skip_path_trivia(raw_path, 0)
+            root_end: mutable usize = root_start
+            while root_end < raw_path.len |root_end, raw_path|:
+                break if raw_path[root_end] == 58 or raw_path[root_end] == 32 or raw_path[root_end] == 9 or raw_path[root_end] == 10 or raw_path[root_end] == 13 or raw_path[root_end] == 35 or (raw_path[root_end] == 34 and root_end + 2.usize() < raw_path.len and raw_path[root_end + 1.usize()] == 34 and raw_path[root_end + 2.usize()] == 34)
+                root_end <- root_end + 1.usize()
+            return (false, 0) if root_end == root_start
+            root: sview = string_view_slice(raw_path, root_start.i64(), root_end.i64())
+            alias: (found: bool, ambiguous: bool, target: sview @source, scope: sview @source, line: u32, offset: u32) = error_union_module_alias_target(file, root, lexical_module, before_offset)
+            return (false, 0) if alias.ambiguous
+            return error_union_module_path_prefix_end(raw_path, canonical_path) if not alias.found
+            alias_prefix: (matched: bool, end: usize) = error_union_module_path_resolved_prefix_end(alias.target, canonical_path, alias.scope, alias.offset, file, depth + 1)
+            return (false, 0) if not alias_prefix.matched
+            suffix_start: usize = error_union_skip_path_trivia(raw_path, root_end)
+            return (false, 0) if suffix_start > raw_path.len
+            raw_suffix: sview = string_view_slice(raw_path, suffix_start.i64(), raw_path.len.i64())
+            canonical_suffix: sview = string_view_slice(canonical_path, alias_prefix.end.i64(), canonical_path.len.i64())
+            suffix_prefix: (matched: bool, end: usize) = error_union_module_path_prefix_end(raw_suffix, canonical_suffix)
+            return (false, 0) if not suffix_prefix.matched
+            return (true, alias_prefix.end + suffix_prefix.end)
+
+
+        # Compare a module path prefix from the source spelling against a registered owner.
+        # For absolute paths only the first module component is alias-resolved; relative paths
+        # are tried separately against each enclosing module, matching ordinary enum lookup.
+        def error_union_path_matches_module(owner: sview, path: sview, module_end: usize, enclosing: sview, before_offset: u32, file: Ast::File&, resolve_aliases: bool) -> bool can[Abort.Panic]:
+            raw_module_path: sview = string_view_slice(path, 0, module_end.i64())
+            return error_union_module_path_matches_text(raw_module_path, owner) if not resolve_aliases
+            resolved: (matched: bool, end: usize) = error_union_module_path_resolved_prefix_end(raw_module_path, owner, enclosing, before_offset, file)
+            return resolved.matched and resolved.end == owner.len
+
+
+        # Return a lexical specificity rank for one registered module owner. The nearest
+        # enclosing namespace wins; an absolute/alias-qualified spelling has rank zero.
+        def error_union_family_path_rank(owner: sview, path: sview, module_end: usize, enclosing: sview, before_offset: u32, file: Ast::File&) -> i64 can[Abort.Panic]:
+            prefix: mutable usize = enclosing.len
+            while prefix > 0 |prefix, owner, path, module_end, enclosing, before_offset, file|:
+                prefix_matches: mutable bool = owner.len > prefix + 2.usize()
+                for index in 0..<prefix |index, prefix_matches, owner, enclosing|:
+                    prefix_matches <- false if owner[index] != enclosing[index]
+                if prefix_matches and owner[prefix] == 58 and owner[prefix + 1.usize()] == 58:
+                    owner_suffix: sview = string_view_slice(owner, (prefix + 2.usize()).i64(), owner.len.i64())
+                    return (prefix + 1.usize()).i64() if error_union_path_matches_module(owner_suffix, path, module_end, enclosing, before_offset, file, false)
+                parent: mutable usize = 0
+                cursor: mutable usize = prefix
+                while cursor > 0 |parent, cursor, enclosing|:
+                    cursor <- cursor - 1.usize()
+                    if cursor + 1.usize() < enclosing.len and enclosing[cursor] == 58 and enclosing[cursor + 1.usize()] == 58:
+                        parent <- cursor
+                        break
+                prefix <- parent
+            return 0 if error_union_path_matches_module(owner, path, module_end, enclosing, before_offset, file, true)
+            return -1
+
+
+        def error_union_error_set_param_shadows_family(file: Ast::File&, family_annotation: Ast::EnumAnnotation) -> bool can[Abort.Panic]:
+            for annotation in file.enum_annotations |family_annotation|:
+                return true if annotation.owner == "__errorset_param" and annotation.name == family_annotation.name and annotation.line == family_annotation.line and annotation.offset == family_annotation.offset and annotation.identity_id == family_annotation.identity_id
             return false
 
 
+        def error_union_error_set_order_key(module: sview, family: sview @source) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            return family if module == ""
+            can Abort.Panic, Memory.Allocate:
+                bytes: mutable darray[u8] = []
+                index: mutable usize = 0
+                while index < module.len |index, bytes, module|:
+                    if index + 1.usize() < module.len and module[index] == 58 and module[index + 1.usize()] == 58:
+                        bytes.push(46)
+                        index <- index + 2.usize()
+                    else:
+                        bytes.push(module[index])
+                        index <- index + 1.usize()
+                bytes.push(46)
+                for index in 0..<family.len |bytes, family|:
+                    bytes.push(family[index])
+                return Parser::persist_name_bytes(&bytes, 0) can Global{Read,Write}
+
+
+        def error_union_error_set_source_path(module: sview, family: sview @source) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            return family if module == ""
+            can Abort.Panic, Memory.Allocate:
+                bytes: mutable darray[u8] = []
+                for index in 0..<module.len |bytes, module|:
+                    bytes.push(module[index])
+                bytes.push(58)
+                bytes.push(58)
+                for index in 0..<family.len |bytes, family|:
+                    bytes.push(family[index])
+                return Parser::persist_name_bytes(&bytes, 0) can Global{Read,Write}
+
+
+        def error_union_type_is_private(file: Ast::File&, name: sview, module: sview) -> bool can[Abort.Panic]:
+            for index in 0..<file.enum_annotations.count |file, name, module|:
+                annotation: Ast::EnumAnnotation = file.enum_annotations[index]
+                if annotation.owner == "__private_member" and annotation.name == name and index + 1.usize() < file.enum_annotations.count:
+                    module_row: Ast::EnumAnnotation = file.enum_annotations[index + 1.usize()]
+                    return true if module_row.owner == "__private_member_module" and module_row.name == module
+                return true if annotation.owner == "__section_private" and annotation.name == name and annotation.module == module
+            return false
+
+
+        def error_union_type_expr_path(expression: Ast::Expr) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            match expression:
+                Ast::Expr.Ident(name, _):
+                    return name
+                Ast::Expr.Scope(base, name, _):
+                    prefix: sview @source = error_union_type_expr_path(base) can Global{Read,Write}
+                    return name if prefix == ""
+                    can Abort.Panic, Memory.Allocate:
+                        bytes: mutable darray[u8] = []
+                        for index in 0..<prefix.len |bytes, prefix|:
+                            bytes.push(prefix[index])
+                        bytes.push(58)
+                        bytes.push(58)
+                        for index in 0..<name.len |bytes, name|:
+                            bytes.push(name[index])
+                        return Parser::persist_name_bytes(&bytes, 0) can Global{Read,Write}
+                Ast::Expr.Paren(inner, _):
+                    return error_union_type_expr_path(inner) can Global{Read,Write}
+                Ast::Expr.Refinement(base, _, _):
+                    return error_union_type_expr_path(base) can Global{Read,Write}
+                _:
+                    return ""
+
+
+        def error_union_type_expr_leaf(expression: Ast::Expr) -> sview @source:
+            match expression:
+                Ast::Expr.Ident(name, _):
+                    return name
+                Ast::Expr.Scope(_, name, _):
+                    return name
+                Ast::Expr.Paren(inner, _):
+                    return error_union_type_expr_leaf(inner)
+                Ast::Expr.Refinement(base, _, _):
+                    return error_union_type_expr_leaf(base)
+                _:
+                    return ""
+
+
+        def error_union_module_child_path(parent: sview, child: sview) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                bytes: mutable darray[u8] = []
+                for index in 0..<parent.len |bytes, parent|:
+                    bytes.push(parent[index])
+                if parent != "":
+                    bytes.push(58)
+                    bytes.push(58)
+                for index in 0..<child.len |bytes, child|:
+                    bytes.push(child[index])
+                return Parser::persist_name_bytes(&bytes, 0) can Global{Read,Write}
+
+
+        def error_union_import_path_resolved_prefix_end(raw_module: sview, owner: sview, import_scope: sview, import_offset: u32, file: Ast::File&) -> (matched: bool, end: usize) can[Abort.Panic, Memory.Allocate]:
+            joined_module: sview @source = error_union_module_child_path(import_scope, raw_module) can Global{Read,Write}
+            return error_union_module_path_resolved_prefix_end(joined_module, owner, import_scope, import_offset, file)
+
+
+        def error_union_alias_target_candidate(file: Ast::File&, target: Ast::Expr, alias_module: sview @source, alias_offset: u32, depth: u32 = 0) -> (found: bool, is_error_set: bool, module: sview @source, family: sview @source) can[Abort.Panic, Memory.Allocate]:
+            return (false, false, "", "") if depth >= 16
+            target_path: sview @source = error_union_type_expr_path(target) can Global{Read,Write}
+            target_family: sview @source = error_union_type_expr_leaf(target)
+            return (true, false, alias_module, target_family) if target_path == "" or target_family == ""
+            path_info: (valid: bool, qualified: bool, module_end: usize) = error_union_family_path_info(target_path, target_family)
+            if path_info.valid and path_info.qualified:
+                best_module: mutable sview @source = ""
+                best_rank: mutable i64 = -1
+                for declaration in file.enum_annotations |target_path, target_family, path_info, alias_module, alias_offset, best_module, best_rank, file|:
+                    continue if declaration.owner != "__error_set_decl" or declaration.name != target_family
+                    rank: i64 = error_union_family_path_rank(declaration.module, target_path, path_info.module_end, alias_module, alias_offset, file)
+                    if rank > best_rank:
+                        best_module <- declaration.module
+                        best_rank <- rank
+                return (true, true, best_module, target_family) if best_rank >= 0
+                raw_module: sview = string_view_slice(target_path, 0, path_info.module_end.i64())
+                candidate_scope: mutable sview @source = alias_module
+                while true |candidate_scope, file, target_family, raw_module, alias_offset, depth|:
+                    qualified: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_type_candidate_for_import_path(file, target_family, raw_module, candidate_scope, alias_offset, depth + 1) can Global{Read,Write}
+                    return qualified if qualified.found
+                    break if candidate_scope == ""
+                    parent_end: mutable usize = 0
+                    for index in 0..<candidate_scope.len |candidate_scope, parent_end|:
+                        parent_end <- index if index + 1.usize() < candidate_scope.len and candidate_scope[index] == 58 and candidate_scope[index + 1.usize()] == 58
+                    candidate_scope <- string_view_slice(candidate_scope, 0, parent_end.i64()) if parent_end > 0
+                    candidate_scope <- "" if parent_end == 0
+                return (true, false, alias_module, target_family)
+            visible: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_visible_type_candidate_at(file, target_family, alias_module, alias_offset, depth + 1) can Global{Read,Write}
+            return visible if visible.found and visible.is_error_set
+            return (true, false, visible.module, target_family) if visible.found
+            return (true, false, alias_module, target_family)
+
+
+        def error_union_alias_candidate_in_declarations(file: Ast::File&, declarations: darray[Ast::Decl], name: sview @source, target_module: sview @source, current_module: sview @source, depth: u32 = 0) -> (found: bool, is_error_set: bool, module: sview @source, family: sview @source) can[Abort.Panic, Memory.Allocate]:
+            for declaration in declarations |file, name, target_module, current_module|:
+                match declaration:
+                    Ast::Decl.Alias(alias_name, target, alias_pos) if alias_name == name and current_module == target_module:
+                        return error_union_alias_target_candidate(file, target, current_module, alias_pos.offset, depth) can Global{Read,Write}
+                    Ast::Decl.Extern(extern_name, _, _, _, callable, extern_type, _, _) if extern_name == name and not callable and extern_type == "" and current_module == target_module:
+                        return (true, false, current_module, name)
+                    Ast::Decl.Module(module_name, body, _):
+                        nested_module: sview @source = error_union_module_child_path(current_module, module_name) can Global{Read,Write}
+                        nested: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_alias_candidate_in_declarations(file, body, name, target_module, nested_module, depth) can Global{Read,Write}
+                        return nested if nested.found
+                    Ast::Decl.Scoped(body, _):
+                        nested: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_alias_candidate_in_declarations(file, body, name, target_module, current_module, depth) can Global{Read,Write}
+                        return nested if nested.found
+                    _:
+                        pass
+            return (false, false, "", "")
+
+
+        def error_union_alias_candidate_for_import_path(file: Ast::File&, declarations: darray[Ast::Decl], name: sview @source, raw_module: sview, import_scope: sview, import_offset: u32, current_module: sview @source, depth: u32 = 0) -> (found: bool, is_error_set: bool, module: sview @source, family: sview @source) can[Abort.Panic, Memory.Allocate]:
+            for declaration in declarations |file, name, raw_module, import_scope, import_offset, current_module|:
+                match declaration:
+                    Ast::Decl.Alias(alias_name, target, alias_pos) if alias_name == name and not error_union_type_is_private(file, name, current_module):
+                        resolved: (matched: bool, end: usize) = error_union_import_path_resolved_prefix_end(raw_module, current_module, import_scope, import_offset, file) can Global{Read,Write}
+                        return error_union_alias_target_candidate(file, target, current_module, alias_pos.offset, depth) can Global{Read,Write} if resolved.matched and resolved.end == current_module.len
+                    Ast::Decl.Extern(extern_name, _, _, _, callable, extern_type, _, _) if extern_name == name and not callable and extern_type == "" and not error_union_type_is_private(file, name, current_module):
+                        resolved: (matched: bool, end: usize) = error_union_import_path_resolved_prefix_end(raw_module, current_module, import_scope, import_offset, file) can Global{Read,Write}
+                        return (true, false, current_module, name) if resolved.matched and resolved.end == current_module.len
+                    Ast::Decl.Module(module_name, body, _):
+                        nested_module: sview @source = error_union_module_child_path(current_module, module_name) can Global{Read,Write}
+                        nested: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_alias_candidate_for_import_path(file, body, name, raw_module, import_scope, import_offset, nested_module, depth) can Global{Read,Write}
+                        return nested if nested.found
+                    Ast::Decl.Scoped(body, _):
+                        nested: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_alias_candidate_for_import_path(file, body, name, raw_module, import_scope, import_offset, current_module, depth) can Global{Read,Write}
+                        return nested if nested.found
+                    _:
+                        pass
+            return (false, false, "", "")
+
+
+        def error_union_alias_candidate_for_family_path(file: Ast::File&, declarations: darray[Ast::Decl], name: sview @source, path: sview @source, module_end: usize, lexical_module: sview @source, before_offset: u32, current_module: sview @source, depth: u32 = 0) -> (found: bool, is_error_set: bool, module: sview @source, family: sview @source, rank: i64) can[Abort.Panic, Memory.Allocate]:
+            best: mutable (found: bool, is_error_set: bool, module: sview @source, family: sview @source, rank: i64) = (false, false, "", "", -1)
+            for declaration in declarations |file, name, path, module_end, lexical_module, before_offset, current_module, depth, best|:
+                match declaration:
+                    Ast::Decl.Alias(alias_name, target, alias_pos) if alias_name == name and not error_union_type_is_private(file, name, current_module):
+                        rank: i64 = error_union_family_path_rank(current_module, path, module_end, lexical_module, before_offset, file)
+                        if rank >= 0 and rank > best.rank:
+                            candidate: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_alias_target_candidate(file, target, current_module, alias_pos.offset, depth) can Global{Read,Write}
+                            best <- (candidate.found, candidate.is_error_set, candidate.module, candidate.family, rank)
+                    Ast::Decl.Extern(extern_name, _, _, _, callable, extern_type, _, _) if extern_name == name and not callable and extern_type == "" and not error_union_type_is_private(file, name, current_module):
+                        rank: i64 = error_union_family_path_rank(current_module, path, module_end, lexical_module, before_offset, file)
+                        best <- (true, false, current_module, name, rank) if rank >= 0 and rank > best.rank
+                    Ast::Decl.Module(module_name, body, _):
+                        nested_module: sview @source = error_union_module_child_path(current_module, module_name) can Global{Read,Write}
+                        nested: (found: bool, is_error_set: bool, module: sview @source, family: sview @source, rank: i64) = error_union_alias_candidate_for_family_path(file, body, name, path, module_end, lexical_module, before_offset, nested_module, depth) can Global{Read,Write}
+                        best <- nested if nested.found and nested.rank > best.rank
+                    Ast::Decl.Scoped(body, _):
+                        nested: (found: bool, is_error_set: bool, module: sview @source, family: sview @source, rank: i64) = error_union_alias_candidate_for_family_path(file, body, name, path, module_end, lexical_module, before_offset, current_module, depth) can Global{Read,Write}
+                        best <- nested if nested.found and nested.rank > best.rank
+                    _:
+                        pass
+            return best
+
+
+        def error_union_type_candidate_in_module(file: Ast::File&, name: sview @source, module: sview @source, depth: u32 = 0) -> (found: bool, is_error_set: bool, module: sview @source, family: sview @source) can[Abort.Panic, Memory.Allocate]:
+            for declaration in file.enum_annotations |file, name, module|:
+                return (true, true, module, name) if declaration.owner == "__error_set_decl" and declaration.name == name and declaration.module == module
+            for index in 0..<file.struct_names.count |file, name, module|:
+                return (true, false, module, name) if file.struct_names[index] == name and index < file.struct_owners.count and file.struct_owners[index] == module
+            for index in 0..<file.generic_struct_decl_names.count |file, name, module|:
+                return (true, false, module, name) if file.generic_struct_decl_names[index] == name and index < file.generic_struct_decl_owners.count and file.generic_struct_decl_owners[index] == module
+            for index in 0..<file.enum_decl_names.count |file, name, module|:
+                return (true, false, module, name) if file.enum_decl_names[index] == name and index < file.enum_decl_owners.count and file.enum_decl_owners[index] == module
+            for index in 0..<file.payload_enum_names.count |file, name, module|:
+                return (true, false, module, name) if file.payload_enum_names[index] == name and index < file.payload_enum_owners.count and file.payload_enum_owners[index] == module
+            alias: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_alias_candidate_in_declarations(file, file.top_decls, name, module, "", depth) can Global{Read,Write}
+            return alias if alias.found
+            return (false, false, "", "")
+
+
+        # Resolve an imported module path against type owners in declaration order. A
+        # non-error type is still returned because it blocks later selective imports and
+        # makes Core fall through to its global bare-variant lookup.
+        def error_union_type_candidate_for_import_path(file: Ast::File&, name: sview @source, raw_module: sview, import_scope: sview @source, import_offset: u32, depth: u32 = 0) -> (found: bool, is_error_set: bool, module: sview @source, family: sview @source) can[Abort.Panic, Memory.Allocate]:
+            for declaration in file.enum_annotations |file, name, raw_module, import_scope, import_offset|:
+                continue if declaration.owner != "__error_set_decl" or declaration.name != name or error_union_type_is_private(file, name, declaration.module)
+                resolved: (matched: bool, end: usize) = error_union_import_path_resolved_prefix_end(raw_module, declaration.module, import_scope, import_offset, file) can Global{Read,Write}
+                return (true, true, declaration.module, name) if resolved.matched and resolved.end == declaration.module.len
+            for index in 0..<file.struct_names.count |file, name, raw_module, import_scope, import_offset|:
+                continue if file.struct_names[index] != name or index >= file.struct_owners.count
+                module: sview = file.struct_owners[index]
+                continue if error_union_type_is_private(file, name, module)
+                resolved: (matched: bool, end: usize) = error_union_import_path_resolved_prefix_end(raw_module, module, import_scope, import_offset, file) can Global{Read,Write}
+                return (true, false, module, name) if resolved.matched and resolved.end == module.len
+            for index in 0..<file.generic_struct_decl_names.count |file, name, raw_module, import_scope, import_offset|:
+                continue if file.generic_struct_decl_names[index] != name or index >= file.generic_struct_decl_owners.count
+                module: sview = file.generic_struct_decl_owners[index]
+                continue if error_union_type_is_private(file, name, module)
+                resolved: (matched: bool, end: usize) = error_union_import_path_resolved_prefix_end(raw_module, module, import_scope, import_offset, file) can Global{Read,Write}
+                return (true, false, module, name) if resolved.matched and resolved.end == module.len
+            for index in 0..<file.enum_decl_names.count |file, name, raw_module, import_scope, import_offset|:
+                continue if file.enum_decl_names[index] != name or index >= file.enum_decl_owners.count
+                module: sview = file.enum_decl_owners[index]
+                continue if error_union_type_is_private(file, name, module)
+                resolved: (matched: bool, end: usize) = error_union_import_path_resolved_prefix_end(raw_module, module, import_scope, import_offset, file) can Global{Read,Write}
+                return (true, false, module, name) if resolved.matched and resolved.end == module.len
+            for index in 0..<file.payload_enum_names.count |file, name, raw_module, import_scope, import_offset|:
+                continue if file.payload_enum_names[index] != name or index >= file.payload_enum_owners.count
+                module: sview = file.payload_enum_owners[index]
+                continue if error_union_type_is_private(file, name, module)
+                resolved: (matched: bool, end: usize) = error_union_import_path_resolved_prefix_end(raw_module, module, import_scope, import_offset, file) can Global{Read,Write}
+                return (true, false, module, name) if resolved.matched and resolved.end == module.len
+            alias: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_alias_candidate_for_import_path(file, file.top_decls, name, raw_module, import_scope, import_offset, "", depth) can Global{Read,Write}
+            return alias if alias.found
+            return (false, false, "", "")
+
+
+        # Match Core's unqualified lookup order: the top-level type, nearest lexical
+        # declarations, wildcard `using` targets, then the first program-wide selective
+        # import alias.
+        # If the winning type is not an error set, error[...] may still denote one unique
+        # bare variant, so keep both the candidate kind and its canonical owner.
+        def error_union_visible_type_candidate_at(file: Ast::File&, name: sview @source, lexical_module: sview @source, before_offset: u32, depth: u32 = 0) -> (found: bool, is_error_set: bool, module: sview @source, family: sview @source) can[Abort.Panic, Memory.Allocate]:
+            return (false, false, "", "") if depth >= 16
+            root: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_type_candidate_in_module(file, name, "", depth) can Global{Read,Write}
+            return root if root.found
+            candidate_module: mutable sview @source = lexical_module
+            while candidate_module != "" |candidate_module, file, name|:
+                local: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_type_candidate_in_module(file, name, candidate_module, depth) can Global{Read,Write}
+                return local if local.found
+                parent_end: mutable usize = 0
+                for index in 0..<candidate_module.len |candidate_module, parent_end|:
+                    parent_end <- index if index + 1.usize() < candidate_module.len and candidate_module[index] == 58 and candidate_module[index + 1.usize()] == 58
+                candidate_module <- string_view_slice(candidate_module, 0, parent_end.i64()) if parent_end > 0
+                candidate_module <- "" if parent_end == 0
+            for import_row in file.enum_annotations |file, name, lexical_module, before_offset|:
+                continue if import_row.name != "__binding_wildcard_import" or not error_union_module_is_ancestor(import_row.module, lexical_module)
+                imported: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_type_candidate_for_import_path(file, name, import_row.owner, import_row.module, import_row.offset, depth) can Global{Read,Write}
+                return imported if imported.found
+            for import_row in file.enum_annotations |file, name, lexical_module, before_offset|:
+                continue if import_row.owner != "__from_member" or import_row.name != name
+                for source_row in file.enum_annotations |file, import_row|:
+                    continue if source_row.owner != "__from_src" or source_row.module != import_row.module or source_row.line != import_row.line or source_row.offset != import_row.offset
+                    imported: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_type_candidate_for_import_path(file, name, source_row.name, import_row.module, import_row.offset, depth) can Global{Read,Write}
+                    return imported if imported.found
+            return (false, false, "", "")
+
+
+        # Return the canonical error-set owner only when Core's visible lookup selects an
+        # error set. A same-name struct/enum ahead of an import leaves the variant fallback
+        # available, while imported families retain the module that declared them.
+        def error_union_error_set_declared_at(file: Ast::File&, family: sview @source, lexical_module: sview @source, before_offset: u32) -> (found: bool, module: sview @source, family: sview @source) can[Abort.Panic, Memory.Allocate]:
+            candidate: (found: bool, is_error_set: bool, module: sview @source, family: sview @source) = error_union_visible_type_candidate_at(file, family, lexical_module, before_offset) can Global{Read,Write}
+            return (true, candidate.module, candidate.family) if candidate.found and candidate.is_error_set
+            return (false, "", "")
+
+
+        def error_union_error_set_has_variant(structs: StructTable&, family: sview, module: sview, variant: sview) -> bool can[Abort.Panic]:
+            payload_index: i64 = penum_index_of_owned(structs, module, family)
+            if payload_index >= 0:
+                start: usize = structs.payload_enums.penum_variant_start[payload_index.usize()]
+                count: usize = structs.payload_enums.penum_variant_count[payload_index.usize()]
+                for offset in 0..<count |start, structs, variant|:
+                    slot: usize = start + offset
+                    return true if structs.payload_enums.penum_variants[slot] == variant and slot < structs.payload_enums.penum_variant_owners.count and structs.payload_enums.penum_variant_owners[slot] == family and slot < structs.payload_enums.penum_variant_modules.count and structs.payload_enums.penum_variant_modules[slot] == module
+            enum_index: i64 = enum_index_of_owned(structs, module, family)
+            if enum_index >= 0:
+                start: usize = structs.const_enums.enum_variant_start[enum_index.usize()]
+                count: usize = structs.const_enums.enum_variant_count[enum_index.usize()]
+                for offset in 0..<count |start, structs, variant|:
+                    return true if structs.const_enums.enum_variants[start + offset] == variant
+            return false
+
+
+        # Return a declared error-set owner only when the short variant is unique across
+        # the error sets represented in this compilation unit. Ordinary enum members are
+        # deliberately excluded by walking __error_set_decl rows first.
+        def error_union_unique_bare_variant_owner(file: Ast::File&, variant: sview, structs: StructTable&) -> (count: usize, family: sview @source, module: sview @source) can[Abort.Panic]:
+            count: mutable usize = 0
+            selected_family: mutable sview @source = ""
+            selected_module: mutable sview @source = ""
+            for declaration_index in 0..<file.enum_annotations.count |count, selected_family, selected_module, declaration_index, file, variant, structs|:
+                declaration: Ast::EnumAnnotation = file.enum_annotations[declaration_index]
+                continue if declaration.owner != "__error_set_decl"
+                duplicate: mutable bool = false
+                for prior_index in 0..<declaration_index |duplicate, prior_index, file, declaration|:
+                    prior: Ast::EnumAnnotation = file.enum_annotations[prior_index]
+                    duplicate <- true if prior.owner == "__error_set_decl" and prior.name == declaration.name and prior.module == declaration.module
+                continue if duplicate
+                continue if not error_union_error_set_has_variant(structs, declaration.name, declaration.module, variant)
+                count <- count + 1.usize()
+                if count == 1.usize():
+                    selected_family <- declaration.name
+                    selected_module <- declaration.module
+            return (count, selected_family, selected_module)
+
+
+        def error_union_family_occurrence(file: Ast::File&, family_row_index: usize, declaration_module: sview @source, structs: StructTable&) -> ErrorUnionFamilyOccurrence can[Abort.Panic, Memory.Allocate]:
+            family_row: Ast::EnumAnnotation = file.enum_annotations[family_row_index]
+            family_path: mutable sview @source = family_row.name
+            family_order_key: mutable sview @source = family_row.family_order_key
+            variant_override: mutable sview @source = ""
+            found_family_path: mutable bool = false
+            if family_row_index + 1.usize() < file.enum_annotations.count:
+                path_row: Ast::EnumAnnotation = file.enum_annotations[family_row_index + 1.usize()]
+                if path_row.owner == "__error_set_family_path" and path_row.line == family_row.line and path_row.offset == family_row.offset and path_row.identity_id == family_row.identity_id and path_row.occurrence_offset == family_row.occurrence_offset:
+                    family_path <- path_row.name
+                    family_order_key <- path_row.name if family_order_key == ""
+                    found_family_path <- true
+            return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: family_row.name, family_path: family_path, family_order_key: family_order_key, module: declaration_module, variant_override: variant_override, error_set_parameter: false, qualified: true, resolved: false} if not found_family_path
+            path_info: (valid: bool, qualified: bool, module_end: usize) = error_union_family_path_info(family_path, family_row.name)
+            if not path_info.valid:
+                return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: family_row.name, family_path: family_path, family_order_key: family_order_key, module: declaration_module, variant_override: variant_override, error_set_parameter: false, qualified: true, resolved: false}
+            if not path_info.qualified:
+                if error_union_error_set_param_shadows_family(file, family_row):
+                    return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: family_row.name, family_path: family_path, family_order_key: family_order_key, module: declaration_module, variant_override: "", error_set_parameter: true, qualified: false, resolved: true}
+                visible_family: (found: bool, module: sview @source, family: sview @source) = error_union_error_set_declared_at(file, family_row.name, declaration_module, family_row.offset) can Global{Read,Write}
+                if visible_family.found:
+                    order_key: sview @source = error_union_error_set_order_key(visible_family.module, visible_family.family) can Global{Read,Write}
+                    return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: visible_family.family, family_path: family_path, family_order_key: order_key, module: visible_family.module, variant_override: "", error_set_parameter: false, qualified: false, resolved: true}
+                variant_owner: (count: usize, family: sview @source, module: sview @source) = error_union_unique_bare_variant_owner(file, family_row.name, structs)
+                if variant_owner.count == 1.usize():
+                    order_key: sview @source = error_union_error_set_order_key(variant_owner.module, variant_owner.family) can Global{Read,Write}
+                    return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: variant_owner.family, family_path: family_path, family_order_key: order_key, module: variant_owner.module, variant_override: family_row.name, error_set_parameter: false, qualified: false, resolved: true}
+                return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: family_row.name, family_path: family_path, family_order_key: family_order_key, module: declaration_module, variant_override: variant_override, error_set_parameter: false, qualified: false, resolved: true}
+            qualified_alias: (found: bool, is_error_set: bool, module: sview @source, family: sview @source, rank: i64) = error_union_alias_candidate_for_family_path(file, file.top_decls, family_row.name, family_path, path_info.module_end, declaration_module, family_row.offset, "") can Global{Read,Write}
+            if qualified_alias.found:
+                if qualified_alias.is_error_set:
+                    alias_order_key: sview @source = error_union_error_set_order_key(qualified_alias.module, qualified_alias.family) can Global{Read,Write}
+                    return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: qualified_alias.family, family_path: family_path, family_order_key: alias_order_key, module: qualified_alias.module, variant_override: "", error_set_parameter: false, qualified: true, resolved: true}
+                return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: family_row.name, family_path: family_path, family_order_key: family_order_key, module: qualified_alias.module, variant_override: "", error_set_parameter: false, qualified: true, resolved: false}
+            best_module: mutable sview @source = ""
+            best_rank: mutable i64 = -1
+            for index in 0..<file.payload_enum_names.count |best_module, best_rank, structs, family_row, family_path, path_info, declaration_module, file|:
+                continue if file.payload_enum_names[index] != family_row.name or index >= file.payload_enum_owners.count
+                candidate_owner: sview @source = file.payload_enum_owners[index]
+                continue if penum_index_of_owned(structs, candidate_owner, family_row.name) < 0
+                rank: i64 = error_union_family_path_rank(candidate_owner, family_path, path_info.module_end, declaration_module, family_row.offset, file)
+                if rank > best_rank:
+                    best_module <- candidate_owner
+                    best_rank <- rank
+            for index in 0..<file.enum_decl_names.count |best_module, best_rank, structs, family_row, family_path, path_info, declaration_module, file|:
+                continue if file.enum_decl_names[index] != family_row.name or index >= file.enum_decl_owners.count
+                candidate_owner: sview @source = file.enum_decl_owners[index]
+                continue if enum_index_of_owned(structs, candidate_owner, family_row.name) < 0
+                rank: i64 = error_union_family_path_rank(candidate_owner, family_path, path_info.module_end, declaration_module, family_row.offset, file)
+                if rank > best_rank:
+                    best_module <- candidate_owner
+                    best_rank <- rank
+            return ErrorUnionFamilyOccurrence{annotation_index: family_row_index, family: family_row.name, family_path: family_path, family_order_key: family_order_key, module: best_module, variant_override: variant_override, error_set_parameter: false, qualified: true, resolved: best_rank >= 0}
+
+
+
+
+        # Repeated subset spellings can refer to one declaration. Compare the resolved
+        # declaration owner so aliases and unqualified references coalesce with its
+        # qualified spelling, while same-leaf families from different modules stay apart.
+        def error_union_family_occurrence_same_declaration(left: ErrorUnionFamilyOccurrence, right: ErrorUnionFamilyOccurrence, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            return false if left.error_set_parameter or right.error_set_parameter
+            return false if left.family != right.family
+            left_payload: mutable i64 = penum_index_of_owned(structs, left.module, left.family)
+            right_payload: mutable i64 = penum_index_of_owned(structs, right.module, right.family)
+            left_payload <- penum_index_of(structs, left.family) if left_payload < 0 and not left.qualified
+            right_payload <- penum_index_of(structs, right.family) if right_payload < 0 and not right.qualified
+            if left_payload >= 0 or right_payload >= 0:
+                return false if left_payload < 0 or right_payload < 0
+                return penum_owner_at(structs, left_payload.usize()) == penum_owner_at(structs, right_payload.usize())
+            left_plain: mutable i64 = enum_index_of_owned(structs, left.module, left.family)
+            right_plain: mutable i64 = enum_index_of_owned(structs, right.module, right.family)
+            left_plain <- enum_index_of(structs, left.family) if left_plain < 0 and not left.qualified
+            right_plain <- enum_index_of(structs, right.family) if right_plain < 0 and not right.qualified
+            if left_plain >= 0 or right_plain >= 0:
+                return false if left_plain < 0 or right_plain < 0
+                return enum_owner_at(structs, left_plain.usize()) == enum_owner_at(structs, right_plain.usize())
+            return left.module == right.module and left.qualified == right.qualified
+
+
+        def error_union_family_variant_allowed(file: Ast::File&, families: darray[ErrorUnionFamilyOccurrence], declaration: ErrorUnionFamilyOccurrence, variant: sview, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            for index in 0..<families.count |index, file, families, declaration, variant, structs|:
+                occurrence: ErrorUnionFamilyOccurrence = families[index]
+                continue if not error_union_family_occurrence_same_declaration(declaration, occurrence, structs)
+                return true if occurrence.variant_override != "" and occurrence.variant_override == variant
+                continue if occurrence.variant_override != ""
+                return true if error_union_variant_allowed(file, occurrence.annotation_index, variant)
+            return false
 
 
         # A fieldless error declaration is stored in the ordinary enum table, not the
         # payload-enum table. Copy its selected variants into the combined row as zero-field
         # entries so they still receive their canonical union tag.
-        def append_error_union_plain_family(file: Ast::File&, line: u32, family: sview, module: sview, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
-            enum_index: mutable i64 = enum_index_of_owned(structs, module, family)
-            enum_index <- enum_index_of(structs, family) if enum_index < 0
+        def append_error_union_plain_family(file: Ast::File&, occurrence: ErrorUnionFamilyOccurrence, families: darray[ErrorUnionFamilyOccurrence], structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if occurrence.error_set_parameter
+            return if occurrence.qualified and not occurrence.resolved
+            enum_index: mutable i64 = enum_index_of_owned(structs, occurrence.module, occurrence.family)
+            enum_index <- enum_index_of(structs, occurrence.family) if enum_index < 0 and not occurrence.qualified
             return if enum_index < 0
             enum_start: usize = structs.const_enums.enum_variant_start[enum_index.usize()]
             enum_count: usize = structs.const_enums.enum_variant_count[enum_index.usize()]
-            for enum_offset in 0..<enum_count |enum_start, enum_index, structs, file, line, family|:
+            for enum_offset in 0..<enum_count |enum_start, enum_index, structs, file, occurrence, families|:
                 variant: sview = structs.const_enums.enum_variants[enum_start + enum_offset]
-                continue if not error_union_variant_allowed(file, line, family, variant)
+                continue if not error_union_family_variant_allowed(file, families, occurrence, variant, structs)
                 structs.payload_enums.penum_variants <- structs.payload_enums.penum_variants.push(variant)
-                structs.payload_enums.penum_variant_owners <- structs.payload_enums.penum_variant_owners.push(family)
+                structs.payload_enums.penum_variant_owners <- structs.payload_enums.penum_variant_owners.push(occurrence.family)
+                structs.payload_enums.penum_variant_modules <- structs.payload_enums.penum_variant_modules.push(occurrence.module)
                 structs.payload_enums.penum_payloads <- structs.payload_enums.penum_payloads.push(unmodeled_type())
                 structs.payload_enums.penum_has_payload <- structs.payload_enums.penum_has_payload.push(false)
                 structs.payload_enums.penum_field_names <- structs.payload_enums.penum_field_names.push("")
@@ -59,27 +701,31 @@ extend Backend:
         # Copy one source enum's selected rows into the synthetic error-set payload table.
         # Keeping the source owner lets `FirstError.Missing` and `SecondError.Missing` remain
         # distinguishable even when their leaf variant names happen to match.
-        def append_error_union_family(file: Ast::File&, line: u32, family: sview, module: sview, structs: mutable StructTable&, widest: mutable u32&) -> void can[Abort.Panic, Memory.Allocate]:
-            family_index: mutable i64 = penum_index_of_owned(structs, module, family)
-            family_index <- penum_index_of(structs, family) if family_index < 0
+        def append_error_union_family(file: Ast::File&, occurrence: ErrorUnionFamilyOccurrence, families: darray[ErrorUnionFamilyOccurrence], structs: mutable StructTable&, widest: mutable u32&) -> void can[Abort.Panic, Memory.Allocate]:
+            return if occurrence.error_set_parameter
+            return if occurrence.qualified and not occurrence.resolved
+            family_index: mutable i64 = penum_index_of_owned(structs, occurrence.module, occurrence.family)
+            family_index <- penum_index_of(structs, occurrence.family) if family_index < 0 and not occurrence.qualified
             if family_index < 0:
-                append_error_union_plain_family(file, line, family, module, structs)
+                append_error_union_plain_family(file, occurrence, families, structs)
                 return
             family_start: usize = structs.payload_enums.penum_variant_start[family_index.usize()]
             family_count: usize = structs.payload_enums.penum_variant_count[family_index.usize()]
-            for family_offset in 0..<family_count |family_offset, family_start, family_index, widest, file, line, family, structs|:
+            for family_offset in 0..<family_count |family_offset, family_start, family_index, widest, file, occurrence, families, structs|:
                 source_slot: usize = family_start + family_offset
                 variant: sview = structs.payload_enums.penum_variants[source_slot]
-                continue if not error_union_variant_allowed(file, line, family, variant)
+                continue if not error_union_family_variant_allowed(file, families, occurrence, variant, structs)
                 field_start: usize = structs.payload_enums.penum_field_type_start[source_slot]
                 field_count: usize = structs.payload_enums.penum_field_type_count[source_slot]
                 variant_owner: sview = structs.payload_enums.penum_variant_owners[source_slot]
+                variant_module: sview = structs.payload_enums.penum_variant_modules[source_slot] if source_slot < structs.payload_enums.penum_variant_modules.count else penum_owner_at(structs, family_index.usize())
                 variant_payload: ValueType = copied_type(structs.payload_enums.penum_payloads[source_slot])
                 variant_has_payload: bool = structs.payload_enums.penum_has_payload[source_slot]
                 variant_field_name: sview = structs.payload_enums.penum_field_names[source_slot]
                 variant_widest: mutable u32 = field_count.u32()
                 structs.payload_enums.penum_variants <- structs.payload_enums.penum_variants.push(variant)
                 structs.payload_enums.penum_variant_owners <- structs.payload_enums.penum_variant_owners.push(variant_owner)
+                structs.payload_enums.penum_variant_modules <- structs.payload_enums.penum_variant_modules.push(variant_module)
                 structs.payload_enums.penum_payloads <- structs.payload_enums.penum_payloads.push(variant_payload)
                 structs.payload_enums.penum_has_payload <- structs.payload_enums.penum_has_payload.push(variant_has_payload)
                 structs.payload_enums.penum_field_names <- structs.payload_enums.penum_field_names.push(variant_field_name)
@@ -96,43 +742,206 @@ extend Backend:
 
 
 
-        def register_error_union_row(file: Ast::File&, key: sview @source, module: sview, line: u32, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
-            return if penum_index_of_owned(structs, module, key) >= 0
-            families: mutable darray[sview] = []
-            for annotation in file.enum_annotations |families, line|:
-                continue if annotation.owner != "__error_set_family" or annotation.line != line
-                families.push(annotation.name)
-            return if families.count == 0
+        def error_union_family_occurrence_precedes(left: ErrorUnionFamilyOccurrence, right: ErrorUnionFamilyOccurrence) -> bool:
+            # Stage0 keys family sets by the complete tag.SetName, so duplicate leaves
+            # from different modules must retain their qualifier in ABI ordering.
+            return error_family_precedes(left.family_order_key, right.family_order_key)
+
+
+        # Keep the source spelling when it is unique, but give a later occurrence a stable
+        # internal key when the same spelling appears again in the same module. The returned
+        # view is compiler-lived because it becomes a registry key.
+        def error_union_occurrence_key(key: sview, occurrence_offset: u32) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                bytes: mutable darray[u8] = []
+                for index in 0..<key.len |bytes, key|:
+                    bytes.push(key[index])
+                bytes.push(35)
+                append_usize_decimal(occurrence_offset.usize(), bytes)
+                return Parser::persist_name_bytes(&bytes, 0) can Global{Read,Write}
+
+
+        # Synthetic singleton rows use a key derived from the canonical owner and tag. This
+        # lets repeated `error[Tag]` signatures share one backend type even when declared in
+        # different modules, while the reserved punctuation cannot collide with source names.
+        def error_union_bare_variant_key(module: sview, family: sview, variant: sview) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                bytes: mutable darray[u8] = []
+                prefix: sview = "__error_bare_variant__::"
+                for index in 0..<prefix.len |bytes, prefix|:
+                    bytes.push(prefix[index])
+                for index in 0..<module.len |bytes, module|:
+                    bytes.push(module[index])
+                if module != "":
+                    bytes.push(58)
+                    bytes.push(58)
+                for index in 0..<family.len |bytes, family|:
+                    bytes.push(family[index])
+                bytes.push(46)
+                for index in 0..<variant.len |bytes, variant|:
+                    bytes.push(variant[index])
+                return Parser::persist_name_bytes(&bytes, 0) can Global{Read,Write}
+
+
+        def error_union_imported_family_key(module: sview, family: sview) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            can Abort.Panic, Memory.Allocate:
+                bytes: mutable darray[u8] = []
+                prefix: sview = "__error_imported_family__::"
+                for index in 0..<prefix.len |bytes, prefix|:
+                    bytes.push(prefix[index])
+                for index in 0..<module.len |bytes, module|:
+                    bytes.push(module[index])
+                if module != "":
+                    bytes.push(58)
+                    bytes.push(58)
+                for index in 0..<family.len |bytes, family|:
+                    bytes.push(family[index])
+                return Parser::persist_name_bytes(&bytes, 0) can Global{Read,Write}
+
+
+        def register_error_union_row(file: Ast::File&, key: sview @source, module: sview @source, line: u32, offset: u32, identity_id: u32, occurrence_offset: u32, structs: mutable StructTable&) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            families: mutable darray[ErrorUnionFamilyOccurrence] = []
+            for annotation_index in 0..<file.enum_annotations.count |families, file, line, offset, identity_id, module, structs|:
+                annotation: Ast::EnumAnnotation = file.enum_annotations[annotation_index]
+                continue if annotation.owner != "__error_set_family" or annotation.line != line or annotation.offset != offset or annotation.occurrence_offset != occurrence_offset
+                continue if identity_id != 0 and annotation.identity_id != identity_id
+                families.push(error_union_family_occurrence(file, annotation_index, module, structs) can Global{Read,Write})
+            return "" if families.count == 0
             # Stage0's error-union ABI orders families by name, regardless of signature order.
             for index in 1..<families.count |families|:
-                selected: sview = families[index]
+                selected: ErrorUnionFamilyOccurrence = families[index]
                 cursor: mutable usize = index
-                while cursor > 0 and error_family_precedes(selected, families[cursor - 1.usize()]) |cursor, families, selected|:
+                while cursor > 0 and error_union_family_occurrence_precedes(selected, families[cursor - 1.usize()]) |cursor, families, selected|:
                     families[cursor] <- families[cursor - 1.usize()]
                     cursor <- cursor - 1.usize()
                 families[cursor] <- selected
+            for index in 0..<families.count |families|:
+                occurrence: ErrorUnionFamilyOccurrence = families[index]
+                return "" if occurrence.qualified and not occurrence.resolved
+            row_key: mutable sview @source = key
+            if penum_index_of_owned(structs, module, key) >= 0:
+                row_key <- error_union_occurrence_key(key, occurrence_offset) can Global{Read,Write}
+                collision: mutable u32 = 0
+                while penum_index_of_owned(structs, module, row_key) >= 0 |collision, row_key, key, occurrence_offset, module, structs|:
+                    collision <- collision + 1
+                    row_key <- error_union_occurrence_key(key, occurrence_offset + collision) can Global{Read,Write}
             start: usize = structs.payload_enums.penum_variants.count
             widest: mutable u32 = 0
-            for family in families |file, line, module, structs, widest|:
-                append_error_union_family(file, line, family, module, structs, widest)
+            for family_index in 0..<families.count |family_index, families, file, structs, widest|:
+                occurrence: ErrorUnionFamilyOccurrence = families[family_index]
+                repeated: mutable bool = false
+                for prior_index in 0..<family_index |prior_index, repeated, families, occurrence, structs|:
+                    prior: ErrorUnionFamilyOccurrence = families[prior_index]
+                    repeated <- true if error_union_family_occurrence_same_declaration(occurrence, prior, structs)
+                    break if repeated
+                continue if repeated
+                append_error_union_family(file, occurrence, families, structs, widest)
             count: usize = structs.payload_enums.penum_variants.count - start
-            return if count == 0
-            structs.payload_enums.penum_names <- structs.payload_enums.penum_names.push(key)
+            return "" if count == 0
+            structs.payload_enums.penum_names <- structs.payload_enums.penum_names.push(row_key)
             structs.payload_enums.penum_owners <- structs.payload_enums.penum_owners.push(module)
             structs.payload_enums.penum_variant_start <- structs.payload_enums.penum_variant_start.push(start)
             structs.payload_enums.penum_variant_count <- structs.payload_enums.penum_variant_count.push(count)
             structs.payload_enums.penum_payload_words <- structs.payload_enums.penum_payload_words.push(widest)
-            structs.errors.error_set_decl_names <- structs.errors.error_set_decl_names.push(key)
+            structs.errors.error_set_decl_names <- structs.errors.error_set_decl_names.push(row_key)
+            return row_key
+
+
+        def register_unkeyed_bare_variant_error_union_occurrence(file: Ast::File&, family_annotation_index: usize, lexical_module: sview @source, structs: mutable StructTable&) -> sview @source can[Abort.Panic, Memory.Allocate]:
+            return "" if family_annotation_index >= file.enum_annotations.count
+            family_annotation: Ast::EnumAnnotation = file.enum_annotations[family_annotation_index]
+            return "" if family_annotation.owner != "__error_set_family"
+            family_count: mutable usize = 0
+            keyed: mutable bool = false
+            for annotation in file.enum_annotations |family_count, keyed, family_annotation|:
+                same_occurrence: bool = annotation.line == family_annotation.line and annotation.offset == family_annotation.offset and annotation.identity_id == family_annotation.identity_id and annotation.occurrence_offset == family_annotation.occurrence_offset
+                family_count <- family_count + 1.usize() if annotation.owner == "__error_set_family" and same_occurrence
+                keyed <- true if annotation.owner == "__error_set_key" and same_occurrence
+            return "" if family_count != 1.usize() or keyed
+            return "" if error_union_error_set_param_shadows_family(file, family_annotation)
+            source_name: sview @source = family_annotation.name
+            visible_family: (found: bool, module: sview @source, family: sview @source) = error_union_error_set_declared_at(file, source_name, lexical_module, family_annotation.offset) can Global{Read,Write}
+            path: mutable sview @source = source_name
+            if family_annotation_index + 1.usize() < file.enum_annotations.count:
+                path_row: Ast::EnumAnnotation = file.enum_annotations[family_annotation_index + 1.usize()]
+                path <- path_row.name if path_row.owner == "__error_set_family_path" and path_row.line == family_annotation.line and path_row.offset == family_annotation.offset and path_row.identity_id == family_annotation.identity_id and path_row.occurrence_offset == family_annotation.occurrence_offset
+            path_info: (valid: bool, qualified: bool, module_end: usize) = error_union_family_path_info(path, source_name)
+            return "" if not path_info.valid or path_info.qualified
+            if visible_family.found:
+                # Local and root families already have a backend lookup path. Imported or
+                # ancestor families need a private owner-qualified row so equal leaves in
+                # different modules cannot share their ABI metadata.
+                return "" if visible_family.module == lexical_module or visible_family.module == ""
+                key: sview @source = error_union_imported_family_key(visible_family.module, visible_family.family) can Global{Read,Write}
+                return key if penum_index_of(structs, key) >= 0
+                return register_error_union_row(file, key, lexical_module, family_annotation.line, family_annotation.offset, family_annotation.identity_id, family_annotation.occurrence_offset, structs) can Global{Read,Write}
+            variant_owner: (count: usize, family: sview @source, module: sview @source) = error_union_unique_bare_variant_owner(file, source_name, structs)
+            return "" if variant_owner.count != 1.usize()
+            key: sview @source = error_union_bare_variant_key(variant_owner.module, variant_owner.family, source_name) can Global{Read,Write}
+            if penum_index_of(structs, key) >= 0:
+                return key
+            return register_error_union_row(file, key, lexical_module, family_annotation.line, family_annotation.offset, family_annotation.identity_id, family_annotation.occurrence_offset, structs) can Global{Read,Write}
+
+
+        # Simple `error[Tag]` return and callback signatures have no __error_set_key row
+        # because the parser normally handles one family without a synthetic union. Once enum
+        # metadata exists, canonicalize each unique bare tag into its owning family and
+        # register the one-tag ABI row used by raises, calls, try propagation, and catches.
+        def register_unkeyed_bare_variant_error_unions(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
+            for return_marker in file.enum_annotations |file, structs|:
+                continue if return_marker.name != "__error_return"
+                family_annotation_index: mutable usize = file.enum_annotations.count
+                family_count: mutable usize = 0
+                function_module: mutable sview @source = ""
+                for annotation_index in 0..<file.enum_annotations.count |family_annotation_index, family_count, function_module, annotation_index, file, return_marker|:
+                    annotation: Ast::EnumAnnotation = file.enum_annotations[annotation_index]
+                    same_occurrence: bool = annotation.line == return_marker.line and annotation.offset == return_marker.offset and annotation.identity_id == return_marker.identity_id and annotation.occurrence_offset == return_marker.occurrence_offset
+                    family_annotation_index <- annotation_index if annotation.owner == "__error_set_family" and same_occurrence
+                    family_count <- family_count + 1.usize() if annotation.owner == "__error_set_family" and same_occurrence
+                    function_module <- annotation.name if annotation.owner == "__fn_module" and annotation.line == return_marker.line and annotation.offset == return_marker.offset and annotation.identity_id == return_marker.identity_id
+                continue if family_count != 1.usize()
+                family_annotation: Ast::EnumAnnotation = file.enum_annotations[family_annotation_index]
+                lexical_module: sview @source = family_annotation.module if family_annotation.module != "" else function_module
+                row_key: sview @source = register_unkeyed_bare_variant_error_union_occurrence(file, family_annotation_index, lexical_module, structs) can Global{Read,Write}
+                if row_key != "":
+                    for error_index in 0..<structs.errors.error_fn_lines.count |structs, return_marker, row_key|:
+                        if structs.errors.error_fn_lines[error_index] == return_marker.line and error_index < structs.errors.error_fn_offsets.count and structs.errors.error_fn_offsets[error_index] == return_marker.offset + 1 and error_index < structs.errors.error_fn_set_names.count:
+                            structs.errors.error_fn_set_names[error_index] <- row_key
+
+            # First-class `fn(...) -> T error[Tag]` types use their own line/offset key. The
+            # parser now carries the exact `error` token offset on __fn_error_union so multiple
+            # callbacks on one header line cannot borrow one another's canonical family.
+            for fn_error_marker in file.enum_annotations |file, structs|:
+                continue if fn_error_marker.owner != "__fn_error_union" or fn_error_marker.occurrence_offset == 0
+                family_annotation_index: mutable usize = file.enum_annotations.count
+                family_count: mutable usize = 0
+                for annotation_index in 0..<file.enum_annotations.count |family_annotation_index, family_count, annotation_index, file, fn_error_marker|:
+                    annotation: Ast::EnumAnnotation = file.enum_annotations[annotation_index]
+                    if annotation.owner == "__error_set_family" and annotation.occurrence_offset == fn_error_marker.occurrence_offset:
+                        family_annotation_index <- annotation_index
+                        family_count <- family_count + 1.usize()
+                continue if family_count != 1.usize()
+                family_annotation: Ast::EnumAnnotation = file.enum_annotations[family_annotation_index]
+                row_key: sview @source = register_unkeyed_bare_variant_error_union_occurrence(file, family_annotation_index, family_annotation.module, structs) can Global{Read,Write}
+                if row_key != "":
+                    for fn_error_index in 0..<structs.function_types.fn_error_lines.count |structs, fn_error_marker, row_key|:
+                        if structs.function_types.fn_error_lines[fn_error_index] == fn_error_marker.line and fn_error_index < structs.function_types.fn_error_offsets.count and structs.function_types.fn_error_offsets[fn_error_index] == fn_error_marker.offset and fn_error_index < structs.function_types.fn_error_occurrence_offsets.count and structs.function_types.fn_error_occurrence_offsets[fn_error_index] == fn_error_marker.occurrence_offset and fn_error_index < structs.function_types.fn_error_families.count:
+                            structs.function_types.fn_error_families[fn_error_index] <- row_key
 
 
 
 
-        # Function signatures retain their source slice as a stable private key, so repeated
-        # identical unions share one row while different restricted unions never collide.
+        # Function signatures retain their source slice as a private key. Repeated composite
+        # spellings in one module are separated by their occurrence before ABI registration.
         def register_composite_error_unions(file: Ast::File&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate]:
             for key_annotation in file.enum_annotations |file, structs|:
                 continue if key_annotation.owner != "__error_set_key"
-                module: mutable sview = ""
+                module: mutable sview @source = ""
                 for module_annotation in file.enum_annotations |module, key_annotation|:
-                    module <- module_annotation.name if module_annotation.owner == "__error_set_module" and module_annotation.line == key_annotation.line
-                register_error_union_row(file, key_annotation.name, module, key_annotation.line, structs)
+                    module <- module_annotation.name if module_annotation.owner == "__error_set_module" and module_annotation.line == key_annotation.line and module_annotation.offset == key_annotation.offset and module_annotation.occurrence_offset == key_annotation.occurrence_offset and (key_annotation.identity_id == 0 or module_annotation.identity_id == key_annotation.identity_id)
+                row_key: sview @source = register_error_union_row(file, key_annotation.name, module, key_annotation.line, key_annotation.offset, key_annotation.identity_id, key_annotation.occurrence_offset, structs) can Global{Read,Write}
+                if row_key != "" and payload_error_set_key_is_return_occurrence(file, key_annotation):
+                    for error_index in 0..<structs.errors.error_fn_lines.count |structs, key_annotation, row_key|:
+                        if structs.errors.error_fn_lines[error_index] == key_annotation.line and error_index < structs.errors.error_fn_offsets.count and structs.errors.error_fn_offsets[error_index] == key_annotation.offset + 1 and error_index < structs.errors.error_fn_set_names.count:
+                            structs.errors.error_fn_set_names[error_index] <- row_key
+            register_unkeyed_bare_variant_error_unions(file, structs) can Global{Read,Write}

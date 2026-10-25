@@ -12,7 +12,8 @@ HERE = Path(__file__).resolve().parent
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 CLASSIFIER = ROOT / "src/backend/codegen_c_abi.elisa"
-DECLARATION = ROOT / "src/backend/codegen_declare_extern.elisa"
+DECLARATION = ROOT / "src/backend/codegen_declare_extern_body.elisa"
+DECLARATION_FACADE = ROOT / "src/backend/codegen_declare.elisa"
 POSITIVE = HERE / "backend_cabi_x86_argument_byval.elisa"
 NEGATIVE = HERE / "backend_cabi_x86_argument_byval_rejected.elisa"
 POSITIVE_HASHES = {
@@ -32,7 +33,7 @@ def section(text: str, name: str) -> str:
     match = re.search(rf"(?m)^[ \t]*def {re.escape(name)}\(", text)
     if not match:
         raise SystemExit(f"missing {name}")
-    following = re.search(r"(?m)^[ \t]*def [A-Za-z_]\w*\(", text[match.end():])
+    following = re.search(r"(?m)^[ \t]*def [A-Za-z_]\w*(?:\[[^\n]*?\])?\(", text[match.end():])
     return text[match.start():match.end() + following.start() if following else len(text)]
 for path, expected in ((POSITIVE, POSITIVE_HASHES), (NEGATIVE, NEGATIVE_HASHES)):
     text = path.read_text()
@@ -56,6 +57,8 @@ ordered = (
 if any(part not in classifier for part in ordered) or [classifier.index(part) for part in ordered] != sorted(classifier.index(part) for part in ordered):
     raise SystemExit("C argument classifier no longer matches aggregate, flatten, target, and x86 size policy")
 declare = compact(section(DECLARATION.read_text(), "declare_extern"))
+if 'include "./codegen_declare_extern_body.elisa"' not in DECLARATION_FACADE.read_text():
+    raise SystemExit("extern declaration body is no longer included by the production declaration facade")
 declare_steps = (
     "ifextern_is_exportandcabi_is_aggregate(param_value_type):",
     "export_arg_plan:CabiArgPlan=cabi_classify_arg(param_value_type,structs,ctx)",
@@ -72,7 +75,7 @@ if args.source_only:
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":
     raise SystemExit("C ABI argument proof requires strict Elisa-Proof build")
-inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", CLASSIFIER, DECLARATION, POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
+inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", CLASSIFIER, DECLARATION, DECLARATION_FACADE, POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
 before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 def run(path: Path):
     result = subprocess.run([str(BIN), "--json", str(path)], capture_output=True, text=True, timeout=60)

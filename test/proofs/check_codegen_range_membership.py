@@ -104,7 +104,7 @@ ordered_fragments = (
     "emit_binary(TokenKind.GtEq,in_left_value,in_lo_value,in_operand_type,structs,runtime.fast_math,runtime.overflow_wrap,m,ctx,builder)",
     "emit_binary(upper_operator,in_left_value,in_hi_value,in_operand_type,structs,runtime.fast_math,runtime.overflow_wrap,m,ctx,builder)",
     'LLVMBuildAnd(builder,lo_ok,hi_ok,"in.range")',
-    "nullreturnifnotis_numeric_type(in_operand_type)",
+    "returnnullifnotis_numeric_type(in_operand_type)",
     "BackendRangeMembershipPolicy::is_range_operator(in_range_operator)",
     "in_upper_operator:TokenKind=BackendRangeMembershipPolicy::upper_operator(in_range_operator)",
     "Expr.Binary(in_lower_test,TokenKind.And,in_upper_test,in_range_line)",

@@ -21,7 +21,8 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 PRERESERVE = ROOT / "src/backend/codegen_loop_prereserve.elisa"
 CONTAINER = ROOT / "src/backend/codegen_container_ops.elisa"
-SHAPES = ROOT / "src/backend/codegen_stmt_for_shapes.elisa"
+CONTAINER_GROWTH = ROOT / "src/backend/codegen_container_ops_darray_growth.elisa"
+SHAPES = ROOT / "src/backend/codegen_stmt_for_shapes_iterable.elisa"
 LOOPS = ROOT / "src/backend/codegen_stmt_loops.elisa"
 PROOF = HERE / "backend_fast_push_cursor.elisa"
 REJECTED = HERE / "backend_fast_push_cursor_rejected.elisa"
@@ -99,12 +100,12 @@ def ordered(source: str, function: str, steps: tuple[str, ...]) -> None:
         cursor = pos + len(needle)
 
 
-for path in (PRERESERVE, CONTAINER, SHAPES, LOOPS):
+for path in (PRERESERVE, CONTAINER, CONTAINER_GROWTH, SHAPES, LOOPS):
     if not path.is_file():
         raise SystemExit(f"missing cursor implementation source: {path}")
 
 prereserve = PRERESERVE.read_text()
-container = CONTAINER.read_text()
+container = CONTAINER.read_text() + CONTAINER_GROWTH.read_text()
 shapes = SHAPES.read_text()
 reserve_body = compact(section(container, "emit_darray_reserve"))
 if 'LLVMBuildStructGEP2(builder,header,array_slot,1,' in reserve_body or "count_pointer" in reserve_body:
@@ -126,7 +127,7 @@ ordered(prereserve, "emit_loop_prereserve", (
     "trip_cap <- prereserve_trip_cap(pushes, element_stride_bytes)",
     "skip <- true if trip_cap == 0",
     "direct_index_candidate: mutable bool = false",
-    "if pushes == 1 and variables.count == 1.usize():",
+    "if not skip and pushes == 1 and variables.count == 1.usize():",
     "match iterable:",
     "Expr.Binary(direct_low, direct_operator, direct_high, _):",
     "if direct_operator == TokenKind.RangeLt and direct_low is Expr.IntLit(direct_start, _):",
@@ -237,7 +238,7 @@ if product.get("compile_mode") != "strict":
     raise SystemExit("fast-push cursor proof requires a strict Elisa-Proof build")
 inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"),
     BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV",
-    Path(__file__), HERE / "proof_product_gate.py", PRERESERVE, CONTAINER, SHAPES, LOOPS,
+    Path(__file__), HERE / "proof_product_gate.py", PRERESERVE, CONTAINER, CONTAINER_GROWTH, SHAPES, LOOPS,
     PROOF, REJECTED, *source_include_closure([PROOF, REJECTED])]))
 before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
 

@@ -1,6 +1,7 @@
 """Replay the source-bound proof for backend error-family ordering."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -13,13 +14,20 @@ from proof_product_gate import require_current_product, source_include_closure
 if not __debug__:
     raise SystemExit("run without Python -O")
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 BACKEND = ROOT / "src/backend/codegen.elisa"
 ERROR_UNIONS = ROOT / "src/backend/codegen_error_union_reg.elisa"
+PARSER_FAMILIES = ROOT / "src/parser/parser_extern_header_probes.elisa"
+PARSER_PROTOCOLS = ROOT / "src/parser/parser_decl_named_block.elisa"
+AST_SIDE_TABLES = ROOT / "src/parser/ast_side_tables.elisa"
+BACKEND_VARIANT_KEYS = ROOT / "src/backend/codegen_variant_paths_error_sets.elisa"
 POSITIVE = HERE / "backend_error_family_order.elisa"
 NEGATIVE = HERE / "backend_error_family_order_rejected.elisa"
 BYTE_ORDER = HERE / "backend_error_family_byte_order.elisa"
@@ -32,6 +40,9 @@ POSITIVE_NAMES = {
     "a_later_differing_byte_decides_after_an_equal_prefix",
     "a_proper_prefix_precedes_its_extension",
     "empty_name_precedes_a_nonempty_name",
+    "qualified_names_with_the_same_leaf_follow_full_path_order",
+    "source_trivia_does_not_change_dotted_path_order",
+    "alias_spelling_remains_the_order_key",
 }
 NEGATIVE_NAMES = {
     "a_proper_extension_does_not_precede_its_prefix",
@@ -182,8 +193,90 @@ if compact(function_section(NEGATIVE.read_text(), "a_smaller_byte_is_not_precede
 negative_transitivity_shape = "def a_concrete_byte_order_chain_can_break_transitivity() -> bool: ensure result == true return error_family_precedes(\"a\", \"b\") and error_family_precedes(\"b\", \"c\") and not error_family_precedes(\"a\", \"c\")"
 if compact(function_section(NEGATIVE.read_text(), "a_concrete_byte_order_chain_can_break_transitivity")) != compact(negative_transitivity_shape):
     raise SystemExit("the false lexicographic transitivity control changed")
-if compact(function_section(production_text, "register_error_union_row")).find("whilecursor>0anderror_family_precedes(") < 0:
-    raise SystemExit("error-union ABI registration no longer orders families with the proved comparator")
+expected_occurrence_comparator = "def error_union_family_occurrence_precedes(left: ErrorUnionFamilyOccurrence, right: ErrorUnionFamilyOccurrence) -> bool: return error_family_precedes(left.family_order_key, right.family_order_key)"
+if compact(function_section(production_text, "error_union_family_occurrence_precedes")) != compact(expected_occurrence_comparator):
+    raise SystemExit("error-union occurrence sorting no longer delegates family order to the proved comparator")
+parser_text = PARSER_FAMILIES.read_text()
+expected_order_key_builder = """
+def header_error_family_order_key(parser: Parser&, start_scan: usize, end_scan: usize) -> sview @source:
+    can Abort.Panic, Memory.Allocate:
+        bytes: mutable darray[u8] = []
+        has_segment: mutable bool = false
+        for index in start_scan..<(end_scan + 1.usize()) |bytes, has_segment, parser|:
+            continue if parser.peek_at(index) != TokenKind.Ident
+            bytes.push(46) if has_segment
+            token: Token = parser.tokens[parser.position + index]
+            segment: sview = Lexer::text_or_empty(token, parser.source, parser.source_length)
+            for byte_index in 0..<segment.len |bytes, segment|:
+                bytes.push(segment[byte_index])
+            has_segment <- true
+        return persist_name_bytes(&bytes, 0) can Global{Read,Write}
+"""
+if compact(function_section(parser_text, "header_error_family_order_key")) != compact(expected_order_key_builder):
+    raise SystemExit("parser family sort keys no longer normalize identifier tokens to Core's dotted SetName")
+if "family_order_key:sview@source=\"\"" not in compact(AST_SIDE_TABLES.read_text()):
+    raise SystemExit("family order keys no longer travel on the family annotation row")
+for capture_name in ("capture_protocol_callback_error_sets_at", "capture_header_error_families"):
+    capture = compact(function_section(parser_text, capture_name))
+    if "header_error_family_order_key(" not in capture or "family_order_key:family_order_key" not in capture:
+        raise SystemExit(f"{capture_name} no longer stores the normalized dotted family order key on its family row")
+    family_push = 'push(Ast::EnumAnnotation{owner:"__error_set_family"'
+    path_push = 'push(Ast::EnumAnnotation{owner:"__error_set_family_path"'
+    if family_push not in capture or path_push not in capture or capture.index(family_push) > capture.index(path_push):
+        raise SystemExit(f"{capture_name} no longer keeps the family row immediately before its path row")
+    if "__error_set_family_order_key" in capture:
+        raise SystemExit(f"{capture_name} emitted a separate order row that can shift subset adjacency")
+header_capture = compact(function_section(parser_text, "capture_header_error_families"))
+dot_capture_fragments = (
+    'dot_variant_family<-Lexer::text_or_empty(token,parser.source,parser.source_length)iffamilyandparser.peek_at(scan+1)==TokenKind.Dot',
+    'ifinside_error_setandnotinside_variant_setanddot_variant_family!=""andkind==TokenKind.Identandprevious_kind==TokenKind.Dot:',
+    'owner:"__error_variant_family",name:dot_variant_family',
+    'owner:"__error_variant_allow",name:Lexer::text_or_empty(token,parser.source,parser.source_length)',
+    'ifinside_error_setandkind==TokenKind.Dotanderror_set_brace_depth==0:complex_error_set<-true',
+)
+if not all(fragment in header_capture for fragment in dot_capture_fragments):
+    raise SystemExit("ordinary/extern error headers no longer retain dot-selected subset and composite-key metadata")
+callback_capture = compact(function_section(parser_text, "capture_protocol_callback_error_sets_at"))
+callback_dot_capture_fragments = (
+    'dot_variant_family<-family_nameifparser.peek_at(scan+1)==TokenKind.Dot',
+    'ifinside_error_setanderror_set_occurrence_offset!=excluded_occurrenceanddot_variant_family!=""andkind==TokenKind.Identandprevious_kind==TokenKind.Dot:',
+    'owner:"__error_variant_family",name:dot_variant_family',
+    'owner:"__error_variant_allow",name:Lexer::text_or_empty(token,parser.source,parser.source_length)',
+)
+if not all(fragment in callback_capture for fragment in callback_dot_capture_fragments):
+    raise SystemExit("protocol callback error types no longer retain dot-selected subset rows")
+protocol_capture = compact(function_section(PARSER_PROTOCOLS.read_text(), "reject_protocol_method_bodies"))
+if not all(fragment in protocol_capture for fragment in (
+    'protocol_subset_family<-family_nameif(parser.peek_at(scan+1)==TokenKind.LBraceorparser.peek_at(scan+1)==TokenKind.Dot)',
+    'protocol_error_dot_variant:bool=',
+    'line:3900000147',
+)):
+    raise SystemExit("protocol return error sets no longer retain dot-selected subset rows")
+variant_key_classifier = compact(function_section(BACKEND_VARIANT_KEYS.read_text(), "error_set_key_is_composite"))
+if 'set_name[index]==46' not in variant_key_classifier:
+    raise SystemExit("dot-selected error-set keys no longer select composite ABI ordinal mapping")
+occurrence = compact(function_section(production_text, "error_union_family_occurrence"))
+if "family_order_key:mutablesview@source=family_row.family_order_key" not in occurrence:
+    raise SystemExit("backend family occurrences no longer read the parser's normalized order key")
+bare_variant_order_key = compact(function_section(production_text, "error_union_error_set_order_key"))
+if not all(fragment in bare_variant_order_key for fragment in (
+    'returnfamilyifmodule==""',
+    'whileindex<module.len|index,bytes,module|:',
+    'module[index]==58andmodule[index+1.usize()]==58',
+    'index<-index+2.usize()',
+    'bytes.push(46)',
+    'forindexin0..<family.len|bytes,family|:',
+    'Parser::persist_name_bytes(&bytes,0)canGlobal{Read,Write}',
+)):
+    raise SystemExit("bare-variant families no longer use their canonical module-qualified order key")
+if not all(fragment in occurrence for fragment in (
+    'error_union_unique_bare_variant_owner(file,family_row.name,structs)',
+    'error_union_error_set_order_key(variant_owner.module,variant_owner.family)',
+    'variant_override:family_row.name',
+)):
+    raise SystemExit("bare-variant family resolution no longer preserves its canonical owner and selected tag")
+if compact(function_section(production_text, "register_error_union_row")).find("whilecursor>0anderror_union_family_occurrence_precedes(") < 0:
+    raise SystemExit("error-union ABI registration no longer orders family occurrences with the proved comparator")
 if 'include "./codegen_error_union_reg.elisa"' not in BACKEND.read_text():
     raise SystemExit("the backend facade no longer includes error-union registration")
 if declarations(POSITIVE) != (POSITIVE_NAMES - {
@@ -210,6 +303,10 @@ if declarations(NEGATIVE) != NEGATIVE_NAMES:
 if ghost_declarations(NEGATIVE):
     raise SystemExit("the error-family negative controls unexpectedly changed ghost inventory")
 
+if args.source_only:
+    print(json.dumps({"source_bound": True, "ordering_theorems": len(POSITIVE_NAMES)}, sort_keys=True))
+    raise SystemExit(0)
+
 try:
     product = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
@@ -227,7 +324,8 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", BACKEND, ERROR_UNIONS,
-    POSITIVE, NEGATIVE, BYTE_ORDER, *source_include_closure([POSITIVE, NEGATIVE]),
+    PARSER_FAMILIES, PARSER_PROTOCOLS, AST_SIDE_TABLES, BACKEND_VARIANT_KEYS, POSITIVE, NEGATIVE, BYTE_ORDER,
+    *source_include_closure([POSITIVE, NEGATIVE]),
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

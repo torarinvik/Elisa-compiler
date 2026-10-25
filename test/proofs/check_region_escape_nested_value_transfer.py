@@ -1,4 +1,5 @@
 """Admit source-linked proofs of nested region-handle transfer rules."""
+import argparse
 import hashlib
 import json
 import os
@@ -11,14 +12,16 @@ from proof_product_gate import require_current_product, source_include_closure
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
 POSITIVE = HERE / "region_escape_nested_value_transfer.elisa"
 NEGATIVE = HERE / "region_escape_nested_value_transfer_rejected.elisa"
-IMPLEMENTATION = ROOT / "src/semantic/region_escape_stores.elisa"
-INTEGRATION = ROOT / "src/semantic/check_region_escape.elisa"
-MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
-MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
+IMPLEMENTATION = ROOT / "src/semantic/region_escape_stores_handles.elisa"
+STORE_CHECK = ROOT / "src/semantic/region_escape_stores.elisa"
+INTEGRATION = ROOT / "src/semantic/check_region_escape/element_taints.elisa"
+ENTRY = ROOT / "src/semantic/check_region_escape.elisa"
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--source-only", action="store_true", help="check source bindings without replaying proof artifacts")
+arguments = parser.parse_args()
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -43,7 +46,9 @@ body_arms = (
 )
 value_arms = (
     "Expr.Block(body,carries_value,_,_):returnregion_escape_body_carries_handles(body,carries_value,annotations,line,local_names,local_types,table)",
-    "Expr.Match(_,carries_arms,_):forarmincarries_arms:arm_names:mutabledarray[sview]=[namefornameinlocal_names]",
+    "Expr.Match(_,carries_arms,_):forarmincarries_arms:arm_names:mutabledarray[sview@source]=[namefornameinlocal_names]",
+    "collect_pattern_binding_names(arm.pattern,arm_names)",
+    "whilearm_types.count<arm_names.count|arm_types|:arm_types.push(Ast::Expr.Absent)",
     "returntrueifregion_escape_body_carries_handles(arm.body,null,annotations,line,arm_names,arm_types,table)returnfalse",
     "Expr.Catch(guarded,carries_arms,_):returntrueifregion_escape_value_carries_handles(guarded,annotations,line,local_names,local_types,table)",
     "returntrueifarm.body.count==0",
@@ -77,10 +82,25 @@ if not expected <= declarations:
     raise SystemExit("nested-value proof lost a block, match, or catch transfer law")
 
 integration = INTEGRATION.read_text()
-if 'include "./region_escape_stores.elisa"' not in integration:
-    raise SystemExit("region escape checker no longer includes nested-value handle analysis")
-if "region_escape_stored_or_call_region(" not in integration:
+entry = ENTRY.read_text()
+store_check = STORE_CHECK.read_text()
+if 'include "../region_escape_stores.elisa"' not in integration or 'include "../region_escape_stores_handles.elisa"' not in integration:
+    raise SystemExit("RegionEscape entry module no longer includes nested-value handle analysis")
+if 'include "./check_region_escape/element_taints.elisa"' not in entry:
+    raise SystemExit("region escape checker no longer reaches nested-value handle analysis")
+if "region_escape_value_carries_handles(" not in store_check:
+    raise SystemExit("RegionEscape store checks no longer consult nested-value handle analysis")
+if "region_escape_stored_or_call_region_with_elements(" not in store_check:
     raise SystemExit("region escape integration no longer reaches nested-value handle analysis")
+
+if arguments.source_only:
+    print("RegionEscape nested-value transfer source binding passed")
+    raise SystemExit(0)
+
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
+MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 
 try:
     manifest = require_current_product(BIN, PROVER)
@@ -93,7 +113,7 @@ stage1_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=Tr
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
 inputs = [BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV", stage1_product,
           stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-          *source_include_closure([POSITIVE, NEGATIVE, IMPLEMENTATION, INTEGRATION])]
+          *source_include_closure([POSITIVE, NEGATIVE, IMPLEMENTATION, STORE_CHECK, INTEGRATION, ENTRY])]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 
 

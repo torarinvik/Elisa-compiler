@@ -44,17 +44,19 @@ if not NEGATIVE.read_text().startswith('include "./backend_cabi_wasm_return.elis
     raise SystemExit("false controls must import the wasm return policy")
 classifier = compact(section(CLASSIFIER.read_text(), "cabi_classify_ret_llvm"))
 ordered = (
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifnotret_is_aggregate",
-    "CabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}returnifsize==0",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifnotret_is_aggregate",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:llvm_value,value_type:llvm_value}ifsize==0",
     "flat_ok:bool=cabi_flatten(llvm_value,0,leaves,structs)",
-    "CabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}returnifflat_ok==false",
+    "returnCabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}ifflat_ok==false",
     "target:i32=cabi_target(structs)",
     "iftarget==2:",
-    "CabiRetPlan{direct:true,sret:false,ret_type:cabi_leaf_type(leaves[0],ctx),value_type:llvm_value}returnifleaves.count==1",
-    "returnCabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}",
+    "returnCabiRetPlan{direct:true,sret:false,ret_type:cabi_leaf_type(leaves[0],ctx),value_type:llvm_value}ifleaves.count==1",
 )
 if any(part not in classifier for part in ordered) or [classifier.index(part) for part in ordered] != sorted(classifier.index(part) for part in ordered):
     raise SystemExit("wasm return classifier no longer matches zero-size, flatten, and single-leaf rules")
+wasm_sret = "returnCabiRetPlan{direct:false,sret:true,ret_type:llvm_value,value_type:llvm_value}"
+if classifier.rfind(wasm_sret) <= classifier.index(ordered[-1]):
+    raise SystemExit("wasm aggregate returns with multiple leaves must use sret")
 wrapper = compact(section(WRAPPER.read_text(), "emit_export_wrapper_to"))
 wrapper_steps = (
     "llvm_param_cursor:mutableu32=1ifexport_ret_plan.sretelse0",

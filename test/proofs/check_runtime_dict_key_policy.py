@@ -21,7 +21,7 @@ POLICY = ROOT / "src/semantic/runtime_dict_key_policy.elisa"
 CONSUMER = ROOT / "src/semantic/check_runtime_dict_key.elisa"
 RESOLVER = ROOT / "src/semantic/resolve_types_infer.elisa"
 RESOLVER_OPERATORS = ROOT / "src/semantic/resolve_types_operators.elisa"
-RESOLVER_INITIALIZERS = ROOT / "src/semantic/resolve_types_initializers.elisa"
+RESOLVER_INITIALIZERS = ROOT / "src/semantic/resolve_types_initializers_check.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 SEMANTIC_PASSES = ROOT / "src/semantic/semantic_parallel_passes.elisa"
 POSITIVE = HERE / "runtime_dict_key_policy.elisa"
@@ -41,12 +41,12 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\]\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -112,7 +112,7 @@ if semantic_text.count('include "./resolve_types_infer.elisa"') != 1 or \
         semantic_text.index('include "./resolve_types_infer.elisa"') > semantic_text.index('include "./check_runtime_dict_key.elisa"'):
     raise SystemExit("dictionary-key policy must be loaded before both semantic consumers")
 pass_dispatch = compact(function_section(semantic_passes_text, "par_pass_call"))
-if "elifpass_id==95:table<-check_runtime_dict_key(loop_view.top_decls,table)" not in pass_dispatch:
+if "ifpass_id==95:table<-check_runtime_dict_key(loop_view.top_decls,table)" not in pass_dispatch:
     raise SystemExit("semantic pass dispatcher no longer invokes the dictionary-key checker")
 
 if compact(function_section(resolver_text, "dict_key_type_unsupported")) != compact('''
@@ -145,7 +145,7 @@ def dict_reported_spelling(declared_spelling: sview) -> sview:
 argument_extractor = compact(function_section(consumer_text, "dict_type_argument_at"))
 require_fragments(argument_extractor, (
     'Expr.IndexN(head,arguments,index_n_line)',
-    'sview("",0,0)returnifident_name_of(head)!="dict"orarguments.count<=position',
+    'returnsview("",0,0)ifident_name_of(head)!="dict"orarguments.count<=position',
     'returnident_name_of(arguments[position])',
     'Expr.Unary(operator,operand,unary_line):returndict_type_argument_at(operand,position)',
     'Expr.Paren(inner,paren_line):returndict_type_argument_at(inner,position)',

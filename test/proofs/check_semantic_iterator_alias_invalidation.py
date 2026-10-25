@@ -24,9 +24,9 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MODULE = ROOT / "src/semantic/iterator_alias_resolution.elisa"
 POLICY = ROOT / "src/semantic/iterator_mutation_policy.elisa"
 CHECKER = ROOT / "src/semantic/check_mutate_while_iterating.elisa"
-CALL_LOWERING = ROOT / "src/backend/codegen_stmt_expr_calls.elisa"
+CALL_LOWERING = ROOT / "src/backend/codegen_stmt_call_expression.elisa"
 SEMANTIC_ROOT = ROOT / "src/semantic/semantic.elisa"
-SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_API = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 POSITIVE = HERE / "semantic_iterator_alias_invalidation.elisa"
 NEGATIVE = HERE / "semantic_iterator_alias_invalidation_rejected.elisa"
 
@@ -317,7 +317,7 @@ for fragment in (
     if fragment not in mutation:
         raise SystemExit(f"production iterator check lost the proved alias-mutator path: {fragment}")
 
-resize_lowering = compact(function_section(CALL_LOWERING.read_text(), "emit_statement_expr_calls"))
+resize_lowering = compact(function_section(CALL_LOWERING.read_text(), "emit_statement_call_expression"))
 resize_start = resize_lowering.find('push_method=="resize"')
 resize_end = resize_lowering.find('push_method=="extend"', resize_start)
 resize_arm = resize_lowering[resize_start:resize_end] if resize_start >= 0 and resize_end > resize_start else ""

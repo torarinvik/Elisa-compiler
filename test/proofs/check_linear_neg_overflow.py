@@ -85,8 +85,9 @@ if "ensureresult.known==(right==0or(right>0andleft<=linear_i64_max()-right)or(ri
         "ensurenotresult.knownimpliesresult.value==0" not in addition:
     raise SystemExit("linear_add_safe no longer exports exact range and fail-closed value contracts")
 multiply = compact(function_section(source_text, "linear_mul_safe"))
+multiply_guard = compact(function_section(source_text, "linear_mul_guard"))
 for fragment in (
-        "ensureresult.known==(",
+        "ensure result == (",
         "left==0orright==0orleft==1orright==1",
         "(left==-1andright!=linear_i64_min())",
         "(right==-1andleft!=linear_i64_min())",
@@ -94,11 +95,17 @@ for fragment in (
         "right>=linear_i64_min()/left",
         "left>=linear_i64_min()/right",
         "left>=linear_i64_max()/right",
-        "ensureresult.knownimpliesresult.value==left*right",
-        "ensurenotresult.knownimpliesresult.value==0",
 ):
-    if fragment not in multiply:
-        raise SystemExit(f"linear_mul_safe lost its exact signed-range contract fragment: {fragment}")
+    if compact(fragment) not in multiply_guard:
+        raise SystemExit(f"linear_mul_guard lost its exact signed-range contract fragment: {fragment}")
+if not all(compact(fragment) in multiply for fragment in (
+        "ensure result.known == linear_mul_guard(left, right)",
+        "ensure result.known implies result.value == left * right",
+        "ensure not result.known implies result.value == 0",
+        "if not linear_mul_guard(left, right): return (false, 0)",
+        "return (true, left * right)",
+)):
+    raise SystemExit("linear_mul_safe no longer checks the proved range guard before multiplying")
 sub_guards = (
     "return(false,0)ifright>0andleft<linear_i64_min()+right",
     "return(false,0)ifright<0andleft>linear_i64_max()+right",

@@ -5,18 +5,20 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from proof_product_gate import require_current_product, source_include_closure
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 SOURCE = ROOT / "src/semantic/check_removed_packed_annotation.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
+SEMANTIC_LATE_CHECKS = ROOT / "src/semantic/semantic_late_checks.elisa"
 PARALLEL_PASSES = ROOT / "src/semantic/semantic_parallel_passes.elisa"
-SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_API = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 POSITIVE = HERE / "removed_packed_annotation.elisa"
 NEGATIVE = HERE / "removed_packed_annotation_rejected.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
@@ -88,13 +90,11 @@ if code_signature(source_text, "check_removed_packed_annotation") != code_signat
 
 proof_text = POSITIVE.read_text()
 expected_policy = """def diagnostic_name(annotation_name: sview) -> sview:
-    ensure result == (
-        when annotation_name:
-            "packed_abi" -> PACKED_ABI_DIAGNOSTIC_NAME
-            "packed_prefix" -> PACKED_PREFIX_DIAGNOSTIC_NAME
-            "c_bind_prefix" -> CBIND_PREFIX_DIAGNOSTIC_NAME
-            _ -> ""
-    )
+    ensure when annotation_name:
+        "packed_abi" -> result == (PACKED_ABI_DIAGNOSTIC_NAME)
+        "packed_prefix" -> result == (PACKED_PREFIX_DIAGNOSTIC_NAME)
+        "c_bind_prefix" -> result == (CBIND_PREFIX_DIAGNOSTIC_NAME)
+        _ -> result == ("")
     return when annotation_name:
         "packed_abi" -> PACKED_ABI_DIAGNOSTIC_NAME
         "packed_prefix" -> PACKED_PREFIX_DIAGNOSTIC_NAME
@@ -102,13 +102,11 @@ expected_policy = """def diagnostic_name(annotation_name: sview) -> sview:
         _ -> ""
 """
 expected_mapping_theorem = """def source_removed_annotation_mapping_is_exact(annotation_name: sview) -> sview:
-    ensure result == (
-        when annotation_name:
-            "packed_abi" -> RemovedPackedAnnotationSpecification::PACKED_ABI_DIAGNOSTIC_NAME
-            "packed_prefix" -> RemovedPackedAnnotationSpecification::PACKED_PREFIX_DIAGNOSTIC_NAME
-            "c_bind_prefix" -> RemovedPackedAnnotationSpecification::CBIND_PREFIX_DIAGNOSTIC_NAME
-            _ -> ""
-    )
+    ensure when annotation_name:
+        "packed_abi" -> result == (RemovedPackedAnnotationSpecification::PACKED_ABI_DIAGNOSTIC_NAME)
+        "packed_prefix" -> result == (RemovedPackedAnnotationSpecification::PACKED_PREFIX_DIAGNOSTIC_NAME)
+        "c_bind_prefix" -> result == (RemovedPackedAnnotationSpecification::CBIND_PREFIX_DIAGNOSTIC_NAME)
+        _ -> result == ("")
     return RemovedPackedAnnotationSpecification::diagnostic_name(annotation_name)
 """
 if code_signature(proof_text, "diagnostic_name") != code_signature(expected_policy, "diagnostic_name"):
@@ -128,13 +126,15 @@ for annotation_name, diagnostic_name in annotation_pairs:
         raise SystemExit(f"production pass no longer emits {diagnostic_name} exactly once")
 if compact(source_text).count("name:annotation.owner,line:annotation.line") != len(annotation_pairs):
     raise SystemExit("removed packed-annotation diagnostics no longer identify the source annotation owner and line")
-if 'include "./check_removed_packed_annotation.elisa"' not in SEMANTIC.read_text():
-    raise SystemExit("semantic root no longer includes the removed packed-annotation pass")
+if 'include "./semantic_late_checks.elisa"' not in SEMANTIC.read_text():
+    raise SystemExit("semantic root no longer includes the late semantic checks")
+if 'include "./check_removed_packed_annotation.elisa"' not in SEMANTIC_LATE_CHECKS.read_text():
+    raise SystemExit("late semantic checks no longer include the removed packed-annotation pass")
 parallel = compact(PARALLEL_PASSES.read_text())
 if f"ifpass_id=={REMOVED_PACKED_PASS_ID}:table<-check_removed_packed_annotation(loop_view,table)" not in parallel:
     raise SystemExit("parallel semantic dispatch no longer calls the proved removed packed-annotation pass")
 pipeline = compact(SEMANTIC_API.read_text())
-if f"par_pass_run(file,&loop_view,flags,table,shared_pool,{REMOVED_PACKED_BATCH_START},{REMOVED_PACKED_BATCH_SIZE})" not in pipeline:
+if f"par_pass_run(file,flags,table,shared_pool,loop_view,{REMOVED_PACKED_BATCH_START},{REMOVED_PACKED_BATCH_SIZE})" not in pipeline:
     raise SystemExit("semantic pipeline no longer schedules the removed packed-annotation pass")
 
 mutations = (
@@ -169,6 +169,10 @@ for annotation_name, diagnostic_name in annotation_pairs:
 if 'include "./removed_packed_annotation.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer exercise the admitted annotation classifier")
 
+if "--source-only" in sys.argv[1:]:
+    print(json.dumps({"admitted": True, "source_only": True}, sort_keys=True))
+    raise SystemExit(0)
+
 try:
     product = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
@@ -180,7 +184,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    SOURCE, SEMANTIC, PARALLEL_PASSES, SEMANTIC_API, POSITIVE, NEGATIVE,
+    SOURCE, SEMANTIC, SEMANTIC_LATE_CHECKS, PARALLEL_PASSES, SEMANTIC_API, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

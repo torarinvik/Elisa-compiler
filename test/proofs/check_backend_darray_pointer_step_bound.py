@@ -13,7 +13,7 @@ args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not args.source_only)
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
-LOWERING = ROOT / "src/backend/codegen_stmt_for_shapes.elisa"
+LOWERING = ROOT / "src/backend/codegen_stmt_for_shapes_iterable.elisa"
 PROOF = ROOT / "test/proofs/backend_darray_pointer_step_bound.elisa"
 REJECTED = ROOT / "test/proofs/backend_darray_pointer_step_bound_rejected.elisa"
 source = "".join(LOWERING.read_text().split())

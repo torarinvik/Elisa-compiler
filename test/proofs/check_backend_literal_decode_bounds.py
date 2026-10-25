@@ -46,8 +46,8 @@ FUNCTION_SHA256 = {
     "hex_escape_value": "d9b1e1e760583153fd1d95a08394c45db8c6d70466c227db4006d1bfddfd42ac",
     "utf16_surrogate_pair_codepoint": "6fe1cf69636c6389de24bbd7d0c07093d8e0f8f40197c287ca9f6090568e4eef",
     "decode_string_escapes": "3a110cd17a2d90bd3291074dfed345436673228dbcd961e3feaca341376af7e0",
-    "decoded_literal_byte_count": "6044656473cebeea9520d7767e1c30fac9197d5491ba5ff2e0de2f50ffc6f9ab",
-    "string_pattern_content_cstr": "e478082e1381286ea6a815ab6b94021ad55e9390800c2190e04b833b5bf78d7a",
+    "decoded_literal_byte_count": "5b2ba850def309cb02f1f9628a2683aebe19a8af87c1424cafdbacc29e097a47",
+    "string_pattern_content_cstr": "1d8a0eb2877fb9d64780ff3a04c8a6b3a62914e71954e9808486852de297a25a",
 }
 
 
@@ -259,6 +259,10 @@ ordered_steps(source_text, "string_pattern_content_cstr", (
     "start: usize = 1 if quoted else 0",
     "stop: usize = length - 1 if quoted else length",
     "inner: sview = text[start:stop]",
+    "escapes_known: mutable bool = true",
+    "decode_string_escapes(inner, storage, escapes_known)",
+    "return null if not escapes_known",
+    "storage.push(0)",
 ), "string pattern span")
 
 for function_name in ("decode_string_escapes", "decoded_literal_byte_count"):

@@ -1,6 +1,7 @@
 """Admit the proof of fallible-callee owner precedence and fallback shielding."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -10,11 +11,15 @@ import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
+
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof"))
 SOURCE = ROOT / "src/backend/codegen_error_callee_facts.elisa"
 POSITIVE = HERE / "backend_error_callee_resolution.elisa"
 NEGATIVE = HERE / "backend_error_callee_resolution_rejected.elisa"
@@ -74,9 +79,9 @@ def declarations(path: Path) -> set[str]:
 source_text = SOURCE.read_text()
 owner_body = compact(function_section(source_text, "error_callee_owner"))
 ordered_source_shapes = (
-    'owner_hintreturnifowner_hint!=""andfunction_is_declared(fns,owner_hint,name)',
-    'structs.visibility.current_ownerreturnifstructs.visibility.current_owner!=""andfunction_is_declared(fns,structs.visibility.current_owner,name)',
-    '""returniffunction_is_declared(fns,"",name)',
+    'returnowner_hintifowner_hint!=""andfunction_is_declared(fns,owner_hint,name)',
+    'returnstructs.visibility.current_ownerifstructs.visibility.current_owner!=""andfunction_is_declared(fns,structs.visibility.current_owner,name)',
+    'return""iffunction_is_declared(fns,"",name)',
     'unique_owner:mutablesview=""',
     'owner_hits:mutablei64=0',
     'owner_index_cursor:mutablei64=first_function_named(fns,name)',
@@ -100,6 +105,11 @@ for name, shape in POSITIVE_SHAPES.items():
 if 'include "./backend_error_callee_resolution.elisa"' not in NEGATIVE.read_text():
     raise SystemExit("negative controls no longer include the positive owner-resolution proof")
 
+if args.source_only:
+    print(json.dumps({"source_bound": True, "owner_precedence_shapes": len(ordered_source_shapes)}))
+    raise SystemExit(0)
+
+BIN = BIN.resolve(strict=True)
 try:
     product = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:

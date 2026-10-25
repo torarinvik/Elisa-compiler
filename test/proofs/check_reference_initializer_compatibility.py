@@ -26,6 +26,7 @@ POLICY = ROOT / "src/semantic/reference_initializer_compatibility.elisa"
 UNIQUE_POLICY = ROOT / "src/semantic/reference_initializer_typestate_unique.elisa"
 INITIALIZERS = ROOT / "src/semantic/resolve_types_initializers.elisa"
 SEMANTIC_TYPES = ROOT / "src/semantic/semantic_types.elisa"
+SYMBOL_TABLE_SOURCE = ROOT / "src/semantic/semantic_types_symbol_table.elisa"
 POSITIVE = HERE / "reference_initializer_compatibility.elisa"
 NEGATIVE = HERE / "reference_initializer_compatibility_rejected.elisa"
 
@@ -253,7 +254,7 @@ expected_table_fields = {
     "typestate_struct_names": "mutabledarray[sview@source]",
 }
 for field, expected in expected_table_fields.items():
-    if struct_fields(actual_semantic_types, "SymbolTable").get(field) != expected or \
+    if struct_fields(SYMBOL_TABLE_SOURCE.read_text(), "SymbolTable").get(field) != expected or \
             struct_fields(proof_projection, "SymbolTable").get(field) != expected:
         raise SystemExit(f"SymbolTable.{field} proof projection differs from production")
 if enum_variants(actual_semantic_types, "SymbolKind") != enum_variants(proof_projection, "SymbolKind"):
@@ -334,7 +335,9 @@ for fragment in (
     "assert registered == typestate_name_member_prefix(table, name, table.typestate_struct_names.count)",
     "assert declarations == matching_struct_count_class_prefix(table, name, table.symbols.count)",
     "assert registered == typestate_name_member_prefix(table, name, table.typestate_struct_names.count)",
-    "return declarations == 1 and registered",
+    "answer: bool = declarations == 1 and registered",
+    "assert answer == unique_named_typestate_struct_spec(table, name)",
+    "return answer",
 ):
     if compact(fragment) not in unique_impl:
         raise SystemExit(f"production uniqueness scan lost its proved loop invariant or result: {fragment}")
@@ -405,7 +408,7 @@ manifest_checksum = MANIFEST.with_name(MANIFEST.name + ".sha256")
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, manifest_checksum, PROVER / "ELISA_COMPILER_REV", compiler_executable,
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POLICY, UNIQUE_POLICY, INITIALIZERS, SEMANTIC_TYPES, POSITIVE, NEGATIVE, *closure,
+    POLICY, UNIQUE_POLICY, INITIALIZERS, SEMANTIC_TYPES, SYMBOL_TABLE_SOURCE, POSITIVE, NEGATIVE, *closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

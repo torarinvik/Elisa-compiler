@@ -232,21 +232,238 @@ extend Parser:
 
 
 
-        def header_error_family(parser: Parser&) -> sview:
+        # Scan a callable header's top-level error clauses. An error set written after
+        # a returned function type belongs to that function type; the enclosing callable's
+        # own set, when present, follows the returned type's callable clauses. Count the
+        # top-level function-type arrows and select the final error set after those nested
+        # clauses. Parameter function types are nested in the declaration's parameter
+        # parentheses and are therefore excluded.
+        def header_error_family_at(parser: Parser&, start: usize) -> (family: sview, occurrence_offset: u32):
             can Abort.Panic:
-                machine over parser.position:
-                    state Scan(index: usize)
-                    start Scan(0)
+                parenthesis_depth: mutable u32 = 0
+                bracket_depth: mutable u32 = 0
+                method_return_arrow_seen: mutable bool = false
+                returned_function_arrows: mutable u32 = 0
+                top_level_error_sets: mutable u32 = 0
+                selected_family: mutable sview = ""
+                selected_occurrence: mutable u32 = 0
+                scan: mutable usize = start
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, scan, parenthesis_depth, bracket_depth, method_return_arrow_seen, returned_function_arrows, top_level_error_sets, selected_family, selected_occurrence|:
+                    kind: TokenKind = parser.peek_at(scan)
+                    at_type_level: bool = parenthesis_depth == 0 and bracket_depth == 0
+                    break if at_type_level and (kind == TokenKind.Colon or kind == TokenKind.Assign)
+                    if at_type_level and kind == TokenKind.Arrow:
+                        if method_return_arrow_seen:
+                            returned_function_arrows <- returned_function_arrows + 1
+                        else:
+                            method_return_arrow_seen <- true
+                    clause_word: sview = Lexer::text_or_empty(parser.tokens[parser.position + scan], parser.source, parser.source_length) if at_type_level and kind == TokenKind.Ident else ""
+                    # A returned function's `can[...]` belongs to that nested callable,
+                    # and its own `error[...]` may follow it before the enclosing set.
+                    # Keep scanning through the effect bracket; the return-type parser's
+                    # error occurrence count below distinguishes the nested and outer rows.
+                    break if at_type_level and (clause_word == "requires" or clause_word == "require" or clause_word == "ensures" or clause_word == "ensure" or clause_word == "changes" or clause_word == "preserves" or clause_word == "decreases" or clause_word == "invariant" or clause_word == "uses" or clause_word == "where" or clause_word == "at" or clause_word == "abi")
+                    is_error_set: bool = at_type_level and kind == TokenKind.Error and parser.peek_at(scan + 1) == TokenKind.LBracket and parser.peek_at(scan + 2) == TokenKind.Ident
+                    if is_error_set:
+                        top_level_error_sets <- top_level_error_sets + 1
+                        selected_family <- parser.header_error_family_tail(scan + 2, 0)
+                        selected_occurrence <- parser.tokens[parser.position + scan].start
+                    parenthesis_depth <- parenthesis_depth + 1 if kind == TokenKind.LParen
+                    parenthesis_depth <- parenthesis_depth - 1 if kind == TokenKind.RParen and parenthesis_depth > 0
+                    bracket_depth <- bracket_depth + 1 if kind == TokenKind.LBracket
+                    bracket_depth <- bracket_depth - 1 if kind == TokenKind.RBracket and bracket_depth > 0
+                    scan <- scan + 1.usize()
+                return (selected_family, selected_occurrence) if top_level_error_sets > returned_function_arrows
+                return ("", 0)
 
-                    Scan(index), _ if parser.peek_at(index) == TokenKind.Error and parser.peek_at(index + 1) == TokenKind.LBracket and parser.peek_at(index + 2) == TokenKind.Ident:
-                        return parser.header_error_family_tail(index + 2, 0)
 
-                    Scan(index), _ if parser.peek_at(index) == TokenKind.Newline or parser.peek_at(index) == TokenKind.Eof:
-                        return ""
 
-                    Scan(index), _:
-                        -> Scan(index + 1)
-                return ""
+        def header_error_family(parser: Parser&) -> (family: sview, occurrence_offset: u32):
+            return parser.header_error_family_at(0)
+
+
+
+        # Core stores qualified error-set names in dotted form, with aliases left as
+        # written. Build that exact sort key from identifier tokens so source trivia
+        # around `::` cannot change the backend's ABI family order.
+        def header_error_family_order_key(parser: Parser&, start_scan: usize, end_scan: usize) -> sview @source:
+            can Abort.Panic, Memory.Allocate:
+                bytes: mutable darray[u8] = []
+                has_segment: mutable bool = false
+                for index in start_scan..<(end_scan + 1.usize()) |bytes, has_segment, parser|:
+                    continue if parser.peek_at(index) != TokenKind.Ident
+                    bytes.push(46) if has_segment
+                    token: Token = parser.tokens[parser.position + index]
+                    segment: sview = Lexer::text_or_empty(token, parser.source, parser.source_length)
+                    for byte_index in 0..<segment.len |bytes, segment|:
+                        bytes.push(segment[byte_index])
+                    has_segment <- true
+                return persist_name_bytes(&bytes, 0) can Global{Read,Write}
+
+
+
+        # Protocol method signatures do not become ordinary Decl.Func nodes, so their
+        # parameter function types are not visited by capture_header_error_families.
+        # Capture their ordinary family/path rows and both brace- and dot-selected subsets;
+        # the protocol method's own return occurrence is handled by its protocol rows.
+        def capture_protocol_callback_error_sets_at(parser: lmut Parser, function_line: u32, function_offset: u32, start: usize, excluded_occurrence: u32, identity_id: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                inside_error_set: mutable bool = false
+                error_set_bracket_depth: mutable u32 = 0
+                error_set_brace_depth: mutable u32 = 0
+                error_set_occurrence_offset: mutable u32 = 0
+                error_family_path_start: mutable usize = 0.usize()
+                error_family_path_start_token: mutable usize = 0.usize()
+                inside_variant_set: mutable bool = false
+                restricted_family: mutable sview = ""
+                restricted_family_has_variant: mutable bool = false
+                dot_variant_family: mutable sview = ""
+                scan: mutable usize = start
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, scan, inside_error_set, error_set_bracket_depth, error_set_brace_depth, error_set_occurrence_offset, error_family_path_start, error_family_path_start_token, inside_variant_set, restricted_family, restricted_family_has_variant, dot_variant_family|:
+                    kind: TokenKind = parser.peek_at(scan)
+                    token: Token = parser.tokens[parser.position + scan]
+                    starts_error_set: bool = kind == TokenKind.Error and parser.peek_at(scan + 1) == TokenKind.LBracket
+                    if starts_error_set:
+                        inside_error_set <- true
+                        error_set_bracket_depth <- 0
+                        error_set_brace_depth <- 0
+                        error_set_occurrence_offset <- token.start
+                        error_family_path_start <- 0.usize()
+                        error_family_path_start_token <- 0.usize()
+                        inside_variant_set <- false
+                        restricted_family <- ""
+                        restricted_family_has_variant <- false
+                        dot_variant_family <- ""
+                    previous_kind: TokenKind = parser.peek_at(scan - 1) if scan > 0 else TokenKind.Eof
+                    error_family_path_start <- token.start.usize() if inside_error_set and error_set_brace_depth == 0 and kind == TokenKind.Ident and (previous_kind == TokenKind.LBracket or previous_kind == TokenKind.Comma)
+                    error_family_path_start_token <- scan if inside_error_set and error_set_brace_depth == 0 and kind == TokenKind.Ident and (previous_kind == TokenKind.LBracket or previous_kind == TokenKind.Comma)
+                    path_head: bool = parser.peek_at(scan + 1) == TokenKind.Scope
+                    family: bool = inside_error_set and error_set_brace_depth == 0 and kind == TokenKind.Ident and (previous_kind == TokenKind.LBracket or previous_kind == TokenKind.Comma or previous_kind == TokenKind.Scope) and not path_head
+                    if family and error_set_occurrence_offset != excluded_occurrence:
+                        family_name: sview = Lexer::text_or_empty(token, parser.source, parser.source_length)
+                        family_path: sview @source = parser.span_view(error_family_path_start, token.start.usize() + token.length.usize())
+                        family_order_key: sview @source = parser.header_error_family_order_key(error_family_path_start_token, scan) can Global{Read,Write}
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_family", name: family_name, line: function_line, offset: function_offset, module: parser.current_module, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset, family_order_key: family_order_key})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_family_path", name: family_path, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        restricted_family <- family_name if parser.peek_at(scan + 1) == TokenKind.LBrace
+                        dot_variant_family <- family_name if parser.peek_at(scan + 1) == TokenKind.Dot
+                    if family and error_set_occurrence_offset != excluded_occurrence and parser.peek_at(scan + 1) == TokenKind.LBrace:
+                        restricted_family_has_variant <- false
+                    if inside_error_set and error_set_occurrence_offset != excluded_occurrence and dot_variant_family != "" and kind == TokenKind.Ident and previous_kind == TokenKind.Dot:
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: dot_variant_family, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_allow", name: Lexer::text_or_empty(token, parser.source, parser.source_length), line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        dot_variant_family <- ""
+                    if inside_error_set and kind == TokenKind.LBrace and restricted_family != "":
+                        inside_variant_set <- true
+                        restricted_family_has_variant <- false
+                    if inside_variant_set and error_set_occurrence_offset != excluded_occurrence and kind == TokenKind.Ident and (previous_kind == TokenKind.LBrace or previous_kind == TokenKind.Comma):
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: restricted_family, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_allow", name: Lexer::text_or_empty(token, parser.source, parser.source_length), line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        restricted_family_has_variant <- true
+                    error_set_brace_depth <- error_set_brace_depth + 1 if inside_error_set and kind == TokenKind.LBrace
+                    if inside_error_set and kind == TokenKind.RBrace and error_set_brace_depth > 0:
+                        error_set_brace_depth <- error_set_brace_depth - 1
+                        if error_set_brace_depth == 0:
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: restricted_family, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset}) if inside_variant_set and not restricted_family_has_variant and error_set_occurrence_offset != excluded_occurrence
+                            inside_variant_set <- false
+                            restricted_family <- ""
+                            restricted_family_has_variant <- false
+                    if inside_error_set and kind == TokenKind.LBracket and previous_kind != TokenKind.Error:
+                        error_set_bracket_depth <- error_set_bracket_depth + 1
+                    if inside_error_set and kind == TokenKind.RBracket:
+                        if error_set_bracket_depth > 0:
+                            error_set_bracket_depth <- error_set_bracket_depth - 1
+                        else:
+                            inside_error_set <- false
+                            dot_variant_family <- ""
+                    scan <- scan + 1.usize()
+
+
+
+        # `error[]` has no family or subset marker for the header scanners to retain.
+        # Also preserve `Family{}` groups globally: header scanners capture their own rows,
+        # but ordinary field and local type positions have no declaration-header callback.
+        def empty_error_subset_count(parser: Parser&, error_index: usize) -> usize can[Abort.Panic]:
+            can Abort.Panic:
+                count: mutable usize = 0
+                scan: mutable usize = error_index + 2.usize()
+                brace_depth: mutable u32 = 0
+                previous_kind: mutable TokenKind = TokenKind.LBracket
+                while scan < parser.tokens.count |count, scan, brace_depth, previous_kind, parser|:
+                    kind: TokenKind = parser.scan_token_kind(scan)
+                    break if kind == TokenKind.Eof
+                    if kind == TokenKind.RBracket and brace_depth == 0:
+                        return count
+                    if kind == TokenKind.LBrace:
+                        empty_end: mutable usize = scan + 1.usize()
+                        while empty_end < parser.tokens.count |empty_end, parser|:
+                            layout_kind: TokenKind = parser.scan_token_kind(empty_end)
+                            break if layout_kind != TokenKind.Newline and layout_kind != TokenKind.Indent and layout_kind != TokenKind.Dedent
+                            empty_end <- empty_end + 1.usize()
+                        empty_group: bool = empty_end < parser.tokens.count and parser.scan_token_kind(empty_end) == TokenKind.RBrace
+                        count <- count + 1.usize() if brace_depth == 0 and previous_kind == TokenKind.Ident and empty_group
+                        brace_depth <- brace_depth + 1
+                    elif kind == TokenKind.RBrace and brace_depth > 0:
+                        brace_depth <- brace_depth - 1
+                    previous_kind <- kind if kind != TokenKind.Newline and kind != TokenKind.Indent and kind != TokenKind.Dedent
+                    scan <- scan + 1.usize()
+                return count
+
+
+
+        def captured_empty_error_subset_count(parser: Parser&, occurrence_offset: u32) -> usize can[Abort.Panic]:
+            count: mutable usize = 0
+            for index in 0..<parser.enum_annotations.count |parser, occurrence_offset|:
+                annotation: Ast::EnumAnnotation = parser.enum_annotations[index]
+                if annotation.owner == "__error_variant_family" and annotation.occurrence_offset == occurrence_offset:
+                    has_allow_row: mutable bool = false
+                    if index + 1.usize() < parser.enum_annotations.count:
+                        next: Ast::EnumAnnotation = parser.enum_annotations[index + 1.usize()]
+                        has_allow_row <- next.owner == "__error_variant_allow" and next.line == annotation.line and next.offset == annotation.offset and next.identity_id == annotation.identity_id and next.occurrence_offset == annotation.occurrence_offset
+                    count <- count + 1.usize() if not has_allow_row
+                elif annotation.owner == "__protocol_error_variant_family" and annotation.line == 3900000146 and annotation.occurrence_offset == occurrence_offset:
+                    has_allow_row: mutable bool = false
+                    if index + 1.usize() < parser.enum_annotations.count:
+                        next: Ast::EnumAnnotation = parser.enum_annotations[index + 1.usize()]
+                        has_allow_row <- next.owner == annotation.name and next.line == 3900000147 and next.module == annotation.module and next.offset == annotation.offset and next.occurrence_offset == annotation.occurrence_offset
+                    count <- count + 1.usize() if not has_allow_row
+            return count
+
+
+
+        # `error[]` has no family or subset marker for the header scanners to retain.
+        # Record it globally so semantic validation can match Stage0's zero-tag error in
+        # every type position, including nested function types and protocol signatures.
+        def record_missing_empty_error_subset_rows(parser: lmut Parser, error_token: Token, missing_count: usize) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for missing_index in 0..<missing_count |parser, error_token|:
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__empty_error_set", name: "", line: error_token.line, offset: error_token.start, occurrence_offset: error_token.start})
+
+        def scan_empty_error_set_syntax(parser: lmut Parser) -> void:
+            can Memory.Allocate, Abort.Panic:
+                machine over parser.tokens for index in 0..<parser.tokens.count:
+                    state Scan
+                    start Scan
+
+                    Scan, _ if index + 2 >= parser.tokens.count:
+                        -> Scan
+
+                    Scan, _ if parser.scan_token_kind(index) == TokenKind.Error and parser.scan_token_kind(index + 1) == TokenKind.LBracket and parser.scan_token_kind(index + 2) == TokenKind.RBracket:
+                        error_token: Token = parser.tokens[index]
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__empty_error_set", name: "", line: error_token.line, offset: error_token.start, occurrence_offset: error_token.start})
+                        -> Scan
+
+                    Scan, _ if parser.scan_token_kind(index) == TokenKind.Error and parser.scan_token_kind(index + 1) == TokenKind.LBracket:
+                        error_token: Token = parser.tokens[index]
+                        subset_count: usize = parser.empty_error_subset_count(index)
+                        captured_count: usize = parser.captured_empty_error_subset_count(error_token.start)
+                        missing_count: usize = subset_count - captured_count if subset_count > captured_count else 0.usize()
+                        if missing_count > 0:
+                            parser <- parser.record_missing_empty_error_subset_rows(error_token, missing_count)
+                        -> Scan
+
+                    Scan, _:
+                        -> Scan
 
 
 
@@ -259,7 +476,9 @@ extend Parser:
                 error_set_bracket_depth: mutable u32 = 0
                 error_set_brace_depth: mutable u32 = 0
                 error_set_key_start: mutable usize = 0
+                error_set_occurrence_offset: mutable u32 = 0
                 error_family_path_start: mutable usize = 0
+                error_family_path_start_token: mutable usize = 0
                 complex_error_set: mutable bool = false
                 # `{...}` after a family (`error[FooError{Bad1}]`) restricts the allowed
                 # variant subset; capture the family (__error_variant_family) and each allowed
@@ -267,8 +486,10 @@ extend Parser:
                 # variant of that family can be rejected.
                 inside_variant_set: mutable bool = false
                 restricted_family: mutable sview = ""
+                restricted_family_has_variant: mutable bool = false
+                dot_variant_family: mutable sview = ""
                 scan: mutable usize = 0
-                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, scan, inside_error_set, inside_variant_set, restricted_family|:
+                while parser.peek_at(scan) != TokenKind.Newline and parser.peek_at(scan) != TokenKind.Eof |parser, scan, inside_error_set, inside_variant_set, restricted_family, restricted_family_has_variant, dot_variant_family, error_family_path_start_token|:
                     kind: TokenKind = parser.peek_at(scan)
                     starts_error_set: bool = kind == TokenKind.Error and parser.peek_at(scan + 1) == TokenKind.LBracket
                     if starts_error_set:
@@ -277,7 +498,11 @@ extend Parser:
                         error_set_brace_depth <- 0
                         complex_error_set <- false
                         error_set_key_start <- parser.tokens[parser.position + scan + 2].start.usize() if parser.peek_at(scan + 2) != TokenKind.Eof
+                        error_family_path_start <- 0.usize()
+                        error_family_path_start_token <- 0.usize()
+                        dot_variant_family <- ""
                     token: Token = parser.tokens[parser.position + scan]
+                    error_set_occurrence_offset <- token.start if starts_error_set
                     previous_kind: TokenKind = parser.peek_at(scan - 1) if scan > 0 else TokenKind.Eof
                     # The family is the LAST segment of a `::` path, not the first.
                     # `error[Backend::SceneError]` names SceneError; recording the token
@@ -289,25 +514,48 @@ extend Parser:
                     # preceded by `::` is the tail, so it is taken.
                     path_head: bool = parser.peek_at(scan + 1) == TokenKind.Scope
                     error_family_path_start <- token.start.usize() if inside_error_set and not inside_variant_set and kind == TokenKind.Ident and (previous_kind == TokenKind.LBracket or previous_kind == TokenKind.Comma)
+                    error_family_path_start_token <- scan if inside_error_set and not inside_variant_set and kind == TokenKind.Ident and (previous_kind == TokenKind.LBracket or previous_kind == TokenKind.Comma)
                     family: bool = inside_error_set and not inside_variant_set and kind == TokenKind.Ident and (previous_kind == TokenKind.LBracket or previous_kind == TokenKind.Comma or previous_kind == TokenKind.Scope) and not path_head
-                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_family", name: Lexer::text_or_empty(token, parser.source, parser.source_length), line: function_line, offset: function_offset, identity_id: identity_id}) if family
-                    family_path: sview @source = parser.span_view(error_family_path_start, token.start.usize() + token.length.usize()) if family else ""
-                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_family_path", name: family_path, line: function_line, offset: function_offset, identity_id: identity_id}) if family
+                    family_path: mutable sview @source = ""
+                    family_order_key: mutable sview @source = ""
+                    if family:
+                        family_path <- parser.span_view(error_family_path_start, token.start.usize() + token.length.usize())
+                        family_order_key <- parser.header_error_family_order_key(error_family_path_start_token, scan) can Global{Read,Write}
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_family", name: Lexer::text_or_empty(token, parser.source, parser.source_length), line: function_line, offset: function_offset, module: parser.current_module, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset, family_order_key: family_order_key}) if family
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_family_path", name: family_path, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset}) if family
+                    dot_variant_family <- Lexer::text_or_empty(token, parser.source, parser.source_length) if family and parser.peek_at(scan + 1) == TokenKind.Dot
                     # Entering a `{` right after a family opens its variant-restriction set.
-                    restricted_family <- Lexer::text_or_empty(token, parser.source, parser.source_length) if family and parser.peek_at(scan + 1) == TokenKind.LBrace
-                    inside_variant_set <- true if kind == TokenKind.LBrace and restricted_family != ""
+                    if family and parser.peek_at(scan + 1) == TokenKind.LBrace:
+                        restricted_family <- Lexer::text_or_empty(token, parser.source, parser.source_length)
+                        restricted_family_has_variant <- false
+                    if kind == TokenKind.LBrace and restricted_family != "":
+                        inside_variant_set <- true
+                        restricted_family_has_variant <- false
+                    if inside_error_set and not inside_variant_set and dot_variant_family != "" and kind == TokenKind.Ident and previous_kind == TokenKind.Dot:
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: dot_variant_family, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_allow", name: Lexer::text_or_empty(token, parser.source, parser.source_length), line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        dot_variant_family <- ""
                     if inside_variant_set and kind == TokenKind.Ident and (previous_kind == TokenKind.LBrace or previous_kind == TokenKind.Comma):
-                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: restricted_family, line: function_line, offset: function_offset, identity_id: identity_id})
-                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_allow", name: Lexer::text_or_empty(token, parser.source, parser.source_length), line: function_line, offset: function_offset, identity_id: identity_id})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: restricted_family, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_allow", name: Lexer::text_or_empty(token, parser.source, parser.source_length), line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                        restricted_family_has_variant <- true
                     if inside_error_set and kind == TokenKind.Comma and error_set_brace_depth == 0:
+                        complex_error_set <- true
+                    if inside_error_set and kind == TokenKind.Dot and error_set_brace_depth == 0:
                         complex_error_set <- true
                     if inside_error_set and kind == TokenKind.LBrace:
                         complex_error_set <- true if error_set_brace_depth == 0
                         error_set_brace_depth <- error_set_brace_depth + 1
                     if inside_error_set and kind == TokenKind.RBrace:
                         error_set_brace_depth <- error_set_brace_depth - 1 if error_set_brace_depth > 0
-                        inside_variant_set <- false
-                        restricted_family <- ""
+                        if error_set_brace_depth == 0:
+                            # Preserve the explicitly empty brace group for recovery and
+                            # semantic diagnostics. Its marker has no allow rows, so consumers
+                            # can distinguish it from a signature with no subset restriction.
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_variant_family", name: restricted_family, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset}) if inside_variant_set and not restricted_family_has_variant
+                            inside_variant_set <- false
+                            restricted_family <- ""
+                            restricted_family_has_variant <- false
                     if inside_error_set and kind == TokenKind.LBracket and previous_kind != TokenKind.Error:
                         error_set_bracket_depth <- error_set_bracket_depth + 1
                     if inside_error_set and kind == TokenKind.RBracket:
@@ -315,7 +563,8 @@ extend Parser:
                             error_set_bracket_depth <- error_set_bracket_depth - 1
                         elif error_set_brace_depth == 0:
                             if complex_error_set:
-                                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_key", name: parser.span_view(error_set_key_start, token.start.usize()), line: function_line, offset: function_offset})
-                                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_module", name: parser.current_module, line: function_line, offset: function_offset})
+                                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_key", name: parser.span_view(error_set_key_start, token.start.usize()), line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
+                                parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__error_set_module", name: parser.current_module, line: function_line, offset: function_offset, identity_id: identity_id, occurrence_offset: error_set_occurrence_offset})
                             inside_error_set <- false
+                            dot_variant_family <- ""
                     scan <- scan + 1

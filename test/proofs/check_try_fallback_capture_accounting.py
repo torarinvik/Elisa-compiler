@@ -5,7 +5,9 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "src/semantic/check_try_fallible.elisa"
+# The recursive fallback walks were split into this module; keep the capture audit
+# attached to the implementation file instead of the facade that includes it.
+SOURCE = ROOT / "src/semantic/check_try_fallible/fallback_casts.elisa"
 text = SOURCE.read_text(encoding="utf-8")
 
 # Annotation arrays are read-only references. docs/119 E10 permits only

@@ -19,6 +19,7 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POLICY = ROOT / "src/semantic/index_type_application_policy.elisa"
 RESOLVER = ROOT / "src/semantic/resolve_expr_walk.elisa"
+RESOLVER_CONTEXT = ROOT / "src/semantic/resolve_expr_walk_context.elisa"
 POSITIVE = HERE / "index_type_application_policy.elisa"
 NEGATIVE = HERE / "index_type_application_policy_rejected.elisa"
 
@@ -36,12 +37,12 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -99,7 +100,7 @@ if compact(function_section(resolver_text, "index_receiver_is_type_application")
     raise SystemExit("resolver's syntactic field classifier no longer delegates to the proved policy")
 
 semantic_classifier = compact(function_section(resolver_text, "index_receiver_is_semantic_type_application"))
-if "truereturnifindex_receiver_is_type_application(object)" not in semantic_classifier:
+if "returntrueifindex_receiver_is_type_application(object)" not in semantic_classifier:
     raise SystemExit("semantic type-application classification must retain the proved field-operator case")
 identifier_arm = between(semantic_classifier, "Expr.Ident(base_name,base_line):", "Expr.Scope(")
 candidate_call = compact('''
@@ -117,21 +118,21 @@ if compact("if table.symbol_name_index_valid and table.symbol_name_indexed_rows 
         compact("row <- table.symbol_name_next[row.usize()]") not in identifier_arm or \
         compact("else: for symbol in table.symbols:") not in identifier_arm:
     raise SystemExit("candidate predicate must remain connected to both collision-chain and canonical scans")
-walk = compact(function_section(resolver_text, "walk_expression_inner"))
+walk = compact(function_section(RESOLVER_CONTEXT.read_text(), "walk_expression_inner_with_context"))
 index_arm = between(walk, "Expr.Index(object,index,line):", "Expr.Binary(left,operator,right,line):")
 index_n_arm = between(walk, "Expr.IndexN(object,arguments,line):", "Expr.SetLit(elements,line):")
 common_index_fragments = (
-    "table<-walk_expression(object,table,bound,bound_mutability,bound_ids)canGlobal{Read,Write}",
+    "table<-walk_expression_with_context(object,table,bound,bound_mutability,bound_ids,lookup_session,lookup_context)canGlobal{Read,Write}",
     "table<-check_non_generic_specialization(object,line.line,table,bound)",
 )
 for fragment in common_index_fragments:
     if fragment not in index_arm or fragment not in index_n_arm:
         raise SystemExit("both index forms must resolve their receiver and retain specialization diagnostics")
-if "table<-walk_expression(index,table,bound,bound_mutability,bound_ids)canGlobal{Read,Write}ifnotindex_receiver_is_semantic_type_application(object,table,bound)" not in index_arm:
+if "table<-walk_expression_with_context(index,table,bound,bound_mutability,bound_ids,lookup_session,lookup_context)canGlobal{Read,Write}ifnotindex_receiver_is_semantic_type_application(object,table,bound)" not in index_arm:
     raise SystemExit("single-index value arguments must be suppressed for semantic type applications")
 for fragment in (
-    "forargumentinarguments|table|->table:",
-    "table<-walk_expression(argument,table,bound,bound_mutability,bound_ids)canGlobal{Read,Write}ifnotindex_receiver_is_semantic_type_application(object,table,bound)",
+    "forargumentinarguments|table,lookup_context,lookup_session|->table:",
+    "table<-walk_expression_with_context(argument,table,bound,bound_mutability,bound_ids,lookup_session,lookup_context)canGlobal{Read,Write}ifnotindex_receiver_is_semantic_type_application(object,table,bound)",
 ):
     if fragment not in index_n_arm:
         raise SystemExit("multi-index type arguments must be suppressed from value resolution")
@@ -198,7 +199,7 @@ provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1, provenance, Path(__file__),
-    HERE / "proof_product_gate.py", POLICY, RESOLVER, POSITIVE, NEGATIVE,
+    HERE / "proof_product_gate.py", POLICY, RESOLVER, RESOLVER_CONTEXT, POSITIVE, NEGATIVE,
     *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

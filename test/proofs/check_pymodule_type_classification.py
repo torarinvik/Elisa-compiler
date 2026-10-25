@@ -1,4 +1,5 @@
 """Admit source-pinned proofs of the type tables used by Python bindings."""
+import argparse
 import hashlib
 import json
 import os
@@ -9,10 +10,13 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=not args.source_only)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 DRIVER = ROOT / "src/driver/elisac.elisa"
 MODULE = ROOT / "src/driver/pymodule/type_classification.elisa"
 LOOKUP = ROOT / "src/driver/pymodule/lookup.elisa"
@@ -77,23 +81,29 @@ def parse_match_arms(block: str, description: str):
         if not arm:
             continue
         match = re.fullmatch(
-            r'((?:"(?:\\.|[^"\\])*"|_)(?:\s*\|\s*"(?:\\.|[^"\\])*")*)\s*->\s*(true|false|"(?:\\.|[^"\\])*")',
+            r'((?:"(?:\\.|[^"\\])*"|_)(?:\s*\|\s*"(?:\\.|[^"\\])*")*)\s*->\s*(?:result\s*==\s*)?(?:\(\s*(true|false|"(?:\\.|[^"\\])*")\s*\)|(true|false|"(?:\\.|[^"\\])*"))',
             arm,
         )
         if not match:
             raise SystemExit(f"unexpected {description} arm: {arm}")
         pattern = tuple(re.findall(r'"((?:\\.|[^"\\])*)"|(_)', match.group(1)))
         names = tuple(literal if literal else "_" for literal, wildcard in pattern)
-        actual.append((names, match.group(2)))
+        actual.append((names, match.group(2) or match.group(3)))
     return tuple(actual)
 
 
 def match_blocks(function: str, description: str, require_contract: bool = True):
     spec = re.search(
-        r"ensure\s+result\s*==\s*\(\s*when\s+type_name:\s*\n(.*?)^\s*\)",
+        r"ensure\s+when\s+type_name:\s*\n(.*?)(?=^\s*return\s+when\s+type_name:)",
         function,
         re.DOTALL | re.MULTILINE,
     )
+    if not spec:
+        spec = re.search(
+            r"ensure\s+result\s*==\s*\(\s*when\s+type_name:\s*\n(.*?)^\s*\)",
+            function,
+            re.DOTALL | re.MULTILINE,
+        )
     implementation = re.search(
         r"return\s+when\s+type_name:\s*\n(.*)", function, re.DOTALL
     )
@@ -216,6 +226,14 @@ for name, expected_return in expected_proof_returns.items():
     proof_source = positive_text if name in EXPECTED_POSITIVE else negative_text
     if compact(function_source(proof_source, name)).count(expected_return) != 1:
         raise SystemExit(f"proof/control {name} no longer states its exact claim")
+
+if args.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "positive_theorems": len(EXPECTED_POSITIVE),
+        "negative_controls": len(EXPECTED_NEGATIVE),
+    }, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     manifest = require_current_product(BIN, PROVER)

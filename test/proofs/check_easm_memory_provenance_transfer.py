@@ -24,6 +24,7 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 POSITIVE = HERE / "easm_memory_provenance_transfer.elisa"
 NEGATIVE = HERE / "easm_memory_provenance_transfer_rejected.elisa"
 MEMORY = ROOT / "src/backend/easm_verify_memory.elisa"
+MEMORY_EFFECTS = ROOT / "src/backend/easm_verify_memory_effects.elisa"
 ADDRESS_POLICY = ROOT / "src/backend/easm_address_width_policy.elisa"
 MODEL = HERE / "easm_memory_provenance_transfer.elisa"
 
@@ -199,7 +200,7 @@ for width_tag, value in (("ADDRESS_REGISTER_WIDTH_UNKNOWN", 0), ("ADDRESS_REGIST
     if f"const{width_tag}:i64={value}" not in compact(ADDRESS_POLICY.read_text()):
         raise SystemExit(f"linear provenance width tag changed: {width_tag}")
 
-implicit_write_source = compact(code_only(function_section(MEMORY.read_text(), "easm_implicit_write_mask")))
+implicit_write_source = compact(code_only(function_section(MEMORY_EFFECTS.read_text(), "easm_implicit_write_mask")))
 expected_implicit_write_source = compact("""
 def easm_implicit_write_mask(op: sview) -> i64:
     ensure result == EasmRegisterMasks::implicit_result_write_mask(op)
@@ -388,6 +389,7 @@ inputs = list(dict.fromkeys([
     Path(__file__),
     HERE / "proof_product_gate.py",
     MEMORY,
+    MEMORY_EFFECTS,
     ADDRESS_POLICY,
     POSITIVE,
     NEGATIVE,

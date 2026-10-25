@@ -15,7 +15,7 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 SIZES = ROOT / "src/backend/codegen_interned_types.elisa"
 RUNTIME_DECL = ROOT / "src/backend/codegen_runtime_decl.elisa"
-LOOPS = ROOT / "src/backend/codegen_stmt_for_shapes.elisa"
+LOOPS = ROOT / "src/backend/codegen_stmt_for_shapes_iterable.elisa"
 PROOF = ROOT / "test/proofs/backend_darray_pointer_countdown_32bit.elisa"
 REJECTED = ROOT / "test/proofs/backend_darray_pointer_countdown_32bit_rejected.elisa"
 compact_sizes = "".join(SIZES.read_text().split())
@@ -24,7 +24,7 @@ compact_proof = "".join(PROOF.read_text().split())
 compact_rejected = "".join(REJECTED.read_text().split())
 if 'returnLLVMBuildZExt(builder,value,size_type,name)ifLLVMGetIntTypeWidth(source_type)<64elsevalue' not in compact_sizes:
     raise SystemExit("DArray usize lengths must remain zero-extended when widened to i64")
-if 'LLVMInt32TypeInContext(ctx)returniftarget_bits==32returnLLVMInt64TypeInContext(ctx)' not in compact_sizes:
+if 'returnLLVMInt32TypeInContext(ctx)iftarget_bits==32returnLLVMInt64TypeInContext(ctx)' not in compact_sizes:
     raise SystemExit("DArray usize must remain exactly 32 or 64 bits on supported targets")
 if 'LLVMBuildICmp(builder,33,remaining_cur,LLVMConstInt(int64_type,0,0),"for.darray.remaining.nonzero")' not in compact_loops or \
         'remaining_next:LLVMValueRef=LLVMBuildSub(builder,remaining_step,LLVMConstInt(int64_type,1,0),"for.darray.remaining.next")' not in compact_loops:

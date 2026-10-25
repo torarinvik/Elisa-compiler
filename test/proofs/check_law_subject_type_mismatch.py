@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from proof_product_gate import require_current_product, source_include_closure
 
@@ -16,7 +17,7 @@ PARSER = ROOT / "src/parser/parser_decl_law.elisa"
 SOURCE = ROOT / "src/semantic/check_law_subject_type.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 PARALLEL_PASSES = ROOT / "src/semantic/semantic_parallel_passes.elisa"
-SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_API = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 POSITIVE = HERE / "law_subject_type_mismatch.elisa"
 NEGATIVE = HERE / "law_subject_type_mismatch_rejected.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
@@ -135,7 +136,7 @@ parallel = compact(PARALLEL_PASSES.read_text())
 if f"pass_id=={PASS_ID}:table<-check_law_subject_type(loop_view,table)" not in parallel:
     raise SystemExit("parallel semantic dispatcher no longer calls the subject-type pass")
 pipeline = compact(SEMANTIC_API.read_text())
-if f"par_pass_run(file,&loop_view,flags,table,shared_pool,{BATCH_START},{BATCH_SIZE})" not in pipeline:
+if f"par_pass_run(file,flags,table,shared_pool,loop_view,{BATCH_START},{BATCH_SIZE})" not in pipeline:
     raise SystemExit("semantic pipeline no longer schedules the subject-type pass")
 
 expected_rule = "ensure result == (value_type != \"\" and subject_type != \"\" and value_type != subject_type) return value_type != \"\" and subject_type != \"\" and value_type != subject_type"
@@ -176,6 +177,10 @@ mutations = (
 for mutation in mutations:
     if mutation == source_text or source_matches(mutation):
         raise SystemExit("subject-type source checker failed to reject a guard, payload, or reachability mutation")
+
+if "--source-only" in sys.argv[1:]:
+    print("law subject-type source binding passed")
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)

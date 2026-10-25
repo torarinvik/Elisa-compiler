@@ -49,10 +49,10 @@ ordered = (
     "f32s<-f32s+1ifleaves[leaf_index].kind==1",
     "f64s<-f64s+1ifleaves[leaf_index].kind==2",
     "found<-ints+f32s+f64s>0",
-    "LLVMInt64TypeInContext(ctx)returnifnotany_leaf",
+    "returnLLVMInt64TypeInContext(ctx)ifnotany_leaf",
     "ifints>0:",
-    "LLVMDoubleTypeInContext(ctx)returniff64s>0",
-    "LLVMVectorType(LLVMFloatTypeInContext(ctx),2)returniff32s>=2",
+    "returnLLVMDoubleTypeInContext(ctx)iff64s>0",
+    "returnLLVMVectorType(LLVMFloatTypeInContext(ctx),2)iff32s>=2",
     "returnLLVMFloatTypeInContext(ctx)",
 )
 if any(part not in body for part in ordered) or [body.index(part) for part in ordered] != sorted(body.index(part) for part in ordered):

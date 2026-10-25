@@ -7,14 +7,33 @@
 #
 # `error NAME:` declarations lower to enums, so their variants populate enum_variant_owner/
 # name. Each `error[...]` set name is captured by the parser as __error_set_family. A name
-# that is itself a declared set (an enum owner) is a family reference and fine; a bare
-# variant in >= 2 sets must be qualified.
+# suppresses variant ambiguity only when it resolves to a visible error-set declaration;
+# an ordinary enum or an inaccessible sibling declaration does not make it unambiguous.
 extend Semantic:
     private:
-        def aev_is_set_name(table: SymbolTable&, name: sview) -> bool:
+        def aev_function_module_for_family(annotations: darray[Ast::EnumAnnotation]&, family: Ast::EnumAnnotation) -> (known: bool, module: sview @source):
             can Abort.Panic:
-                for owner in table.enum_variant_owner:
-                    return true if owner == name
+                selected_module: mutable sview @source = ""
+                found: mutable bool = false
+                ambiguous: mutable bool = false
+                for declaration in annotations:
+                    continue if declaration.owner != "__fn_module" or declaration.line != family.line
+                    same_offset: bool = declaration.offset == family.offset if declaration.offset != 0 and family.offset != 0 else true
+                    same_identity: bool = family.identity_id == 0 or declaration.identity_id == family.identity_id
+                    continue if not same_offset or not same_identity
+                    if not found:
+                        selected_module <- declaration.name
+                        found <- true
+                    elif declaration.name != selected_module:
+                        ambiguous <- true
+                return (found and not ambiguous, selected_module)
+
+        def aev_is_set_name(annotations: darray[Ast::EnumAnnotation]&, family: Ast::EnumAnnotation, function_module: (known: bool, module: sview @source), table: mutable SymbolTable&) -> bool:
+            can Abort.Panic:
+                if function_module.known:
+                    return esh_is_error_set_visible(annotations, family.name, function_module.module, family.offset, table)
+                # Without the use site's module, a same-named set may be inaccessible.
+                # Do not let incomplete provenance hide a genuinely ambiguous variant.
                 return false
 
         # Qualified error-set paths carry their full spelling in the paired path row,
@@ -25,7 +44,7 @@ extend Semantic:
                 return false if family_index + 1.usize() >= annotations.count
                 family: Ast::EnumAnnotation = annotations[family_index]
                 path: Ast::EnumAnnotation = annotations[family_index + 1.usize()]
-                return false if path.owner != "__error_set_family_path" or path.line != family.line or path.offset != family.offset or path.identity_id != family.identity_id
+                return false if path.owner != "__error_set_family_path" or path.line != family.line or path.offset != family.offset or path.identity_id != family.identity_id or path.occurrence_offset != family.occurrence_offset
                 return path.name != family.name
 
         def aev_owner_label(module: sview, owner: sview @source, table: mutable SymbolTable&) -> sview @source:
@@ -40,9 +59,15 @@ extend Semantic:
                     bytes.push(owner[index])
                 return intern_joined_text(bytes, table)
 
+        def aev_is_error_set_owner(annotations: darray[Ast::EnumAnnotation]&, owner: sview, module: sview) -> bool:
+            can Abort.Panic:
+                for declaration in annotations:
+                    return true if declaration.owner == "__error_set_decl" and declaration.name == owner and declaration.module == module
+                return false
+
         # Distinct (module, error-set owner) pairs declaring a variant `name`, as
         # (count, first, second). Equal leaf owners in separate modules remain distinct.
-        def aev_owners_of_variant(table: mutable SymbolTable&, variant: sview) -> (count: usize, first: sview @source, second: sview @source):
+        def aev_owners_of_variant(annotations: darray[Ast::EnumAnnotation]&, table: mutable SymbolTable&, variant: sview) -> (count: usize, first: sview @source, second: sview @source):
             can Memory.Allocate, Abort.Panic:
                 seen_owners: mutable darray[sview @source] = []
                 seen_modules: mutable darray[sview @source] = []
@@ -52,13 +77,14 @@ extend Semantic:
                     if table.enum_variant_name[index] == variant:
                         owner: sview = table.enum_variant_owner[index]
                         module: sview = table.enum_variant_module[index] if index < table.enum_variant_module.count else ""
-                        duplicate: mutable bool = false
-                        for seen_index in 0..<seen_owners.count |duplicate, seen_index, seen_owners, seen_modules, owner, module|:
-                            duplicate <- true if seen_owners[seen_index] == owner and seen_modules[seen_index] == module
-                        if not duplicate:
-                            seen_owners.push(owner)
-                            seen_modules.push(module)
-                            seen_labels.push(aev_owner_label(module, owner, table))
+                        if aev_is_error_set_owner(annotations, owner, module):
+                            duplicate: mutable bool = false
+                            for seen_index in 0..<seen_owners.count |duplicate, seen_index, seen_owners, seen_modules, owner, module|:
+                                duplicate <- true if seen_owners[seen_index] == owner and seen_modules[seen_index] == module
+                            if not duplicate:
+                                seen_owners.push(owner)
+                                seen_modules.push(module)
+                                seen_labels.push(aev_owner_label(module, owner, table))
                     index <- index + 1
                 first: sview @source = seen_labels[0] if seen_labels.count > 0 else sview("", 0, 0)
                 second: sview @source = seen_labels[1] if seen_labels.count > 1 else sview("", 0, 0)
@@ -67,16 +93,17 @@ extend Semantic:
     public:
         def check_ambiguous_error_variant(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                reported: mutable darray[sview] = []
+                reported: mutable darray[Ast::EnumAnnotation] = []
                 annotation_index: mutable usize = 0
                 for annotation in file.enum_annotations |annotation_index, reported, table| -> table:
                     current_index: usize = annotation_index
                     annotation_index <- annotation_index + 1.usize()
                     if annotation.owner == "__error_set_family" and not aev_is_qualified_family_reference(file.enum_annotations, current_index):
                         referenced: sview = annotation.name
-                        already: bool = any entry in reported where entry == referenced
-                        if not already and not aev_is_set_name(table, referenced):
-                            owners: (count: usize, first: sview, second: sview) = aev_owners_of_variant(table, referenced)
+                        already: bool = any entry in reported where entry.name == annotation.name and entry.line == annotation.line and entry.offset == annotation.offset and entry.identity_id == annotation.identity_id and entry.occurrence_offset == annotation.occurrence_offset
+                        function_module: (known: bool, module: sview @source) = aev_function_module_for_family(file.enum_annotations, annotation)
+                        if not already and not aev_is_set_name(file.enum_annotations, annotation, function_module, table):
+                            owners: (count: usize, first: sview, second: sview) = aev_owners_of_variant(file.enum_annotations, table, referenced)
                             if owners.count >= 2:
-                                reported.push(referenced)
+                                reported.push(annotation)
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AmbiguousErrorVariant, name: referenced, line: annotation.line, expected: owners.first, actual: owners.second})

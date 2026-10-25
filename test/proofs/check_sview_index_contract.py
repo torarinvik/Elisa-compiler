@@ -23,6 +23,8 @@ RUNTIME_STRINGS = ROOT / "elisacore_std/elisacore_runtime_strings.elisa"
 TYPE_INFERENCE = ROOT / "src/semantic/resolve_types_infer.elisa"
 FIELD_LOWERING = ROOT / "src/backend/codegen_expr_field_read.elisa"
 INDEX_LOWERING = ROOT / "src/backend/codegen_expr_index_read.elisa"
+INDEX_EMITTER = ROOT / "src/backend/codegen_expr_index_read_emit.elisa"
+INDEX_MODULE_ROOT = ROOT / "src/backend/codegen_expr_index_fields.elisa"
 DECIMAL_PARSER = ROOT / "src/backend/easm_checked_decimal.elisa"
 POSITIVE = HERE / "sview_index_contract.elisa"
 NEGATIVE = HERE / "sview_index_contract_rejected.elisa"
@@ -79,12 +81,12 @@ required_index_contracts = (
 if any(compact(clause) not in index_helper for clause in required_index_contracts):
     raise SystemExit("StringView runtime index lost its rejected, selected-byte, or byte-width contract")
 index_guards = (
-    "0 return if view.len < 0",
+    "return 0 if view.len < 0",
     "view_len: usize = view.len.usize()",
     "0 return if view_len.i64() != view.len",
     "0 return if index < 0 or index >= view.len",
     "index_usize: usize = index.usize()",
-    "0 return if index_usize.i64() != index",
+    "return 0 if index_usize.i64() != index",
     "return view.data[index_usize].i64()",
 )
 guard_positions = [index_helper.find(compact(guard)) for guard in index_guards]
@@ -116,7 +118,7 @@ required_inline_guards = (
 inline_positions = [index_lowering.find(compact(fragment)) for fragment in required_inline_guards]
 if any(position < 0 for position in inline_positions) or inline_positions != sorted(inline_positions):
     raise SystemExit("sview indexing no longer guards the byte load and zero-extends the selected byte")
-index_dispatch = compact(function_section(INDEX_LOWERING.read_text(), "emit_expression_index_read"))
+index_dispatch = compact(function_section(INDEX_EMITTER.read_text(), "emit_expression_index_read"))
 required_index_dispatch = (
     "if sview_index_recv_type.kind == TypeKind.SView:",
     "if structs.target.target_pointer_bits == 64:",
@@ -125,6 +127,10 @@ required_index_dispatch = (
 )
 if any(compact(fragment) not in index_dispatch for fragment in required_index_dispatch):
     raise SystemExit("sview [index] no longer dispatches through the checked inline/runtime paths")
+index_module_text = INDEX_MODULE_ROOT.read_text()
+if index_module_text.count('include "./codegen_expr_index_read.elisa"') != 1 or \
+        index_module_text.count('include "./codegen_expr_index_read_emit.elisa"') != 1:
+    raise SystemExit("index lowering must include its inline helper and dispatcher exactly once")
 decimal_source = DECIMAL_PARSER.read_text()
 decimal_parser = compact(function_section(decimal_source, "parse_signed"))
 decimal_reference = compact(function_section(decimal_source, "decimal_parse_reference"))
@@ -266,7 +272,8 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1, provenance, Path(__file__),
     HERE / "proof_product_gate.py", PRELUDE, RUNTIME_STRINGS,
-    TYPE_INFERENCE, FIELD_LOWERING, INDEX_LOWERING, DECIMAL_PARSER,
+    TYPE_INFERENCE, FIELD_LOWERING, INDEX_LOWERING, INDEX_EMITTER,
+    INDEX_MODULE_ROOT, DECIMAL_PARSER,
     POSITIVE, NEGATIVE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

@@ -5,17 +5,18 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from proof_product_gate import require_current_product, source_include_closure
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve()
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE = ROOT / "src/semantic/check_division_by_zero.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
-SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_API = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
 PARALLEL_PASSES = ROOT / "src/semantic/semantic_parallel_passes.elisa"
 AST_NODES = ROOT / "src/parser/ast_nodes.elisa"
 AST_SIDE_TABLES = ROOT / "src/parser/ast_side_tables.elisa"
@@ -182,53 +183,53 @@ EXPECTED_EXPR_VARIANTS = tuple("""
 Invalid
 Absent
 IntLit(value: i64, pos: Pos)
-FloatLit(text: sview, pos: Pos)
-StringLit(text: sview, pos: Pos)
-CharLit(text: sview, pos: Pos)
+FloatLit(text: sview @source, pos: Pos)
+StringLit(text: sview @source, pos: Pos)
+CharLit(text: sview @source, pos: Pos)
 BoolLit(value: bool, pos: Pos)
-Ident(name: sview, pos: Pos)
-Call(callee: Expr, arguments: darray[Expr], argument_names: darray[sview], pos: Pos)
-StaticEffectCall(effect_type: Expr, operation: sview, candidates: darray[StaticEffectCandidate], arguments: darray[Expr], argument_names: darray[sview], pos: Pos)
-Field(object: Expr, field: sview, pos: Pos)
-Scope(base: Expr, name: sview, pos: Pos)
-ShorthandMember(parts: darray[sview], pos: Pos)
+Ident(name: sview @source, pos: Pos)
+Call(callee: Expr, arguments: darray[Expr] @source, argument_names: darray[sview @source] @source, pos: Pos)
+StaticEffectCall(effect_type: Expr, operation: sview @source, candidates: darray[StaticEffectCandidate] @source, arguments: darray[Expr] @source, argument_names: darray[sview @source] @source, pos: Pos)
+Field(object: Expr, field: sview @source, pos: Pos)
+Scope(base: Expr, name: sview @source, pos: Pos)
+ShorthandMember(parts: darray[sview @source] @source, pos: Pos)
 Index(object: Expr, index: Expr, pos: Pos)
 Slice(object: Expr, low: Expr, high: Expr, pos: Pos)
-IndexN(object: Expr, arguments: darray[Expr], pos: Pos)
+IndexN(object: Expr, arguments: darray[Expr] @source, pos: Pos)
 Binary(left: Expr, operator: TokenKind, right: Expr, pos: Pos)
 Unary(operator: TokenKind, operand: Expr, pos: Pos)
 Move(operand: Expr, pos: Pos)
-RegionNew(operand: Expr, region: sview, pos: Pos)
+RegionNew(operand: Expr, region: sview @source, pos: Pos)
 Paren(inner: Expr, pos: Pos)
-Array(elements: darray[Expr], pos: Pos)
-Tuple(elements: darray[Expr], pos: Pos)
-SetLit(elements: darray[Expr], pos: Pos)
-DictLit(entries: darray[DictEntry], pos: Pos)
-Construct(type: Expr, fields: darray[FieldInit], pos: Pos)
-RecordUpdate(base: Expr, fields: darray[FieldInit], pos: Pos)
+Array(elements: darray[Expr] @source, pos: Pos)
+Tuple(elements: darray[Expr] @source, pos: Pos)
+SetLit(elements: darray[Expr] @source, pos: Pos)
+DictLit(entries: darray[DictEntry] @source, pos: Pos)
+Construct(type: Expr, fields: darray[FieldInit] @source, pos: Pos)
+RecordUpdate(base: Expr, fields: darray[FieldInit] @source, pos: Pos)
 If(condition: Expr, then_expr: Expr, else_expr: Expr, pos: Pos)
-Match(scrutinee: Expr, arms: darray[MatchArm], pos: Pos)
-Catch(guarded: Expr, arms: darray[MatchArm], pos: Pos)
-Comprehension(var: sview, iterable: Expr, condition: Expr, body: Expr, pos: Pos, query_scope_id: u32)
+Match(scrutinee: Expr, arms: darray[MatchArm] @source, pos: Pos)
+Catch(guarded: Expr, arms: darray[MatchArm] @source, pos: Pos)
+Comprehension(var: sview @source, iterable: Expr, condition: Expr, body: Expr, pos: Pos, query_scope_id: u32)
 Refinement(base: Expr, predicate: Expr, pos: Pos)
-GetElse(guarded: Expr, recovery: darray[Stmt], pos: Pos)
-Lambda(params: darray[sview], body: darray[Stmt], pos: Pos)
-Block(stmts: darray[Stmt], value: Expr, captures: darray[sview], pos: Pos)
+GetElse(guarded: Expr, recovery: darray[Stmt] @source, pos: Pos)
+Lambda(params: darray[sview @source] @source, body: darray[Stmt] @source, pos: Pos)
+Block(stmts: darray[Stmt] @source, value: Expr, captures: darray[sview @source] @source, pos: Pos)
 """.strip().splitlines())
 EXPECTED_STMT_VARIANTS = tuple("""
 Invalid
 Expr(expression: Expr, pos: Pos)
-Block(kind: sview, clause: darray[sview], binding: sview, body: darray[Stmt], pos: Pos)
-VarDecl(name: sview, type_expression: Expr, value: Expr, pos: Pos)
+Block(kind: sview @source, clause: darray[sview @source] @source, binding: sview @source, body: darray[Stmt] @source, pos: Pos)
+VarDecl(name: sview @source, type_expression: Expr, value: Expr, pos: Pos)
 Assign(target: Expr, operator: TokenKind, value: Expr, pos: Pos)
-If(condition: Expr, then_body: darray[Stmt], else_body: darray[Stmt], pos: Pos)
-While(condition: Expr, body: darray[Stmt], pos: Pos)
-For(bind: sview, variables: darray[sview], iterable: Expr, body: darray[Stmt], pos: Pos)
+If(condition: Expr, then_body: darray[Stmt] @source, else_body: darray[Stmt] @source, pos: Pos)
+While(condition: Expr, body: darray[Stmt] @source, pos: Pos)
+For(bind: sview @source, variables: darray[sview @source] @source, iterable: Expr, body: darray[Stmt] @source, pos: Pos)
 Return(value: Expr?, pos: Pos)
-Break(label: sview, pos: Pos)
-Continue(label: sview, pos: Pos)
-Match(scrutinee: Expr, arms: darray[MatchArm], pos: Pos)
-Contract(kind: sview, expression: Expr, pos: Pos)
+Break(label: sview @source, pos: Pos)
+Continue(label: sview @source, pos: Pos)
+Match(scrutinee: Expr, arms: darray[MatchArm] @source, pos: Pos)
+Contract(kind: sview @source, expression: Expr, pos: Pos)
 """.strip().splitlines())
 EXPECTED_DECL_VARIANT_NAMES = (
     "Invalid", "Func", "Struct", "Enum", "Alias", "Law", "Import", "Scoped", "Extern", "Const", "Module",
@@ -240,18 +241,18 @@ CHILD_BEARING_EXPR_ARM_NAMES = (
 )
 CHILD_BEARING_DECL_ARM_NAMES = ("Func", "Struct", "Enum", "Alias", "Law", "Scoped", "Const", "Module")
 EXPECTED_SIDE_TABLE_FIELDS = {
-    "ParamDecl": tuple("name:sview name_pos:Pos type_expression:Expr is_mutable:bool has_default:bool default_value:Expr is_affine:bool value_thread:bool".split()),
-    "LocalRegionAnnotation": ("name:sview", "type_expression:Expr", "region:sview", "line:u32", "end_line:mutable u32"),
-    "BitGroupMember": tuple("name:sview type_expression:Expr pos:Pos".split()),
-    "StructMember": tuple("is_private:bool name:sview type_expression:Expr omittable:bool is_ghost:bool has_default:bool default_value:Expr region:sview bit_group_kind:sview bit_group_members:darray[BitGroupMember]".split()),
-    "EnumVariant": tuple("name:sview fields:darray[Expr] field_names:darray[sview] value_expr:Expr".split()),
-    "MatchArm": tuple("pattern:Pattern body:darray[Stmt] guard:Expr pos:Pos".split()),
-    "FieldInit": tuple("name:sview value:Expr is_copy_base:bool".split()),
+    "ParamDecl": ("name:sview @source", "name_pos:Pos", "type_expression:Expr", "is_mutable:bool", "has_default:bool", "default_value:Expr", "is_affine:bool", "value_thread:bool"),
+    "LocalRegionAnnotation": ("name:sview @source", "type_expression:Expr", "region:sview @source", "line:u32", "end_line:mutable u32"),
+    "BitGroupMember": ("name:sview @source", "type_expression:Expr", "pos:Pos"),
+    "StructMember": ("is_private:bool", "name:sview @source", "type_expression:Expr", "omittable:bool", "is_ghost:bool", "has_default:bool", "default_value:Expr", "region:sview @source", "bit_group_kind:sview @source", "bit_group_members:darray[BitGroupMember] @source"),
+    "EnumVariant": ("name:sview @source", "fields:darray[Expr] @source", "field_names:darray[sview @source] @source", "value_expr:Expr"),
+    "MatchArm": ("pattern:Pattern", "body:darray[Stmt] @source", "guard:Expr", "pos:Pos"),
+    "FieldInit": ("name:sview @source", "value:Expr", "is_copy_base:bool"),
     "StructCopyBase": tuple("type_expression:Expr base:Expr pos:Pos".split()),
     "DictEntry": tuple("key:Expr value:Expr".split()),
-    "DerivedStateRule": tuple("owner:sview state:sview condition:Expr module_name:sview declaration_line:u32 declaration_offset:u32 pos:Pos".split()),
-    "StaticEffectCandidate": tuple("effect_type:Expr callee:sview captures:darray[Expr] effect_identity_id:u32 handler_identity_id:u32 callee_owner:sview".split()),
-    "EffectTypeReference": tuple("spelling:sview type_expression:Expr position:Pos lexical_owner:sview identity_id:u32".split()),
+    "DerivedStateRule": ("owner:sview @source", "state:sview @source", "condition:Expr", "module_name:sview @source", "declaration_line:u32", "declaration_offset:u32", "pos:Pos"),
+    "StaticEffectCandidate": ("effect_type:Expr", "callee:sview @source", "captures:darray[Expr] @source", "effect_identity_id:u32", "handler_identity_id:u32", "callee_owner:sview @source"),
+    "EffectTypeReference": ("spelling:sview @source", "type_expression:Expr", "position:Pos", "lexical_owner:sview @source", "identity_id:u32"),
 }
 
 
@@ -501,7 +502,7 @@ declaration_edges = (
     ("match declaration:", "Decl.Module(module_name, body, line):"),
     ("match declaration:", "Decl.Scoped(body, line):"),
     ("Decl.Func(name, params, return_type, body, effects, decorators, line):", "for parameter in params |table|:"),
-    ("Decl.Func(name, params, return_type, body, effects, decorators, line):", "table <- walk_expression_for_division_by_zero(return_type, table)"),
+    ("Decl.Func(name, params, return_type, body, effects, decorators, line):", "table <- walk_expression_for_division_by_zero(declared_return, table) if return_type is declared_return"),
     ("Decl.Func(name, params, return_type, body, effects, decorators, line):", "table <- walk_statements_for_division_by_zero(body, table)"),
     ("for parameter in params |table|:", "table <- walk_expression_for_division_by_zero(parameter.type_expression, table)"),
     ("for parameter in params |table|:", "table <- walk_expression_for_division_by_zero(parameter.default_value, table)"),
@@ -580,7 +581,7 @@ ROUTE_AGGREGATE_BINDINGS = {
     "proof_declaration_children_reported": {
         "parameter_type": (("declaration", "for parameter in params |table|:", "table <- walk_expression_for_division_by_zero(parameter.type_expression, table)"),),
         "parameter_default": (("declaration", "for parameter in params |table|:", "table <- walk_expression_for_division_by_zero(parameter.default_value, table)"),),
-        "return_type": (("declaration", "Decl.Func(name, params, return_type, body, effects, decorators, line):", "table <- walk_expression_for_division_by_zero(return_type, table)"),),
+        "return_type": (("declaration", "Decl.Func(name, params, return_type, body, effects, decorators, line):", "table <- walk_expression_for_division_by_zero(declared_return, table) if return_type is declared_return"),),
         "function_body": (("declaration", "Decl.Func(name, params, return_type, body, effects, decorators, line):", "table <- walk_statements_for_division_by_zero(body, table)"),),
         "member_type": (("declaration", "for member in members |table|:", "table <- walk_expression_for_division_by_zero(member.type_expression, table)"),),
         "member_default": (("declaration", "for member in members |table|:", "table <- walk_expression_for_division_by_zero(member.default_value, table)"),),
@@ -680,7 +681,7 @@ if 'include "./check_division_by_zero.elisa"' not in SEMANTIC.read_text():
 parallel = compact(PARALLEL_PASSES.read_text())
 if "ifpass_id==4:table<-check_division_by_zero(loop_view.top_decls,table)" not in parallel:
     raise SystemExit("parallel semantic dispatch no longer calls division-by-zero at its assigned pass id")
-if "par_pass_run(file,&loop_view,flags,table,shared_pool,0,5)" not in compact(SEMANTIC_API.read_text()):
+if "par_pass_run(file,flags,table,shared_pool,loop_view,0,5)" not in compact(SEMANTIC_API.read_text()):
     raise SystemExit("semantic pipeline no longer schedules the division-by-zero pass")
 
 mutations = (
@@ -817,6 +818,10 @@ for path, shapes in ((POSITIVE, positive_shapes), (NEGATIVE, negative_shapes)):
     for name, shape in shapes.items():
         if compact(shape) not in compact(function_section(text, name)):
             raise SystemExit(f"{name} no longer states its exact division-by-zero claim")
+
+if "--source-only" in sys.argv[1:]:
+    print(json.dumps({"admitted": True, "source_only": True}, sort_keys=True))
+    raise SystemExit(0)
 
 try:
     product = require_current_product(BIN, PROVER)

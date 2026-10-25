@@ -105,7 +105,18 @@ def main() -> None:
             else:
                 expected = f"par_pass_parent_view(table, first + {copies.index(name)})"
             assert normalized_expression(values[name]) == expected, f"{label}: incorrect copy of {name}"
-    api = (root / "src/semantic/semantic_api.elisa").read_text()
+    api_candidates = (
+        root / "src/semantic/semantic_api.elisa",
+        root / "src/semantic/semantic_api/diagnostic_output.elisa",
+    )
+    api_path = next(
+        (path for path in api_candidates
+         if path.is_file() and re.search(
+             r"^[ \t]*def diagnostic_export(?:\[[^\]]*\])?\(",
+             path.read_text(), re.M)),
+        api_candidates[0],
+    )
+    api = api_path.read_text()
     exported = function_section(api, "diagnostic_export")
     export_copies = re.findall(r"(\w+): diagnostic_output_text\(source\.(\w+), text_buffers\)", exported)
     assert len(export_copies) == len(export_texts), "export text copies changed"

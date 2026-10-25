@@ -19,7 +19,8 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE = ROOT / "src/semantic/scalar_match_literal_policy.elisa"
 CONSUMER = ROOT / "src/semantic/resolve_types_match.elisa"
-PARSER = ROOT / "src/parser/parser_stmt_pattern.elisa"
+PARSER = ROOT / "src/parser/parser_stmt_pattern_arms.elisa"
+PARSER_ROOT = ROOT / "src/parser/parser.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 POSITIVE = HERE / "scalar_match_literal_policy.elisa"
 NEGATIVE = HERE / "scalar_match_literal_policy_rejected.elisa"
@@ -107,11 +108,15 @@ if consumer_text.count('include "./scalar_match_literal_policy.elisa"') != 1:
     raise SystemExit("scalar match resolver must import the proved literal policy exactly once")
 if compact(function_section(consumer_text, "scalar_match_pattern_valid")) != compact(expected_consumer_wrapper):
     raise SystemExit("semantic scalar match checker no longer delegates to the proved pattern policy")
-if "notscalar_match_pattern_valid(arm.pattern,scalar_family)" not in compact(
-        function_section(consumer_text, "check_scalar_match_arm_types")):
+scalar_match_checker = compact(function_section(consumer_text, "check_scalar_match_arm_types"))
+if "literal_valid:bool=scalar_match_pattern_valid(arm.pattern,scalar_family)" not in scalar_match_checker or \
+        "kind:DiagnosticKind.InvalidTopLevelScalarMatchArm" not in scalar_match_checker or \
+        "ifnotliteral_validandnotconstant_valid" not in scalar_match_checker:
     raise SystemExit("scalar match arm diagnostics no longer consume the proved pattern policy")
 if semantic_text.count('include "./resolve_types_match.elisa"') != 1:
     raise SystemExit("semantic root must include the scalar match resolver exactly once")
+if PARSER_ROOT.read_text().count('include "./parser_stmt_pattern_arms.elisa"') != 1:
+    raise SystemExit("parser root must include the literal-pattern parser exactly once")
 pattern_parser = compact(function_section(parser_text, "parse_pattern_primary"))
 shared_literal_group = "TokenKind.IntLit|TokenKind.HexLit|TokenKind.FloatLit|TokenKind.StringLit|TokenKind.CharLit|TokenKind.True|TokenKind.False|TokenKind.Null:"
 if shared_literal_group not in pattern_parser:
@@ -339,7 +344,7 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
     Path(__file__), HERE / "proof_product_gate.py", SOURCE, CONSUMER, PARSER, SEMANTIC,
-    POSITIVE, NEGATIVE, *source_closure,
+    POSITIVE, NEGATIVE, PARSER_ROOT, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

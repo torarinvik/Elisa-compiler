@@ -38,12 +38,12 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\]\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -85,7 +85,7 @@ if consumer_text.count('include "./set_membership_element_policy.elisa"') != 1:
 if semantic_text.count('include "./check_set_membership_element.elisa"') != 1:
     raise SystemExit("semantic root must include the set membership checker exactly once")
 pass_dispatch = compact(function_section(semantic_passes_text, "par_pass_call"))
-if "elifpass_id==94:table<-check_set_membership_element(loop_view.top_decls,table)" not in pass_dispatch:
+if "ifpass_id==94:table<-check_set_membership_element(loop_view.top_decls,table)" not in pass_dispatch:
     raise SystemExit("semantic pass dispatcher no longer invokes the proved set-element checker")
 
 if compact(function_section(consumer_text, "set_element_spelling_unsupported")) != compact('''

@@ -20,7 +20,9 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POLICY = ROOT / "src/semantic/generic_extern_index_policy.elisa"
 RESOLVER = ROOT / "src/semantic/resolve_expr_walk.elisa"
-SEMANTIC_API = ROOT / "src/semantic/semantic_api.elisa"
+SEMANTIC_API_FULL_PIPELINE = ROOT / "src/semantic/semantic_api/full_pipeline.elisa"
+SEMANTIC_API_TABLE_SETUP = ROOT / "src/semantic/semantic_api/table_setup.elisa"
+SEMANTIC_API_DIAGNOSTICS = ROOT / "src/semantic/semantic_api/diagnostic_output.elisa"
 POSITIVE = HERE / "generic_extern_index_policy.elisa"
 NEGATIVE = HERE / "generic_extern_index_policy_rejected.elisa"
 
@@ -38,12 +40,12 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)(?:ghost )?def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)(?:ghost )?def {re.escape(name)}(?:\[[^\]\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}(?:ghost )?def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}(?:ghost )?def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -54,7 +56,9 @@ def declarations(source: str) -> set[str]:
 
 policy_text = POLICY.read_text()
 resolver_text = RESOLVER.read_text()
-semantic_api_text = SEMANTIC_API.read_text()
+semantic_api_full_pipeline_text = SEMANTIC_API_FULL_PIPELINE.read_text()
+semantic_api_table_setup_text = SEMANTIC_API_TABLE_SETUP.read_text()
+semantic_api_diagnostics_text = SEMANTIC_API_DIAGNOSTICS.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
@@ -116,12 +120,16 @@ if any(position < 0 for position in positions) or positions != sorted(positions)
     raise SystemExit("generic externs must be checked after local shadowing and before symbol lookup fallback")
 
 annotation_append = 'table.generic_extern_names <- table.generic_extern_names.push(annotation.name) if annotation.owner == "__extern_generic_name"'
-api_sites = [
-    function_section(semantic_api_text, "check_full_into_pipeline"),
-    function_section(semantic_api_text, "unresolved_table"),
-    function_section(semantic_api_text, "unresolved_references"),
+full_pipeline_site = function_section(semantic_api_full_pipeline_text, "check_full_into_pipeline")
+table_setup_site = function_section(semantic_api_table_setup_text, "prepare_symbol_table")
+diagnostic_sites = [
+    function_section(semantic_api_diagnostics_text, "unresolved_table"),
+    function_section(semantic_api_diagnostics_text, "unresolved_references"),
 ]
-if any(compact(site).count(compact(annotation_append)) != 1 for site in api_sites):
+if compact(full_pipeline_site).count("prepare_symbol_table(file,table)") != 1:
+    raise SystemExit("the full semantic pipeline must seed its generic-extern registry through table preparation")
+if compact(table_setup_site).count(compact(annotation_append)) != 1 or any(
+        compact(site).count(compact(annotation_append)) != 1 for site in diagnostic_sites):
     raise SystemExit("all semantic entry paths must register the exact generic-extern annotation names")
 annotation_append_compact = compact(annotation_append)
 all_semantic_sources = [path.read_text() for path in SEMANTIC_DIR.rglob("*.elisa")]
@@ -184,7 +192,8 @@ provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1, provenance, Path(__file__),
-    HERE / "proof_product_gate.py", POLICY, RESOLVER, SEMANTIC_API,
+    HERE / "proof_product_gate.py", POLICY, RESOLVER,
+    SEMANTIC_API_FULL_PIPELINE, SEMANTIC_API_TABLE_SETUP, SEMANTIC_API_DIAGNOSTICS,
     *sorted(SEMANTIC_DIR.rglob("*.elisa")),
     POSITIVE, NEGATIVE, *source_closure,
 ]))

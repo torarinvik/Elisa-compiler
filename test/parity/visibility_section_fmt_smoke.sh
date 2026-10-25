@@ -24,9 +24,15 @@ module Pack:
         def make(v: i64) -> Item:
             return Item{v: v}
 
+        def dispatch(value: bool) -> i64:
+            return 2
+
     private:
         def hidden() -> i64:
             return 1
+
+        def dispatch(value: i64) -> i64:
+            return 3
 
 def pick(it: Pack::Item) -> i64:
     let Pack::Item{v} = it
@@ -57,8 +63,10 @@ grep -q '<pattern>' "$WORK/s1.txt" && fail "stage1 left an unprinted pattern: $(
     || fail "stage0 could not reformat its own output"
 cmp -s "$WORK/s0.txt" "$WORK/s0.again" || fail "stage0 formatting is not idempotent"
 
-printf 'def probe() -> i64:\n    return Pack::hidden()\n' >> "$WORK/s0.txt"
+printf 'def probe_hidden() -> i64:\n    return Pack::hidden()\n\ndef probe_public_overload() -> i64:\n    return Pack::dispatch(true)\n\ndef probe_private_overload() -> i64:\n    return Pack::dispatch(1)\n' >> "$WORK/s0.txt"
 out="$("$ELISACORE_BIN" -emit obj -o "$WORK/probe.o" "$WORK/s0.txt" 2>&1)"
-grep -q 'is private to module' <<< "$out" || fail "the reformatted module no longer hides its private member: $out"
+grep -q '"Pack.hidden" is private to module' <<< "$out" || fail "the reformatted module no longer hides its private member: $out"
+grep -q '"Pack.dispatch" is private to module' <<< "$out" || fail "the reformatted module lost the private overload: $out"
+[[ "$(grep -c 'is private to module' <<< "$out")" -eq 2 ]] || fail "the public same-name overload was formatted as private too: $out"
 
 echo "visibility_section_fmt OK: sections, qualified patterns and let-destructures round-trip byte-identically"

@@ -39,19 +39,31 @@ def section(text: str, name: str) -> str:
 
 source = compact(section(SOURCE.read_text(), "error_union_variant_allowed"))
 production_fragments = (
-    'forannotationinfile.enum_annotations|restricted,line,family|:',
-    'restricted<-trueifannotation.owner=="__error_variant_family"andannotation.line==lineandannotation.name==family',
-    'returntrueifnotrestricted',
-    'continueifannotation.owner!="__error_variant_family"orannotation.line!=lineorannotation.name!=family',
-    'continueifannotation_index+1>=file.enum_annotations.count',
-    'allowed:Ast::EnumAnnotation=file.enum_annotations[annotation_index+1]',
-    'returntrueifallowed.owner=="__error_variant_allow"andallowed.line==lineandallowed.name==variant',
-    'returnfalse',
+    'deferror_union_variant_allowed(file:Ast::File&,family_row_index:usize,variant:sview)->boolcan[Abort.Panic]:',
+    'returntrueiffamily_row_index>=file.enum_annotations.count',
+    'family_row:Ast::EnumAnnotation=file.enum_annotations[family_row_index]',
+    'cursor:mutableusize=family_row_index+1.usize()',
+    'breakifannotation.owner=="__error_set_family"',
+    'ifannotation.owner=="__error_variant_family"andannotation.line==family_row.lineandannotation.offset==family_row.offsetandannotation.identity_id==family_row.identity_idandannotation.occurrence_offset==family_row.occurrence_offsetandannotation.name==family_row.name:',
+    'allowed:Ast::EnumAnnotation=file.enum_annotations[cursor+1.usize()]',
+    'allowed.owner=="__error_variant_allow"andallowed.line==family_row.lineandallowed.offset==family_row.offsetandallowed.identity_id==family_row.identity_idandallowed.occurrence_offset==family_row.occurrence_offsetandallowed.name==variant',
+    'elifannotation.owner=="__error_variant_family":returnfalse',
+    'returnnotrestricted',
 )
 if not all(fragment in source for fragment in production_fragments):
-    raise SystemExit("error-union variant admission no longer matches the proved unrestricted/restricted policy")
-if 'allowed.owner=="__error_variant_allow"andallowed.line==lineandallowed.name==variant' not in source:
-    raise SystemExit("restricted variant admission no longer requires matching owner, line, and variant")
+    raise SystemExit("error-union variant admission no longer binds the proved policy to one family occurrence")
+
+registration = compact(section(SOURCE.read_text(), "register_error_union_row"))
+registration_fragments = (
+    'occurrence_offset:u32',
+    'annotation.occurrence_offset!=occurrence_offset',
+)
+if not all(fragment in registration for fragment in registration_fragments):
+    raise SystemExit("error-union ABI registration no longer filters family rows by error-set occurrence")
+
+composite_registration = compact(section(SOURCE.read_text(), "register_composite_error_unions"))
+if 'key_annotation.occurrence_offset,structs' not in composite_registration:
+    raise SystemExit("composite error-union keys no longer pass their occurrence to ABI registration")
 
 proof = PROOF.read_text()
 expected = {
@@ -75,35 +87,61 @@ expected = {
             ensure result == false
             return restricted_error_variant_is_allowed(true, false)
     """,
+    "family_marker_restricts_even_when_identity_mismatches": """
+        def family_marker_restricts_even_when_identity_mismatches(has_family_marker: bool, same_identity: bool) -> bool:
+            ensure result == has_family_marker
+            return has_family_marker
+    """,
+    "mismatched_identity_subset_marker_rejects_all_variants": """
+        def mismatched_identity_subset_marker_rejects_all_variants() -> bool:
+            ensure result == false
+            restricted: bool = family_marker_restricts_even_when_identity_mismatches(true, false)
+            return restricted_error_variant_is_allowed(restricted, false)
+    """,
 }
 for name, shape in expected.items():
     if compact(section(proof, name)) != compact(shape):
         raise SystemExit(f"proof claim {name} changed without source review")
 annotation_expected = {
     "error_variant_allow_annotation_matches": """
-        def error_variant_allow_annotation_matches(is_allow_owner: bool, same_line: bool, same_variant: bool) -> bool:
-            ensure result == (is_allow_owner and same_line and same_variant)
-            return is_allow_owner and same_line and same_variant
+        def error_variant_allow_annotation_matches(is_allow_owner: bool, same_line: bool, same_offset: bool, same_identity: bool, same_occurrence: bool, same_variant: bool) -> bool:
+            ensure result == (is_allow_owner and same_line and same_offset and same_identity and same_occurrence and same_variant)
+            return is_allow_owner and same_line and same_offset and same_identity and same_occurrence and same_variant
     """,
     "wrong_owner_allow_marker_is_rejected": """
-        def wrong_owner_allow_marker_is_rejected(same_line: bool, same_variant: bool) -> bool:
+        def wrong_owner_allow_marker_is_rejected(same_line: bool, same_offset: bool, same_identity: bool, same_occurrence: bool, same_variant: bool) -> bool:
             ensure result == false
-            return error_variant_allow_annotation_matches(false, same_line, same_variant)
+            return error_variant_allow_annotation_matches(false, same_line, same_offset, same_identity, same_occurrence, same_variant)
     """,
     "wrong_line_allow_marker_is_rejected": """
-        def wrong_line_allow_marker_is_rejected(is_allow_owner: bool, same_variant: bool) -> bool:
+        def wrong_line_allow_marker_is_rejected(is_allow_owner: bool, same_offset: bool, same_identity: bool, same_occurrence: bool, same_variant: bool) -> bool:
             ensure result == false
-            return error_variant_allow_annotation_matches(is_allow_owner, false, same_variant)
+            return error_variant_allow_annotation_matches(is_allow_owner, false, same_offset, same_identity, same_occurrence, same_variant)
+    """,
+    "wrong_offset_allow_marker_is_rejected": """
+        def wrong_offset_allow_marker_is_rejected(is_allow_owner: bool, same_line: bool, same_identity: bool, same_occurrence: bool, same_variant: bool) -> bool:
+            ensure result == false
+            return error_variant_allow_annotation_matches(is_allow_owner, same_line, false, same_identity, same_occurrence, same_variant)
+    """,
+    "wrong_identity_allow_marker_is_rejected": """
+        def wrong_identity_allow_marker_is_rejected(is_allow_owner: bool, same_line: bool, same_offset: bool, same_occurrence: bool, same_variant: bool) -> bool:
+            ensure result == false
+            return error_variant_allow_annotation_matches(is_allow_owner, same_line, same_offset, false, same_occurrence, same_variant)
+    """,
+    "wrong_occurrence_allow_marker_is_rejected": """
+        def wrong_occurrence_allow_marker_is_rejected(is_allow_owner: bool, same_line: bool, same_offset: bool, same_identity: bool, same_variant: bool) -> bool:
+            ensure result == false
+            return error_variant_allow_annotation_matches(is_allow_owner, same_line, same_offset, same_identity, false, same_variant)
     """,
     "wrong_variant_allow_marker_is_rejected": """
-        def wrong_variant_allow_marker_is_rejected(is_allow_owner: bool, same_line: bool) -> bool:
+        def wrong_variant_allow_marker_is_rejected(is_allow_owner: bool, same_line: bool, same_offset: bool, same_identity: bool, same_occurrence: bool) -> bool:
             ensure result == false
-            return error_variant_allow_annotation_matches(is_allow_owner, same_line, false)
+            return error_variant_allow_annotation_matches(is_allow_owner, same_line, same_offset, same_identity, same_occurrence, false)
     """,
     "matching_allow_marker_is_accepted": """
         def matching_allow_marker_is_accepted() -> bool:
             ensure result == true
-            return error_variant_allow_annotation_matches(true, true, true)
+            return error_variant_allow_annotation_matches(true, true, true, true, true, true)
     """,
 }
 annotation_proof = ANNOTATION_PROOF.read_text()

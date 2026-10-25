@@ -24,14 +24,14 @@ audits that from the source, conservatively:
     Local aliases of diagnostics are treated as reads because they may inspect earlier-pass
     results.
 
-Passes run in `check_full_into_pipeline` (semantic_api.elisa) as `table <- pass(ARGS) [if COND]`. A
+Passes run in `check_full_into_pipeline` (the pipeline source under `semantic_api/`) as `table <- pass(ARGS) [if COND]`. A
 maximal run of consecutive append-only passes whose ARGS/COND use only `file`, `loop_view`,
 `table` and the function's scalar flags becomes one `par_pass_run` call; the passes go into
 semantic_parallel_passes.elisa by id, in pipeline order (the splice order).
 
   semantic_parallel_gen.py --check      verify every pass in semantic_parallel_passes.elisa
                                         (exit 1 naming each one that is not append-only)
-  semantic_parallel_gen.py --write      rewrite semantic_api.elisa runs + the passes file
+  semantic_parallel_gen.py --write      rewrite the pipeline source + the passes file
                                         (input: sequential or already generated pipeline)
   semantic_parallel_gen.py --report     list every pipeline pass and its classification
 """
@@ -43,9 +43,19 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
-API = os.path.join(SRC, "semantic", "semantic_api.elisa")
 PASSES = os.path.join(SRC, "semantic", "semantic_parallel_passes.elisa")
 PIPELINE = "check_full_into_pipeline"
+API_CANDIDATES = (
+    os.path.join(SRC, "semantic", "semantic_api.elisa"),
+    os.path.join(SRC, "semantic", "semantic_api", "full_pipeline.elisa"),
+)
+API = next(
+    (path for path in API_CANDIDATES
+     if os.path.isfile(path) and re.search(
+         r"^\s*def " + PIPELINE + r"(?:\[[^\]]*\])?\(",
+         open(path, encoding="utf-8").read(), re.M)),
+    API_CANDIDATES[0],
+)
 PIPELINE_CONTEXT = {
     "file", "table", "shared_pool", "snapshot", "incremental_skip_count",
     "effect_source_bodies_skipped", "ungranted_panic_bodies_skipped",

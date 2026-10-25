@@ -82,9 +82,18 @@ for name, fields_text in variant_rows:
             raise SystemExit(f"Ast.decl_name must return Decl.{name}'s stored name")
         implementation_fields = [part.strip() for part in implementation_arm.group(1).split(",")]
         first_decl_field = fields_text.split(",", 1)[0].strip() if fields_text else ""
+        declared_field_name = first_decl_field.split(":", 1)[0].strip()
+        implementation_first_field = implementation_fields[0] if implementation_fields else ""
+        if ":" in implementation_first_field:
+            implementation_field_name, implementation_binding = (
+                part.strip() for part in implementation_first_field.split(":", 1)
+            )
+        else:
+            implementation_field_name = declared_field_name
+            implementation_binding = implementation_first_field
         if (not re.search(r":\s*sview(?:\s*@source)?$", first_decl_field) or
-                not implementation_fields or
-                implementation_fields[0] != implementation_arm.group(2)):
+                implementation_field_name != declared_field_name or
+                implementation_binding != implementation_arm.group(2)):
             raise SystemExit(f"Decl.{name} must select exactly its first, declared-name field")
     else:
         expected_implementation = f"Decl.{name}: sview(\"\", 0, 0)" if name == "Invalid" else f"Decl.{name}(_, _): sview(\"\", 0, 0)"

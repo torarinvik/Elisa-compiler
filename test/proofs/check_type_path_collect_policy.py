@@ -101,7 +101,7 @@ scope_arm = semantic_classifier[semantic_classifier.find("Expr.Scope("):]
 qualified_fragments = (
     "false return if not type_path_collect(object, names, dotted) or names.count == 0",
     "false return if any was_dotted in dotted where was_dotted",
-    "return false if any bound_name in bound where bound_name == names[0]",
+    "false return if any bound_name in bound where bound_name == names[0]",
     "row: u32 = binding_nominal_declaration(object, table.current_module, table)",
     "return row != SYMBOL_INDEX_ROW_NONE",
 )

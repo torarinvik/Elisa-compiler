@@ -21,6 +21,7 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 ARITHMETIC = ROOT / "src/backend/codegen_const_checked_arithmetic.elisa"
 FOLDING = ROOT / "src/backend/codegen_const_folding.elisa"
+FOLDING_EXPRS = ROOT / "src/backend/codegen_const_folding_exprs.elisa"
 SEMANTIC_ARITHMETIC = ROOT / "src/semantic/linear_checked_arithmetic.elisa"
 SEMANTIC_INDEX_FOLD = ROOT / "src/semantic/check_index_out_of_bounds.elisa"
 POSITIVE = HERE / "codegen_const_checked_arithmetic.elisa"
@@ -103,6 +104,7 @@ def declaration_names(path: Path) -> set[str]:
 
 arithmetic_text = ARITHMETIC.read_text()
 folding_text = FOLDING.read_text()
+folding_exprs_text = FOLDING_EXPRS.read_text()
 proof_text = POSITIVE.read_text()
 if 'include "./codegen_const_checked_arithmetic.elisa"' not in folding_text:
     raise SystemExit("backend constant folding no longer imports its checked arithmetic helpers")
@@ -245,21 +247,15 @@ semantic_safe_expression = compact("""(
     or (left < 0 and right > 0 and left >= linear_i64_min() / right)
     or (left < 0 and right < 0 and left >= linear_i64_max() / right)
 )""")
+semantic_multiply_guard = compact(function_body(semantic_text, "linear_mul_guard"))
 semantic_multiply = compact(function_body(semantic_text, "linear_mul_safe"))
-multiply_guards = (
-    "ensureresult.known==" + semantic_safe_expression,
-    "safe:bool=" + semantic_safe_expression,
-    "return(safe,0)ifnotsafe",
-    "return(safe,left*right)",
-)
-multiply_positions = []
-search_from = 0
-for fragment in multiply_guards:
-    position = semantic_multiply.find(fragment, search_from)
-    multiply_positions.append(position)
-    search_from = position + len(fragment) if position >= 0 else search_from
-if any(position < 0 for position in multiply_positions) or multiply_positions != sorted(multiply_positions):
+if "ensureresult==" + semantic_safe_expression not in semantic_multiply_guard or \
+        "return" + semantic_safe_expression not in semantic_multiply_guard:
     raise SystemExit("backend multiplication guard no longer matches the proved semantic overflow conditions")
+if "ensureresult.known==linear_mul_guard(left,right)" not in semantic_multiply or \
+        "ifnotlinear_mul_guard(left,right):return(false,0)" not in semantic_multiply or \
+        "return(true,left*right)" not in semantic_multiply:
+    raise SystemExit("semantic multiplication must apply the proved guard before evaluating the product")
 
 semantic_negate = compact(function_body(semantic_text, "linear_neg_safe"))
 if "returnlinear_sub_safe(0,operand)" not in semantic_negate:
@@ -276,7 +272,7 @@ division_positions = [semantic_division.find(fragment) for fragment in division_
 if any(position < 0 for position in division_positions) or division_positions != sorted(division_positions):
     raise SystemExit("backend division and remainder guards no longer match semantic constant folding")
 
-fold_binary = compact(function_body(folding_text, "fold_const_binary_values"))
+fold_binary = compact(function_body(folding_exprs_text, "fold_const_binary_values"))
 fold_patterns = (
     "ifoperator==TokenKind.Plus:ifBackendConstArithmetic::add_is_safe(left_value,right_value):returnleft_value+right_valueelse:ok<-falsereturn0",
     "ifoperator==TokenKind.Minus:ifBackendConstArithmetic::subtract_is_safe(left_value,right_value):returnleft_value-right_valueelse:ok<-falsereturn0",
@@ -288,7 +284,7 @@ fold_patterns = (
 )
 if any(pattern not in fold_binary for pattern in fold_patterns):
     raise SystemExit("constant arithmetic must be guarded before evaluating the signed operation")
-unary = compact(function_body(folding_text, "fold_const_expr"))
+unary = compact(function_body(folding_exprs_text, "fold_const_expr"))
 if "ifunary_operator==TokenKind.Minus:ifBackendConstArithmetic::negation_is_safe(operand_value):return0-operand_valueelse:ok<-falsereturn0" not in unary:
     raise SystemExit("unary-minus folding no longer rejects i64 minimum before negating it")
 
@@ -430,7 +426,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", ARITHMETIC, FOLDING,
+    Path(__file__), HERE / "proof_product_gate.py", ARITHMETIC, FOLDING, FOLDING_EXPRS,
     SEMANTIC_ARITHMETIC, SEMANTIC_INDEX_FOLD,
     POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE]),
 ]))

@@ -28,6 +28,7 @@ extend Semantic:
         struct PrivateMemberIndex:
             names: mutable darray[sview @source]
             modules: mutable darray[sview @source]
+            declaration_offsets: mutable darray[u32]
             name_heads: mutable dict[u64, u32]
             name_next: mutable darray[u32]
             import_heads: mutable dict[u64, u32]
@@ -122,6 +123,7 @@ extend Semantic:
                     previous: u32 = pma_member_head(index, annotation.name)
                     index.names.push(annotation.name)
                     index.modules.push(module_annotation.name)
+                    index.declaration_offsets.push(annotation.offset)
                     index.name_next.push(previous)
                     index.name_heads <- index.name_heads.put(name_hash(annotation.name), row) can Global{Read,Write}
 
@@ -161,26 +163,29 @@ extend Semantic:
                 return false
 
         # A file-level declaration shadows an imported module member with the same bare
-        # spelling. The flat symbol index also contains module members, so an arbitrary
-        # non-module symbol is not enough to establish file-level ownership. An excess value
-        # symbol beyond this name's recorded module-member rows is the top-level declaration.
-        # This matters for the runtime, which intentionally provides a top-level
-        # `sview_starts_with` while the compiler's `Semantic` module has an unrelated private
-        # helper of the same name.
+        # spelling. Module-member rows are recorded once per declaration, so count differences
+        # are not a reliable ownership test when the file also declares an overload.
         def pma_has_global_value(table: SymbolTable&, member: sview) -> bool:
             can Abort.Panic:
-                symbol_count: mutable usize = 0
                 symbol_row: mutable u32 = symbol_chain_head(table, member)
-                while symbol_row != SYMBOL_INDEX_ROW_NONE |symbol_row, table, member, symbol_count|:
+                while symbol_row != SYMBOL_INDEX_ROW_NONE |symbol_row, table, member|:
                     symbol: Symbol = table.symbols[symbol_row.usize()]
-                    symbol_count <- symbol_count + 1 if symbol.name == member and symbol.kind != SymbolKind.Module
+                    return true if symbol.name == member and symbol.kind != SymbolKind.Module and symbol.module_owner == ""
                     symbol_row <- table.symbol_name_next[symbol_row.usize()]
-                member_count: mutable usize = 0
-                member_row: mutable u32 = member_chain_head(table, member)
-                while member_row != SYMBOL_INDEX_ROW_NONE |member_row, table, member, member_count|:
-                    member_count <- member_count + 1 if table.module_member_name[member_row.usize()] == member
-                    member_row <- table.member_name_next[member_row.usize()]
-                return symbol_count > member_count
+                return false
+
+        # A global function shadows a bare function value, but calls still use Core's
+        # overload candidate set across local and imported names. For call targets, only a
+        # non-callable global value or lexical binding makes the private module candidate
+        # unreachable before overload ranking.
+        def pma_has_global_non_callable_value(table: SymbolTable&, member: sview) -> bool:
+            can Abort.Panic:
+                symbol_row: mutable u32 = symbol_chain_head(table, member)
+                while symbol_row != SYMBOL_INDEX_ROW_NONE |symbol_row, table, member|:
+                    symbol: Symbol = table.symbols[symbol_row.usize()]
+                    return true if symbol.name == member and symbol.kind != SymbolKind.Module and symbol.kind != SymbolKind.Func and symbol.module_owner == ""
+                    symbol_row <- table.symbol_name_next[symbol_row.usize()]
+                return false
 
         # `table.imported_members` intentionally keeps only the member spelling. The compact
         # line-indexed pair projection preserves the source module without rescanning all
@@ -195,6 +200,73 @@ extend Semantic:
                     row <- index.import_next[row.usize()]
                 return false
 
+        def pma_import_scope_visible(current_module: sview, import_scope: sview) -> bool:
+            can Abort.Panic:
+                return true if import_scope == ""
+                return pma_within_module(current_module, import_scope)
+
+        def pma_selective_annotation_is_using_member(annotations: darray[Ast::EnumAnnotation]&, member_annotation: Ast::EnumAnnotation, source_annotation: Ast::EnumAnnotation, member: sview) -> bool:
+            can Abort.Panic:
+                return any annotation in annotations where annotation.name == "__using_member" and annotation.owner == source_annotation.name and annotation.module == member and annotation.line == member_annotation.line and annotation.offset == member_annotation.offset
+
+        def pma_selective_import_target_status(annotations: darray[Ast::EnumAnnotation]&, current_module: sview, owner: sview, member: sview) -> (found: bool, known: bool, first: bool):
+            can Abort.Panic:
+                selected_owner: mutable sview = ""
+                selected_scope: mutable sview = ""
+                selected_offset: mutable u32 = 4294967295
+                selected_is_using: mutable bool = false
+                found_owner: mutable bool = false
+                known_order: mutable bool = true
+                for member_annotation in annotations |annotations, current_module, owner, member|:
+                    continue if member_annotation.owner != "__from_member" or member_annotation.name != member
+                    continue if not pma_import_scope_visible(current_module, member_annotation.module)
+                    for source_annotation in annotations |annotations, current_module, owner, member, member_annotation|:
+                        continue if source_annotation.owner != "__from_src" or source_annotation.line != member_annotation.line or source_annotation.module != member_annotation.module
+                        found_owner <- true if source_annotation.name == owner
+                        candidate_is_using: bool = pma_selective_annotation_is_using_member(annotations, member_annotation, source_annotation, member)
+                        if selected_owner == "":
+                            selected_owner <- source_annotation.name
+                            selected_scope <- member_annotation.module
+                            selected_offset <- member_annotation.offset
+                            selected_is_using <- candidate_is_using
+                        elif selected_owner != source_annotation.name:
+                            # Core registers the first alias in one scope. Cross-scope
+                            # conflicts do not carry enough ordered metadata here, so keep
+                            # the private path fail-closed instead of guessing a winner.
+                            if selected_scope != member_annotation.module:
+                                known_order <- false
+                            elif candidate_is_using and not selected_is_using:
+                                selected_owner <- source_annotation.name
+                                selected_offset <- member_annotation.offset
+                                selected_is_using <- true
+                            elif selected_is_using and not candidate_is_using:
+                                pass
+                            elif member_annotation.offset < selected_offset:
+                                selected_owner <- source_annotation.name
+                                selected_offset <- member_annotation.offset
+                                selected_is_using <- candidate_is_using
+                            elif member_annotation.offset == selected_offset:
+                                known_order <- false
+                return (found_owner, known_order, selected_owner == owner)
+
+        def pma_private_imported_module_member_visible(index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, owner: sview, member: sview) -> bool:
+            can Abort.Panic:
+                return true if any annotation in annotations where annotation.name == "__binding_wildcard_import" and annotation.owner == owner and pma_import_scope_visible(current_module, annotation.module)
+                return false if not pma_selective_imports(index, owner, member)
+                target: (found: bool, known: bool, first: bool) = pma_selective_import_target_status(annotations, current_module, owner, member)
+                return target.found and (not target.known or target.first)
+
+        def pma_public_imported_module_member_visible(index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, owner: sview, member: sview) -> bool:
+            can Abort.Panic:
+                return true if any annotation in annotations where annotation.name == "__binding_wildcard_import" and annotation.owner == owner and pma_import_scope_visible(current_module, annotation.module)
+                return false if not pma_selective_imports(index, owner, member)
+                target: (found: bool, known: bool, first: bool) = pma_selective_import_target_status(annotations, current_module, owner, member)
+                return target.found and target.known and target.first
+
+        def pma_imported_module_member_visible(index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, owner: sview, member: sview) -> bool:
+            can Abort.Panic:
+                return pma_public_imported_module_member_visible(index, annotations, current_module, owner, member)
+
         # Is the accessing module INSIDE the owner's privacy boundary? A nested module is:
         # `module A::Paint` may call `A::helper` even when `helper` is private to `A`, which is
         # what stage0 allows. This was a plain `!=` on the module names, so every child module
@@ -204,27 +276,202 @@ extend Semantic:
             can Abort.Panic:
                 return SemanticPrivateModuleBoundary::within_module(current_module, owner)
 
+        # A candidate can join Core's unqualified receiver set when it is in the
+        # current lexical module/one of its ancestors, at file scope, or imported into
+        # the caller's scope. Do not count a public member in a private module path as a
+        # usable sibling: Core can select it, but access checking will reject it.
+        def pma_unqualified_candidate_module_visible(index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, candidate_module: sview, member: sview) -> bool:
+            can Abort.Panic:
+                return true if candidate_module == "" or pma_within_module(current_module, candidate_module)
+                return false if not pma_imported_module_member_visible(index, annotations, current_module, candidate_module, member)
+                segment_start: mutable usize = 0.usize()
+                while segment_start < candidate_module.len |segment_start, candidate_module, current_module, index, member|:
+                    segment_end: mutable usize = segment_start
+                    while segment_end < candidate_module.len and candidate_module[segment_end] != 58 |segment_end, candidate_module|:
+                        segment_end <- segment_end + 1.usize()
+                    segment: sview = candidate_module[segment_start:segment_end]
+                    owner: sview = candidate_module[0:segment_start - 2.usize()] if segment_start >= 2.usize() else ""
+                    return false if pma_is_private(index, owner, segment) and not pma_within_module(current_module, owner)
+                    break if segment_end == candidate_module.len
+                    next_start: usize = segment_end + 2.usize()
+                    return false if next_start >= candidate_module.len or candidate_module[segment_end + 1.usize()] != 58
+                    segment_start <- next_start
+                return true
+
         # Return the owning module when an unqualified name resolves to a private
         # member imported into the current file. Qualified access was the original
         # check, but `using M` makes `M::hidden` and `hidden` the same visibility
         # boundary. Keep the caller's lexical bindings in the query so a parameter
         # or local that shadows a private imported member is not misdiagnosed.
-        def pma_unqualified_owner(table: SymbolTable&, current_module: sview, private_index: PrivateMemberIndex&, bound: darray[sview @source]&, member: sview) -> sview @source:
+        def pma_unqualified_owner(table: SymbolTable&, current_module: sview, private_index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, bound: darray[sview @source]&, member: sview) -> sview @source:
             can Abort.Panic:
                 return "" if:
                     any bound_name in bound where bound_name == member
                     pma_has_global_value(table, member)
+                owner: sview @source = pma_unqualified_private_import_owner(table, current_module, private_index, annotations, member)
+                return "" if owner != "" and pma_has_public_imported_function_value(table, private_index, annotations, current_module, member, owner)
+                return owner
+
+        def pma_unqualified_call_owner(table: SymbolTable&, current_module: sview, private_index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, bound: darray[sview @source]&, member: sview) -> sview @source:
+            can Abort.Panic:
+                return "" if:
+                    any bound_name in bound where bound_name == member
+                    pma_has_global_non_callable_value(table, member)
+                return pma_unqualified_private_import_owner(table, current_module, private_index, annotations, member)
+
+        def pma_unqualified_private_import_owner(table: SymbolTable&, current_module: sview, private_index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, member: sview) -> sview @source:
+            can Abort.Panic:
                 row: mutable u32 = member_chain_head(table, member)
                 while row != SYMBOL_INDEX_ROW_NONE |row, table, current_module, member|:
                     index: usize = row.usize()
                     if table.module_member_name[index] == member:
                         owner: sview @source = table.module_member_owner[index]
                         if not pma_within_module(current_module, owner):
-                            imported: mutable bool = any imported_module in table.imported_modules where imported_module == owner
-                            imported <- true if pma_selective_imports(private_index, owner, member)
+                            imported: bool = pma_private_imported_module_member_visible(private_index, annotations, current_module, owner, member)
                             return owner if imported and pma_is_private(private_index, owner, member) and pma_module_owns(table, owner, member)
                     row <- table.member_name_next[index]
                 return ""
+
+        # The private-section marker is attached to the declaration-head offset, which is
+        # also Symbol.offset. Match it back to the exact overload before using its signature;
+        # name_pos.offset is the identifier token and does not identify the marker.
+        def pma_symbol_has_private_marker(index: PrivateMemberIndex&, symbol: Symbol) -> bool:
+            can Abort.Panic:
+                row: mutable u32 = pma_member_head(index, symbol.name)
+                while row != SYMBOL_INDEX_ROW_NONE |row, index, symbol|:
+                    index_position: usize = row.usize()
+                    return true if index.names[index_position] == symbol.name and index.modules[index_position] == symbol.module_owner and index.declaration_offsets[index_position] == symbol.offset
+                    row <- index.name_next[index_position]
+                return false
+
+        # A private wildcard candidate is removed before a function value is resolved.
+        # If the source also imports a public callable of the same spelling explicitly,
+        # that selective binding is the visible value and the private wildcard row must
+        # not trigger a name-only diagnostic. Calls use the overload-aware path below.
+        def pma_has_public_imported_function_value(table: SymbolTable&, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, member: sview, hidden_owner: sview) -> bool:
+            can Abort.Panic:
+                for symbol in table.symbols |table, index, annotations, current_module, member, hidden_owner|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != member or symbol.module_owner == "" or symbol.module_owner == hidden_owner
+                    continue if not pma_module_owns(table, symbol.module_owner, member) or not pma_unqualified_candidate_module_visible(index, annotations, current_module, symbol.module_owner, member)
+                    return true if not pma_symbol_has_private_marker(index, symbol)
+                return false
+
+        def pma_bound_type_name(bound: darray[sview @source]&, bound_types: darray[sview @source]&, name: sview) -> sview @source:
+            can Abort.Panic:
+                index: mutable usize = bound.count
+                while index > 0 |index, bound, bound_types, name|:
+                    index <- index - 1
+                    return bound_types[index] if bound[index] == name and index < bound_types.count
+                    return "" if bound[index] == name
+                return ""
+
+        def pma_argument_type_name(argument: Ast::Expr, bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> sview @source:
+            can Abort.Panic:
+                match argument:
+                    Expr.IntLit(_, _):
+                        return "int"
+                    Expr.FloatLit(_, _):
+                        return "f64"
+                    Expr.BoolLit(_, _):
+                        return "bool"
+                    Expr.CharLit(_, _):
+                        return "char"
+                    Expr.StringLit(_, _):
+                        return "string"
+                    Expr.Ident(name, _):
+                        return pma_bound_type_name(bound, bound_types, name)
+                    Expr.Paren(inner, _):
+                        return pma_argument_type_name(inner, bound, bound_types)
+                    _:
+                        return ""
+
+        def pma_symbol_first_parameter_type(table: SymbolTable&, symbol: Symbol) -> (found: bool, kind: SemTypeKind, name: sview @source):
+            can Abort.Panic:
+                parameter_index: mutable usize = 0.usize()
+                for row in 0..<table.function_param_declaration_id.count |parameter_index, table, symbol|:
+                    continue if table.function_param_declaration_id[row].value != symbol.id.value
+                    if parameter_index == 0.usize():
+                        return (true, interned_kind(table.function_param_type_id[row], table), table.function_param_type[row]) if row < table.function_param_type_id.count and row < table.function_param_type.count
+                        return (false, SemTypeKind.Unknown, "")
+                    parameter_index <- parameter_index + 1.usize()
+                return (false, SemTypeKind.Unknown, "")
+
+        def pma_generic_parameter_identity(annotations: darray[Ast::EnumAnnotation]&, parameter_name: sview, symbol: Symbol) -> bool:
+            can Abort.Panic:
+                return any annotation in annotations where annotation.owner == parameter_name and annotation.name == "__generic_param_identity" and annotation.detail_line == symbol.line and annotation.offset == symbol.offset and annotation.module == symbol.module_owner
+
+        # Core retains defaulted and variadic signatures in its receiver-ranking pass;
+        # later call validation diagnoses an invalid final argument count.
+        def pma_symbol_core_accepts_receiver_arity(table: SymbolTable&, symbol: Symbol, argument_count: usize) -> bool:
+            can Abort.Panic:
+                return true if symbol.arity_max == 4294967295
+                for row in 0..<table.function_param_declaration_id.count |table, symbol|:
+                    continue if table.function_param_declaration_id[row].value != symbol.id.value
+                    return true if row < table.function_param_has_default.count and table.function_param_has_default[row]
+                return symbol.arity_max == argument_count.u32()
+
+        # Rank only the public cases this checker can prove from source facts: an exact
+        # known builtin formal, or Core's untyped-int-to-integral receiver case, outranks
+        # a bare type parameter. A generic formal can still be the only visible sibling;
+        # unknown conversions fail closed.
+        def pma_public_call_sibling_rank(index: PrivateMemberIndex&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, owner: sview, member: sview, current_module: sview, unqualified_call: bool, arguments: darray[Ast::Expr], bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> (found: bool, rank: usize):
+            can Abort.Panic:
+                return (false, 0.usize()) if arguments.count == 0.usize()
+                actual_type: sview @source = pma_argument_type_name(arguments[0], bound, bound_types)
+                return (false, 0.usize()) if actual_type == ""
+                best_found: mutable bool = false
+                best_rank: mutable usize = 0.usize()
+                for symbol in table.symbols |best_found, best_rank, index, table, annotations, owner, member, current_module, unqualified_call, arguments, actual_type|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != member or pma_symbol_has_private_marker(index, symbol)
+                    if not unqualified_call:
+                        continue if symbol.module_owner != owner
+                    continue if unqualified_call and not pma_unqualified_candidate_module_visible(index, annotations, current_module, symbol.module_owner, member)
+                    continue if not pma_symbol_core_accepts_receiver_arity(table, symbol, arguments.count)
+                    first_parameter: (found: bool, kind: SemTypeKind, name: sview @source) = pma_symbol_first_parameter_type(table, symbol)
+                    continue if not first_parameter.found
+                    candidate_rank: mutable usize = 0.usize()
+                    if first_parameter.kind == SemTypeKind.Named and pma_generic_parameter_identity(annotations, first_parameter.name, symbol):
+                        candidate_rank <- 0.usize()
+                    elif (first_parameter.kind == SemTypeKind.Bool or first_parameter.kind == SemTypeKind.Int or first_parameter.kind == SemTypeKind.Float or first_parameter.kind == SemTypeKind.Char or first_parameter.kind == SemTypeKind.String) and first_parameter.name == actual_type:
+                        candidate_rank <- 1.usize()
+                    elif actual_type == "int" and (first_parameter.kind == SemTypeKind.Int or first_parameter.kind == SemTypeKind.Char):
+                        candidate_rank <- 1.usize()
+                    else:
+                        continue
+                    if not best_found or candidate_rank > best_rank:
+                        best_found <- true
+                        best_rank <- candidate_rank
+                return (best_found, best_rank)
+
+        def pma_private_candidate_excluded_by_public_rank(table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, symbol: Symbol, public_rank: usize, actual_type: sview) -> bool:
+            can Abort.Panic:
+                first_parameter: (found: bool, kind: SemTypeKind, name: sview @source) = pma_symbol_first_parameter_type(table, symbol)
+                return false if not first_parameter.found
+                return true if actual_type == "bool" and (first_parameter.kind == SemTypeKind.Int or first_parameter.kind == SemTypeKind.Float or first_parameter.kind == SemTypeKind.Char or first_parameter.kind == SemTypeKind.String)
+                return public_rank > 0.usize() if first_parameter.kind == SemTypeKind.Named and pma_generic_parameter_identity(annotations, first_parameter.name, symbol)
+                # An exact concrete match can tie another concrete overload, so it must
+                # remain visible to the privacy check. Other conversions are unmodeled.
+                return false
+
+        # Suppress a spelling-based private-call report only when every exact private
+        # overload is ineligible by Core's coarse fixed-arity filter, mismatches a known
+        # bool-vs-primitive pair, or is a generic receiver outranked by an exact public type.
+        # Unknown conversions and concrete ties preserve the privacy diagnostic.
+        def pma_private_call_overloads_excluded(index: PrivateMemberIndex&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, owner: sview, member: sview, current_module: sview, unqualified_call: bool, arguments: darray[Ast::Expr], argument_names: darray[sview @source], bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> bool:
+            can Abort.Panic:
+                return false if any argument_name in argument_names where argument_name != ""
+                public_rank: (found: bool, rank: usize) = pma_public_call_sibling_rank(index, table, annotations, owner, member, current_module, unqualified_call, arguments, bound, bound_types)
+                return false if not public_rank.found
+                actual_type: sview @source = pma_argument_type_name(arguments[0], bound, bound_types) if arguments.count > 0.usize() else ""
+                return false if actual_type == ""
+                private_candidates: mutable usize = 0.usize()
+                all_excluded: mutable bool = true
+                for symbol in table.symbols |private_candidates, all_excluded, index, table, annotations, owner, member, arguments, actual_type, public_rank|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != member or symbol.module_owner != owner or not pma_symbol_has_private_marker(index, symbol)
+                    private_candidates <- private_candidates + 1.usize()
+                    candidate_excluded: bool = not pma_symbol_core_accepts_receiver_arity(table, symbol, arguments.count) or pma_private_candidate_excluded_by_public_rank(table, annotations, symbol, public_rank.rank, actual_type)
+                    all_excluded <- false if not candidate_excluded
+                return private_candidates > 0.usize() and all_excluded
 
         # Whether the `::`-joined module path `owner` is spelled by the Ident/Scope chain in
         # `base`, matching right to left so no joined path has to be BUILT: a synthesized
@@ -274,11 +521,62 @@ extend Semantic:
                     _:
                         Ast::expr_pos(base)
 
-        def pma_report(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview @source]&) -> void:
+        def pma_call_target_identity(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> (member: sview @source, owner: sview @source):
+            can Abort.Panic:
+                return match expression:
+                    Expr.Ident(member, _):
+                        (member, pma_unqualified_call_owner(table, current_module, index, annotations, bound, member))
+                    Expr.Scope(base, member, _):
+                        (member, pma_scope_owner(index, table, base, member))
+                    Expr.Paren(inner, _):
+                        pma_call_target_identity(inner, current_module, index, annotations, table, bound)
+                    _:
+                        ("", "")
+
+        def pma_is_private_function_target(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> bool:
+            can Abort.Panic:
+                identity: (member: sview @source, owner: sview @source) = pma_call_target_identity(expression, current_module, index, annotations, table, bound)
+                return false if identity.member == "" or identity.owner == ""
+                return any symbol in table.symbols where symbol.kind == SymbolKind.Func and symbol.name == identity.member and symbol.module_owner == identity.owner and pma_symbol_has_private_marker(index, symbol)
+
+        # `f[T](...)` and `f[T, U](...)` arrive as Index / IndexN callees, while
+        # `(f)(...)` arrives as Paren. Normalize only a declaration-backed private
+        # function target; ordinary subscripts and function-value expressions keep the
+        # existing recursive expression walk below.
+        def pma_normalize_call_callee(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, bound: darray[sview @source]&) -> Ast::Expr:
+            can Abort.Panic:
+                return match expression:
+                    Expr.Paren(inner, _):
+                        pma_normalize_call_callee(inner, current_module, index, annotations, table, bound)
+                    Expr.Index(object, _, _) if pma_is_private_function_target(object, current_module, index, annotations, table, bound):
+                        pma_normalize_call_callee(object, current_module, index, annotations, table, bound)
+                    Expr.IndexN(object, _, _) if pma_is_private_function_target(object, current_module, index, annotations, table, bound):
+                        pma_normalize_call_callee(object, current_module, index, annotations, table, bound)
+                    _:
+                        expression
+
+        # Once a generic callee has been normalized, still visit its type/index arguments
+        # so private type names inside `f[Hidden]` retain their own diagnostics.
+        def pma_report_call_callee_indices(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, _):
+                        table <- pma_report_call_callee_indices(inner, current_module, index, annotations, table, bound, bound_types)
+                    Expr.Index(object, argument, _):
+                        table <- pma_report_call_callee_indices(object, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(argument, current_module, index, annotations, table, bound, bound_types)
+                    Expr.IndexN(object, arguments, _):
+                        table <- pma_report_call_callee_indices(object, current_module, index, annotations, table, bound, bound_types)
+                        for argument in arguments |table| -> table:
+                            table <- pma_report(argument, current_module, index, annotations, table, bound, bound_types)
+                    _:
+                        pass
+
+        def pma_report(expression: Ast::Expr, current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: darray[sview @source]&, bound_types: darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Ident(member, ident_line):
-                        owner: sview @source = pma_unqualified_owner(table, current_module, index, bound, member)
+                        owner: sview @source = pma_unqualified_owner(table, current_module, index, annotations, bound, member)
                         table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: member, pos: ident_line, line: ident_line.line, expected: "", actual: owner}) if owner != ""
                     Expr.Scope(base, member, scope_line):
                         # The path is checked OUTSIDE-IN: a private module closes the door on
@@ -287,33 +585,57 @@ extend Semantic:
                         # errors for one closed door, so the leaf is only judged once the whole
                         # base path came back clean.
                         reported_before: usize = table.diagnostics.count
-                        table <- pma_report(base, current_module, index, annotations, table, bound)
+                        table <- pma_report(base, current_module, index, annotations, table, bound, bound_types)
                         table <- pma_report_scope_member(base, member, scope_line, current_module, index, annotations, table) if table.diagnostics.count == reported_before
                     Expr.Construct(type_expression, fields, _):
-                        table <- pma_report(type_expression, current_module, index, annotations, table, bound)
+                        table <- pma_report(type_expression, current_module, index, annotations, table, bound, bound_types)
                         for field in fields |table|:
-                            table <- pma_report(field.value, current_module, index, annotations, table, bound)
+                            table <- pma_report(field.value, current_module, index, annotations, table, bound, bound_types)
                     Expr.Block(statements, value, _, _):
                         block_bound: mutable darray[sview @source] = []
                         block_bound.extend(bound)
-                        table <- pma_walk_stmts(statements, current_module, index, annotations, table, block_bound)
-                        table <- pma_report(value, current_module, index, annotations, table, block_bound)
+                        block_bound_types: mutable darray[sview @source] = []
+                        block_bound_types.extend(bound_types)
+                        table <- pma_walk_stmts(statements, current_module, index, annotations, table, block_bound, block_bound_types)
+                        table <- pma_report(value, current_module, index, annotations, table, block_bound, block_bound_types)
                     Expr.Field(object, field, field_line):
-                        table <- pma_report(object, current_module, index, annotations, table, bound)
+                        table <- pma_report(object, current_module, index, annotations, table, bound, bound_types)
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        table <- pma_report(callee, current_module, index, annotations, table, bound)
+                        normalized_callee: Ast::Expr = pma_normalize_call_callee(callee, current_module, index, annotations, table, bound)
+                        normalized_callee_is_path: mutable bool = false
+                        match normalized_callee:
+                            Expr.Ident(callee_name, callee_line):
+                                normalized_callee_is_path <- true
+                                owner: sview @source = pma_unqualified_call_owner(table, current_module, index, annotations, bound, callee_name)
+                                private_candidates_excluded: mutable bool = false
+                                if owner != "":
+                                    private_candidates_excluded <- pma_private_call_overloads_excluded(index, table, annotations, owner, callee_name, current_module, true, arguments, argument_names, bound, bound_types)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: callee_name, pos: callee_line, line: callee_line.line, expected: "", actual: owner}) if owner != "" and not private_candidates_excluded
+                            Expr.Scope(base, callee_name, callee_line):
+                                normalized_callee_is_path <- true
+                                reported_before: usize = table.diagnostics.count
+                                table <- pma_report(base, current_module, index, annotations, table, bound, bound_types)
+                                if table.diagnostics.count == reported_before:
+                                    owner: sview @source = pma_scope_owner(index, table, base, callee_name)
+                                    private_candidates_excluded: mutable bool = false
+                                    if owner != "":
+                                        private_candidates_excluded <- pma_private_call_overloads_excluded(index, table, annotations, owner, callee_name, current_module, false, arguments, argument_names, bound, bound_types)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: callee_name, pos: pma_chain_head_pos(base), line: callee_line.line, expected: "", actual: owner}) if owner != "" and not pma_within_module(current_module, owner) and not private_candidates_excluded
+                            _:
+                                table <- pma_report(callee, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report_call_callee_indices(callee, current_module, index, annotations, table, bound, bound_types) if normalized_callee_is_path
                         for argument in arguments |table| -> table:
-                            table <- pma_report(argument, current_module, index, annotations, table, bound)
+                            table <- pma_report(argument, current_module, index, annotations, table, bound, bound_types)
                     Expr.Binary(left, operator, right, binary_line):
-                        table <- pma_report(left, current_module, index, annotations, table, bound)
-                        table <- pma_report(right, current_module, index, annotations, table, bound)
+                        table <- pma_report(left, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(right, current_module, index, annotations, table, bound, bound_types)
                     Expr.Unary(operator, operand, unary_line):
-                        table <- pma_report(operand, current_module, index, annotations, table, bound)
+                        table <- pma_report(operand, current_module, index, annotations, table, bound, bound_types)
                     Expr.Paren(inner, paren_line):
-                        table <- pma_report(inner, current_module, index, annotations, table, bound)
+                        table <- pma_report(inner, current_module, index, annotations, table, bound, bound_types)
                     Expr.Index(object, index_argument, index_line):
-                        table <- pma_report(object, current_module, index, annotations, table, bound)
-                        table <- pma_report(index_argument, current_module, index, annotations, table, bound)
+                        table <- pma_report(object, current_module, index, annotations, table, bound, bound_types)
+                        table <- pma_report(index_argument, current_module, index, annotations, table, bound, bound_types)
                     _:
                         pass
 
@@ -323,52 +645,69 @@ extend Semantic:
                 return if owner == "" or pma_within_module(current_module, owner)
                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.PrivateMemberAccess, name: member, pos: pma_chain_head_pos(base), line: scope_line.line, expected: "", actual: owner})
 
-        def pma_walk_stmts(statements: darray[Ast::Stmt], current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: mutable darray[sview @source]&) -> void:
+        def pma_walk_stmts(statements: darray[Ast::Stmt], current_module: sview, index: PrivateMemberIndex&, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable, bound: mutable darray[sview @source]&, bound_types: mutable darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table, bound| -> table, bound:
+                for statement in statements |table, bound, bound_types| -> table, bound, bound_types:
                     match statement:
                         Stmt.Return(value, line):
-                            table <- pma_report(returned, current_module, index, annotations, table, bound) if value is returned
+                            table <- pma_report(returned, current_module, index, annotations, table, bound, bound_types) if value is returned
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- pma_report(type_expression, current_module, index, annotations, table, bound)
-                            table <- pma_report(value, current_module, index, annotations, table, bound)
-                            bound.push(name) if name != ""
+                            table <- pma_report(type_expression, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(value, current_module, index, annotations, table, bound, bound_types)
+                            if name != "":
+                                bound.push(name)
+                                bound_types.push(bare_type_name(type_expression))
                         Stmt.Assign(target, operator, value, line):
-                            table <- pma_report(target, current_module, index, annotations, table, bound)
-                            table <- pma_report(value, current_module, index, annotations, table, bound)
+                            table <- pma_report(target, current_module, index, annotations, table, bound, bound_types)
+                            table <- pma_report(value, current_module, index, annotations, table, bound, bound_types)
                         Stmt.Expr(expression, line):
-                            table <- pma_report(expression, current_module, index, annotations, table, bound)
+                            table <- pma_report(expression, current_module, index, annotations, table, bound, bound_types)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- pma_report(condition, current_module, index, annotations, table, bound)
+                            table <- pma_report(condition, current_module, index, annotations, table, bound, bound_types)
                             then_bound: mutable darray[sview @source] = []
                             then_bound.extend(bound)
+                            then_bound_types: mutable darray[sview @source] = []
+                            then_bound_types.extend(bound_types)
                             else_bound: mutable darray[sview @source] = []
                             else_bound.extend(bound)
-                            table <- pma_walk_stmts(then_body, current_module, index, annotations, table, then_bound)
-                            table <- pma_walk_stmts(else_body, current_module, index, annotations, table, else_bound)
+                            else_bound_types: mutable darray[sview @source] = []
+                            else_bound_types.extend(bound_types)
+                            table <- pma_walk_stmts(then_body, current_module, index, annotations, table, then_bound, then_bound_types)
+                            table <- pma_walk_stmts(else_body, current_module, index, annotations, table, else_bound, else_bound_types)
                         Stmt.While(condition, while_body, while_line):
-                            table <- pma_report(condition, current_module, index, annotations, table, bound)
+                            table <- pma_report(condition, current_module, index, annotations, table, bound, bound_types)
                             while_bound: mutable darray[sview @source] = []
                             while_bound.extend(bound)
-                            table <- pma_walk_stmts(while_body, current_module, index, annotations, table, while_bound)
+                            while_bound_types: mutable darray[sview @source] = []
+                            while_bound_types.extend(bound_types)
+                            table <- pma_walk_stmts(while_body, current_module, index, annotations, table, while_bound, while_bound_types)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
-                            table <- pma_report(iterable, current_module, index, annotations, table, bound)
+                            table <- pma_report(iterable, current_module, index, annotations, table, bound, bound_types)
                             for_bound: mutable darray[sview @source] = []
                             for_bound.extend(bound)
+                            for_bound_types: mutable darray[sview @source] = []
+                            for_bound_types.extend(bound_types)
                             for variable in variables:
                                 for_bound.push(variable)
-                            table <- pma_walk_stmts(for_body, current_module, index, annotations, table, for_bound)
+                                for_bound_types.push("")
+                            table <- pma_walk_stmts(for_body, current_module, index, annotations, table, for_bound, for_bound_types)
                         Stmt.Block(kind, clause, binding, body, block_line):
                             block_bound: mutable darray[sview @source] = []
                             block_bound.extend(bound)
-                            block_bound.push(binding) if binding != ""
-                            table <- pma_walk_stmts(body, current_module, index, annotations, table, block_bound)
+                            block_bound_types: mutable darray[sview @source] = []
+                            block_bound_types.extend(bound_types)
+                            if binding != "":
+                                block_bound.push(binding)
+                                block_bound_types.push("")
+                            table <- pma_walk_stmts(body, current_module, index, annotations, table, block_bound, block_bound_types)
                         Stmt.Match(scrutinee, arms, match_line):
-                            table <- pma_report(scrutinee, current_module, index, annotations, table, bound)
+                            table <- pma_report(scrutinee, current_module, index, annotations, table, bound, bound_types)
                             for arm in arms |table| -> table:
                                 arm_bound: mutable darray[sview @source] = []
                                 arm_bound.extend(bound)
-                                table <- pma_walk_stmts(arm.body, current_module, index, annotations, table, arm_bound)
+                                arm_bound_types: mutable darray[sview @source] = []
+                                arm_bound_types.extend(bound_types)
+                                table <- pma_walk_stmts(arm.body, current_module, index, annotations, table, arm_bound, arm_bound_types)
                         _:
                             pass
 
@@ -378,11 +717,13 @@ extend Semantic:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
                             function_bound: mutable darray[sview @source] = []
+                            function_bound_types: mutable darray[sview @source] = []
                             for parameter in parameters |table|:
-                                table <- pma_report(parameter.type_expression, current_module, index, annotations, table, function_bound)
+                                table <- pma_report(parameter.type_expression, current_module, index, annotations, table, function_bound, function_bound_types)
                                 function_bound.push(parameter.name)
-                            table <- pma_report(result_type, current_module, index, annotations, table, function_bound) if return_type is result_type
-                            table <- pma_walk_stmts(body, current_module, index, annotations, table, function_bound)
+                                function_bound_types.push(bare_type_name(parameter.type_expression))
+                            table <- pma_report(result_type, current_module, index, annotations, table, function_bound, function_bound_types) if return_type is result_type
+                            table <- pma_walk_stmts(body, current_module, index, annotations, table, function_bound, function_bound_types)
                         Decl.Module(module_name, module_body, module_line):
                             table <- pma_walk_declarations(module_body, module_name, index, annotations, table)
                         Decl.Scoped(scoped_body, scoped_line):
@@ -394,7 +735,7 @@ extend Semantic:
         def check_private_member_access(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 has_private: bool = any annotation in file.enum_annotations where annotation.owner == "__private_member"
-                private_index: mutable PrivateMemberIndex = PrivateMemberIndex{names: [], modules: [], name_heads: {}, name_next: [], import_heads: {}, import_owners: [], import_members: [], import_next: []}
+                private_index: mutable PrivateMemberIndex = PrivateMemberIndex{names: [], modules: [], declaration_offsets: [], name_heads: {}, name_next: [], import_heads: {}, import_owners: [], import_members: [], import_next: []}
                 pma_build_index(file.enum_annotations, private_index) can Global{Read,Write} if has_private
                 pma_build_selective_import_index(file.enum_annotations, private_index) can Global{Read,Write} if has_private
                 table <- pma_walk_declarations(file.top_decls, "", private_index, file.enum_annotations, table) if has_private

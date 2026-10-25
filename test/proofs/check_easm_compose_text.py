@@ -22,7 +22,7 @@ ENV = ROOT / "src/backend/codegen_env.elisa"
 TEXT = ROOT / "src/backend/easm_compose_text.elisa"
 VERIFY = ROOT / "src/backend/easm_verify_function.elisa"
 PARSE = ROOT / "src/backend/easm_parse.elisa"
-CODEGEN = ROOT / "src/backend/codegen_module.elisa"
+CODEGEN = ROOT / "src/backend/codegen_module_easm.elisa"
 POSITIVE = HERE / "easm_compose_text.elisa"
 NEGATIVE = HERE / "easm_compose_text_rejected.elisa"
 

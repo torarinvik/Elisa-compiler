@@ -23,10 +23,12 @@ rejected = HERE / "ownership_binding_fact_flow_rejected.elisa"
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 MANIFEST_CHECKSUM = MANIFEST.with_name(MANIFEST.name + ".sha256")
 FACADE = ROOT / "src/semantic/semantic.elisa"
+LATE_CHECKS = ROOT / "src/semantic/semantic_late_checks.elisa"
 CONTROL_FLOW = ROOT / "src/semantic/ownership_control_flow.elisa"
 semantic_sources = [ROOT / "src/semantic/binding_identity_types.elisa",
                     ROOT / "src/semantic/ownership_flow_domain.elisa",
                     ROOT / "src/semantic/ownership_binding_flow.elisa",
+                    LATE_CHECKS,
                     CONTROL_FLOW,
                     FACADE]
 source_inputs = [HERE / "proof_product_gate.py", Path(__file__), proof, rejected, *semantic_sources]
@@ -59,7 +61,6 @@ unknown_vector_contract = (
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable)"
     "fact_count:usize=facts.count"
-    "assertfacts.count==fact_count"
     "forindexin0..<fact_count|facts,fact_count,reachable|:"
     "invariantfacts.count==fact_count"
     "invariantforallfact_indexin0..<index:notfacts[fact_index].known"
@@ -67,7 +68,7 @@ unknown_vector_contract = (
     "andfacts[fact_index].may_live==reachable"
     "andfacts[fact_index].may_consumed==reachable"
     "fact:OwnershipBindingFact=facts[index]"
-    "facts[index]<-OwnershipBindingFact{binding_id:fact.binding_id,reachable:reachable,known:false,may_live:reachable,may_consumed:reachable}"
+    "facts[index]<-ownership_binding_unknown(fact.binding_id,reachable)"
     "assertfacts.count==fact_count"
     "assertnotfacts[index].known"
     "assertfacts[index].reachable==reachable"
@@ -97,9 +98,11 @@ unknown_flow_contract = (
 if unknown_flow_contract not in unknown_flow_source:
     raise SystemExit("ownership flow fallback no longer establishes its whole-array unknown invariant")
 facade_source = FACADE.read_text()
-if 'include "./ownership_binding_flow.elisa"' not in facade_source or \
-        'include "./ownership_control_flow.elisa"' not in facade_source or \
-        facade_source.index('include "./ownership_binding_flow.elisa"') > facade_source.index('include "./ownership_control_flow.elisa"'):
+late_checks_source = LATE_CHECKS.read_text()
+if 'include "./semantic_late_checks.elisa"' not in facade_source or \
+        'include "./ownership_binding_flow.elisa"' not in late_checks_source or \
+        'include "./ownership_control_flow.elisa"' not in late_checks_source or \
+        late_checks_source.index('include "./ownership_binding_flow.elisa"') > late_checks_source.index('include "./ownership_control_flow.elisa"'):
     raise SystemExit("the source-bound unknown-fact contract must load before its control-flow consumer")
 if 'include "../../src/semantic/ownership_binding_flow.elisa"' not in proof.read_text():
     raise SystemExit("positive ownership proof no longer includes the production fact-flow laws")

@@ -20,10 +20,19 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POLICY = ROOT / "src/semantic/global_authority_origin_policy.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 AUTHORITY = ROOT / "src/semantic/check_global_authority.elisa"
+AUTHORITY_COVERAGE = ROOT / "src/semantic/check_global_authority_coverage.elisa"
+AUTHORITY_ROWS = ROOT / "src/semantic/check_global_authority_rows.elisa"
+AUTHORITY_SOURCES = [AUTHORITY, AUTHORITY_COVERAGE, AUTHORITY_ROWS, *sorted((AUTHORITY.parent / "check_global_authority").rglob("*.elisa"))]
 AUTHORITY_TYPES = ROOT / "src/semantic/check_global_authority_types.elisa"
+AUTHORITY_TYPE_SOURCES = [AUTHORITY_TYPES, AUTHORITY_TYPES.with_name("check_global_authority_types_references.elisa")]
+FN_VALUE_SIGNATURES = ROOT / "src/semantic/check_fn_value_effect_row_signatures.elisa"
+IMPL_CONFORMANCE = ROOT / "src/semantic/check_impl_conformance.elisa"
 POSITIVE = HERE / "global_authority_origin_policy.elisa"
 NEGATIVE = HERE / "global_authority_origin_policy_rejected.elisa"
 SMOKE = ROOT / "test/parity/mutable_global_grants_smoke.py"
+ALIAS_FIXTURE = ROOT / "test/fixtures/effects/qualified_permission_using_alias.elisa"
+ALIAS_CONFLICT_FIXTURE = ROOT / "test/fixtures/effects/global_authority_nested_alias_conflict.elisa"
+ALIAS_SMOKE = ROOT / "test/parity/effect_handler_stage1_smoke.sh"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--source-only", action="store_true",
@@ -55,7 +64,8 @@ def declarations(source: str) -> set[str]:
 
 policy_text = POLICY.read_text()
 semantic_text = SEMANTIC.read_text()
-authority_text = AUTHORITY.read_text()
+authority_text = "\n".join(path.read_text() for path in AUTHORITY_SOURCES)
+authority_types_text = "\n".join(path.read_text() for path in AUTHORITY_TYPE_SOURCES)
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
@@ -73,6 +83,163 @@ authority_origin_constants = (
 )
 if any(compact(fragment) not in compact(authority_text) for fragment in authority_origin_constants):
     raise SystemExit("origin policy sentinels no longer match the semantic pass")
+
+alias_choice = compact(function_section(authority_text, "ga_module_alias_choice"))
+alias_registration = compact(function_section(authority_text, "ga_module_alias_registration_precedes"))
+if "left_scope==right_scope" not in alias_registration or \
+        "current==left_scope" not in alias_registration or \
+        "current==right_scope" not in alias_registration or \
+        "left_offset<right_offset" not in alias_registration:
+    raise SystemExit("GlobalAuthority alias precedence no longer models Core's scope prepass and source order")
+alias_registration_index = compact(function_section(authority_text, "ga_module_alias_registration_index"))
+if 'alias.name!="__using_alias"' not in alias_registration_index or \
+        "alias.offset!=offset" not in alias_registration_index or \
+        "ga_module_text(alias.module,state)!=scope" not in alias_registration_index:
+    raise SystemExit("GlobalAuthority alias-target cutoffs are not bound to the declaration's registration position")
+if "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,selected_scope,selected_alias.offset,selected_index,state)" not in alias_choice or \
+        "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,lexical_scope,before_alias.offset,before_index,state)" not in alias_choice or \
+        "before_index:usize=ga_module_alias_registration_index(lexical_scope,before_offset,state)" not in alias_choice:
+    raise SystemExit("GlobalAuthority aliases do not select Core's first registered program-wide target")
+parts_resolve = compact(function_section(authority_text, "ga_module_parts_resolve"))
+parts_lexical = parts_resolve.find("ga_module_lexical_parts_path(parts,lexical_scope,state)")
+parts_alias = parts_resolve.find("ga_module_alias_choice(parts[0],lexical_scope,state,depth)")
+parts_root = parts_resolve.find("raw_root:usize=ga_child(state,0,parts[0])")
+if min(parts_lexical, parts_alias, parts_root) < 0 or not parts_lexical < parts_alias < parts_root:
+    raise SystemExit("GlobalAuthority expression/store paths must try complete lexical candidates, aliases, then root spelling")
+alias_resolve = compact(function_section(authority_text, "ga_module_alias_resolve"))
+if "before_offset:u32=GLOBAL_AUTHORITY_OFFSET_NONE" not in alias_resolve or \
+        "ga_module_alias_choice(first,lexical_scope,state,depth)" not in alias_resolve or \
+        "ga_module_alias_target_resolve(target.path,alias.scope,state,depth+1,alias_row.offset)" not in alias_resolve:
+    raise SystemExit("qualified GlobalAuthority module resolution does not use registered aliases and declaration offsets for target recursion")
+alias_lexical = alias_resolve.find("ga_module_lexical_path(path,first,start,lexical_scope,state)")
+alias_choice_position = alias_resolve.find("ga_module_alias_choice(first,lexical_scope,state,depth)")
+alias_suffix = alias_resolve.find("alias_path:usize=ga_module_path_suffix(path,start,resolved,state)")
+alias_root = alias_resolve.find("raw_root:usize=ga_child(state,0,first)")
+if min(alias_lexical, alias_choice_position, alias_suffix, alias_root) < 0 or not alias_lexical < alias_choice_position < alias_suffix < alias_root:
+    raise SystemExit("GlobalAuthority text paths must try complete lexical candidates, alias suffixes, then root spelling")
+alias_target = compact(function_section(authority_text, "ga_module_alias_target_resolve"))
+if "ga_module_alias_choice(first,declaration_scope,state,depth,before_offset)" not in alias_target or \
+        "ga_module_alias_target_resolve(target.path,alias.scope,state,depth+1,alias_row.offset)" not in alias_target:
+    raise SystemExit("GlobalAuthority alias-target recursion drops its source registration cutoff")
+text_module = compact(function_section(authority_text, "ga_text_module"))
+if "ga_module_alias_resolve(path,lexical_scope,state,0,true,before_offset)" not in text_module:
+    raise SystemExit("GlobalAuthority text module lookup drops its source offset")
+for helper_name in ("ga_module", "ga_module_readonly"):
+    helper = compact(function_section(authority_text, helper_name))
+    if "ga_module_parts_resolve(parts,resolved_scope,state,depth,Ast::expr_pos(expression).offset)" not in helper:
+        raise SystemExit(f"{helper_name} drops the source offset while resolving qualified module expressions")
+store_slot = compact(function_section(authority_text, "ga_store_slot"))
+if "ga_module_parts_resolve(module_parts,state.module_scope,state,0,before_offset)" not in store_slot:
+    raise SystemExit("global-store module lookup drops its source offset")
+statement_walk = compact(function_section(authority_text, "ga_statements_inner"))
+if "ga_store_slot(clause[0],state,at.offset)" not in statement_walk:
+    raise SystemExit("global-store statement lookup does not forward the statement offset")
+permission_slot = compact(function_section(authority_text, "ga_permission_slot"))
+if "ga_text_module(head[0:last_scope],lexical_scope,state,before_offset)" not in permission_slot:
+    raise SystemExit("qualified permission lookup drops its source offset")
+coverage = compact(function_section(authority_text, "ga_ref_covers"))
+if "ga_capability_slot(grant,grant_scope,state,grant_before_offset)" not in coverage or "ga_permission_slot(required,required_scope,state,required_before_offset)" not in coverage:
+    raise SystemExit("authority coverage does not bind grant and required aliases to their source offsets")
+row_add = compact(function_section(authority_text, "ga_row_add"))
+if "before_offset:u32=GLOBAL_AUTHORITY_OFFSET_NONE" not in row_add or \
+        "ga_capability_slot(ref,lexical_scope,state,before_offset)" not in row_add or \
+        "ga_permission_slot(ref,lexical_scope,state,before_offset)" not in row_add or \
+        "state.capability_offsets[row]" not in row_add:
+    raise SystemExit("effect-row normalization drops the source offset while resolving capability and permission aliases")
+row_leaf = compact(function_section(authority_text, "ga_row_add_leaf"))
+if "state.effect_row_offsets.push(before_offset)" not in row_leaf:
+    raise SystemExit("normalized effect rows do not retain the source offset used for alias resolution")
+row_replay = compact(function_section(authority_text, "ga_resolve_initial_rows"))
+if "state.effect_row_offsets[row]" not in row_replay:
+    raise SystemExit("signature effect-row replay loses its original alias source offset")
+row_close = compact(function_section(authority_text, "ga_close_rows"))
+if "state.effect_row_offsets[row]" not in row_close:
+    raise SystemExit("call-graph effect-row propagation loses the originating alias source offset")
+row_publish = compact(function_section(authority_text, "ga_publish_rows"))
+if "effect_row_offsets:darray[u32]&" not in row_publish or \
+        "table.effect_canonical_row_offset" not in row_publish:
+    raise SystemExit("canonical effect rows do not publish their source offsets")
+generic_rows = compact(function_section(authority_text, "ga_generic_call_rows_at"))
+if "table.effect_canonical_row_offset[row]" not in generic_rows:
+    raise SystemExit("call-site effect coverage does not use each normalized row's source offset")
+refs_at = compact(function_section(authority_text, "ga_refs_cover_at"))
+if "offsets[index]" not in refs_at or "ga_ref_covers(grants[index],required" not in refs_at:
+    raise SystemExit("stored authority grants are not resolved at their individual declaration offsets")
+lambda_effects = compact(function_section(authority_types_text, "ga_declared_global_members"))
+if 'ga_ref_covers(annotation.name,"Global.Read",ga_module_text(annotation.module,state),0,state,0,annotation.offset' not in lambda_effects or \
+        'ga_ref_covers(annotation.name,"Global.Write",ga_module_text(annotation.module,state),0,state,0,annotation.offset' not in lambda_effects:
+    raise SystemExit("lambda effect inference drops the annotation source offset")
+fn_value_text = FN_VALUE_SIGNATURES.read_text()
+fn_value_families = compact(function_section(fn_value_text, "fver_type_families"))
+fn_value_rows = compact(function_section(fn_value_text, "fver_canonical_within"))
+if "ga_capability_slot(ref,origin_scope,context,before_offset)" not in fn_value_families or \
+        "context.capability_offsets[row]" not in fn_value_families or \
+        "table.effect_canonical_row_offset[row]" not in fn_value_rows or \
+        "ga_refs_cover_at(expected_refs,expected_scopes,expected_offsets" not in fn_value_rows:
+    raise SystemExit("function-value effect comparison drops source offsets from actual or expected alias rows")
+impl_text = IMPL_CONFORMANCE.read_text()
+impl_effects = compact(function_section(impl_text, "imc_protocol_effects"))
+impl_check = compact(function_section(impl_text, "imc_check_effects"))
+if "offsets:mutabledarray[u32]&" not in impl_effects or "offsets.push(effect.offset)" not in impl_effects or \
+        "ga_refs_cover_at(allowed,allowed_scopes,allowed_offsets" not in impl_check or \
+        "table.effect_canonical_row_offset[row]" not in impl_check:
+    raise SystemExit("protocol effect conformance drops source offsets while comparing aliases")
+alias_atom = (ROOT / "test/atoms/authority_coverage.elisa").read_text()
+for probe in (
+    'ga_ref_covers("P::Cap.Read", "Old::Cap.Read", 0, 0, &permission_aliases, 0, 125, 125)',
+    'ga_ref_covers("P::Cap.Read", "Old::Cap.Read", 0, 0, &permission_aliases, 0, 150, 150)',
+    'ga_ref_covers("P::Cap.Read", "New::Cap.Read", 0, 0, &permission_aliases, 0, 150, 150)',
+    'return 59 if ga_text_module("P::Leaf", 0, permission_aliases, 125) != old_permission_leaf',
+    'return 60 if ga_text_module("P::Leaf", 0, permission_aliases, 150) != new_permission_leaf',
+    'return 61 if ga_module_alias_resolve("P::Leaf", 0, permission_aliases, 0, true, 125) != old_permission_leaf',
+    'return 62 if ga_module_alias_resolve("P::Leaf", 0, permission_aliases, 0, true, 150) != new_permission_leaf',
+):
+    if probe not in alias_atom:
+        raise SystemExit(f"authority coverage atom is missing source-order alias probe {probe}")
+for probe in (
+    '_ = ga_row_add(0, "Choice", true, &permission_aliases, 0, 0, 150)',
+    'return 42 if row_ref != "P::Cap.Read" or row_offset != 120',
+    'ga_ref_covers(row_ref, "Old::Cap.Read", 0, 0, &permission_aliases, 0, row_offset, 125)',
+    'ga_ref_covers(row_ref, "New::Cap.Read", 0, 0, &permission_aliases, 0, row_offset, 150)',
+    'ga_edge_rows(0, 1, &edge_filters)',
+    'ga_edge_ref_suppressed(0, "Old::Unsafe", 0, 150, edge_filters)',
+    'edge_old_scope: usize = ga_collect_module(0, "Old", edge_filters)',
+    'edge_new_scope: usize = ga_collect_module(0, "New", edge_filters)',
+    'return 48 if ga_text_module("P", 0, edge_filters, 125) != edge_old_scope',
+    'return 49 if ga_text_module("P", 0, edge_filters, 150) != edge_new_scope',
+    'return 53 if not tied_conflict.found or not tied_conflict.ambiguous',
+    'return 54 if ga_module_alias_resolve("Tie::Leaf", 0.usize(), tied_aliases) != GLOBAL_AUTHORITY_NONE',
+    'return 55 if ga_text_module("Tie::Leaf", 0.usize(), tied_aliases) != GLOBAL_AUTHORITY_NONE',
+    'return 57 if not same_target_tie.found or same_target_tie.ambiguous',
+    'return 58 if ga_module_alias_resolve("Same::Leaf", 0.usize(), tied_aliases) != tied_actual_leaf',
+):
+    if probe not in alias_atom:
+        raise SystemExit(f"authority coverage atom is missing effect-row alias probe {probe}")
+alias_fixture = ALIAS_FIXTURE.read_text()
+alias_smoke = ALIAS_SMOKE.read_text()
+if not (
+    alias_fixture.index("using Backend::Parent as ParentAlias") <
+    alias_fixture.index("using ParentAlias as CapabilityScope") <
+    alias_fixture.index("def caller()") <
+    alias_fixture.index("can CapabilityScope::Cap.Read") <
+    alias_fixture.rindex("using Backend::Alternate as CapabilityScope")
+):
+    raise SystemExit("qualified permission alias fixture no longer shadows after the earlier grant")
+if 'run_positive "qualified_permission_using_alias.elisa"' not in alias_smoke:
+    raise SystemExit("qualified permission alias fixture is not bound to the Stage1 effect smoke")
+alias_conflict_fixture = ALIAS_CONFLICT_FIXTURE.read_text()
+nested_conflict = alias_conflict_fixture.find("using NestedTarget as Shared")
+root_conflict = alias_conflict_fixture.find("using RootTarget as Shared")
+if nested_conflict < 0 or root_conflict < 0 or nested_conflict >= root_conflict or \
+        "# Core registers direct aliases in the current block before descending into nested modules." not in alias_conflict_fixture or \
+        "Shared::slot" not in alias_conflict_fixture:
+    raise SystemExit("nested alias-conflict control no longer exercises Core's reversed textual/registration order")
+
+row_edges = compact(function_section((ROOT / "src/semantic/check_global_authority_rows.elisa").read_text(), "ga_edge_rows"))
+row_filter_check = compact(function_section((ROOT / "src/semantic/check_global_authority_rows.elisa").read_text(), "ga_edge_ref_suppressed"))
+if "row_edge_filter_offsets.push(state.firewall_offsets[index])" not in row_edges or \
+        "state.row_edge_filter_offsets[filter]" not in row_filter_check:
+    raise SystemExit("call-graph firewall snapshots drop their source offsets")
 
 policy_body = compact(function_section(policy_text, "pattern_binding_origin"))
 expected_policy = compact("""
@@ -134,11 +301,11 @@ if permission_body != expected_permission:
 conservative_origin_body = compact(function_section(policy_text, "requires_unknown_alias_permission"))
 expected_conservative_origin = compact('''
 def requires_unknown_alias_permission(origin: usize) -> bool:
-    ensure result == (origin == NO_ORIGIN or origin == UNKNOWN_ALIAS or origin == LOCAL_ALIAS)
-    return origin == NO_ORIGIN or origin == UNKNOWN_ALIAS or origin == LOCAL_ALIAS
+    ensure result == (origin == NO_ORIGIN or origin == UNKNOWN_ALIAS)
+    return origin == NO_ORIGIN or origin == UNKNOWN_ALIAS
 ''')
 if conservative_origin_body != expected_conservative_origin:
-    raise SystemExit("reserved and unknown origins must use the exact fail-closed access classification")
+    raise SystemExit("missing and unknown origins must use the exact fail-closed access classification")
 
 policy_include = 'include "./global_authority_origin_policy.elisa"'
 authority_include = 'include "./check_global_authority.elisa"'
@@ -151,7 +318,8 @@ metadata_steps = (
     "is_reference: bool = ga_type_id_is_reference(binding_type_id, table) or (binding_type_id == 0 and whole_value and ga_expression_is_reference(subject, state, 0))",
     "contains_reference: mutable bool = ga_type_id_contains_reference(binding_type_id, table) or is_reference",
     "source_origin: usize = ga_reference_origin(subject, state, 0) if contains_reference else GLOBAL_AUTHORITY_NONE",
-    "global_origin: usize = SemanticGlobalAuthorityOrigin::pattern_binding_origin(contains_reference, source_origin)",
+    "global_origin: mutable usize = SemanticGlobalAuthorityOrigin::pattern_binding_origin(contains_reference, source_origin)",
+    "global_origin <- GLOBAL_AUTHORITY_LOCAL_ALIAS if contains_reference and source_origin == GLOBAL_AUTHORITY_NONE",
     "return (type_expression, global_origin, type_scope)",
 )
 metadata_positions = [pattern_metadata.find(compact(fragment)) for fragment in metadata_steps]
@@ -161,16 +329,22 @@ if "iftype_expressionisbinding_type_expression:contains_reference<-contains_refe
     raise SystemExit("match binders must classify nested references in named aggregate types")
 if "return(type_expression,GLOBAL_AUTHORITY_NONE)" in pattern_metadata or \
         "return(type_expression,GLOBAL_AUTHORITY_UNKNOWN_ALIAS)" in pattern_metadata:
-    raise SystemExit("match-pattern origin bypasses the proved policy with a local fallback")
+    raise SystemExit("match-pattern origin bypasses the proved policy with an unconditional fallback")
 
 expression_walk = compact(function_section(authority_text, "ga_expression_inner"))
 statement_walk = compact(function_section(authority_text, "ga_statements_inner"))
-for body in (expression_walk, statement_walk):
-    if "ga_type_id_contains_reference(binding_type_id,table)" not in body or \
-            "iterable_origin:usize=ga_reference_origin(iterable,state,0)" not in body or \
-            "SemanticGlobalAuthorityOrigin::pattern_binding_origin(binding_has_references,iterable_origin)" not in body or \
-            "ga_iteration_binding_type_expression(iterable,binding_type_id" not in body:
-        raise SystemExit("loop and comprehension binders must preserve item type and reference-origin summaries")
+if "ga_type_id_contains_reference(binding_type_id,table)" not in expression_walk or \
+        "iterable_origin:usize=ga_reference_origin(iterable,state,0)" not in expression_walk or \
+        "SemanticGlobalAuthorityOrigin::pattern_binding_origin(binding_has_references,iterable_origin)" not in expression_walk or \
+        "SemanticGlobalAuthorityOrigin::pattern_binding_origin(extra_binding_has_references[extra_index],iterable_origin)" not in expression_walk or \
+        "ga_iteration_binding_type_expression(iterable,binding_type_id" not in expression_walk:
+    raise SystemExit("comprehension binders must preserve each item type and reference-origin summary")
+if "ga_type_id_contains_reference(binding_type_id,table)" not in statement_walk or \
+        "iterable_origin:usize=ga_reference_origin(iterable,state,0)" not in statement_walk or \
+        "binding_reference_flags.push(binding_has_references)" not in statement_walk or \
+        "SemanticGlobalAuthorityOrigin::pattern_binding_origin(binding_reference_flags[binding_index],iterable_origin)" not in statement_walk or \
+        "ga_iteration_binding_type_expression(iterable,binding_type_id" not in statement_walk:
+    raise SystemExit("loop binders must preserve each item type and reference-origin summary")
 arms_body = compact(function_section(authority_text, "ga_arms_inner"))
 if "state.local_global_origins.push(metadata.global_origin)" not in arms_body:
     raise SystemExit("match-arm binders no longer retain the proved origin metadata")
@@ -181,20 +355,36 @@ if "elifSemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(alias_o
 if "ifga_expression_is_reference(expression,state,0):ifalias_origin<state.globals.count:" not in access_body:
     raise SystemExit("aggregate origin summaries must not be mistaken for direct global accesses")
 rebind_body = compact(function_section(authority_text, "ga_statements_inner"))
-if "elifSemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin):table<-ga_access_unknown_alias(Ast::expr_pos(value),true,state,table)canGlobal{Read,Write}" not in rebind_body:
-    raise SystemExit("unknown reference rebinds no longer route writes through conservative authority requirements")
+if "origin:usize=ga_update_reference_origin(target,value,state)" not in rebind_body or \
+        "iforigin<state.globals.count:table<-ga_access_slot(origin,Ast::expr_pos(value),true,false,state,table)canGlobal{Read,Write}" not in rebind_body:
+    raise SystemExit("reference rebinds must retain their new origin and charge writes to exact global roots")
+rebind_origin = compact(function_section(authority_text, "ga_update_reference_origin"))
+if "source_origin:usize=ga_reference_rebind_origin(value,state,0)" not in rebind_origin or \
+        "state.local_global_origins[local_index]<-GLOBAL_AUTHORITY_UNKNOWN_ALIAS" not in rebind_origin or \
+        "returnstate.local_global_origins[local_index]" not in rebind_origin:
+    raise SystemExit("reference rebinds must preserve unresolved aliases for conservative checks at later access")
 write_place_body = compact(function_section(authority_text, "ga_write_place_inner"))
 if "ifga_expression_is_reference(expression,state,0):table<-ga_access(expression,true,state,table)canGlobal{Read,Write}" not in write_place_body:
     raise SystemExit("writes through typed aggregate reference fields must consult their preserved origin")
 origin_walk = compact(function_section(authority_text, "ga_reference_origin"))
 for fragment in (
     "Expr.Array(elements,_)|Expr.Tuple(elements,_)|Expr.SetLit(elements,_) ",
-    "SemanticGlobalAuthorityOrigin::join_reference_origins(origin,element_origin)",
-    "SemanticGlobalAuthorityOrigin::join_reference_origins(origin,key_origin)",
-    "SemanticGlobalAuthorityOrigin::join_reference_origins(origin,value_origin)",
+    "ga_join_origins(state,origin,element_origin)",
+    "ga_join_origins(state,origin,key_origin)",
+    "ga_join_origins(state,origin,value_origin)",
 ):
     if compact(fragment) not in origin_walk:
         raise SystemExit("aggregate reference-origin summaries no longer join all contained value origins")
+join_origins = compact(function_section(authority_text, "ga_join_origins"))
+for fragment in (
+    "joined:usize=SemanticGlobalAuthorityOrigin::join_reference_origins(left,right)",
+    "returnjoinedifjoined!=GLOBAL_AUTHORITY_UNKNOWN_ALIAS",
+    "returnGLOBAL_AUTHORITY_UNKNOWN_ALIASifleft==GLOBAL_AUTHORITY_UNKNOWN_ALIASorright==GLOBAL_AUTHORITY_UNKNOWN_ALIAS",
+    "returnGLOBAL_AUTHORITY_UNKNOWN_ALIASifleft<state.globals.countorright<state.globals.count",
+    "returnGLOBAL_AUTHORITY_LOCAL_ALIAS",
+):
+    if fragment not in join_origins:
+        raise SystemExit("authority origin joins must keep known global and unknown aliases conservative")
 local_address = compact(function_section(authority_text, "ga_local_address_origin"))
 for fragment in (
     "returnga_local_origin(local_index,state)ifnotprojected",
@@ -237,17 +427,19 @@ for fragment in (
         raise SystemExit("constructor completeness must fail closed on omitted or unresolved reference fields")
 collection = compact(function_section(authority_text, "ga_collect"))
 for fragment in (
-    "Decl.Enum(name,variants,_,_,_):",
+    "Decl.Enum(name: name, variants: variants, _):",
     "state.enum_variant_owners.push(name)",
     "state.enum_variant_payload_starts.push(state.enum_variant_payload_types.count)",
     "state.enum_variant_payload_counts.push(variant.fields.count)",
     "state.enum_variant_payload_types.push(variant.fields[field_index])",
     "state.enum_variant_payload_names.push(variant.field_names[field_index]iffield_index<variant.field_names.countelsesview(\"\",0,0))",
 ):
-    if fragment not in collection:
+    if compact(fragment) not in collection:
         raise SystemExit("enum constructor origin summaries must bind to declared lexical payload layouts")
 variant_slot = compact(function_section(authority_text, "ga_enum_variant_slot"))
-if "ga_resolve(ga_type_head(owner_expression),ga_type_scope(owner_expression,state),ga_type_qualified(owner_expression),state.enum_names,state.enum_scopes,state)" not in variant_slot or \
+if "ga_resolve_indexed(ga_type_head(owner_expression),ga_type_scope(owner_expression,state),ga_type_qualified(owner_expression),state.enum_names,state.enum_scopes,state.enum_heads,state.enum_next,state)" not in variant_slot or \
+        "state.enum_variant_owners[variant_slot]==state.enum_names[enum_slot]" not in variant_slot or \
+        "state.enum_variant_scopes[variant_slot]==state.enum_scopes[enum_slot]" not in variant_slot or \
         "state.enum_variant_names[variant_slot]==variant_name" not in variant_slot or \
         "ga_local_slot(owner_name,state)<state.locals.count" not in variant_slot:
     raise SystemExit("enum constructor recognition must require its resolved owner and exact variant")
@@ -255,9 +447,13 @@ variant_origin = compact(function_section(authority_text, "ga_enum_constructor_o
 for fragment in (
     "arguments.count!=state.enum_variant_payload_counts[variant_slot]",
     "SemanticGlobalAuthorityOrigin::constructor_origin(GLOBAL_AUTHORITY_NONE,false)",
-    "state.enum_variant_payload_names[payload_index]==label",
+    "payload_count>state.enum_variant_payload_names.count-payload_start",
+    "forargument_indexin0..<arguments.count:",
+    "forpayload_indexinpayload_start..<payload_start+payload_count:",
+    "found<-trueifstate.enum_variant_payload_names[payload_index]==label",
+    "returnSemanticGlobalAuthorityOrigin::constructor_origin(GLOBAL_AUTHORITY_NONE,false)ifnotfound",
     "ga_reference_origin(argument,state,depth+1)",
-    "SemanticGlobalAuthorityOrigin::join_reference_origins(origin,argument_origin)",
+    "ga_join_origins(state,origin,argument_origin)",
     "SemanticGlobalAuthorityOrigin::constructor_origin(origin,true)",
 ):
     if fragment not in variant_origin:
@@ -265,7 +461,7 @@ for fragment in (
 if "Expr.Call(callee,arguments,labels,_):variant_slot:usize=ga_enum_variant_slot(callee,state)" not in origin_walk or \
         "ga_enum_constructor_origin(variant_slot,arguments,labels,state,depth+1)" not in origin_walk:
     raise SystemExit("only resolved enum constructors may expose their payload origins")
-type_expression_classifier = compact(function_section(AUTHORITY_TYPES.read_text(), "ga_type_expression_contains_reference"))
+type_expression_classifier = compact(function_section(authority_types_text, "ga_type_expression_contains_reference"))
 if "returntrueifga_reference_type(resolved,state,depth+1)" not in type_expression_classifier or \
         "owner:usize=ga_known_struct(resolved,state.module_scope,state,depth+1)" not in type_expression_classifier or \
         "returntrueif:state.field_scopes[index]!=state.module_scopega_type_expression_contains_reference(state.field_types[index],state,depth+1)" not in type_expression_classifier or \
@@ -275,7 +471,7 @@ contains_refs = compact(function_section(authority_text, "ga_type_id_contains_re
 if "kind!=SemTypeKind.Optionalandkind!=SemTypeKind.Tupleandkind!=SemTypeKind.Container" not in contains_refs or \
         "ga_type_id_contains_reference(interned_elem(type_id,element_index,table),table,depth+1)" not in contains_refs:
     raise SystemExit("binder reference detection must recurse through tuples and container element types")
-tuple_annotation = compact(function_section(AUTHORITY_TYPES.read_text(), "ga_tuple_field_type"))
+tuple_annotation = compact(function_section(authority_types_text, "ga_tuple_field_type"))
 if 'annotation.owner=="__tuple_label"andannotation.name==field' not in tuple_annotation:
     raise SystemExit("named-tuple field annotations must be available to the global-authority type walk")
 smoke_text = SMOKE.read_text()
@@ -283,20 +479,20 @@ required_regressions = (
     "local reference items stay local through tuple iteration",
     "local reference items stay local through tuple comprehension",
     "local reference payloads stay local through tuple matching",
-    "named tuple reference binder requires Global.Write",
+    "named tuple reference binder follows a loaded reference freely",
     "named tuple reference binder accepts both grants",
     "local nominal reference items stay local through iteration",
-    "nominal reference binder requires Global.Write",
+    "nominal reference binder follows a loaded reference freely",
     "nominal reference binder accepts both grants",
     "local nominal reference binder stays local through match",
-    "nominal match reference binder requires Global.Write",
+    "nominal match reference binder follows a loaded reference freely",
     "nominal match reference binder accepts both grants",
     "nominal reference origin does not taint scalar siblings",
-    "omitted default reference field keeps aggregate origin unknown",
+    "omitted default reference field is followed freely",
     "local enum constructor payload keeps local origin",
-    "external enum payload binder requires Global.Write",
+    "external enum payload binder follows a loaded reference freely",
     "external enum payload binder accepts both grants",
-    "mixed enum payload origins require Global.Write",
+    "mixed enum payload charges the global alias where it is created",
 )
 if any(smoke_text.count(f'("{name}",') != 1 for name in required_regressions):
     raise SystemExit("global-authority smoke suite lost a local-origin or named-tuple alias regression")
@@ -318,8 +514,8 @@ if "GrantOriginCarrier.Wrap(pointer: &seed)" not in smoke_text or \
 unknown_access_body = compact(function_section(authority_text, "ga_access_unknown_alias"))
 unknown_access_fragments = (
     "required:sview=SemanticGlobalAuthorityOrigin::unknown_alias_permission(write)",
-    "returnifga_refs_cover(state.firewalls,state.firewall_scopes,required,0,state)",
-    "ifnotstate.report:_=ga_row_add(state.function,required,true,state)canGlobal{Read,Write}",
+    "returnifga_refs_cover_at(state.firewalls,state.firewall_scopes,state.firewall_offsets,required,0,state,at.offset)",
+    "ifnotstate.report:_=ga_row_add(state.function,required,true,state,GLOBAL_AUTHORITY_NONE,0,at.offset)canGlobal{Read,Write}",
     "ifwrite:state.writes[state.function]<-trueelse:state.reads[state.function]<-true",
     "elifnotga_granted(required,at,state):table.diagnostics<-table.diagnostics.push(Diagnostic{kind:DiagnosticKind.MutableGlobalPermissionUngranted",
 )
@@ -354,7 +550,7 @@ positive_names = {
     "conservative_alias_policy_matches_its_exact_spec",
     "missing_origin_requires_conservative_access",
     "unknown_origin_requires_conservative_access",
-    "reserved_local_alias_requires_conservative_access",
+    "detached_storage_skips_conservative_access",
     "encoded_local_origins_bypass_unknown_alias_policy",
 }
 negative_names = {
@@ -374,7 +570,7 @@ negative_names = {
     "unknown_alias_read_can_require_global_write",
     "unknown_alias_can_skip_conservative_access",
     "missing_origin_can_skip_conservative_access",
-    "reserved_local_alias_can_skip_conservative_access",
+    "detached_storage_can_require_conservative_access",
     "encoded_local_origin_can_require_unknown_alias_access",
 }
 if declarations(positive_text) != positive_names or declarations(negative_text) != negative_names:
@@ -409,10 +605,10 @@ positive_claims = {
     "unknown_alias_permission_matches_its_exact_spec": "SemanticGlobalAuthorityOrigin::unknown_alias_permission(write) == (\"Global.Write\" if write else \"Global.Read\")",
     "writing_through_an_unknown_alias_requires_global_write": 'SemanticGlobalAuthorityOrigin::unknown_alias_permission(true) == "Global.Write"',
     "reading_through_an_unknown_alias_requires_global_read": 'SemanticGlobalAuthorityOrigin::unknown_alias_permission(false) == "Global.Read"',
-    "conservative_alias_policy_matches_its_exact_spec": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin) == (origin == SemanticGlobalAuthorityOrigin::NO_ORIGIN or origin == SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS or origin == SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
+    "conservative_alias_policy_matches_its_exact_spec": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(origin) == (origin == SemanticGlobalAuthorityOrigin::NO_ORIGIN or origin == SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS)",
     "missing_origin_requires_conservative_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::NO_ORIGIN)",
     "unknown_origin_requires_conservative_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS)",
-    "reserved_local_alias_requires_conservative_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
+    "detached_storage_skips_conservative_access": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
     "encoded_local_origins_bypass_unknown_alias_policy": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(global_count + identity)",
 }
 negative_claims = {
@@ -432,7 +628,7 @@ negative_claims = {
     "unknown_alias_read_can_require_global_write": 'SemanticGlobalAuthorityOrigin::unknown_alias_permission(false) == "Global.Write"',
     "unknown_alias_can_skip_conservative_access": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::UNKNOWN_ALIAS)",
     "missing_origin_can_skip_conservative_access": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::NO_ORIGIN)",
-    "reserved_local_alias_can_skip_conservative_access": "not SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
+    "detached_storage_can_require_conservative_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(SemanticGlobalAuthorityOrigin::LOCAL_ALIAS)",
     "encoded_local_origin_can_require_unknown_alias_access": "SemanticGlobalAuthorityOrigin::requires_unknown_alias_permission(global_count + identity)",
 }
 for source_text, claims, label in (
@@ -466,7 +662,8 @@ stage1_provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POLICY, SEMANTIC, AUTHORITY, AUTHORITY_TYPES, SMOKE, POSITIVE, NEGATIVE, *source_closure,
+    POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_SMOKE,
+    ROOT / "test/atoms/authority_coverage.elisa", POSITIVE, NEGATIVE, *source_closure,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

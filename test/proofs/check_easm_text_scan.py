@@ -205,58 +205,23 @@ required_source = (
 )
 if not all(fragment in source_compact for fragment in required_source):
     raise SystemExit("production EASM scanner lost a source contract or loop invariant")
-expected_find = """
-def find(text: sview, needle: sview) -> usize:
-    ensure result <= text.len
-    ensure (needle.len == 0 or text.len < needle.len) implies result == text.len
-    ensure result < text.len implies (
-        needle.len > 0 and
-        needle.len <= text.len and
-        result <= text.len - needle.len and
-        text[result:result + needle.len] == needle
-    )
-    ensure needle.len == 0 or text.len < needle.len or (forall candidate in 0..<result:
-        needle.len > text.len - candidate or
-        text[candidate:candidate + needle.len] != needle
-    )
-    if needle.len == 0 or text.len < needle.len:
-        return text.len
-    assert needle.len > 0 and needle.len <= text.len
-    search_limit: usize = text.len - needle.len + BYTE_INDEX_STEP
-    assert search_limit <= text.len
-    index: mutable usize = 0
-    while index < search_limit |index, search_limit, text, needle|:
-        decreases search_limit - index
-        invariant index <= search_limit
-        invariant forall candidate in 0..<index:
-            candidate <= text.len - needle.len and
-            text[candidate:candidate + needle.len] != needle
-        assert index <= text.len - needle.len
-        assert index + needle.len <= text.len
-        if text[index:index + needle.len] == needle:
-            assert index < text.len
-            assert index <= text.len - needle.len
-            assert text[index:index + needle.len] == needle
-            assert needle.len == 0 or text.len < needle.len or (forall candidate in 0..<index:
-                needle.len > text.len - candidate or
-                text[candidate:candidate + needle.len] != needle
-            )
-            return index
-        else:
-            assert text[index:index + needle.len] != needle
-            assert (forall candidate in 0..<(index + BYTE_INDEX_STEP):
-                candidate <= text.len - needle.len and
-                text[candidate:candidate + needle.len] != needle
-            )
-        index <- index + BYTE_INDEX_STEP
-    assert index == search_limit
-    assert needle.len == 0 or text.len < needle.len or (forall candidate in 0..<text.len:
-        needle.len > text.len - candidate or
-        text[candidate:candidate + needle.len] != needle
-    )
-    return text.len
-"""
-if compact(function_section(source_text, "find")) != compact(expected_find):
+find_scan = compact(function_section(source_text, "find"))
+required_find_scan = (
+    "ensure result <= text.len",
+    "ensure (needle.len > 0 and needle.len <= text.len and result < text.len) implies (find_no_match_before(text, needle, result.i64()))",
+    "ensure (needle.len > 0 and needle.len <= text.len and result == text.len) implies (find_no_match_before(text, needle, text.len.i64() - needle.len.i64() + SIGNED_INDEX_STEP))",
+    "if needle.len == 0 or text.len < needle.len: return text.len.usize()",
+    "search_limit: i64 = text_length - needle_length + SIGNED_INDEX_STEP",
+    "invariant find_no_match_before(text, needle, index)",
+    "if text[index:index + needle.len] == needle",
+    "assert find_no_match_before(text, needle, index)",
+    "return index.usize()",
+    "assert find_no_match_before(text, needle, index + SIGNED_INDEX_STEP)",
+    "index <- index + SIGNED_INDEX_STEP",
+    "assert find_no_match_before(text, needle, search_limit)",
+    "return text.len.usize()",
+)
+if any(compact(fragment) not in find_scan for fragment in required_find_scan):
     raise SystemExit("production EASM substring search no longer implements the verified first-match scan")
 expected_memory_delimiter = """
 def contains_memory_address_delimiter(has_parenthesis: bool, has_square_bracket: bool) -> bool:

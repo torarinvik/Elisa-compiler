@@ -5,7 +5,7 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "src/backend/codegen_try_lowering.elisa"
+SOURCE = ROOT / "src/backend/codegen_try_lowering_propagation.elisa"
 text = SOURCE.read_text(encoding="utf-8")
 
 

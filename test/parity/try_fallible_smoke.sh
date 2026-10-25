@@ -85,6 +85,54 @@ grep -q 'try requires a fallible expression' <<< "$unary_numeric_alias"
 first_class=$(printf 'error E:\n    Bad\n\ndef forward(value: i64 error[E]) -> i64 error[E]:\n    return try value\n' | "$RPT")
 grep -q '^D 0$' <<< "$first_class"
 
+callback_return_occurrence='error CallbackFault:
+    Bad
+error ReturnFault:
+    Other
+
+def bad(callback: fn() -> i64 error[CallbackFault]) -> i64 error[ReturnFault]:
+    return try callback()
+
+def good(callback: fn() -> i64 error[CallbackFault]) -> i64 error[CallbackFault]:
+    return try callback()'
+callback_return_occurrence_report=$(printf '%s\n' "$callback_return_occurrence" | "$RPT")
+grep -q '^D 1$' <<< "$callback_return_occurrence_report" || {
+    echo "try_fallible FAILED: expected exactly the incompatible callback/return diagnostic: $callback_return_occurrence_report"
+    exit 1
+}
+grep -q 'cannot propagate CallbackFault from a function returning ReturnFault' <<< "$callback_return_occurrence_report" || {
+    echo "try_fallible FAILED: callback parameter error set was mistaken for the enclosing return set: $callback_return_occurrence_report"
+    exit 1
+}
+[[ $(grep -c 'cannot propagate CallbackFault from a function returning ReturnFault' <<< "$callback_return_occurrence_report") -eq 1 ]] || {
+    echo "try_fallible FAILED: expected exactly one callback/return occurrence mismatch: $callback_return_occurrence_report"
+    exit 1
+}
+
+composite_source='error Foo:
+    FooTag
+error Bar:
+    BarTag
+
+def may_fail() -> i64 error[Foo, Bar]:
+    return 1
+
+def only_foo() -> i64 error[Foo]:
+    return try may_fail()'
+composite_source_report=$(printf '%s\n' "$composite_source" | "$RPT")
+grep -q '^D 1$' <<< "$composite_source_report" || {
+    echo "try_fallible FAILED: expected composite source to reject its unrepresented Bar family: $composite_source_report"
+    exit 1
+}
+grep -q 'cannot propagate Bar from a function returning Foo' <<< "$composite_source_report" || {
+    echo "try_fallible FAILED: composite source was accepted by a caller that only returns Foo: $composite_source_report"
+    exit 1
+}
+[[ $(grep -c 'cannot propagate Bar from a function returning Foo' <<< "$composite_source_report") -eq 1 ]] || {
+    echo "try_fallible FAILED: expected exactly one diagnostic for the unrepresented Bar family: $composite_source_report"
+    exit 1
+}
+
 nested_parens=$(printf 'error E:\n    Bad\n\ndef forward(value: i64 error[E]) -> i64 error[E]:\n    return try ((value))\n' | "$RPT")
 grep -q '^D 0$' <<< "$nested_parens"
 
@@ -630,5 +678,14 @@ grep -q 'try requires a fallible expression' <<< "$nonfallible_conditional"
 
 recovered=$(printf 'def maybe(flag: bool) -> int?:\n    return 7 if flag else null\ndef ok(flag: bool) -> int:\n    return try maybe(flag) else 0\n' | "$RPT")
 grep -q '^D 0$' <<< "$recovered"
+
+bash "$REPO_ROOT/test/parity/try_lexical_lookup_smoke.sh"
+bash "$REPO_ROOT/test/parity/try_error_subset_coverage_smoke.sh"
+bash "$REPO_ROOT/test/parity/try_error_malformed_empty_destination_different_source_smoke.sh"
+bash "$REPO_ROOT/test/parity/try_overload_error_set_by_argument_type_smoke.sh"
+bash "$REPO_ROOT/test/parity/try_overload_error_set_by_struct_argument_smoke.sh"
+bash "$REPO_ROOT/test/parity/try_error_repeated_family_subsets_smoke.sh"
+bash "$REPO_ROOT/test/parity/try_error_dot_subset_smoke.sh"
+bash "$REPO_ROOT/test/parity/try_error_bare_variant_subset_smoke.sh"
 
 echo "try fallibility smoke OK" >&2

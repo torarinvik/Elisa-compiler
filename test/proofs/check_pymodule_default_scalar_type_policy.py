@@ -1,4 +1,5 @@
 """Admit source-linked proofs of PyModule default scalar type-name groups."""
+import argparse
 import hashlib
 import json
 import os
@@ -9,10 +10,17 @@ import subprocess
 from proof_product_gate import require_current_product, source_include_closure
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--source-only", action="store_true")
+args = parser.parse_args()
 ROOT = Path(__file__).resolve().parents[2]
-PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
+PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(
+    strict=not args.source_only
+)
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(
+    strict=not args.source_only
+)
 POSITIVE = HERE / "pymodule_default_scalar_type_policy.elisa"
 NEGATIVE = HERE / "pymodule_default_scalar_type_policy_rejected.elisa"
 POLICY = ROOT / "src/driver/pymodule/default_scalar_type_policy.elisa"
@@ -54,13 +62,17 @@ if 'include "../../src/driver/pymodule/default_hashable_policy.elisa"' not in pr
     raise SystemExit("the scalar group partition proof no longer includes the hashable-type policy")
 for name, expected_names in groups.items():
     section = function_section(policy_text, name)
-    contract = re.search(r"(?m)^\s*ensure result == \(when type_name:\s*\n(.*?)^\s*\)", section, re.DOTALL)
+    contract = re.search(
+        r"(?m)^[ \t]*ensure when type_name:[ \t]*\n(.*?)(?=^[ \t]*return match type_name:)",
+        section,
+        re.DOTALL,
+    )
     implementation = re.search(r"(?m)^\s*return match type_name:\s*\n(.*)", section, re.DOTALL)
     if not contract or not implementation:
         raise SystemExit(f"{name} must have both a match contract and a match implementation")
-    for description, body, arrow in (
-        ("contract", contract.group(1), "->"),
-        ("implementation", implementation.group(1), ":"),
+    for description, body, arm_suffix in (
+        ("contract", contract.group(1), r"->\s*result\s*==\s*(true|false)"),
+        ("implementation", implementation.group(1), r":\s*(true|false)"),
     ):
         arms = []
         for line in body.splitlines():
@@ -69,8 +81,7 @@ for name, expected_names in groups.items():
                 continue
             match = re.fullmatch(
                 r'("[^"\\]+"(?:\s*\|\s*"[^"\\]+")*|_)\s*'
-                + re.escape(arrow)
-                + r'\s*(true|false)',
+                + arm_suffix,
                 stripped,
             )
             if not match:
@@ -126,6 +137,14 @@ expected_proofs = {
 for name, expected in expected_proofs.items():
     if compact(function_section(proof_text, name)) != compact(expected):
         raise SystemExit(f"proof body {name} changed without updating its source gate")
+
+if args.source_only:
+    print(json.dumps({
+        "source_bound": True,
+        "scalar_type_groups": len(groups),
+        "proof_bodies": len(expected_proofs),
+    }))
+    raise SystemExit(0)
 
 try:
     manifest = require_current_product(BIN, PROVER)

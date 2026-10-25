@@ -1,20 +1,8 @@
-# Error-union diagnostic (docs/62 §3.3): a `raise` statement requires the enclosing
-# function to declare an error-union return set (`-> T error[E]`). Stage0 emits "raise
-# requires the current function to return an error union" at each such `raise` whose
-# function declares no error set.
-#
-# In stage1 the `raise` keyword parses to a bare `Expr.Ident("raise")` leaf (its operand
-# is not modeled yet), so a `raise` statement surfaces as `Stmt.Expr(Expr.Ident("raise"))`.
-# `raise` is a reserved keyword (lexed to TokenKind.Raise), so no user identifier can spell
-# it — every such leaf is a genuine raise.
-#
-# SOUNDNESS (zero false positives is the prime directive): fire ONLY on a statement-position
-# `raise` inside a function whose signature declared NO `error[...]` set. The declared-set
-# presence is recorded by the parser (File.error_set_func_lines) exhaustively — every
-# error-set function's line is pushed — so a function that has an error set is NEVER flagged.
-# A `raise` buried in a sub-expression (e.g. a lambda body) is not at statement position and
-# is a sound miss, never a fire. `error[...]` is the only error-union return spelling
-# (docs/62), so exemption is complete.
+# Error-union diagnostics (docs/62 §3.3): every `raise` expression requires the enclosing
+# function to declare an error-union return set (`-> T error[E]`), and a qualified raised
+# family must be covered by that set. The parser represents `raise E.Tag` as a call-shaped
+# AST node so ordinary expression walks can retain its operand. Lambda bodies are skipped
+# here and checked by the lambda-specific conformance pass.
 extend Semantic:
     private:
         # Whether a source line is among the recorded error-set-declaring function lines.
@@ -35,46 +23,279 @@ extend Semantic:
                     return ident_name == "raise"
                 Expr.Call(callee, arguments, argument_names, call_line):
                     return is_raise_expression(callee)
+                Expr.Paren(inner, _):
+                    return is_raise_expression(inner)
                 _:
                     return false
 
 
-        def raised_error_owner(expression: Ast::Expr) -> sview:
+        def raise_append_scope_path(expression: Ast::Expr, bytes: mutable darray[u8]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        for index in 0..<name.len |bytes, name|:
+                            bytes.push(name[index])
+                        return true
+                    Expr.Scope(base, name, _):
+                        return false if not raise_append_scope_path(base, bytes)
+                        bytes.push(58)
+                        bytes.push(58)
+                        for index in 0..<name.len |bytes, name|:
+                            bytes.push(name[index])
+                        return true
+                    Expr.Paren(inner, _):
+                        return raise_append_scope_path(inner, bytes)
+                    _:
+                        return false
+
+
+        def raise_scope_path_leaf(expression: Ast::Expr) -> sview:
             match expression:
-                Expr.Call(Expr.Ident(head, head_line), arguments, argument_names, call_line):
-                    if arguments.count > 0:
-                        match arguments[0]:
-                            Expr.Field(object, tag, tag_line):
-                                match object:
-                                    Expr.Ident(owner, owner_line):
-                                        return owner
-                                    _:
-                                        pass
-                            _:
-                                pass
+                Expr.Ident(name, _):
+                    return name
+                Expr.Scope(_, name, _):
+                    return name
+                Expr.Paren(inner, _):
+                    return raise_scope_path_leaf(inner)
                 _:
                     pass
             return ""
 
 
-        def raised_error_tag(expression: Ast::Expr) -> sview:
-            match expression:
-                Expr.Call(Expr.Ident(head, head_line), arguments, argument_names, call_line):
-                    if arguments.count > 0:
-                        match arguments[0]:
-                            Expr.Field(object, tag, tag_line):
-                                match object:
-                                    Expr.Ident(owner, owner_line):
-                                        return tag
-                                    _:
-                                        pass
-                            _:
-                                pass
-                _:
-                    pass
-            return ""
+        def raise_variant_source(expression: Ast::Expr, table: mutable SymbolTable&) -> (family: sview @source, path: sview @source, tag: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Field(owner_expression, tag, _):
+                        family: sview @source = raise_scope_path_leaf(owner_expression)
+                        return ("", "", "") if family == ""
+                        path_bytes: mutable darray[u8] = []
+                        return ("", "", "") if not raise_append_scope_path(owner_expression, path_bytes)
+                        path: sview @source = intern_joined_text(path_bytes, table)
+                        return (family, path, tag)
+                    # Payload-bearing variants are represented as a call whose callee is
+                    # the same `Family.Variant` field expression. Keep destination and
+                    # subset checks active for `raise Family.Variant(payload)` too.
+                    Expr.Call(Expr.Field(owner_expression, tag, _), _, _, _):
+                        family: sview @source = raise_scope_path_leaf(owner_expression)
+                        return ("", "", "") if family == ""
+                        path_bytes: mutable darray[u8] = []
+                        return ("", "", "") if not raise_append_scope_path(owner_expression, path_bytes)
+                        path: sview @source = intern_joined_text(path_bytes, table)
+                        return (family, path, tag)
+                    Expr.Paren(inner, _):
+                        return raise_variant_source(inner, table)
+                    _:
+                        return ("", "", "")
 
 
+        def raised_error_source(expression: Ast::Expr, table: mutable SymbolTable&) -> (family: sview @source, path: sview @source, tag: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(Expr.Ident(head, _), arguments, _, _):
+                        if head == "raise" and arguments.count > 0:
+                            return raise_variant_source(arguments[0], table)
+                    _:
+                        pass
+                return ("", "", "")
+
+
+        def raise_declaration_annotation_matches(annotation: Ast::EnumAnnotation, function_pos: Ast::Pos, identity_id: u32) -> bool:
+            return false if annotation.line != function_pos.line
+            return false if function_pos.offset != 0 and annotation.offset != 0 and annotation.offset != function_pos.offset
+            return false if identity_id != 0 and annotation.identity_id != 0 and annotation.identity_id != identity_id
+            return true
+
+
+        def raise_function_identity(annotations: darray[Ast::EnumAnnotation]&, function_name: sview, function_pos: Ast::Pos) -> u32:
+            for annotation in annotations |function_name, function_pos|:
+                return annotation.identity_id if annotation.owner == function_name and annotation.name == "__error_return" and annotation.line == function_pos.line and (function_pos.offset == 0 or annotation.offset == 0 or annotation.offset == function_pos.offset)
+            return 0
+
+
+        # Header error-family rows share a declaration key, but callback parameter
+        # types and the function's return type can each contain their own error set.
+        # The return marker carries the occurrence key for the set checked here.
+        def raise_return_error_occurrence(annotations: darray[Ast::EnumAnnotation]&, function_name: sview, function_pos: Ast::Pos, identity_id: u32) -> u32:
+            for annotation in annotations |function_pos, identity_id|:
+                return annotation.occurrence_offset if annotation.owner == function_name and annotation.name == "__error_return" and raise_declaration_annotation_matches(annotation, function_pos, identity_id)
+            return 0
+
+
+        def lrc_is_error_set_family(annotation: Ast::EnumAnnotation) -> bool:
+            return annotation.owner == "__error_set_family"
+
+
+        def raise_function_declares_error_set(lines: darray[u32], annotations: darray[Ast::EnumAnnotation]&, function_name: sview, function_pos: Ast::Pos) -> bool:
+            for annotation in annotations |function_name, function_pos|:
+                return true if annotation.owner == function_name and annotation.name == "__error_return" and annotation.line == function_pos.line and (function_pos.offset == 0 or annotation.offset == 0 or annotation.offset == function_pos.offset)
+            return line_declares_error_set(lines, function_pos.line) if function_pos.offset == 0
+            return false
+
+
+        def raise_function_module(annotations: darray[Ast::EnumAnnotation]&, function_pos: Ast::Pos, identity_id: u32, occurrence_offset: u32) -> (known: bool, module: sview @source):
+            for annotation in annotations |function_pos, identity_id|:
+                continue if annotation.owner != "__fn_module" or not raise_declaration_annotation_matches(annotation, function_pos, identity_id) or annotation.occurrence_offset != occurrence_offset
+                return (true, annotation.name)
+            return (false, "")
+
+
+        def raise_family_path(annotations: darray[Ast::EnumAnnotation]&, family_index: usize, function_pos: Ast::Pos, identity_id: u32, occurrence_offset: u32) -> sview @source:
+            can Abort.Panic:
+                return "" if family_index >= annotations.count or family_index + 1.usize() >= annotations.count
+                family: Ast::EnumAnnotation = annotations[family_index]
+                path: Ast::EnumAnnotation = annotations[family_index + 1.usize()]
+                return "" if family.owner != "__error_set_family" or not raise_declaration_annotation_matches(family, function_pos, identity_id)
+                return "" if family.occurrence_offset != occurrence_offset
+                return path.name if path.owner == "__error_set_family_path" and path.line == family.line and path.offset == family.offset and path.identity_id == family.identity_id and path.occurrence_offset == family.occurrence_offset
+                return ""
+
+
+        def raise_family_subset_status(annotations: darray[Ast::EnumAnnotation]&, family_index: usize, function_pos: Ast::Pos, identity_id: u32, occurrence_offset: u32, family: sview, variant: sview) -> (restricted: bool, allowed: bool, first_allowed: sview @source):
+            can Abort.Panic:
+                restricted: mutable bool = false
+                allowed: mutable bool = false
+                first_allowed: mutable sview @source = ""
+                return (false, true, "") if family_index >= annotations.count
+                family_row: Ast::EnumAnnotation = annotations[family_index]
+                return (false, true, "") if family_row.owner != "__error_set_family" or family_row.name != family or not raise_declaration_annotation_matches(family_row, function_pos, identity_id)
+                return (false, true, "") if family_row.occurrence_offset != occurrence_offset
+                path_row: sview = raise_family_path(annotations, family_index, function_pos, identity_id, occurrence_offset)
+                return (false, true, "") if path_row == ""
+                row_index: mutable usize = family_index + 2.usize()
+                while row_index < annotations.count |row_index, annotations, function_pos, identity_id, family, variant, restricted, allowed, first_allowed, family_row|:
+                    row: Ast::EnumAnnotation = annotations[row_index]
+                    break if row.owner == "__error_set_family" and raise_declaration_annotation_matches(row, function_pos, identity_id)
+                    if row.owner == "__error_variant_family":
+                        restricted <- true
+                        marker_matches: bool = row.name == family and row.line == family_row.line and row.offset == family_row.offset and row.identity_id == family_row.identity_id and row.occurrence_offset == family_row.occurrence_offset
+                        if marker_matches and row_index + 1.usize() < annotations.count:
+                            allow: Ast::EnumAnnotation = annotations[row_index + 1.usize()]
+                            if allow.owner == "__error_variant_allow" and allow.line == row.line and allow.offset == row.offset and allow.identity_id == row.identity_id and allow.occurrence_offset == row.occurrence_offset:
+                                first_allowed <- allow.name if first_allowed == ""
+                                allowed <- true if allow.name == variant
+                    elif row.owner == "__error_variant_allow":
+                        # Do not let an orphan allow row turn a restricted family into an
+                        # unrestricted one; the bounded family/path region makes it suspect.
+                        restricted <- true
+                    row_index <- row_index + 1.usize()
+                return (restricted, allowed, first_allowed)
+
+
+        def raise_family_refs_match(source_family: sview, source_path: sview, source_module_known: bool, source_module: sview, destination_family: sview, destination_path: sview, destination_module_known: bool, destination_module: sview) -> bool:
+            return false if source_family != destination_family
+            return source_module == destination_module if source_module_known and destination_module_known
+            return source_family == destination_family if source_path == source_family and destination_path == destination_family and not source_module_known and not destination_module_known
+            return false
+
+
+        # An unqualified enum name may resolve through a declaration-scoped selective
+        # import even when another module declares the same leaf. Mirror that binding only
+        # when the import is visible before this function and its source module resolves to
+        # one concrete owner; otherwise retain the conservative family resolver below.
+        def raise_imported_family_module(annotations: darray[Ast::EnumAnnotation]&, function_pos: Ast::Pos, function_module_known: bool, function_module: sview @source, family: sview @source, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Abort.Panic:
+                return (false, family) if not function_module_known
+                import_scope: mutable sview @source = ""
+                import_source: mutable sview @source = ""
+                import_scope_length: mutable usize = 0
+                import_found: mutable bool = false
+                import_ambiguous: mutable bool = false
+                for imported in annotations |import_scope, import_source, import_scope_length, import_found, import_ambiguous, function_pos, function_module, family|:
+                    continue if imported.owner != "__from_member" or imported.name != family
+                    continue if not catch_module_is_ancestor(imported.module, function_module)
+                    continue if function_pos.offset != 0 and imported.offset >= function_pos.offset
+                    continue if function_pos.offset == 0 and imported.line >= function_pos.line
+                    source_module: mutable sview @source = ""
+                    source_found: mutable bool = false
+                    source_ambiguous: mutable bool = false
+                    for source in annotations |source_module, source_found, source_ambiguous, imported|:
+                        if source.owner == "__from_src" and source.module == imported.module and source.line == imported.line and source.offset == imported.offset:
+                            if not source_found:
+                                source_module <- source.name
+                                source_found <- true
+                            elif source_module != source.name:
+                                source_ambiguous <- true
+                    continue if not source_found or source_ambiguous or source_module == ""
+                    if not import_found or imported.module.len > import_scope_length:
+                        import_scope <- imported.module
+                        import_source <- source_module
+                        import_scope_length <- imported.module.len
+                        import_found <- true
+                        import_ambiguous <- false
+                    elif imported.module == import_scope and source_module != import_source:
+                        import_ambiguous <- true
+                return (false, family) if not import_found or import_ambiguous
+                target_owner: sview @source = binding_import_module_owner(import_source, import_scope, table)
+                return (false, family) if target_owner == ""
+                selected_module: mutable sview @source = ""
+                selected_found: mutable bool = false
+                for index in 0..<table.enum_variant_owner.count |index, selected_module, selected_found, table, family, target_owner|:
+                    continue if table.enum_variant_owner[index] != family or index >= table.enum_variant_module.count
+                    candidate_module: sview @source = table.enum_variant_module[index]
+                    continue if candidate_module != target_owner
+                    if not selected_found:
+                        selected_module <- candidate_module
+                        selected_found <- true
+                    elif candidate_module != selected_module:
+                        return (false, family)
+                return (true, selected_module) if selected_found
+                return (false, family)
+
+
+        def raise_error_family_module_for_declaration(annotations: darray[Ast::EnumAnnotation]&, function_pos: Ast::Pos, identity_id: u32, family: sview @source, family_path: sview @source, function_module_known: bool, function_module: sview @source, table: SymbolTable&) -> (known: bool, module: sview @source):
+            can Abort.Panic:
+                explicit: (known: bool, module: sview @source) = catch_error_family_module_for_declaration(annotations, function_pos.line, function_pos.offset, identity_id, family, family_path, function_module_known, function_module, table)
+                return explicit if explicit.known
+                return raise_imported_family_module(annotations, function_pos, function_module_known, function_module, family, table) if family_path == family
+                return explicit
+
+
+        def check_raise_destination(expression: Ast::Expr, line: u32, function_name: sview, function_pos: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                source: (family: sview, path: sview, tag: sview) = raised_error_source(expression, table)
+                source_owner: sview = source.family
+                source_path: sview = source.path
+                source_tag: sview = source.tag
+                return if source_owner == "" or source_tag == ""
+                identity_id: u32 = raise_function_identity(annotations, function_name, function_pos)
+                return_occurrence_offset: u32 = raise_return_error_occurrence(annotations, function_name, function_pos, identity_id)
+                function_module: (known: bool, module: sview @source) = raise_function_module(annotations, function_pos, identity_id, return_occurrence_offset)
+                source_module: (known: bool, module: sview @source) = raise_error_family_module_for_declaration(annotations, function_pos, identity_id, source_owner, source_path, function_module.known, function_module.module, table)
+                family_count: mutable usize = 0
+                source_is_destination: mutable bool = false
+                source_family_unrestricted: mutable bool = false
+                source_variant_allowed: mutable bool = false
+                first_source_allowed: mutable sview @source = ""
+                destination_families: mutable darray[sview @source] = []
+                for family_index in 0..<annotations.count |family_count, source_is_destination, source_family_unrestricted, source_variant_allowed, first_source_allowed, destination_families, source_owner, source_path, source_tag, source_module, function_name, function_pos, identity_id, annotations, table|:
+                    family_row: Ast::EnumAnnotation = annotations[family_index]
+                    continue if family_row.owner != "__error_set_family" or not raise_declaration_annotation_matches(family_row, function_pos, identity_id) or family_row.occurrence_offset != return_occurrence_offset
+                    family_path: sview = raise_family_path(annotations, family_index, function_pos, identity_id, return_occurrence_offset)
+                    continue if family_path == ""
+                    family_count <- family_count + 1.usize()
+                    destination_families.push(family_row.name)
+                    destination_module: (known: bool, module: sview @source) = catch_error_family_module_for_declaration(annotations, function_pos.line, function_pos.offset, identity_id, family_row.name, family_path, function_module.known, function_module.module, table)
+                    if raise_family_refs_match(source_owner, source_path, source_module.known, source_module.module, family_row.name, family_path, destination_module.known, destination_module.module):
+                        source_is_destination <- true
+                        subset: (restricted: bool, allowed: bool, first_allowed: sview) = raise_family_subset_status(annotations, family_index, function_pos, identity_id, return_occurrence_offset, family_row.name, source_tag)
+                        source_family_unrestricted <- true if not subset.restricted
+                        source_variant_allowed <- true if subset.allowed
+                        first_source_allowed <- subset.first_allowed if first_source_allowed == "" and subset.first_allowed != ""
+                # A restricted source family must not borrow an allowed variant from a
+                # different same-leaf family elsewhere in this declaration.
+                if source_is_destination and not source_family_unrestricted and not source_variant_allowed:
+                    allowed_variant: sview = first_source_allowed if first_source_allowed != "" else source_tag
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RaiseVariantNotAllowed, name: source_owner, line: line, expected: source_owner, actual: source_tag, detail: allowed_variant})
+                    return
+                return if source_is_destination
+                return if family_count == 0
+                first: mutable sview @source = destination_families[0]
+                second: mutable sview @source = ""
+                if family_count > 1:
+                    second <- destination_families[1]
+                    swap: bool = error_family_symbol_position(table, second) < error_family_symbol_position(table, first)
+                    first, second <- second, first if swap
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RaiseDestinationMismatch, name: source_owner, line: line, expected: first, actual: source_tag, detail: second})
         def error_family_symbol_position(table: SymbolTable&, family: sview) -> usize:
             can Abort.Panic:
                 # Was an O(symbols.count) scan of every declaration in the whole program — see
@@ -84,87 +305,115 @@ extend Semantic:
                     return cur.usize() if table.symbols[cur.usize()].name == family
                     cur <- table.symbol_name_next[cur.usize()]
                 return table.symbols.count
-
-
-        def check_raise_destination(expression: Ast::Expr, line: u32, function_line: u32, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
-                source_owner: sview = raised_error_owner(expression)
-                source_tag: sview = raised_error_tag(expression)
-                return if source_owner == "" or source_tag == ""
-                # Variant-subset restriction: `error[FooError{Bad1}]` allows only Bad1, so a
-                # raise of another FooError variant cannot propagate.
-                family_restricted: bool = any restriction in annotations where restriction.owner == "__error_variant_family" and restriction.name == source_owner and restriction.line == function_line
-                if family_restricted:
-                    variant_allowed: bool = any allow in annotations where allow.owner == "__error_variant_allow" and allow.name == source_tag and allow.line == function_line
-                    if not variant_allowed:
-                        allowed_variant: mutable sview = source_tag
-                        for allow in annotations |allowed_variant|:
-                            allowed_variant <- allow.name if allow.owner == "__error_variant_allow" and allow.line == function_line
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RaiseVariantNotAllowed, name: source_owner, line: line, expected: source_owner, actual: source_tag, detail: allowed_variant})
-                        return
-                families: mutable darray[sview] = []
-                families.extend([annotation.name for annotation in annotations if annotation.owner == "__error_set_family" and annotation.line == function_line])
-                return if families.count < 2
-                source_is_destination: bool = any family in families where family == source_owner
-                # The raised VARIANT itself may be listed bare in the destination set
-                # (`error[IndentError, …]` accepts `raise LexError.IndentError` because
-                # `IndentError` is a member). stage0 matches the tag nominally, not just
-                # the owning family.
-                tag_is_destination: bool = any family in families where family == source_tag
-                return if source_is_destination or tag_is_destination
-                first: mutable sview = families[0]
-                second: mutable sview = families[1]
-                swap: bool = error_family_symbol_position(table, second) < error_family_symbol_position(table, first)
-                first, second <- second, first if swap
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RaiseDestinationMismatch, name: source_owner, line: line, expected: first, actual: source_tag, detail: second})
-
-
-        # Descend into a value expression's `try … else e: BLOCK` recovery (Expr.GetElse):
-        # its statements can raise, and must be checked with the enclosing function context.
-        def check_raise_expr_recovery(expression: Ast::Expr, func_exempt: bool, function_line: u32, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        # Descend through value expressions to find `get … else` recoveries and nested
+        # expression blocks. Their statement bodies still execute in the enclosing function
+        # and must be checked there. Lambda bodies are deliberately left to lambda-specific
+        # conformance checks, which know the lambda's own declared error set.
+        def check_raise_expr_recovery(expression: Ast::Expr, func_exempt: bool, function_name: sview, function_pos: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.GetElse(guarded, recovery, getelse_line):
-                        table <- check_raise_statements(recovery, func_exempt, function_line, annotations, table)
-                        table <- check_raise_expr_recovery(guarded, func_exempt, function_line, annotations, table)
+                        table <- check_raise_statements(recovery, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(guarded, func_exempt, function_name, function_pos, annotations, table)
                     Expr.Call(callee, arguments, argument_names, call_line):
+                        if is_raise_expression(expression):
+                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RaiseWithoutErrorSet, name: "", pos: call_line, line: call_line.line, expected: "", actual: ""}) if not func_exempt
+                            table <- check_raise_destination(expression, call_line.line, function_name, function_pos, annotations, table) if func_exempt
+                        else:
+                            table <- check_raise_expr_recovery(callee, func_exempt, function_name, function_pos, annotations, table)
                         for argument in arguments |table| -> table:
-                            table <- check_raise_expr_recovery(argument, func_exempt, function_line, annotations, table)
-                    Expr.Binary(left, operator, right, binary_line):
-                        table <- check_raise_expr_recovery(left, func_exempt, function_line, annotations, table)
-                        table <- check_raise_expr_recovery(right, func_exempt, function_line, annotations, table)
-                    Expr.Paren(inner, paren_line):
-                        table <- check_raise_expr_recovery(inner, func_exempt, function_line, annotations, table)
+                            table <- check_raise_expr_recovery(argument, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Ident(name, ident_pos):
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RaiseWithoutErrorSet, name: "", pos: ident_pos, line: ident_pos.line, expected: "", actual: ""}) if name == "raise" and not func_exempt
+                        table <- check_raise_destination(expression, ident_pos.line, function_name, function_pos, annotations, table) if name == "raise" and func_exempt
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, call_line):
+                        table <- check_raise_expr_recovery(effect_type, func_exempt, function_name, function_pos, annotations, table)
+                        for candidate in candidates |table| -> table:
+                            for capture in candidate.captures |table| -> table:
+                                table <- check_raise_expr_recovery(capture, func_exempt, function_name, function_pos, annotations, table)
+                        for argument in arguments |table| -> table:
+                            table <- check_raise_expr_recovery(argument, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Field(object, field, field_line) | Expr.Scope(object, field, field_line):
+                        table <- check_raise_expr_recovery(object, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Index(object, index, index_line) | Expr.Binary(object, _, index, index_line):
+                        table <- check_raise_expr_recovery(object, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(index, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.IndexN(object, arguments, index_line):
+                        table <- check_raise_expr_recovery(object, func_exempt, function_name, function_pos, annotations, table)
+                        for argument in arguments |table| -> table:
+                            table <- check_raise_expr_recovery(argument, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Slice(object, low, high, slice_line):
+                        table <- check_raise_expr_recovery(object, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(low, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(high, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Unary(operator, operand, unary_line) | Expr.Move(operand, unary_line) | Expr.RegionNew(operand, _, unary_line) | Expr.Paren(operand, unary_line):
+                        table <- check_raise_expr_recovery(operand, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |table| -> table:
+                            table <- check_raise_expr_recovery(element, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |table| -> table:
+                            table <- check_raise_expr_recovery(entry.key, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_expr_recovery(entry.value, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Construct(type_expression, fields, _):
+                        table <- check_raise_expr_recovery(type_expression, func_exempt, function_name, function_pos, annotations, table)
+                        for field in fields |table| -> table:
+                            table <- check_raise_expr_recovery(field.value, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.RecordUpdate(base, fields, _):
+                        table <- check_raise_expr_recovery(base, func_exempt, function_name, function_pos, annotations, table)
+                        for field in fields |table| -> table:
+                            table <- check_raise_expr_recovery(field.value, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.If(condition, then_expression, else_expression, _):
+                        table <- check_raise_expr_recovery(condition, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(then_expression, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(else_expression, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        table <- check_raise_expr_recovery(scrutinee, func_exempt, function_name, function_pos, annotations, table)
+                        for arm in arms |table| -> table:
+                            table <- check_raise_expr_recovery(arm.guard, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_statements(arm.body, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Comprehension(variable, iterable, condition, body, _, _):
+                        table <- check_raise_expr_recovery(iterable, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(condition, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(body, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Refinement(base, predicate, _):
+                        table <- check_raise_expr_recovery(base, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(predicate, func_exempt, function_name, function_pos, annotations, table)
+                    Expr.Block(statements, value, _, _):
+                        table <- check_raise_statements(statements, func_exempt, function_name, function_pos, annotations, table)
+                        table <- check_raise_expr_recovery(value, func_exempt, function_name, function_pos, annotations, table)
                     _:
                         pass
 
-        # Walk statement-position raises: require an error set, then validate that a
-        # cross-family tag has an unambiguous destination in multi-family sets. Descends
-        # every block-bearing statement, mirroring check_ungranted_panic_statements.
-        def check_raise_statements(statements: darray[Ast::Stmt], func_exempt: bool, function_line: u32, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        # Walk statement bodies and inspect every expression child for raises, while
+        # keeping lambda bodies for the lambda-specific conformance pass.
+        def check_raise_statements(statements: darray[Ast::Stmt], func_exempt: bool, function_name: sview, function_pos: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RaiseWithoutErrorSet, name: "", pos: line, line: line.line, expected: "", actual: ""}) if not func_exempt and is_raise_expression(expression)
-                            table <- check_raise_destination(expression, line.line, function_line, annotations, table) if func_exempt and is_raise_expression(expression)
-                            table <- check_raise_expr_recovery(expression, func_exempt, function_line, annotations, table)
+                            table <- check_raise_expr_recovery(expression, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_raise_statements(body, func_exempt, function_line, annotations, table)
+                            table <- check_raise_statements(body, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_raise_statements(then_body, func_exempt, function_line, annotations, table)
-                            table <- check_raise_statements(else_body, func_exempt, function_line, annotations, table)
+                            table <- check_raise_expr_recovery(condition, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_statements(then_body, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_statements(else_body, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.While(condition, body, line):
-                            table <- check_raise_statements(body, func_exempt, function_line, annotations, table)
+                            table <- check_raise_expr_recovery(condition, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_statements(body, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_raise_statements(body, func_exempt, function_line, annotations, table)
+                            table <- check_raise_expr_recovery(iterable, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_statements(body, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.Match(scrutinee, arms, line):
+                            table <- check_raise_expr_recovery(scrutinee, func_exempt, function_name, function_pos, annotations, table)
                             for arm in arms |table| -> table:
-                                table <- check_raise_statements(arm.body, func_exempt, function_line, annotations, table)
+                                table <- check_raise_expr_recovery(arm.guard, func_exempt, function_name, function_pos, annotations, table)
+                                table <- check_raise_statements(arm.body, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.Return(value, line):
-                            pass
+                            table <- check_raise_expr_recovery(returned, func_exempt, function_name, function_pos, annotations, table) if value is returned
                         Stmt.Contract(kind, expression, line):
-                            pass
+                            table <- check_raise_expr_recovery(expression, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.Invalid:
                             pass
                         Stmt.Break(label, line):
@@ -172,9 +421,11 @@ extend Semantic:
                         Stmt.Continue(label, line):
                             pass
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- check_raise_expr_recovery(value, func_exempt, function_line, annotations, table)
+                            table <- check_raise_expr_recovery(type_expression, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_expr_recovery(value, func_exempt, function_name, function_pos, annotations, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- check_raise_expr_recovery(value, func_exempt, function_line, annotations, table)
+                            table <- check_raise_expr_recovery(target, func_exempt, function_name, function_pos, annotations, table)
+                            table <- check_raise_expr_recovery(value, func_exempt, function_name, function_pos, annotations, table)
 
 
         # Recurse through every function body (descending Module/Scoped). A function whose
@@ -184,8 +435,8 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
-                            func_exempt: bool = line_declares_error_set(error_set_lines, line.line)
-                            table <- check_raise_statements(body, func_exempt, line.line, annotations, table)
+                            func_exempt: bool = raise_function_declares_error_set(error_set_lines, annotations, name, line)
+                            table <- check_raise_statements(body, func_exempt, name, line, annotations, table)
                         Decl.Module(name, body, line):
                             table <- check_raise_without_error_set_decls(body, error_set_lines, annotations, table)
                         Decl.Scoped(body, line):

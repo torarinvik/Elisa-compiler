@@ -21,25 +21,32 @@ set +e
 stage0_output="$("$ELISACORE_BIN" -emit semantic "$FIXTURE" 2>&1)"
 stage0_status=$?
 set -e
-[[ "$stage0_status" -ne 0 ]] || fail "Stage0 accepted the two incompatible propagations"
+[[ "$stage0_status" -ne 0 ]] || fail "Stage0 accepted incompatible propagations"
 
 stage0_rows="$(printf '%s\n' "$stage0_output" \
-    | sed -E -n 's#^.*:([0-9]+):[0-9]+-[0-9]+: (cannot propagate.*)$#L\1 \2#p' \
+    | sed -E -n 's#^.*:([0-9]+):[0-9]+-[0-9]+: cannot propagate.*$#L\1#p' \
     | LC_ALL=C sort)"
 stage0_diagnostic_count="$(printf '%s\n' "$stage0_output" | grep -cF "$FIXTURE:" || true)"
 stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
-    | sed -E -n 's#^[[:space:]]*L([0-9]+) (cannot propagate.*)$#L\1 \2#p' \
+    | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
     | LC_ALL=C sort)"
 expected_rows="$(cat <<'EOF'
-L21 cannot propagate error[First.Fault.Bad] from a function returning error[Second.Fault.Other]
-L24 cannot propagate First.Fault from a function returning error[Second.Fault.Bad]
+L27
+L30
+L36
+L39
+L44
+L55
+L72
 EOF
 )"
 
-[[ "$stage0_rows" == "$expected_rows" ]] || fail "Stage0 subset baseline changed:\n$stage0_rows"
-[[ "$stage0_diagnostic_count" == 2 ]] || fail "Stage0 reported $stage0_diagnostic_count diagnostics, expected 2"
-grep -q '^D 2$' <<< "$stage1_output" || fail "Stage1 reported an unexpected diagnostic count:\n$stage1_output"
-[[ "$stage1_rows" == "$expected_rows" ]] || fail "Stage1 subset coverage differs:\n$stage1_rows"
+[[ "$stage0_rows" == "$expected_rows" ]] || fail "Stage0 subset diagnostic lines changed:\n$stage0_rows"
+[[ "$stage0_diagnostic_count" == 16 ]] || fail "Stage0 reported $stage0_diagnostic_count diagnostics, expected 16 including three malformed-empty-subset recovery cascades"
+[[ $(grep -cF 'error[...] requires at least one qualified error tag' <<< "$stage0_output") -eq 3 ]] || fail "Stage0 did not report exactly the three primary empty-subset diagnostics:\n$stage0_output"
+grep -q '^D 10$' <<< "$stage1_output" || fail "Stage1 reported an unexpected diagnostic count:\n$stage1_output"
+[[ $(grep -cF 'error[...] requires at least one qualified error tag' <<< "$stage1_output") -eq 3 ]] || fail "Stage1 did not suppress secondary Try mismatches for malformed source and destination sets:\n$stage1_output"
+[[ "$stage1_rows" == "$expected_rows" ]] || fail "Stage1 subset diagnostic lines differ:\n$stage1_rows"
 
-echo "try error subset coverage smoke OK: restricted-source/full-destination passes; incompatible subsets are rejected by both compilers"
+echo "try error subset coverage smoke OK: subset unions, union-wide short-tag ambiguity, malformed-empty suppression, and composite source families match"

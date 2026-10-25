@@ -128,7 +128,7 @@ if "returnLLVMBuildZExt(builder,value,size_type,name)ifLLVMGetIntTypeWidth(sourc
 if "UGE:i32=35" not in compact(LLVM_C.read_text()):
     raise SystemExit("zip_map count guard must bind UGE to LLVMIntPredicate's unsigned-greater-or-equal value")
 runtime_size = compact(function_section(RUNTIME_DECL.read_text(), "runtime_size_llvm_type"))
-if "LLVMInt32TypeInContext(ctx)returniftarget_bits==32" not in runtime_size or \
+if "returnLLVMInt32TypeInContext(ctx)iftarget_bits==32" not in runtime_size or \
         "returnLLVMInt64TypeInContext(ctx)" not in runtime_size:
     raise SystemExit("view lengths must use target-sized usize fields")
 view_type = compact(function_section(LLVM_TYPES.read_text(), "llvm_type_of"))

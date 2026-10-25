@@ -27,6 +27,7 @@ MASKS = ROOT / "src/backend/easm_register_masks.elisa"
 ENV = ROOT / "src/backend/codegen_env.elisa"
 MODEL = ROOT / "src/backend/easm_model.elisa"
 MEMORY = ROOT / "src/backend/easm_verify_memory.elisa"
+MEMORY_EFFECTS = ROOT / "src/backend/easm_verify_memory_effects.elisa"
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -274,7 +275,7 @@ for register in register_aliases:
     if f"mask <- mask | EasmRegisterMasks::{register} if easm_find(text, \"%{register.lower()}\")" not in register_scan:
         raise SystemExit(f"register scan no longer contributes the canonical {register} bit")
 
-memory = MEMORY.read_text()
+memory = MEMORY_EFFECTS.read_text()
 operation_effect = memory.split("def easm_operation_effect(op: sview)", 1)[1].split(
     "def easm_implicit_read_mask(", 1
 )[0]
@@ -327,6 +328,7 @@ inputs = [
     ENV,
     MODEL,
     MEMORY,
+    MEMORY_EFFECTS,
 ]
 inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
