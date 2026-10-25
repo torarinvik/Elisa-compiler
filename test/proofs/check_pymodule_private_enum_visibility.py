@@ -19,6 +19,8 @@ ERROR_FIXTURE = ROOT / "test/repro/pymodule_private_error_enum_root_fallback.eli
 ERROR_SMOKE = ROOT / "test/parity/pymodule_private_error_enum_root_fallback_smoke.sh"
 EXTEND_FIXTURE = ROOT / "test/repro/pymodule_private_extend_enum_root_fallback.elisa"
 EXTEND_SMOKE = ROOT / "test/parity/pymodule_private_extend_enum_root_fallback_smoke.sh"
+STATIC_BRANCH_FIXTURE = ROOT / "test/repro/pymodule_private_enum_inactive_static_branch.elisa"
+STATIC_BRANCH_SMOKE = ROOT / "test/parity/pymodule_private_enum_inactive_static_branch_smoke.sh"
 
 
 def compact_function(source: str, name: str) -> str:
@@ -165,4 +167,23 @@ extend_smoke = EXTEND_SMOKE.read_text(encoding="utf-8")
 if '"default": "97"' not in extend_smoke or "root_fallback(value: int = 97)" not in extend_smoke:
     raise SystemExit("private extend smoke must assert fallback to the public root enum")
 
-print('{"source_bound": true, "visibility_markers": 5, "root_fallback": true, "private_error_fallback": true, "private_extend_fallback": true, "private_header_forms": true}')
+static_branch_fixture = STATIC_BRANCH_FIXTURE.read_text(encoding="utf-8")
+if not all(
+    fragment in static_branch_fixture
+    for fragment in (
+        "static if false:\n        private:\n            const enum Mode of i64:\n                High = 11",
+        "static else:\n        public:\n            const enum Mode of i64:\n                High = 22",
+        "const enum Mode of i64:\n    High = 97",
+        "using Values",
+        "value: i64 = Mode.High",
+        "value: i64 = Values::Mode.High",
+    )
+):
+    raise SystemExit("inactive private enum fixture must preserve the active public enum over a root fallback")
+static_branch_smoke = STATIC_BRANCH_SMOKE.read_text(encoding="utf-8")
+if '"default": "22"' not in static_branch_smoke or \
+        "selected_public_enum(value: int = 22)" not in static_branch_smoke or \
+        "selected_public_enum_qualified(value: int = 22)" not in static_branch_smoke:
+    raise SystemExit("static-branch smoke must assert the active public enum value")
+
+print('{"source_bound": true, "visibility_markers": 5, "root_fallback": true, "private_error_fallback": true, "private_extend_fallback": true, "inactive_private_static_branch": true, "private_header_forms": true}')

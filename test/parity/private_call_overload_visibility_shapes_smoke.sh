@@ -20,14 +20,18 @@ stage0_output="$("$ELISACORE_BIN" -emit semantic "$FIXTURE" 2>&1)"
 stage0_rc=$?
 set -e
 [[ "$stage0_rc" -ne 0 ]] || fail "Stage0 accepted the private-only incompatible call"
-[[ $(grep -cF 'is private to module' <<< "$stage0_output") == 1 ]] \
-    || fail "Stage0 reported private access for a public generic winner or missed the private-only negative control: $stage0_output"
+[[ $(grep -cF 'is private to module' <<< "$stage0_output") == 2 ]] \
+    || fail "Stage0 reported private access for a public winner or missed a private-winner control: $stage0_output"
+grep -qF 'QualifiedNamedProvider.inspect' <<< "$stage0_output" \
+    || fail "Stage0 missed the same-spelling cross-module named-type private winner: $stage0_output"
 
 stage1_output="$("$RPT" < "$FIXTURE")"
 grep -q '^P 0$' <<< "$stage1_output" || fail "Stage1 returned a nonzero process status: $stage1_output"
-[[ $(grep -cF 'is private to module' <<< "$stage1_output") == 1 ]] \
-    || fail "Stage1 reported private access for a public generic winner or missed the private-only negative control: $stage1_output"
+[[ $(grep -cF 'is private to module' <<< "$stage1_output") == 2 ]] \
+    || fail "Stage1 reported private access for a public winner or missed a private-winner control: $stage1_output"
 grep -qF 'Provider.sealed' <<< "$stage1_output" \
     || fail "Stage1's private diagnostic did not identify the private-only callee: $stage1_output"
+grep -qF 'QualifiedNamedProvider.inspect' <<< "$stage1_output" \
+    || fail "Stage1 missed the same-spelling cross-module named-type private winner: $stage1_output"
 
 echo "private call target visibility smoke OK"

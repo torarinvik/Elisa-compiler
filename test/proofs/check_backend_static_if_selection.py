@@ -4,20 +4,27 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import argparse
 from pathlib import Path
 import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
 
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("--source-only", action="store_true",
+                             help="check source bindings without requiring the proof/compiler artifacts")
+ARGS = argument_parser.parse_args()
+
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
 HERE = Path(__file__).resolve().parent
-BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=True)
+BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not ARGS.source_only)
 BRANCH_TAGS = ROOT / "src/parser/static_if_branch.elisa"
 PARSER_FACADE = ROOT / "src/parser/parser.elisa"
 PARSER_CORE = ROOT / "src/parser/parser_core.elisa"
+PARSER_CORE_MEMBER_TABLES = ROOT / "src/parser/parser_core_member_tables.elisa"
 PARSER_TOKENS = ROOT / "src/parser/parser_tokens.elisa"
 PARSER_DECL = ROOT / "src/parser/parser_decl.elisa"
 PARSER_DECL_IMPL = ROOT / "src/parser/parser_decl_impl.elisa"
@@ -110,16 +117,15 @@ def require_branch_kind_contract() -> None:
 def require_parser_emission() -> None:
     declaration = compact(function_section(PARSER_DECL.read_text(), "capture_static_if_condition"))
     expected = (
-        "branch_kind:StaticIfBranch::Kind=matchis_chain_head:true:StaticIfBranch::Kind.ChainHead"
-        "false:StaticIfBranch::Kind.ChainContinuation"
+        "branch_kind:StaticIfBranch::Kind=StaticIfBranch::Kind.ChainHeadifis_chain_headelseStaticIfBranch::Kind.ChainContinuation"
         "parser.static_if_kinds<-parser.static_if_kinds.push(branch_kind)"
     )
     if expected not in declaration:
-        raise SystemExit("parser must pattern-match static-if and static-elif row tags")
+        raise SystemExit("parser must derive typed tags for static-if and static-elif row kinds")
     fallback = compact(function_section(PARSER_DECL.read_text(), "record_static_else"))
     if "StaticIfBranch::Kind.Fallback" not in fallback or "push(2)" in fallback:
         raise SystemExit("parser fallback rows must use the shared named branch kind")
-    if "StaticIfBranch::TOP_LEVEL_DEPTH" not in compact(PARSER_CORE.read_text()):
+    if "StaticIfBranch::TOP_LEVEL_DEPTH" not in compact(PARSER_CORE_MEMBER_TABLES.read_text()):
         raise SystemExit("parser static-if nesting must start at the named top-level depth")
     for path in (PARSER_DECL_IMPL, PARSER_STMT):
         text = compact(path.read_text())
@@ -143,11 +149,12 @@ def require_static_if_row_alignment() -> None:
             raise SystemExit(f"{function_name} must append all four static-if row columns in lockstep")
         if any(section.count(fragment) != 1 for fragment in fragments):
             raise SystemExit(f"{function_name} must append each static-if row column exactly once")
-    core = compact(PARSER_CORE.read_text())
+    parser_core = compact(PARSER_CORE.read_text())
+    constructor = compact(PARSER_CORE_MEMBER_TABLES.read_text())
     for column in columns:
-        if core.count(f"{column}:[]") != 1:
+        if constructor.count(f"{column}:[]") != 1:
             raise SystemExit(f"parser constructor must initialize the {column} row column exactly once")
-    if "static_if_kinds:mutabledarray[StaticIfBranch::Kind]" not in core:
+    if "static_if_kinds:mutabledarray[StaticIfBranch::Kind]" not in parser_core:
         raise SystemExit("parser must keep static-if tags in the closed branch-kind enum")
     token_types = compact(PARSER_TOKENS.read_text())
     if "static_if_kinds:darray[StaticIfBranch::Kind]" not in token_types:
@@ -169,14 +176,10 @@ def require_policy_source() -> None:
         "ensurekind==StaticIfBranch::Kind.ChainContinuationandnotpreviously_satisfiedimpliesresult==Action.EvaluateCondition",
         "ensurekind==StaticIfBranch::Kind.Fallbackandnotpreviously_satisfiedimpliesresult==Action.SelectFallback",
         "ensurepreviously_satisfiedandkind!=StaticIfBranch::Kind.ChainHeadimpliesresult==Action.Skip",
-        "starts_new_chain:bool=matchkind:StaticIfBranch::Kind.ChainHead:true_:false",
-        "chain_satisfied:bool=falseifstarts_new_chainelsepreviously_satisfied",
-        "returnAction.Skipifchain_satisfied",
-        "returnmatchkind:",
-        "StaticIfBranch::Kind.ChainHead:Action.EvaluateCondition",
-        "StaticIfBranch::Kind.ChainContinuation:Action.EvaluateCondition",
-        "StaticIfBranch::Kind.Fallback:Action.SelectFallback",
-        "_:Action.Skip",
+        "returnAction.Skipifpreviously_satisfiedandkind!=StaticIfBranch::Kind.ChainHead",
+        "returnAction.EvaluateConditionifkind==StaticIfBranch::Kind.ChainHeadorkind==StaticIfBranch::Kind.ChainContinuation",
+        "returnAction.SelectFallbackifkind==StaticIfBranch::Kind.Fallback",
+        "returnAction.Skip",
         "defcondition_selects_branch(condition_ok:bool,condition_value:i64)->bool:",
         "returncondition_okandcondition_value!=StaticIfBranch::CONDITION_FALSE_VALUE",
     )
@@ -330,6 +333,10 @@ require_selector_layout()
 require_static_if_callers()
 require_proof_shapes()
 
+if ARGS.source_only:
+    print("source_bound=True parser_rows=4 static_if_policy=True selector=True")
+    raise SystemExit(0)
+
 try:
     product = require_current_product(BIN, PROVER)
 except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
@@ -351,6 +358,7 @@ inputs = list(dict.fromkeys([
     BRANCH_TAGS,
     PARSER_FACADE,
     PARSER_CORE,
+    PARSER_CORE_MEMBER_TABLES,
     PARSER_TOKENS,
     PARSER_DECL,
     PARSER_DECL_IMPL,

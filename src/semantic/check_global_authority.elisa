@@ -47,6 +47,15 @@ extend Semantic:
             function_lines: mutable darray[u32] = []
             function_variadic: mutable darray[bool] = []
             function_return_types: mutable darray[Ast::Expr?] = []
+            static_if_conds: darray[Ast::Expr] = []
+            static_if_lines: darray[u32] = []
+            static_if_kinds: darray[StaticIfBranch::Kind] = []
+            static_if_depths: darray[u32] = []
+            static_const_names: darray[sview] = []
+            static_const_values: darray[Ast::Expr] = []
+            static_const_owners: mutable darray[sview @source] = []
+            static_const_lines: mutable darray[u32] = []
+            static_const_offsets: mutable darray[u32] = []
             returned_callees: mutable darray[usize] = []
             callback_result_sources: mutable darray[usize] = []
             callback_result_slots: mutable darray[usize] = []
@@ -208,6 +217,7 @@ extend Semantic:
             global_mutable_modules: mutable darray[sview] = []
             global_mutable_next: mutable darray[usize] = []
             import_annotations: mutable darray[Ast::EnumAnnotation] = []
+            static_import_uncertain: mutable bool = false
             # Per import row, filled once collection ends (ga_prepare_import_scopes): the row's
             # own module scope and the scope it imports from (modules.count when none).
             import_module_scopes: mutable darray[usize] = []
@@ -242,12 +252,299 @@ extend Semantic:
                     module_scope <- state.parents[module_scope]
                 return false
 
+        # Resolve target predicates only when semantic and backend target inputs are known
+        # to agree. An explicit non-host triple needs string parsing plus the full backend
+        # target model; leave that case unknown rather than deriving a host branch.
+        def ga_static_if_target_constant(name: sview) -> (known: bool, value: i64):
+            can Abort.Panic:
+                explicit_triple: bool = getenv("ELISA_STAGE1_TRIPLE") is target_triple
+                return (false, 0) if explicit_triple
+                wasm: bool = getenv("ELISA_STAGE1_WASM") is wasm_target
+                linux_host: bool = getenv("ELISA_HOST_LINUX") is linux_marker
+                windows_host: bool = getenv("ELISA_HOST_WINDOWS") is windows_marker
+                x86_host: bool = getenv("ELISA_HOST_X86_64") is x86_marker
+                linux: bool = linux_host and not windows_host
+                windows: bool = windows_host
+                macos: bool = not linux and not windows
+                if wasm:
+                    if name == "ELISA_TARGET_OS_POSIX" or name == "ELISA_TARGET_OS_WASM" or name == "ELISA_TARGET_OS_WASI" or name == "PLATFORM_WASM" or name == "ELISA_TARGET_ARCH_WASM32" or name == "ELISA_TARGET_ARCH_WASM" or name == "ARCH_WASM32":
+                        return (true, 1)
+                    if name == "ELISA_TARGET_OS_MACOS" or name == "ELISA_TARGET_OS_FREEBSD" or name == "PLATFORM_APPLE" or name == "PLATFORM_DARWIN" or name == "PLATFORM_FREEBSD" or name == "PLATFORM_LINUX" and not linux_host or name == "PLATFORM_WINDOWS" and not windows_host or name == "ELISA_TARGET_ARCH_ARM64" or name == "ELISA_TARGET_ARCH_WASM64" or name == "ARCH_ARM64":
+                        return (true, 0)
+                    return (false, 0)
+                if name == "ELISA_TARGET_OS_MACOS":
+                    return (true, 1 if macos else 0)
+                if name == "ELISA_TARGET_OS_LINUX" or name == "PLATFORM_LINUX":
+                    return (true, 1 if linux else 0)
+                if name == "ELISA_TARGET_OS_WINDOWS" or name == "PLATFORM_WINDOWS":
+                    return (true, 1 if windows else 0)
+                if name == "ELISA_TARGET_OS_FREEBSD" or name == "PLATFORM_FREEBSD":
+                    return (true, 0)
+                if name == "ELISA_TARGET_OS_POSIX":
+                    return (true, 0 if windows else 1)
+                if name == "ELISA_TARGET_OS_WASM" or name == "ELISA_TARGET_OS_WASI" or name == "ELISA_TARGET_ARCH_WASM32" or name == "ELISA_TARGET_ARCH_WASM64" or name == "ELISA_TARGET_ARCH_WASM" or name == "PLATFORM_WASM" or name == "ARCH_WASM32":
+                    return (true, 0)
+                if name == "ELISA_TARGET_ARCH_X86_64" or name == "ARCH_X86_64":
+                    return (true, 1 if x86_host else 0)
+                if name == "ELISA_TARGET_ARCH_ARM64" or name == "ARCH_ARM64":
+                    return (true, 0 if x86_host else 1)
+                return (false, 0)
+
+        def ga_static_if_target_predicate(name: sview) -> bool:
+            can Abort.Panic:
+                return name == "ELISA_TARGET_OS_MACOS" or name == "ELISA_TARGET_OS_LINUX" or name == "ELISA_TARGET_OS_WINDOWS" or name == "ELISA_TARGET_OS_FREEBSD" or name == "ELISA_TARGET_OS_POSIX" or name == "ELISA_TARGET_OS_WASM" or name == "ELISA_TARGET_OS_WASI" or name == "ELISA_TARGET_ARCH_X86_64" or name == "ELISA_TARGET_ARCH_ARM64" or name == "ELISA_TARGET_ARCH_WASM32" or name == "ELISA_TARGET_ARCH_WASM64" or name == "ELISA_TARGET_ARCH_WASM" or name == "PLATFORM_APPLE" or name == "PLATFORM_DARWIN" or name == "PLATFORM_LINUX" or name == "PLATFORM_WINDOWS" or name == "PLATFORM_FREEBSD" or name == "PLATFORM_WASM" or name == "ARCH_X86_64" or name == "ARCH_ARM64" or name == "ARCH_WASM32"
+
+        # A const declaration inside a static-if arm is only a candidate when that arm is
+        # selected. Missing branch metadata is treated as unresolved rather than allowing
+        # a sibling declaration with the same lexical owner to win by source order.
+        def ga_static_if_const_branch_selection(const_index: usize, state: GlobalAuthority&, depth: u32) -> (known: bool, active: bool):
+            can Abort.Panic:
+                return (false, false) if const_index >= state.static_const_names.count or const_index >= state.static_const_owners.count or const_index >= state.static_const_lines.count or const_index >= state.static_const_offsets.count
+                found_marker: mutable bool = false
+                unknown: mutable bool = false
+                for marker in state.annotations |found_marker, unknown, const_index, state, depth|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__const_static_branch" or marker.detail_name != state.static_const_names[const_index] or marker.module != state.static_const_owners[const_index] or marker.line != state.static_const_lines[const_index] or marker.offset != state.static_const_offsets[const_index]
+                    found_marker <- true
+                    if marker.identity_id == 4294967295:
+                        unknown <- true
+                    else:
+                        branch: (known: bool, selected: bool) = ga_static_if_row_selection(marker.identity_id.usize(), state.static_const_owners[const_index], state, depth + 1)
+                        return (true, false) if branch.known and not branch.selected
+                        unknown <- true if not branch.known
+                return (true, true) if not found_marker
+                return (false, false) if unknown
+                return (true, true)
+
+        # Resolve the source const subset that backend static-if folding can safely read.
+        # Exact-module declarations win, then top-level declarations; the backend's final
+        # bare-name fallback is mirrored only when one unambiguous active source candidate remains.
+        def ga_static_if_named_constant_value(name: sview, current_module: sview, state: GlobalAuthority&, depth: u32) -> (known: bool, value: i64, backend_folds: bool):
+            can Abort.Panic:
+                return (false, 0, true) if depth >= 64
+                exact_index: mutable usize = state.static_const_names.count
+                exact_matches: mutable usize = 0
+                exact_unknown: mutable bool = false
+                top_index: mutable usize = state.static_const_names.count
+                top_matches: mutable usize = 0
+                top_unknown: mutable bool = false
+                any_index: mutable usize = state.static_const_names.count
+                any_matches: mutable usize = 0
+                any_unknown: mutable bool = false
+                for index in 0..<state.static_const_names.count |exact_index, exact_matches, exact_unknown, top_index, top_matches, top_unknown, any_index, any_matches, any_unknown, current_module, name, state, depth|:
+                    continue if index >= state.static_const_owners.count or state.static_const_names[index] != name
+                    branch: (known: bool, active: bool) = ga_static_if_const_branch_selection(index, state, depth + 1)
+                    if not branch.known:
+                        if state.static_const_owners[index] == current_module:
+                            exact_unknown <- true
+                        elif state.static_const_owners[index] == "":
+                            top_unknown <- true
+                        any_unknown <- true
+                        continue
+                    continue if not branch.active
+                    any_index <- index if any_matches == 0
+                    any_matches <- any_matches + 1
+                    if state.static_const_owners[index] == current_module:
+                        exact_index <- index if exact_matches == 0
+                        exact_matches <- exact_matches + 1
+                    elif state.static_const_owners[index] == "":
+                        top_index <- index if top_matches == 0
+                        top_matches <- top_matches + 1
+                exact_selected: bool = exact_matches > 0 or exact_unknown
+                top_selected: bool = not exact_selected and (top_matches > 0 or top_unknown)
+                selected_index: mutable usize = state.static_const_names.count
+                if exact_selected:
+                    return (false, 0, true) if exact_unknown or exact_matches != 1
+                    selected_index <- exact_index
+                elif top_selected:
+                    return (false, 0, true) if top_unknown or top_matches != 1
+                    selected_index <- top_index
+                else:
+                    return (false, 0, false) if any_matches == 0 and not any_unknown
+                    return (false, 0, true) if any_unknown or any_matches != 1
+                    selected_index <- any_index
+                return (false, 0, true) if selected_index >= state.static_const_values.count
+                selected_owner: sview = state.static_const_owners[selected_index]
+                return ga_static_if_condition_value(state.static_const_values[selected_index], selected_owner, state, depth + 1)
+
+        # The semantic pass folds literals, immutable source constants and operations
+        # supported by BackendConstArithmetic. Target builtins use the same host inputs as
+        # the backend. Unsupported expressions stay unknown.
+        def ga_static_if_condition_value(expression: Ast::Expr, current_module: sview, state: GlobalAuthority&, depth: u32 = 0) -> (known: bool, value: i64, backend_folds: bool):
+            can Abort.Panic:
+                return (false, 0, true) if depth >= 64
+                match expression:
+                    Expr.BoolLit(value, _):
+                        return (true, 1 if value else 0, true)
+                    Expr.IntLit(value, _):
+                        return (true, value, true)
+                    Expr.Paren(inner, _):
+                        return ga_static_if_condition_value(inner, current_module, state, depth + 1)
+                    Expr.Ident(name, _):
+                        target: (known: bool, value: i64) = ga_static_if_target_constant(name)
+                        return (target.known, target.value, true) if target.known
+                        return (false, 0, true) if ga_static_if_target_predicate(name)
+                        return ga_static_if_named_constant_value(name, current_module, state, depth + 1)
+                    Expr.Unary(operator, operand, _):
+                        inner: (known: bool, value: i64, backend_folds: bool) = ga_static_if_condition_value(operand, current_module, state, depth + 1)
+                        if operator == TokenKind.Plus:
+                            return inner
+                        if operator == TokenKind.Minus:
+                            return (false, 0, inner.backend_folds) if not inner.known
+                            return (false, 0, false) if not BackendConstArithmetic::negation_is_safe(inner.value)
+                            return (true, 0 - inner.value, true)
+                        if operator == TokenKind.Tilde:
+                            return (false, 0, inner.backend_folds) if not inner.known
+                            return (true, ~inner.value, true)
+                        return (false, 0, false)
+                    Expr.Binary(left, operator, right, _):
+                        supported: bool = operator == TokenKind.EqEq or operator == TokenKind.BangEq or operator == TokenKind.Lt or operator == TokenKind.Gt or operator == TokenKind.LtEq or operator == TokenKind.GtEq or operator == TokenKind.And or operator == TokenKind.Or or operator == TokenKind.Plus or operator == TokenKind.Minus or operator == TokenKind.Star or operator == TokenKind.Slash or operator == TokenKind.Percent or operator == TokenKind.Caret or operator == TokenKind.Pipe or operator == TokenKind.Ampersand or operator == TokenKind.LShift or operator == TokenKind.RShift
+                        return (false, 0, false) if not supported
+                        left_value: (known: bool, value: i64, backend_folds: bool) = ga_static_if_condition_value(left, current_module, state, depth + 1)
+                        right_value: (known: bool, value: i64, backend_folds: bool) = ga_static_if_condition_value(right, current_module, state, depth + 1)
+                        if not left_value.known or not right_value.known:
+                            return (false, 0, left_value.backend_folds and right_value.backend_folds)
+                        if operator == TokenKind.EqEq:
+                            return (true, 1 if left_value.value == right_value.value else 0, true)
+                        if operator == TokenKind.BangEq:
+                            return (true, 1 if left_value.value != right_value.value else 0, true)
+                        if operator == TokenKind.Lt:
+                            return (true, 1 if left_value.value < right_value.value else 0, true)
+                        if operator == TokenKind.Gt:
+                            return (true, 1 if left_value.value > right_value.value else 0, true)
+                        if operator == TokenKind.LtEq:
+                            return (true, 1 if left_value.value <= right_value.value else 0, true)
+                        if operator == TokenKind.GtEq:
+                            return (true, 1 if left_value.value >= right_value.value else 0, true)
+                        if operator == TokenKind.And:
+                            return (true, 1 if left_value.value != 0 and right_value.value != 0 else 0, true)
+                        if operator == TokenKind.Or:
+                            return (true, 1 if left_value.value != 0 or right_value.value != 0 else 0, true)
+                        if operator == TokenKind.Plus:
+                            return (false, 0, false) if not BackendConstArithmetic::add_is_safe(left_value.value, right_value.value)
+                            return (true, left_value.value + right_value.value, true)
+                        if operator == TokenKind.Minus:
+                            return (false, 0, false) if not BackendConstArithmetic::subtract_is_safe(left_value.value, right_value.value)
+                            return (true, left_value.value - right_value.value, true)
+                        if operator == TokenKind.Star:
+                            return (false, 0, false) if not BackendConstArithmetic::multiply_is_safe(left_value.value, right_value.value)
+                            return (true, left_value.value * right_value.value, true)
+                        if operator == TokenKind.Slash:
+                            return (false, 0, false) if not BackendConstArithmetic::division_is_safe(left_value.value, right_value.value)
+                            return (true, left_value.value / right_value.value, true)
+                        if operator == TokenKind.Percent:
+                            return (false, 0, false) if not BackendConstArithmetic::remainder_is_safe(left_value.value, right_value.value)
+                            return (true, left_value.value % right_value.value, true)
+                        if operator == TokenKind.Caret:
+                            return (true, left_value.value ^ right_value.value, true)
+                        if operator == TokenKind.Pipe:
+                            return (true, left_value.value | right_value.value, true)
+                        if operator == TokenKind.Ampersand:
+                            return (true, left_value.value & right_value.value, true)
+                        if operator == TokenKind.LShift:
+                            return (false, 0, false) if not BackendConstArithmetic::shift_count_is_safe(right_value.value)
+                            return (true, left_value.value << right_value.value, true)
+                        if operator == TokenKind.RShift:
+                            return (false, 0, false) if not BackendConstArithmetic::shift_count_is_safe(right_value.value)
+                            return (true, left_value.value >> right_value.value, true)
+                    Expr.FloatLit(_, _):
+                        return (false, 0, false)
+                    Expr.StringLit(_, _):
+                        return (false, 0, false)
+                    _:
+                        # Other AST forms include qualified constants and backend-specific
+                        # const expressions; preserve uncertainty unless we can prove failure.
+                        return (false, 0, true)
+
+        # Mirror selected_static_if_lines' first-true/fallback policy for one branch row.
+        # Backend treats a condition it cannot fold as false, then continues through later
+        # elif arms and fallback. GA's own unknown is weaker: explicit target triples and
+        # qualified constants may still be foldable by the backend, so preserve uncertainty.
+        def ga_static_if_row_selection(branch_row: usize, current_module: sview, state: GlobalAuthority&, depth: u32 = 0) -> (known: bool, selected: bool):
+            can Abort.Panic:
+                return (false, false) if depth >= 64 or branch_row >= state.static_if_lines.count or branch_row >= state.static_if_kinds.count
+                branch_depth: u32 = state.static_if_depths[branch_row] if branch_row < state.static_if_depths.count else StaticIfBranch::TOP_LEVEL_DEPTH
+                chain_start: mutable usize = state.static_if_lines.count
+                row: mutable usize = branch_row + 1.usize()
+                while row > 0 |row, chain_start, branch_depth, state|:
+                    row <- row - 1.usize()
+                    continue if row >= state.static_if_depths.count or state.static_if_depths[row] != branch_depth
+                    if state.static_if_kinds[row] == StaticIfBranch::Kind.ChainHead:
+                        chain_start <- row
+                        break
+                return (false, false) if chain_start >= state.static_if_lines.count
+                for row in chain_start..<(branch_row + 1.usize()) |row, branch_row, branch_depth, current_module, state, depth|:
+                    continue if row >= state.static_if_depths.count or state.static_if_depths[row] != branch_depth
+                    branch_kind: StaticIfBranch::Kind = state.static_if_kinds[row]
+                    if branch_kind == StaticIfBranch::Kind.Fallback:
+                        return (true, row == branch_row)
+                    return (false, false) if row >= state.static_if_conds.count
+                    condition: (known: bool, value: i64, backend_folds: bool) = ga_static_if_condition_value(state.static_if_conds[row], current_module, state, depth + 1)
+                    if condition.known:
+                        return (true, row == branch_row) if condition.value != 0
+                    else:
+                        return (false, false) if condition.backend_folds
+                    return (true, false) if row == branch_row
+                return (true, false)
+
+        # A parser marker is attached to each enclosing branch row for aliases nested inside
+        # multiple static-if chains. Any known-false ancestor makes the alias inactive; any
+        # unresolved ancestor makes the alias uncertain.
+        def ga_module_alias_branch_selection(alias_index: usize, state: GlobalAuthority&) -> (known: bool, active: bool):
+            can Abort.Panic:
+                return (true, true) if alias_index >= state.annotations.count
+                alias: Ast::EnumAnnotation = state.annotations[alias_index]
+                found_marker: mutable bool = false
+                unknown: mutable bool = false
+                for marker in state.annotations |found_marker, unknown, alias, state|:
+                    continue if marker.owner != "__static_if_branch" or marker.name != "__using_alias_static_branch" or marker.detail_name != alias.owner or marker.module != alias.module or marker.line != alias.line or marker.offset != alias.offset
+                    found_marker <- true
+                    branch: mutable (known: bool, selected: bool) = (false, false)
+                    branch <- ga_static_if_row_selection(marker.identity_id.usize(), alias.module, state) if marker.identity_id != 4294967295
+                    return (true, false) if branch.known and not branch.selected
+                    unknown <- true if not branch.known
+                return (true, true) if not found_marker
+                return (false, false) if unknown
+                return (true, true)
+
+        # Imports carry the same per-ancestor parser markers as aliases. Exclude both
+        # proven-inactive and unresolved branch imports from GlobalAuthority's resolver:
+        # authority lookup must not gain a candidate from an arm whose selection is unknown.
+        def ga_import_annotation_branch_selection(import_row: Ast::EnumAnnotation, state: GlobalAuthority&) -> (known: bool, active: bool):
+            can Abort.Panic:
+                marker_owner: sview = "__static_if_branch"
+                marker_name: sview = "__from_member_static_branch" if import_row.owner == "__from_member" else "__binding_wildcard_import_static_branch"
+                marker_detail: sview = import_row.name if import_row.owner == "__from_member" else import_row.owner
+                return (true, true) if import_row.owner != "__from_member" and import_row.name != "__binding_wildcard_import"
+                found_marker: mutable bool = false
+                unknown: mutable bool = false
+                for marker in state.annotations |found_marker, unknown, import_row, marker_owner, marker_name, marker_detail, state|:
+                    continue if marker.owner != marker_owner or marker.name != marker_name or marker.detail_name != marker_detail or marker.module != import_row.module or marker.line != import_row.line or marker.offset != import_row.offset
+                    found_marker <- true
+                    branch: mutable (known: bool, selected: bool) = (false, false)
+                    branch <- ga_static_if_row_selection(marker.identity_id.usize(), import_row.module, state) if marker.identity_id != 4294967295
+                    return (true, false) if branch.known and not branch.selected
+                    unknown <- true if not branch.known
+                return (true, true) if not found_marker
+                return (false, false) if unknown
+                return (true, true)
+
+        def ga_module_alias_is_static_branch(alias_index: usize, state: GlobalAuthority&) -> bool:
+            can Abort.Panic:
+                return false if alias_index >= state.annotations.count
+                alias: Ast::EnumAnnotation = state.annotations[alias_index]
+                return any marker in state.annotations where marker.owner == "__static_if_branch" and marker.name == "__using_alias_static_branch" and marker.detail_name == alias.owner and marker.module == alias.module and marker.line == alias.line and marker.offset == alias.offset
+
         # Core registers a block's direct aliases before descending into child modules.
         # Within one block, aliases retain source order; unrelated blocks follow source
         # order because their module declarations are traversed in source order.
         def ga_module_alias_registration_precedes(left_scope: usize, left_offset: u32, left_index: usize, right_scope: usize, right_offset: u32, right_index: usize, state: GlobalAuthority&) -> bool:
             can Abort.Panic:
-                return left_offset < right_offset or (left_offset == right_offset and left_index < right_index) if left_scope == right_scope
+                if left_scope == right_scope:
+                    left_is_branch: bool = ga_module_alias_is_static_branch(left_index, state)
+                    right_is_branch: bool = ga_module_alias_is_static_branch(right_index, state)
+                    return false if left_is_branch and not right_is_branch
+                    return true if not left_is_branch and right_is_branch
+                    return left_offset < right_offset or (left_offset == right_offset and left_index < right_index)
                 current: mutable usize = right_scope
                 while current < state.parents.count |current, left_scope|:
                     return true if current == left_scope
@@ -281,6 +578,8 @@ extend Semantic:
                 selected_index: mutable usize = state.annotations.count
                 selected_scope: mutable usize = state.modules.count
                 before_index: usize = ga_module_alias_registration_index(lexical_scope, before_offset, state) if before_offset != GLOBAL_AUTHORITY_OFFSET_NONE else state.annotations.count
+                uncertain_index: mutable usize = state.annotations.count
+                uncertain_scope: mutable usize = state.modules.count
                 for alias_index in 0..<state.annotations.count:
                     alias: Ast::EnumAnnotation = state.annotations[alias_index]
                     continue if alias.name != "__using_alias" or alias.owner != name
@@ -292,6 +591,13 @@ extend Semantic:
                             continue if not ga_module_alias_registration_precedes(alias_scope, alias.offset, alias_index, lexical_scope, before_alias.offset, before_index, state)
                         else:
                             continue if alias.offset >= before_offset
+                    branch_selection: (known: bool, active: bool) = ga_module_alias_branch_selection(alias_index, state)
+                    continue if branch_selection.known and not branch_selection.active
+                    if not branch_selection.known:
+                        if uncertain_index >= state.annotations.count or ga_module_alias_registration_precedes(alias_scope, alias.offset, alias_index, uncertain_scope, state.annotations[uncertain_index].offset, uncertain_index, state):
+                            uncertain_index <- alias_index
+                            uncertain_scope <- alias_scope
+                        continue
                     if selected_index >= state.annotations.count:
                         selected_index <- alias_index
                         selected_scope <- alias_scope
@@ -300,6 +606,9 @@ extend Semantic:
                         if ga_module_alias_registration_precedes(alias_scope, alias.offset, alias_index, selected_scope, selected_alias.offset, selected_index, state):
                             selected_index <- alias_index
                             selected_scope <- alias_scope
+                if uncertain_index < state.annotations.count:
+                    if selected_index >= state.annotations.count or ga_module_alias_registration_precedes(uncertain_scope, state.annotations[uncertain_index].offset, uncertain_index, selected_scope, state.annotations[selected_index].offset, selected_index, state):
+                        return (true, true, uncertain_index, uncertain_scope)
                 return (selected_scope < state.modules.count, false, selected_index, selected_scope)
 
         # Alias target rows are paired by the alias token's full declaration identity.

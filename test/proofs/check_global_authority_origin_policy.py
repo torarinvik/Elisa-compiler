@@ -32,6 +32,8 @@ NEGATIVE = HERE / "global_authority_origin_policy_rejected.elisa"
 SMOKE = ROOT / "test/parity/mutable_global_grants_smoke.py"
 ALIAS_FIXTURE = ROOT / "test/fixtures/effects/qualified_permission_using_alias.elisa"
 ALIAS_CONFLICT_FIXTURE = ROOT / "test/fixtures/effects/global_authority_nested_alias_conflict.elisa"
+STATIC_BRANCH_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_static_branch_alias_conflict.elisa"
+ACTIVE_STATIC_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_active_static_alias.elisa"
 ALIAS_SMOKE = ROOT / "test/parity/effect_handler_stage1_smoke.sh"
 
 parser = argparse.ArgumentParser()
@@ -48,12 +50,12 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -89,8 +91,107 @@ alias_registration = compact(function_section(authority_text, "ga_module_alias_r
 if "left_scope==right_scope" not in alias_registration or \
         "current==left_scope" not in alias_registration or \
         "current==right_scope" not in alias_registration or \
-        "left_offset<right_offset" not in alias_registration:
+        "left_offset<right_offset" not in alias_registration or \
+        "ga_module_alias_is_static_branch(left_index,state)" not in alias_registration or \
+        "ga_module_alias_is_static_branch(right_index,state)" not in alias_registration:
     raise SystemExit("GlobalAuthority alias precedence no longer models Core's scope prepass and source order")
+if not all(fragment in alias_registration for fragment in (
+        "returnfalseifleft_is_branchandnotright_is_branch",
+        "returntrueifnotleft_is_branchandright_is_branch",
+        "returnleft_offset<right_offsetor(left_offset==right_offsetandleft_index<right_index)")):
+    raise SystemExit("direct aliases must keep Core's registration priority over static-branch aliases")
+alias_static_branch = compact(function_section(authority_text, "ga_module_alias_is_static_branch"))
+parser_decl_module = (ROOT / "src/parser/parser_decl_module.elisa").read_text()
+alias_static_branch_parser = compact(function_section(parser_decl_module, "record_static_if_branch_rows"))
+static_branch_marker_parser = compact(function_section(parser_decl_module, "record_static_if_branch_markers"))
+using_alias_parser = compact(function_section(parser_decl_module, "using_alias"))
+import_member_parser = compact(function_section(parser_decl_module, "record_from_import_member"))
+wildcard_import_parser = compact(function_section(parser_decl_module, "consume_using_target"))
+private_member_parser = compact(function_section(parser_decl_module, "record_private_member_if"))
+bare_const_member_parser = compact(function_section(parser_decl_module, "bare_const_member"))
+const_declaration_parser = compact(function_section((ROOT / "src/parser/parser_types_aggregate.elisa").read_text(), "const_declaration"))
+declaration_static_if_parser = compact(function_section((ROOT / "src/parser/parser_decl_impl.elisa").read_text(), "static_if_declaration"))
+statement_static_if_parser = compact(function_section((ROOT / "src/parser/parser_stmt.elisa").read_text(), "statement_inner"))
+if 'marker.owner=="__static_if_branch"' not in alias_static_branch or \
+        'marker.name=="__using_alias_static_branch"' not in alias_static_branch or \
+        'marker.detail_name==alias.owner' not in alias_static_branch or \
+        "parser.static_if_branch_rows.count.u32()!=parser.static_if_depth" not in static_branch_marker_parser or \
+        "forbranch_identityinparser.static_if_branch_rows" not in static_branch_marker_parser or \
+        'owner:"__static_if_branch"' not in static_branch_marker_parser or \
+        "identity_id:branch_identity" not in static_branch_marker_parser or \
+        "identity_id:4294967295" not in static_branch_marker_parser or \
+        'parser.record_static_if_branch_markers(marker_name,detail_name,parser.current_module,token.line,token.start)' not in alias_static_branch_parser or \
+        'parser.record_static_if_branch_rows("__using_alias_static_branch",alias_name,alias_token)' not in using_alias_parser or \
+        'parser.record_static_if_branch_rows("__from_member_static_branch",member,token)' not in import_member_parser or \
+        'parser.record_static_if_branch_rows("__binding_wildcard_import_static_branch",full_text,target_token)' not in wildcard_import_parser or \
+        'parser.record_static_if_branch_markers("__private_member_static_branch",member_name,parser.current_module,section_line,member_position.offset)' not in private_member_parser or \
+        'parser.record_static_if_branch_rows("__const_static_branch",Lexer::text_or_empty(name_token,parser.source,parser.source_length),token)' not in bare_const_member_parser or \
+        'parser.record_static_if_branch_rows("__const_static_branch",Lexer::text_or_empty(name_token,parser.source,parser.source_length),token)' not in const_declaration_parser or \
+        "branch_row:u32=parser.static_if_lines.count.u32()-1" not in declaration_static_if_parser or \
+        "parser.static_if_branch_rows<-parser.static_if_branch_rows.push(branch_row)" not in declaration_static_if_parser or \
+        "parser.static_if_branch_rows<-parser.static_if_branch_rows.truncate(parser.static_if_branch_rows.count-1.usize())" not in declaration_static_if_parser or \
+        "parser.static_if_branch_rows<-parser.static_if_branch_rows.push(static_branch_row)" not in statement_static_if_parser or \
+        "parser.static_if_branch_rows<-parser.static_if_branch_rows.truncate(parser.static_if_branch_rows.count-1.usize())" not in statement_static_if_parser:
+    raise SystemExit("static-if alias origin is not carried from parsing into GlobalAuthority registration order")
+static_row_selection = compact(function_section(authority_text, "ga_static_if_row_selection"))
+static_condition_fold = compact(function_section(authority_text, "ga_static_if_condition_value"))
+static_target_fold = compact(function_section(authority_text, "ga_static_if_target_constant"))
+static_target_predicate = compact(function_section(authority_text, "ga_static_if_target_predicate"))
+alias_branch_selection = compact(function_section(authority_text, "ga_module_alias_branch_selection"))
+if not all(fragment in static_condition_fold for fragment in (
+        "Expr.Unary(operator,operand,_)",
+        "ga_static_if_named_constant_value(name,current_module,state,depth+1)",
+        "BackendConstArithmetic::add_is_safe(left_value.value,right_value.value)",
+        "BackendConstArithmetic::multiply_is_safe(left_value.value,right_value.value)",
+        "BackendConstArithmetic::division_is_safe(left_value.value,right_value.value)",
+        "operator==TokenKind.LShift",
+        "operator==TokenKind.RShift",
+        "Expr.Binary(left,operator,right,_)")):
+    raise SystemExit("GlobalAuthority static-if fold no longer follows the backend's checked integer expression subset")
+if not all(fragment in static_target_fold for fragment in (
+        'getenv("ELISA_STAGE1_TRIPLE")istarget_triple',
+        "return(false,0)ifexplicit_triple")) or \
+        'name=="ELISA_TARGET_OS_LINUX"' not in static_target_predicate or \
+        "return(false,0,true)ifga_static_if_target_predicate(name)" not in static_condition_fold:
+    raise SystemExit("unresolved explicit-target predicates must stay backend-foldable and uncertain to GlobalAuthority")
+if not all(fragment in static_row_selection for fragment in (
+        "static_if_depths[row]!=branch_depth",
+        "branch_kind==StaticIfBranch::Kind.Fallback",
+        "ga_static_if_condition_value(state.static_if_conds[row],current_module,state,depth+1)",
+        "condition.backend_folds",
+        "return(false,false)ifcondition.backend_folds",
+        "return(true,row==branch_row)",
+        "return(true,false)ifrow==branch_row")) or not all(fragment in alias_branch_selection for fragment in (
+        'marker.owner!="__static_if_branch"',
+        'marker.name!="__using_alias_static_branch"',
+        "marker.detail_name!=alias.owner",
+        "ga_static_if_row_selection(marker.identity_id.usize(),alias.module,state)",
+        "return(true,false)ifbranch.knownandnotbranch.selected",
+        "unknown<-trueifnotbranch.known",
+        "return(false,false)ifunknown")):
+    raise SystemExit("GlobalAuthority must follow known static-if selection and fail closed on unknown branch ancestry")
+import_branch_selection = compact(function_section(authority_text, "ga_import_annotation_branch_selection"))
+import_index = compact(function_section((ROOT / "src/semantic/check_global_authority/annotation_index.elisa").read_text(), "ga_index_import_annotations"))
+if not all(fragment in import_branch_selection for fragment in (
+        'marker_owner:sview="__static_if_branch"',
+        'marker_name:sview="__from_member_static_branch"ifimport_row.owner=="__from_member"else"__binding_wildcard_import_static_branch"',
+        "marker.owner!=marker_owner",
+        "marker.detail_name!=marker_detail",
+        "ga_static_if_row_selection(marker.identity_id.usize(),import_row.module,state)",
+        "return(false,false)ifunknown")) or \
+        "ga_import_annotation_branch_selection(annotation,state)" not in import_index or \
+        "ifnotbranch.known:state.static_import_uncertain<-true" not in import_index or \
+        "continueifnotbranch.active" not in import_index:
+    raise SystemExit("GlobalAuthority import indexing must exclude inactive imports and preserve uncertainty for possible imports")
+import_uncertainty = compact((ROOT / "src/semantic/check_global_authority/incremental.elisa").read_text())
+if "ga_mark_all_possible_global_effects(&state)ifstate.static_import_uncertain" not in import_uncertainty:
+    raise SystemExit("uncertain static imports must conservatively retain possible global effects")
+if not all(fragment in import_uncertainty for fragment in (
+        "forconst_indexin0..<table.immutable_const_names.count",
+        "state.static_const_names.push(table.immutable_const_names[const_index])",
+        "state.static_const_values.push(table.immutable_const_values[const_index]ifconst_index<table.immutable_const_values.countelseAst::Expr.Absent)",
+        "state.static_const_owners.push(table.symbols[const_row].module_ownerifconst_row<table.symbols.countelse\"\")")):
+    raise SystemExit("GlobalAuthority must receive source-constant values and lexical owners for static-if folding")
 alias_registration_index = compact(function_section(authority_text, "ga_module_alias_registration_index"))
 if 'alias.name!="__using_alias"' not in alias_registration_index or \
         "alias.offset!=offset" not in alias_registration_index or \
@@ -121,6 +222,13 @@ alias_target = compact(function_section(authority_text, "ga_module_alias_target_
 if "ga_module_alias_choice(first,declaration_scope,state,depth,before_offset)" not in alias_target or \
         "ga_module_alias_target_resolve(target.path,alias.scope,state,depth+1,alias_row.offset)" not in alias_target:
     raise SystemExit("GlobalAuthority alias-target recursion drops its source registration cutoff")
+if not all(fragment in alias_choice for fragment in (
+        "branch_selection:(known:bool,active:bool)=ga_module_alias_branch_selection(alias_index,state)",
+        "continueifbranch_selection.knownandnotbranch_selection.active",
+        "ifnotbranch_selection.known:",
+        "uncertain_index<-alias_index",
+        "return(true,true,uncertain_index,uncertain_scope)")):
+    raise SystemExit("alias choice must skip proven-inactive branches and preserve unknown branch precedence conservatively")
 text_module = compact(function_section(authority_text, "ga_text_module"))
 if "ga_module_alias_resolve(path,lexical_scope,state,0,true,before_offset)" not in text_module:
     raise SystemExit("GlobalAuthority text module lookup drops its source offset")
@@ -197,6 +305,12 @@ for probe in (
     if probe not in alias_atom:
         raise SystemExit(f"authority coverage atom is missing source-order alias probe {probe}")
 for probe in (
+    'return 21 if not conflicting_choice.found or conflicting_choice.ambiguous or conflicting_choice.index != 0',
+    'return 36 if ga_module_alias_resolve("Alias", 0.usize(), conflicting_aliases) != conflicting_actual',
+):
+    if probe not in alias_atom:
+        raise SystemExit(f"authority coverage atom has stale first-registration expectation {probe}")
+for probe in (
     '_ = ga_row_add(0, "Choice", true, &permission_aliases, 0, 0, 150)',
     'return 42 if row_ref != "P::Cap.Read" or row_offset != 120',
     'ga_ref_covers(row_ref, "Old::Cap.Read", 0, 0, &permission_aliases, 0, row_offset, 125)',
@@ -207,14 +321,50 @@ for probe in (
     'edge_new_scope: usize = ga_collect_module(0, "New", edge_filters)',
     'return 48 if ga_text_module("P", 0, edge_filters, 125) != edge_old_scope',
     'return 49 if ga_text_module("P", 0, edge_filters, 150) != edge_new_scope',
-    'return 53 if not tied_conflict.found or not tied_conflict.ambiguous',
-    'return 54 if ga_module_alias_resolve("Tie::Leaf", 0.usize(), tied_aliases) != GLOBAL_AUTHORITY_NONE',
-    'return 55 if ga_text_module("Tie::Leaf", 0.usize(), tied_aliases) != GLOBAL_AUTHORITY_NONE',
-    'return 57 if not same_target_tie.found or same_target_tie.ambiguous',
+    'return 53 if not tied_conflict.found or tied_conflict.ambiguous or tied_conflict.index != 0',
+    'return 54 if ga_module_alias_resolve("Tie::Leaf", 0.usize(), tied_aliases) != tied_actual_leaf',
+    'return 55 if ga_text_module("Tie::Leaf", 0.usize(), tied_aliases) != tied_actual_leaf',
+    'return 57 if not same_target_tie.found or same_target_tie.ambiguous or same_target_tie.index != 4',
     'return 58 if ga_module_alias_resolve("Same::Leaf", 0.usize(), tied_aliases) != tied_actual_leaf',
 ):
     if probe not in alias_atom:
         raise SystemExit(f"authority coverage atom is missing effect-row alias probe {probe}")
+for probe in (
+    'Ast::EnumAnnotation{owner: "__static_if_branch", name: "__using_alias_static_branch", detail_name: "Shared", line: 90, module: "", offset: 90, identity_id: 0}',
+    'return 63 if not branch_choice.found or branch_choice.ambiguous or branch_choice.index != 3',
+    'return 65 if ga_module_alias_resolve("Shared::Leaf", 0.usize(), branch_aliases) != direct_target_leaf',
+    'Ast::EnumAnnotation{owner: "__static_if_branch", name: "__using_alias_static_branch", detail_name: "Shared", line: 91, module: "", offset: 100, identity_id: 1}',
+    'static_if_conds: [Ast::Expr.BoolLit(false, alias_branch_at), Ast::Expr.Absent]',
+    'static_if_kinds: [StaticIfBranch::Kind.ChainHead, StaticIfBranch::Kind.Fallback]',
+    'return 66 if not selected_branch_choice.found or selected_branch_choice.ambiguous or selected_branch_choice.index != 3',
+    'unknown_branch_condition: Ast::Expr = Ast::Expr.Scope(Ast::Expr.Ident("Feature", alias_branch_at), "Enabled", alias_branch_at)',
+    'return 68 if not unknown_branch_choice.found or not unknown_branch_choice.ambiguous',
+    'Ast::Expr.Ident("UNKNOWN_STATIC_CONDITION", alias_branch_at)',
+    'return 74 if not unfoldable_fallback_choice.found or unfoldable_fallback_choice.ambiguous or unfoldable_fallback_choice.index != 0',
+    'return 75 if not backend_unknown_fallback_choice.found or not backend_unknown_fallback_choice.ambiguous',
+    'identity_id: 0},\n                        Ast::EnumAnnotation{owner: "__static_if_branch", name: "__using_alias_static_branch", detail_name: "Shared", line: 92, module: "", offset: 120, identity_id: 1}',
+    'static_if_depths: [0, 1]',
+    'return 69 if nested_branch_choice.found or nested_branch_choice.ambiguous',
+):
+    if probe not in alias_atom:
+        raise SystemExit(f"authority coverage atom is missing static-branch registration probe {probe}")
+for probe in (
+    'Ast::EnumAnnotation{owner: "__static_if_branch", name: "__from_member_static_branch", detail_name: "hidden", line: 101, module: "", offset: 101, identity_id: 0}',
+    'Ast::EnumAnnotation{owner: "__static_if_branch", name: "__binding_wildcard_import_static_branch", detail_name: "InactiveWildcard", line: 103, module: "", offset: 103, identity_id: 2}',
+    'Ast::EnumAnnotation{owner: "__static_if_branch", name: "__binding_wildcard_import_static_branch", detail_name: "ActiveWildcard", line: 104, module: "", offset: 104, identity_id: 3}',
+    'Ast::Expr.Ident("UNKNOWN_STATIC_CONDITION", alias_branch_at)',
+    'ga_index_import_annotations(&branch_imports)',
+    'return 70 if branch_imports.import_annotations.count != 2',
+    'return 71 if branch_imports.import_annotations[0].owner != "__from_member" or branch_imports.import_annotations[0].name != "visible"',
+    'return 72 if branch_imports.import_annotations[1].name != "__binding_wildcard_import" or branch_imports.import_annotations[1].owner != "ActiveWildcard"',
+    'return 77 if not branch_imports.static_import_uncertain',
+    'arithmetic_static_condition: Ast::Expr = Ast::Expr.Binary(Ast::Expr.Binary(Ast::Expr.IntLit(1, alias_branch_at), TokenKind.Plus, Ast::Expr.IntLit(1, alias_branch_at), alias_branch_at), TokenKind.EqEq, Ast::Expr.IntLit(2, alias_branch_at), alias_branch_at)',
+    'return 73 if not folded_static_condition.known or folded_static_condition.value != 1 or not folded_static_condition.backend_folds',
+    'static_const_names: ["SOURCE_FLAG"]',
+    'return 76 if not source_const_condition.known or source_const_condition.value != 1 or not source_const_condition.backend_folds',
+):
+    if probe not in alias_atom:
+        raise SystemExit(f"authority coverage atom is missing static-import branch-selection probe {probe}")
 alias_fixture = ALIAS_FIXTURE.read_text()
 alias_smoke = ALIAS_SMOKE.read_text()
 if not (
@@ -227,6 +377,8 @@ if not (
     raise SystemExit("qualified permission alias fixture no longer shadows after the earlier grant")
 if 'run_positive "qualified_permission_using_alias.elisa"' not in alias_smoke:
     raise SystemExit("qualified permission alias fixture is not bound to the Stage1 effect smoke")
+if "run_negative \"global_authority_nested_alias_conflict.elisa\" 'conflicting alias: \"Shared\" already aliases module \"RootTarget\", cannot also alias \"Parent.NestedTarget\"'" not in alias_smoke:
+    raise SystemExit("nested alias-conflict fixture is not bound to its expected negative diagnostic")
 alias_conflict_fixture = ALIAS_CONFLICT_FIXTURE.read_text()
 nested_conflict = alias_conflict_fixture.find("using NestedTarget as Shared")
 root_conflict = alias_conflict_fixture.find("using RootTarget as Shared")
@@ -234,6 +386,27 @@ if nested_conflict < 0 or root_conflict < 0 or nested_conflict >= root_conflict 
         "# Core registers direct aliases in the current block before descending into nested modules." not in alias_conflict_fixture or \
         "Shared::slot" not in alias_conflict_fixture:
     raise SystemExit("nested alias-conflict control no longer exercises Core's reversed textual/registration order")
+static_branch_alias_fixture = STATIC_BRANCH_ALIAS_FIXTURE.read_text()
+static_nested_alias = static_branch_alias_fixture.find("using NestedTarget as Shared")
+static_direct_alias = static_branch_alias_fixture.find("using RootTarget as Shared")
+if "static if true:" not in static_branch_alias_fixture or static_nested_alias < 0 or static_direct_alias < 0 or static_nested_alias >= static_direct_alias or "Shared::slot" not in static_branch_alias_fixture:
+    raise SystemExit("static-branch alias fixture no longer covers Core's direct-registration-before-active-branch order")
+if 'run_negative "global_authority_static_branch_alias_conflict.elisa" \'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "NestedTarget"\'' not in alias_smoke:
+    raise SystemExit("static-branch alias fixture is not bound to the Core first-registration diagnostic")
+if not all(probe in alias_smoke for probe in (
+        "grep -cF 'conflicting alias:' \"$static_alias_log\") == 1",
+        "requires can[RootTarget::slot.Read]",
+        'run_negative "global_authority_static_branch_alias_conflict.elisa"')):
+    raise SystemExit("static-branch alias smoke must reject extra conflict or wrong-target authority diagnostics")
+active_static_alias_fixture = ACTIVE_STATIC_ALIAS_FIXTURE.read_text()
+if not all(fragment in active_static_alias_fixture for fragment in (
+        "static if false:",
+        "using InactiveTarget as Shared",
+        "static else:",
+        "using ActiveTarget as Shared",
+        "can Shared::slot.Read:",
+        "ActiveTarget::needs_read()")) or 'run_positive "global_authority_active_static_alias.elisa"' not in alias_smoke:
+    raise SystemExit("active-static alias control must prove inactive arms do not shadow the selected permission target")
 
 row_edges = compact(function_section((ROOT / "src/semantic/check_global_authority_rows.elisa").read_text(), "ga_edge_rows"))
 row_filter_check = compact(function_section((ROOT / "src/semantic/check_global_authority_rows.elisa").read_text(), "ga_edge_ref_suppressed"))
@@ -662,7 +835,7 @@ stage1_provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_SMOKE,
+    POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_CONFLICT_FIXTURE, STATIC_BRANCH_ALIAS_FIXTURE, ACTIVE_STATIC_ALIAS_FIXTURE, ALIAS_SMOKE,
     ROOT / "test/atoms/authority_coverage.elisa", POSITIVE, NEGATIVE, *source_closure,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

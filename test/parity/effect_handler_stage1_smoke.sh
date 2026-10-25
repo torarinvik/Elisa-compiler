@@ -392,5 +392,14 @@ run_interpret_warning "deep_permission_alias_uncovered.warn.elisa" 'requires can
 run_negative "helper_generic_specialization_mismatch.neg.elisa" 'abstract effect specialization mismatch'
 run_negative "helper_clone_private.neg.elisa" 'is private'
 run_negative "global_authority_nested_alias_conflict.elisa" 'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "Parent.NestedTarget"'
+run_negative "global_authority_static_branch_alias_conflict.elisa" 'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "NestedTarget"'
+static_alias_log="$WORK/global_authority_static_branch_alias_conflict.log"
+[[ $(grep -cF 'conflicting alias:' "$static_alias_log") == 1 ]] \
+    || { echo "static-branch alias fixture emitted an extra alias conflict: $(cat "$static_alias_log")" >&2; exit 1; }
+if grep -Fq 'requires can[RootTarget::slot.Read]' "$static_alias_log"; then
+    echo "static-branch alias fixture resolved Shared to the wrong permission target: $(cat "$static_alias_log")" >&2
+    exit 1
+fi
+run_positive "global_authority_active_static_alias.elisa"
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"

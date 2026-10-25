@@ -282,8 +282,14 @@ if not all(fragment in argument_types for fragment in (
         "ownership_binding_at_position(table, caller, argument_position)",
         "declared.binding_id.owner.value != binding.binding_id.owner.value",
         "declared.binding_id.serial != binding.binding_id.serial",
-        "try_overload_type_is_firm(argument_type_id, caller, annotations, table) else 0)")):
-    raise SystemExit("Try argument types must come from exact resolved binding positions and fail closed on unknown, generic, or conflicting rows")
+        'marker.owner != "__try_callee_argument_direct_call"',
+        "ownership_binding_at_position(table, caller, nested_call_position)",
+        "symbol.return_type_id",
+        "type_id_contains_function_generic(call_return_type_id, call_return_function_line, table)",
+        "type_id_contains_region(call_return_type_id, table)",
+        "call_return_conflict",
+        "argument_type_firm or argument_type_ambiguous")):
+    raise SystemExit("Try argument types must use exact bindings or a unique unshadowed same-module concrete call result, and fail closed on generic or region schemes")
 generic_parameter = compact_inline(function_section(source_text, "try_overload_type_is_generic_parameter"))
 if not all(fragment in generic_parameter for fragment in (
         'annotation.name == "__generic_param_identity"',
@@ -295,11 +301,11 @@ type_selection = compact_inline(function_section(source_text, "callable_symbol_t
 if not all(fragment in type_selection for fragment in (
         'argument.owner == "__try_callee_named_arg"',
         "actual_receiver_type_id: u32 = argument_type_ids[0]",
-        "try_overload_type_is_firm(actual_receiver_type_id, invalid, annotations, table)",
+        "try_overload_type_is_firm_in_module(actual_receiver_type_id, enclosing_module, annotations, table)",
         "callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)",
         "callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)",
         "continue if not receiver.found and not callable_symbol_has_parameter_rows(table, symbol) and symbol.arity_min == 0 and (symbol.arity_max == 0 or symbol.arity_max == 4294967295)",
-        "try_overload_receiver_pattern_matches(receiver.type_id, actual_receiver_type_id, symbol.id, annotations, table, 0)",
+        "try_overload_receiver_pattern_matches(receiver.type_id, actual_receiver_type_id, symbol.id, enclosing_module, annotations, table, 0)",
         "if actual_receiver_is_ref and not formal_receiver_is_ref and not try_overload_type_is_generic_parameter(receiver.type_id, symbol.id, annotations, table):",
         "return invalid if actual_receiver_base_kind == SemTypeKind.Int or actual_receiver_base_kind == SemTypeKind.Float or actual_receiver_base_kind == SemTypeKind.Bool",
         "continue if receiver.mutable_ref and not receiver_ref_mutable",
@@ -310,6 +316,16 @@ if not all(fragment in type_selection for fragment in (
     raise SystemExit("Try overload selection must use the known first argument, Core-compatible receiver ranking, and a unique top rank")
 if "for actual_type_id in argument_type_ids" in type_selection or "argument_type_ids[parameter_index]" in type_selection:
     raise SystemExit("Later argument types must not affect Core's first-receiver overload selection")
+raw_receiver_overload_set = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_candidate"))
+ranked_receiver_overload_gate = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_in_scope"))
+if not all(fragment in raw_receiver_overload_set for fragment in (
+        "callable_row_in_ufcs_candidate_set_indexed",
+        "other.kind == SymbolKind.Func and other.name == name and other.module_owner == symbol.module_owner",
+        "candidate_count >= 2.usize()")) or not all(fragment in ranked_receiver_overload_gate for fragment in (
+        "callable_try_call_forwards_arguments(annotations, try_offset)",
+        'argument.owner == "__try_callee_named_arg"',
+        "return callable_name_has_ufcs_overload_set_candidate")):
+    raise SystemExit("Try must distinguish Core's raw overload set from the call shapes eligible for receiver ranking")
 receiver_arity = compact_inline(function_section(source_text, "callable_symbol_core_accepts_receiver_arity"))
 if not all(fragment in receiver_arity for fragment in (
         "symbol.arity_max == 4294967295",
@@ -319,7 +335,11 @@ if not all(fragment in receiver_arity for fragment in (
 if "declaration_id.value == symbol.id.value" not in compact_inline(function_section(source_text, "callable_symbol_has_parameter_rows")):
     raise SystemExit("Try overload ranking must distinguish an actual zero-parameter function from incomplete formal metadata")
 visible_overloads = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_in_scope"))
+visible_overload_candidates = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_candidate"))
 if not all(fragment in visible_overloads for fragment in (
+        "callable_try_call_forwards_arguments(annotations, try_offset)",
+        'argument.owner == "__try_callee_named_arg"',
+        "callable_name_has_ufcs_overload_set_candidate(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, table)")) or not all(fragment in visible_overload_candidates for fragment in (
         "callable_row_in_ufcs_candidate_set_indexed",
         "other.module_owner == symbol.module_owner",
         "candidate_count >= 2.usize()")):
@@ -469,15 +489,62 @@ if not all(fragment in cached_env_clone for fragment in (
     raise SystemExit("Try branch clones must preserve cached overload signature facts")
 selected_receiver_acceptance = compact_inline(function_section(source_text, "callable_symbol_accepts_arity"))
 if not all(fragment in selected_receiver_acceptance for fragment in (
-        "symbol.id.value == selected_type_candidate.value",
-        "not callable_function_declaration_visible(annotations, name, module, symbol.line, symbol.offset, enclosing_module)")):
-    raise SystemExit("Try receiver family inference must reject the exact inaccessible winner after Core-compatible raw ranking")
+        "accepts_call <- false if selected_type_candidate.value != INVALID_DECL_ID_VALUE and symbol.id.value != selected_type_candidate.value",
+        "symbol.id.value == selected_type_candidate.value and not callable_function_declaration_visible")):
+    raise SystemExit("Try family selection must reject a private receiver winner and its public overload siblings")
 selected_receiver_count = compact_inline(function_section(source_text, "callable_symbol_arity_candidate_count"))
 if not all(fragment in selected_receiver_count for fragment in (
         "selected_type_candidate.value.usize() >= table.symbols.count",
-        "callable_function_declaration_visible(annotations, name, selected_symbol.module_owner, selected_symbol.line, selected_symbol.offset, enclosing_module)",
+        "return 1.usize() if callable_function_declaration_visible",
         "return 0.usize()")):
-    raise SystemExit("Try receiver candidate counting must fail closed for a selected inaccessible overload")
+    raise SystemExit("Try receiver candidate counting must keep private winners out of accessible family selection")
+private_selected_fallibility = compact_inline(function_section(source_text, "callable_error_indexed_returns_error"))
+if not all(fragment in private_selected_fallibility for fragment in (
+        "selected_type_candidate: DeclId = callable_symbol_type_selected_candidate",
+        "selected_private_winner: bool = selected_symbol.line == annotation.line",
+        "not callable_function_declaration_visible(annotations, name, candidate_module, annotation.line, annotation.offset, enclosing_module)",
+        "return true if selected_private_winner",
+        "forwarded_private_candidate: bool = callable_row_in_ufcs_candidate_set_indexed",
+        "unresolved_private_candidate: bool = callable_overload_declaration_is_inaccessible_arity_candidate",
+        "return true if unresolved_private_candidate")):
+    raise SystemExit("Try must suppress cascading TryRequiresFallible diagnostics for exact or unresolved private winners without exposing their ErrorSets")
+private_family_ref = compact_inline(function_section(source_text, "callable_error_indexed_family_ref"))
+if not all(fragment in private_family_ref for fragment in (
+        "callable_row_visible_for_try_call(module_index, module_annotations, annotations, name, annotation.offset, annotation.line",
+        "callable_symbol_accepts_arity(table, annotations, try_named_arguments, argument_type_ids",
+        "return TryErrorFamilyRef{family: \"\"")) or "selected_private_winner" in private_family_ref:
+    raise SystemExit("Try's private-winner suppression must not expose an inaccessible ErrorSet to propagation checks")
+private_family_refs = compact_inline(function_section(source_text, "callable_error_indexed_family_refs"))
+if not all(fragment in private_family_refs for fragment in (
+        "visible: bool = callable_row_visible_for_try_call",
+        "and callable_symbol_accepts_arity(table, annotations, try_named_arguments, argument_type_ids",
+        "if visible")):
+    raise SystemExit("Try composite family collection must apply the same visibility filter before selecting a propagation family")
+unresolved_private_candidate = compact_inline(function_section(source_text, "callable_overload_declaration_is_inaccessible_arity_candidate"))
+if not all(fragment in unresolved_private_candidate for fragment in (
+        "callable_name_has_ufcs_overload_set_in_scope",
+        "callable_row_in_ufcs_candidate_set_indexed",
+        "callable_symbol_core_accepts_receiver_arity",
+        "callable_symbol_accepts_named_arguments",
+        "or callable_function_declaration_visible",
+        "try_overload_receiver_pattern_matches(receiver.type_id, argument_type_ids[0]",
+        "try_overload_type_shared_ambiguous_match_state(receiver.type_id, argument_type_ids[0]",
+        "receiver_ref_mutability_known",
+        "receiver.mutable_ref and not receiver_ref_mutable")):
+    raise SystemExit("Try unresolved private-candidate checks must model Core's overload set, receiver compatibility, and reference mutability")
+unresolved_private_guard = compact_inline(function_section(source_text, "callable_overload_has_inaccessible_arity_candidate"))
+if "callable_overload_declaration_is_inaccessible_arity_candidate" not in unresolved_private_guard:
+    raise SystemExit("Try must identify inaccessible receiver candidates before unresolved family fallback")
+if "callable_overload_has_inaccessible_arity_candidate" not in selected_receiver_acceptance or "callable_overload_has_inaccessible_arity_candidate" not in selected_receiver_count:
+    raise SystemExit("Try unresolved receiver selection must fail closed for ErrorSet family lookup when a private candidate remains")
+forwarded_family_guard = compact_inline(function_section(source_text, "callable_symbol_accepts_arity"))
+forwarded_candidate_count = compact_inline(function_section(source_text, "callable_symbol_arity_candidate_count"))
+if not all(fragment in forwarded_family_guard for fragment in (
+        "callable_try_call_forwards_arguments(annotations, try_offset)",
+        "callable_name_has_ufcs_overload_set_candidate")) or not all(fragment in forwarded_candidate_count for fragment in (
+        "callable_try_call_forwards_arguments(annotations, try_offset)",
+        "callable_name_has_ufcs_overload_set_candidate")):
+    raise SystemExit("Try forwarded calls must not propagate an arbitrary sibling ErrorSet, while singleton lookup remains available")
 cached_source_facts = compact_inline(function_section(source_text, "try_noncall_callable_source_facts"))
 if 'return (false, "", false, false, false) if cached_facts.ambiguous or callee_qualifier != ""' not in cached_source_facts:
     raise SystemExit("Try cached source inference must not borrow a family from an ambiguous wildcard lookup")
@@ -490,9 +557,14 @@ if not all(fragment in receiver_match for fragment in (
         "try_overload_type_is_generic_parameter(formal_type_id, declaration, annotations, table)",
         "return (true, true) if formal_type_id == actual_type_id",
         'interned_name(actual_type_id, table) == "int"',
+        'formal_kind == SemTypeKind.Char and actual_kind == SemTypeKind.Int and interned_name(actual_type_id, table) == "int"',
         "type_ids_compatible(formal_type_id, actual_type_id, table)",
         "element_position in 0..<element_count.usize()")):
     raise SystemExit("Receiver matching must support exact generic parameters, compatible concrete types, and structural receiver shapes")
+cached_integer_type = compact_inline(function_section(source_text, "try_noncall_cached_integer_type"))
+cached_builtin_type = compact_inline(function_section(source_text, "try_noncall_cached_builtin_type"))
+if '"char"' not in cached_integer_type or '"uintptr"' not in cached_integer_type or '"uintptr"' not in cached_builtin_type:
+    raise SystemExit("Try cached receiver ranking must treat char and uintptr as integral storage for an untyped int actual")
 receiver_specificity = compact_inline(function_section(source_text, "try_overload_receiver_specificity"))
 if not all(fragment in receiver_specificity for fragment in (
         "return (true, 0.usize()) if try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)",
@@ -511,11 +583,123 @@ if not all(fragment in argument_types for fragment in (
         "not receiver_ref_mutability_resolved")):
     raise SystemExit("Try receiver mutability reads must snapshot the mutable output reference before boolean negation")
 firm_type = compact_inline(function_section(source_text, "try_overload_type_is_firm"))
-if "matches == 1.usize()" not in firm_type or "kind == SemTypeKind.Named" not in firm_type:
-    raise SystemExit("Named overload types may be used only when the symbol table proves a unique declaration spelling")
+if not all(fragment in firm_type for fragment in (
+        "try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)",
+        "try_overload_nominal_type_owner(name, declaration, annotations, table)",
+        "return identity.found")):
+    raise SystemExit("Try firm named receiver types must resolve one nominal owner in the declaration's lexical scope")
+module_firm_type = compact_inline(function_section(source_text, "try_overload_type_is_firm_in_module"))
+if not all(fragment in module_firm_type for fragment in (
+        "depth > 64",
+        "try_overload_nominal_type_owner_for_module(name, lexical_module, annotations, table)",
+        "try_overload_type_is_firm_in_module(interned_elem(type_id, element_position.u32(), table), lexical_module, annotations, table, depth + 1)")):
+    raise SystemExit("Try receiver ranking must resolve named actual types in the call-site module, including nested type shapes")
+type_visibility = compact_inline(function_section(source_text, "try_overload_type_declaration_visible"))
+if not all(fragment in type_visibility for fragment in (
+        "try_error_alias_module_visible(annotations, declaration_module, lexical_module)",
+        'annotation.owner != "__section_private"',
+        "exact_offset",
+        "try_noncall_module_is_ancestor(declaration_module, lexical_module)")):
+    raise SystemExit("Try nominal owner lookup must filter inaccessible modules and declaration-specific private type markers")
+type_owner_module = compact_inline(function_section(source_text, "try_overload_type_owner_in_module"))
+if not all(fragment in type_owner_module for fragment in (
+        "try_overload_type_symbol_is_nominal(symbol)",
+        "try_overload_type_declaration_visible(annotations, name, declaration_module, symbol.line, symbol.offset, lexical_module)",
+        "return (count > 0.usize(), false, declaration_module)")):
+    raise SystemExit("Try nominal owner lookup must recognize a visible owner within one module and leave duplicate declarations to Core")
+nominal_type_identity = compact_inline(function_section(source_text, "try_overload_nominal_type_owner_for_module"))
+if not all(fragment in nominal_type_identity for fragment in (
+        "try_overload_type_owner_in_module(name, scope_module, lexical_module, annotations, table)",
+        "return local if local.found or local.ambiguous",
+        "scope_module <- try_noncall_module_parent(scope_module)",
+        'binding.owner != "__from_member"',
+        'source.owner != "__from_src"',
+        "callable_module_path_matches_suffix(symbol.module_owner, binding.module, source.name)",
+        'binding.name != "__binding_wildcard_import"',
+        "binding.module.len > wildcard_scope_length",
+        "try_overload_type_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)")):
+    raise SystemExit("Try nominal identity must follow local and ancestor declarations, selective imports, then the nearest visible wildcard import")
+nominal_type_owner = compact_inline(function_section(source_text, "try_overload_nominal_type_owner"))
+if "table.symbols[declaration.value.usize()].module_owner" not in nominal_type_owner:
+    raise SystemExit("Try formal nominal identities must be resolved from the owning declaration's module")
+ambiguous_type_identity = compact_inline(function_section(source_text, "try_overload_type_has_ambiguous_nominal_identity"))
+if not all(fragment in ambiguous_type_identity for fragment in (
+        "try_overload_type_is_generic_parameter(type_id, declaration, annotations, table)",
+        "try_overload_nominal_type_owner(name, declaration, annotations, table)",
+        "identity.ambiguous",
+        "interned_elem(type_id, element_position.u32(), table)")):
+    raise SystemExit("Try ambiguous nominal receiver detection must preserve generic identity and recurse through structural types")
+if not all(fragment in receiver_match for fragment in (
+        "try_overload_nominal_type_owner(name, declaration, annotations, table)",
+        "try_overload_nominal_type_owner_for_module(name, actual_module, annotations, table)",
+        "formal_identity.ambiguous or actual_identity.ambiguous",
+        "formal_identity.owner == actual_identity.owner")):
+    raise SystemExit("Try named receiver matching must compare lexical nominal owners and fail closed on ambiguity")
+argument_types = compact_inline(function_section(source_text, "try_call_argument_type_ids"))
+if "try_overload_type_has_ambiguous_nominal_identity(argument_type_id, caller, annotations, table, 0)" not in argument_types or "argument_type_firm or argument_type_ambiguous" not in argument_types:
+    raise SystemExit("Try argument typing must preserve ambiguous nominal identity for candidate lookup to fail closed")
+shared_ambiguous_match = compact_inline(function_section(source_text, "try_overload_type_shared_ambiguous_match_state"))
+if not all(fragment in shared_ambiguous_match for fragment in (
+        "try_overload_nominal_type_owner_for_module(name, actual_module, annotations, table)",
+        "try_overload_nominal_type_owner(name, formal_declaration, annotations, table)",
+        "actual_identity.owner != formal_identity.owner",
+        "element_count != interned_elem_count(formal_type_id, table)",
+        "has_ambiguous_element <- true if element_state.ambiguous")):
+    raise SystemExit("Try ambiguity overlap must distinguish known different owners and recurse through potentially matching structural receiver shapes")
+ambiguous_receiver_candidate = compact_inline(function_section(source_text, "callable_overload_has_ambiguous_nominal_receiver_candidate"))
+if not all(fragment in ambiguous_receiver_candidate for fragment in (
+        "callable_name_has_ufcs_overload_set_in_scope(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, try_named_arguments, try_offset, table)",
+        "callable_row_in_ufcs_candidate_set_indexed(module_index, module_annotations, annotations, name, symbol.offset, symbol.line, enclosing_module, callee_qualifier, table)",
+        "callable_symbol_core_accepts_receiver_arity(table, symbol, arity)",
+        "callable_symbol_receiver_type(table, symbol)",
+        "try_overload_type_shared_ambiguous_match_state(receiver.type_id, argument_type_ids[0], symbol.id, enclosing_module, annotations, table, 0)",
+        "ambiguous_match.potential_match and ambiguous_match.ambiguous")):
+    raise SystemExit("Try ambiguity rejection must be limited to a visible, arity-eligible receiver candidate with a shared ambiguous nominal spelling")
+if "return false if callable_overload_has_ambiguous_nominal_receiver_candidate" not in selected_receiver_acceptance or "return 0.usize() if callable_overload_has_ambiguous_nominal_receiver_candidate" not in selected_receiver_count:
+    raise SystemExit("Try candidate fallback must not reselect a visible concrete overload after nominal receiver identity becomes ambiguous")
 parser_source = PARSER_ARGUMENT_SOURCE.read_text()
 if 'owner: "__try_callee_argument_position"' not in parser_source or "pos: Ast::expr_pos(arguments[index])" not in parser_source:
     raise SystemExit("Try calls must retain each actual argument's exact AST position for resolved type lookup")
+parser_try_expression = compact_inline(function_section(parser_source, "get_expression"))
+parser_call_arity = compact_inline(function_section(parser_source, "try_expression_call_arity"))
+parser_try_arguments = compact_inline(function_section(parser_source, "try_expression_record_named_arguments"))
+if not all(fragment in parser_try_arguments for fragment in (
+        'marker.owner == "__arg_forward"',
+        'owner: "__try_callee_argument_forward"',
+        'Ast::Expr.Call(callee, _, _, _)',
+        'owner: "__try_callee_argument_direct_call"',
+        "call_position.offset",
+        "offset: try_offset")):
+    raise SystemExit("Try parser metadata must carry forwarding state and direct-call identity from each argument to its Try position")
+forward_try_selector = compact_inline(function_section(source_text, "callable_try_call_forwards_arguments"))
+if 'marker.owner == "__try_callee_argument_forward"' not in forward_try_selector or "return invalid if callable_try_call_forwards_arguments" not in compact_inline(function_section(source_text, "callable_symbol_type_selected_candidate")):
+    raise SystemExit("Try receiver overload ranking must be disabled for forwarded argument calls")
+if not all(fragment in parser_try_expression for fragment in (
+        'owner: "__try_callee_arity"',
+        "line: get_token.line",
+        "offset: get_token.start",
+        "identity_id: call_arity.value",
+        "if call_arity.known")) or not all(fragment in parser_call_arity for fragment in (
+        "Ast::Expr.Call(_, arguments, _, _)",
+        "return (false, 0) if any marker in parser.enum_annotations",
+        'marker.owner == "__arg_forward"',
+        "return (true, arguments.count.u32())",
+        "Ast::Expr.Paren(inner, _)",
+        "return parser.try_expression_call_arity(inner)")):
+    raise SystemExit("Try calls must retain known positional arity, mark forwarded arity unknown, and recurse through parentheses")
+try_projection = compact_inline(function_section(source_text, "fallible_try_projection_add"))
+try_arity_lookup = compact_inline(function_section(source_text, "try_callee_arity"))
+try_rows = compact_inline(function_section(source_text, "check_try_fallible_rows"))
+if not all(fragment in try_projection for fragment in (
+        'annotation.owner == "__try_callee_arity"',
+        "projection.try_arities.get(annotation.offset.u64())",
+        "projection.try_arities <- projection.try_arities.put(annotation.offset.u64(), annotation.identity_id)")) or not all(fragment in try_arity_lookup for fragment in (
+        "index.get(try_offset.u64())",
+        "return (true, arity)")) or not all(fragment in try_rows for fragment in (
+        "try_callee_arity(try_arities, annotation.offset)",
+        "row_arity.value",
+        "if row_arity.known else []")):
+    raise SystemExit("Try overload ranking must consume the parser's call arity by the exact try-site offset")
 parser_visibility_source = PARSER_VISIBILITY_SOURCE.read_text()
 section_marker = compact_inline(function_section(parser_visibility_source, "record_section_member"))
 if not all(fragment in section_marker for fragment in (
@@ -605,6 +789,7 @@ for fixture_name, smoke_name in (
         ("try_noncall_cached_ancestor_precedes_selective_import.elisa", "try_noncall_cached_ancestor_precedes_selective_import_smoke.sh"),
         ("try_noncall_cached_private_import_visibility.elisa", "try_noncall_cached_private_import_visibility_smoke.sh"),
         ("try_overload_private_winner_visibility.elisa", "try_overload_private_winner_visibility_smoke.sh"),
+        ("try_overload_nominal_identity_controls.elisa", "try_overload_nominal_identity_controls_smoke.sh"),
         ("try_wildcard_import_order_outer_before_nested.elisa", "try_wildcard_import_order_outer_before_nested_smoke.sh"),
         ("try_private_outer_using_does_not_shadow_public_inner.elisa", "try_private_outer_using_does_not_shadow_public_inner_smoke.sh"),
         ("try_wildcard_import_does_not_shadow_ancestor.elisa", "try_wildcard_import_does_not_shadow_ancestor_smoke.sh")):
@@ -678,11 +863,23 @@ if not all(fragment in private_visibility_fixture for fragment in (
         "def char_public_winner_cached(value: char) -> i64 error[Consumer::Destination]",
         "def root_callable_private_winner_direct(value: i64) -> i64 error[Consumer::Destination]",
         "def root_callable_private_winner_cached(value: i64) -> i64 error[Consumer::Destination]",
-        "def origin(value: bool) -> i64 error[Provider::GenericFault]")) or not all(fragment in private_visibility_smoke for fragment in (
+        "def origin(value: bool) -> i64 error[Provider::GenericFault]",
+        "def narrow[T](value: T) -> i64 error[CharProvider::GenericFault]",
+        "def narrow(value: char) -> i64 error[CharProvider::ConcreteFault]",
+        "def address[T](value: T) -> i64 error[CharProvider::GenericFault]",
+        "def address(value: uintptr) -> i64 error[CharProvider::ConcreteFault]",
+        "def int_char_private_winner_direct(value: int) -> i64 error[Consumer::Destination]",
+        "return try CharProvider::narrow(value)",
+        "def int_char_private_winner_cached(value: int) -> i64 error[Consumer::Destination]",
+        "payload = CharProvider::narrow(value)",
+        "def int_uintptr_private_winner_cached(value: int) -> i64 error[Consumer::Destination]",
+        "payload = CharProvider::address(value)")) or not all(fragment in private_visibility_smoke for fragment in (
         "grep -cF 'cannot propagate'",
         "== 8",
         "grep -cF 'is private to module'",
-        "== 6",
+        "== 9",
+        "CharProvider.narrow",
+        "CharProvider.address",
         'L32 "Provider.origin" is private to module "Provider"',
         'L35 "Provider.origin" is private to module "Provider"',
         'L67 "Provider.origin" is private to module "Provider"',
@@ -692,10 +889,70 @@ if not all(fragment in private_visibility_fixture for fragment in (
         "root_callable_private_winner_direct",
         "root_callable_private_winner_cached",
         "^  L(39|42|46|49|53|56|60|63) .*is private to module ",
-        "grep -cF 'try requires a fallible expression'",
-        "== 6",
-        "private-winner invalid-call diagnostic")):
+        "if grep -qF 'try requires a fallible expression' <<< \"$stage0_output\"; then",
+        "if grep -qF 'try requires a fallible expression' <<< \"$stage1_output\"; then")):
     raise SystemExit("Try private-overload visibility control must preserve direct and cached public generic mismatch diagnostics")
+private_same_named_types_fixture = (ROOT / "test/repro/try_overload_private_same_named_module_types.elisa").read_text()
+private_same_named_types_smoke = (ROOT / "test/parity/try_overload_private_same_named_module_types_smoke.sh").read_text()
+if not all(fragment in private_same_named_types_fixture for fragment in (
+        "module NamedProvider:",
+        "struct Widget:",
+        "def inspect(value: Widget) -> i64:",
+        "def inspect[T](value: T) -> i64 error[NamedProvider::GenericFault]",
+        "module Consumer:",
+        "def direct(value: Widget)",
+        "return try NamedProvider::inspect(value)",
+        "def cached(value: Widget)",
+        "payload = NamedProvider::inspect(value)")) or not all(fragment in private_same_named_types_smoke for fragment in (
+        "try_overload_private_same_named_module_types.elisa",
+        'is private to module "NamedProvider"',
+        "if grep -qF 'try requires a fallible expression' <<< \"$stage0_output\"; then",
+        "if grep -qF 'try requires a fallible expression' <<< \"$stage1_output\"; then",
+        "== 2")):
+    raise SystemExit("Try named-type visibility fixture must reject same-spelled nominal mismatches for direct and cached calls")
+nominal_identity_controls_fixture = (ROOT / "test/repro/try_overload_nominal_identity_controls.elisa").read_text()
+nominal_identity_controls_smoke = (ROOT / "test/parity/try_overload_nominal_identity_controls_smoke.sh").read_text()
+if not all(fragment in nominal_identity_controls_fixture for fragment in (
+        "module HiddenTypes:",
+        "private:",
+        "struct Widget:",
+        "module Provider:",
+        "error GenericFault:",
+        "struct Widget:",
+        "def singleton(value: Widget)",
+        "def generic_only[T](value: T)",
+        "def generic_only(value: bool, marker: i64)",
+        "def overloaded(value: Widget)",
+        "def overloaded[T](value: T)",
+        "def overloaded(value: i64)",
+        "from Provider import Widget",
+        "def singleton_same_name(value: Widget)",
+        "def generic_only_same_name(value: Widget)",
+        "def concrete_overload_same_name(value: Widget)",
+        "def concrete_overload_wrong_family(value: Widget)",
+        "return try Provider::singleton(value)",
+        "return try Provider::generic_only(value)",
+        "return try Provider::overloaded(value)")) or not all(fragment in nominal_identity_controls_smoke for fragment in (
+        "try_overload_nominal_identity_controls.elisa",
+        "wrong-family concrete-overload control",
+        "^D 1$",
+        "cannot propagate",
+        "expected_rows=$'L51'")):
+    raise SystemExit("Try nominal identity controls must preserve singleton, generic-only, and visible concrete winners despite an inaccessible same-spelled type")
+nested_forward_fixture = (ROOT / "test/repro/try_overload_nested_and_forwarded_calls.elisa").read_text()
+nested_forward_smoke = (ROOT / "test/parity/try_overload_nested_and_forwarded_calls_smoke.sh").read_text()
+if not all(fragment in nested_forward_fixture for fragment in (
+        "def choose(value: i64)",
+        "def choose(value: bool)",
+        "def produce_i64() -> i64",
+        "return try choose(produce_i64())",
+        "return try choose(..)",
+        "return try singleton(..)")) or not all(fragment in nested_forward_smoke for fragment in (
+        "try_overload_nested_and_forwarded_calls.elisa",
+        "expected_rows=$'L27\\nL36'",
+        "grep -q '^D 2$'",
+        "try requires a fallible expression")):
+    raise SystemExit("Try receiver guards must preserve a known public nested-call winner, fail closed on forwarded overload families, and retain forwarded singleton inference")
 cross_module_private_fixture = (ROOT / "test/repro/try_overload_cross_module_private_cached_winner.elisa").read_text()
 cross_module_private_smoke = (ROOT / "test/parity/try_overload_cross_module_private_cached_winner_smoke.sh").read_text()
 if not all(fragment in cross_module_private_fixture for fragment in (
@@ -714,6 +971,25 @@ if not all(fragment in cross_module_private_fixture for fragment in (
         "grep -cF 'cannot propagate'",
         "== 2")):
     raise SystemExit("Try cached winner coverage must include hidden private candidates from a different selective-import module and retain a public generic control")
+static_import_fixture = (ROOT / "test/repro/try_overload_static_import_family.elisa").read_text()
+static_import_smoke = (ROOT / "test/parity/try_overload_static_import_family_smoke.sh").read_text()
+if not all(fragment in static_import_fixture for fragment in (
+        "const USE_INACTIVE_PROVIDER: bool = false",
+        "static if USE_INACTIVE_PROVIDER:",
+        "from InactiveProvider import origin",
+        "static else:",
+        "from ActiveProvider import origin",
+        "error InactiveFault:",
+        "error ActiveFault:",
+        "def caller(value: bool) -> i64 error[ActiveProvider::ActiveFault]",
+        "return try origin(value)")) or not all(fragment in static_import_smoke for fragment in (
+        "try_overload_static_import_family.elisa",
+        "Stage0 selected the inactive import's ErrorSet",
+        "Stage1 selected the inactive import's ErrorSet",
+        "cannot propagate")):
+    raise SystemExit("Try static-import coverage must select the active static-else provider's ErrorSet over the earlier inactive import")
+if not (static_import_fixture.index("from InactiveProvider import origin") < static_import_fixture.index("from ActiveProvider import origin")):
+    raise SystemExit("Try static-import coverage must put the inactive import before the active fallback import")
 if "try_error_alias_name_visible(annotations, name, declaration_module, function_module)" not in alias_visibility or not all(fragment in private_alias_path for fragment in (
         'row.owner == "__section_private"',
         "row.name == segment",
@@ -748,6 +1024,35 @@ if not all(fragment in family_covers for fragment in (
 statement_catch_marker = compact_inline(function_section(source_text, "try_noncall_statement_match_is_catch"))
 if 'marker.owner == "__catch_match" and marker.name == "__catch_match" and marker.line == position.line and marker.offset == position.offset and marker.module == lexical_module' not in statement_catch_marker:
     raise SystemExit("Try catchability must match statement Catch markers by exact source position and lexical module")
+fallback_atom_text = (ROOT / "test/atoms/try_fallback_source.elisa").read_text()
+for helper_name, expected_count in (
+        ("try_noncall_expression_directly_raises(", 3),
+        ("try_noncall_block_directly_raises(", 4)):
+    helper_calls = [line for line in fallback_atom_text.splitlines() if helper_name in line]
+    if len(helper_calls) != expected_count or any(
+            not re.search(r"(?:no_error_rows|no_annotations), \"\"\)$", line.strip())
+            for line in helper_calls):
+        raise SystemExit(f"Try fallback atom must pass annotations and lexical module to every {helper_name[:-1]} call")
+direct_raise = compact_inline(function_section(source_text, "try_noncall_expression_directly_raises"))
+if not all(fragment in direct_raise for fragment in (
+        "annotations: darray[Ast::EnumAnnotation]&, lexical_module: sview",
+        "try_noncall_statement_match_is_catch(position, annotations, lexical_module)",
+        "return arms.count > 0 and catch_arms_raise if is_catch",
+        "try_noncall_expression_aborts_with_annotations(scrutinee, annotations, lexical_module)")):
+    raise SystemExit("Try direct-raise analysis must preserve lexical Catch identity and classify Catch arms separately from ordinary matches")
+direct_raise_block = compact_inline(function_section(source_text, "try_noncall_block_directly_raises"))
+if not all(fragment in direct_raise_block for fragment in (
+        "annotations: darray[Ast::EnumAnnotation]&, lexical_module: sview",
+        "try_noncall_single_statement_terminates_with_annotations(statement, annotations, lexical_module)",
+        "try_noncall_block_terminates_with_annotations(selected_body, annotations, lexical_module)",
+        "try_noncall_expression_directly_raises(Ast::Expr.Match(scrutinee, arms, position), annotations, lexical_module)")):
+    raise SystemExit("Try direct-raise block recursion must preserve Catch marker annotations and lexical module context")
+direct_raise_arms = compact_inline(function_section(source_text, "try_noncall_match_bool_arms_directly_raise"))
+if not all(fragment in direct_raise_arms for fragment in (
+        "annotations: darray[Ast::EnumAnnotation]&, lexical_module: sview",
+        "try_noncall_expression_aborts_with_annotations(arm.guard, annotations, lexical_module)",
+        "try_noncall_block_directly_raises(arm.body, annotations, lexical_module)")):
+    raise SystemExit("Try direct-raise boolean arms must preserve annotations and lexical module context recursively")
 single_statement_termination = compact_inline(function_section(source_text, "try_noncall_single_statement_terminates_with_annotations"))
 if not all(fragment in single_statement_termination for fragment in (
         "try_noncall_statement_match_is_catch(position, annotations, lexical_module)",
@@ -811,9 +1116,31 @@ if not contains_contiguous_block(may_raise_source, call_argument_scan):
     raise SystemExit("Try call catchability must scan ordinary arguments in evaluation order before callable metadata")
 
 main_try_check = function_section(source_text, "check_try_fallible")
-rows_call = "table <- check_try_fallible_rows(file.top_decls, file.enum_annotations, projection.try_named_arguments, projection.try_argument_positions, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, projection.try_arities, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
+static_binding_selection = compact_inline(function_section(source_text, "try_static_binding_branch_selection"))
+static_binding_filter = compact_inline(function_section(source_text, "try_static_binding_filtered_annotations"))
+if not all(fragment in static_binding_selection for fragment in (
+        'marker.owner != "__static_if_branch"',
+        'marker.detail_name != marker_detail',
+        "pma_static_if_row_selection(file, marker.identity_id.usize(), annotation.module, table)",
+        "return (true, true, false) if branch.known and not branch.selected",
+        "return (true, false, false) if unresolved")) or not all(fragment in static_binding_filter for fragment in (
+        "try_static_binding_branch_selection(annotation, file.enum_annotations, file, table)",
+        "if branch.tracked and branch.known and not branch.active:",
+        'owner: "__try_unresolved_static_binding"',
+        'name: "__using_alias"')):
+    raise SystemExit("Try must filter proven-inactive import/alias rows and retain unresolved bindings as conservative sentinels")
+unresolved_static_binding = compact_inline(function_section(source_text, "callable_try_static_binding_uncertain"))
+if not all(fragment in unresolved_static_binding for fragment in (
+        'unresolved.owner != "__try_unresolved_static_binding"',
+        'unresolved.name == "__from_member"',
+        'unresolved.name == "__binding_wildcard_import"',
+        'unresolved.name == "__using_alias"')):
+    raise SystemExit("Try callable resolution must decline a family when an unresolved static binding could affect the call")
+rows_call = "table <- check_try_fallible_rows(file.top_decls, try_annotations, projection.try_named_arguments, projection.try_argument_positions, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, projection.try_arities, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
 if compact_inline(main_try_check).count(compact_inline(rows_call)) != 1:
     raise SystemExit("check_try_fallible must invoke the source-row checker when at least one try site exists")
+if 'try_annotations: darray[Ast::EnumAnnotation] = try_static_binding_filtered_annotations(file, table)' not in compact_inline(main_try_check):
+    raise SystemExit("check_try_fallible must derive its callable imports from the static-branch-filtered annotation set")
 
 if semantic_text.count('include "./check_try_fallible.elisa"') != 1:
     raise SystemExit("semantic module no longer includes the try-fallibility checker exactly once")
@@ -951,6 +1278,13 @@ inputs = list(dict.fromkeys([
     *PIPELINE_FILES,
     PARSER_ARGUMENT_SOURCE,
     PARSER_VISIBILITY_SOURCE,
+    ROOT / "test/atoms/try_fallback_source.elisa",
+    ROOT / "test/repro/try_overload_private_same_named_module_types.elisa",
+    ROOT / "test/parity/try_overload_private_same_named_module_types_smoke.sh",
+    ROOT / "test/repro/try_overload_nominal_identity_controls.elisa",
+    ROOT / "test/parity/try_overload_nominal_identity_controls_smoke.sh",
+    ROOT / "test/repro/try_overload_static_import_family.elisa",
+    ROOT / "test/parity/try_overload_static_import_family_smoke.sh",
     POSITIVE,
     NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
