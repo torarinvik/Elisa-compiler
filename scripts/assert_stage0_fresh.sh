@@ -9,8 +9,8 @@
 #   bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 #
 # ELISA_ALLOW_STALE_STAGE0=1 opts out, for bisecting the oracle. A missing binary is the
-# caller's own guard to report. So is a binary outside a `compiler/bin/` of its own tree:
-# that one was named deliberately and is not ours to judge.
+# caller's own guard to report. A binary outside its source tree is not ours to judge unless
+# it carries a receipt; then ELISA_STAGE0_SOURCE_ROOT must name the inputs to verify.
 set -uo pipefail
 
 BIN="${1:-${ELISACORE_BIN:-}}"
@@ -55,9 +55,93 @@ case "$(basename "$BIN")" in
     s0cache) BIN="${ELISA_S0_REAL:-}"; [ -n "$BIN" ] || exit 0 ;;
 esac
 [ -x "$BIN" ] || exit 0
+PROVENANCE="${BIN}.provenance.json"
 
-SRC="$(cd -- "$(dirname -- "$BIN")/../src" 2>/dev/null && pwd || true)"
-[ -n "$SRC" ] && [ -d "$SRC" ] || exit 0
+if [ -n "${ELISA_STAGE0_SOURCE_ROOT:-}" ]; then
+    STAGE0_ROOT="$(cd -- "$ELISA_STAGE0_SOURCE_ROOT" 2>/dev/null && pwd || true)"
+    if [ -z "$STAGE0_ROOT" ] || [ ! -d "$STAGE0_ROOT/src" ]; then
+        echo "cannot verify Stage0 source root: $ELISA_STAGE0_SOURCE_ROOT" >&2
+        exit 2
+    fi
+else
+    STAGE0_ROOT="$(cd -- "$(dirname -- "$BIN")/.." 2>/dev/null && pwd || true)"
+    if [ -z "$STAGE0_ROOT" ] || [ ! -d "$STAGE0_ROOT/src" ]; then
+        if [ -f "$PROVENANCE" ]; then
+            echo "Stage0 provenance receipt exists without an adjacent source tree; set ELISA_STAGE0_SOURCE_ROOT to verify $BIN" >&2
+            exit 2
+        fi
+        exit 0
+    fi
+fi
+SRC="$STAGE0_ROOT/src"
+
+# Go-core's normal build recipe disables embedded VCS metadata. When its producer writes
+# a content-bound receipt beside the binary, verify that receipt against both the binary
+# bytes and the source/module inputs. Legacy VCS-stamped products continue through the
+# revision check below until every producer has adopted receipt generation.
+if [ -f "$PROVENANCE" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "cannot verify Stage0 provenance: python3 is unavailable (binary: $BIN)" >&2
+        exit 2
+    fi
+    PROVENANCE_CHECKER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/stage0_provenance.py"
+    if ! python3 - "$PROVENANCE" "$PROVENANCE_CHECKER" "$STAGE0_ROOT" "$BIN" <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+receipt_path, checker_path, source_root, binary = sys.argv[1:]
+try:
+    receipt = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+    spec = importlib.util.spec_from_file_location("stage0_provenance_checker", checker_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load Stage0 provenance checker")
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    if not isinstance(receipt, dict) or receipt.get("schema") != checker.SCHEMA:
+        raise RuntimeError("Stage0 provenance receipt has an unsupported schema")
+    context = receipt.get("build_context")
+    if not isinstance(context, dict):
+        raise RuntimeError("Stage0 provenance receipt has no build context")
+
+    environment = os.environ.copy()
+    replay_keys = (
+        "GOOS", "GOARCH", "CGO_ENABLED", "GOEXPERIMENT", "GOAMD64", "GOARM",
+        "GO386", "GOMIPS", "GOMIPS64", "GOPPC64", "GORISCV64", "GOWASM",
+        "CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS", "CGO_LDFLAGS",
+    )
+    for key in replay_keys:
+        value = context.get(key)
+        if not isinstance(value, str):
+            raise RuntimeError(f"Stage0 provenance build context is missing {key}")
+        if key.startswith("CGO_") and key in environment:
+            continue
+        environment[key] = value
+    # Replay source-selection settings and Make-synthesized CGO flags only. Keep GOENV and
+    # executable/toolchain selectors tied to the current process. Build-vcs and workspace
+    # overrides are rejected by the producer; normalize them so source enumeration cannot
+    # depend on unsupported GOFLAGS or workspace settings.
+    environment["GOFLAGS"] = ""
+    environment["GOWORK"] = "off"
+    result = subprocess.run(
+        [sys.executable, checker_path, "check", "--root", source_root, "--binary", binary],
+        check=False,
+        env=environment,
+    )
+    raise SystemExit(result.returncode)
+except (OSError, ValueError, TypeError, json.JSONDecodeError, RuntimeError) as error:
+    print(f"cannot prepare Stage0 provenance check: {error}", file=sys.stderr)
+    raise SystemExit(2) from error
+PY
+    then
+        echo "Stage0 oracle binary is stale or unverifiable: $BIN" >&2
+        exit 2
+    fi
+    exit 0
+fi
 
 # Timestamps alone miss a stale product after switching branches or restoring a checkout:
 # the current files can all be older than a binary built from a different revision. Go embeds

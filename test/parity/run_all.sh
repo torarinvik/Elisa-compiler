@@ -164,8 +164,9 @@ export ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 S0_BUILD_TARGET="${ELISA_S0_REAL:-$ELISACORE_BIN}"
 if [[ -z "${ELISA_GATE_PREBUILT:-}" ]]; then
   echo "prebuilding shared artifacts (stage0, parse_report, easm driver)…" >&2
-  ( cd "$ELISA_CORE/compiler" && go build -o "$S0_BUILD_TARGET" ./src ) || {
-    echo "error: could not build stage0" >&2; exit 2; }
+  python3 "$REPO_ROOT/scripts/stage0_provenance.py" build --root "$ELISA_CORE/compiler" --binary "$S0_BUILD_TARGET" || {
+    echo "error: could not build stage0 with current provenance" >&2; exit 2; }
+  export ELISA_STAGE0_SOURCE_ROOT="$ELISA_CORE/compiler"
   # The shared reporter is a STAGE1 artifact; using stage0 here would make every semantic
   # check below test the oracle instead of the product. build_parse_report.sh owns the same
   # freshness/atomic-publish logic used by the workers, so priming it here keeps the checks

@@ -25,7 +25,9 @@ if [[ -n "${ELISACORE_BIN:-}" ]]; then
 else
 	command -v go >/dev/null 2>&1 || { echo "error: missing 'go' (needed to build the latest elisac)" >&2; exit 2; }
 	ELISACORE_BIN="${ELISAC_OUT:-$ELISA_CORE/compiler/bin/elisac}"
+	REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 	mkdir -p "$(dirname "$ELISACORE_BIN")"
 	echo "building latest elisac from $ELISA_CORE/compiler -> $ELISACORE_BIN" >&2
-	( cd "$ELISA_CORE/compiler" && go build -o "$ELISACORE_BIN" ./src )
+	python3 "$REPO_ROOT/scripts/stage0_provenance.py" build --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN" || exit 2
+	export ELISA_STAGE0_SOURCE_ROOT="$ELISA_CORE/compiler"
 fi
