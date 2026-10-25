@@ -5,6 +5,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
 bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
+python3 "$REPO_ROOT/test/proofs/check_strict_unsafe_generic_owner_identity.py"
 
 python3 - "$STAGE1" "$REPO_ROOT" <<'PY'
 import pathlib
@@ -115,6 +116,17 @@ cases = {
         "# strict\n"
         "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
         "def bad(x: mutable i64&) -> void can[Unsafe.Alias]:\n    pair(x, x)\n"
+        "def main() -> i64:\n    return 0\n",
+        "mutable alias requires",
+    ),
+    "line-zero generic owner does not suppress concrete unsafe check": (
+        "# strict\n"
+        "#line 0 generic_owner.elisa\n"
+        "def phantom[T](value: T) -> void:\n    return\n"
+        "#line 0 pair_owner.elisa\n"
+        "def pair(a: mutable i64&, b: mutable i64&) -> void:\n    return\n"
+        "#line 0 bad_owner.elisa\n"
+        "def bad(x: mutable i64&) -> void:\n    pair(x, x)\n"
         "def main() -> i64:\n    return 0\n",
         "mutable alias requires",
     ),

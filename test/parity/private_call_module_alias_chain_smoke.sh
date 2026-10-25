@@ -22,10 +22,24 @@ set -e
 [[ "$stage0_rc" -ne 0 ]] || fail "Stage0 accepted a private call through a chained module alias"
 grep -qF 'is private to module' <<< "$stage0_output" \
     || fail "Stage0 missed the private alias-chain call: $stage0_output"
+grep -qF 'nested_hidden' <<< "$stage0_output" \
+    || fail "Stage0 missed the qualified private alias-suffix call: $stage0_output"
+grep -qF 'ProjectionChoice.loser_only' <<< "$stage0_output" \
+    || fail "Stage0 did not reject a loser-only member under the winning duplicate alias: $stage0_output"
 
 stage1_output="$("$RPT" < "$FIXTURE")"
 grep -q '^P 0$' <<< "$stage1_output" || fail "Stage1 returned a nonzero process status: $stage1_output"
 grep -qF 'is private to module' <<< "$stage1_output" \
     || fail "Stage1 missed the private alias-chain call: $stage1_output"
+grep -qF 'nested_hidden' <<< "$stage1_output" \
+    || fail "Stage1 missed the qualified private alias-suffix call: $stage1_output"
+grep -qF 'ProjectionChoice.loser_only' <<< "$stage1_output" \
+    || fail "Stage1 did not reject a loser-only member under the winning duplicate alias: $stage1_output"
+if grep -qF 'undefined identifier "NestedSecret.nested_hidden"' <<< "$stage1_output"; then
+    fail "Stage1 failed to project the canonical target's nested alias member: $stage1_output"
+fi
+if grep -qF 'undefined identifier "ProjectionChoice.winner_only"' <<< "$stage1_output"; then
+    fail "Stage1 failed to project the winning alias member: $stage1_output"
+fi
 
 echo "private call module-alias chain smoke OK"

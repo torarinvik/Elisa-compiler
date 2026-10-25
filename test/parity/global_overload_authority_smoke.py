@@ -2,7 +2,12 @@
 """Actual canonical parser/Semantic reporter controls; no source rewriting."""
 import json, pathlib, re, subprocess, sys
 reporter = sys.argv[1]
-cases = json.loads(pathlib.Path(__file__).with_name("global_overload_authority_cases.json").read_text())
+here = pathlib.Path(__file__).resolve().parent
+proof = here.parent / "proofs" / "check_global_authority_generic_receiver_rank.py"
+subprocess.run([sys.executable, str(proof)], check=True)
+cases = json.loads((here / "global_overload_authority_cases.json").read_text())
+generic_receiver_fixture = pathlib.Path(__file__).resolve().parents[1] / "repro" / "global_authority_generic_receiver_rank_line_zero.elisa"
+cases.append(("generic receiver rank uses exact owner at line zero", generic_receiver_fixture.read_text(), None))
 failed = 0
 for case in cases:
     name, source, missing = case[:3]

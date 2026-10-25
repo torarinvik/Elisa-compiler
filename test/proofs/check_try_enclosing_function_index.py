@@ -35,25 +35,37 @@ PIPELINE_FILES = [
     ROOT / "src/semantic/semantic_api/full_pipeline.elisa",
 ]
 PARSER_ARGUMENT_SOURCE = ROOT / "src/parser/parser_expr_query.elisa"
+PARSER_FUNCTION_SOURCE = ROOT / "src/parser/parser_types_function.elisa"
+PARSER_DECLARATION_SOURCE = ROOT / "src/parser/parser_decl.elisa"
 PARSER_VISIBILITY_SOURCE = ROOT / "src/parser/parser_decl_module.elisa"
 PARSER_CATCH_SOURCE = ROOT / "src/parser/parser_stmt_pattern_arms.elisa"
 PARSER_NOMINAL_SOURCES = [
     ROOT / "src/parser/parser_types_aggregate.elisa",
     ROOT / "src/parser/parser_export_surface.elisa",
+    ROOT / "src/parser/parser_types.elisa",
 ]
 POSITIVE = HERE / "try_enclosing_function_index.elisa"
 NEGATIVE = HERE / "try_enclosing_function_index_rejected.elisa"
+QUALIFIED_LEAF_FIXTURE = ROOT / "test/repro/try_qualified_module_leaf_collision.elisa"
+NESTED_GLOBAL_ALIAS_FIXTURE = ROOT / "test/repro/try_nested_global_using_alias.elisa"
+ZERO_OFFSET_ENCLOSING_FIXTURE = ROOT / "test/repro/try_zero_offset_enclosing_function_identity.elisa"
+LINE_ZERO_NONERROR_FIXTURE = ROOT / "test/repro/try_nonerror_enclosing_line_zero.elisa"
+FIRST_CLASS_AMBIGUOUS_FAMILY_FIXTURE = ROOT / "test/repro/try_first_class_ambiguous_error_family.elisa"
+FIRST_CLASS_INACTIVE_DUPLICATE_FAMILY_FIXTURE = ROOT / "test/repro/try_first_class_inactive_duplicate_error_family.elisa"
+TRY_SMOKE = ROOT / "test/parity/try_fallible_smoke.sh"
+PRIVATE_OVERLOAD_FIXTURE = ROOT / "test/repro/try_overload_private_winner_visibility.elisa"
+PRIVATE_OVERLOAD_SMOKE = ROOT / "test/parity/try_overload_private_winner_visibility_smoke.sh"
 PROOF_PROCESS_TIMEOUT_SECONDS = 60
 
 POSITION_CONSTANTS = {
-    "FALLIBLE_FUNCTION_NO_OFFSET": ("u32", "0"),
+    "FALLIBLE_FUNCTION_NO_OFFSET": ("u32", "4294967295"),
     "FALLIBLE_FUNCTION_NO_LINE": ("u32", "0"),
     "FALLIBLE_FUNCTION_FIRST_POSITION": ("usize", "0"),
     "FALLIBLE_FUNCTION_POSITION_STEP": ("usize", "1"),
     "FALLIBLE_FUNCTION_SEARCH_DIVISOR": ("usize", "2"),
 }
 POSITIVE_NAMES = {
-    "try_offsets_are_nonzero",
+    "try_offsets_are_valid",
     "try_offsets_are_nondecreasing",
     "try_predecessor_is_last",
     "try_linear_predecessor",
@@ -61,6 +73,8 @@ POSITIVE_NAMES = {
     "last_predecessor_results_are_unique",
     "sorted_binary_predecessor_equals_linear_reference",
     "duplicate_offsets_select_the_last_qualifying_position",
+    "zero_offset_is_a_real_position",
+    "unsorted_offsets_keep_zero_in_linear_fallback",
     "sorted_binary_predecessor_preserves_parallel_line_mapping",
     "empty_index_reports_no_predecessor",
     "sorted_index_without_a_predecessor_reports_fallback_case",
@@ -184,6 +198,15 @@ semantic_text = SEMANTIC.read_text()
 pipeline_text = "\n".join(path.read_text() for path in PIPELINE_FILES)
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
+qualified_leaf_fixture = QUALIFIED_LEAF_FIXTURE.read_text()
+nested_global_alias_fixture = NESTED_GLOBAL_ALIAS_FIXTURE.read_text()
+zero_offset_enclosing_fixture = ZERO_OFFSET_ENCLOSING_FIXTURE.read_text()
+line_zero_nonerror_fixture = LINE_ZERO_NONERROR_FIXTURE.read_text()
+first_class_ambiguous_family_fixture = FIRST_CLASS_AMBIGUOUS_FAMILY_FIXTURE.read_text()
+first_class_inactive_duplicate_family_fixture = FIRST_CLASS_INACTIVE_DUPLICATE_FAMILY_FIXTURE.read_text()
+try_smoke = TRY_SMOKE.read_text()
+private_overload_fixture = PRIVATE_OVERLOAD_FIXTURE.read_text()
+private_overload_smoke = PRIVATE_OVERLOAD_SMOKE.read_text()
 
 if not __debug__:
     raise SystemExit("run without Python -O")
@@ -209,14 +232,16 @@ expected_linear = """
 def enclosing_try_function(table: SymbolTable&, try_line: u32, try_offset: u32) -> (line: u32, offset: u32):
     best_line: mutable u32 = FALLIBLE_FUNCTION_NO_LINE
     best_offset_line: mutable u32 = FALLIBLE_FUNCTION_NO_LINE
-    best_offset: mutable u32 = FALLIBLE_FUNCTION_NO_OFFSET
-    for symbol in table.symbols |best_line, best_offset_line, best_offset|:
+    best_offset: mutable u32 = 0
+    best_offset_found: mutable bool = false
+    for symbol in table.symbols |best_line, best_offset_line, best_offset, best_offset_found|:
         if symbol.kind == SymbolKind.Func:
             best_line <- symbol.line if symbol.line <= try_line and symbol.line >= best_line
-            if try_offset != FALLIBLE_FUNCTION_NO_OFFSET and symbol.offset != FALLIBLE_FUNCTION_NO_OFFSET and symbol.offset <= try_offset and symbol.offset >= best_offset:
+            if try_offset != FALLIBLE_FUNCTION_NO_OFFSET and symbol.offset != FALLIBLE_FUNCTION_NO_OFFSET and symbol.offset <= try_offset and (not best_offset_found or symbol.offset >= best_offset):
                 best_offset <- symbol.offset
                 best_offset_line <- symbol.line
-    return (best_offset_line, best_offset) if best_offset != FALLIBLE_FUNCTION_NO_OFFSET
+                best_offset_found <- true
+    return (best_offset_line, best_offset) if best_offset_found
     return (best_line, FALLIBLE_FUNCTION_NO_OFFSET)
 """
 expected_builder = """
@@ -225,7 +250,7 @@ def fallible_function_position_index_build(index: mutable FallibleFunctionPositi
         positions: mutable darray[FallibleFunctionPosition] = []
         offsets_ordered: mutable bool = true
         saw_previous: mutable bool = false
-        previous_offset: mutable u32 = FALLIBLE_FUNCTION_NO_OFFSET
+        previous_offset: mutable u32 = 0
         for symbol in table.symbols |positions, offsets_ordered, saw_previous, previous_offset|:
             if symbol.kind == SymbolKind.Func and symbol.offset != FALLIBLE_FUNCTION_NO_OFFSET:
                 offsets_ordered <- false if saw_previous and symbol.offset < previous_offset
@@ -263,9 +288,118 @@ for name, expected in (
     if compact(function_section(source_text, name)) != compact(expected):
         raise SystemExit(f"production {name} changed without updating the source-bound proof")
 
+exact_zero_contracts = {
+    "try_enclosing_function_decl_id": (
+        "enclosing.offset != FALLIBLE_FUNCTION_NO_OFFSET and symbol.offset != enclosing.offset",
+        "matches <- matches + 1.usize()",
+    ),
+    "try_enclosing_return_occurrence": (
+        "function_offset != FALLIBLE_FUNCTION_NO_OFFSET and marker.offset != function_offset",
+    ),
+    "fallible_function_module_index_add": (
+        "annotation.offset != FALLIBLE_FUNCTION_NO_OFFSET",
+        "index.by_offset <- index.by_offset.put(annotation.offset.u64(), row)",
+        "index.by_line <- index.by_line.put(line_key, CALLABLE_ERROR_ROW_NONE)",
+        "index.unknown_offset_by_line",
+    ),
+    "fallible_fn_module_indexed": (
+        "declaration_offset == FALLIBLE_FUNCTION_NO_OFFSET",
+        "index.by_offset.get(declaration_offset.u64())",
+        "return module_annotations[offset_row.usize()].name if offset_row != CALLABLE_ERROR_ROW_NONE and module_annotations[offset_row.usize()].line == declaration_line",
+        "row != CALLABLE_ERROR_ROW_NONE",
+    ),
+    "fallible_fn_module": (
+        "declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET and module_annotation.offset == declaration_offset",
+        "fallback_module <- module_annotation.name",
+        "return fallback_module if fallback_count == 1.usize()",
+    ),
+    "fallible_fn_module_known": (
+        "module_annotation.offset == declaration_offset",
+        "declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET",
+        "return fallback_count == 1.usize()",
+    ),
+    "try_error_set_index_build": (
+        "annotation.offset != FALLIBLE_FUNCTION_NO_OFFSET",
+        "index.by_offset_heads <- index.by_offset_heads.put(offset_key, row_id)",
+        "index.unknown_offset_line_heads",
+    ),
+    "try_error_set_destinations": (
+        "declaration_offset == FALLIBLE_FUNCTION_NO_OFFSET",
+        "candidate.offset == declaration_offset",
+        "if destinations.count == 0.usize():",
+    ),
+    "try_error_family_path_for_declaration": (
+        "declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET and family_annotation.offset != declaration_offset",
+    ),
+    "try_error_family_refs_match": (
+        "source.declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET and destination.declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET",
+        "try_error_family_name_has_unique_module(file, annotations, source.family, expected_module_known, expected_module, table)",
+    ),
+    "try_error_set_decl_is_static_inactive": (
+        'name_row.owner != "__lsp_decl_name" or name_row.name != declaration.name or name_row.line != declaration.line',
+        "name_row.pos.offset != declaration.offset",
+        "name_row_count != 1.usize()",
+        "try_overload_nominal_type_declaration_is_static_inactive(file, annotations, declaration.name, declaration.module, declaration.line, declaration_keyword_offset, table)",
+    ),
+    "try_error_family_name_has_unique_module": (
+        'declaration.owner != "__error_set_decl" or declaration.name != family',
+        "try_error_set_decl_is_static_inactive(file, annotations, declaration, table)",
+        "declaration.module != selected_module",
+        "module_found and (not expected_module_known or selected_module == expected_module)",
+    ),
+    "try_error_family_subset_status": (
+        "family.declaration_offset == FALLIBLE_FUNCTION_NO_OFFSET or family.family_path == \"\"",
+    ),
+    "try_error_family_has_empty_subset": (
+        "family.declaration_offset == FALLIBLE_FUNCTION_NO_OFFSET or family.family_path == \"\"",
+    ),
+    "callable_function_declaration_visible": (
+        "declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET and annotation.offset != FALLIBLE_FUNCTION_NO_OFFSET",
+        "annotation.offset == declaration_offset",
+        "annotation.offset == FALLIBLE_FUNCTION_NO_OFFSET",
+    ),
+    "callable_symbol_accepts_arity": (
+        "if symbol.offset == declaration_offset:",
+        "declaration_offset == FALLIBLE_FUNCTION_NO_OFFSET or symbol.offset == FALLIBLE_FUNCTION_NO_OFFSET",
+    ),
+    "try_noncall_parameter_error_family": (
+        "function_pos.offset != FALLIBLE_FUNCTION_NO_OFFSET and enclosing.offset != FALLIBLE_FUNCTION_NO_OFFSET",
+        "function_pos.offset < enclosing.offset",
+    ),
+    "check_try_propagation_row": (
+        "enclosing.offset != FALLIBLE_FUNCTION_NO_OFFSET and family_annotation.offset != FALLIBLE_FUNCTION_NO_OFFSET",
+        "family_annotation.offset == enclosing.offset",
+        "function_line != 0 or enclosing.offset != FALLIBLE_FUNCTION_NO_OFFSET",
+    ),
+    "try_parameter_error_family": (
+        "parameter_found: mutable bool = false",
+        "return (false, \"\") if not parameter_found",
+    ),
+    "try_noncall_static_effect_candidate_may_raise": (
+        "operation_matches != 1.usize() or operation_name == \"\"",
+        "operation_offset <- operation_row.offset",
+    ),
+    "try_fallback_extern_declaration_line": (
+        "-> (found: bool, line: u32, offset: u32)",
+        "function_count <- function_count + 1.usize()",
+        "return (true, declaration_line, declaration_offset) if function_count == 1.usize()",
+        "return (false, 0, 0)",
+    ),
+    "try_fallback_extern_return_info": (
+        "declaration: (found: bool, line: u32, offset: u32) = try_fallback_extern_declaration_line(table, name)",
+        "return info if not declaration.found",
+    ),
+}
+for name, fragments in exact_zero_contracts.items():
+    body = compact_inline(function_section(source_text, name))
+    if any(compact_inline(fragment) not in body for fragment in fragments):
+        raise SystemExit(f"Try source selector must treat byte offset zero as exact and reserve the sentinel for missing positions: {name}")
+if "declaration_line != 0" in compact_inline(function_section(source_text, "try_error_family_refs_match")):
+    raise SystemExit("Try family identity must not treat logical line zero as missing provenance")
+
 rows_function = function_section(source_text, "check_try_fallible_rows")
 expected_dispatch = """
-row_enclosing: mutable (line: u32, offset: u32) = (0, 0)
+row_enclosing: mutable (line: u32, offset: u32) = (0, FALLIBLE_FUNCTION_NO_OFFSET)
 if try_site_count > 1:
     row_enclosing <- enclosing_try_function_indexed(function_positions, table, annotation.line, annotation.offset)
 else:
@@ -292,7 +426,9 @@ if not all(fragment in argument_types for fragment in (
         "callable_try_static_binding_uncertain(annotations, nested_call_name, caller_module, \"\", table)",
         "callable_row_in_scope_indexed(module_index, module_annotations, annotations, nested_call_name, symbol.offset, symbol.line, caller_module, \"\", table)",
         "symbol.return_type_id",
-        "type_id_contains_function_generic(call_return_type_id, call_return_function_line, table)",
+        "call_return_function_offset: mutable u32 = 0",
+        "call_return_function_offset <- symbol.offset",
+        "type_id_contains_function_generic(call_return_type_id, call_return_function_line, call_return_function_offset, table)",
         "type_id_contains_region(call_return_type_id, table)",
         "call_return_conflict",
         "argument_type_firm or argument_type_ambiguous")):
@@ -372,7 +508,7 @@ if not all(fragment in visible_overloads for fragment in (
     raise SystemExit("Try receiver ranking must detect Core overload sets across all visible module candidates")
 candidate_set = compact_inline(function_section(source_text, "callable_row_in_ufcs_candidate_set_indexed"))
 if not all(fragment in candidate_set for fragment in (
-        'if callee_qualifier != "": return false if not try_error_alias_module_visible(annotations, candidate_module, enclosing_module) return callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier)',
+        'if callee_qualifier != "": return false if not try_error_alias_module_visible(annotations, candidate_module, enclosing_module) return callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier, name, table)',
         "candidate_module == scope_module and callable_named_declaration_in_module",
         "callable_wildcard_imported_row_in_scope(annotations, table, name, candidate_module, scope_module)",
         "return callable_program_selective_import_row(annotations, name, candidate_module)")):
@@ -390,12 +526,66 @@ if 'binding.name == "__binding_wildcard_import" and binding.owner == candidate_m
 ordinary_row = compact_inline(function_section(source_text, "callable_row_in_scope_indexed"))
 qualified_module_match = compact_inline(function_section(source_text, "callable_qualified_module_matches_candidate"))
 if not all(fragment in qualified_module_match for fragment in (
-        "callable_using_alias_visible_target(annotations, enclosing_module, alias_head)",
-        "callable_alias_path_matches_candidate(annotations, visible_prefix_alias.scope, visible_prefix_alias.target, alias_suffix, candidate_module)",
-        "candidate_module == callee_qualifier or module_last_segment(candidate_module) == callee_qualifier")):
-    raise SystemExit("Try qualified overload ranking must retain alias-aware module matching independently of member visibility")
-if 'return false if not try_error_alias_module_visible(annotations, candidate_module, enclosing_module) return false if not callable_function_declaration_visible(annotations, name, candidate_module, declaration_line, declaration_offset, enclosing_module) return callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier)' not in ordinary_row:
+        "callable_module_path_matches_suffix(symbol.module_owner, scope_module, callee_qualifier)",
+        "callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, enclosing_module)",
+        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, 4294967295, table)",
+        "semantic_possible_import_alias_target_prefix(symbol.module_owner, alias.raw_target, alias.scope, alias.offset, table)",
+        "candidate_module == callee_qualifier and callable_named_visible_declaration_in_module(table, annotations, name, candidate_module, enclosing_module)")) or "module_last_segment(candidate_module)" in qualified_module_match:
+    raise SystemExit("Try qualified overload ranking must use exact lexical modules, the shared global alias winner, and an exact root path")
+if 'return false if not try_error_alias_module_visible(annotations, candidate_module, enclosing_module) return false if not callable_function_declaration_visible(annotations, name, candidate_module, declaration_line, declaration_offset, enclosing_module) return callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier, name, table)' not in ordinary_row:
     raise SystemExit("Try ordinary qualified lookup must reject private modules and exact private members while sharing the path matcher")
+linear_scope = compact_inline(function_section(source_text, "callable_row_in_scope"))
+if "callable_qualified_module_matches_candidate(annotations, candidate_module, enclosing_module, callee_qualifier, name, table)" not in linear_scope or "module_last_segment(candidate_module)" in linear_scope:
+    raise SystemExit("Try linear family lookup must use the same exact qualified-module matcher")
+global_alias_lookup = compact_inline(function_section(source_text, "callable_using_alias_visible_target_global"))
+if not all(fragment in global_alias_lookup for fragment in (
+        "semantic_possible_import_alias_head_target(alias_name, enclosing_module, 4294967295, table)",
+        "return (2.usize(), \"\", \"\") if not alias.known",
+        "return (1.usize(), alias.target, alias.scope) if alias.found")):
+    raise SystemExit("Try must use the shared analyzer-wide alias winner and keep unresolved alias contenders unknown")
+cached_alias_chain = compact_inline(function_section(source_text, "callable_using_alias_target_chain_known"))
+if not all(fragment in cached_alias_chain for fragment in (
+        "semantic_possible_import_alias_head_target(alias_head, alias_scope, before_offset, table)",
+        "return false if not alias.known",
+        "return callable_using_alias_target_chain_known(alias.raw_target, alias.scope, alias.offset, table, depth + 1.u32())")):
+    raise SystemExit("Try cached aliases must validate target chains at each declaration cutoff")
+static_alias_binding = compact_inline(function_section(source_text, "callable_try_static_binding_uncertain"))
+if not all(fragment in static_alias_binding for fragment in (
+        'unresolved.name == "__using_alias" and callee_qualifier != "" and unresolved.detail_name == alias_head',
+        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, 4294967295, table)",
+        "continue if selected_alias.known and selected_alias.found return true")) or "try_noncall_module_is_ancestor(unresolved.module, enclosing_module)" in static_alias_binding:
+    raise SystemExit("Try static alias uncertainty must follow the analyzer-wide alias winner rather than caller ancestry")
+if not all(fragment in qualified_leaf_fixture for fragment in (
+        "module OuterB:", "def fail() -> i64 error[F]:", "module OuterA:",
+        "def fail() -> i64 error[E]:", "module Caller:", "return try Common::fail()")) or not all(fragment in try_smoke for fragment in (
+        "try_qualified_module_leaf_collision.elisa", "cannot propagate E from a function returning F")):
+    raise SystemExit("Try smoke must bind the duplicate-leaf fixture where Common resolves only to the caller's OuterA ancestor")
+if not all(fragment in nested_global_alias_fixture for fragment in (
+        "module AliasHome:", "module Provider:", "using Provider as Shared", "def good() -> i64 error[E]:", "return try Shared::load()")) or not all(fragment in try_smoke for fragment in (
+        "try_nested_global_using_alias.elisa", "root call could not resolve a module alias declared in a nested module")):
+    raise SystemExit("Try smoke must bind a root call through a module alias declared inside a nested module")
+if not zero_offset_enclosing_fixture.startswith("def caller() -> i64 error[E]:\n") or not all(fragment in zero_offset_enclosing_fixture for fragment in (
+        "return try load()", "def load() -> i64 error[E]:",
+        "#line 1 zero-offset-enclosing.elisa", "def sibling() -> i64 error[F]:")) or not all(fragment in try_smoke for fragment in (
+        "try_zero_offset_enclosing_function_identity.elisa", "^D 0$",
+        "same-#line sibling displaced the byte-zero caller")):
+    raise SystemExit("Try smoke must bind a byte-zero enclosing function against a same-line sibling with a different error family")
+if "#line 0 try-line-zero.elisa\ndef caller() -> i64:" not in line_zero_nonerror_fixture or not all(fragment in line_zero_nonerror_fixture for fragment in (
+        "def load() -> i64 error[E]:", "return try load()")) or not all(fragment in try_smoke for fragment in (
+        "try_nonerror_enclosing_line_zero.elisa", "try without else requires the current function to return an error union")):
+    raise SystemExit("Try smoke must retain the #line 0 non-error caller regression")
+if not all(fragment in first_class_ambiguous_family_fixture for fragment in (
+        "module Provider:", "error Fault:", "module Caller:", "from Caller import Fault",
+        "#line 0 try-family-ref-provenance.elisa", "error[Provider::Fault]", "return try value")) or not all(fragment in try_smoke for fragment in (
+        "try_first_class_ambiguous_error_family.elisa", "^D 1$",
+        "cannot propagate Fault from a function returning Fault")):
+    raise SystemExit("Try family provenance must reject a line-zero name-only match when duplicate ErrorSet owners exist")
+if not all(fragment in first_class_inactive_duplicate_family_fixture for fragment in (
+        "module Provider:", "error Fault:", "static if false:", "module InactiveCaller:",
+        "error Fault:", "from Provider import Fault", "#line 0 try-family-inactive-owner.elisa",
+        "error[Provider::Fault]", "return try value")) or not all(fragment in try_smoke for fragment in (
+        "try_first_class_inactive_duplicate_error_family.elisa", "^D 0$")):
+    raise SystemExit("Try family uniqueness must ignore a duplicate ErrorSet only when its static branch is proven inactive")
 ordinary_local = ordinary_row.find("if callable_named_visible_declaration_in_module(table, annotations, name, scope_module, enclosing_module): return candidate_module == scope_module")
 ordinary_parent_walk = ordinary_row.find("scope_module <- try_noncall_module_parent(scope_module)")
 ordinary_wildcard = ordinary_row.find("wildcard: (found: bool, matches: bool) = callable_first_wildcard_imported_row")
@@ -504,8 +694,21 @@ if not all(fragment in cached_candidate_set for fragment in (
         "try_noncall_module_is_ancestor(candidate_module, environment.current_module)",
         "try_noncall_module_is_ancestor(environment.callable_wildcard_import_scopes[import_index], environment.current_module)",
         "environment.callable_imported_member_names[import_index] != callee_name",
-        "try_noncall_callable_matches_using_alias(callee, alias_index, candidate_module, environment)")):
+        "try_noncall_qualified_module_matches(callee, candidate_module, callee_name, environment, true)")):
     raise SystemExit("Try cached hidden-candidate checks must cover Core's lexical, wildcard, selective, and qualified receiver candidate modules")
+cached_module_match = compact_inline(function_section(source_text, "try_noncall_qualified_module_matches"))
+cached_qualifier_path = compact_inline(function_section(source_text, "try_noncall_qualifier_path_matches_module"))
+cached_alias_target = compact_inline(function_section(source_text, "try_noncall_visible_using_alias_target"))
+if not all(fragment in cached_module_match for fragment in (
+        "include_hidden: bool",
+        "try_noncall_qualifier_path_matches_module(qualifier, environment.callable_modules[index], scope_module)",
+        "not include_hidden and not environment.callable_visible[index]",
+        "try_noncall_callable_matches_using_alias(callee, alias_index, environment.callable_modules[index], environment)",
+        "try_noncall_qualifier_path_matches_module(qualifier, module_path, \"\")")) or "module_path == name if lexical_scope == \"\"" not in cached_qualifier_path or "module_last_segment(module_path)" in cached_qualifier_path or "environment.using_alias_known[index]" not in cached_alias_target:
+    raise SystemExit("Try cached qualified lookup must bind lexical module identity, the global alias target, and exact root spelling")
+if "try_noncall_qualified_module_matches(callee, candidate_module, callee_name, environment, true)" not in cached_candidate_set or "try_noncall_qualified_module_matches(callee, environment.callable_modules[index], callee_name, environment, false)" not in cached_lookup or not all(fragment in private_overload_fixture for fragment in (
+        "def qualified_private_winner_direct", "def qualified_private_winner_cached", "private:", "return try Provider::origin(value)")) or "try_overload_private_winner_visibility.elisa" not in private_overload_smoke:
+    raise SystemExit("Try must match hidden qualified candidates in blocker mode while skipping them in ordinary cached lookup, with private winner coverage")
 cached_lookup_signature = compact_inline(function_section(source_text, "try_noncall_callable_cached_facts"))
 if "arguments: darray[Ast::Expr]&" not in cached_lookup_signature or "try_noncall_cached_hidden_candidate_blocks(callable_index, callee_name, callee_qualifier, callee, arguments, argument_names, params, environment)" not in cached_lookup_signature or "try_noncall_callable_cached_facts(callee_name, callee_qualifier, callee, environment)" in source_text:
     raise SystemExit("Every Try cached callable lookup must receive call arguments and caller parameter types before returning ErrorSet facts")
@@ -514,8 +717,9 @@ if not all(fragment in cached_static_binding for fragment in (
         'unresolved.name == "__from_member"',
         'unresolved.name == "__binding_wildcard_import"',
         'unresolved.name == "__using_alias"',
-        "environment.callable_modules[index] == target_module",
-        "try_noncall_static_alias_call_matches_module(callee, unresolved.detail_name, target_module, environment.callable_modules[callable_index])")) or "continue if not try_noncall_module_is_ancestor(unresolved.module, environment.current_module)" in cached_static_binding or not all(fragment in cached_lookup_signature for fragment in (
+        "try_noncall_visible_using_alias_target(environment, alias_head)",
+        "continue if resolved_alias.known",
+        "return true if any callable_index in 0..<environment.callable_names.count where environment.callable_names[callable_index] == callee_name and environment.callable_visible[callable_index]")) or "continue if not try_noncall_module_is_ancestor(unresolved.module, environment.current_module)" in cached_static_binding or not all(fragment in cached_lookup_signature for fragment in (
         "try_noncall_static_binding_may_affect_call(callee_name, callee_qualifier, callee, environment)",
         'return (false, "", false, false, false, true, "", 0.usize())')):
     raise SystemExit("Try cached callable facts must fail closed only when an unresolved static import or alias can reach a same-name candidate")
@@ -523,9 +727,12 @@ if cached_lookup_signature.find("try_noncall_static_binding_may_affect_call") > 
     raise SystemExit("Try must reject an unresolved static candidate before selecting cached callable facts")
 static_alias_path_uncertain = compact_inline(function_section(source_text, "callable_static_alias_path_uncertain"))
 if not all(fragment in static_alias_path_uncertain for fragment in (
-        "callable_using_alias_visible_target(annotations, current_scope, segments[0])",
-        'unresolved.name == "__using_alias"',
-        "try_noncall_module_is_ancestor(unresolved.module, lexical_module)",
+        "semantic_possible_import_alias_head_target(segments[0], current_scope, before_offset, table)",
+        'unresolved.owner != "__try_unresolved_static_binding" or unresolved.name != "__using_alias" or unresolved.detail_name != segments[0]',
+        "possible_alias.module != unresolved.module or possible_alias.line != unresolved.line or possible_alias.offset != unresolved.offset",
+        "semantic_possible_import_alias_precedes_position(possible_alias, current_scope, before_offset, table)",
+        "visible_alias.raw_target",
+        "before_offset <- visible_alias.offset",
         "return segments.count > 0.usize()")):
     raise SystemExit("Try direct callable lookup must keep uncertainty when an alias target path crosses a visible or unresolved alias head")
 if not all(fragment in noncall_import_builder for fragment in (
@@ -534,7 +741,11 @@ if not all(fragment in noncall_import_builder for fragment in (
         "try_noncall_module_path(unresolved.module, source.name, table)",
         "try_noncall_module_path(unresolved.module, alias_target.owner, table)",
         'candidate_alias.name == "__using_alias" and candidate_alias.detail_name == target_head',
-        "visible_target_alias.count == 0.usize() and not unresolved_target_alias")):
+        "callable_using_alias_visible_target_global(annotations, unresolved.module, target_head, table)",
+        "visible_target_alias.count == 0.usize() and not unresolved_target_alias",
+        "environment.using_alias_known.push(alias_target.count == 1.usize() and alias_chain_known)",
+        "callable_using_alias_target_chain_known(alias_selection.raw_target, alias_selection.scope, alias_selection.offset, table)",
+        'candidate_alias.name == "__using_alias" and candidate_alias.detail_name == target_head')):
     raise SystemExit("Try non-call environments must retain unresolved marker targets through branch clones")
 cached_env_clone = compact_inline(function_section(source_text, "try_noncall_family_clone"))
 if not all(fragment in cached_env_clone for fragment in (
@@ -543,6 +754,7 @@ if not all(fragment in cached_env_clone for fragment in (
         "clone.callable_max_param_counts.extend(environment.callable_max_param_counts)",
         "clone.callable_has_default_params.extend(environment.callable_has_default_params)",
         "clone.callable_variadic.extend(environment.callable_variadic)",
+        "clone.using_alias_known.extend(environment.using_alias_known)",
         "clone.unresolved_static_bindings.extend(environment.unresolved_static_bindings)",
         "clone.unresolved_static_binding_targets.extend(environment.unresolved_static_binding_targets)")):
     raise SystemExit("Try branch clones must preserve cached overload signature facts")
@@ -686,6 +898,16 @@ if not all(fragment in nominal_static_activity for fragment in (
         "pma_static_if_row_selection(file, marker.identity_id.usize(), declaration_module, table)",
         "return true if branch.known and not branch.selected")):
     raise SystemExit("Try nominal owner lookup must exclude only exact, proven-inactive non-alias type declarations")
+error_set_static_activity = compact_inline(function_section(source_text, "try_error_set_decl_is_static_inactive"))
+if not all(fragment in error_set_static_activity for fragment in (
+        'name_row.owner != "__lsp_decl_name"',
+        "name_row.line != declaration.line",
+        "name_row.pos.offset != declaration.offset",
+        "name_row_count != 1.usize()",
+        "try_overload_nominal_type_declaration_is_static_inactive(file, annotations, declaration.name, declaration.module, declaration.line, declaration_keyword_offset, table)")) or not all(fragment in nominal_static_activity for fragment in (
+        "continue if marker.identity_id == 4294967295",
+        "return true if branch.known and not branch.selected")):
+    raise SystemExit("Try family uniqueness must ignore only exact, proven-inactive ErrorSets and retain unknown branch owners")
 type_owner_module = compact_inline(function_section(source_text, "try_overload_type_owner_in_module"))
 if not all(fragment in type_owner_module for fragment in (
         "try_overload_type_symbol_is_nominal(symbol)",
@@ -754,6 +976,15 @@ if parser_nominal_text[0].count('record_static_if_branch_rows("__nominal_type_st
         'record_static_if_branch_rows("__nominal_type_static_branch", target_name, token)' not in parser_nominal_text[1] or \
         'record_static_if_branch_rows("__nominal_type_static_branch", name, token)' not in parser_nominal_text[1]:
     raise SystemExit("Try nominal lookup must receive exact static-branch markers for structs, enums, opaque externs, and exported types")
+error_set_parser = compact_inline(function_section(parser_nominal_text[2], "error_type_declaration"))
+declaration_name_parser = compact_inline(function_section(PARSER_DECLARATION_SOURCE.read_text(), "record_lsp_declaration_name"))
+if not all(fragment in error_set_parser for fragment in (
+        "record_lsp_declaration_name(error_set_name, token, name_token, name_token)",
+        'record_static_if_branch_rows("__nominal_type_static_branch", error_set_name, token)',
+        'owner: "__error_set_decl", name: error_set_name, module: parser.current_module, line: name_token.line, offset: name_token.start')) or not all(fragment in declaration_name_parser for fragment in (
+        "offset: declaration_token.start",
+        "offset: first_name_token.start")):
+    raise SystemExit("Try ErrorSet activity lookup must join the name-token declaration row to the exact keyword-position branch marker")
 parser_try_expression = compact_inline(function_section(parser_source, "get_expression"))
 parser_call_arity = compact_inline(function_section(parser_source, "try_expression_call_arity"))
 parser_try_arguments = compact_inline(function_section(parser_source, "try_expression_record_named_arguments"))
@@ -795,6 +1026,11 @@ if not all(fragment in try_projection for fragment in (
         "if row_arity.known else []")):
     raise SystemExit("Try overload ranking must consume the parser's call arity by the exact try-site offset")
 parser_visibility_source = PARSER_VISIBILITY_SOURCE.read_text()
+parser_function_source = PARSER_FUNCTION_SOURCE.read_text()
+if not all(fragment in compact_inline(parser_function_source) for fragment in (
+        'owner: function_name, name: "__error_return", line: token.line, offset: token.start',
+        'owner: "__fn_module", name: parser.current_module, line: token.line, offset: token.start')):
+    raise SystemExit("Try byte-zero return and module rows must retain their parser token offsets")
 section_marker = compact_inline(function_section(parser_visibility_source, "record_section_member"))
 if not all(fragment in section_marker for fragment in (
         '"__section_private" if visibility_name == "private" else "__section_public"',
@@ -810,6 +1046,15 @@ family_module = compact_inline(function_section(source_text, "try_error_set_decl
 root_precedence = 'return (true, family_annotation.name, "", false) if not qualified and try_error_set_decl_has_owner(annotations, family_annotation.name, "")'
 if root_precedence not in family_module or family_module.index(root_precedence) > family_module.index("for declaration in annotations"):
     raise SystemExit("A bare root error-set declaration must win before Try scans lexical module candidates")
+if not all(fragment in family_module for fragment in (
+        "(found: bool, uncertain: bool, module: sview @source) = catch_explicit_error_family_module",
+        'return (false, family_annotation.name, "", true) if qualified and explicit_module.uncertain',
+        'return (false, family_annotation.name, "", true) if not qualified and family_path != "" and not catch_module_path_matches(family_path, family_annotation.name)')):
+    raise SystemExit("Try must keep uncertain qualified ErrorSet aliases unknown before considering raw module candidates")
+bare_path_guard = 'return (false, family_annotation.name, "", true) if not qualified and family_path != "" and not catch_module_path_matches(family_path, family_annotation.name)'
+root_alias_lookup = 'try_error_alias_index(family_annotation.name, "", table)'
+if family_module.index(bare_path_guard) > family_module.index(root_precedence) or family_module.index(bare_path_guard) > family_module.index(root_alias_lookup):
+    raise SystemExit("Try must reject a malformed nonempty bare ErrorSet path before root declaration or alias lookup")
 root_nominal_precedence = 'return (false, family_annotation.name, "", false) if not qualified and function_module_known and try_error_local_nominal_type_shadows_family(annotations, family_annotation.name, function_module, table)'
 if root_nominal_precedence not in family_module or family_module.index(root_nominal_precedence) > family_module.index("try_error_alias_index(family_annotation.name, \"\", table)"):
     raise SystemExit("A root nominal type must shadow lexical and imported same-name ErrorSets before alias candidate lookup")
@@ -1102,6 +1347,7 @@ if not (static_import_fixture.index("from InactiveProvider import origin") < sta
     raise SystemExit("Try static-import coverage must put the inactive import before the active fallback import")
 static_alias_fixture = (ROOT / "test/repro/try_overload_static_alias_family.elisa").read_text()
 static_alias_smoke = (ROOT / "test/parity/try_overload_static_alias_family_smoke.sh").read_text()
+static_alias_propagation_row = compact_inline(function_section(source_text, "check_try_propagation_row"))
 if not all(fragment in static_alias_fixture for fragment in (
         "const USE_INACTIVE_PROVIDER: bool = false",
         "static if USE_INACTIVE_PROVIDER:",
@@ -1109,11 +1355,22 @@ if not all(fragment in static_alias_fixture for fragment in (
         "static else:",
         "using ActiveProvider as BaseProvider",
         "using BaseProvider as Selected",
+        "module RootCollision:",
+        "error RootFault:",
+        "def origin(value: bool) -> i64 error[RootCollision::RootFault]:",
+        "module AliasSafeProvider:",
+        "def origin(value: bool) -> i64 error[AliasSafeProvider::SafeFault]:",
+        "module AliasInstallerA:\n    static if UNKNOWN_ALIAS_TARGET:\n        using AliasSafeProvider as RootCollision",
+        "module AliasInstallerB:\n    static if UNKNOWN_ALIAS_TARGET:\n        using AliasSafeProvider as RootCollision",
+        "def unresolved_alias_cannot_select_root(value: bool) -> i64:",
+        "return try RootCollision::origin(value)",
         "error InactiveFault:",
         "error ActiveFault:",
         "def caller(value: bool) -> i64 error[ActiveProvider::ActiveFault]",
         "return try Selected::origin(value)")):
     raise SystemExit("Try static-alias coverage must select the active static-else provider's ErrorSet for a qualified call")
+if not all(fragment in static_alias_fixture for fragment in ("error SafeFault:", "SafeFault")) or 'return if first_class_error_family == "" and annotation.owner != "__noncall" and callable_try_static_binding_uncertain(annotations, annotation.owner, enclosing_module, callee_qualifier, table)' not in static_alias_propagation_row:
+    raise SystemExit("Try must suppress family inference at the propagation-row boundary while an unknown alias could select a fallible target")
 if not all(fragment in static_alias_smoke for fragment in (
         "try_overload_static_alias_family.elisa",
         "Stage0 selected the inactive alias provider's ErrorSet",
@@ -1307,7 +1564,7 @@ positive_shapes = {
         "return (found, selected)",
     ),
     "try_binary_predecessor": (
-        "requires try_offsets_are_nonzero(offsets)",
+        "requires try_offsets_are_valid(offsets)",
         "requires try_offsets_are_nondecreasing(offsets)",
         "invariant forall prior in TRY_ENCLOSING_FIRST_POSITION..<low: offsets[prior] <= query",
         "invariant forall later in high..<offsets.count: offsets[later] > query",
@@ -1332,7 +1589,17 @@ positive_shapes = {
     "duplicate_offsets_select_the_last_qualifying_position": (
         "indexed.index == TRY_ENCLOSING_SECOND_POSITION",
     ),
-    "try_offsets_are_nonzero": (
+    "zero_offset_is_a_real_position": (
+        "offsets: darray[u32] = [0, TRY_ENCLOSING_DUPLICATE_OFFSET]",
+        "try_binary_predecessor(offsets, 0)",
+        "indexed.found and indexed.index == TRY_ENCLOSING_FIRST_POSITION and indexed == linear",
+    ),
+    "unsorted_offsets_keep_zero_in_linear_fallback": (
+        "offsets: darray[u32] = [TRY_ENCLOSING_DUPLICATE_OFFSET, 0]",
+        "try_linear_predecessor(offsets, 0)",
+        "linear.found and linear.index == TRY_ENCLOSING_SECOND_POSITION",
+    ),
+    "try_offsets_are_valid": (
         "forall position in TRY_ENCLOSING_FIRST_POSITION..<offsets.count",
         "offsets[position] != TRY_ENCLOSING_NO_OFFSET",
     ),
@@ -1342,7 +1609,7 @@ positive_shapes = {
     ),
     "sorted_binary_predecessor_preserves_parallel_line_mapping": (
         "requires offsets.count == lines.count",
-        "requires try_offsets_are_nonzero(offsets)",
+        "requires try_offsets_are_valid(offsets)",
         "requires try_offsets_are_nondecreasing(offsets)",
         "indexed == linear and lines[indexed.index] == lines[linear.index] and offsets[indexed.index] == offsets[linear.index]",
     ),
@@ -1351,7 +1618,7 @@ positive_shapes = {
         "not indexed.found and indexed.index == TRY_ENCLOSING_FIRST_POSITION",
     ),
     "sorted_index_without_a_predecessor_reports_fallback_case": (
-        "requires try_offsets_are_nonzero(offsets)",
+        "requires try_offsets_are_valid(offsets)",
         "requires try_offsets_are_nondecreasing(offsets)",
         "offsets.count == TRY_ENCLOSING_FIRST_POSITION or offsets[TRY_ENCLOSING_FIRST_POSITION] > query",
         "not indexed.found and indexed.index == TRY_ENCLOSING_FIRST_POSITION and indexed == linear",
@@ -1378,7 +1645,7 @@ for raw_value in ("middle: usize = low + (high - low) / 2", "low <- middle + 1",
         raise SystemExit(f"proof model contains a raw position-search value: {raw_value}")
 
 if args.source_only:
-    print(json.dumps({"source_bound": True, "theorems": len(POSITIVE_NAMES), "try_source_files": len(SOURCE_FILES), "pipeline_source_files": len(PIPELINE_FILES), "parser_argument_source": 1, "parser_visibility_source": 1, "parser_nominal_sources": len(PARSER_NOMINAL_SOURCES)}))
+    print(json.dumps({"source_bound": True, "theorems": len(POSITIVE_NAMES), "try_source_files": len(SOURCE_FILES), "pipeline_source_files": len(PIPELINE_FILES), "parser_argument_source": 1, "parser_function_source": 1, "parser_visibility_source": 1, "parser_nominal_sources": len(PARSER_NOMINAL_SOURCES)}))
     raise SystemExit(0)
 
 try:
@@ -1407,9 +1674,13 @@ inputs = list(dict.fromkeys([
     SEMANTIC,
     *PIPELINE_FILES,
     PARSER_ARGUMENT_SOURCE,
+    PARSER_FUNCTION_SOURCE,
+    PARSER_DECLARATION_SOURCE,
     PARSER_VISIBILITY_SOURCE,
     PARSER_CATCH_SOURCE,
     *PARSER_NOMINAL_SOURCES,
+    ZERO_OFFSET_ENCLOSING_FIXTURE,
+    TRY_SMOKE,
     ROOT / "test/atoms/try_fallback_source.elisa",
     ROOT / "test/repro/try_overload_private_same_named_module_types.elisa",
     ROOT / "test/parity/try_overload_private_same_named_module_types_smoke.sh",
@@ -1418,6 +1689,9 @@ inputs = list(dict.fromkeys([
     ROOT / "test/repro/try_overload_static_import_family.elisa",
     ROOT / "test/repro/try_overload_static_alias_family.elisa",
     ROOT / "test/repro/try_overload_imported_argument_type_id.elisa",
+    LINE_ZERO_NONERROR_FIXTURE,
+    FIRST_CLASS_AMBIGUOUS_FAMILY_FIXTURE,
+    FIRST_CLASS_INACTIVE_DUPLICATE_FAMILY_FIXTURE,
     ROOT / "test/parity/try_overload_imported_argument_type_id_smoke.sh",
     ROOT / "test/parity/try_overload_static_import_family_smoke.sh",
     ROOT / "test/parity/try_overload_static_alias_family_smoke.sh",

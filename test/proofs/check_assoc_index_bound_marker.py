@@ -90,13 +90,19 @@ if compact(function_section(source_text, "contains")) != compact(expected_scan):
 if consumer_text.count('include "./assoc_index_bound_marker.elisa"') != 1:
     raise SystemExit("associated-index checker must include the isolated bound-marker scan exactly once")
 expected_consumer = '''
-def aib_function_has_bound(file: Ast::File&, func_line: u32) -> bool:
-    ensure result == SemanticAssocIndexBoundMarker::contains(file.generic_param_lines, func_line + 2147483648)
-    return SemanticAssocIndexBoundMarker::contains(file.generic_param_lines, func_line + 2147483648)
+def aib_function_has_bound(file: Ast::File&, func_line: u32, func_offset: u32) -> bool:
+    can Abort.Panic:
+        return true if file.generic_param_lines.count != file.generic_param_names.count or file.generic_param_lines.count != file.generic_param_owner_offsets.count
+        return false if not SemanticAssocIndexBoundMarker::contains(file.generic_param_lines, func_line + 2147483648)
+        index: mutable usize = 0
+        while index < file.generic_param_lines.count |index, file, func_line, func_offset|:
+            return true if file.generic_param_lines[index] == func_line + 2147483648 and file.generic_param_owner_offsets[index] == func_offset
+            index <- index + 1
+        return false
 '''
 if compact(function_section(consumer_text, "aib_function_has_bound")) != compact(expected_consumer):
-    raise SystemExit("semantic bound detection must use the proved lookup on the encoded function line")
-if consumer_text.count("aib_function_has_bound(file, line.line)") != 1:
+    raise SystemExit("semantic bound detection must refine the proved encoded-line marker by exact owner offset")
+if consumer_text.count("aib_function_has_bound(file, line.line, line.offset)") != 1:
     raise SystemExit("declaration analysis must activate from exactly one bound-marker lookup")
 if semantic_text.count('include "./check_assoc_index_bounds.elisa"') != 1:
     raise SystemExit("semantic root must include the associated-index checker exactly once")

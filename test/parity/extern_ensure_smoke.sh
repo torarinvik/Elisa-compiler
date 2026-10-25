@@ -51,6 +51,24 @@ assert declares[0] == declares[1], declares
 assert 'declare i64 @strnlen(ptr, i64, i64)' in declares[0], declares[0]
 print('extern_ensure: one guard each, @trusted exempt, declarations byte-identical PASS', flush=True)
 
+# Same displayed source line, distinct extern offsets: each call must enforce only its own
+# postcondition. A line-only collector emits both predicates at both call sites.
+same_line = work / 'same-line.elisa'
+same_line.write_text('''#line 37 first.elisa
+extern answer_zero() -> i64 ensure result == 0
+#line 37 second.elisa
+extern answer_one() -> i64 ensure result == 1
+def main() -> i64:
+    return answer_zero() + answer_one()
+''')
+same_line_guards = []
+for stage, compiler in enumerate((stage0, stage1)):
+    ll = work / f'same-line{stage}.ll'
+    subprocess.run([compiler, '-emit', 'llvm', '-O0', '-o', str(ll), str(same_line)], check=True, timeout=60)
+    same_line_guards.append(ll.read_text().count('call void @abort'))
+assert same_line_guards == [2, 2], f'one exact ensure per same-line extern call: {same_line_guards}'
+print('extern_ensure: same-line declaration owners stay isolated in both PASS', flush=True)
+
 # 2. The bounded fixture RUNS clean from both: a truthful library passes its own boundary.
 for stage, compiler in enumerate((stage0, stage1)):
     obj, exe = work / f'ens{stage}.o', work / f'ens{stage}'

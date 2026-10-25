@@ -28,6 +28,66 @@ FIXTURES="$REPO_ROOT/test/fixtures/diagnostics"
 
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
+python3 "$REPO_ROOT/test/proofs/check_signature_contract_owner_identity.py" || {
+    echo "signature contract owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_extern_signature_contract_owner.py" || {
+    echo "extern signature contract owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_extern_return_owner_identity.py" || {
+    echo "extern return owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_backend_extern_ensure_scoped_selection.py" || {
+    echo "extern ensure scoped-selection proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_extern_effect_owner_identity.py" || {
+    echo "extern effect owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_extern_segment_owner_identity.py" || {
+    echo "extern segment owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_ensures_return_bool_owner.py" || {
+    echo "ensures return owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_field_default_type_owner_identity.py" || {
+    echo "field default owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_generic_operator_no_bound_owner_identity.py" || {
+    echo "generic operator owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_resolve_generic_scope_owner_identity.py" || {
+    echo "generic function scope owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_thread_generic_owner_identity.py" || {
+    echo "thread generic owner proof failed" >&2
+    exit 1
+}
+python3 "$REPO_ROOT/test/proofs/check_region_param_value_arg_owner_identity.py" || {
+    echo "region parameter value argument owner proof failed" >&2
+    exit 1
+}
+"$REPO_ROOT/test/parity/protocol_precondition_generic_owner_smoke.sh" || {
+    echo "protocol precondition generic owner smoke failed" >&2
+    exit 1
+}
+"$REPO_ROOT/test/parity/unknown_type_generic_owner_smoke.sh" || {
+    echo "unknown type generic owner smoke failed" >&2
+    exit 1
+}
+bash "$REPO_ROOT/test/parity/field_access_generic_owner_smoke.sh" || {
+    echo "field access generic owner smoke failed" >&2
+    exit 1
+}
 
 [[ -d "$FIXTURES" ]] || { echo "error: missing fixture dir: $FIXTURES" >&2; exit 2; }
 
@@ -84,6 +144,7 @@ NAMES=(
     thread_shareability_ref_elements
     thread_shareability_same_line
     thread_shareability_nested_submit
+    thread_shareability_generic_owner_line_zero
     storage_dependency_owned_return_global
     storage_dependency_owned_return_qualified
     store_ref_local_global
@@ -241,6 +302,7 @@ NAMES=(
     static_string_binding_cstr_argument
     static_string_binding_declaration
     static_string_binding_ternary
+    static_string_binding_inactive_alias
     container_literal_block_tail
     discarded_loop_value
     # --- rule R (2026-09-22): the TYPE's `mutable` is the write capability ---
@@ -337,6 +399,7 @@ EXPECTS=(
     "storage dependency facts were invalidated by darray push"
     "argument 1 to \"f\" expects sview, got static u8&"
     "storage dependency facts were invalidated by darray push"
+    "is not structurally shareable across threads"
     "is not structurally shareable across threads"
     "is not structurally shareable across threads"
     "is not structurally shareable across threads"
@@ -501,6 +564,7 @@ EXPECTS=(
     "argument 1 to \"take_c\" expects cstr, got static u8&"
     "variable \"t\" expects sview, got static u8&"
     "ternary branches are incompatible: static u8& and sview"
+    "argument 1 to \"inspect\" expects sview, got static u8&"
     "darray literal has no region to allocate in"
     "accumulator loop result \`valid\` is discarded; make the loop the final expression of its block"
     # --- rule R (2026-09-22) ---
@@ -637,6 +701,71 @@ while [[ "$index" -lt "$num_diagnostics" ]]; do
     run_case "$name" neg "$FIXTURES/$name.neg.elisa" "$expect"
     index=$((index + 1))
 done
+
+# Generic operator checks must not borrow a type parameter from another declaration
+# that happens to share a logical line with `#line`.
+generic_operator_owner_out=$(printf 'type T = i64\n#line 0 generic_owner.elisa\ndef phantom[T]() -> void:\n    pass\n#line 0 concrete_owner.elisa\ndef concrete_sum(a: T, b: T) -> T:\n    return a + b\n' | "$RPT")
+if grep -Fq 'operator requires numeric operands' <<< "$generic_operator_owner_out"; then
+    echo "FAIL generic_operator_no_bound: a same-line generic owner misclassified a concrete alias function" >&2
+    echo "$generic_operator_owner_out" | sed 's/^/    /' >&2
+    failed=$((failed + 1))
+else
+    echo "PASS generic_operator_no_bound line-zero owner collision"
+fi
+generic_operator_bound_owner_out=$(printf 'protocol Add:\n    def __add__(self: Self, other: Self) -> Self\n#line 0 bounded_owner.elisa\ndef evidence[T: Add](x: T, y: T) -> T:\n    return x + y\n#line 0 unbound_owner.elisa\ndef bad[U](x: U, y: U) -> U:\n    return x + y\n' | "$RPT")
+if ! grep -Fq 'operator requires numeric operands' <<< "$generic_operator_bound_owner_out"; then
+    echo "FAIL generic_operator_no_bound: a same-line bounded owner suppressed the unbound function's operator diagnostic" >&2
+    echo "$generic_operator_bound_owner_out" | sed 's/^/    /' >&2
+    failed=$((failed + 1))
+else
+    echo "PASS generic_operator_no_bound line-zero bounded-owner collision"
+fi
+
+# Extern effect references are separate annotations from their declaration markers. The source
+# lines are forced equal so a line-only lookup would give `second` the first extern's effect.
+same_line_extern_effect_out=$(printf '#line 37 first_effect.elisa\nextern first_effect() -> void can[Memory.Allocate]\n#line 37 second_effect.elisa\nextern second_effect() -> void can[Unsafe.Alias]\ndef effect_caller() -> void:\n    second_effect()\n' | "$RPT")
+if ! grep -Fq 'call to "second_effect" requires can[Unsafe]' <<< "$same_line_extern_effect_out"; then
+    echo "FAIL extern effect owner: a same-line sibling supplied the wrong capability ref" >&2
+    echo "$same_line_extern_effect_out" | sed 's/^/    /' >&2
+    failed=$((failed + 1))
+else
+    echo "PASS extern effect owner same-line declaration identity"
+fi
+blocking_same_line_effect_out=$(printf '#line 37 blocking_decorator.elisa\n@blocking\nextern blocking_call() -> void\n#line 38 signature_effect.elisa\nextern signature_call() -> void can[Unsafe.Alias]\ndef blocking_effect_caller() -> void:\n    blocking_call()\n    signature_call()\n' | "$RPT")
+if ! grep -Fq 'call to "blocking_call" requires can[Blocking]' <<< "$blocking_same_line_effect_out" || ! grep -Fq 'call to "signature_call" requires can[Unsafe]' <<< "$blocking_same_line_effect_out"; then
+    echo "FAIL extern effect owner: @blocking and signature effects crossed on a shared logical line" >&2
+    echo "$blocking_same_line_effect_out" | sed 's/^/    /' >&2
+    failed=$((failed + 1))
+else
+    echo "PASS extern effect owner separates @blocking from signature effects"
+fi
+same_line_extern_segment_out=$(printf '#line 37 module_a.elisa\nmodule A:\n    extern f() -> void can[Unsafe.SegmentMutation, Segment.Guest]\n#line 37 module_b.elisa\nmodule B:\n    extern f() -> void\ndef main() -> i64:\n    return 0\n' | "$RPT")
+same_line_extern_segment_count=$(grep -Fc 'mutates the active segment; add @segment_transition' <<< "$same_line_extern_segment_out" || true)
+if [[ "$same_line_extern_segment_count" -ne 1 ]]; then
+    echo "FAIL extern segment owner: a same-named sibling borrowed another module's marker" >&2
+    echo "$same_line_extern_segment_out" | sed 's/^/    /' >&2
+    failed=$((failed + 1))
+else
+    echo "PASS extern segment owner same-named module declaration identity"
+fi
+same_line_ensures_return_out=$(printf '#line 0 numeric_return.elisa\ndef choose(value: i64) -> i64 ensures return true:\n    return value\n#line 0 boolean_return.elisa\ndef choose(value: bool) -> bool:\n    return value\n' | "$RPT")
+same_line_ensures_return_count=$(grep -Fc 'ensures return true on function "choose" requires a bool return type' <<< "$same_line_ensures_return_out" || true)
+if [[ "$same_line_ensures_return_count" -ne 1 ]]; then
+    echo "FAIL ensures return owner: a same-line bool overload borrowed its sibling's marker" >&2
+    echo "$same_line_ensures_return_out" | sed 's/^/    /' >&2
+    failed=$((failed + 1))
+else
+    echo "PASS ensures return owner same-line overload identity"
+fi
+same_line_field_default_out=$(cat "$REPO_ROOT/test/repro/field_default_type_owner_line_zero.elisa" | "$RPT")
+same_line_field_default_count=$(grep -Fc 'default value for struct field "bad" expects bool, got int' <<< "$same_line_field_default_out" || true)
+if [[ "$same_line_field_default_count" -ne 1 ]]; then
+    echo "FAIL field default owner: a same-line field borrowed its sibling's type/kind marker" >&2
+    echo "$same_line_field_default_out" | sed 's/^/    /' >&2
+    failed=$((failed + 1))
+else
+    echo "PASS field default owner same-line field identity"
+fi
 
 # The direct warning plus match guards/bodies and the catch expression, guards, and body
 # prove each structured arm walker visits its conditions and statements.
@@ -1102,6 +1231,11 @@ run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_fiel
 run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_field.pos.elisa" "L15 cannot infer region parameter \"__rg_p\" for call to \"add\""
 run_case region_param_ref_field pos "$REPO_ROOT/test/repro/region_param_ref_field.pos.elisa" "L17 cannot infer region parameter \"__rg_p\" for call to \"add\""
 run_case region_param_ref_field neg "$REPO_ROOT/test/repro/region_param_ref_field.neg.elisa" "cannot infer region parameter"
+
+echo "-- region_param_value_arg_owner_line_zero --"
+run_case region_param_value_arg_owner_line_zero pos "$REPO_ROOT/test/repro/region_param_value_arg_owner_line_zero.pos.elisa" 'argument 1 to "put" expects i64& @r, got i64'
+run_case region_param_value_arg_owner_line_zero pos "$REPO_ROOT/test/repro/region_param_value_arg_owner_line_zero.pos.elisa" 'cannot infer region parameter "r" for call to "put"'
+run_case region_param_value_arg_owner_line_zero neg "$REPO_ROOT/test/repro/region_param_value_arg_owner_line_zero.neg.elisa" "cannot infer region parameter"
 
 echo "-- global_storage_return --"
 run_case global_storage_return pos "$FIXTURES/global_storage_return.pos.elisa" "L16 value backed by global \"store\" cannot be returned by value with a region-less type"

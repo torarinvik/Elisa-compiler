@@ -32,6 +32,16 @@ grep -Fq 'function "id" is not generic' <<< "$out" || fail "non-generic speciali
 out=$(printf 'def id[T](value: T) -> T:\n    return value\ndef run() -> int:\n    return id[int](7)\n' | "$RPT")
 grep -Fq 'is not generic' <<< "$out" && fail "generic specialization rejected: $out"
 
+# `#line` may assign the same display line to different declarations. A generic
+# function on that line must not make a distinct nongeneric function appear generic.
+out=$(printf '#line 0 generic.elisa\ndef generic[T](value: T) -> T:\n    return value\n#line 0 plain.elisa\ndef plain(value: int) -> int:\n    return value\n#line 1 use.elisa\ndef run() -> int:\n    return plain[int](1)\n' | "$RPT")
+grep -Fq 'function "plain" is not generic' <<< "$out" || fail "same-line generic declaration made plain appear generic: $out"
+
+# Region-only generic functions use a separate parser side table, which must carry
+# the same declaration identity as ordinary type-generic rows.
+out=$(printf '#line 0 region.elisa\ndef region_generic[@r](value: i32& @r) -> i32& @r:\n    return value\n#line 0 plain.elisa\ndef plain(value: int) -> int:\n    return value\n#line 1 use.elisa\ndef run() -> int:\n    return plain[int](1)\n' | "$RPT")
+grep -Fq 'function "plain" is not generic' <<< "$out" || fail "same-line region-generic declaration made plain appear generic: $out"
+
 # 6. A local binding shadows a same-named function and remains ordinary indexing.
 out=$(printf 'def item(value: int) -> int:\n    return value\ndef run(item: darray[int]&) -> int:\n    return item[0]\n' | "$RPT")
 grep -Fq 'is not generic' <<< "$out" && fail "shadowed local index treated as specialization: $out"

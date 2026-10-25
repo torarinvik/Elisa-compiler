@@ -7,6 +7,11 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
+python3 "$REPO_ROOT/test/proofs/check_region_annotation_generic_owner_identity.py"
+python3 "$REPO_ROOT/test/proofs/check_function_param_region_owner_identity.py"
+python3 "$REPO_ROOT/test/proofs/check_region_binding_owner_identity.py"
+python3 "$REPO_ROOT/test/proofs/check_region_return_owner_offset_identity.py"
+python3 "$REPO_ROOT/test/proofs/check_region_escape_param_owner_identity.py"
 
 fail() { echo "region-scope smoke FAIL: $1" >&2; exit 1; }
 clean() {
@@ -28,9 +33,20 @@ clean $'def f() -> void:\n    region a(1024) using reserve_commit\n    region b(
 out=$(printf 'def f() -> void:\n    region a(1024) using bogus\n    destroy a\n' | "$RPT")
 grep -q 'unknown region backing "bogus"' <<< "$out" || fail "unknown backing strategy was not flagged: $out"
 clean $'def id[T, @r](value: T& @r) -> T& @r:\n    return value\n'
+clean "$(cat "$REPO_ROOT/test/repro/region_binding_owner_line0.elisa")"
+clean "$(cat "$REPO_ROOT/test/repro/region_local_shadow_owner_offset.elisa")"
+clean "$(cat "$REPO_ROOT/test/repro/region_return_owner_offset.elisa")"
+clean "$(cat "$REPO_ROOT/test/repro/region_escape_param_owner_line_zero.elisa")"
+local_view_owner_out="$(cat "$REPO_ROOT/test/repro/local_view_return_region_owner_offset.elisa" | "$RPT")"
+grep -q 'value backed by a short-lived region escapes via return' <<< "$local_view_owner_out" || fail "same-line sibling function supplied a caller-region return annotation: $local_view_owner_out"
 
 out=$(printf 'def f() -> void:\n    value: i32&? @missing = null\n' | "$RPT")
 grep -q 'unknown region qualifier "missing"' <<< "$out" || fail "unknown local region qualifier was not flagged: $out"
+
+# A generic declaration on a reused logical line does not give a nongeneric struct
+# region parameters. The field's qualifier must still be rejected.
+line_zero_owner_out=$(printf '#line 0 generic_owner.elisa\ndef phantom[T]() -> void:\n    pass\n#line 0 plain_struct.elisa\nstruct Plain:\n    values: darray[i64] @missing\n' | "$RPT")
+grep -q 'unknown region qualifier "missing"' <<< "$line_zero_owner_out" || fail "same-line generic function suppressed a plain struct's unknown region qualifier: $line_zero_owner_out"
 
 # Arena& locals and `region NAME:` binders introduce names only within their lexical blocks. The
 # regression uses a later function, a sibling block, and a sibling after a closed region. Stage0

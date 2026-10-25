@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[2]
 ESH = ROOT / "src/semantic/check_errorset_shadow.elisa"
 TRY = ROOT / "src/semantic/check_try_fallible.elisa"
 ERRORSET_PARAM = ROOT / "src/semantic/check_errorset_param_inference.elisa"
+PARSER_IMPORTS = ROOT / "src/parser/parser_decl_module.elisa"
+NESTED_EXPR_FIXTURE = ROOT / "test/repro/errorset_param_nested_expression.elisa"
+NESTED_EXPR_SMOKE = ROOT / "test/parity/errorset_param_nested_expression_smoke.sh"
 
 
 def function_source(name: str, path: Path = ESH) -> str:
@@ -65,7 +68,7 @@ for import_path in (
     function_source("try_error_set_import_path_matches", TRY),
 ):
     if "catch_module_qualifier_alias_target(" in import_path or \
-            "catch_module_alias_path_matches(import_module, raw_module, declaration_module)" not in import_path:
+            "catch_module_path_matches_relative(import_module, raw_module, declaration_module)" not in import_path:
         raise SystemExit("ErrorSet imports must use their raw path qualified by the importer namespace")
 atom = (ROOT / "test/atoms/errorset_shadow_identity.elisa").read_text()
 for probe in (
@@ -77,6 +80,28 @@ for probe in (
 
 param_import_filter = function_source("errorset_active_import_annotations", ERRORSET_PARAM)
 param_import_entrypoint = function_source("check_errorset_param_inference", ERRORSET_PARAM)
+param_call_walk = function_source("errorset_walk_expression", ERRORSET_PARAM)
+param_scope_lookup = function_source("errorset_param_for_scope", ERRORSET_PARAM)
+param_identity = function_source("errorset_param_at", ERRORSET_PARAM)
+param_candidate_collection = function_source("errorset_collect_candidates_from", ERRORSET_PARAM)
+param_import_order = function_source("errorset_import_precedes_call", ERRORSET_PARAM)
+param_identity_atom = (ROOT / "test/atoms/errorset_param_identity.elisa").read_text()
+if not all(fragment in param_identity for fragment in (
+        "function_offset: u32, function_module: sview",
+        "annotation.line != function_line or annotation.module != function_module",
+        "if annotation.offset == function_offset",
+        "return exact_name if exact_count == 1.usize()")) or \
+        "function_offset == 0" in param_identity or "function_offset != 0" in param_identity or \
+        "errorset_param_at(annotations, line.line, line.offset, current_module)" not in param_candidate_collection or \
+        not all(fragment in param_identity_atom for fragment in (
+        'errorset_param_at(annotations, 50, 0, "") != "Legacy"',
+        'errorset_param_at(annotations, 50, 500, "") != ""',
+        'cpb_errorset_param(lines, offsets, names, modules, 50, 0, "") != "Legacy"',
+        'cpb_errorset_param(lines, offsets, names, modules, 50, 500, "") != ""',
+        'errorset_param_at(annotations, 44, 0, "ByteZeroModule") != "ByteZero"',
+        'errorset_param_at(annotations, 44, 0, "OtherModule") != "OtherModuleByteZero"',
+        'errorset_param_at(annotations, 44, 0, "AbsentModule") != ""')):
+    raise SystemExit("ErrorSet parameter identity must match the candidate's exact offset within its declaring module, including byte zero")
 if not all(fragment in param_import_filter for fragment in (
         "pma_import_annotation_branch_selection(annotation, file.enum_annotations, file, table)",
         "continue if branch.known and not branch.active",
@@ -87,6 +112,31 @@ if not all(fragment in param_import_entrypoint for fragment in (
         "errorset_collect_candidates(file.top_decls, annotations, names, params, modules, file, table)",
         "errorset_walk_decls(file.top_decls, names, params, modules, annotations, \"\", file, table)")):
     raise SystemExit("ErrorSet parameter inference must use branch-filtered imports for candidate lookup and call walking")
+parser_import_source = PARSER_IMPORTS.read_text()
+if not all(fragment in param_import_order for fragment in (
+        "annotation.pos.end_offset > annotation.pos.offset",
+        "call_offset_present",
+        "call_has_offset: bool = call_offset != 0 or call_offset_present",
+        "return annotation.offset < call_offset if annotation_offset_present and call_has_offset",
+        "return annotation.line < call_line")) or \
+        "annotation.offset != 0 and call_offset != 0" in param_import_order:
+    raise SystemExit("ErrorSet import ordering must compare exact offsets when source spans prove offset zero is real")
+if not all(fragment in parser_import_source for fragment in (
+        'owner: "__from_member", name: member, module: parser.current_module, line: token.line, offset: token.start, pos: Ast::pos_of_token(token)',
+        'name: "__binding_wildcard_import", module: parser.current_module, line: target_token.line, offset: target_token.start, pos: Ast::pos_of_token(target_token)')):
+    raise SystemExit("parser-backed ErrorSet import rows must retain a source-span presence marker for byte-zero offsets")
+if not all(fragment in param_call_walk for fragment in (
+        "line.line, line.offset, line.end_offset > line.offset",
+        "errorset_param_for_scope(names, params, modules, annotations, target.name, target.module_path, current_module, line.line, line.offset, line.end_offset > line.offset")) or \
+        "errorset_import_scope(annotations, modules[index], wanted, current_module, call_line, call_offset, call_offset_present)" not in param_scope_lookup:
+    raise SystemExit("ErrorSet import ordering must receive the parser-backed call-offset presence bit")
+if not all(fragment in param_identity_atom for fragment in (
+        'offset: 0, pos: Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 3, end_offset: 3}',
+        'return 38 if errorset_param_for_scope(bytezero_names, bytezero_params, bytezero_modules, bytezero_import_rows, "remote", good_scope, 0, 12, true) != "ByteZeroR"',
+        'return 39 if errorset_param_for_scope(bytezero_names, bytezero_params, bytezero_modules, call_bytezero_after_import_rows, "remote", good_scope, 0, 0, true) != ""',
+        'return 40 if errorset_param_for_scope(bytezero_names, bytezero_params, bytezero_modules, legacy_import_rows, "remote", good_scope, 12, 12, true) != "ByteZeroR"',
+        'return 41 if errorset_param_for_scope(bytezero_names, bytezero_params, bytezero_modules, legacy_same_line_rows, "remote", good_scope, 12, 12, true) != ""')):
+    raise SystemExit("ErrorSet import atom must cover exact byte-zero ordering and conservative legacy same-line behavior")
 static_import_fixture = (ROOT / "test/repro/errorset_param_static_import_branch.elisa").read_text()
 static_import_smoke = (ROOT / "test/parity/errorset_param_static_import_branch_smoke.sh").read_text()
 if not all(fragment in static_import_fixture for fragment in (
@@ -134,6 +184,82 @@ if not all(fragment in static_scope_fixture for fragment in (
         'L22 cannot infer error-set parameter "A" for call to "active_wrap"')):
     raise SystemExit("ErrorSet static-scope coverage must keep only its active call diagnostic")
 
+param_expression_walk = function_source("errorset_walk_expression", ERRORSET_PARAM)
+param_statement_walk = function_source("errorset_walk_statements", ERRORSET_PARAM)
+param_declaration_walk = function_source("errorset_walk_decls", ERRORSET_PARAM)
+param_call_target = function_source("errorset_call_target", ERRORSET_PARAM)
+param_module_path = function_source("errorset_module_path", ERRORSET_PARAM)
+param_module_symbol = function_source("errorset_module_symbol_exists", ERRORSET_PARAM)
+param_alias_target = function_source("errorset_qualified_alias_target", ERRORSET_PARAM)
+param_qualified_module = function_source("errorset_qualified_module_for_call", ERRORSET_PARAM)
+type_path_alias_selection = function_source("type_path_alias_selection", ROOT / "src/semantic/check_type_path_separator.elisa")
+nested_expression_fixture = NESTED_EXPR_FIXTURE.read_text()
+nested_expression_smoke = NESTED_EXPR_SMOKE.read_text()
+if not all(fragment in param_expression_walk for fragment in (
+        "errorset_walk_expression(callee, names, params, modules, annotations, current_module, file, table)",
+        "errorset_call_target(callee, table)",
+        "target.module_path",
+        "Expr.StaticEffectCall(_, operation, candidates, arguments, argument_names, line)",
+        "Expr.If(condition, then_expression, else_expression, line)",
+        "Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line)",
+        "Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line)",
+        "Expr.Comprehension(variable, iterable, condition, body, line, scope_id)",
+        "Expr.Lambda(parameters, body, line)",
+        "Expr.Construct(_, fields, line)",
+        "Expr.Block(statements, value, captures, line)")) or not all(fragment in param_statement_walk for fragment in (
+        "Stmt.Assign(target, operator, value, line)",
+        "errorset_walk_expression(target, names, params, modules, annotations, current_module, file, table)",
+        "Stmt.While(condition, body, line)",
+        "Stmt.Contract(kind, expression, line)",
+        'kind == "requires" or kind == "require" or kind == "assert" or kind == "ensure" or kind == "ensures"')) or not all(fragment in param_declaration_walk for fragment in (
+        "parameter.default_value",
+        "member.default_value")) or not all(fragment in nested_expression_fixture for fragment in (
+        "def wrap[errorset R]() -> i64 error[R]",
+        "def nested_conditional_call() -> i64 error[CallerFault]",
+        "return 7 if try wrap() == 1 else 0",
+        "def default_parameter_call(value: i64 = wrap()) -> i64:",
+        "value: i64 = wrap()",
+        "def qualified_call() -> i64:",
+        "QualifiedProvider::Nested::wrap()",
+        "using QualifiedProvider as QP",
+        "def alias_qualified_call() -> i64:",
+        "QP::Nested::wrap()")) or not all(fragment in nested_expression_smoke for fragment in (
+        "errorset_param_nested_expression.elisa",
+        'L8 cannot infer error-set parameter "R" for call to "wrap"',
+        'L11 cannot infer error-set parameter "R" for call to "wrap"',
+        'L15 cannot infer error-set parameter "R" for call to "wrap"',
+        'L24 cannot infer error-set parameter "Q" for call to "wrap"',
+        'L30 cannot infer error-set parameter "Q" for call to "wrap"')):
+    raise SystemExit("ErrorSet inference must recursively visit nested expression and statement call sites")
+if "errorset_walk_expression(effect_type" in param_expression_walk or "errorset_walk_expression(type_expression" in param_expression_walk:
+    raise SystemExit("ErrorSet inference must only walk runtime-evaluated effect captures and constructor fields")
+if not all(fragment in param_call_target for fragment in (
+        "Expr.Ident(name, line)",
+        "Expr.Scope(base, name, line)",
+        "errorset_module_path(base, table)",
+        "Expr.Paren(inner, line)")) or not all(fragment in param_module_path for fragment in (
+        "Expr.Scope(base, name, line)",
+        "prefix.len + 2.usize() + name.len",
+        "intern_joined_text(bytes, table)")) or not all(fragment in param_module_symbol for fragment in (
+        "symbol.kind != SymbolKind.Module",
+        'alias.name == "__using_alias"',
+        "symbol.offset")) or not all(fragment in param_alias_target for fragment in (
+        "alias_row.name != \"__using_alias\"",
+        "alias_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(alias_names[alias_index], alias_scopes[alias_index], alias_occurrence, table)",
+        "type_path_canonical_alias_target(alias_raw_targets[alias_index], alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table, alias_scopes[alias_index], alias_class.offset, alias_class.order_index, alias_class.branch, true)",
+        "alias_uncertain[alias_index] <- true",
+        "type_path_alias_selection(alias_name, alias_names, alias_targets, alias_scopes, alias_uncertain, table)",
+        "not selected.known")) or not all(fragment in param_qualified_module for fragment in (
+        "errorset_module_symbol_exists(candidate, table)",
+        "errorset_qualified_alias_target(qualifier, table)",
+        "alias.target",
+        "errorset_module_symbol_exists(qualifier, table)")) or \
+        "table.possible_import_annotations" not in type_path_alias_selection or \
+        param_qualified_module.find("errorset_module_symbol_exists(candidate, table)") > param_qualified_module.find("errorset_qualified_alias_target(qualifier, table)") or \
+        param_qualified_module.find("errorset_qualified_alias_target(qualifier, table)") > param_qualified_module.find("errorset_module_symbol_exists(qualifier, table)") or \
+        "module_last_segment" in param_qualified_module:
+    raise SystemExit("qualified ErrorSet calls must resolve an exact module identity after lexical, alias, and root lookup")
+
 print(
-    '{"source_bound": true, "candidate_order": 5, "declaration_id_cycle_guard": true, "raw_import_path": true, "static_import_branch": true}'
+    '{"source_bound": true, "candidate_order": 5, "declaration_id_cycle_guard": true, "raw_import_path": true, "static_import_branch": true, "nested_expression_walk": true, "declaration_defaults": true, "runtime_contracts_only": true, "runtime_value_children_only": true, "errorset_parameter_module_identity": true, "qualified_call_path": true, "alias_qualified_call_path": true}'
 )

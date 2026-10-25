@@ -59,6 +59,15 @@ SAFE_IDENTITY_CAST = """def identity[T](value: mutable T&) -> mutable T&:
     value.cast[mutable T&]
 """
 
+LINE_ZERO_CONCRETE_ALIAS_CAST = """type T = i64
+#line 0 generic_owner.elisa
+def phantom[T]() -> void:
+    pass
+#line 0 concrete_owner.elisa
+def concrete_alias_cast(value: T) -> T:
+    return value.cast[T]
+"""
+
 GRANTED_CASTS = {
     "generic cast": """def convert[T, U](value: T) -> U:
     can Unsafe.PointerCast:
@@ -187,6 +196,15 @@ def main() -> None:
         and "pointer cast requires can[Unsafe]" not in identity_output
     ), (identity.returncode, identity_output[-5000:])
     print("same-type mutable reference: accepted with redundant-cast advisory PASS", flush=True)
+
+    line_zero_cast = analyze_case(reporter, "line_zero_concrete_alias_cast", LINE_ZERO_CONCRETE_ALIAS_CAST, strict=True)
+    line_zero_cast_output = line_zero_cast.stdout + line_zero_cast.stderr
+    assert (
+        line_zero_cast.returncode == 0
+        and "P 0" in line_zero_cast_output
+        and "pointer cast requires can[Unsafe]" not in line_zero_cast_output
+    ), (line_zero_cast.returncode, line_zero_cast_output[-5000:])
+    print("line-zero generic owner does not classify concrete alias cast: PASS", flush=True)
 
     for name, source in GRANTED_CASTS.items():
         granted = analyze_case(reporter, f"granted_{name.replace(' ', '_')}", source, strict=True)

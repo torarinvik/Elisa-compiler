@@ -113,6 +113,7 @@ check_readonly_ref_text = CHECK_READONLY_REF.read_text()
 check_private_fields_types_text = CHECK_PRIVATE_FIELDS_TYPES.read_text()
 parser_text = PARSER.read_text()
 parser_using_alias = compact(function_section(parser_text, "using_alias"))
+parser_consume_using_target = compact(function_section(parser_text, "consume_using_target"))
 parser_const_text = (ROOT / "src/parser/parser_types_aggregate.elisa").read_text()
 parser_function_text = PARSER_FUNCTION.read_text()
 symbols_text = SYMBOLS.read_text()
@@ -268,8 +269,36 @@ possible_import_module_visible = compact(function_section(import_visibility_text
 possible_import_module_member = compact(function_section(import_visibility_text, "semantic_possible_import_module_member_visible"))
 possible_import_module_path = compact(function_section(import_visibility_text, "semantic_import_module_path_matches"))
 possible_import_module_path_suffix = compact(function_section(import_visibility_text, "semantic_import_module_path_with_suffix_matches"))
+possible_import_alias_branch = compact(function_section(import_visibility_text, "semantic_import_alias_is_static_branch"))
+possible_import_alias_branch_marker_at = compact(function_section(import_visibility_text, "semantic_possible_import_alias_branch_marker_at"))
+possible_import_alias_branch_marker_count = compact(function_section(import_visibility_text, "semantic_possible_import_alias_branch_marker_count"))
+possible_import_alias_branch_stack = compact(function_section(import_visibility_text, "semantic_possible_import_alias_branch_stack_relation"))
+possible_import_alias_definite = compact(function_section(import_visibility_text, "semantic_possible_import_alias_is_definite"))
+import_alias_pair_target = compact(function_section(import_visibility_text, "semantic_import_alias_pair_target"))
+import_alias_global_winner = compact(function_section(import_visibility_text, "semantic_import_alias_is_global_winner"))
+import_alias_target_global_winner = compact(function_section(import_visibility_text, "semantic_import_alias_target_is_global_winner"))
+import_alias_target_canonical_owner = compact(function_section(import_visibility_text, "semantic_import_alias_target_canonical_owner"))
+import_using_row_alias_pair = compact(function_section(import_visibility_text, "semantic_import_using_row_has_alias_pair"))
+possible_import_alias_target_row_can_win = compact(function_section(import_visibility_text, "semantic_possible_import_alias_target_row_can_win"))
+possible_import_alias_order = compact(function_section(import_visibility_text, "semantic_possible_import_alias_precedes"))
+possible_import_alias_position = compact(function_section(import_visibility_text, "semantic_possible_import_alias_precedes_position"))
+possible_import_alias_head_target = compact(function_section(import_visibility_text, "semantic_possible_import_alias_head_target"))
+possible_import_alias_target_prefix = compact(function_section(import_visibility_text, "semantic_possible_import_alias_target_prefix"))
+possible_import_alias_target_matches = compact(function_section(import_visibility_text, "semantic_possible_import_alias_target_matches"))
+possible_import_alias_target_head_status = compact(function_section(import_visibility_text, "semantic_possible_import_alias_target_head_status"))
+possible_import_alias_target_alias_matches = compact(function_section(import_visibility_text, "semantic_possible_import_alias_target_alias_matches"))
+possible_import_alias_precedence = compact(function_section(import_visibility_text, "semantic_possible_import_alias_can_win"))
+possible_import_alias_dependency = compact(function_section(import_visibility_text, "semantic_possible_import_alias_dependency_exists"))
 possible_import_alias_module_path = compact(function_section(import_visibility_text, "semantic_possible_import_alias_module_path_matches"))
 possible_import_member_owner = compact(function_section(import_visibility_text, "semantic_possible_import_member_owner_visible"))
+possible_import_module_path_alias_member = compact(function_section(import_visibility_text, "semantic_possible_import_module_path_alias_member_visible"))
+possible_import_module_path_member = compact(function_section(import_visibility_text, "semantic_possible_import_module_path_member_visible"))
+possible_import_module_path_candidate = compact(function_section(import_visibility_text, "semantic_possible_import_module_path_candidate_matches"))
+possible_import_type_path_candidate = compact(function_section(import_visibility_text, "semantic_possible_import_type_path_candidate_matches"))
+possible_import_module_symbol_alias = compact(function_section(import_visibility_text, "semantic_possible_import_module_symbol_is_using_alias"))
+possible_import_module_path_alias_module = compact(function_section(import_visibility_text, "semantic_possible_import_module_path_alias_module_visible"))
+possible_import_module_path_module_candidate = compact(function_section(import_visibility_text, "semantic_possible_import_module_path_module_candidate_matches"))
+possible_import_import_row_member = compact(function_section(import_visibility_text, "semantic_possible_import_import_row_member_visible"))
 possible_import_type_selection = compact(function_section(import_visibility_text, "semantic_possible_import_may_select_type"))
 resolver_name_known = compact(function_section(resolve_scope_text, "name_known"))
 resolver_module_alias = compact(function_section(resolve_scope_text, "name_is_module"))
@@ -284,11 +313,11 @@ readonly_callee_lookup = compact(function_section(check_readonly_ref_text, "read
 private_field_owner_lookup = compact(function_section(check_private_fields_types_text, "pft_owner_matches"))
 using_alias_target = compact(function_section(consumer_text, "pma_using_alias_target"))
 alias_chain_match = compact(function_section(consumer_text, "pma_alias_chain_ends_at"))
+alias_chain_prefix_match = compact(function_section(consumer_text, "pma_alias_chain_prefix_ends_at"))
+alias_target_matches_owner = compact(function_section(consumer_text, "pma_alias_target_matches_owner"))
 scope_owner = compact(function_section(consumer_text, "pma_scope_owner"))
-alias_is_static_branch = compact(function_section(consumer_text, "pma_using_alias_is_static_branch"))
 alias_precedence = compact(function_section(consumer_text, "pma_using_alias_precedes"))
 alias_shadowed = compact(function_section(consumer_text, "pma_using_alias_is_shadowed"))
-resolved_alias_target = compact(function_section(consumer_text, "pma_resolved_using_alias_target"))
 inactive_import_branch = compact(function_section(consumer_text, "pma_import_annotation_in_inactive_static_branch"))
 uncertain_import_row = compact(function_section(consumer_text, "pma_import_row_branch_uncertain"))
 active_import_annotations = compact(function_section(consumer_text, "pma_active_import_annotations"))
@@ -517,29 +546,128 @@ if not all(fragment in possible_import_name_visible for fragment in (
         'semantic_import_scope_visible(annotation.module,current_scope)',
         'annotation.owner=="__from_member"',
         'annotation.name=="__using_alias"',
-        'semantic_possible_import_module_member_visible(table,annotation.owner,name,current_scope)')) or not all(fragment in possible_import_type_selection for fragment in (
+        'semantic_possible_import_import_row_member_visible(table,annotation,name,current_scope)')) or not all(fragment in possible_import_type_selection for fragment in (
         'semantic_import_scope_visible(annotation.module,current_scope)',
         'source.owner!="__from_src"',
-        'semantic_possible_import_alias_module_path_matches(symbol.module_owner,source.name,source.module,source.offset,table)',
+        'semantic_possible_import_type_path_candidate_matches(table,symbol.module_owner,source.name,name,kind,include_constants,source.module,source.offset)',
+        'annotation.name=="__using_alias_target"',
+        'semantic_possible_import_alias_target_row_can_win(annotation,current_scope,table)',
+        'annotation.name=="__using"',
+        'semantic_import_using_row_has_alias_pair(annotation,table)',
         'annotation.name=="__binding_wildcard_import"',
-        'semantic_possible_import_alias_module_path_matches(symbol.module_owner,annotation.owner,annotation.module,annotation.offset,table)')) or not all(fragment in possible_import_alias for fragment in (
+        'semantic_possible_import_type_path_candidate_matches(table,symbol.module_owner,annotation.owner,name,kind,include_constants,annotation.module,annotation.offset)')) or not all(fragment in possible_import_alias for fragment in (
         'annotation.name=="__using_alias"',
         'annotation.owner==alias_name',
-        'semantic_import_scope_visible(annotation.module,current_scope)')) or not all(fragment in possible_import_module_visible for fragment in (
-        'annotation.name=="__binding_wildcard_import"',
-        'semantic_possible_import_alias_module_path_matches(owner,annotation.owner,annotation.module,annotation.offset,table)')) or not all(fragment in possible_import_member_owner for fragment in (
-        'semantic_possible_import_alias_module_path_matches(owner,source.name,source.module,source.offset,table)')) or not all(fragment in possible_import_module_member for fragment in (
-        'semantic_import_module_path_matches(symbol.module_owner,owner,current_scope)',
-        'alias.name=="__using_alias"',
-        'target.name!="__using_alias_target"',
-        'target.module!=alias.module',
-        'semantic_possible_import_alias_module_path_matches(table.module_member_owner[member_index],target_owner,target.module,target.offset,table)')) or not all(fragment in possible_import_module_path for fragment in (
+        'semantic_possible_import_alias_can_win(annotation,current_scope,4294967295,table)')) or not all(fragment in possible_import_module_visible for fragment in (
+        'annotation.name=="__using_alias_target"',
+        'semantic_possible_import_alias_target_row_can_win(annotation,current_scope,table)',
+        'semantic_import_using_row_has_alias_pair(annotation,table)',
+        'semantic_possible_import_module_path_module_candidate_matches(table,owner,annotation.owner,annotation.module,annotation.offset)')) or not all(fragment in possible_import_member_owner for fragment in (
+        'semantic_possible_import_module_path_candidate_matches(table,owner,source.name,name,source.module,source.offset)')) or not all(fragment in possible_import_module_member for fragment in (
+        'semantic_possible_import_module_path_member_visible(table,owner,name,current_scope,4294967295)',
+        'semantic_possible_import_alias_target_row_can_win(target,current_scope,table)',
+        'semantic_possible_import_module_path_member_visible(table,target.owner,name,target.module,target.offset)')) or not all(fragment in possible_import_module_path for fragment in (
         'candidate_owner==target',
         'prefix_length==import_scope.len',
         'import_scope[prefix_length]==58',
         'import_scope[prefix_length+1.usize()]==58',
         'candidate_owner[prefix_length+2.usize()+index]==target[index]')):
-    raise SystemExit("possible import lookups must be lexical-scope-aware and pair selective members with their source target")
+    raise SystemExit("possible imports must preserve ordinary scope visibility and resolve candidate paths through the selected alias or raw root")
+if not all(fragment in possible_import_alias_target_row_can_win for fragment in (
+        'target_row.name!="__using_alias_target"',
+        'candidate.name=="__using_alias"',
+        'candidate.name=="__using_alias_target"',
+        'candidate.module==target_row.module',
+        'candidate.line==target_row.line',
+        'candidate.offset==target_row.offset',
+        'alias_count!=1.usize()',
+        'target_count!=1.usize()',
+        'alias.owner==""',
+        'paired_target_owner==""',
+        'paired_target_owner!=target_row.owner',
+        'semantic_possible_import_alias_can_win(alias,current_scope,4294967295,table)')) or not all(fragment in possible_import_alias_target_prefix for fragment in (
+        'return(false,false,0)ifnotalias.known',
+        'ifalias.found:',
+        'semantic_import_module_path_prefix_matches(candidate_owner,alias.target,alias.scope)',
+        'semantic_possible_import_alias_target_prefix(candidate_owner,alias.raw_target,alias.scope,alias.offset,table,depth+1.u32())',
+        'return(true,false,0)ifnotcanonical_prefix.matches',
+        'semantic_import_module_path_prefix_matches(candidate_owner,target_path,import_scope)')) or not all(fragment in possible_import_alias_target_matches for fragment in (
+        'semantic_possible_import_alias_target_prefix(candidate_owner,target_path,import_scope,before_offset,table)',
+        'returntrueifnottarget_prefix.known',
+        'returnfalseifnottarget_prefix.matches',
+        'appended.end==candidate_owner.len')) or not all(fragment in possible_import_alias_target_head_status for fragment in (
+        'semantic_possible_import_alias_head_target(alias_name,import_scope,before_offset,table)',
+        'return(alias.known,alias.found)')) or not all(fragment in possible_import_alias_target_alias_matches for fragment in (
+        'semantic_possible_import_alias_target_head_status(target_path,import_scope,before_offset,table)',
+        'returntrueifnothead.known',
+        'returnfalseifnothead.found',
+        'semantic_possible_import_alias_target_matches(candidate_owner,target_path,"",import_scope,before_offset,table)')) or not all(fragment in possible_import_module_path_alias_member for fragment in (
+        'semantic_possible_import_alias_target_alias_matches(symbol.module_owner,target_path,import_scope,before_offset,table)',
+        'semantic_possible_import_alias_target_alias_matches(table.module_member_owner[member_index],target_path,import_scope,before_offset,table)')) or not all(fragment in possible_import_module_path_member for fragment in (
+        'semantic_possible_import_alias_target_head_status(target_path,import_scope,before_offset,table)',
+        'semantic_possible_import_module_path_alias_member_visible(table,target_path,name,import_scope,before_offset)',
+        'semantic_import_module_path_matches(symbol.module_owner,target_path,import_scope)',
+        'semantic_import_module_path_matches(table.module_member_owner[member_index],target_path,import_scope)')) or not all(fragment in possible_import_module_path_candidate for fragment in (
+        'semantic_possible_import_alias_target_head_status(target_path,import_scope,before_offset,table)',
+        'semantic_possible_import_module_path_alias_member_visible(table,target_path,name,import_scope,before_offset)',
+        'semantic_possible_import_alias_target_alias_matches(candidate_owner,target_path,import_scope,before_offset,table)',
+        'semantic_import_module_path_matches(candidate_owner,target_path,import_scope)')) or not all(fragment in possible_import_type_path_candidate for fragment in (
+        'semantic_possible_import_alias_target_head_status(target_path,import_scope,before_offset,table)',
+        'symbol.name==name',
+        'symbol.kind==kind',
+        'semantic_possible_import_alias_target_alias_matches(symbol.module_owner,target_path,import_scope,before_offset,table)',
+        'semantic_possible_import_alias_target_alias_matches(candidate_owner,target_path,import_scope,before_offset,table)',
+        'semantic_import_module_path_matches(candidate_owner,target_path,import_scope)')) or not all(fragment in possible_import_module_symbol_alias for fragment in (
+        'alias.name=="__using_alias"',
+        'alias.owner==symbol.name',
+        'alias.line==symbol.line',
+        'alias.offset==symbol.offset')) or not all(fragment in possible_import_module_path_alias_module for fragment in (
+        'for module_row in table.module_symbol_rows',
+        'semantic_possible_import_module_symbol_is_using_alias(symbol,table)',
+        'semantic_possible_import_alias_target_alias_matches(symbol.name,target_path,import_scope,before_offset,table)')) or not all(fragment in possible_import_module_path_module_candidate for fragment in (
+        'semantic_possible_import_alias_target_head_status(target_path,import_scope,before_offset,table)',
+        'semantic_possible_import_module_path_alias_module_visible(table,target_path,import_scope,before_offset)',
+        'semantic_possible_import_alias_target_alias_matches(candidate_owner,target_path,import_scope,before_offset,table)',
+        'semantic_import_module_path_matches(candidate_owner,target_path,import_scope)')) or not all(fragment in possible_import_import_row_member for fragment in (
+        'import_row.name=="__using_alias_target"',
+        'semantic_possible_import_alias_target_row_can_win(import_row,current_scope,table)',
+        'import_row.name=="__using"',
+        'semantic_import_using_row_has_alias_pair(import_row,table)',
+        'semantic_possible_import_module_path_member_visible(table,import_row.owner,name,import_row.module,import_row.offset)')):
+    raise SystemExit("possible alias targets and selective imports must preserve exact winner gating and candidate-level alias-before-raw selection")
+if not (possible_import_alias_target_prefix.find('ifalias.found:') < possible_import_alias_target_prefix.find('direct:(matches:bool,end:usize)=semantic_import_module_path_prefix_matches(candidate_owner,target_path,import_scope)')):
+    raise SystemExit("nested raw-target expansion must only fall back after the alias head is known absent")
+for source, order in (
+        (possible_import_module_path_member, (
+            'returntrueifnotalias_head.known',
+            'ifalias_head.found:',
+            'semantic_possible_import_module_path_alias_member_visible(table,target_path,name,import_scope,before_offset)',
+            'semantic_import_module_path_matches(symbol.module_owner,target_path,import_scope)')),
+        (possible_import_module_path_candidate, (
+            'semantic_possible_import_module_path_alias_member_visible(table,target_path,name,import_scope,before_offset)',
+            'semantic_possible_import_alias_target_alias_matches(candidate_owner,target_path,import_scope,before_offset,table)',
+            'semantic_import_module_path_matches(candidate_owner,target_path,import_scope)')),
+        (possible_import_type_path_candidate, (
+            'alias_candidate_exists:bool=anysymbolintable.symbols',
+            'semantic_possible_import_alias_target_alias_matches(candidate_owner,target_path,import_scope,before_offset,table)',
+            'semantic_import_module_path_matches(candidate_owner,target_path,import_scope)')),
+        (possible_import_module_path_module_candidate, (
+            'semantic_possible_import_module_path_alias_module_visible(table,target_path,import_scope,before_offset)',
+            'semantic_possible_import_alias_target_alias_matches(candidate_owner,target_path,import_scope,before_offset,table)',
+            'semantic_import_module_path_matches(candidate_owner,target_path,import_scope)'))):
+    positions = [source.find(fragment) for fragment in order]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise SystemExit("possible-import candidate selection must choose the complete alias candidate set before raw fallback")
+if any(fragment in function for function in (possible_import_module_visible, possible_import_type_selection, possible_import_member_owner, possible_import_module_member) for fragment in (
+        'semantic_import_module_path_matches(owner,annotation.owner,annotation.module)',
+        'semantic_import_module_path_matches(symbol.module_owner,annotation.owner,annotation.module)',
+        'semantic_import_module_path_matches(owner,source.name,source.module)',
+        'semantic_import_module_path_matches(symbol.module_owner,source.name,source.module)',
+        'semantic_possible_import_alias_module_path_matches(owner,annotation.owner,annotation.module,annotation.offset,table)',
+        'semantic_possible_import_alias_module_path_matches(symbol.module_owner,annotation.owner,annotation.module,annotation.offset,table)',
+        'semantic_possible_import_alias_module_path_matches(owner,source.name,source.module,source.offset,table)',
+        'semantic_possible_import_alias_module_path_matches(symbol.module_owner,source.name,source.module,source.offset,table)')):
+    raise SystemExit("possible-import consumers must not OR alias targets with raw root-path matches")
 if not all(fragment in possible_import_module_path_suffix for fragment in (
         'tail_length:=target.len+2.usize()+suffix.len',
         'candidate_owner.len==tail_length',
@@ -547,9 +675,81 @@ if not all(fragment in possible_import_module_path_suffix for fragment in (
         'candidate_owner[target_end+1.usize()]==58')) or not all(fragment in possible_import_alias_module_path for fragment in (
         'string_view_slice(target,0,head_length.i64())',
         'string_view_slice(target,(head_length+2.usize()).i64(),target.len.i64())',
-        'semantic_import_module_path_with_suffix_matches(candidate_owner,target_row.owner,suffix,target_row.module)',
-        'alias.offset>=before_offset')):
-    raise SystemExit("possible import path matching must preserve qualified alias suffixes and declaration ordering")
+        'semantic_possible_import_alias_can_win(alias,import_scope,before_offset,table)',
+        'semantic_possible_import_alias_target_matches(candidate_owner,target_row.owner,suffix,target_row.module,target_row.offset,table)',
+        'semantic_possible_import_alias_dependency_exists(raw_target_row.owner,alias.module,alias.offset,table)',
+        'semantic_possible_import_alias_target_matches(candidate_owner,raw_target_row.owner,suffix,raw_target_row.module,raw_target_row.offset,table)')):
+    raise SystemExit("possible import path matching must preserve qualified alias suffixes and use the selected global alias rows")
+if not all(fragment in possible_import_alias_dependency for fragment in (
+        'depth>=64',
+        'semantic_possible_import_alias_head_target(alias_name,import_scope,before_offset,table)',
+        'semantic_possible_import_alias_dependency_exists(alias.raw_target,alias.scope,alias.offset,table,depth+1.u32())')) or not all(fragment in possible_import_alias_branch for fragment in (
+        'marker.name=="__using_alias_static_branch"',
+        'marker.detail_name==alias.owner')) or not all(fragment in possible_import_alias_branch_marker_at for fragment in (
+        'marker.identity_id==4294967295',
+        'seen==ordinal',
+        'return(true,marker.identity_id)')) or not all(fragment in possible_import_alias_branch_marker_count for fragment in (
+        'marker.identity_id==4294967295',
+        'return(true,count)')) or not all(fragment in possible_import_alias_branch_stack for fragment in (
+        'shared_count:usize=left_stack.countifleft_stack.count<right_stack.countelseright_stack.count',
+        'left_marker.identity!=right_marker.identity',
+        'shared_prefixandleft_stack.count==right_stack.count')):
+    raise SystemExit("possible alias dependencies must use exact source targets and preserve branch identity stacks")
+if not all(fragment in possible_import_alias_order for fragment in (
+        'left.module==right.module',
+        'branch_relation<-semantic_possible_import_alias_branch_stack_relation(left,right,table)',
+        'left_is_branchandright_is_branchandnotbranch_relation.known',
+        'return(true,notleft_is_branch)ifleft_is_branch!=right_is_branch',
+        'branch_relation.shared_prefix',
+        'branch_relation.left_count<branch_relation.right_count',
+        'both_definite:bool=left_is_branchandright_is_branchandsemantic_possible_import_alias_is_definite(left,table)andsemantic_possible_import_alias_is_definite(right,table)',
+        'return(true,true)ifbranch_relation.left_count<=branch_relation.right_count',
+        'return(true,false)ifbranch_relation.right_count<=branch_relation.left_count',
+        'ifnotright_is_branch:return(false,false)ifleft.offset==right.offsetreturn(true,left.offset<right.offset)',
+        'ifnotleft_is_branch:return(false,false)ifleft.offset==right.offsetreturn(true,left.offset<right.offset)',
+        'return(true,left.offset<right.offset)',
+        'named_type_owner_is_lexical(left.module,right.module)',
+        'named_type_owner_is_lexical(right.module,left.module)',
+        'left.offset<right.offset')) or not all(fragment in possible_import_alias_definite for fragment in (
+        'row.name==alias.name',
+        'row.owner==alias.owner',
+        'row.module==alias.module',
+        'row.line==alias.line',
+        'row.offset==alias.offset')) or not all(fragment in possible_import_alias_position for fragment in (
+        'semantic_possible_import_alias_precedes(alias,requester,table)',
+        'requester.name=="__using_alias"',
+        'alias.module==scope',
+        'named_type_owner_is_lexical(alias.module,scope)',
+        'alias_is_branch',
+        'return(true,true)')):
+    raise SystemExit("possible alias winner selection must use Core's global order and fail closed for unknown branch relations")
+if not all(fragment in possible_import_alias_head_target for fragment in (
+        'table.definite_import_annotations',
+        'semantic_possible_import_alias_precedes_position(alias,import_scope,before_offset,table)',
+        'semantic_possible_import_alias_precedes(other,alias,table)',
+        'raw_target_count!=1.usize()',
+        'canonical_target_count!=1.usize()',
+        'table.possible_import_annotations')):
+    raise SystemExit("possible alias chains must choose one prior global winner and pair it with one raw/canonical target")
+if not all(fragment in possible_import_alias_head_target for fragment in (
+        'candidate_wins:mutablebool=true',
+        'ifselected_found:',
+        'raw_target_count:mutableusize=0',
+        'canonical_target_count:mutableusize=0')) or (
+        possible_import_alias_head_target.index('raw_target_count:mutableusize=0') <
+        possible_import_alias_head_target.index('candidate_wins:mutablebool=true')):
+    raise SystemExit("possible alias target rows must be validated after the final global winner is selected")
+if not all(fragment in possible_import_alias_precedence for fragment in (
+        'semantic_possible_import_alias_precedes_position(alias,import_scope,before_offset,table)',
+        'table.definite_import_annotations',
+        'semantic_possible_import_alias_precedes(candidate,selected,table)',
+        'semantic_possible_import_alias_precedes(alias,selected,table)',
+        'other_before_position.knownandnotother_before_position.precedes',
+        'returntrueiffound_priorand(notselected_foundorwinner_ambiguous)',
+        'returnfalseifcandidate_before.knownandnotcandidate_before.precedes',
+        'returnnotcandidate_before.knownorcandidate_before.precedes',
+        'returntrueifnotorder.known')) or 'semantic_possible_import_alias_can_win(alias,import_scope,before_offset,table)' not in possible_import_alias_module_path:
+    raise SystemExit("possible alias paths must account for global definite winners and remain conservative when ordering is unknown")
 if not all(fragment in resolver_name_known for fragment in ('semantic_possible_import_name_visible(table,name,table.current_module)',)) or not all(fragment in resolver_name_classification for fragment in (
         'semantic_possible_import_name_visible(table,name,table.current_module)')) or not all(fragment in resolver_wildcard_uncertainty for fragment in (
         'table.possible_import_annotations',
@@ -612,41 +812,108 @@ if not all(fragment in import_annotation_branch_selection for fragment in (
         'annotation.name=="__using_alias_target"',
         'branch.knownandnotbranch.active')):
     raise SystemExit("PMA must remove proven-inactive private declarations before building its privacy index")
-if not all(fragment in using_alias_target for fragment in (
+if not all(fragment in parser_consume_using_target for fragment in (
+        'parser.record_using_annotation(Ast::EnumAnnotation{owner:recorded_target,name:"__using",module:parser.current_module,line:target_token.line,offset:target_token.start})',
+        'parser.using_alias(alias_target)')) or not all(fragment in parser_using_alias for fragment in (
+        'offset:alias_token.start',
+        'name:"__using_alias_target"')):
+    raise SystemExit("the legacy using row and alias pair must retain their distinct parser token offsets")
+if not all(fragment in import_using_row_alias_pair for fragment in (
+        'using_row.name!="__using"',
+        'candidate.module!=using_row.module',
+        'candidate.line!=using_row.line',
+        'candidate.offset<=using_row.offset',
+        'candidate.offset<next_using_offset',
+        'for candidate in table.possible_import_annotations',
+        'target_row.owner!=using_row.owner',
+        'target_row.module!=using_row.module',
+        'target_row.line!=using_row.line',
+        'target_row.offset<=using_row.offset',
+        'target_row.offset>=next_using_offset',
+        'alias_row.name=="__using_alias"',
+        'alias_row.module==target_row.module',
+        'alias_row.line==target_row.line',
+        'alias_row.offset==target_row.offset',
+        'for alias_row in table.possible_import_annotations',
+        'for target_row in table.possible_import_annotations')):
+    raise SystemExit("alias-associated legacy using rows must be identified without altering the raw import views")
+if not all(fragment in binding_import_builder for fragment in (
+        'annotation.name=="__using_alias_target"',
+        'binding_resolve_module_alias_target(annotation.owner,requester,table)',
+        'normalized<-annotation{owner=canonical_target}',
+        'table.binding_import_annotations.push(normalized)')) or not all(fragment in import_alias_pair_target for fragment in (
+        'candidate.name=="__using_alias"',
         'target.name=="__using_alias_target"',
-        "target.module==alias.module",
-        "target.line==alias.line",
-        "target.offset==alias.offset")) or not all(fragment in alias_chain_match for fragment in (
+        'candidate.module==alias.module',
+        'candidate.line==alias.line',
+        'candidate.offset==alias.offset',
+        'target.module==alias.module',
+        'target.line==alias.line',
+        'target.offset==alias.offset',
+        'alias_count!=1.usize()',
+        'definite_alias_count!=1.usize()',
+        'target_count!=1.usize()',
+        'definite_target_count!=1.usize()',
+        'target_owner==""')) or not all(fragment in import_alias_global_winner for fragment in (
+        'semantic_possible_import_alias_is_definite(alias,table)',
+        'semantic_import_alias_pair_target(alias,table)',
+        'semantic_possible_import_alias_precedes(candidate,alias,table)',
+        'returnfalseifnotorder.knownororder.precedes')) or not all(fragment in import_alias_target_global_winner for fragment in (
+        'target.name!="__using_alias_target"',
+        'pair.target!=target.owner',
+        'semantic_import_alias_is_global_winner(alias,table)')) or not all(fragment in import_alias_target_canonical_owner for fragment in (
+        'semantic_import_alias_target_is_global_winner(target,table)',
+        'binding_target.name=="__using_alias_target"',
+        'binding_target.module==target.module',
+        'binding_target.line==target.line',
+        'binding_target.offset==target.offset',
+        'canonical_count!=1.usize()',
+        'canonical_owner==""')):
+    raise SystemExit("module-alias projections must require one exact winner pair and one canonical target")
+if not all(fragment in alias_member_builder for fragment in (
+        'semantic_import_alias_target_canonical_owner(target_row,table)',
+        'canonical_target==""',
+        'table.module_member_owner[member_index]!=canonical_target',
+        'table.module_member_owner.push(alias_name)')):
+    raise SystemExit("mirrored alias members must come from the exact canonical target")
+for setup in (prepare_symbol_table, unresolved_table_setup, unresolved_references_setup):
+    if not all(fragment in setup for fragment in (
+            'table.imported_modules.push(annotation.owner)ifannotation.name=="__using"andnotsemantic_import_using_row_has_alias_pair(annotation,table)',
+            'semantic_import_alias_target_canonical_owner(annotation,table)',
+            'table.imported_modules.push(canonical_target)ifcanonical_target!=""',
+            'semantic_import_alias_is_global_winner(annotation,table)')):
+        raise SystemExit("every symbol-table construction path must project only exact alias winners and canonical targets")
+    binding_metadata_index = setup.find('binding_import_metadata(table.definite_import_annotations,table)')
+    alias_members_index = setup.find('register_using_alias_members(table.definite_import_annotations,table)')
+    canonical_target_index = setup.find('semantic_import_alias_target_canonical_owner(annotation,table)')
+    if binding_metadata_index < 0 or alias_members_index < 0 or canonical_target_index < 0 or not (
+            binding_metadata_index < alias_members_index < canonical_target_index):
+        raise SystemExit("canonical alias projections must run after binding import metadata is built")
+if not all(fragment in using_alias_target for fragment in (
+        'target_row.name=="__using_alias_target"',
+        "target_row.module==alias.module",
+        "target_row.line==alias.line",
+        "target_row.offset==alias.offset",
+        "target_count==1.usize()")) or not all(fragment in alias_chain_match for fragment in (
         'Expr.Ident(head_name,_)',
-        'head_name!=alias_name',
-        'end!=alias_target.len',
-        'Expr.Scope(inner,last_name,_)')) or not all(fragment in scope_owner for fragment in (
+        'head_name!=alias.owner',
+        'pma_alias_target_matches_owner(annotations,candidate_owner,alias,table)',
+        'pma_alias_chain_prefix_ends_at(inner,owner,end,last_name,alias,annotations,table)',
+        'Expr.Scope(inner,last_name,_)')) or not all(fragment in alias_chain_prefix_match for fragment in (
+        'pma_alias_chain_ends_at(inner,owner,start-2.usize(),alias,annotations,table)')) or not all(fragment in alias_target_matches_owner for fragment in (
+        'semantic_possible_import_alias_target_prefix(candidate_owner,target,alias.module,alias.offset,table)',
+        'target_prefix.knownandtarget_prefix.matchesandtarget_prefix.end==candidate_owner.len')) or not all(fragment in scope_owner for fragment in (
         'alias.name!="__using_alias"',
         "alias.owner!=alias_name",
         "pma_import_annotation_branch_selection(alias,annotations,file,table)",
-        "pma_resolved_using_alias_target(annotations,file,table,alias)",
-        "pma_alias_chain_ends_at(base,candidate,candidate.len,alias.owner,alias_target)",
-        "pma_using_alias_is_shadowed(annotations,file,table,current_module,alias)",
-        "notbranch.knownornotbranch.active")) or not all(fragment in alias_is_static_branch for fragment in (
-        'marker.owner=="__static_if_branch"',
-        'marker.name=="__using_alias_static_branch"',
-        "marker.detail_name==alias.owner",
-        "marker.offset==alias.offset")) or not all(fragment in alias_precedence for fragment in (
-        "left.module!=right.module",
-        "left.module.len>right.module.len",
-        "left_is_branch",
-        "right_is_branch",
-        "left.offset<right.offset")) or not all(fragment in alias_shadowed for fragment in (
-        "pma_using_alias_precedes(annotations,earlier_alias,alias)",
-        "notearlier_branch.knownorearlier_branch.active")):
-    raise SystemExit("PMA must resolve exact alias rows, honor unconditional/scope precedence, and decline uncertain aliases")
-if not all(fragment in resolved_alias_target for fragment in (
-        "pma_using_alias_target(annotations,alias)",
-        "candidate_alias.owner!=target",
-        "pma_using_alias_precedes(annotations,candidate_alias,alias)",
-        "pma_using_alias_is_shadowed(annotations,file,table,alias.module,candidate_alias)",
-        "pma_resolved_using_alias_target(annotations,file,table,annotations[selected_index],depth+1)")):
-    raise SystemExit("PMA chained alias resolution must follow exact, visible, selected alias rows and decline ambiguity")
+        "pma_alias_chain_ends_at(base,candidate,candidate.len,alias,annotations,table)",
+        "pma_using_alias_is_shadowed(annotations,file,table,alias)",
+        "notbranch.knownornotbranch.active")) or "pma_import_scope_visible(current_module,alias.module)" in scope_owner or not all(fragment in alias_precedence for fragment in (
+        "semantic_possible_import_alias_precedes(left,right,table)")) or not all(fragment in alias_shadowed for fragment in (
+        "pma_using_alias_precedes(earlier_alias,alias,table)",
+        "returntrueifnotorder.known",
+        "returntrueiforder.precedes")):
+    raise SystemExit("PMA must resolve exact global alias winners, preserve active-branch checks, and decline uncertain aliases")
 static_statement_walk = compact(function_section(consumer_text, "pma_walk_stmts"))
 if not all(fragment in static_if_row_for_position for fragment in (
         "selected:mutableusize=file.static_if_lines.count",
@@ -949,10 +1216,29 @@ module_alias_chain_smoke_text = MODULE_ALIAS_CHAIN_SMOKE.read_text()
 if not all(fragment in module_alias_chain_text for fragment in (
         "using Secret as First",
         "using First as Second",
-        "return Second::hidden()")) or not all(fragment in module_alias_chain_smoke_text for fragment in (
+        "return Second::hidden()",
+        "module Backend:",
+        "module Nested:",
+        "def nested_hidden() -> i64:",
+        "using Backend as BackendRoot",
+        "using BackendRoot::Nested as NestedSecret",
+        "module ProjectionWinner:",
+        "def winner_only() -> i64:",
+        "module ProjectionLoser:",
+        "def loser_only() -> i64:",
+        "using ProjectionWinner as ProjectionChoice",
+        "using ProjectionLoser as ProjectionChoice",
+        "ProjectionChoice::winner_only()",
+        "ProjectionChoice::loser_only()",
+        "return Second::hidden() + NestedSecret::nested_hidden() + ProjectionChoice::winner_only() + ProjectionChoice::loser_only()")) or not all(fragment in module_alias_chain_smoke_text for fragment in (
         "private_call_module_alias_chain.elisa",
         "chained module alias",
-        "private alias-chain call")):
+        "private alias-chain call",
+        "qualified private alias-suffix call",
+        "nested_hidden",
+        "ProjectionChoice.loser_only",
+        'undefined identifier "NestedSecret.nested_hidden"',
+        'undefined identifier "ProjectionChoice.winner_only"')):
     raise SystemExit("module-alias regression must resolve a private module through a chained alias")
 
 if not all(fragment in root_overloads_text for fragment in (

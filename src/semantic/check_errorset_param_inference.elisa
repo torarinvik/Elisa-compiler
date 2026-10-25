@@ -6,29 +6,19 @@
 # type; a callback parameter carrying `error[R]` binds it and is left clean.
 extend Semantic:
     private:
-        # The errorset-parameter name declared at (FUNCTION_LINE, FUNCTION_OFFSET), else "".
-        # `#line` can reuse a display line in included sources, so a line-only lookup could
-        # attach another function's errorset parameter. Legacy offsetless rows are accepted
-        # only when they are unique on that line.
-        def errorset_param_at(annotations: darray[Ast::EnumAnnotation]&, function_line: u32, function_offset: u32) -> sview:
+        # The errorset-parameter name declared at (FUNCTION_LINE, FUNCTION_OFFSET, FUNCTION_MODULE), else "".
+        # `#line` can reuse a display line in included sources, and byte offset zero is a
+        # real parser position, so the declaration's module and exact source offset identify the row.
+        def errorset_param_at(annotations: darray[Ast::EnumAnnotation]&, function_line: u32, function_offset: u32, function_module: sview) -> sview:
             can Abort.Panic:
                 exact_count: mutable usize = 0.usize()
                 exact_name: mutable sview = sview("", 0, 0)
-                line_count: mutable usize = 0.usize()
-                legacy_count: mutable usize = 0.usize()
-                legacy_name: mutable sview = sview("", 0, 0)
-                for annotation in annotations |exact_count, exact_name, line_count, legacy_count, legacy_name, function_line, function_offset|:
-                    continue if annotation.owner != "__errorset_param" or annotation.line != function_line
-                    line_count <- line_count + 1.usize()
+                for annotation in annotations |exact_count, exact_name, function_line, function_offset, function_module|:
+                    continue if annotation.owner != "__errorset_param" or annotation.line != function_line or annotation.module != function_module
                     if annotation.offset == function_offset:
                         exact_count <- exact_count + 1.usize()
                         exact_name <- annotation.name
-                    elif annotation.offset == 0:
-                        legacy_count <- legacy_count + 1.usize()
-                        legacy_name <- annotation.name
                 return exact_name if exact_count == 1.usize()
-                return "" if exact_count > 1.usize()
-                return legacy_name if line_count == 1.usize() and legacy_count == 1.usize()
                 return ""
 
         # Whether CANDIDATE is the top-level module or a lexical ancestor of MODULE.
@@ -42,19 +32,168 @@ extend Semantic:
                     return false if candidate[offset] != module[offset]
                 return module[candidate.len] == 58 and module[candidate.len + 1.usize()] == 58
 
-        def errorset_import_precedes_call(annotation: Ast::EnumAnnotation, call_line: u32, call_offset: u32) -> bool:
-            return annotation.offset < call_offset if annotation.offset != 0 and call_offset != 0
+        # The module path visible before a qualified call's final `::name` component.
+        # Parentheses around the path are transparent; other expression forms cannot be
+        # a statically resolved module qualifier for this source-only lookup.
+        def errorset_module_path(expression: Ast::Expr, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, line):
+                        return name
+                    Expr.Scope(base, name, line):
+                        prefix: sview = errorset_module_path(base, table)
+                        return "" if prefix == ""
+                        bytes: mutable darray[u8] = []
+                        bytes.reserve(prefix.len + 2.usize() + name.len)
+                        for offset in 0..<prefix.len |bytes, prefix|:
+                            bytes.push(prefix[offset])
+                        bytes.push(58)
+                        bytes.push(58)
+                        for offset in 0..<name.len |bytes, name|:
+                            bytes.push(name[offset])
+                        return intern_joined_text(bytes, table)
+                    Expr.Paren(inner, line):
+                        return errorset_module_path(inner, table)
+                    _:
+                        return ""
+
+        # A call head is either a bare name or a module path ending in `::name`.
+        def errorset_call_target(callee: Ast::Expr, table: lmut SymbolTable) -> (name: sview @source, module_path: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Ident(name, line):
+                        return (name, "")
+                    Expr.Scope(base, name, line):
+                        qualifier: sview = errorset_module_path(base, table)
+                        return (name, qualifier) if qualifier != ""
+                        return ("", "")
+                    Expr.Paren(inner, line):
+                        return errorset_call_target(inner, table)
+                    _:
+                        return ("", "")
+
+        def errorset_module_symbol_exists(module_path: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for symbol in table.symbols |module_path, table|:
+                    continue if symbol.kind != SymbolKind.Module or symbol.name != module_path
+                    # `using Target as Alias` also registers a Module symbol. It is a
+                    # lookup alias, not a declared canonical module path.
+                    is_alias_symbol: bool = any alias in table.definite_import_annotations where alias.name == "__using_alias" and alias.owner == symbol.name and alias.line == symbol.line and alias.offset == symbol.offset
+                    return true if not is_alias_symbol
+                return false
+
+        def errorset_join_module_path(parent: sview, child: sview, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                return child if parent == ""
+                bytes: mutable darray[u8] = []
+                bytes.reserve(parent.len + 2.usize() + child.len)
+                for offset in 0..<parent.len |bytes, parent|:
+                    bytes.push(parent[offset])
+                bytes.push(58)
+                bytes.push(58)
+                for offset in 0..<child.len |bytes, child|:
+                    bytes.push(child[offset])
+                return intern_joined_text(bytes, table)
+
+        # Build the same two-pass, branch-aware global alias map used by type-path
+        # resolution. A qualified call must decline if a possible or conflicting alias
+        # could change the target; using only definite, unambiguous canonical paths keeps
+        # this diagnostic sound.
+        def errorset_qualified_alias_target(qualifier: sview, table: lmut SymbolTable) -> (known: bool, found: bool, target: sview @source, suffix: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                separator: mutable usize = qualifier.len
+                for offset in 0..<qualifier.len |separator, qualifier|:
+                    if offset + 1.usize() < qualifier.len and qualifier[offset] == 58 and qualifier[offset + 1.usize()] == 58:
+                        separator <- offset
+                        break
+                alias_name: sview = qualifier[0:separator]
+                suffix: sview = qualifier[separator + 2.usize():qualifier.len] if separator < qualifier.len else ""
+                alias_names: mutable darray[sview] = []
+                alias_raw_targets: mutable darray[sview @source] = []
+                alias_targets: mutable darray[sview @source] = []
+                alias_scopes: mutable darray[sview] = []
+                alias_uncertain: mutable darray[bool] = []
+                for alias_row in table.definite_import_annotations |alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table|:
+                    continue if alias_row.name != "__using_alias"
+                    target_path: mutable sview @source = ""
+                    target_count: mutable usize = 0.usize()
+                    for target_row in table.definite_import_annotations |target_path, target_count, alias_row|:
+                        if target_row.name == "__using_alias_target" and target_row.module == alias_row.module and target_row.line == alias_row.line and target_row.offset == alias_row.offset:
+                            target_path <- target_row.owner
+                            target_count <- target_count + 1.usize()
+                    alias_names.push(alias_row.owner)
+                    alias_raw_targets.push(target_path)
+                    alias_scopes.push(alias_row.module)
+                    alias_uncertain.push(target_count != 1.usize())
+                for alias_index in 0..<alias_names.count |alias_targets, alias_uncertain, alias_names, alias_raw_targets, alias_scopes, table|:
+                    alias_occurrence: mutable usize = 0.usize()
+                    for prior_index in 0..<alias_index |alias_occurrence, alias_index, alias_names, alias_scopes|:
+                        alias_occurrence <- alias_occurrence + 1.usize() if alias_names[prior_index] == alias_names[alias_index] and alias_scopes[prior_index] == alias_scopes[alias_index]
+                    alias_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(alias_names[alias_index], alias_scopes[alias_index], alias_occurrence, table)
+                    if alias_class.found:
+                        canonical: (path: sview @source, known: bool) = type_path_canonical_alias_target(alias_raw_targets[alias_index], alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table, alias_scopes[alias_index], alias_class.offset, alias_class.order_index, alias_class.branch, true)
+                        alias_targets.push(canonical.path)
+                        alias_uncertain[alias_index] <- alias_uncertain[alias_index] or not canonical.known
+                    else:
+                        alias_targets.push(alias_raw_targets[alias_index])
+                        alias_uncertain[alias_index] <- true
+                selected: (found: bool, known: bool, row: usize) = type_path_alias_selection(alias_name, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
+                return (true, false, "", suffix) if not selected.found
+                return (false, true, "", suffix) if not selected.known or selected.row >= alias_targets.count or alias_targets[selected.row] == ""
+                return (true, true, alias_targets[selected.row], suffix)
+
+        # Resolve modules in Stage0's order: the nearest declared lexical path, a
+        # definite and unambiguous alias at its head, then the raw root spelling. Keep
+        # the canonical owner independent of callable candidates so a missing member in
+        # a nearer module cannot fall through and produce a diagnostic for another one.
+        def errorset_qualified_module_for_call(qualifier: sview, current_module: sview, table: lmut SymbolTable) -> (known: bool, found: bool, module: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                scope: mutable sview = current_module
+                while scope != "" |scope, qualifier, table|:
+                    candidate: sview @source = errorset_join_module_path(scope, qualifier, table)
+                    return (true, true, candidate) if errorset_module_symbol_exists(candidate, table)
+                    scope <- errorset_module_parent(scope)
+                alias: (known: bool, found: bool, target: sview @source, suffix: sview @source) = errorset_qualified_alias_target(qualifier, table)
+                return (false, false, "") if not alias.known
+                if alias.found:
+                    candidate: sview @source = errorset_join_module_path(alias.target, alias.suffix, table) if alias.suffix != "" else alias.target
+                    return (true, true, candidate)
+                return (true, true, qualifier) if errorset_module_symbol_exists(qualifier, table)
+                return (true, false, "")
+
+        # A qualified spelling is resolved against a canonical module identity. The
+        # leaf-only match is deliberately not used because it could confuse same-named
+        # modules from unrelated namespaces.
+        def errorset_module_parent(module_path: sview) -> sview:
+            can Abort.Panic:
+                separator: mutable usize = module_path.len
+                offset: mutable usize = 0.usize()
+                while offset + 1.usize() < module_path.len |separator, offset, module_path|:
+                    separator <- offset if module_path[offset] == 58 and module_path[offset + 1.usize()] == 58
+                    offset <- offset + 1.usize()
+                return "" if separator == module_path.len
+                return module_path[0:separator]
+
+        def errorset_import_precedes_call(annotation: Ast::EnumAnnotation, call_line: u32, call_offset: u32, call_offset_present: bool) -> bool:
+            # Parser import rows carry the source span of their target token in `pos`.
+            # Unlike `offset != 0`, that distinguishes a real byte-zero position from a
+            # legacy row whose offset was never recorded. A call's AST position likewise
+            # tells the caller whether offset zero is real. Compare exact offsets whenever
+            # both sides have them; fall back to lines only when one side lacks an offset.
+            annotation_offset_present: bool = annotation.offset != 0 or annotation.pos.end_offset > annotation.pos.offset
+            call_has_offset: bool = call_offset != 0 or call_offset_present
+            return annotation.offset < call_offset if annotation_offset_present and call_has_offset
             return annotation.line < call_line
 
         # The nearest import scope that makes CANDIDATE_MODULE.NAME visible at this call,
         # or (false, 0) when the sibling module is not imported into the caller's scope.
-        def errorset_import_scope(annotations: darray[Ast::EnumAnnotation]&, candidate_module: sview, wanted: sview, current_module: sview, call_line: u32, call_offset: u32) -> (visible: bool, scope_length: usize):
+        def errorset_import_scope(annotations: darray[Ast::EnumAnnotation]&, candidate_module: sview, wanted: sview, current_module: sview, call_line: u32, call_offset: u32, call_offset_present: bool) -> (visible: bool, scope_length: usize):
             can Abort.Panic:
                 visible: mutable bool = false
                 scope_length: mutable usize = 0
-                for binding in annotations |visible, scope_length, annotations, candidate_module, wanted, current_module, call_line, call_offset|:
+                for binding in annotations |visible, scope_length, annotations, candidate_module, wanted, current_module, call_line, call_offset, call_offset_present|:
                     continue if not errorset_module_is_lexical_ancestor(binding.module, current_module)
-                    continue if not errorset_import_precedes_call(binding, call_line, call_offset)
+                    continue if not errorset_import_precedes_call(binding, call_line, call_offset, call_offset_present)
                     if binding.name == "__binding_wildcard_import" and binding.owner == candidate_module:
                         if not visible or binding.module.len > scope_length:
                             visible <- true
@@ -70,21 +209,24 @@ extend Semantic:
         # Pick the nearest visible declaration for a bare call. Keep non-uninferable
         # declarations in the index too: a nearer ordinary or inferable `wrap` shadows a
         # same-named uninferable function in an ancestor module.
-        def errorset_param_for_scope(names: darray[sview]&, params: darray[sview]&, modules: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, wanted: sview, current_module: sview, call_line: u32, call_offset: u32) -> sview:
+        def errorset_param_for_scope(names: darray[sview]&, params: darray[sview]&, modules: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, wanted: sview, qualified_module: sview, current_module: sview, call_line: u32, call_offset: u32, call_offset_present: bool, table: lmut SymbolTable) -> sview:
             can Abort.Panic:
                 paired: mutable usize = names.count if names.count < params.count else params.count
                 paired <- modules.count if modules.count < paired
+                resolved_module: (known: bool, found: bool, module: sview @source) = errorset_qualified_module_for_call(qualified_module, current_module, table) if qualified_module != "" else (true, false, "")
+                return "" if qualified_module != "" and (not resolved_module.known or not resolved_module.found)
                 best_length: mutable usize = 0.usize()
                 found: mutable bool = false
                 ambiguous: mutable bool = false
                 best_is_direct: mutable bool = false
                 selected: mutable sview = ""
-                for index in 0..<paired |best_length, found, ambiguous, best_is_direct, selected, names, params, modules, annotations, wanted, current_module, call_line, call_offset|:
+                for index in 0..<paired |best_length, found, ambiguous, best_is_direct, selected, names, params, modules, annotations, wanted, qualified_module, current_module, call_line, call_offset, call_offset_present, resolved_module|:
                     continue if names[index] != wanted
-                    direct: bool = errorset_module_is_lexical_ancestor(modules[index], current_module)
-                    imported: (visible: bool, scope_length: usize) = errorset_import_scope(annotations, modules[index], wanted, current_module, call_line, call_offset) if not direct else (false, 0.usize())
-                    continue if not direct and not imported.visible
-                    candidate_rank: usize = modules[index].len if direct else imported.scope_length
+                    direct: bool = errorset_module_is_lexical_ancestor(modules[index], current_module) if qualified_module == "" else true
+                    imported: (visible: bool, scope_length: usize) = errorset_import_scope(annotations, modules[index], wanted, current_module, call_line, call_offset, call_offset_present) if qualified_module == "" and not direct else (false, 0.usize())
+                    continue if qualified_module != "" and modules[index] != resolved_module.module
+                    continue if qualified_module == "" and not direct and not imported.visible
+                    candidate_rank: usize = modules[index].len if qualified_module != "" else (modules[index].len if direct else imported.scope_length)
                     if not found or candidate_rank > best_length or (candidate_rank == best_length and direct and not best_is_direct):
                         best_length <- candidate_rank
                         selected <- params[index]
@@ -143,7 +285,7 @@ extend Semantic:
                             # binding R inside a `fn(...) -> T error[R]` type, which is not reliably
                             # scannable here (function types have no dedicated AST node), so it is a
                             # conservative miss rather than a false positive.
-                            errorset_param: sview = errorset_param_at(annotations, line.line, line.offset)
+                            errorset_param: sview = errorset_param_at(annotations, line.line, line.offset, current_module)
                             errorset_r: sview = errorset_param if parameters.count == 0 else ""
                             out_names.push(name)
                             out_params.push(errorset_r)
@@ -175,22 +317,78 @@ extend Semantic:
                     index <- index + 1
                 return sview("", 0, 0)
 
-        def errorset_walk_expression(expression: Ast::Expr, names: darray[sview]&, params: darray[sview]&, modules: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, table: lmut SymbolTable) -> void:
+        def errorset_walk_expression(expression: Ast::Expr, names: darray[sview]&, params: darray[sview]&, modules: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, current_module: sview, file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, line):
-                        callee_name: sview = ident_name_of(callee)
-                        errorset_r: sview = errorset_param_for_scope(names, params, modules, annotations, callee_name, current_module, line.line, line.offset) if callee_name != "" else sview("", 0, 0)
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ErrorSetParamUninferable, name: callee_name, line: line.line, expected: errorset_r, actual: ""}) if errorset_r != ""
+                        target: (name: sview @source, module_path: sview @source) = errorset_call_target(callee, table)
+                        errorset_r: sview = errorset_param_for_scope(names, params, modules, annotations, target.name, target.module_path, current_module, line.line, line.offset, line.end_offset > line.offset, table) if target.name != "" else sview("", 0, 0)
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ErrorSetParamUninferable, name: target.name, line: line.line, expected: errorset_r, actual: ""}) if errorset_r != ""
+                        table <- errorset_walk_expression(callee, names, params, modules, annotations, current_module, file, table)
                         for argument in arguments |table| -> table:
-                            table <- errorset_walk_expression(argument, names, params, modules, annotations, current_module, table)
+                            table <- errorset_walk_expression(argument, names, params, modules, annotations, current_module, file, table)
+                    Expr.StaticEffectCall(_, operation, candidates, arguments, argument_names, line):
+                        for candidate in candidates |table| -> table:
+                            for capture in candidate.captures |table| -> table:
+                                table <- errorset_walk_expression(capture, names, params, modules, annotations, current_module, file, table)
+                        for argument in arguments |table| -> table:
+                            table <- errorset_walk_expression(argument, names, params, modules, annotations, current_module, file, table)
+                    Expr.Field(object, field, line) | Expr.Scope(object, field, line):
+                        table <- errorset_walk_expression(object, names, params, modules, annotations, current_module, file, table)
+                    Expr.Index(object, index, line):
+                        table <- errorset_walk_expression(object, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(index, names, params, modules, annotations, current_module, file, table)
+                    Expr.Slice(object, low, high, line):
+                        table <- errorset_walk_expression(object, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(low, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(high, names, params, modules, annotations, current_module, file, table)
+                    Expr.IndexN(object, arguments, line):
+                        table <- errorset_walk_expression(object, names, params, modules, annotations, current_module, file, table)
+                        for argument in arguments |table| -> table:
+                            table <- errorset_walk_expression(argument, names, params, modules, annotations, current_module, file, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- errorset_walk_expression(left, names, params, modules, annotations, current_module, table)
-                        table <- errorset_walk_expression(right, names, params, modules, annotations, current_module, table)
-                    Expr.Unary(operator, operand, line):
-                        table <- errorset_walk_expression(operand, names, params, modules, annotations, current_module, table)
-                    Expr.Paren(inner, line):
-                        table <- errorset_walk_expression(inner, names, params, modules, annotations, current_module, table)
+                        table <- errorset_walk_expression(left, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(right, names, params, modules, annotations, current_module, file, table)
+                    Expr.Unary(_, operand, line) | Expr.Move(operand, line) | Expr.RegionNew(operand, _, line) | Expr.Paren(operand, line):
+                        table <- errorset_walk_expression(operand, names, params, modules, annotations, current_module, file, table)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |table| -> table:
+                            table <- errorset_walk_expression(element, names, params, modules, annotations, current_module, file, table)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |table| -> table:
+                            table <- errorset_walk_expression(entry.key, names, params, modules, annotations, current_module, file, table)
+                            table <- errorset_walk_expression(entry.value, names, params, modules, annotations, current_module, file, table)
+                    Expr.Construct(_, fields, line):
+                        for field in fields |table| -> table:
+                            table <- errorset_walk_expression(field.value, names, params, modules, annotations, current_module, file, table)
+                    Expr.RecordUpdate(base, fields, line):
+                        table <- errorset_walk_expression(base, names, params, modules, annotations, current_module, file, table)
+                        for field in fields |table| -> table:
+                            table <- errorset_walk_expression(field.value, names, params, modules, annotations, current_module, file, table)
+                    Expr.If(condition, then_expression, else_expression, line):
+                        table <- errorset_walk_expression(condition, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(then_expression, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(else_expression, names, params, modules, annotations, current_module, file, table)
+                    Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
+                        table <- errorset_walk_expression(scrutinee, names, params, modules, annotations, current_module, file, table)
+                        for arm in arms |table| -> table:
+                            table <- errorset_walk_expression(arm.guard, names, params, modules, annotations, current_module, file, table)
+                            table <- errorset_walk_statements(arm.body, names, params, modules, annotations, current_module, file, table)
+                    Expr.Comprehension(variable, iterable, condition, body, line, scope_id):
+                        table <- errorset_walk_expression(iterable, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(condition, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(body, names, params, modules, annotations, current_module, file, table)
+                    Expr.Refinement(base, predicate, line):
+                        table <- errorset_walk_expression(base, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(predicate, names, params, modules, annotations, current_module, file, table)
+                    Expr.GetElse(guarded, recovery, line):
+                        table <- errorset_walk_expression(guarded, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_statements(recovery, names, params, modules, annotations, current_module, file, table)
+                    Expr.Lambda(parameters, body, line):
+                        table <- errorset_walk_statements(body, names, params, modules, annotations, current_module, file, table)
+                    Expr.Block(statements, value, captures, line):
+                        table <- errorset_walk_statements(statements, names, params, modules, annotations, current_module, file, table)
+                        table <- errorset_walk_expression(value, names, params, modules, annotations, current_module, file, table)
                     _:
                         pass
 
@@ -199,30 +397,37 @@ extend Semantic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- errorset_walk_expression(expression, names, params, modules, annotations, current_module, table)
+                            table <- errorset_walk_expression(expression, names, params, modules, annotations, current_module, file, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- errorset_walk_expression(value, names, params, modules, annotations, current_module, table)
+                            table <- errorset_walk_expression(value, names, params, modules, annotations, current_module, file, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- errorset_walk_expression(value, names, params, modules, annotations, current_module, table)
+                            table <- errorset_walk_expression(target, names, params, modules, annotations, current_module, file, table)
+                            table <- errorset_walk_expression(value, names, params, modules, annotations, current_module, file, table)
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- errorset_walk_expression(returned, names, params, modules, annotations, current_module, table)
+                                table <- errorset_walk_expression(returned, names, params, modules, annotations, current_module, file, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- errorset_walk_expression(condition, names, params, modules, annotations, current_module, table)
+                            table <- errorset_walk_expression(condition, names, params, modules, annotations, current_module, file, table)
                             table <- errorset_walk_statements(then_body, names, params, modules, annotations, current_module, file, table)
                             table <- errorset_walk_statements(else_body, names, params, modules, annotations, current_module, file, table)
                         Stmt.While(condition, body, line):
+                            table <- errorset_walk_expression(condition, names, params, modules, annotations, current_module, file, table)
                             table <- errorset_walk_statements(body, names, params, modules, annotations, current_module, file, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- errorset_walk_expression(iterable, names, params, modules, annotations, current_module, table)
+                            table <- errorset_walk_expression(iterable, names, params, modules, annotations, current_module, file, table)
                             table <- errorset_walk_statements(body, names, params, modules, annotations, current_module, file, table)
                         Stmt.Block(kind, clause, binding, body, line):
                             continue if kind == "static" and errorset_static_scope_is_inactive(file, line, current_module, table)
                             table <- errorset_walk_statements(body, names, params, modules, annotations, current_module, file, table)
                         Stmt.Match(scrutinee, arms, line):
-                            table <- errorset_walk_expression(scrutinee, names, params, modules, annotations, current_module, table)
+                            table <- errorset_walk_expression(scrutinee, names, params, modules, annotations, current_module, file, table)
                             for arm in arms |table| -> table:
+                                table <- errorset_walk_expression(arm.guard, names, params, modules, annotations, current_module, file, table)
                                 table <- errorset_walk_statements(arm.body, names, params, modules, annotations, current_module, file, table)
+                        Stmt.Contract(kind, expression, line):
+                            # Executable contracts run as guards or at returns. Loop/frame
+                            # proof clauses are not runtime call sites for ErrorSet inference.
+                            table <- errorset_walk_expression(expression, names, params, modules, annotations, current_module, file, table) if kind == "requires" or kind == "require" or kind == "assert" or kind == "ensure" or kind == "ensures"
                         _:
                             pass
 
@@ -231,7 +436,12 @@ extend Semantic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            for parameter in parameters |table| -> table:
+                                table <- errorset_walk_expression(parameter.default_value, names, params, modules, annotations, current_module, file, table) if parameter.has_default
                             table <- errorset_walk_statements(body, names, params, modules, annotations, current_module, file, table)
+                        Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, line):
+                            for member in members |table| -> table:
+                                table <- errorset_walk_expression(member.default_value, names, params, modules, annotations, current_module, file, table) if member.has_default
                         Decl.Module(module_name, module_body, module_line):
                             table <- errorset_walk_decls(module_body, names, params, modules, annotations, module_name, file, table)
                         Decl.Scoped(scoped_body, scoped_line):

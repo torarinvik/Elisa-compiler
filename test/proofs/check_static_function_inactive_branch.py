@@ -20,6 +20,8 @@ PARSER_TABLES = (ROOT / "src/parser/parser_core_member_tables.elisa").read_text(
 PARSER_ENTRY = (ROOT / "src/parser/parser_types_entry.elisa").read_text()
 LOOP_VIEW = (ROOT / "src/semantic/semantic_loop_view.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/static_function_inactive_branch.elisa").read_text()
+UNKNOWN_ASSERT_FIXTURE = (ROOT / "test/repro/static_assert_unknown_branch.elisa").read_text()
+UNKNOWN_ASSERT_SMOKE = (ROOT / "test/parity/static_assert_unknown_branch_smoke.sh").read_text()
 INTERP_FIXTURE = (ROOT / "test/repro/static_generate_interp_module_visibility.elisa").read_text()
 INTERP_SMOKE = (ROOT / "test/parity/static_generate_interp_module_visibility_smoke.sh").read_text()
 
@@ -50,7 +52,7 @@ sgi_check = function_source(INTERPOLATION, "check_static_generate_interp")
 eval_runner = function_source(STATIC_EVAL, "static_run_func")
 eval_expr = function_source(STATIC_EVAL, "static_eval_expr")
 eval_entry = function_source(STATIC_EVAL, "check_static_eval")
-assert_branch_filter = function_source(STATIC_ASSERT, "static_assert_is_in_inactive_branch")
+assert_branch_activity = function_source(STATIC_ASSERT, "static_assert_branch_activity")
 assert_entry = function_source(STATIC_ASSERT, "check_static_assert")
 error_branch_selection = function_source(STATIC_ERROR, "static_error_function_branch_selection")
 error_candidate_count = function_source(STATIC_ERROR, "static_error_count_function_candidates")
@@ -145,15 +147,19 @@ if "sdr_collect_static_fn_annotations(file, static_fns, table)" not in eval_entr
     "sdr_static_scope_is_inactive(file, scoped_line, current_module, table)",
 )):
     raise SystemExit("static evaluation must use filtered static-function rows and skip inactive declarations")
-if not all(fragment in assert_branch_filter for fragment in (
+if not all(fragment in assert_branch_activity for fragment in (
     "not file.static_assert_branch_rows_known[index]",
     "file.static_assert_branch_row_starts[index]",
     "file.static_assert_branch_row_counts[index]",
     "file.static_assert_branch_row_ids[start + row_offset]",
     "pma_static_if_row_selection(file, branch_row.usize(), current_module, table)",
-    "return true if branch.known and not branch.selected",
-)) or "static_assert_is_in_inactive_branch(file, index, current_module, table)" not in assert_entry:
-    raise SystemExit("static assertions must retain enclosing branch rows and skip only proven-inactive conditions")
+        "return (true, false) if branch.known and not branch.selected",
+        "return (false, true) if not branch.known",
+        "row_count != file.static_assert_branch_row_counts[index]",
+        "return (true, true)")) or not all(fragment in assert_entry for fragment in (
+        "static_assert_branch_activity(file, index, current_module, table)",
+        "activity.known and activity.active")):
+    raise SystemExit("static assertions must evaluate only under proven-active enclosing branches")
 if not all(fragment in error_branch_selection for fragment in (
     'marker.owner != "__static_if_branch"',
     'marker.name != "__function_static_branch"',
@@ -175,14 +181,16 @@ if not all(fragment in error_branch_selection for fragment in (
     "out: mutable darray[i64]",
 )) or not all(fragment in error_entry for fragment in (
     "file.static_assert_modules[index]",
-    "static_assert_is_in_inactive_branch(file, index, current_module, table)",
+    "static_assert_branch_activity(file, index, current_module, table)",
+    "activity.known and activity.active",
     "static_error_scan_calls(condition, file, static_fns, current_module, called, table)",
     "static_error_count_function_candidates(file, file.top_decls, \"\", current_module, name, candidates, table)",
     "candidates == 1 and static_def_body_error",
     "sdr_collect_static_fn_annotations(file, static_fns, table)",
 )) or not all(fragment in eval_entry for fragment in (
     "file.static_assert_modules[index]",
-    "static_assert_is_in_inactive_branch(file, index, current_module, table)",
+    "static_assert_branch_activity(file, index, current_module, table)",
+    "activity.known and activity.active",
     "static_eval_expr(file.top_decls, static_fns, condition, empty_names, empty_vals, counter, exceeded, unsupported, file, current_module, table)",
 )):
     raise SystemExit("static error reporting must resolve visible static declarations only")
@@ -203,6 +211,17 @@ if not all("static_assert_modules" in source and "static_assert_branch_row_start
     "parser.static_assert_branch_row_ids <- parser.static_assert_branch_row_ids.push(branch_row)",
 )):
     raise SystemExit("static-assert module and branch provenance must survive parse and semantic loop views")
+if not all(fragment in UNKNOWN_ASSERT_FIXTURE for fragment in (
+        "static def branch_error() -> i32:",
+        'error("unknown condition static error")',
+        "static if ELISA_TARGET_OS_WASI:",
+        'static assert 1 == 2, "unknown condition assert"',
+        "static assert branch_error() == 0")) or not all(fragment in UNKNOWN_ASSERT_SMOKE for fragment in (
+        "static_assert_unknown_branch.elisa",
+        "ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown",
+        "unknown condition assert",
+        "unknown condition static error")):
+    raise SystemExit("unknown static-if conditions must defer assertions, static evaluation, and static-error reporting")
 if not all(fragment in PARSER for fragment in (
     'record_static_if_branch_rows("__function_static_branch", function_name, token)',
 )) or not all(fragment in FIXTURE for fragment in (

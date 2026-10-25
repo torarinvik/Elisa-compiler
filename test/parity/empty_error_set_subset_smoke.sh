@@ -16,6 +16,10 @@ protocol_report=$("$RPT" < "$ROOT/test/fixtures/diagnostics/empty_protocol_error
 grep -q '^D 1$' <<< "$protocol_report"
 grep -q 'error\[...\] requires at least one qualified error tag' <<< "$protocol_report"
 
+line_zero_protocol_report=$("$RPT" < "$ROOT/test/fixtures/diagnostics/empty_protocol_error_set_subset_line_zero.elisa")
+grep -q '^D 1$' <<< "$line_zero_protocol_report"
+grep -q 'error\[...\] requires at least one qualified error tag' <<< "$line_zero_protocol_report"
+
 parameter_report=$("$RPT" < "$ROOT/test/fixtures/diagnostics/empty_protocol_callback_error_set_subset.elisa")
 grep -q '^D 1$' <<< "$parameter_report"
 grep -q 'error\[...\] requires at least one qualified error tag' <<< "$parameter_report"

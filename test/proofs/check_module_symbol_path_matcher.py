@@ -20,6 +20,7 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 POLICY = ROOT / "src/semantic/module_symbol_path_matcher.elisa"
 CONSUMER = ROOT / "src/semantic/check_type_path_separator.elisa"
+IMPORT_VISIBILITY = ROOT / "src/semantic/semantic_import_visibility.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 RESOLVER = ROOT / "src/semantic/resolve_expr_walk.elisa"
 BINDING_RESOLVER = ROOT / "src/semantic/resolve_binding_capabilities.elisa"
@@ -58,6 +59,7 @@ def declarations(source: str) -> set[str]:
 
 policy_text = POLICY.read_text()
 consumer_text = CONSUMER.read_text()
+import_visibility_text = IMPORT_VISIBILITY.read_text()
 semantic_text = SEMANTIC.read_text()
 resolver_text = RESOLVER.read_text()
 binding_resolver_text = BINDING_RESOLVER.read_text()
@@ -168,24 +170,101 @@ if semantic_text.count('include "./check_type_path_separator.elisa"') != 1:
 alias_visibility = compact(function_section(consumer_text, "type_path_prefix_is_module"))
 alias_canonicalization = compact(function_section(consumer_text, "type_path_canonical_alias_target"))
 alias_selection = compact(function_section(consumer_text, "type_path_alias_selection"))
+alias_order = compact(function_section(import_visibility_text, "semantic_possible_import_alias_precedes"))
+alias_cutoff = compact(function_section(consumer_text, "type_path_possible_alias_precedes_cutoff"))
+alias_unordered_cutoff = compact(function_section(consumer_text, "type_path_alias_name_has_unordered_cutoff_row"))
+raw_module_target = compact(function_section(consumer_text, "type_path_raw_module_target"))
+module_alias_row = compact(function_section(consumer_text, "type_path_module_symbol_is_using_alias"))
+alias_branch = compact(function_section(consumer_text, "type_path_alias_branch_at"))
 alias_setup = compact(function_section(consumer_text, "check_type_path_separator"))
 alias_fixture = ALIAS_BRANCH_FIXTURE.read_text()
 alias_smoke = ALIAS_BRANCH_SMOKE.read_text()
+negative_alias_only_smoke = compact('''
+if grep -Fq '"RawAliasOnlyTarget" is a namespace; write RawAliasOnlyTarget::' <<< "$report"; then
+    fail "$label treated a later using-alias as a declared raw module for an earlier alias target: $report"
+fi
+''')
+if negative_alias_only_smoke not in compact(alias_smoke):
+    raise SystemExit("TypePath smoke must fail if a later alias-only name is accepted as a raw declared module")
 if not all(fragment in alias_visibility for fragment in (
-        "alias_scopes:darray[sview]&",
-        "type_path_alias_selection(names[0],enclosing,alias_names,alias_targets,alias_scopes)",
+        "alias_uncertain:darray[bool]&",
+        "type_path_alias_selection(names[0],alias_names,alias_targets,alias_scopes,alias_uncertain,table)",
         "module_symbol_matches(symbol_name,alias_targets[alias.row],names,1,count)")) or not all(fragment in alias_canonicalization for fragment in (
-        "alias_scopes:darray[sview]&",
-        "type_path_alias_selection(first,declaration_scope,alias_names,alias_targets,alias_scopes)")) or not all(fragment in alias_selection for fragment in (
-        "semantic_import_scope_visible(alias_scopes[alias_index],current_scope)",
-        "alias_scopes[alias_index].len>selected_scope_length",
-        "alias_targets[alias_index]!=alias_targets[selected_row]",
-        "return(false,false,alias_names.count)ifselected_row>=alias_names.count",
-        "return(true,false,alias_names.count)ifambiguous")) or "returnpathifalias.found" not in alias_canonicalization or not all(fragment in alias_setup for fragment in (
-        "for target_row in table.definite_import_annotations",
+        "alias_raw_targets:darray[sview@source]&",
+        "type_path_alias_selection(first,alias_names,alias_raw_targets,alias_scopes,alias_uncertain,table,declaration_scope,declaration_offset,declaration_index,declaration_branch,has_declaration)",
+        "alias_raw_targets[alias_index]",
+        "alias_scopes[alias_index],alias_class.offset,alias_class.order_index,alias_class.branch,true,depth+1",
+        "return(path,false)ifalias.found",
+        "ifhas_declaration",
+        "type_path_raw_module_target(path,declaration_scope,table)",
+        "return(raw_module.module,true)ifraw_module.found",
+        "return(intern_joined_text(bytes,table),canonical_prefix.known)")) or not all(fragment in alias_selection for fragment in (
+        "alias_names[alias_index]!=name",
+        "alias_uncertain[alias_index]",
+        "cutoff_scope:sview",
+        "enforce_cutoff:bool",
+        "type_path_alias_branch_at(name,alias_scopes[selected_row],selected_occurrence,table)",
+        "semantic_possible_import_alias_precedes(table.definite_import_annotations[candidate_class.order_index],table.definite_import_annotations[selected_class.order_index],table)",
+        "foralias_indexin0..<alias_names.count|ambiguous,name,alias_names,alias_scopes,selected_row,selected_class,table|",
+        "ambiguous<-false",
+        "ifcutoff_order.known",
+        "notwinner_order.knownorwinner_order.precedes",
+        "alias_index==selected_rowornotwinner_order.knownorwinner_order.precedes",
+        "forannotationinttable.possible_import_annotations",
+        'annotation.name!="__using_alias"orannotation.owner!=name',
+        "type_path_possible_alias_precedes_cutoff(name,cutoff_scope,cutoff_offset,cutoff_index,cutoff_branch,enforce_cutoff,table)",
+        "type_path_alias_name_has_unordered_cutoff_row(name,cutoff_index,table)",
+        "return(true,false,alias_names.count)",
+        "return(true,false,alias_names.count)ifambiguousoruncertain")) or not all(fragment in alias_setup for fragment in (
+        "alias_raw_targets:mutabledarray[sview@source]=[]",
         "for alias_row in table.definite_import_annotations",
-        "alias_scopes.push(target_row.module)")):
-    raise SystemExit("type-path namespace detection must use only definite aliases visible from the lexical module")
+        'alias_row.name!="__using_alias"',
+        'target_row.name=="__using_alias_target"',
+        "alias_raw_targets.push(target_path)",
+        "alias_uncertain.push(target_count!=1.usize())",
+        "for alias_index in 0..<alias_names.count",
+        "type_path_alias_branch_at(alias_names[alias_index],alias_scopes[alias_index],alias_occurrence,table)",
+        "type_path_canonical_alias_target(alias_raw_targets[alias_index],alias_names,alias_raw_targets,alias_scopes,alias_uncertain,table,alias_scopes[alias_index],alias_class.offset,alias_class.order_index,alias_class.branch,alias_class.found)",
+        "alias_uncertain[alias_index]<-alias_uncertain[alias_index]ornotalias_class.foundornotcanonical_target.known")):
+    raise SystemExit("type-path namespace detection must preserve Stage0 global alias visibility and possible-target uncertainty")
+if not all(fragment in alias_branch for fragment in (
+        'alias.name!="__using_alias"oralias.owner!=nameoralias.module!=scope',
+        'target.name=="__using_alias_target"',
+        "target_count!=1.usize()",
+        "semantic_import_alias_is_static_branch(alias,table)")):
+    raise SystemExit("TypePath definite alias selection must retain same-scope direct-over-branch precedence")
+if not all(fragment in alias_order for fragment in (
+        "left.module==right.module",
+        "branch_relation.shared_prefix",
+        "both_definite:left_is_branchandright_is_branchandsemantic_possible_import_alias_is_definite(left,table)andsemantic_possible_import_alias_is_definite(right,table)",
+        "semantic_possible_import_alias_branch_stack_relation(left,right,table)",
+        "named_type_owner_is_lexical(left.module,right.module)",
+        "named_type_owner_is_lexical(right.module,left.module)",
+        "left.offset<right.offset")):
+    raise SystemExit("TypePath alias selection must use Core ordering plus branch-context evidence")
+if not all(fragment in alias_cutoff for fragment in (
+        'annotation.name!="__using_alias"orannotation.owner!=name',
+        "same_position:bool=annotation.module==cutoff_scopeandannotation.offset==cutoff_offsetandpossible_is_branch==cutoff_branch",
+        "semantic_possible_import_alias_precedes(annotation,cutoff,table)",
+        "cutoff_index>=table.definite_import_annotations.count")):
+    raise SystemExit("TypePath alias-target chains must respect their Core registration cutoff")
+if not all(fragment in alias_unordered_cutoff for fragment in (
+        'candidate.name!="__using_alias"orcandidate.owner!=name',
+        "semantic_possible_import_alias_precedes(candidate,cutoff,table)",
+        "notorder.known")):
+    raise SystemExit("TypePath alias targets must remain unresolved when a definite registration cutoff is unordered")
+if not all(fragment in module_alias_row for fragment in (
+        'annotation.name=="__using_alias"',
+        "annotation.owner==symbol.name",
+        "annotation.line==symbol.line",
+        "annotation.offset==symbol.offset")) or raw_module_target.count("type_path_module_symbol_is_using_alias(symbol,table)") != 1 or not all(fragment in raw_module_target for fragment in (
+        "candidate==pathorsemantic_import_module_path_matches(candidate,path,declaration_scope)",
+        "semantic_import_module_path_matches(candidate,path,declaration_scope)",
+        "candidate.len>selected.len",
+        "candidate.len==selected.lenandcandidate!=selected")):
+    raise SystemExit("TypePath raw alias-target fallback must exclude using-alias symbols and match only declared module paths")
+if "foralias_indexin0..<alias_names.count" not in alias_selection or "continueifalias_names[alias_index]!=name" not in alias_selection:
+    raise SystemExit("Stage0-global module aliases must scan every declaration scope before applying registration precedence")
 if not all(fragment in alias_fixture for fragment in (
         "using TypePathAliasProvider as ActiveAlias",
         "using TypePathAliasProvider as InactiveAlias",
@@ -196,22 +275,77 @@ if not all(fragment in alias_fixture for fragment in (
         "ActiveAlias::Nested.Item",
         "InactiveAlias.Item",
         "PossibleAlias.Item",
-        "module AliasShadowing:",
-        "using OuterProvider as Choice",
-        "using InnerProvider as Choice",
-        "using OtherProvider as Choice",
-        "static if ELISA_TARGET_OS_WASI:",
-        "Choice::Nested.Item")) or not all(fragment in alias_smoke for fragment in (
+        "using PossibleAlias::Nested as ChainedAlias",
+        "ChainedAlias.Item",
+        "module AliasOwner:",
+        "using AliasProvider as NestedGlobalAlias",
+        "module LateAliasContainer:",
+        "using LaterRootAlias::Nested as LateNestedAlias",
+        "using TypePathAliasProvider as LaterRootAlias",
+        "LateNestedAlias.Item",
+        "NestedGlobalAlias.Item",
+        "module EarlierNestedPossibleAlias:",
+        "using TypePathAliasProvider as AncestorWins",
+        "ancestor_alias_precedes_nested_possible",
+        "module OtherTypePathAliasProvider:",
+        "module RawFallbackModule:",
+        "module Inner:",
+        "module Inner:\n    struct RootItem:",
+        "module Outer:",
+        "module Outer:\n    module Inner:\n        module Nested:\n            struct Item:",
+        "using Inner as ScopedAlias",
+        "using Inner as ScopedAlias\n\ndef scoped_raw_module_alias_prefers_nearest_scope(value: ScopedAlias::Nested.Item)",
+        "module RawFallbackAliasContainer:",
+        "using RawFallbackModule::Nested as RawFallbackAlias",
+        "using TypePathAliasProvider as RawFallbackModule",
+        "later_alias_keeps_raw_module_target",
+        "module RawAliasOnlyContainer:",
+        "using RawAliasOnlyName as RawAliasOnlyTarget",
+        "using TypePathAliasProvider as RawAliasOnlyName",
+        "later_alias_does_not_create_raw_module",
+        "using TypePathAliasProvider as DirectWins",
+        "using OtherTypePathAliasProvider as DirectWins",
+        "direct_alias_precedes_same_scope_possible",
+        "module ParentBranchAfterChild:",
+        "using FlatTypePathAliasProvider as BranchAfterChild",
+        "using TypePathAliasProvider as BranchAfterChild",
+        "later_parent_branch_does_not_win",
+        "module ParentBranchBeforeChild:",
+        "using TypePathAliasProvider as BranchBeforeChild",
+        "using FlatTypePathAliasProvider as BranchBeforeChild",
+        "earlier_parent_branch_wins",
+        "module BranchBodyPrepass:",
+        "using FlatTypePathAliasProvider as SharedBranchAlias",
+        "using TypePathAliasProvider as SharedBranchAlias",
+        "branch_body_direct_alias_wins",
+        "using TypePathAliasProvider as BranchHeadBeforeChain",
+        "using BranchHeadBeforeChain::Nested as BranchChainBeforeHead",
+        "using BranchHeadAfterChain::Nested as BranchChainAfterHead",
+        "using TypePathAliasProvider as BranchHeadAfterChain",
+        "branch_alias_target_before_chain",
+        "branch_alias_target_after_chain")) or not all(fragment in alias_smoke for fragment in (
         "type_path_alias_static_branch.elisa",
         "ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown",
         '"ActiveAlias" is a namespace; write ActiveAlias::',
         '"ActiveAlias::Nested" is a namespace; write ActiveAlias::Nested::',
         '"InactiveAlias" is a namespace; write InactiveAlias::',
         '"PossibleAlias" is a namespace; write PossibleAlias::',
-        '"Choice::Nested" is a namespace; write Choice::Nested::',
-        'check_report native "$("$RPT" < "$FIXTURE")" 1',
-        'check_report unknown-target "$(ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT" < "$FIXTURE")" 0')):
-    raise SystemExit("type-path alias regression must retain definite aliases and ignore inactive or unresolved aliases")
+        '"ChainedAlias" is a namespace; write ChainedAlias::',
+        '"NestedGlobalAlias" is a namespace; write NestedGlobalAlias::',
+        '"LateNestedAlias" is a namespace; write LateNestedAlias::',
+        '"AncestorWins::Nested" is a namespace; write AncestorWins::Nested::',
+        '"DirectWins::Nested" is a namespace; write DirectWins::Nested::',
+        '"RawFallbackAlias" is a namespace; write RawFallbackAlias::',
+        '"ScopedAlias::Nested" is a namespace; write ScopedAlias::Nested::',
+        '"RawAliasOnlyTarget" is a namespace; write RawAliasOnlyTarget::',
+        '"BranchBeforeChild::Nested" is a namespace; write BranchBeforeChild::Nested::',
+        '"BranchAfterChild::Nested" is a namespace; write BranchAfterChild::Nested::',
+        '"SharedBranchAlias::Nested" is a namespace; write SharedBranchAlias::Nested::',
+        '"BranchChainBeforeHead" is a namespace; write BranchChainBeforeHead::',
+        '"BranchChainAfterHead" is a namespace; write BranchChainAfterHead::',
+        'check_report native "$("$RPT" < "$FIXTURE")"',
+        'check_report unknown-target "$(ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT" < "$FIXTURE")"')):
+    raise SystemExit("type-path alias regression must retain Stage0-global aliases while ignoring inactive or uncertain alias targets")
 qualified_candidate = compact(function_section(binding_resolver_text, "binding_nominal_qualified_candidate"))
 nominal_lookup = compact(function_section(binding_resolver_text, "binding_nominal_declaration"))
 if "module_symbol_matches(" not in qualified_candidate or "module_symbol_matches_relative(" not in qualified_candidate:

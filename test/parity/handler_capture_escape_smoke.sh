@@ -24,6 +24,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIR="$ROOT/test/repro/handler_capture_escape"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 
+python3 "$ROOT/test/proofs/check_handler_capture_escape_owner_identity.py"
+
 stage0="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
 if [[ -z "${ELISACORE_BIN:-}" ]]; then
     mkdir -p "$(dirname "$stage0")"

@@ -33,12 +33,23 @@ extend Semantic:
                 return false
 
 
-        def transfer_allocation_on_line(allocation_names: darray[sview @source]&, allocation_lines: darray[u32]&, line: u32) -> sview @source:
+        def transfer_allocation_on_line(allocation_names: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, line: u32) -> sview @source:
             can Abort.Panic:
                 while index < allocation_names.count |index: usize = 0|:
-                    return allocation_names[index] if allocation_lines[index] == line
+                    return allocation_names[index] if allocation_lines[index] == line and not allocation_region_is_inline_effect_row(allocation_names, allocation_offsets, index)
                     index <- index + 1
                 return ""
+
+
+        def transfer_allocation_regions(value: Ast::Expr, statement_start: u32, statement_end: u32, allocation_names: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                allocation_regions_in_expression(value, allocation_names, allocation_lines, allocation_offsets, call_spans, out)
+                allocation_regions_in_source_interval(statement_start, statement_end, allocation_names, allocation_offsets, out)
+                position: Ast::Pos = Ast::expr_pos(value)
+                # Old parser snapshots and synthetic expressions can lack byte spans. Keep
+                # their line-indexed allocation provenance as the compatibility fallback.
+                if out.count == 0 and statement_end <= statement_start and position.offset == 0 and position.end_offset == 0:
+                    allocation_region_note(out, transfer_allocation_on_line(allocation_names, allocation_lines, allocation_offsets, position.line))
 
 
         def transfer_note(owner: sview @source, kind: u8, dependency: sview @source, owners: mutable darray[sview @source]&, kinds: mutable darray[u8]&, dependencies: mutable darray[sview @source]&) -> void:
@@ -205,15 +216,19 @@ extend Semantic:
                         pass
 
 
-        def walk_transfer_statements(statements: darray[Ast::Stmt], allocation_names: darray[sview @source]&, allocation_lines: darray[u32]&, store_names: mutable darray[sview @source]&, owners: mutable darray[sview @source]&, kinds: mutable darray[u8]&, dependencies: mutable darray[sview @source]&, open_regions: mutable darray[sview @source]&, in_nursery: bool, nursery_floor: usize, table: lmut SymbolTable) -> void:
+        def walk_transfer_statements(statements: darray[Ast::Stmt], allocation_names: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, store_names: mutable darray[sview @source]&, owners: mutable darray[sview @source]&, kinds: mutable darray[u8]&, dependencies: mutable darray[sview @source]&, open_regions: mutable darray[sview @source]&, in_nursery: bool, nursery_floor: usize, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
                             store_names.push(name) if transfer_type_is_local_store(type_expression)
-                            allocation: sview @source = transfer_allocation_on_line(allocation_names, allocation_lines, line.line)
-                            allocation_kind: u8 = 1 if transfer_name_exists(store_names, allocation) else (2 if allocation != "" else 0)
-                            transfer_note(name, allocation_kind, allocation, owners, kinds, dependencies)
+                            allocations: mutable darray[sview @source] = []
+                            value_end_offset: u32 = allocation_expression_end_offset(value, call_spans)
+                            transfer_allocation_regions(value, line.offset, value_end_offset, allocation_names, allocation_lines, allocation_offsets, call_spans, allocations)
+                            for allocation in allocations |store_names, name, owners, kinds, dependencies|:
+                                allocation_kind: u8 = 1 if transfer_name_exists(store_names, allocation) else 2
+                                transfer_note(name, allocation_kind, allocation, owners, kinds, dependencies)
+                            allocation_kind: u8 = 1 if allocations.count > 0 and transfer_name_exists(store_names, allocations[0]) else (2 if allocations.count > 0 else 0)
                             transfer_note(name, 3, open_regions[open_regions.count - 1] if open_regions.count > 0 else sview("<inferred>", 0, 10), owners, kinds, dependencies) if allocation_kind == 0 and transfer_allocates(value)
                             transfer_propagate_expression(name, value, owners, kinds, dependencies)
                             frozen_store: sview = transfer_freeze_source(value)
@@ -227,22 +242,22 @@ extend Semantic:
                         Stmt.Return(value, line):
                             table <- check_transfer_boundary(returned, owners, kinds, dependencies, table) if value is returned
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_transfer_statements(then_body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, open_regions, in_nursery, nursery_floor, table)
-                            table <- walk_transfer_statements(else_body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, open_regions, in_nursery, nursery_floor, table)
+                            table <- walk_transfer_statements(then_body, allocation_names, allocation_lines, allocation_offsets, call_spans, store_names, owners, kinds, dependencies, open_regions, in_nursery, nursery_floor, table)
+                            table <- walk_transfer_statements(else_body, allocation_names, allocation_lines, allocation_offsets, call_spans, store_names, owners, kinds, dependencies, open_regions, in_nursery, nursery_floor, table)
                         Stmt.Block(kind, clause, binding, body, line):
                             opens_region: bool = kind == "region" and clause.count > 0
                             open_regions.push(clause[0]) if opens_region
                             starts_nursery: bool = kind == "nursery" or kind == "pool"
                             child_floor: usize = open_regions.count if starts_nursery else nursery_floor
-                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, open_regions, in_nursery or starts_nursery, child_floor, table)
+                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, allocation_offsets, call_spans, store_names, owners, kinds, dependencies, open_regions, in_nursery or starts_nursery, child_floor, table)
                             open_regions <- open_regions.truncate(open_regions.count - 1) if opens_region
                         Stmt.While(_, body, line) | Stmt.For(_, _, _, body, line):
-                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, open_regions, in_nursery, nursery_floor, table)
+                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, allocation_offsets, call_spans, store_names, owners, kinds, dependencies, open_regions, in_nursery, nursery_floor, table)
                         _:
                             pass
 
 
-        def check_transfer_declarations(declarations: darray[Ast::Decl], allocation_names: darray[sview @source]&, allocation_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+        def check_transfer_declarations(declarations: darray[Ast::Decl], allocation_names: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
@@ -252,13 +267,13 @@ extend Semantic:
                             kinds: mutable darray[u8] = []
                             dependencies: mutable darray[sview @source] = []
                             open_regions: mutable darray[sview @source] = []
-                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, store_names, owners, kinds, dependencies, open_regions, false, 0, table)
+                            table <- walk_transfer_statements(body, allocation_names, allocation_lines, allocation_offsets, call_spans, store_names, owners, kinds, dependencies, open_regions, false, 0, table)
                         Decl.Module(name, body, line) | Decl.Scoped(body, line):
-                            table <- check_transfer_declarations(body, allocation_names, allocation_lines, table)
+                            table <- check_transfer_declarations(body, allocation_names, allocation_lines, allocation_offsets, call_spans, table)
                         _:
                             pass
 
     public:
         def check_thread_transfer_provenance(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                table <- check_transfer_declarations(file.top_decls, file.allocation_region_names, file.allocation_region_lines, table)
+                table <- check_transfer_declarations(file.top_decls, file.allocation_region_names, file.allocation_region_lines, file.allocation_region_offsets, file.enum_annotations, table)

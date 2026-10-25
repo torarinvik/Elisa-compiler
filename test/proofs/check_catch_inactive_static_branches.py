@@ -16,6 +16,7 @@ PARSER_EXPRESSION = (ROOT / "src/parser/parser_expr.elisa").read_text()
 PARSER_PRIMARY = (ROOT / "src/parser/parser_expr_primary.elisa").read_text()
 PARSER_POSTFIX = (ROOT / "src/parser/parser_expr_postfix.elisa").read_text()
 PARSER_BINARY = (ROOT / "src/parser/parser_expr_binary.elisa").read_text()
+PARSER_LITERALS = (ROOT / "src/parser/parser_expr_literals.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/catch_inactive_static_branches.elisa").read_text()
 UNKNOWN_FIXTURE = (ROOT / "test/repro/catch_unknown_static_branches.elisa").read_text()
 SMOKE = (ROOT / "test/parity/catch_inactive_static_branches_smoke.sh").read_text()
@@ -91,17 +92,43 @@ catch_expression = function_source(PARSER_EXPRESSION, "primary_catch_expression"
 keyword_expression = function_source(PARSER_EXPRESSION, "primary_keyword_expression")
 primary_expression = function_source(PARSER_PRIMARY, "primary_expression")
 postfix_expression = function_source(PARSER_POSTFIX, "postfix_expression")
+unary_expression = function_source(PARSER_BINARY, "unary_expression")
+binary_step = function_source(PARSER_BINARY, "binary_expression_step")
+binary_level = function_source(PARSER_BINARY, "binary_expression_at_level")
+expression_entry = function_source(PARSER_LITERALS, "expression")
+expression_body_if = function_source(PARSER_LITERALS, "expression_body_if")
+expression_body = function_source(PARSER_LITERALS, "expression_body")
 if not all(fragment in catch_expression for fragment in (
     "can Memory.Allocate, Abort.Panic:",
     'record_static_if_branch_rows("__catch_expr_static_branch", callee_name, token)',
 )) or "can Memory.Allocate, Abort.Panic:" not in primary_expression or \
         "can Memory.Allocate, Abort.Panic:" not in postfix_expression or \
+        "can Memory.Allocate, Abort.Panic:" not in unary_expression or \
+        "can Memory.Allocate, Abort.Panic:" not in binary_step or \
+        "can Memory.Allocate, Abort.Panic:" not in binary_level or \
+        "can Memory.Allocate, Abort.Panic:" not in expression_body or \
         'primary_catch_expression(token) can Global{Read,Write}, Memory.Allocate' not in keyword_expression or \
         'primary_keyword_expression(kind, token) can Global{Read,Write}, Memory.Allocate' not in primary_expression or \
         'primary_expression() can Global{Read,Write}, Memory.Allocate' not in postfix_expression or \
+        'postfix_expression() can Global{Read,Write}, Memory.Allocate' not in unary_expression or \
+        'unary_expression() can Global{Read,Write}, Memory.Allocate' not in unary_expression or \
+        'unary_expression() can Global{Read,Write}, Memory.Allocate' not in expression_body or \
+        'unary_expression() can Global{Read,Write}, Memory.Allocate' not in binary_step or \
+        'binary_expression_at_level(membership_right, 4) can Global{Read,Write}, Memory.Allocate' not in binary_step or \
+        'binary_expression_at_level(right, current_precedence + 1) can Global{Read,Write}, Memory.Allocate' not in binary_step or \
+        'binary_expression_step(active, minimum_precedence) can Global{Read,Write}, Memory.Allocate' not in binary_level or \
+        'expression_body() can Global{Read,Write}, Memory.Allocate' not in expression_body_if or \
+        'expression_body_if(not exceeded) can Global{Read,Write}, Memory.Allocate' not in expression_entry or \
         PARSER_EXPRESSION.count('parser.postfix_expression() can Global{Read,Write}, Memory.Allocate') < 2 or \
         'parser.postfix_expression() can Global{Read,Write}, Memory.Allocate' not in PARSER_BINARY:
     raise SystemExit("expression Catch must carry the branch-row recorder's allocation effect through the primary parser path")
+if any('unary_expression() can Global{Read,Write}' in parser_file.read_text()
+       for parser_file in (ROOT / "src/parser").glob("*.elisa")):
+    raise SystemExit("all parser unary-expression entrypoints must grant the Catch branch recorder's allocation effect")
+if any("binary_expression_at_level(" in line and "def binary_expression_at_level(" not in line and
+       "can Global{Read,Write}, Memory.Allocate" not in line
+       for parser_file in (ROOT / "src/parser").glob("*.elisa") for line in parser_file.read_text().splitlines()):
+    raise SystemExit("all parser binary-expression entrypoints must grant the Catch branch recorder's allocation effect")
 catch_tail = function_source(PARSER_STATEMENT, "record_catch_tail")
 if not all(fragment in catch_tail for fragment in (
     'name: "__catch_arm_tail"',

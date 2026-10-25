@@ -15,6 +15,7 @@ EWR = ROOT / "src/semantic/check_errorset_wrapper_return.elisa"
 TRY = ROOT / "src/semantic/check_try_fallible.elisa"
 PARSER = ROOT / "src/parser/parser_decl_module.elisa"
 FORMATTER = ROOT / "src/driver/emit_fmt_decl.elisa"
+VISIBILITY_ATOM = ROOT / "test/atoms/errorset_wrapper_return_visibility.elisa"
 
 
 def function_source(path: Path, name: str) -> str:
@@ -92,19 +93,31 @@ if not all(fragment in callable_visibility for fragment in (
         "try_error_alias_module_visible(annotations, candidate_module, caller_module)",
         'annotation.name != name or annotation.module != candidate_module',
         '(annotation.owner != "__section_private" and annotation.owner != "__section_public")',
-        "annotation.offset == declaration_offset",
-        "annotation.line == declaration_line",
+        "marker_position_known: bool = annotation.pos.end_offset > annotation.pos.offset",
+        "annotation.pos.offset == declaration_offset",
+        "annotation.pos.line == declaration_line",
         'annotation.owner == "__section_private"',
         'annotation.owner == "__section_public"',
         "legacy_private_marker")):
-    raise SystemExit("EWR callable visibility must combine private module paths with declaration-specific section markers")
+    raise SystemExit("EWR callable visibility must use explicit marker positions so byte offset zero is exact")
+visibility_atom = VISIBILITY_ATOM.read_text()
+if not all(fragment in visibility_atom for fragment in (
+        'owner: "__section_private", name: "dispatch", line: 0, module: "Api", pos: zero_private_pos',
+        'Ast::Pos{line: 0, column: 1, offset: 0, end_line: 0, end_column: 2, end_offset: 1}',
+        'owner: "__section_public", name: "dispatch", line: 0, module: "Api", pos: same_line_public_pos',
+        'ewr_callable_name_visible(annotations, "dispatch", "Api", "Client", 0, 0)',
+        'ewr_callable_name_visible(annotations, "dispatch", "Api", "Api", 0, 0)',
+        'ewr_callable_name_visible(annotations, "dispatch", "Api", "Client", 0, 20)',
+        'owner: "__section_private", name: "legacy", line: 0, module: "Api"')):
+    raise SystemExit("EWR visibility atom must cover a valid private marker at byte zero, a same-line public sibling, and legacy marker fail-closed behavior")
 private_position = function_source(PARSER, "private_member_declaration_position")
 section_marker = function_source(PARSER, "record_section_member")
 if "Ast::pos_of_token(token)" not in private_position or not all(fragment in section_marker for fragment in (
         '"__section_private" if visibility_name == "private" else "__section_public"',
         "line: member_position.line",
         "offset: member_position.offset",
-        "module: owning_module")):
+        "module: owning_module",
+        "pos: member_position")):
     raise SystemExit("Parser visibility markers must retain each member declaration's source identity")
 format_visibility = function_source(FORMATTER, "fmt_section_visibility_of")
 if not all(fragment in format_visibility for fragment in (
@@ -382,6 +395,7 @@ if min(infallible_shadow_call, known_arity_check, call_resolution_check) < 0 or 
     raise SystemExit("EWR must check known-arity infallible winners before accepting a fallible family")
 
 for fixture_name, smoke_name in (
+    ("errorset_wrapper_return_public_sibling_same_line.elisa", "errorset_wrapper_return_public_sibling_same_line_smoke.sh"),
     ("errorset_wrapper_return_overloaded_expr.elisa", "errorset_wrapper_return_overloaded_expr_smoke.sh"),
     ("errorset_wrapper_return_defaulted_overflow_rank.elisa", "errorset_wrapper_return_defaulted_overflow_rank_smoke.sh"),
     ("errorset_wrapper_return_defaulted_underflow_rank.elisa", "errorset_wrapper_return_defaulted_underflow_rank_smoke.sh"),
@@ -407,6 +421,10 @@ for fixture_name, smoke_name in (
     smoke = ROOT / "test/parity" / smoke_name
     if not fixture.is_file() or not smoke.is_file() or fixture_name not in smoke.read_text():
         raise SystemExit(f"EWR regression coverage must retain its fixture and parity smoke: {fixture_name}")
+
+same_line_visibility_fixture = (ROOT / "test/repro/errorset_wrapper_return_public_sibling_same_line.elisa").read_text()
+if same_line_visibility_fixture.count("#line 9 ") != 2 or same_line_visibility_fixture.count("def dispatch(") != 2:
+    raise SystemExit("EWR visibility regression must place both private and public overload declarations on one #line")
 
 overloaded_expr_fixture = (ROOT / "test/repro/errorset_wrapper_return_overloaded_expr.elisa").read_text()
 overloaded_expr_smoke = (ROOT / "test/parity/errorset_wrapper_return_overloaded_expr_smoke.sh").read_text()
@@ -636,6 +654,18 @@ static_condition_value = function_source(EWR, "ewr_static_if_condition_value")
 static_row_selection = function_source(EWR, "ewr_static_if_row_selection")
 static_branch_markers = function_source(PARSER, "record_static_if_branch_markers")
 unknown_static_import = function_source(EWR, "ewr_unknown_static_import_affects_call")
+unknown_alias_winner = function_source(EWR, "ewr_unknown_using_alias_is_definitely_shadowed")
+alias_order = function_source(EWR, "ewr_module_alias_order")
+alias_winner = function_source(EWR, "ewr_definite_module_alias_is_global_winner")
+unknown_alias_head = function_source(EWR, "ewr_qualifier_head_matches")
+unknown_alias_target = function_source(EWR, "ewr_raw_callable_matches_alias_path")
+known_alias_path = function_source(EWR, "ewr_known_module_alias_path_matches_candidate")
+qualified_module_match = function_source(EWR, "ewr_qualified_module_matches")
+qualified_module_rank = function_source(EWR, "ewr_qualified_module_rank")
+qualified_module_path_rank = function_source(EWR, "ewr_qualified_module_path_rank")
+unknown_alias_barrier = unknown_static_import[unknown_static_import.find('marker.owner == "__ewr_unknown_using_alias"'):]
+if "table: SymbolTable&" not in known_alias_path.splitlines()[0]:
+    raise SystemExit("EWR global alias ordering requires the symbol table alongside active annotations")
 if not all(fragment in static_alias_fixture for fragment in (
         "const USE_INACTIVE_PROVIDER: bool = false",
         "static if USE_INACTIVE_PROVIDER:",
@@ -646,8 +676,46 @@ if not all(fragment in static_alias_fixture for fragment in (
         "static if UNKNOWN_PROVIDER_CHOICE:",
         "using OtherProvider as Maybe",
         "using CandidateProvider as Maybe",
-        "return Maybe::wrap(Maybe::origin())")):
-    raise SystemExit("EWR static-alias fixture must contrast an inactive same-name alias with the active family-bearing provider")
+        "static if UNKNOWN_PROVIDER_CHOICE:\n    using OtherProvider as Maybe\nstatic else:\n    using CandidateProvider as Maybe",
+        "return Maybe::wrap(Maybe::origin())",
+        "using CandidateProvider as Stable",
+        "using OtherProvider as Stable",
+        "static if true:",
+        "using CandidateProvider as Earlier",
+        "using OtherProvider as Earlier",
+        "static if true:\n    static if true:",
+        "using OtherProvider as NestedBranchWinner",
+        "using CandidateProvider as NestedBranchWinner",
+        "NestedBranchWinner::wrap(NestedBranchWinner::origin())",
+        "module CrossBranchInstaller:",
+        "using OtherProvider as CrossScopeBranchWinner",
+        "using CandidateProvider as CrossScopeBranchWinner",
+        "CrossScopeBranchWinner::wrap(CrossScopeBranchWinner::origin())",
+        "def cross_scope_branch_parent_prepass_wins()",
+        "module Maybe:",
+        "OtherProvider::Maybe::wrap(OtherProvider::Maybe::origin())",
+        "module Pick:",
+        "module LexicalScope:",
+        "LexicalPathFault",
+        "def lexical_path_beats_module_alias()",
+        "module AliasInstaller:",
+        "using LocalProvider as NestedGlobal",
+        "module AliasShadowInstaller:",
+        "using OtherProvider as RegistrationWinner",
+        "using CandidateProvider as RegistrationWinner",
+        "using CandidateProvider as Pick",
+        "RegistrationWinner::wrap(RegistrationWinner::origin())",
+        "Pick::wrap(Pick::origin())",
+        "module Detached:",
+        "module Same:",
+        "return Same::wrap(Same::origin())",
+        "NestedGlobal::wrap(NestedGlobal::origin())",
+        "def unresolved_alias_call()",
+        "def definite_alias_wins()",
+        "def earlier_active_branch_alias_wins()",
+        "def alias_spelling_in_non_head_segment_does_not_poison()",
+        "def nested_global_alias_is_visible()")):
+    raise SystemExit("EWR static-alias fixture must cover branch winners, global registration order, nested aliases, and unrelated leaf names")
 if not all(fragment in static_import_selection for fragment in (
         "__from_member_static_branch",
         "__binding_wildcard_import_static_branch",
@@ -665,8 +733,55 @@ if not all(fragment in static_import_filter for fragment in (
         "__ewr_unknown_using_alias")) or not all(fragment in unknown_static_import for fragment in (
         "__ewr_unknown_selective_import",
         "__ewr_unknown_wildcard_import",
-        "__ewr_unknown_using_alias")):
-    raise SystemExit("EWR must remove proven-inactive imports and retain relevant unresolved imports as conservative lookup barriers")
+        "__ewr_unknown_using_alias",
+        "ewr_qualifier_head_matches",
+        "ewr_raw_callable_matches_alias_path",
+        "ewr_unknown_using_alias_is_definitely_shadowed")) or not all(fragment in unknown_alias_head for fragment in (
+        "qualifier[0:wanted.len] != wanted",
+        "qualifier[wanted.len + 1.usize()] == 58")) or not all(fragment in unknown_alias_target for fragment in (
+        "callable_alias_path_matches_candidate(annotations, alias_module, alias_target, suffix, current_module)",
+        "Decl.Func(function_name",
+        "Decl.Extern(extern_name")) or not all(fragment in known_alias_path for fragment in (
+        'alias.name != "__using_alias"',
+        "alias.owner != alias_name",
+        "ewr_module_alias_order(earlier_alias, alias, table)",
+        "not ordering.known or ordering.left_precedes",
+        "table.possible_import_annotations",
+        "ewr_module_alias_order(possible_alias, alias, table)",
+        "not ordering.known or ordering.left_precedes",
+        'target_row.name == "__using_alias_target"',
+        "target_count <- target_count + 1.usize()",
+        "return false if target_count != 1.usize()",
+        "callable_alias_path_matches_candidate(annotations, alias.module, target, suffix, candidate_module)")) or not all(fragment in qualified_module_match for fragment in (
+        "ewr_qualified_module_rank(candidate_module, qualifier, caller_module, annotations, table) > 0.usize()")) or "module_last_segment(candidate_module)" in qualified_module_match or not all(fragment in qualified_module_rank for fragment in (
+        "ewr_qualified_module_path_rank(candidate_module, qualifier, caller_module)",
+        "return lexical_rank if lexical_rank > 0.usize()",
+        "return 2.usize() if ewr_known_module_alias_path_matches_candidate(candidate_module, qualifier, annotations, table)",
+        "return 1.usize() if candidate_module == qualifier",
+        "return 0.usize()")) or not all(fragment in qualified_module_path_rank for fragment in (
+        "scope_module: mutable sview = caller_module",
+        "return scope_module.len + 3.usize() if callable_module_path_matches_suffix(candidate_module, scope_module, qualifier)",
+        "try_noncall_module_parent(scope_module)")) or not all(fragment in unknown_alias_winner for fragment in (
+        "table.possible_import_annotations",
+        "possible_alias.owner != marker.name",
+        "possible_alias.module != marker.module",
+        "possible_alias.line != marker.line",
+        "possible_alias.offset != marker.offset",
+        "table.definite_import_annotations",
+        "ewr_module_alias_order(definite_alias, possible_alias, table)",
+        "ordering.known and ordering.left_precedes",
+        "ewr_definite_module_alias_is_global_winner(definite_alias, table)")) or not all(fragment in alias_winner for fragment in (
+        "table.definite_import_annotations",
+        "table.possible_import_annotations",
+        "ewr_module_alias_order(candidate, alias, table)",
+        "not ordering.known or ordering.left_precedes",
+        "return true")) or not all(fragment in alias_order for fragment in (
+        "return (known: bool, left_precedes: bool)",
+        "return semantic_possible_import_alias_precedes(left, right, table)")) or "ewr_module_is_lexical_ancestor(marker.module, caller_module)" in unknown_alias_barrier:
+    raise SystemExit("EWR must check only a possible alias head and retain the barrier only when its target may supply the call")
+for alias_rank_source in (binding_scope, inaccessible_binding_scope, function_source(EWR, "ewr_infallible_callable_scope"), ordinary_binding):
+    if "ewr_qualified_module_rank(" not in alias_rank_source:
+        raise SystemExit("EWR callable selection must preserve Core's lexical, alias, and raw qualified-name candidate order")
 if not all(fragment in static_const_value for fragment in (
         "table.immutable_const_names",
         "table.immutable_const_rows",

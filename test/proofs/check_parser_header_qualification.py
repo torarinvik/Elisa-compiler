@@ -85,7 +85,7 @@ expected_peek = compact("""def peek_at(parser: Parser&, offset: usize) -> TokenK
             return parser.tokens[token_index].kind""")
 if compact(function_section(CURSOR.read_text(), "peek_at")) != expected_peek:
     raise SystemExit("parser lookahead no longer checks remaining length before adding and indexing")
-expected_capture = compact("""def capture_extern_header_contracts(parser: lmut Parser, extern_line: u32) -> void:
+expected_capture = compact("""def capture_extern_header_contracts(parser: lmut Parser, extern_line: u32, extern_offset: u32) -> void:
             can Abort.Panic, Memory.Allocate:
                 machine over parser.position while parser.peek() != TokenKind.Eof:
                     state Scan(depth: int)
@@ -104,20 +104,24 @@ expected_capture = compact("""def capture_extern_header_contracts(parser: lmut P
                     Scan(depth), _:
                         parser.position <- parser.position + 1
                         -> Scan(depth)
-                parser <- parser.drain_signature_contracts(extern_line)""")
+                parser <- parser.drain_signature_contracts(extern_line, extern_offset)""")
 if compact(function_section(SIGNATURES.read_text(), "capture_extern_header_contracts")) != expected_capture:
     raise SystemExit("extern header contract parser no longer uses exactly the verified qualifier path")
 expected_probe = compact("""def header_has_signature_contract(parser: Parser&) -> bool:
             can Abort.Panic:
                 machine over parser.position:
-                    state Scan(index: usize)
-                    start Scan(0)
-                    Scan(index), _ if parser.peek_at(index) == TokenKind.Ident and not parser.header_token_is_qualified(index) and (parser.header_token_text(index) == "requires" or parser.header_token_text(index) == "ensure" or parser.header_token_text(index) == "ensures"):
+                    state Scan(index: usize, depth: int)
+                    start Scan(0, 0)
+                    Scan(index, depth), _ if depth == 0 and parser.peek_at(index) == TokenKind.Ident and not parser.header_token_is_qualified(index) and (parser.header_token_text(index) == "requires" or parser.header_token_text(index) == "require" or parser.header_token_text(index) == "ensure" or parser.header_token_text(index) == "ensures") and parser.peek_at(index + 1) != TokenKind.Return:
                         return true
-                    Scan(index), _ if parser.peek_at(index) == TokenKind.Newline or parser.peek_at(index) == TokenKind.Eof:
+                    Scan(index, _), _ if parser.peek_at(index) == TokenKind.Newline or parser.peek_at(index) == TokenKind.Eof:
                         return false
-                    Scan(index), _:
-                        -> Scan(index + 1)
+                    Scan(index, depth), _ if parser.peek_at(index) == TokenKind.LParen or parser.peek_at(index) == TokenKind.LBracket:
+                        -> Scan(index + 1, depth + 1)
+                    Scan(index, depth), _ if parser.peek_at(index) == TokenKind.RParen or parser.peek_at(index) == TokenKind.RBracket:
+                        -> Scan(index + 1, depth - 1)
+                    Scan(index, depth), _:
+                        -> Scan(index + 1, depth)
                 return false""")
 if compact(function_section(PROBES.read_text(), "header_has_signature_contract")) != expected_probe:
     raise SystemExit("extern contract probe no longer uses exactly the verified qualifier path")

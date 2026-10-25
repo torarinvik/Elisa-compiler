@@ -12,6 +12,7 @@ if [[ ! -x "$STAGE1" ]]; then
     echo "effect_handler_stage1_smoke FAIL: no stage1 seed at $STAGE1" >&2
     exit 1
 fi
+python3 "$ROOT/test/proofs/check_effect_generic_owner_line_zero.py"
 
 run_positive() {
     local fixture="$1"
@@ -213,6 +214,7 @@ run_positive "helper_qualified_chain.elisa"
 run_positive "helper_generic_handler_selection.elisa"
 run_positive "helper_generic_phantom_effect.elisa"
 run_positive "helper_generic_effect_inferred.elisa"
+run_positive "helper_generic_effect_line_zero.elisa"
 run_positive "helper_generic_const_enum_selection.elisa"
 run_positive "helper_generic_equivalence.elisa"
 run_positive "helper_generic_equivalence_manual.elisa"
@@ -236,6 +238,7 @@ run_native_result "module_forward_duplicate_handler_names.elisa" 1
 run_native_result "helper_generic_handler_selection.elisa" 17
 run_native_result "helper_generic_phantom_effect.elisa" 34
 run_native_result "helper_generic_effect_inferred.elisa" 42
+run_native_result "helper_generic_effect_line_zero.elisa" 83
 run_native_result "helper_generic_const_enum_selection.elisa" 34
 run_native_result "helper_generic_equivalence.elisa" 17
 run_native_result "helper_generic_equivalence_manual.elisa" 17
@@ -276,6 +279,7 @@ run_zero_overhead_ir "helper_qualified_chain.elisa"
 run_zero_overhead_ir "helper_generic_handler_selection.elisa"
 run_zero_overhead_ir "helper_generic_phantom_effect.elisa"
 run_zero_overhead_ir "helper_generic_effect_inferred.elisa"
+run_zero_overhead_ir "helper_generic_effect_line_zero.elisa"
 run_zero_overhead_ir "helper_generic_const_enum_selection.elisa"
 run_zero_overhead_ir "helper_defaults.elisa"
 run_zero_overhead_ir "helper_sibling_capture.elisa"

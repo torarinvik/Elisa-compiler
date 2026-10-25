@@ -22,6 +22,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+python3 "$REPO_ROOT/test/proofs/check_ambiguous_error_variant_offset_identity.py"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
@@ -113,6 +114,15 @@ duplicate_protocol_report="$("$RPT" < "$WORK/duplicate_protocol_method_error_set
 if ! grep -q 'impl method "push" for interface "FirstProtocol" raises error `SecondError` not declared in the protocol' <<< "$duplicate_protocol_report"; then
     failed=$((failed + 1))
     printf 'qualified-error-set missing expected duplicate-protocol diagnostic\n' >&2
+fi
+
+offset_zero_impl_fixture="$REPO_ROOT/test/repro/impl_error_set_offset_identity.elisa"
+check_case impl_error_set_offset_identity "$(cat "$offset_zero_impl_fixture")"
+offset_zero_impl_report="$("$RPT" < "$offset_zero_impl_fixture")"
+offset_zero_impl_count="$(grep -c 'impl method "push" for interface "Sink" raises error `Extra` not declared in the protocol' <<< "$offset_zero_impl_report" || true)"
+if [[ "$offset_zero_impl_count" != "1" ]]; then
+    failed=$((failed + 1))
+    printf 'qualified-error-set expected one extra-family diagnostic on the same-#line impl method\n' >&2
 fi
 
 check_case protocol_same_leaf_different_modules $'module First:\n    public:\n        error Fault:\n            FirstOnly\n\nmodule Second:\n    public:\n        error Fault:\n            SecondOnly\n\nprotocol FirstSink:\n    def push(callback: fn() -> i64 error[Second::Fault]) -> i64 error[First::Fault]\n\nstruct Log:\n    tag: i64\n\nimpl FirstSink for Log:\n    def push(callback: fn() -> i64 error[Second::Fault]) -> i64 error[Second::Fault]:\n        return 0\n\ndef main() -> i64:\n    return 0\n'

@@ -23,6 +23,8 @@ CONSUMER = ROOT / "src/semantic/check_named_type_mismatch.elisa"
 SEMANTIC = ROOT / "src/semantic/semantic.elisa"
 BINDING_RESOLVER = ROOT / "src/semantic/resolve_binding_capabilities.elisa"
 STATIC_STRING = ROOT / "src/semantic/check_static_string_binding.elisa"
+STATIC_ALIAS_POSITIVE = ROOT / "test/fixtures/diagnostics/static_string_binding_inactive_alias.pos.elisa"
+STATIC_ALIAS_NEGATIVE = ROOT / "test/fixtures/diagnostics/static_string_binding_inactive_alias.neg.elisa"
 POSITIVE = HERE / "lexical_module_owner_policy.elisa"
 NEGATIVE = HERE / "lexical_module_owner_policy_rejected.elisa"
 
@@ -59,6 +61,8 @@ consumer_text = CONSUMER.read_text()
 semantic_text = SEMANTIC.read_text()
 binding_text = BINDING_RESOLVER.read_text()
 static_string_text = STATIC_STRING.read_text()
+static_alias_positive_text = STATIC_ALIAS_POSITIVE.read_text()
+static_alias_negative_text = STATIC_ALIAS_NEGATIVE.read_text()
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 
@@ -111,15 +115,23 @@ for function_name, source in (
 ):
     if "named_type_owner_is_lexical(" not in compact(function_section(source, function_name)):
         raise SystemExit(f"{function_name} must retain the proved lexical visibility predicate")
-if "named_type_owner_is_lexical(" not in static_string_text:
-    raise SystemExit("static string alias resolution must retain the proved lexical visibility predicate")
 static_alias_lookup = compact(function_section(static_string_text, "static_module_name_is_alias"))
 if not all(fragment in static_alias_lookup for fragment in (
         "table.definite_import_annotations",
         "table.possible_import_annotations",
-        "named_type_owner_is_lexical(alias.module,lexical_module)",
+        'alias.owner==module_name',
         "returnfalse")) or "table.using_alias_rows" in static_alias_lookup:
-    raise SystemExit("static string alias lookup must exclude proven-inactive rows and retain unresolved aliases conservatively")
+    raise SystemExit("static string lookup must recognize analyzer-wide aliases while excluding proven-inactive rows")
+if "named_type_owner_is_lexical(" in static_alias_lookup:
+    raise SystemExit("static string alias classification must follow Stage0's analyzer-wide module-alias map")
+if not all(fragment in static_alias_positive_text for fragment in (
+        "static if false:",
+        "using Other as Bytes",
+        "Bytes::inspect(\"zero\")")) or not all(fragment in static_alias_negative_text for fragment in (
+        "static if true:",
+        "using Other as Bytes",
+        "Bytes::inspect(\"zero\")")):
+    raise SystemExit("static string alias fixtures must contrast inactive and active module-alias shadowing")
 
 positive_names = {
     "implementation_matches_the_lexical_prefix_contract",

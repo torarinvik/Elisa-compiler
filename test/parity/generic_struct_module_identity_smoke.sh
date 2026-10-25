@@ -2,6 +2,7 @@
 # Generic layouts and memoization follow template declarations, never basenames.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/test/proofs/check_generic_struct_owner_offset_identity.py"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 CLANG="${ELISA_CLANG:-clang}"
@@ -14,7 +15,9 @@ COMPILERS=("$STAGE1")
 for compiler in "${COMPILERS[@]}"; do
     tag="$(basename -- "$compiler")"
 for level in 0 2; do
-    for repro in generic_struct_module_identity generic_struct_module_identity_reversed generic_struct_argument_owner generic_struct_relative_owner generic_struct_recursive_reference generic_struct_recursive_mutual_reference generic_struct_qualified_inference; do
+    for repro in generic_struct_module_identity generic_struct_module_identity_reversed generic_struct_argument_owner generic_struct_same_line_owner generic_struct_relative_owner generic_struct_recursive_reference generic_struct_recursive_mutual_reference generic_struct_qualified_inference; do
+        # Same-line generic ownership depends on Stage1's owner-offset metadata.
+        [[ "$repro" != generic_struct_same_line_owner || "$compiler" == "$STAGE1" ]] || continue
         source="$ROOT/test/repro/$repro.elisa"
         "$compiler" -emit obj "-O$level" -o "$WORK/$tag-$repro-O$level.o" "$source"
         "$CLANG" -o "$WORK/$tag-$repro-O$level" "$WORK/$tag-$repro-O$level.o"

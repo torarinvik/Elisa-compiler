@@ -29,9 +29,8 @@ for row in "stage0:$S0" "stage1:$S1"; do
     if grep -Fq 'static function "branch_pick" can only be called from a static context' "$WORK/$stage.err"; then
         fail "$stage treated BranchSelection's inactive static overload as the selected runtime branch"
     fi
-    if grep -Fq 'static function "branch_static" can only be called from a static context' "$WORK/$stage.err"; then
-        fail "$stage walked a runtime caller from an inactive declaration branch"
-    fi
+    branch_static_count="$(grep -Fc 'static function "branch_static" can only be called from a static context' "$WORK/$stage.err" || true)"
+    [[ "$branch_static_count" -eq 1 ]] || fail "$stage should diagnose only the selected static-if runtime caller, not the inactive arm or bare static block (got $branch_static_count)"
     if grep -Fq 'static function "shadowed_helper" can only be called from a static context' "$WORK/$stage.err"; then
         fail "$stage let an ancestor static function outrank a nearer runtime declaration"
     fi
@@ -44,6 +43,8 @@ unknown_rc=0
 ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$S1" -emit llvm -o "$WORK/stage1-unknown.ll" "$ROOT/test/repro/static_call_context_module_identity.elisa" >"$WORK/stage1-unknown.out" 2>"$WORK/stage1-unknown.err" || unknown_rc=$?
 [[ "$unknown_rc" -eq 1 ]] || fail "stage1 unknown-target compile should retain the fixture's expected static-call diagnostics, got exit $unknown_rc"
 grep -Fq 'static function "compile_only" can only be called from a static context' "$WORK/stage1-unknown.err" || fail "stage1 skipped the runtime caller inside an unresolved static-if arm"
+unknown_branch_static_count="$(grep -Fc 'static function "branch_static" can only be called from a static context' "$WORK/stage1-unknown.err" || true)"
+[[ "$unknown_branch_static_count" -eq 1 ]] || fail "stage1 unknown-target compile should diagnose the selected static-if runtime call exactly once, got $unknown_branch_static_count"
 if grep -Fq 'static function "late_bound" can only be called from a static context' "$WORK/stage1-unknown.err"; then
     fail "stage1 failed to let an unresolved nearer runtime function shadow its ancestor static function"
 fi

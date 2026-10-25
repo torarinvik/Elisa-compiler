@@ -51,30 +51,41 @@ extend Semantic:
         # from leaking into an earlier function's annotations.
         # `__region_local` is visible only while its block is open. Comparing line order alone
         # lets a closed sibling region satisfy the query; zero end_line is the unbounded form.
-        def local_region_is_in_scope(annotations: darray[Ast::LocalRegionAnnotation]&, region: sview, use_line: u32) -> bool:
+        def local_region_is_in_scope(annotations: darray[Ast::LocalRegionAnnotation]&, region: sview, use_line: u32, use_offset: u32) -> bool:
             can Abort.Panic:
                 for annotation in annotations:
-                    continue if annotation.region != region or annotation.line > use_line
+                    continue if annotation.region != region or annotation.owner_offset > use_offset
+                    scope_active: bool = use_offset < annotation.end_offset if annotation.end_offset != 0 else annotation.end_line == 0 or use_line <= annotation.end_line
                     if annotation.name == "__region_param" or annotation.name == "__region_local":
-                        return true if annotation.end_line == 0 or use_line <= annotation.end_line
+                        return true if scope_active
                     # An `Arena&`-typed LOCAL declared earlier in the same lexical block owns a
                     # region too -- `alloc: mutable Arena& = ...` then
                     # `xs: darray[i64] @alloc = [...]`. Parser block extents prevent this binding
                     # from leaking into sibling blocks or later functions after it is out of scope.
-                    return true if annotation.name == "__region_arena_local" and annotation.end_line > 0 and use_line <= annotation.end_line
+                    return true if annotation.name == "__region_arena_local" and scope_active
                 return false
 
 
-        # The newest `@region` annotation on local NAME written by BEFORE_LINE, or null. An
-        # annotation on a type with no region of its own (`xs: array[i64, 4] @r`, `x: i64 @r`,
+        # The newest `@region` annotation on local NAME active at the use position, or null.
+        # When BEFORE_OFFSET_KNOWN, byte offsets are authoritative even at offset zero;
+        # source-less callers retain the legacy BEFORE_LINE fallback. An annotation on a type
+        # with no region of its own (`xs: array[i64, 4] @r`, `x: i64 @r`,
         # `y: T @r`) is skipped: stage0 drops that region when it resolves the type, so the value
         # has no dependency on it. Counting one turned the single rejected annotation into a
         # cascade -- `cannot return reference` on a returned i64, and a destroy-then-use error.
-        def local_region_annotation_of(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, before_line: u32) -> Ast::LocalRegionAnnotation?:
+        def local_region_annotation_of(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, before_line: u32, before_offset: u32 = 0, before_offset_known: bool = false) -> Ast::LocalRegionAnnotation?:
             can Abort.Panic:
                 found: mutable Ast::LocalRegionAnnotation? = null
-                for annotation in annotations |found|:
-                    found <- annotation if annotation.name == name and annotation.line <= before_line and not local_type_cannot_carry_region(annotation.type_expression)
+                found_offset: mutable u32 = 0
+                for annotation in annotations |found, found_offset, before_offset, before_offset_known|:
+                    source_visible: bool = annotation.owner_offset <= before_offset and (before_offset < annotation.end_offset if annotation.end_offset != 0 else annotation.end_line == 0 or before_line <= annotation.end_line)
+                    line_visible: bool = annotation.line <= before_line and (annotation.end_line == 0 or before_line <= annotation.end_line)
+                    visible: bool = source_visible if before_offset_known else line_visible
+                    if annotation.name == name and visible and not local_type_cannot_carry_region(annotation.type_expression):
+                        candidate_offset: u32 = annotation.owner_offset if before_offset_known else annotation.line
+                        if candidate_offset >= found_offset:
+                            found <- annotation
+                            found_offset <- candidate_offset
                 return found
 
 
@@ -89,29 +100,377 @@ extend Semantic:
                         return "reference"
 
 
-        def region_is_function_local(annotations: darray[Ast::LocalRegionAnnotation]&, region: sview, function_line: u32, use_line: u32) -> bool:
+        def region_is_function_local(annotations: darray[Ast::LocalRegionAnnotation]&, region: sview, function_line: u32, use_line: u32, use_offset: u32 = 0) -> bool:
             can Abort.Panic:
-                return any annotation in annotations where annotation.name == "__region_local" and annotation.region == region and annotation.line >= function_line and annotation.line <= use_line
+                return any annotation in annotations where annotation.name == "__region_local" and annotation.region == region and (annotation.owner_offset <= use_offset and (use_offset < annotation.end_offset if annotation.end_offset != 0 else annotation.end_line == 0 or use_line <= annotation.end_line) if use_offset > 0 else annotation.line >= function_line and annotation.line <= use_line)
 
 
-        def allocation_region_at(regions: darray[sview]&, lines: darray[u32]&, line: u32) -> sview:
+        def allocation_region_is_inline_effect_row(regions: darray[sview]&, offsets: darray[u32]&, row: usize) -> bool:
+            can Abort.Panic:
+                return false if row >= regions.count
+                return true if regions[row] == "__inline_can"
+                return false if offsets.count != regions.count or row >= offsets.count
+                return any marker_index in 0..<regions.count where regions[marker_index] == "__inline_can" and offsets[marker_index] == offsets[row]
+
+
+        def allocation_region_note(out: mutable darray[sview @source]&, region: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if region == "" or region == "__inline_can"
+                out.push(region) if not any existing in out where existing == region
+
+
+        # An initializer's AST may keep only the payload position after parser lowering removes
+        # a prefix `new[region]`. The containing declaration/return interval still spans the
+        # exact allocation token and avoids attributing a different allocation on the same line.
+        def allocation_regions_in_source_interval(start_offset: u32, end_offset: u32, regions: darray[sview]&, offsets: darray[u32]&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if offsets.count != regions.count or end_offset <= start_offset
+                for row_index in 0..<regions.count |out, offsets, start_offset, end_offset|:
+                    allocation_offset: u32 = offsets[row_index]
+                    if allocation_offset >= start_offset and allocation_offset < end_offset and not allocation_region_is_inline_effect_row(regions, offsets, row_index):
+                        allocation_region_note(out, regions[row_index])
+
+
+        def allocation_source_interval_has_region(start_offset: u32, end_offset: u32, region: sview, regions: darray[sview]&, offsets: darray[u32]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if offsets.count != regions.count or end_offset <= start_offset
+                for row_index in 0..<regions.count |offsets, start_offset, end_offset|:
+                    allocation_offset: u32 = offsets[row_index]
+                    return true if allocation_offset >= start_offset and allocation_offset < end_offset and regions[row_index] == region and not allocation_region_is_inline_effect_row(regions, offsets, row_index)
+                return false
+
+
+        # `Ast::Pos` for postfix brace forms may be only the opening brace token. Extend an
+        # initializer's end through its child expressions so a removed prefix `new[r]` stays
+        # inside the bounded statement interval.
+        def allocation_expression_end_offset(expression: Ast::Expr, call_spans: darray[Ast::EnumAnnotation]&) -> u32:
+            can Abort.Panic:
+                end_offset: mutable u32 = Ast::expr_pos(expression).end_offset
+                match expression:
+                    Expr.RegionNew(operand, _, _):
+                        child_end: u32 = allocation_expression_end_offset(operand, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.Call(callee, arguments, _, call_pos):
+                        for annotation in call_spans |end_offset, call_pos|:
+                            end_offset <- annotation.pos.end_offset if annotation.owner == "__call_source_span" and annotation.offset == call_pos.offset and annotation.pos.end_offset > end_offset
+                        child_end: u32 = allocation_expression_end_offset(callee, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        for argument in arguments |end_offset, call_spans|:
+                            child_end <- allocation_expression_end_offset(argument, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _):
+                        child_end: u32 = allocation_expression_end_offset(object, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.Unary(_, operand, _) | Expr.Move(operand, _) | Expr.Paren(operand, _):
+                        child_end: u32 = allocation_expression_end_offset(operand, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.Index(object, index, _):
+                        child_end: u32 = allocation_expression_end_offset(object, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(index, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.Slice(object, low, high, _):
+                        child_end: u32 = allocation_expression_end_offset(object, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(low, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(high, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.IndexN(object, arguments, _):
+                        child_end: u32 = allocation_expression_end_offset(object, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        for argument in arguments |end_offset, call_spans|:
+                            child_end <- allocation_expression_end_offset(argument, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |end_offset, call_spans|:
+                            child_end: u32 = allocation_expression_end_offset(element, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                    Expr.DictLit(entries, _):
+                        for entry in entries |end_offset, call_spans|:
+                            key_end: u32 = allocation_expression_end_offset(entry.key, call_spans)
+                            value_end: u32 = allocation_expression_end_offset(entry.value, call_spans)
+                            end_offset <- key_end if key_end > end_offset
+                            end_offset <- value_end if value_end > end_offset
+                    Expr.Construct(type_expression, fields, _) | Expr.RecordUpdate(type_expression, fields, _):
+                        child_end: u32 = allocation_expression_end_offset(type_expression, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        for field in fields |end_offset, call_spans|:
+                            child_end <- allocation_expression_end_offset(field.value, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                    Expr.Binary(left, _, right, _) | Expr.Refinement(left, right, _):
+                        child_end: u32 = allocation_expression_end_offset(left, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(right, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.If(condition, then_expression, else_expression, _):
+                        child_end: u32 = allocation_expression_end_offset(condition, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(then_expression, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(else_expression, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        child_end: u32 = allocation_expression_end_offset(scrutinee, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        for arm in arms |end_offset, call_spans|:
+                            child_end <- allocation_expression_end_offset(arm.guard, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                            child_end <- allocation_statements_end_offset(arm.body, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                    Expr.Comprehension(_, iterable, condition, body, _, _):
+                        child_end: u32 = allocation_expression_end_offset(iterable, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(condition, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(body, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.GetElse(guarded, recovery, _):
+                        child_end: u32 = allocation_expression_end_offset(guarded, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_statements_end_offset(recovery, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    Expr.Block(statements, value, _, _):
+                        child_end: u32 = allocation_statements_end_offset(statements, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        child_end <- allocation_expression_end_offset(value, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                    # Lambda bodies run later. Their statement walker computes its own
+                    # initializer intervals when the closure is validated.
+                    Expr.Lambda(_, _, _):
+                        pass
+                    Expr.StaticEffectCall(head, _, _, arguments, _, _):
+                        child_end: u32 = allocation_expression_end_offset(head, call_spans)
+                        end_offset <- child_end if child_end > end_offset
+                        for argument in arguments |end_offset, call_spans|:
+                            child_end <- allocation_expression_end_offset(argument, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                    _:
+                        pass
+                return end_offset
+
+
+        def allocation_statements_end_offset(statements: darray[Ast::Stmt], call_spans: darray[Ast::EnumAnnotation]&) -> u32:
+            can Abort.Panic:
+                end_offset: mutable u32 = 0
+                for statement in statements |end_offset, call_spans|:
+                    match statement:
+                        Stmt.VarDecl(_, _, value, line):
+                            child_end: u32 = allocation_expression_end_offset(value, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                        Stmt.Assign(target, _, value, line):
+                            child_end: u32 = allocation_expression_end_offset(target, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                            child_end <- allocation_expression_end_offset(value, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                        Stmt.Return(value, line) | Stmt.Expr(value, line):
+                            child_end: u32 = allocation_expression_end_offset(value, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                        Stmt.If(condition, then_body, else_body, line):
+                            child_end: u32 = allocation_expression_end_offset(condition, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                            child_end <- allocation_statements_end_offset(then_body, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                            child_end <- allocation_statements_end_offset(else_body, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                        Stmt.Block(_, _, _, body, _):
+                            child_end: u32 = allocation_statements_end_offset(body, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                        Stmt.While(condition, body, _) | Stmt.For(_, _, condition, body, _):
+                            child_end: u32 = allocation_expression_end_offset(condition, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                            child_end <- allocation_statements_end_offset(body, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                        Stmt.Match(scrutinee, arms, _):
+                            child_end: u32 = allocation_expression_end_offset(scrutinee, call_spans)
+                            end_offset <- child_end if child_end > end_offset
+                            for arm in arms |end_offset, call_spans|:
+                                child_end <- allocation_expression_end_offset(arm.guard, call_spans)
+                                end_offset <- child_end if child_end > end_offset
+                                child_end <- allocation_statements_end_offset(arm.body, call_spans)
+                                end_offset <- child_end if child_end > end_offset
+                        _:
+                            pass
+                return end_offset
+
+
+        # Exact `new[region]` token rows inside a call's full parser-recorded source span.
+        # A lone Ast::Pos token is sufficient only for an exact-token hit. Logical line
+        # fallback is reserved for synthetic positions or legacy/misaligned metadata.
+        def allocation_regions_in_call_span(call_pos: Ast::Pos, regions: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                span: mutable Ast::Pos = call_pos
+                for annotation in call_spans |span|:
+                    if annotation.owner == "__call_source_span" and annotation.offset == call_pos.offset:
+                        span <- annotation.pos
+                if offsets.count == regions.count and lines.count == regions.count and span.end_offset > span.offset:
+                    for row_index in 0..<regions.count |out, offsets, span|:
+                        allocation_offset: u32 = offsets[row_index]
+                        if allocation_offset >= span.offset and allocation_offset < span.end_offset and not allocation_region_is_inline_effect_row(regions, offsets, row_index):
+                            allocation_region_note(out, regions[row_index])
+                    return
+                if offsets.count == regions.count and lines.count == regions.count and call_pos.end_offset > call_pos.offset:
+                    for row_index in 0..<regions.count |out, offsets, call_pos|:
+                        allocation_offset: u32 = offsets[row_index]
+                        allocation_region_note(out, regions[row_index]) if allocation_offset >= call_pos.offset and allocation_offset < call_pos.end_offset and not allocation_region_is_inline_effect_row(regions, offsets, row_index)
+                    return
+                return if call_pos.offset != 0 or call_pos.end_offset != 0
+                for row_index in 0..<regions.count |out, lines, call_pos|:
+                    allocation_region_note(out, regions[row_index]) if row_index < lines.count and lines[row_index] == call_pos.line and not allocation_region_is_inline_effect_row(regions, offsets, row_index)
+
+
+        def allocation_regions_in_expression(expression: Ast::Expr, regions: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                position: Ast::Pos = Ast::expr_pos(expression)
+                allocation_regions_in_source_interval(position.offset, position.end_offset, regions, offsets, out)
+                match expression:
+                    Expr.RegionNew(operand, region, _):
+                        allocation_region_note(out, region)
+                        allocation_regions_in_expression(operand, regions, lines, offsets, call_spans, out)
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        allocation_regions_in_call_span(call_pos, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(callee, regions, lines, offsets, call_spans, out)
+                        for argument in arguments |regions, lines, offsets, call_spans, out|:
+                            allocation_regions_in_expression(argument, regions, lines, offsets, call_spans, out)
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _):
+                        allocation_regions_in_expression(object, regions, lines, offsets, call_spans, out)
+                    Expr.Index(object, index, _):
+                        allocation_regions_in_expression(object, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(index, regions, lines, offsets, call_spans, out)
+                    Expr.Slice(object, low, high, _):
+                        allocation_regions_in_expression(object, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(low, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(high, regions, lines, offsets, call_spans, out)
+                    Expr.IndexN(object, arguments, _):
+                        allocation_regions_in_expression(object, regions, lines, offsets, call_spans, out)
+                        for argument in arguments |regions, lines, offsets, call_spans, out|:
+                            allocation_regions_in_expression(argument, regions, lines, offsets, call_spans, out)
+                    Expr.Unary(_, operand, _) | Expr.Move(operand, _) | Expr.Paren(operand, _):
+                        allocation_regions_in_expression(operand, regions, lines, offsets, call_spans, out)
+                    Expr.Binary(left, _, right, _) | Expr.Refinement(left, right, _):
+                        allocation_regions_in_expression(left, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(right, regions, lines, offsets, call_spans, out)
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |regions, lines, offsets, call_spans, out|:
+                            allocation_regions_in_expression(element, regions, lines, offsets, call_spans, out)
+                    Expr.DictLit(entries, _):
+                        for entry in entries |regions, lines, offsets, call_spans, out|:
+                            allocation_regions_in_expression(entry.key, regions, lines, offsets, call_spans, out)
+                            allocation_regions_in_expression(entry.value, regions, lines, offsets, call_spans, out)
+                    Expr.Construct(type_expression, fields, _) | Expr.RecordUpdate(type_expression, fields, _):
+                        allocation_regions_in_expression(type_expression, regions, lines, offsets, call_spans, out)
+                        for field in fields |regions, lines, offsets, call_spans, out|:
+                            allocation_regions_in_expression(field.value, regions, lines, offsets, call_spans, out)
+                    Expr.If(condition, then_expression, else_expression, _):
+                        allocation_regions_in_expression(condition, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(then_expression, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(else_expression, regions, lines, offsets, call_spans, out)
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        allocation_regions_in_expression(scrutinee, regions, lines, offsets, call_spans, out)
+                        for arm in arms |regions, lines, offsets, call_spans, out|:
+                            allocation_regions_in_expression(arm.guard, regions, lines, offsets, call_spans, out)
+                            allocation_regions_in_statements(arm.body, regions, lines, offsets, call_spans, out)
+                    Expr.Comprehension(_, iterable, condition, body, _, _):
+                        allocation_regions_in_expression(iterable, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(condition, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(body, regions, lines, offsets, call_spans, out)
+                    Expr.GetElse(guarded, recovery, _):
+                        allocation_regions_in_expression(guarded, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_statements(recovery, regions, lines, offsets, call_spans, out)
+                    Expr.Block(statements, value, _, _):
+                        allocation_regions_in_statements(statements, regions, lines, offsets, call_spans, out)
+                        allocation_regions_in_expression(value, regions, lines, offsets, call_spans, out)
+                    # Deferred allocations belong to lambda execution, not to the
+                    # enclosing closure initializer.
+                    Expr.Lambda(_, _, _):
+                        pass
+                    Expr.StaticEffectCall(head, _, _, arguments, _, _):
+                        allocation_regions_in_expression(head, regions, lines, offsets, call_spans, out)
+                        for argument in arguments |regions, lines, offsets, call_spans, out|:
+                            allocation_regions_in_expression(argument, regions, lines, offsets, call_spans, out)
+                    _:
+                        pass
+
+
+        def allocation_regions_in_statements(statements: darray[Ast::Stmt], regions: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements |regions, lines, offsets, call_spans, out|:
+                    match statement:
+                        Stmt.VarDecl(_, _, value, _):
+                            allocation_regions_in_expression(value, regions, lines, offsets, call_spans, out)
+                        Stmt.Assign(target, _, value, _):
+                            allocation_regions_in_expression(target, regions, lines, offsets, call_spans, out)
+                            allocation_regions_in_expression(value, regions, lines, offsets, call_spans, out)
+                        Stmt.Return(value, _):
+                            allocation_regions_in_expression(value, regions, lines, offsets, call_spans, out)
+                        Stmt.Expr(value, _):
+                            allocation_regions_in_expression(value, regions, lines, offsets, call_spans, out)
+                        Stmt.If(condition, then_body, else_body, _):
+                            allocation_regions_in_expression(condition, regions, lines, offsets, call_spans, out)
+                            allocation_regions_in_statements(then_body, regions, lines, offsets, call_spans, out)
+                            allocation_regions_in_statements(else_body, regions, lines, offsets, call_spans, out)
+                        Stmt.Block(_, _, _, body, _):
+                            allocation_regions_in_statements(body, regions, lines, offsets, call_spans, out)
+                        Stmt.While(condition, body, _) | Stmt.For(_, _, condition, body, _):
+                            allocation_regions_in_expression(condition, regions, lines, offsets, call_spans, out)
+                            allocation_regions_in_statements(body, regions, lines, offsets, call_spans, out)
+                        Stmt.Match(scrutinee, arms, _):
+                            allocation_regions_in_expression(scrutinee, regions, lines, offsets, call_spans, out)
+                            for arm in arms |regions, lines, offsets, call_spans, out|:
+                                allocation_regions_in_expression(arm.guard, regions, lines, offsets, call_spans, out)
+                                allocation_regions_in_statements(arm.body, regions, lines, offsets, call_spans, out)
+                        _:
+                            pass
+
+
+        def region_expression_has_recorded_allocation(expression: Ast::Expr, region: sview, regions: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                found_regions: mutable darray[sview @source] = []
+                allocation_regions_in_expression(expression, regions, lines, offsets, call_spans, found_regions)
+                return any found_region in found_regions where found_region == region
+
+
+        def region_expression_or_statement_has_recorded_allocation(expression: Ast::Expr, region: sview, statement_start: u32, statement_end: u32, regions: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return true if region_expression_has_recorded_allocation(expression, region, regions, lines, offsets, call_spans)
+                return allocation_source_interval_has_region(statement_start, statement_end, region, regions, offsets)
+
+
+        def region_expression_recorded_allocations(expression: Ast::Expr, statement_start: u32, statement_end: u32, regions: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                allocation_regions_in_expression(expression, regions, lines, offsets, call_spans, out)
+                allocation_regions_in_source_interval(statement_start, statement_end, regions, offsets, out)
+
+
+        # Legacy lookup retained for callers that truly have no source position.
+        def allocation_region_at(regions: darray[sview]&, lines: darray[u32]&, offsets: darray[u32]&, line: u32) -> sview:
             can Abort.Panic:
                 found: mutable sview = ""
-                for allocation_line in lines |index: usize = 0, found|:
-                    found <- regions[index] if allocation_line == line
+                for allocation_line in lines |index: usize = 0, found, regions, offsets, line|:
+                    found <- regions[index] if index < regions.count and allocation_line == line and not allocation_region_is_inline_effect_row(regions, offsets, index)
                     index <- index + 1
                 return found
 
 
-        def allocated_local_region(statements: darray[Ast::Stmt]&, regions: darray[sview]&, lines: darray[u32]&, name: sview, before_line: u32) -> sview:
+        def region_expression_direct_allocation_region(expression: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match expression:
+                    Expr.RegionNew(_, region, _): return region
+                    Expr.Paren(inner, _): return region_expression_direct_allocation_region(inner)
+                    _:
+                        return ""
+
+
+        def allocated_local_region(statements: darray[Ast::Stmt]&, name: sview, before_line: u32, before_offset: u32, before_offset_known: bool) -> sview:
             can Abort.Panic:
                 found: mutable sview = ""
-                for statement in statements |found|:
+                for statement in statements |found, before_line, before_offset, before_offset_known|:
                     match statement:
                         Stmt.VarDecl(local_name, type_expression, value, line):
-                            continue if local_name != name or line.line > before_line
-                            allocation_region: sview = allocation_region_at(regions, lines, line.line)
-                            direct_allocation: bool = allocation_region != "" and region_expression_is_direct_allocation(value, allocation_region)
+                            position_visible: bool = line.offset <= before_offset if before_offset_known else line.line <= before_line
+                            continue if local_name != name or not position_visible
+                            allocation_region: sview = region_expression_direct_allocation_region(value)
+                            direct_allocation: bool = allocation_region != ""
                             found <- allocation_region if direct_allocation
                         _:
                             pass
@@ -133,10 +492,10 @@ extend Semantic:
                         return ""
 
 
-        def function_return_region(annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32) -> sview:
+        def function_return_region(annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, function_offset: u32) -> sview:
             can Abort.Panic:
-                for annotation in annotations:
-                    return annotation.region if annotation.name == "__region_return" and annotation.line == function_line
+                for annotation in annotations |function_line, function_offset|:
+                    return annotation.region if annotation.name == "__region_return" and annotation.line == function_line and annotation.owner_offset == function_offset
                 return ""
 
 
@@ -145,7 +504,7 @@ extend Semantic:
                 match function:
                     Decl.Func(name, params, return_type, body, effects, decorators, line):
                         for param in params |index: int = 0|:
-                            matching: bool = any annotation in annotations where annotation.name == param.name and annotation.line == line.line and annotation.region == region
+                            matching: bool = any annotation in annotations where annotation.name == param.name and annotation.line == line.line and annotation.owner_offset == line.offset and annotation.region == region
                             return index if matching
                             index <- index + 1
                     _:
@@ -161,13 +520,13 @@ extend Semantic:
                             match declaration:
                                 Decl.Func(function_name, params, return_type, body, effects, decorators, function_line):
                                     continue if function_name != callee_name
-                                    return_region: sview = function_return_region(annotations, function_line.line)
+                                    return_region: sview = function_return_region(annotations, function_line.line, function_line.offset)
                                     continue if return_region == ""
                                     param_index: int = function_param_region_index(declaration, annotations, return_region)
                                     continue if param_index < 0 or param_index.usize() >= arguments.count
                                     match arguments[param_index.usize()]:
                                         Expr.Ident(argument_name, argument_line):
-                                            argument_has_region: bool = any annotation in annotations where annotation.name == argument_name and annotation.line == caller_line
+                                            argument_has_region: bool = any annotation in annotations where annotation.name == argument_name and annotation.owner_offset <= argument_line.offset and (argument_line.offset < annotation.end_offset if annotation.end_offset != 0 else annotation.end_line == 0 or argument_line.line <= annotation.end_line)
                                             return return_region if not argument_has_region
                                         _:
                                             pass
@@ -299,6 +658,10 @@ extend Semantic:
                         for element in elements:
                             return true if region_expression_contains_allocation(element, region)
                         return false
+                    Expr.DictLit(entries, line):
+                        for entry in entries:
+                            return true if region_expression_contains_allocation(entry.key, region) or region_expression_contains_allocation(entry.value, region)
+                        return false
                     Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
                         return true if region_expression_contains_allocation(type_expression, region)
                         for field in fields:
@@ -306,6 +669,27 @@ extend Semantic:
                         return false
                     Expr.If(condition, then_expression, else_expression, line):
                         return region_expression_contains_allocation(condition, region) or region_expression_contains_allocation(then_expression, region) or region_expression_contains_allocation(else_expression, region)
+                    Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
+                        return true if region_expression_contains_allocation(scrutinee, region)
+                        for arm in arms:
+                            return true if region_expression_contains_allocation(arm.guard, region)
+                            for statement in arm.body:
+                                match statement:
+                                    Stmt.VarDecl(_, _, value, _):
+                                        return true if region_expression_contains_allocation(value, region)
+                                    Stmt.Return(value, _) | Stmt.Expr(value, _):
+                                        return true if region_expression_contains_allocation(value, region)
+                                    _:
+                                        pass
+                        return false
+                    Expr.Comprehension(_, iterable, condition, body, _, _):
+                        return region_expression_contains_allocation(iterable, region) or region_expression_contains_allocation(condition, region) or region_expression_contains_allocation(body, region)
+                    Expr.GetElse(guarded, recovery, line):
+                        return region_expression_contains_allocation(guarded, region)
+                    Expr.Block(statements, value, _, line):
+                        return region_expression_contains_allocation(value, region)
+                    Expr.Lambda(_, body, line):
+                        return false
                     _:
                         return false
 
@@ -334,48 +718,56 @@ extend Semantic:
 
 
         # Whether a value contains a region allocation flowing through a known
-        # reference-returning call. The line-indexed fallback covers the parser's call-argument
-        # lowering, which can erase the `RegionNew` wrapper while retaining the allocation token
-        # provenance on the call's source line.
-        def region_expression_contains_reference_call_allocation(expression: Ast::Expr, region: sview, declarations: darray[Ast::Decl], allocation_regions: darray[sview]&, allocation_lines: darray[u32]&) -> bool:
+        # reference-returning call. The recorded call span still captures the allocation token
+        # when parser call-argument lowering erases the `RegionNew` wrapper.
+        def region_expression_contains_reference_call_allocation(expression: Ast::Expr, region: sview, declarations: darray[Ast::Decl], allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
                         call_returns_reference: bool = region_callee_returns_reference(callee, declarations)
                         if call_returns_reference:
-                            return true if:
-                                any argument in arguments where region_expression_contains_allocation(argument, region)
-                                allocation_region_at(allocation_regions, allocation_lines, call_line.line) == region
-                        return true if region_expression_contains_reference_call_allocation(callee, region, declarations, allocation_regions, allocation_lines)
+                            has_wrapped_allocation: bool = any argument in arguments where region_expression_contains_allocation(argument, region)
+                            has_recorded_allocation: bool = region_expression_has_recorded_allocation(expression, region, allocation_regions, allocation_lines, allocation_offsets, call_spans)
+                            return true if has_wrapped_allocation or has_recorded_allocation
+                        return true if region_expression_contains_reference_call_allocation(callee, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                         for argument in arguments:
-                            return true if region_expression_contains_reference_call_allocation(argument, region, declarations, allocation_regions, allocation_lines)
+                            return true if region_expression_contains_reference_call_allocation(argument, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                         return false
                     Expr.Field(object, field, line) | Expr.Scope(object, field, line):
-                        return region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines)
+                        return region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                     Expr.Index(object, index, line):
-                        return region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines) or region_expression_contains_reference_call_allocation(index, region, declarations, allocation_regions, allocation_lines)
+                        return region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(index, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                     Expr.Slice(object, low, high, line):
-                        return region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines) or region_expression_contains_reference_call_allocation(low, region, declarations, allocation_regions, allocation_lines) or region_expression_contains_reference_call_allocation(high, region, declarations, allocation_regions, allocation_lines)
+                        return region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(low, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(high, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                     Expr.IndexN(object, arguments, line):
-                        return true if region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines)
+                        return true if region_expression_contains_reference_call_allocation(object, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                         for argument in arguments:
-                            return true if region_expression_contains_reference_call_allocation(argument, region, declarations, allocation_regions, allocation_lines)
+                            return true if region_expression_contains_reference_call_allocation(argument, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                         return false
                     Expr.Unary(operator, operand, line) | Expr.Move(operand, line) | Expr.Paren(operand, line):
-                        return region_expression_contains_reference_call_allocation(operand, region, declarations, allocation_regions, allocation_lines)
+                        return region_expression_contains_reference_call_allocation(operand, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                     Expr.Binary(left, operator, right, line) | Expr.Refinement(left, right, line):
-                        return region_expression_contains_reference_call_allocation(left, region, declarations, allocation_regions, allocation_lines) or region_expression_contains_reference_call_allocation(right, region, declarations, allocation_regions, allocation_lines)
+                        return region_expression_contains_reference_call_allocation(left, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(right, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                     Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
                         for element in elements:
-                            return true if region_expression_contains_reference_call_allocation(element, region, declarations, allocation_regions, allocation_lines)
+                            return true if region_expression_contains_reference_call_allocation(element, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
+                        return false
+                    Expr.DictLit(entries, line):
+                        for entry in entries:
+                            return true if region_expression_contains_reference_call_allocation(entry.key, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
+                            return true if region_expression_contains_reference_call_allocation(entry.value, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                         return false
                     Expr.Construct(type_expression, fields, line) | Expr.RecordUpdate(type_expression, fields, line):
-                        return true if region_expression_contains_reference_call_allocation(type_expression, region, declarations, allocation_regions, allocation_lines)
+                        return true if region_expression_contains_reference_call_allocation(type_expression, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                         for field in fields:
-                            return true if region_expression_contains_reference_call_allocation(field.value, region, declarations, allocation_regions, allocation_lines)
+                            return true if region_expression_contains_reference_call_allocation(field.value, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                         return false
                     Expr.If(condition, then_expression, else_expression, line):
-                        return region_expression_contains_reference_call_allocation(condition, region, declarations, allocation_regions, allocation_lines) or region_expression_contains_reference_call_allocation(then_expression, region, declarations, allocation_regions, allocation_lines) or region_expression_contains_reference_call_allocation(else_expression, region, declarations, allocation_regions, allocation_lines)
+                        return region_expression_contains_reference_call_allocation(condition, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(then_expression, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(else_expression, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
+                    Expr.Comprehension(_, iterable, condition, body, _, _):
+                        return region_expression_contains_reference_call_allocation(iterable, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(condition, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans) or region_expression_contains_reference_call_allocation(body, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
+                    Expr.GetElse(guarded, _, _) | Expr.Block(_, guarded, _, _):
+                        return region_expression_contains_reference_call_allocation(guarded, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                     _:
                         return false
 
@@ -396,18 +788,19 @@ extend Semantic:
                         pass
 
 
-        def walk_local_region_dependencies(statements: darray[Ast::Stmt], region: sview @source, return_carries_reference: bool, declarations: darray[Ast::Decl], allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, tainted: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def walk_local_region_dependencies(statements: darray[Ast::Stmt], region: sview @source, return_carries_reference: bool, declarations: darray[Ast::Decl], allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, tainted: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |tainted, table|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, value, line):
-                            allocated_here: bool = allocation_region_at(allocation_regions, allocation_lines, line.line) == region and region_expression_is_direct_allocation(value, region)
+                            allocated_here: bool = region_expression_is_direct_allocation(value, region)
+                            value_end_offset: u32 = allocation_expression_end_offset(value, call_spans)
                             # The parser's call-argument path can lower `new[r]` to the
-                            # operand while retaining its line-indexed allocation record.
+                            # operand while retaining its exact token offset and call span.
                             # In a reference-returning function that record is enough to
                             # conservatively preserve the lifetime dependency; scalar-returning
                             # functions stay exempt, so a consumed temporary remains legal.
-                            call_allocation: bool = return_carries_reference and region_expression_contains_reference_call_allocation(value, region, declarations, allocation_regions, allocation_lines)
+                            call_allocation: bool = return_carries_reference and region_expression_contains_reference_call_allocation(value, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                             # A binding whose initializer CONTAINS a `new[region]` anywhere —
                             # inside an array literal, a struct construction, a tuple — holds a
                             # reference into the region just as a direct `new` does, and every
@@ -424,12 +817,10 @@ extend Semantic:
                             # still requires a reference-returning function, so a scalar result
                             # computed from such a binding stays legal.
                             nested_allocation: bool = region_expression_contains_allocation(value, region)
-                            # The parser records every `new[region]` by LINE whatever it lowers
-                            # the node to; a `new` inside a struct-literal field does not survive
-                            # as Expr.RegionNew (the unparser prints `<expr>` for it), so neither
-                            # test above can see it. In a reference-returning function the record
-                            # alone is enough: the binding on that line holds region memory.
-                            recorded_allocation: bool = return_carries_reference and allocation_region_at(allocation_regions, allocation_lines, line.line) == region
+                            # A `new` inside a struct-literal field can disappear from the child
+                            # AST after lowering. Query the declaration interval as well as
+                            # expression spans so the exact token row still taints this binding.
+                            recorded_allocation: bool = return_carries_reference and region_expression_or_statement_has_recorded_allocation(value, region, line.offset, value_end_offset, allocation_regions, allocation_lines, allocation_offsets, call_spans)
                             tainted.push(name) if (allocated_here or nested_allocation or recorded_allocation or call_allocation or region_expression_depends_on(value, tainted)) and not region_tainted_name(tainted, name)
                         Stmt.Assign(target, operator, value, line):
                             target_name: sview = region_return_source_name(target)
@@ -437,26 +828,28 @@ extend Semantic:
                         Stmt.Return(value, line):
                             if value is returned:
                                 contains_allocation: bool = region_expression_contains_allocation(returned, region)
-                                through_reference_call: bool = region_expression_contains_reference_call_allocation(returned, region, declarations, allocation_regions, allocation_lines)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: region_return_source_name(returned), line: line.line, expected: "", actual: region}) if return_carries_reference and (region_expression_depends_on(returned, tainted) or contains_allocation or through_reference_call)
+                                through_reference_call: bool = region_expression_contains_reference_call_allocation(returned, region, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans)
+                                return_end_offset: u32 = allocation_expression_end_offset(returned, call_spans)
+                                recorded_allocation: bool = region_expression_or_statement_has_recorded_allocation(returned, region, line.offset, return_end_offset, allocation_regions, allocation_lines, allocation_offsets, call_spans)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: region_return_source_name(returned), line: line.line, expected: "", actual: region}) if return_carries_reference and (region_expression_depends_on(returned, tainted) or contains_allocation or through_reference_call or recorded_allocation)
                         Stmt.Block("move", clause, binding, body, line):
                             taint_move_bindings(body, tainted)
-                            table <- walk_local_region_dependencies(body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, tainted, table)
+                            table <- walk_local_region_dependencies(body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, tainted, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- walk_local_region_dependencies(body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, tainted, table)
+                            table <- walk_local_region_dependencies(body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, tainted, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- walk_local_region_dependencies(then_body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, tainted, table)
-                            table <- walk_local_region_dependencies(else_body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, tainted, table)
+                            table <- walk_local_region_dependencies(then_body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, tainted, table)
+                            table <- walk_local_region_dependencies(else_body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, tainted, table)
                         Stmt.While(condition, body, line) | Stmt.For(_, _, condition, body, line):
-                            table <- walk_local_region_dependencies(body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, tainted, table)
+                            table <- walk_local_region_dependencies(body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, tainted, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |tainted, table|:
-                                table <- walk_local_region_dependencies(arm.body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, tainted, table)
+                                table <- walk_local_region_dependencies(arm.body, region, return_carries_reference, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, tainted, table)
                         _:
                             pass
 
 
-        def check_local_region_dependencies(statements: darray[Ast::Stmt], return_type: Ast::Expr, declarations: darray[Ast::Decl], allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+        def check_local_region_dependencies(statements: darray[Ast::Stmt], return_type: Ast::Expr, declarations: darray[Ast::Decl], allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
@@ -471,22 +864,22 @@ extend Semantic:
                             # unreported (17 stage0 acceptance tests).
                             walked_region: mutable sview = binding
                             walked_region <- clause[0] if walked_region == "" and clause.count > 0 and clause[0] != "using"
-                            table <- walk_local_region_dependencies(body, walked_region, region_return_can_carry_reference(return_type), declarations, allocation_regions, allocation_lines, tainted, table)
+                            table <- walk_local_region_dependencies(body, walked_region, region_return_can_carry_reference(return_type), declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, tainted, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_local_region_dependencies(body, return_type, declarations, allocation_regions, allocation_lines, table)
+                            table <- check_local_region_dependencies(body, return_type, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_local_region_dependencies(then_body, return_type, declarations, allocation_regions, allocation_lines, table)
-                            table <- check_local_region_dependencies(else_body, return_type, declarations, allocation_regions, allocation_lines, table)
+                            table <- check_local_region_dependencies(then_body, return_type, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, table)
+                            table <- check_local_region_dependencies(else_body, return_type, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, table)
                         _:
                             pass
 
 
-        def check_region_assignment_statements(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, function_line: u32, return_type: Ast::Expr, table: lmut SymbolTable) -> void:
+        def check_region_assignment_statements(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, function_line: u32, function_offset: u32, return_type: Ast::Expr, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
                         Stmt.VarDecl(name, type_expression, Expr.Ident(source_name, source_line), line):
-                            if local_region_annotation_of(annotations, name, line.line) is target_annotation and local_region_annotation_of(annotations, source_name, line.line) is source_annotation:
+                            if local_region_annotation_of(annotations, name, line.line, line.offset, true) is target_annotation and local_region_annotation_of(annotations, source_name, line.line, line.offset, true) is source_annotation:
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionQualifierMismatch, name: name, line: line.line, expected: target_annotation.region, actual: source_annotation.region, detail: region_reference_base(target_annotation.type_expression)}) if target_annotation.region != source_annotation.region
                         Stmt.VarDecl(name, type_expression, value, line):
                             # A reference-typed local allocated from a function-local region is
@@ -497,10 +890,13 @@ extend Semantic:
                             pass
                         Stmt.Return(value, line):
                             if value is return_value:
-                                temporary_region: sview = allocation_region_at(allocation_regions, allocation_lines, line.line)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: region_return_source_name(return_value), line: line.line, expected: "", actual: temporary_region}) if temporary_region != "" and region_is_function_local(annotations, temporary_region, function_line, line.line) and region_return_can_carry_reference(return_type)
+                                return_end_offset: u32 = allocation_expression_end_offset(return_value, call_spans)
+                                return_allocations: mutable darray[sview @source] = []
+                                region_expression_recorded_allocations(return_value, line.offset, return_end_offset, allocation_regions, allocation_lines, allocation_offsets, call_spans, return_allocations)
+                                for temporary_region in return_allocations |annotations, function_line, line, return_type, return_value, table|:
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: region_return_source_name(return_value), line: line.line, expected: "", actual: temporary_region}) if region_is_function_local(annotations, temporary_region, function_line, line.line, line.offset) and region_return_can_carry_reference(return_type)
                                 uninferred_region: sview = region_call_result_is_uninferable(return_value, declarations, annotations, function_line)
-                                caller_return_region: sview = function_return_region(annotations, function_line)
+                                caller_return_region: sview = function_return_region(annotations, function_line, function_offset)
                                 # stage0 names the region after the CALLER-side binding it
                                 # was inferred from ("__rg_value" for identity(value)); the
                                 # renderer adds the __rg_ prefix around this recorded name.
@@ -513,39 +909,39 @@ extend Semantic:
                                 table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RegionParamInferenceFailure, name: inferred_source_name, pos: Ast::expr_pos(return_value), line: line.line, expected: "", actual: uninferred_region}) if uninferred_region != "" and caller_return_region == ""
                                 return_name: sview = region_return_source_name(return_value)
                                 if return_name != "":
-                                    if local_region_annotation_of(annotations, return_name, line.line) is return_annotation:
-                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: return_name, line: line.line, expected: "", actual: return_annotation.region}) if region_is_function_local(annotations, return_annotation.region, function_line, line.line)
-                                    allocation_region: sview = allocated_local_region(statements, allocation_regions, allocation_lines, return_name, line.line)
-                                    has_explicit_region: bool = any annotation in annotations where annotation.name == return_name and annotation.line <= line.line
-                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: return_name, line: line.line, expected: "", actual: allocation_region}) if not has_explicit_region and allocation_region != "" and region_is_function_local(annotations, allocation_region, function_line, line.line)
+                                    if local_region_annotation_of(annotations, return_name, line.line, line.offset, true) is return_annotation:
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: return_name, line: line.line, expected: "", actual: return_annotation.region}) if region_is_function_local(annotations, return_annotation.region, function_line, line.line, line.offset)
+                                    allocation_region: sview = allocated_local_region(statements, return_name, line.line, line.offset, true)
+                                    has_explicit_region: bool = any annotation in annotations where annotation.name == return_name and annotation.owner_offset <= line.offset and (line.offset < annotation.end_offset if annotation.end_offset != 0 else annotation.end_line == 0 or line.line <= annotation.end_line)
+                                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.LocalRegionReferenceEscape, name: return_name, line: line.line, expected: "", actual: allocation_region}) if not has_explicit_region and allocation_region != "" and region_is_function_local(annotations, allocation_region, function_line, line.line, line.offset)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, function_line, return_type, table)
+                            table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, function_line, function_offset, return_type, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- check_region_assignment_statements(then_body, declarations, annotations, allocation_regions, allocation_lines, function_line, return_type, table)
-                            table <- check_region_assignment_statements(else_body, declarations, annotations, allocation_regions, allocation_lines, function_line, return_type, table)
+                            table <- check_region_assignment_statements(then_body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, function_line, function_offset, return_type, table)
+                            table <- check_region_assignment_statements(else_body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, function_line, function_offset, return_type, table)
                         Stmt.While(condition, body, line):
-                            table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, function_line, return_type, table)
+                            table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, function_line, function_offset, return_type, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, function_line, return_type, table)
+                            table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, function_line, function_offset, return_type, table)
                         Stmt.Match(scrutinee, arms, line):
                             for arm in arms |table|:
-                                table <- check_region_assignment_statements(arm.body, declarations, annotations, allocation_regions, allocation_lines, function_line, return_type, table)
+                                table <- check_region_assignment_statements(arm.body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, function_line, function_offset, return_type, table)
                         _:
                             pass
 
 
-        def check_region_assignment_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, table: lmut SymbolTable) -> void:
+        def check_region_assignment_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
                         Decl.Func(name, params, return_type, body, effects, decorators, line):
                             if return_type is function_return_type:
-                                table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, line.line, function_return_type, table)
-                                table <- check_local_region_dependencies(body, function_return_type, declarations, allocation_regions, allocation_lines, table)
+                                table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, line.line, line.offset, function_return_type, table)
+                                table <- check_local_region_dependencies(body, function_return_type, declarations, allocation_regions, allocation_lines, allocation_offsets, call_spans, table)
                             else:
-                                table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, line.line, (Ast::Expr.Invalid), table)
+                                table <- check_region_assignment_statements(body, declarations, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, line.line, line.offset, (Ast::Expr.Invalid), table)
                         Decl.Module(name, body, line) | Decl.Scoped(body, line):
-                            table <- check_region_assignment_declarations(body, annotations, allocation_regions, allocation_lines, table)
+                            table <- check_region_assignment_declarations(body, annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans, table)
                         _:
                             pass
 

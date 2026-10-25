@@ -42,56 +42,196 @@ extend Semantic:
                 return SemanticModuleSymbolPathMatcher::absolute(candidate, prefix, names, from, count)
 
 
-        # Select the nearest lexical import alias. Equal-rank declarations with different
-        # targets are ambiguous, so namespace validation must not choose one by source order.
-        def type_path_alias_selection(name: sview, current_scope: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, table: SymbolTable&) -> (found: bool, known: bool, row: usize):
+        # Stage0 registers module aliases in one analyzer-wide map keyed by their bare name.
+        # Type-path lookup therefore sees aliases declared in any module. If multiple active
+        # declarations disagree, their separate conflicting-alias diagnostic already owns the
+        # source error; this check stays conservative instead of guessing a target.
+        def type_path_alias_branch_at(name: sview, scope: sview, occurrence: usize, table: SymbolTable&) -> (found: bool, branch: bool, offset: u32, order_index: usize):
+            can Abort.Panic:
+                matched: mutable usize = 0.usize()
+                for alias_index in 0..<table.definite_import_annotations.count |matched, name, scope, occurrence, table|:
+                    alias: Ast::EnumAnnotation = table.definite_import_annotations[alias_index]
+                    continue if alias.name != "__using_alias" or alias.owner != name or alias.module != scope
+                    if matched == occurrence:
+                        return (true, semantic_import_alias_is_static_branch(alias, table), alias.offset, alias_index)
+                    matched <- matched + 1.usize()
+                return (false, false, 0, table.definite_import_annotations.count)
+
+
+        def type_path_possible_alias_precedes_cutoff(name: sview, cutoff_scope: sview, cutoff_offset: u32, cutoff_index: usize, cutoff_branch: bool, enforce_cutoff: bool, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for possible_index in 0..<table.possible_import_annotations.count |name, cutoff_scope, cutoff_offset, cutoff_index, cutoff_branch, enforce_cutoff, table|:
+                    annotation: Ast::EnumAnnotation = table.possible_import_annotations[possible_index]
+                    continue if annotation.name != "__using_alias" or annotation.owner != name
+                    return true if not enforce_cutoff
+                    possible_is_branch: bool = semantic_import_alias_is_static_branch(annotation, table)
+                    same_position: bool = annotation.module == cutoff_scope and annotation.offset == cutoff_offset and possible_is_branch == cutoff_branch
+                    return true if same_position
+                    return true if cutoff_index >= table.definite_import_annotations.count
+                    cutoff: Ast::EnumAnnotation = table.definite_import_annotations[cutoff_index]
+                    cutoff_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(annotation, cutoff, table)
+                    return true if not cutoff_order.known or cutoff_order.precedes
+                return false
+
+
+        def type_path_alias_name_has_unordered_cutoff_row(name: sview, cutoff_index: usize, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if cutoff_index >= table.definite_import_annotations.count
+                cutoff: Ast::EnumAnnotation = table.definite_import_annotations[cutoff_index]
+                for candidate in table.definite_import_annotations |name, cutoff, table|:
+                    continue if candidate.name != "__using_alias" or candidate.owner != name
+                    order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(candidate, cutoff, table)
+                    return true if not order.known
+                return false
+
+
+        # When no alias was registered before this declaration, retain the raw path only
+        # when it resolves to a declared module. Consider exact and lexical matches
+        # together; the longest canonical owner is the closest lexical match.
+        def type_path_module_symbol_is_using_alias(symbol: Symbol, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for annotation in table.definite_import_annotations:
+                    return true if annotation.name == "__using_alias" and annotation.owner == symbol.name and annotation.line == symbol.line and annotation.offset == symbol.offset
+                return false
+
+
+        def type_path_raw_module_target(path: sview @source, declaration_scope: sview, table: SymbolTable&) -> (found: bool, module: sview @source):
+            can Abort.Panic:
+                selected: mutable sview @source = ""
+                for module_row in table.module_symbol_rows |selected, path, table|:
+                    symbol: Symbol = table.symbols[module_row.usize()]
+                    continue if type_path_module_symbol_is_using_alias(symbol, table)
+                    candidate: sview @source = symbol.name
+                    if candidate == path or semantic_import_module_path_matches(candidate, path, declaration_scope):
+                        if candidate.len > selected.len:
+                            selected <- candidate
+                        elif candidate.len == selected.len and candidate != selected:
+                            return (false, "")
+                return (selected != "", selected)
+
+
+        def type_path_alias_selection(name: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, alias_uncertain: darray[bool]&, table: SymbolTable&, cutoff_scope: sview = "", cutoff_offset: u32 = 0, cutoff_index: usize = 0, cutoff_branch: bool = false, enforce_cutoff: bool = false) -> (found: bool, known: bool, row: usize):
             can Abort.Panic:
                 selected_row: mutable usize = alias_names.count
-                selected_scope_length: mutable usize = 0.usize()
                 ambiguous: mutable bool = false
-                for alias_index in 0..<alias_names.count |selected_row, selected_scope_length, ambiguous, name, current_scope, alias_names, alias_targets, alias_scopes|:
+                for alias_index in 0..<alias_names.count |selected_row, ambiguous, name, alias_names, alias_targets, alias_scopes, table|:
                     continue if alias_index >= alias_targets.count or alias_index >= alias_scopes.count
-                    continue if alias_names[alias_index] != name or not semantic_import_scope_visible(alias_scopes[alias_index], current_scope)
-                    if selected_row >= alias_names.count or alias_scopes[alias_index].len > selected_scope_length:
+                    continue if alias_names[alias_index] != name
+                    if enforce_cutoff:
+                        candidate_occurrence: mutable usize = 0.usize()
+                        for prior_index in 0..<alias_index |candidate_occurrence, alias_index, alias_names, alias_scopes, name|:
+                            candidate_occurrence <- candidate_occurrence + 1.usize() if alias_names[prior_index] == name and alias_scopes[prior_index] == alias_scopes[alias_index]
+                        candidate_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(name, alias_scopes[alias_index], candidate_occurrence, table)
+                        continue if not candidate_class.found
+                        cutoff_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(table.definite_import_annotations[candidate_class.order_index], table.definite_import_annotations[cutoff_index], table)
+                        continue if cutoff_order.known and not cutoff_order.precedes
+                    if selected_row >= alias_names.count:
                         selected_row <- alias_index
-                        selected_scope_length <- alias_scopes[alias_index].len
-                        ambiguous <- false
-                    elif alias_scopes[alias_index].len == selected_scope_length and alias_targets[alias_index] != alias_targets[selected_row]:
+                    else:
+                        selected_occurrence: mutable usize = 0.usize()
+                        candidate_occurrence: mutable usize = 0.usize()
+                        for prior_index in 0..<alias_index |selected_occurrence, candidate_occurrence, alias_index, alias_names, alias_scopes, selected_row, name|:
+                            selected_occurrence <- selected_occurrence + 1.usize() if prior_index < selected_row and alias_names[prior_index] == name and alias_scopes[prior_index] == alias_scopes[selected_row]
+                            candidate_occurrence <- candidate_occurrence + 1.usize() if alias_names[prior_index] == name and alias_scopes[prior_index] == alias_scopes[alias_index]
+                        selected_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(name, alias_scopes[selected_row], selected_occurrence, table)
+                        candidate_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(name, alias_scopes[alias_index], candidate_occurrence, table)
+                        if not selected_class.found or not candidate_class.found:
+                            ambiguous <- true
+                        else:
+                            candidate_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(table.definite_import_annotations[candidate_class.order_index], table.definite_import_annotations[selected_class.order_index], table)
+                            selected_row <- alias_index if candidate_order.known and candidate_order.precedes
+                if selected_row >= alias_names.count:
+                    return (true, false, alias_names.count) if enforce_cutoff and type_path_alias_name_has_unordered_cutoff_row(name, cutoff_index, table)
+                    return (true, false, alias_names.count) if type_path_possible_alias_precedes_cutoff(name, cutoff_scope, cutoff_offset, cutoff_index, cutoff_branch, enforce_cutoff, table)
+                    return (false, false, alias_names.count)
+                selected_occurrence: mutable usize = 0.usize()
+                for prior_index in 0..<selected_row |selected_occurrence, alias_names, alias_scopes, selected_row, name|:
+                    selected_occurrence <- selected_occurrence + 1.usize() if alias_names[prior_index] == name and alias_scopes[prior_index] == alias_scopes[selected_row]
+                selected_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(name, alias_scopes[selected_row], selected_occurrence, table)
+                return (true, false, alias_names.count) if not selected_class.found
+                # Recheck every row against the final winner. An earlier pairwise
+                # uncertainty may become irrelevant when a later candidate is proven
+                # before both; only unresolved rows that can still beat the final winner
+                # keep the lookup unknown.
+                ambiguous <- false
+                for alias_index in 0..<alias_names.count |ambiguous, name, alias_names, alias_scopes, selected_row, selected_class, table|:
+                    continue if alias_index >= alias_targets.count or alias_index >= alias_scopes.count or alias_names[alias_index] != name
+                    candidate_occurrence: mutable usize = 0.usize()
+                    for prior_index in 0..<alias_index |candidate_occurrence, alias_index, alias_names, alias_scopes, name|:
+                        candidate_occurrence <- candidate_occurrence + 1.usize() if alias_names[prior_index] == name and alias_scopes[prior_index] == alias_scopes[alias_index]
+                    candidate_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(name, alias_scopes[alias_index], candidate_occurrence, table)
+                    if not candidate_class.found:
                         ambiguous <- true
-                return (false, false, alias_names.count) if selected_row >= alias_names.count
-                return (true, false, alias_names.count) if ambiguous
-                for annotation in table.possible_import_annotations |selected_scope_length, name, current_scope, table|:
-                    continue if annotation.name != "__using_alias" or annotation.owner != name or not semantic_import_scope_visible(annotation.module, current_scope)
-                    return (true, false, alias_names.count) if annotation.module.len >= selected_scope_length
+                    else:
+                        if enforce_cutoff:
+                            cutoff_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(table.definite_import_annotations[candidate_class.order_index], table.definite_import_annotations[cutoff_index], table)
+                            if cutoff_order.known:
+                                continue if not cutoff_order.precedes
+                                winner_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(table.definite_import_annotations[candidate_class.order_index], table.definite_import_annotations[selected_class.order_index], table)
+                                ambiguous <- true if not winner_order.known or winner_order.precedes
+                            else:
+                                winner_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(table.definite_import_annotations[candidate_class.order_index], table.definite_import_annotations[selected_class.order_index], table)
+                                ambiguous <- true if alias_index == selected_row or not winner_order.known or winner_order.precedes
+                        else:
+                            winner_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(table.definite_import_annotations[candidate_class.order_index], table.definite_import_annotations[selected_class.order_index], table)
+                            ambiguous <- true if not winner_order.known or winner_order.precedes
+                for possible_index in 0..<table.possible_import_annotations.count |selected_row, selected_class, alias_names, alias_scopes, name, table|:
+                    annotation: Ast::EnumAnnotation = table.possible_import_annotations[possible_index]
+                    continue if annotation.name != "__using_alias" or annotation.owner != name
+                    possible_is_branch: bool = semantic_import_alias_is_static_branch(annotation, table)
+                    if enforce_cutoff:
+                        same_cutoff_position: bool = annotation.module == cutoff_scope and annotation.offset == cutoff_offset and possible_is_branch == cutoff_branch
+                        continue if same_cutoff_position
+                        cutoff_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(annotation, table.definite_import_annotations[cutoff_index], table)
+                        continue if cutoff_order.known and not cutoff_order.precedes
+                    same_registration_position: bool = annotation.module == alias_scopes[selected_row] and annotation.offset == selected_class.offset and possible_is_branch == selected_class.branch
+                    unrelated_equal_offsets: bool = annotation.offset == selected_class.offset and not semantic_import_scope_visible(annotation.module, alias_scopes[selected_row]) and not semantic_import_scope_visible(alias_scopes[selected_row], annotation.module)
+                    possible_order: (known: bool, precedes: bool) = semantic_possible_import_alias_precedes(annotation, table.definite_import_annotations[selected_class.order_index], table)
+                    if same_registration_position or unrelated_equal_offsets or (possible_order.known and possible_order.precedes):
+                        return (true, false, alias_names.count)
+                    ambiguous <- true if not possible_order.known
+                uncertain: bool = selected_row < alias_uncertain.count and alias_uncertain[selected_row]
+                return (true, false, alias_names.count) if ambiguous or uncertain
                 return (true, true, selected_row)
 
 
-        # Rewrite an alias in the first segment of a module target using aliases already
-        # declared in this file. Parser annotations keep the source spelling, so this also
-        # canonicalizes chains such as `using First::Nested as Second`.
-        def type_path_canonical_alias_target(path: sview @source, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, table: lmut SymbolTable, declaration_scope: sview @source = "", depth: u32 = 0) -> sview @source:
+        # Rewrite an alias in the first segment of a module target using only aliases
+        # registered before that declaration. The full table is collected first so Core's
+        # parent-block prepass is visible even when an enclosing direct alias appears later
+        # in source text; the registration cutoff still excludes later branch/sibling rows.
+        # Parser annotations keep the source spelling, so this canonicalizes chains such as
+        # `using First::Nested as Second` without inventing forward visibility.
+        def type_path_canonical_alias_target(path: sview @source, alias_names: darray[sview]&, alias_raw_targets: darray[sview @source]&, alias_scopes: darray[sview]&, alias_uncertain: darray[bool]&, table: lmut SymbolTable, declaration_scope: sview @source = "", declaration_offset: u32 = 0, declaration_index: usize = 0, declaration_branch: bool = false, has_declaration: bool = false, depth: u32 = 0) -> (path: sview @source, known: bool):
             can Memory.Allocate, Abort.Panic:
-                return path if depth > 64
+                return (path, false) if depth > 64
                 separator: mutable usize = path.len
                 offset: mutable usize = 0
                 while offset + 1.usize() < path.len |separator, offset|:
                     separator <- offset if separator == path.len and path[offset] == 58 and path[offset + 1.usize()] == 58
                     offset <- offset + 1.usize()
                 first: sview = path[0:separator]
-                alias: (found: bool, known: bool, row: usize) = type_path_alias_selection(first, declaration_scope, alias_names, alias_targets, alias_scopes, table)
+                alias: (found: bool, known: bool, row: usize) = type_path_alias_selection(first, alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table, declaration_scope, declaration_offset, declaration_index, declaration_branch, has_declaration)
                 if alias.known:
                     alias_index: usize = alias.row
-                    # Earlier alias targets were already canonicalized in their own
-                    # declaration scopes, so expand them without applying this alias's
-                    # declaration scope a second time.
-                    rebind canonical_prefix: sview @source, table = type_path_canonical_alias_target(alias_targets[alias_index], alias_names, alias_targets, alias_scopes, table, "", depth + 1)
+                    alias_occurrence: mutable usize = 0.usize()
+                    for prior_index in 0..<alias_index |alias_occurrence, alias_names, alias_scopes, alias_index, first|:
+                        alias_occurrence <- alias_occurrence + 1.usize() if alias_names[prior_index] == first and alias_scopes[prior_index] == alias_scopes[alias_index]
+                    alias_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(first, alias_scopes[alias_index], alias_occurrence, table)
+                    return (path, false) if not alias_class.found
+                    # Resolve the selected raw target in its own declaration scope and at
+                    # its registration point. This keeps its own alias chain from seeing
+                    # aliases that were registered only later in traversal.
+                    canonical_prefix: (path: sview @source, known: bool) = type_path_canonical_alias_target(alias_raw_targets[alias_index], alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table, alias_scopes[alias_index], alias_class.offset, alias_class.order_index, alias_class.branch, true, depth + 1)
                     bytes: mutable darray[u8] = []
-                    for byte_index in 0..<canonical_prefix.len |bytes, canonical_prefix|:
-                        bytes.push(canonical_prefix[byte_index])
+                    for byte_index in 0..<canonical_prefix.path.len |bytes, canonical_prefix|:
+                        bytes.push(canonical_prefix.path[byte_index])
                     for byte_index in separator..<path.len |bytes, path, separator|:
                         bytes.push(path[byte_index])
-                    return intern_joined_text(bytes, table)
-                return path if alias.found
+                    return (intern_joined_text(bytes, table), canonical_prefix.known)
+                return (path, false) if alias.found
+                if has_declaration:
+                    raw_module: (found: bool, module: sview @source) = type_path_raw_module_target(path, declaration_scope, table)
+                    return (raw_module.module, true) if raw_module.found
                 if declaration_scope != "":
                     bytes: mutable darray[u8] = []
                     for byte_index in 0..<declaration_scope.len |bytes, declaration_scope|:
@@ -100,8 +240,8 @@ extend Semantic:
                     bytes.push(58)
                     for byte_index in 0..<path.len |bytes, path|:
                         bytes.push(path[byte_index])
-                    return intern_joined_text(bytes, table)
-                return path
+                    return (intern_joined_text(bytes, table), true)
+                return (path, true)
 
 
         # `candidate == ANCESTOR ++ "::" ++ path` where ANCESTOR is `enclosing` or any of
@@ -114,10 +254,10 @@ extend Semantic:
 
         # Does names[0..count) name a declared module -- absolutely, relative to the
         # enclosing module chain, or through a `using M as A` alias at its head?
-        def type_path_prefix_is_module(names: darray[sview]&, count: usize, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, table: SymbolTable&) -> bool:
+        def type_path_prefix_is_module(names: darray[sview]&, count: usize, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, alias_uncertain: darray[bool]&, table: SymbolTable&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return false if count == 0
-                alias: (found: bool, known: bool, row: usize) = type_path_alias_selection(names[0], enclosing, alias_names, alias_targets, alias_scopes, table)
+                alias: (found: bool, known: bool, row: usize) = type_path_alias_selection(names[0], alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                 # Only Module symbols can match; module_symbol_rows lists them in row order.
                 for module_row in table.module_symbol_rows |names, count, enclosing, alias_targets, alias|:
                     symbol_name: sview = table.symbols[module_row.usize()].name
@@ -153,7 +293,7 @@ extend Semantic:
         # `.` inside it is the defect, reported once at the head with stage0's spelling:
         # the FIRST module prefix followed by `.` is the quoted name, the whole corrected
         # path the suggestion.
-        def check_type_path_chain(expression: Ast::Expr, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_type_path_chain(expression: Ast::Expr, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, alias_uncertain: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 names: mutable darray[sview] = []
                 dotted: mutable darray[bool] = []
@@ -161,8 +301,8 @@ extend Semantic:
                     not type_path_collect(expression, names, dotted)
                     names.count < 2
                 module_depth: mutable usize = 0
-                for count in 1..<names.count |module_depth, names, enclosing, alias_names, alias_targets, alias_scopes, table|:
-                    module_depth <- count if type_path_prefix_is_module(names, count, enclosing, alias_names, alias_targets, alias_scopes, table)
+                for count in 1..<names.count |module_depth, names, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table|:
+                    module_depth <- count if type_path_prefix_is_module(names, count, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                 return if module_depth == 0
                 offending: mutable usize = names.count
                 for index in 0..<module_depth |offending, names, dotted|:
@@ -202,6 +342,7 @@ extend Semantic:
                 no_aliases: darray[sview] = []
                 no_alias_targets: darray[sview @source] = []
                 no_alias_scopes: darray[sview] = []
+                no_alias_uncertain: darray[bool] = []
                 # Copied out first: `table` is linear-mutable, and naming a field of it in
                 # the same call that threads it would alias the binding.
                 enclosing: sview = table.current_module
@@ -214,84 +355,84 @@ extend Semantic:
                         if is_as:
                             table <- check_pattern_path_chain(expression, table)
                         else:
-                            table <- check_type_path_chain(expression, enclosing, no_aliases, no_alias_targets, no_alias_scopes, table)
+                            table <- check_type_path_chain(expression, enclosing, no_aliases, no_alias_targets, no_alias_scopes, no_alias_uncertain, table)
 
 
         # Descend a type annotation to every named-type position inside it.
-        def check_type_path_expression(expression: Ast::Expr, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_type_path_expression(expression: Ast::Expr, enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, alias_uncertain: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Field(tp_field_object, tp_field_name, tp_field_pos):
-                        table <- check_type_path_chain(expression, enclosing, alias_names, alias_targets, alias_scopes, table)
+                        table <- check_type_path_chain(expression, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     Expr.Scope(tp_scope_base, tp_scope_name, tp_scope_pos):
-                        table <- check_type_path_chain(expression, enclosing, alias_names, alias_targets, alias_scopes, table)
+                        table <- check_type_path_chain(expression, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     Expr.Index(tp_index_object, tp_index_argument, tp_index_pos):
-                        table <- check_type_path_expression(tp_index_object, enclosing, alias_names, alias_targets, alias_scopes, table)
-                        table <- check_type_path_expression(tp_index_argument, enclosing, alias_names, alias_targets, alias_scopes, table)
+                        table <- check_type_path_expression(tp_index_object, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
+                        table <- check_type_path_expression(tp_index_argument, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     Expr.IndexN(tp_indexn_object, tp_indexn_arguments, tp_indexn_pos):
-                        table <- check_type_path_expression(tp_indexn_object, enclosing, alias_names, alias_targets, alias_scopes, table)
+                        table <- check_type_path_expression(tp_indexn_object, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         for tp_indexn_argument in tp_indexn_arguments |table| -> table:
-                            table <- check_type_path_expression(tp_indexn_argument, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_path_expression(tp_indexn_argument, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     Expr.Unary(tp_unary_operator, tp_unary_operand, tp_unary_pos):
-                        table <- check_type_path_expression(tp_unary_operand, enclosing, alias_names, alias_targets, alias_scopes, table)
+                        table <- check_type_path_expression(tp_unary_operand, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     Expr.Paren(tp_paren_inner, tp_paren_pos):
-                        table <- check_type_path_expression(tp_paren_inner, enclosing, alias_names, alias_targets, alias_scopes, table)
+                        table <- check_type_path_expression(tp_paren_inner, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     Expr.Tuple(tp_tuple_elements, tp_tuple_pos):
                         for tp_tuple_element in tp_tuple_elements |table| -> table:
-                            table <- check_type_path_expression(tp_tuple_element, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_path_expression(tp_tuple_element, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     Expr.Refinement(tp_refinement_base, tp_refinement_predicate, tp_refinement_pos):
-                        table <- check_type_path_expression(tp_refinement_base, enclosing, alias_names, alias_targets, alias_scopes, table)
+                        table <- check_type_path_expression(tp_refinement_base, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                     _:
                         pass
 
 
-        def check_type_paths_in_body(statements: darray[Ast::Stmt], enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_type_paths_in_body(statements: darray[Ast::Stmt], enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, alias_uncertain: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.VarDecl(tp_var_name, tp_var_type, tp_var_value, tp_var_line):
-                            table <- check_type_path_expression(tp_var_type, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_path_expression(tp_var_type, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Stmt.If(tp_if_condition, tp_then_body, tp_else_body, tp_if_line):
-                            table <- check_type_paths_in_body(tp_then_body, enclosing, alias_names, alias_targets, alias_scopes, table)
-                            table <- check_type_paths_in_body(tp_else_body, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_paths_in_body(tp_then_body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
+                            table <- check_type_paths_in_body(tp_else_body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Stmt.While(tp_while_condition, tp_while_body, tp_while_line):
-                            table <- check_type_paths_in_body(tp_while_body, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_paths_in_body(tp_while_body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Stmt.For(tp_for_bind, tp_for_variables, tp_for_iterable, tp_for_body, tp_for_line):
-                            table <- check_type_paths_in_body(tp_for_body, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_paths_in_body(tp_for_body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Stmt.Block(tp_block_kind, tp_block_clause, tp_block_binding, tp_block_body, tp_block_line):
-                            table <- check_type_paths_in_body(tp_block_body, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_paths_in_body(tp_block_body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Stmt.Match(tp_match_scrutinee, tp_match_arms, tp_match_line):
                             for tp_arm in tp_match_arms |table| -> table:
-                                table <- check_type_paths_in_body(tp_arm.body, enclosing, alias_names, alias_targets, alias_scopes, table)
+                                table <- check_type_paths_in_body(tp_arm.body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         _:
                             pass
 
 
-        def check_type_paths_in_declarations(declarations: darray[Ast::Decl], enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_type_paths_in_declarations(declarations: darray[Ast::Decl], enclosing: sview, alias_names: darray[sview]&, alias_targets: darray[sview @source]&, alias_scopes: darray[sview]&, alias_uncertain: darray[bool]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(tp_fn_name, tp_fn_params, tp_fn_return, tp_fn_body, tp_fn_effects, tp_fn_decorators, tp_fn_line):
                             for tp_param in tp_fn_params |table| -> table:
-                                table <- check_type_path_expression(tp_param.type_expression, enclosing, alias_names, alias_targets, alias_scopes, table)
+                                table <- check_type_path_expression(tp_param.type_expression, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                             if tp_fn_return is tp_fn_return_expr:
-                                table <- check_type_path_expression(tp_fn_return_expr, enclosing, alias_names, alias_targets, alias_scopes, table)
-                            table <- check_type_paths_in_body(tp_fn_body, enclosing, alias_names, alias_targets, alias_scopes, table)
+                                table <- check_type_path_expression(tp_fn_return_expr, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
+                            table <- check_type_paths_in_body(tp_fn_body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Decl.Const(tp_const_name, tp_const_type, tp_const_value, tp_const_mutable, tp_const_line):
-                            table <- check_type_path_expression(tp_const_type, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_path_expression(tp_const_type, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Decl.Struct(tp_struct_name, tp_struct_members, tp_struct_affinity, tp_struct_states, tp_struct_derive, tp_struct_invariants, tp_struct_line):
                             for tp_member in tp_struct_members |table| -> table:
-                                table <- check_type_path_expression(tp_member.type_expression, enclosing, alias_names, alias_targets, alias_scopes, table)
+                                table <- check_type_path_expression(tp_member.type_expression, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Decl.Enum(tp_enum_name, tp_enum_variants, tp_enum_const, tp_enum_storage, tp_enum_line):
                             for tp_variant in tp_enum_variants |table| -> table:
                                 for tp_payload in tp_variant.fields |table| -> table:
-                                    table <- check_type_path_expression(tp_payload, enclosing, alias_names, alias_targets, alias_scopes, table)
+                                    table <- check_type_path_expression(tp_payload, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Decl.Alias(tp_alias_name, tp_alias_target, tp_alias_line):
-                            table <- check_type_path_expression(tp_alias_target, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_path_expression(tp_alias_target, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Decl.Module(tp_module_name, tp_module_body, tp_module_line):
-                            table <- check_type_paths_in_declarations(tp_module_body, tp_module_name, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_paths_in_declarations(tp_module_body, tp_module_name, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         Decl.Scoped(tp_scoped_body, tp_scoped_line):
-                            table <- check_type_paths_in_declarations(tp_scoped_body, enclosing, alias_names, alias_targets, alias_scopes, table)
+                            table <- check_type_paths_in_declarations(tp_scoped_body, enclosing, alias_names, alias_targets, alias_scopes, alias_uncertain, table)
                         _:
                             pass
 
@@ -299,20 +440,34 @@ extend Semantic:
         def check_type_path_separator(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 alias_names: mutable darray[sview] = []
+                alias_raw_targets: mutable darray[sview @source] = []
                 alias_targets: mutable darray[sview @source] = []
                 alias_scopes: mutable darray[sview] = []
-                # Only definitely-visible aliases establish a module prefix here. Aliases
-                # in proven-inactive or unresolved branches must not force a namespace
-                # diagnostic; their uncertainty belongs to ordinary name resolution.
-                for target_row in table.definite_import_annotations |alias_names, alias_targets, alias_scopes, table| -> table:
-                    continue if target_row.name != "__using_alias_target"
-                    alias_name: mutable sview @source = ""
-                    for alias_row in table.definite_import_annotations |alias_name, target_row|:
-                        if alias_row.name == "__using_alias" and alias_row.module == target_row.module and alias_row.line == target_row.line and alias_row.offset == target_row.offset:
-                            alias_name <- alias_row.owner
-                    if alias_name != "":
-                        rebind canonical_target: sview @source, table = type_path_canonical_alias_target(target_row.owner, alias_names, alias_targets, alias_scopes, table, target_row.module)
-                        alias_names.push(alias_name)
-                        alias_targets.push(canonical_target)
-                        alias_scopes.push(target_row.module)
-                table <- check_type_paths_in_declarations(file.top_decls, sview("", 0, 0), alias_names, alias_targets, alias_scopes, table)
+                alias_uncertain: mutable darray[bool] = []
+                # Definite aliases use Stage0's global bare-name map; unresolved aliases
+                # are consulted by the selector only as uncertainty and cannot establish a
+                # prefix on their own. Gather every alias row before resolving target
+                # chains. Core's block prepass registers direct aliases in each block
+                # before descending into nested declarations, including aliases inside an
+                # active static branch.
+                for alias_row in table.definite_import_annotations |alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table| -> table:
+                    continue if alias_row.name != "__using_alias"
+                    target_path: mutable sview @source = ""
+                    target_count: mutable usize = 0.usize()
+                    for target_row in table.definite_import_annotations |target_path, target_count, alias_row|:
+                        if target_row.name == "__using_alias_target" and target_row.module == alias_row.module and target_row.line == alias_row.line and target_row.offset == alias_row.offset:
+                            target_path <- target_row.owner
+                            target_count <- target_count + 1.usize()
+                    alias_names.push(alias_row.owner)
+                    alias_raw_targets.push(target_path)
+                    alias_scopes.push(alias_row.module)
+                    alias_uncertain.push(target_count != 1.usize())
+                for alias_index in 0..<alias_names.count |alias_targets, alias_uncertain, alias_names, alias_raw_targets, alias_scopes, table| -> table:
+                    alias_occurrence: mutable usize = 0.usize()
+                    for prior_index in 0..<alias_index |alias_occurrence, alias_names, alias_scopes, alias_index|:
+                        alias_occurrence <- alias_occurrence + 1.usize() if alias_names[prior_index] == alias_names[alias_index] and alias_scopes[prior_index] == alias_scopes[alias_index]
+                    alias_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(alias_names[alias_index], alias_scopes[alias_index], alias_occurrence, table)
+                    canonical_target: (path: sview @source, known: bool) = type_path_canonical_alias_target(alias_raw_targets[alias_index], alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table, alias_scopes[alias_index], alias_class.offset, alias_class.order_index, alias_class.branch, alias_class.found)
+                    alias_targets.push(canonical_target.path)
+                    alias_uncertain[alias_index] <- alias_uncertain[alias_index] or not alias_class.found or not canonical_target.known
+                table <- check_type_paths_in_declarations(file.top_decls, sview("", 0, 0), alias_names, alias_targets, alias_scopes, alias_uncertain, table)

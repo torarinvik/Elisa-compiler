@@ -27,6 +27,8 @@ BAD_ZEROED_CATCH="$ROOT/test/repro/struct_field_refinement_zeroed_catch.elisa"
 BAD_ZEROED_IDENTITY_CALL="$ROOT/test/repro/struct_field_refinement_zeroed_identity_call.elisa"
 BAD_ZEROED_NAMED_CALL="$ROOT/test/repro/struct_field_refinement_zeroed_named_call.elisa"
 BAD_ZEROED_GENERIC_CALL="$ROOT/test/repro/struct_field_refinement_zeroed_generic_call.elisa"
+BAD_ZEROED_GENERIC_CALL_LINE_ZERO="$ROOT/test/repro/struct_field_refinement_zeroed_generic_call_line_zero.elisa"
+GOOD_ZEROED_SHADOWED_FUNCTION_VALUE="$ROOT/test/repro/struct_field_refinement_zeroed_shadowed_function_value.elisa"
 BAD_ZEROED_RETURN="$ROOT/test/repro/struct_field_refinement_zeroed_return.elisa"
 GOOD="$ROOT/test/repro/struct_field_refinement_refined_param.elisa"
 GOOD_RETURN="$ROOT/test/repro/struct_field_refinement_valid_return.elisa"
@@ -125,6 +127,14 @@ reject_stage1 "$BAD_ZEROED_CATCH" "bad-zeroed-catch"
 reject_stage1 "$BAD_ZEROED_IDENTITY_CALL" "bad-zeroed-identity-call"
 reject_stage1 "$BAD_ZEROED_NAMED_CALL" "bad-zeroed-named-call"
 reject_stage1 "$BAD_ZEROED_GENERIC_CALL" "bad-zeroed-generic-call"
+reject_stage1 "$BAD_ZEROED_GENERIC_CALL_LINE_ZERO" "bad-zeroed-generic-call-line-zero"
 reject_stage1 "$BAD_ZEROED_RETURN" "bad-zeroed-return"
+
+ELISACORE_BIN="$STAGE0" ELISA_STAGE1_BIN="$STAGE1" \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -O0 -o "$WORK/good-zeroed-shadowed-function-value.o" "$GOOD_ZEROED_SHADOWED_FUNCTION_VALUE" >"$WORK/good-zeroed-shadowed-function-value.log" 2>&1 || {
+        printf 'Stage1 incorrectly used a same-named global function signature for a shadowing function value\n' >&2
+        cat "$WORK/good-zeroed-shadowed-function-value.log" >&2
+        exit 1
+    }
 
 echo "struct-field refinement shadow smoke OK: unproven constructions and stale facts are rejected; refined returns from block, assignment, loop, and match shadows remain accepted"

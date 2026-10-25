@@ -133,6 +133,7 @@ compare "skipped"             "$WORK/skip.elisa"
 compare "skipped, filtered"   "$WORK/skip.elisa" -filter skipped
 # This regression parses compiler ASTs and then traverses them through Semantic. An @test
 # must be a plain C-callable entry point while creating its AST store in its own frame.
+python3 "$REPO_ROOT/test/proofs/check_readonly_ref_generic_owner_identity.py"
 compare "compiler AST store and readonly lookup" "$REPO_ROOT/test/parity/readonly_lookup_smoke.elisa" --require-pass
 
 # The failure path: status lines only (see the header).

@@ -25,25 +25,30 @@ extend Semantic:
                 return true if region == candidate
             return false
 
-        def region_binding_id_at(annotations: darray[Ast::LocalRegionAnnotation]&, region: sview, function_line: u32, use_line: u32) -> u32:
+        def region_binding_id_at(annotations: darray[Ast::LocalRegionAnnotation]&, region: sview, function_line: u32, use_line: u32, use_offset: u32 = 0, use_offset_known: bool = false) -> u32:
             can Abort.Panic:
                 found: mutable u32 = NO_REGION_BINDING
-                found_line: mutable u32 = 0
-                # Only rows on lines function_line..max(function_line, use_line) can match.
+                found_offset: mutable u32 = 0
+                # Exact source intervals are authoritative across #line resets. The
+                # explicit presence bit keeps a valid byte-zero owner distinct from a
+                # legacy query that has no source position.
                 window_high: u32 = use_line if use_line > function_line else function_line
-                window_end: usize = region_annotation_window_end(annotations, window_high) can Global{Read,Write}
-                for annotation_index in (region_annotation_window_start(annotations, function_line) can Global{Read,Write})..<window_end |found, found_line, annotations, region, function_line, use_line|:
+                window_start: usize = 0 if use_offset_known else (region_annotation_window_start(annotations, function_line) can Global{Read,Write})
+                window_end: usize = annotations.count if use_offset_known else (region_annotation_window_end(annotations, window_high) can Global{Read,Write})
+                for annotation_index in window_start..<window_end |found, found_offset, annotations, region, function_line, use_line, use_offset, use_offset_known|:
                     annotation: Ast::LocalRegionAnnotation = annotations[annotation_index]
-                    is_function_param: bool = annotation.name == "__region_param" and annotation.line == function_line
-                    is_open_region: bool = annotation.name == "__region_local" and annotation.line >= function_line and annotation.line <= use_line and (annotation.end_line == 0 or use_line <= annotation.end_line)
+                    has_source_interval: bool = use_offset_known and annotation.owner_offset <= use_offset and (annotation.end_offset == 0 or use_offset < annotation.end_offset)
+                    is_function_param: bool = annotation.name == "__region_param" and (has_source_interval or (not use_offset_known and annotation.line == function_line))
+                    is_open_region: bool = annotation.name == "__region_local" and (has_source_interval or (not use_offset_known and annotation.line >= function_line and annotation.line <= use_line and (annotation.end_line == 0 or use_line <= annotation.end_line)))
                     # Arena-local aliases are bounded to their containing parser block,
                     # just like region-block binders are bounded to the block they own.
-                    # Ignoring end_line lets a closed same-name inner owner mask the still
-                    # live outer owner at a later reset, so invalidation is attached to the
-                    # wrong RegionBindingId and a stale outer view can escape this check.
-                    is_arena_owner: bool = annotation.name == "__region_arena_local" and annotation.line >= function_line and annotation.line <= use_line and annotation.end_line > 0 and use_line <= annotation.end_line
-                    if annotation.region == region and (is_function_param or is_open_region or is_arena_owner) and annotation.line >= found_line:
-                        found_line <- annotation.line
+                    # Source intervals remain ordered across #line resets, and choosing
+                    # the latest active binder keeps a closed inner owner from masking a
+                    # still-live outer owner with the same spelling.
+                    is_arena_owner: bool = annotation.name == "__region_arena_local" and (has_source_interval or (not use_offset_known and annotation.line >= function_line and annotation.line <= use_line and annotation.end_line > 0 and use_line <= annotation.end_line))
+                    candidate_offset: u32 = annotation.owner_offset if use_offset_known else annotation.line
+                    if annotation.region == region and (is_function_param or is_open_region or is_arena_owner) and candidate_offset >= found_offset:
+                        found_offset <- candidate_offset
                         found <- (annotation_index + 1).u32()
                 return found
 
@@ -268,17 +273,15 @@ extend Semantic:
                 destroyed.push(region_id) if not any existing in destroyed where existing == region_id
 
 
-        def destroyed_region_binding_is_generic(binding_id: u32, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32) -> bool can[Abort.Panic]:
-            return binding_id > 0 and binding_id.usize() <= annotations.count and annotations[(binding_id - 1).usize()].name == "__region_param" and annotations[(binding_id - 1).usize()].line == function_line
+        def destroyed_region_binding_is_generic(binding_id: u32, annotations: darray[Ast::LocalRegionAnnotation]&) -> bool can[Abort.Panic]:
+            return binding_id > 0 and binding_id.usize() <= annotations.count and annotations[(binding_id - 1).usize()].name == "__region_param"
 
 
-        def destroyed_mark_function_generic_regions(destroyed: mutable darray[u32]&, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32) -> void:
+        def destroyed_mark_function_generic_regions(destroyed: mutable darray[u32]&, annotations: darray[Ast::LocalRegionAnnotation]&, function_offset: u32) -> void:
             can Memory.Allocate, Abort.Panic:
-                window_start: usize = region_annotation_window_start(annotations, function_line) can Global{Read,Write}
-                window_end: usize = region_annotation_window_end(annotations, function_line) can Global{Read,Write}
-                for annotation_index in window_start..<window_end |destroyed, annotations, function_line|:
+                for annotation_index in 0..<annotations.count |destroyed, annotations, function_offset|:
                     annotation: Ast::LocalRegionAnnotation = annotations[annotation_index]
-                    if annotation.name == "__region_param" and annotation.line == function_line:
+                    if annotation.name == "__region_param" and annotation.owner_offset == function_offset:
                         destroyed_push_region_id(destroyed, (annotation_index + 1).u32())
 
 
@@ -291,7 +294,8 @@ extend Semantic:
                     destroyed_push_all(destroyed)
                     return
                 found_alias: mutable bool = false
-                aliases_generic_region: mutable bool = destroyed_region_binding_is_generic(binding_id, annotations, function_line)
+                aliases_generic_region: mutable bool = destroyed_region_binding_is_generic(binding_id, annotations)
+                generic_owner_offset: mutable u32 = annotations[(binding_id - 1).usize()].owner_offset if aliases_generic_region else 0
                 for alias_index in 0..<alias_ids.count |destroyed, alias_ids, alias_roots, binding_id, found_alias|:
                     if alias_ids[alias_index] == binding_id:
                         found_alias <- true
@@ -302,8 +306,9 @@ extend Semantic:
                         if root_id == DESTROYED_REGION_ALL:
                             destroyed_push_all(destroyed)
                             return
-                        if destroyed_region_binding_is_generic(root_id, annotations, function_line):
+                        if destroyed_region_binding_is_generic(root_id, annotations):
                             aliases_generic_region <- true
+                            generic_owner_offset <- annotations[(root_id - 1).usize()].owner_offset
                         else:
                             destroyed_push_region_id(destroyed, root_id)
                         for related_alias_index in 0..<alias_ids.count |destroyed, alias_ids, alias_roots, root_id|:
@@ -311,7 +316,7 @@ extend Semantic:
                                 destroyed_push_region_id(destroyed, alias_ids[related_alias_index])
                 if aliases_generic_region:
                     can Global{Read,Write}:
-                        destroyed_mark_function_generic_regions(destroyed, annotations, function_line)
+                    destroyed_mark_function_generic_regions(destroyed, annotations, generic_owner_offset)
                 destroyed_push_region_id(destroyed, binding_id) if not found_alias
 
 
@@ -359,20 +364,20 @@ extend Semantic:
                 alias_roots.push(root_id)
 
 
-        def destroyed_rebind_arena_owner_alias(name: sview, value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, line: u32, branch_sensitive: bool, destroyed: mutable darray[u32]&, alias_ids: mutable darray[u32]&, alias_roots: mutable darray[u32]&) -> void:
+        def destroyed_rebind_arena_owner_alias(name: sview, value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, function_line: u32, position: Ast::Pos, branch_sensitive: bool, destroyed: mutable darray[u32]&, alias_ids: mutable darray[u32]&, alias_roots: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                binding_id: u32 = region_binding_id_at(annotations, name, function_line, line) can Global{Read,Write}
+                binding_id: u32 = region_binding_id_at(annotations, name, function_line, position.line, position.offset, true) can Global{Read,Write}
                 return if binding_id == NO_REGION_BINDING or binding_id.usize() > annotations.count
                 owner_annotation: Ast::LocalRegionAnnotation = annotations[(binding_id - 1).usize()]
-                return if owner_annotation.name != "__region_arena_local" or owner_annotation.line >= line
+                return if owner_annotation.name != "__region_arena_local" or owner_annotation.owner_offset >= position.offset
                 source_name: sview = destroyed_arena_owner_source_name(value)
                 roots: mutable darray[u32] = []
                 if source_name != "":
-                    target_id: mutable u32 = region_binding_id_at(annotations, source_name, function_line, line) can Global{Read,Write}
+                    target_id: mutable u32 = region_binding_id_at(annotations, source_name, function_line, position.line, position.offset, true) can Global{Read,Write}
                     if target_id == NO_REGION_BINDING:
-                        target_annotation: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, source_name, line)
+                        target_annotation: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, source_name, position.line, position.offset, true)
                         if target_annotation is target_region and target_region.region != "":
-                            target_id <- region_binding_id_at(annotations, target_region.region, function_line, line) can Global{Read,Write}
+                            target_id <- region_binding_id_at(annotations, target_region.region, function_line, position.line, position.offset, true) can Global{Read,Write}
                     if target_id != NO_REGION_BINDING:
                         destroyed_collect_owner_alias_roots(target_id, alias_ids, alias_roots, roots)
                 if roots.count == 0:
@@ -391,20 +396,20 @@ extend Semantic:
                         destroyed_push_region_id(destroyed, binding_id)
 
 
-        def destroyed_register_arena_owner_alias(name: sview, value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, params: darray[Ast::ParamDecl]&, function_line: u32, line: u32, destroyed: mutable darray[u32]&, alias_ids: mutable darray[u32]&, alias_roots: mutable darray[u32]&) -> void:
+        def destroyed_register_arena_owner_alias(name: sview, value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, params: darray[Ast::ParamDecl]&, function_line: u32, position: Ast::Pos, destroyed: mutable darray[u32]&, alias_ids: mutable darray[u32]&, alias_roots: mutable darray[u32]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                binding_id: u32 = region_binding_id_at(annotations, name, function_line, line) can Global{Read,Write}
+                binding_id: u32 = region_binding_id_at(annotations, name, function_line, position.line, position.offset, true) can Global{Read,Write}
                 return if binding_id == NO_REGION_BINDING or binding_id.usize() > annotations.count
                 owner_annotation: Ast::LocalRegionAnnotation = annotations[(binding_id - 1).usize()]
-                return if owner_annotation.name != "__region_arena_local" or owner_annotation.line != line
+                return if owner_annotation.name != "__region_arena_local" or owner_annotation.owner_offset > position.offset
                 source_name: sview = destroyed_arena_owner_source_name(value)
                 roots: mutable darray[u32] = []
                 if source_name != "":
-                    target_id: mutable u32 = region_binding_id_at(annotations, source_name, function_line, line) can Global{Read,Write}
+                    target_id: mutable u32 = region_binding_id_at(annotations, source_name, function_line, position.line, position.offset, true) can Global{Read,Write}
                     if target_id == NO_REGION_BINDING:
-                        target_annotation: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, source_name, line)
+                        target_annotation: Ast::LocalRegionAnnotation? = local_region_annotation_of(annotations, source_name, position.line, position.offset, true)
                         if target_annotation is target_region and target_region.region != "":
-                            target_id <- region_binding_id_at(annotations, target_region.region, function_line, line) can Global{Read,Write}
+                            target_id <- region_binding_id_at(annotations, target_region.region, function_line, position.line, position.offset, true) can Global{Read,Write}
                     if target_id != NO_REGION_BINDING:
                         destroyed_collect_owner_alias_roots(target_id, alias_ids, alias_roots, roots)
                     elif any parameter in params where parameter.name == source_name and destroyed_type_is_arena_reference(parameter.type_expression):
@@ -430,16 +435,17 @@ extend Semantic:
                 return annotations[(binding_id - 1).usize()].region if binding_id > 0 and binding_id.usize() <= annotations.count
                 return ""
 
-        def function_regions_of_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, function_line: u32, use_line: u32, out: mutable darray[u32]&) -> void:
+        def function_regions_of_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, function_line: u32, use_line: u32, out: mutable darray[u32]&, use_offset: u32 = 0, use_offset_known: bool = false) -> void:
             can Memory.Allocate, Abort.Panic:
                 # Only rows on lines function_line..use_line can match.
-                window_start: usize = region_annotation_window_start(annotations, function_line) can Global{Read,Write}
-                window_end: usize = region_annotation_window_end(annotations, use_line) can Global{Read,Write}
-                for annotation_index in window_start..<(window_end if window_end > window_start else window_start) |out, annotations, name, function_line, use_line|:
+                window_start: usize = 0 if use_offset_known else (region_annotation_window_start(annotations, function_line) can Global{Read,Write})
+                window_end: usize = annotations.count if use_offset_known else (region_annotation_window_end(annotations, use_line) can Global{Read,Write})
+                for annotation_index in window_start..<(window_end if window_end > window_start else window_start) |out, annotations, name, function_line, use_line, use_offset, use_offset_known|:
                     annotation: Ast::LocalRegionAnnotation = annotations[annotation_index]
                     # A type with no region of its own depends on none (see local_region_annotation_of).
-                    is_local_value: bool = annotation.name == name and annotation.line >= function_line and annotation.line <= use_line and not local_type_cannot_carry_region(annotation.type_expression)
-                    binding_id: u32 = region_binding_id_at(annotations, annotation.region, function_line, annotation.line) can Global{Read,Write} if is_local_value and annotation.region != "" else NO_REGION_BINDING
+                    is_visible_local: bool = annotation.owner_offset <= use_offset and (annotation.end_offset == 0 or use_offset < annotation.end_offset) if use_offset_known else annotation.line >= function_line and annotation.line <= use_line
+                    is_local_value: bool = annotation.name == name and is_visible_local and not local_type_cannot_carry_region(annotation.type_expression)
+                    binding_id: u32 = region_binding_id_at(annotations, annotation.region, function_line, annotation.line, annotation.owner_offset, true) can Global{Read,Write} if is_local_value and annotation.region != "" else NO_REGION_BINDING
                     if binding_id != NO_REGION_BINDING and not any existing in out where existing == binding_id:
                         out.push(binding_id)
 
@@ -456,10 +462,10 @@ extend Semantic:
                     found <- annotation.region if is_local_value
                 return found
 
-        def destroyed_annotation_region_id_of_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, destroyed: darray[u32]&, function_line: u32, use_line: u32) -> u32:
+        def destroyed_annotation_region_id_of_name(annotations: darray[Ast::LocalRegionAnnotation]&, name: sview, destroyed: darray[u32]&, function_line: u32, use_line: u32, use_offset: u32 = 0, use_offset_known: bool = false) -> u32:
             can Memory.Allocate, Abort.Panic:
                 regions: mutable darray[u32] = []
-                function_regions_of_name(annotations, name, function_line, use_line, regions) can Global{Read,Write}
+                function_regions_of_name(annotations, name, function_line, use_line, regions, use_offset, use_offset_known) can Global{Read,Write}
                 for region in regions:
                     return region if destroyed_region_id_contains(destroyed, region)
                 return NO_REGION_BINDING

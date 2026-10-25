@@ -219,23 +219,25 @@ if 'alias.name!="__using_alias"' not in alias_registration_index or \
         "alias.offset!=offset" not in alias_registration_index or \
         "ga_module_text(alias.module,state)!=scope" not in alias_registration_index:
     raise SystemExit("GlobalAuthority alias-target cutoffs are not bound to the declaration's registration position")
-if "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,selected_scope,selected_alias.offset,selected_index,state)" not in alias_choice or \
+if "source_positioned:bool=before_offset!=GLOBAL_AUTHORITY_OFFSET_NONE" not in alias_choice or \
+        "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,selected_scope,selected_alias.offset,selected_index,state)" not in alias_choice or \
+        "ga_module_alias_registration_precedes(selected_scope,selected_alias.offset,selected_index,alias_scope,alias.offset,alias_index,state)" not in alias_choice or \
         "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,lexical_scope,before_alias.offset,before_index,state)" not in alias_choice or \
         "before_index:usize=ga_module_alias_registration_index(lexical_scope,before_offset,state)" not in alias_choice:
-    raise SystemExit("GlobalAuthority aliases do not select Core's first registered program-wide target")
+    raise SystemExit("GlobalAuthority alias lookup must keep first registration without a cutoff and the latest eligible registration with one")
 parts_resolve = compact(function_section(authority_text, "ga_module_parts_resolve"))
 parts_lexical = parts_resolve.find("ga_module_lexical_parts_path(parts,lexical_scope,state)")
-parts_alias = parts_resolve.find("ga_module_alias_choice(parts[0],lexical_scope,state,depth)")
+parts_alias = parts_resolve.find("ga_module_alias_choice(parts[0],lexical_scope,state,depth,before_offset)")
 parts_root = parts_resolve.find("raw_root:usize=ga_child(state,0,parts[0])")
 if min(parts_lexical, parts_alias, parts_root) < 0 or not parts_lexical < parts_alias < parts_root:
     raise SystemExit("GlobalAuthority expression/store paths must try complete lexical candidates, aliases, then root spelling")
 alias_resolve = compact(function_section(authority_text, "ga_module_alias_resolve"))
 if "before_offset:u32=GLOBAL_AUTHORITY_OFFSET_NONE" not in alias_resolve or \
-        "ga_module_alias_choice(first,lexical_scope,state,depth)" not in alias_resolve or \
+        "ga_module_alias_choice(first,lexical_scope,state,depth,before_offset)" not in alias_resolve or \
         "ga_module_alias_target_resolve(target.path,alias.scope,state,depth+1,alias_row.offset)" not in alias_resolve:
     raise SystemExit("qualified GlobalAuthority module resolution does not use registered aliases and declaration offsets for target recursion")
 alias_lexical = alias_resolve.find("ga_module_lexical_path(path,first,start,lexical_scope,state)")
-alias_choice_position = alias_resolve.find("ga_module_alias_choice(first,lexical_scope,state,depth)")
+alias_choice_position = alias_resolve.find("ga_module_alias_choice(first,lexical_scope,state,depth,before_offset)")
 alias_suffix = alias_resolve.find("alias_path:usize=ga_module_path_suffix(path,start,resolved,state)")
 alias_root = alias_resolve.find("raw_root:usize=ga_child(state,0,first)")
 if min(alias_lexical, alias_choice_position, alias_suffix, alias_root) < 0 or not alias_lexical < alias_choice_position < alias_suffix < alias_root:
@@ -319,6 +321,9 @@ for probe in (
     'ga_ref_covers("P::Cap.Read", "Old::Cap.Read", 0, 0, &permission_aliases, 0, 125, 125)',
     'ga_ref_covers("P::Cap.Read", "Old::Cap.Read", 0, 0, &permission_aliases, 0, 150, 150)',
     'ga_ref_covers("P::Cap.Read", "New::Cap.Read", 0, 0, &permission_aliases, 0, 150, 150)',
+    'return 39 if ga_ref_covers("P::Cap.Read", "Old::Cap.Read", 0, 0, &permission_aliases, 0, 150, 150)',
+    'return 40 if not ga_ref_covers("P::Cap.Read", "New::Cap.Read", 0, 0, &permission_aliases, 0, 150, 150)',
+    'return 45 if ga_text_module("P", 0, permission_aliases, 150) != new_permission_scope',
     'return 59 if ga_text_module("P::Leaf", 0, permission_aliases, 125) != old_permission_leaf',
     'return 60 if ga_text_module("P::Leaf", 0, permission_aliases, 150) != new_permission_leaf',
     'return 61 if ga_module_alias_resolve("P::Leaf", 0, permission_aliases, 0, true, 125) != old_permission_leaf',

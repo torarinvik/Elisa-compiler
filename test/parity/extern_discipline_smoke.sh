@@ -19,11 +19,13 @@ main = 'def main() -> i64:\n    return 0\n'
 rejected = {
     'untyped_param': 'extern adsr_process(envelope: mutable void&?, level: f64) -> f64 requires level >= 0.0\n',
     'untyped_const_param': 'extern adsr_busy(envelope: void&) -> bool ensure true\n',
+    'singular_require_uncovered': 'extern adsr_busy(envelope: void&) -> bool require true\n',
     'untyped_return': 'extern adsr_create(sustain: bool) -> mutable void&? ensure true\n',
     'covers_none': 'extern memcpy(dest: mutable u8&, src: u8&, n: usize) -> void requires n > 0\n',
     'covers_none_cstr': 'extern puts(text: cstr) -> i32 ensure result >= 0\n',
     'unbounded_pair': 'extern read(fd: i32, buf: mutable u8&, count: usize) -> isize requires buf != null\n',
     'unbounded_const_pair': 'extern sum(values: f32&, count: usize) -> f32 requires values != null\n',
+    'same_line_contract_owner': '#line 37 first.elisa\nextern missing(ptr: cstr) -> usize requires true\n#line 37 second.elisa\nextern covered(ptr: cstr) -> usize requires ptr != null\n',
 }
 accepted = {
     'opaque_handle': 'extern Adsr\nextern adsr_process(envelope: mutable Adsr&, level: f64) -> f64 requires level >= 0.0\n',

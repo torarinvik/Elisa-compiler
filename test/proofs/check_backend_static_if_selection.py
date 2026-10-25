@@ -459,7 +459,7 @@ def require_static_call_context_identity() -> None:
             "Stmt.Contract(kind,expression,line)",
             'kind=="requires"orkind=="require"orkind=="assert"orkind=="ensure"orkind=="ensures"',
             "Stmt.Block(kind,clause,binding,body,line)",
-            'kind!="static"',
+            'kind=="static"',
             "static_call_check_statements(file,then_body",
             "static_call_check_statements(file,else_body")):
         raise SystemExit("static-call checking must recurse through runtime expression and statement children")
@@ -534,6 +534,11 @@ def require_static_call_context_identity() -> None:
             "static def branch_pick()",
             "static else:",
             "def branch_pick()",
+            "static if true:",
+            "def selected_runtime_caller()",
+            "branch_static()",
+            "def bare_static_compile_time_caller()",
+            "static:",
             "return branch_pick()",
             "module UnknownRuntimeShadow:",
             "static def compile_only()",
@@ -552,13 +557,28 @@ def require_static_call_context_identity() -> None:
             'static function "parse" can only be called from a static context',
             'static function "ancestor_helper" can only be called from a static context',
             'static function "branch_pick" can only be called from a static context',
-            'static function "branch_static" can only be called from a static context',
+            'branch_static_count="$(grep-Fc',
+            '[["$branch_static_count"-eq1]]',
+            'unknown_branch_static_count="$(grep-Fc',
+            '[["$unknown_branch_static_count"-eq1]]',
             'static function "shadowed_helper" can only be called from a static context',
             'ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown',
             'static function "compile_only" can only be called from a static context',
             'static function "late_bound" can only be called from a static context',
             'static function "choose" can only be called from a static context')):
         raise SystemExit("static-call regression must cover exact declaration, module, and active branch identity")
+    static_block = compact(function_section(source, "static_call_check_statements"))
+    if not all(fragment in static_block for fragment in (
+            "branch_row:usize=pma_static_if_row_for_position(file,line)",
+            "ifbranch_row<file.static_if_lines.count:",
+            "table<-static_call_check_statements(file,body,static_fns,current_module,table)ifnotstatic_call_scope_is_inactive(file,line,current_module,table)")):
+        raise SystemExit("static-call statement walk must inspect mapped static-if arms unless proven inactive, while leaving bare static blocks compile-time-only")
+    selected_runtime = compact(function_section(fixture, "selected_runtime_caller"))
+    bare_static = compact(function_section(fixture, "bare_static_compile_time_caller"))
+    if not all(fragment in selected_runtime for fragment in (
+            "static if true:", "static else:", "branch_static()")) or selected_runtime.count("branch_static()") != 2 or not all(fragment in bare_static for fragment in (
+            "static:", "branch_static()")):
+        raise SystemExit("static-call regression must pair a selected and inactive static-if statement call with a bare-static compile-time control")
     lexical_fixture = LEXICAL_MODULE_FIXTURE.read_text()
     lexical_smoke = LEXICAL_MODULE_SMOKE.read_text()
     if not all(fragment in lexical_fixture for fragment in (

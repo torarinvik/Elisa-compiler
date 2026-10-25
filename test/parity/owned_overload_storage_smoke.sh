@@ -2,6 +2,8 @@
 # Fresh array overloads may discard argument provenance; borrow-carrying results may not.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/test/proofs/check_region_storage_generic_owner_identity.py"
+python3 "$ROOT/test/proofs/check_view_return_generic_owner_identity.py"
 STAGE0="${ELISACORE_BIN:?Set ELISACORE_BIN to the fresh Stage0 compiler}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/owned-overload-storage.XXXXXX")"
@@ -10,7 +12,7 @@ bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 for opt in -O0 -O2; do
     for mode in bare runtime; do
-        for fixture in storage_dependency_owned_return_global.neg storage_dependency_owned_return.neg storage_dependency_owned_return_global.pos storage_dependency_owned_return.pos; do
+        for fixture in storage_dependency_owned_return_global.neg storage_dependency_owned_return.neg storage_dependency_generic_owner_line_zero.neg storage_dependency_owned_return_global.pos storage_dependency_owned_return.pos; do
             source="$ROOT/test/fixtures/diagnostics/$fixture.elisa"
             probe="$WORK/probe.elisa"
             if [[ "$mode" == runtime ]]; then

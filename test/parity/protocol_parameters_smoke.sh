@@ -3,6 +3,7 @@
 # Protocol value parameters specialize by receiver; execute both compiler outputs.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/test/proofs/check_protocol_parameter_generic_owner_identity.py"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

@@ -8,7 +8,7 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 report="$("$RPT" < "$REPO_ROOT/test/repro/error_union_static_import_branches.elisa")"
 unhandled_count="$(grep -c 'error union result must be handled' <<< "$report" || true)"
 if [[ "$unhandled_count" != 1 ]]; then
-  printf 'error-union static-branch smoke failed; expected only the active fallible overload to require handling:\n%s\n' "$report" >&2
+  printf 'error-union static-branch smoke failed; expected only the active fallible overload to require handling, with unresolved module aliases blocking same-name raw-module fallback:\n%s\n' "$report" >&2
   exit 1
 fi
 

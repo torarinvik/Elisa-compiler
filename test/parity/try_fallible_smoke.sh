@@ -85,6 +85,24 @@ grep -q 'try requires a fallible expression' <<< "$unary_numeric_alias"
 first_class=$(printf 'error E:\n    Bad\n\ndef forward(value: i64 error[E]) -> i64 error[E]:\n    return try value\n' | "$RPT")
 grep -q '^D 0$' <<< "$first_class"
 
+first_class_ambiguous_family=$(cat "$REPO_ROOT/test/repro/try_first_class_ambiguous_error_family.elisa" | "$RPT")
+grep -q '^D 1$' <<< "$first_class_ambiguous_family" && grep -q 'cannot propagate Fault from a function returning Fault' <<< "$first_class_ambiguous_family" || {
+    echo "try_fallible FAILED: a first-class Fault from duplicate modules was accepted by a line-zero caller returning Provider::Fault: $first_class_ambiguous_family"
+    exit 1
+}
+
+first_class_inactive_duplicate_family=$(cat "$REPO_ROOT/test/repro/try_first_class_inactive_duplicate_error_family.elisa" | "$RPT")
+grep -q '^D 0$' <<< "$first_class_inactive_duplicate_family" || {
+    echo "try_fallible FAILED: an inactive duplicate ErrorSet made a unique active Provider::Fault ambiguous: $first_class_inactive_duplicate_family"
+    exit 1
+}
+
+line_zero_nonerror=$(cat "$REPO_ROOT/test/repro/try_nonerror_enclosing_line_zero.elisa" | "$RPT")
+grep -q 'try without else requires the current function to return an error union' <<< "$line_zero_nonerror" || {
+    echo "try_fallible FAILED: a #line 0 non-error caller did not receive the required error-union diagnostic: $line_zero_nonerror"
+    exit 1
+}
+
 callback_return_occurrence='error CallbackFault:
     Bad
 error ReturnFault:
@@ -276,6 +294,24 @@ if grep -q 'try requires a fallible expression' <<< "$nested_qualified_pure_call
     echo "try_fallible FAILED: fallible OuterB::Common::pure was classified as nonfallible"
     exit 1
 fi
+qualified_leaf_collision_report=$(cat "$REPO_ROOT/test/repro/try_qualified_module_leaf_collision.elisa" | "$RPT")
+grep -q '^D 1$' <<< "$qualified_leaf_collision_report" && grep -q 'cannot propagate E from a function returning F' <<< "$qualified_leaf_collision_report" || {
+    echo "try_fallible FAILED: Common::fail matched the duplicate-leaf OuterB module instead of lexical OuterA::Common: $qualified_leaf_collision_report"
+    exit 1
+}
+
+zero_offset_enclosing_identity_report=$(cat "$REPO_ROOT/test/repro/try_zero_offset_enclosing_function_identity.elisa" | "$RPT")
+grep -q '^D 0$' <<< "$zero_offset_enclosing_identity_report" || {
+    echo "try_fallible FAILED: a same-#line sibling displaced the byte-zero caller of try load(): $zero_offset_enclosing_identity_report"
+    exit 1
+}
+
+nested_global_alias_report=$(cat "$REPO_ROOT/test/repro/try_nested_global_using_alias.elisa" | "$RPT")
+grep -q '^D 0$' <<< "$nested_global_alias_report" || {
+    echo "try_fallible FAILED: root call could not resolve a module alias declared in a nested module: $nested_global_alias_report"
+    exit 1
+}
+
 using_alias_declarations='error E:
     Bad
 module Backend:

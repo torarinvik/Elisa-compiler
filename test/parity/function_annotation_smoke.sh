@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
+python3 "$REPO_ROOT/test/proofs/check_function_annotation_generic_owner_identity.py"
 
 check_diagnostic() {
   local source="$1"
@@ -27,6 +28,18 @@ check_clean() {
   }
 }
 
+check_absent() {
+  local source="$1"
+  local unexpected="$2"
+  local output
+  output="$(printf '%s' "$source" | "$REPO_ROOT/build/parse_report")"
+  [[ "$output" != *"$unexpected"* ]] || {
+    echo "unexpected annotation diagnostic: $unexpected" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  }
+}
+
 check_diagnostic $'@smoke\ndef sample_case() -> void:\n    pass\n' 'unknown function annotation @smoke'
 check_diagnostic $'@smoke\nextern borrow_value(holder: i32&) -> i32&\n' 'unknown extern function annotation @smoke on "borrow_value"'
 check_diagnostic $'@borrows_return(missing)\nextern borrow_value(holder: i32&) -> i32&\n' '@borrows_return on extern function "borrow_value" references unknown parameter "missing"'
@@ -38,5 +51,6 @@ check_clean $'@test\ndef sample_case() -> void:\n    pass\n'
 check_clean $'@bench\ndef hot_loop() -> void:\n    pass\n'
 check_clean $'@fixture\ndef shared_seed() -> int:\n    return 7\n'
 check_clean $'@link_name("borrow_value")\nextern borrow_value(holder: i32&) -> i32&\n'
+check_absent $'#line 0 generic_owner.elisa\ndef generic_seed[T]() -> void:\n    pass\n#line 0 ordinary_owner.elisa\n@fixture\ndef ordinary_seed() -> void:\n    pass\n' '@fixture function "ordinary_seed" must not have type or shape parameters'
 
 echo "function annotation smoke OK"

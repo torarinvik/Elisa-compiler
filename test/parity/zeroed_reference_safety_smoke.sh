@@ -4,6 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/test/proofs/check_zeroed_generic_owner_identity.py"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 CLANG="${ELISA_CLANG:-clang}"
@@ -37,13 +38,15 @@ for repro in \
     zeroed_sview_return.elisa \
     zeroed_sview_field.elisa \
     zeroed_sview_trusted_field.elisa \
+    zeroed_nested_global_module_alias.elisa \
     uninitialized_nonnull_reference.elisa \
     zeroed_nonnull_reference_field.elisa \
     zeroed_nonnull_reference_array_field.elisa \
     zeroed_nonnull_reference_tuple.elisa \
     zeroed_nonnull_reference_nested_field.elisa \
     zeroed_nonnull_reference_generic_field.elisa \
-    zeroed_nonnull_reference_generic_field_line0.elisa; do
+    zeroed_nonnull_reference_generic_field_line0.elisa \
+    zeroed_generic_owner_collision_line_zero.elisa; do
     for compiler in "${COMPILERS[@]}"; do
         for level in 0 2; do
             output="$WORK/$(basename -- "$compiler")-${repro%.elisa}-O$level.ll"
@@ -63,6 +66,90 @@ for repro in \
             }
         done
     done
+done
+
+# A generic function whose declaration is mapped to logical line zero must still
+# be recognized by its source offset when checking an unresolved `T = zeroed` value.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-generic-function-line-zero-O$level.ll"
+    log="$output.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_generic_function_line_zero.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted a zeroed generic value at logical line 0 at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed line-zero generic compilation left an LLVM artifact" >&2
+        exit 1
+    }
+    rg -q 'cannot initialize aggregate .* from zeroed: field .* requires a valid non-null value' "$log" || {
+        echo "zeroed reference smoke: Stage1 rejected the line-zero generic value without its aggregate diagnostic" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
+# Proven-inactive rows and losing nested aliases must not displace the selected scalar
+# target during qualified type resolution.
+for repro in zeroed_inactive_module_alias.elisa zeroed_nested_alias_precedence.elisa; do
+    for compiler in "${COMPILERS[@]}"; do
+        for level in 0 2; do
+            output="$WORK/$(basename -- "$compiler")-${repro%.elisa}-O$level.ll"
+            log="$output.log"
+            if ! "$compiler" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/$repro" >"$log" 2>&1; then
+                echo "zeroed reference smoke: $compiler rejected the selected module alias in $repro at -O$level" >&2
+                cat "$log" >&2
+                exit 1
+            fi
+            [[ -s "$output" ]] || {
+                echo "zeroed reference smoke: $compiler did not emit LLVM for $repro" >&2
+                cat "$log" >&2
+                exit 1
+            }
+        done
+    done
+done
+
+# An earlier unresolved branch alias can change the selected `sview` target; a later
+# unresolved same-scope alias and a nested possible alias behind a root direct alias cannot.
+# The cross-scope branch/direct collision remains unknown, so Stage1 reports two invalid values.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-possible-module-alias-order-O$level.ll"
+    log="$output.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_possible_module_alias_order.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted an earlier possible alias that may select sview at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed possible-alias compilation left an LLVM artifact" >&2
+        exit 1
+    }
+    invalid_zeroed_count="$(grep -Eci '(sview.*zeroed|zeroed.*sview)' "$log" || true)"
+    [[ "$invalid_zeroed_count" == "2" ]] || {
+        echo "zeroed reference smoke: expected two invalid possible-alias sview diagnostics, got $invalid_zeroed_count" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
+
+# A possible alias can target a nested module through an earlier alias head. Its
+# nested sview type must remain visible to the zeroed safety check.
+for level in 0 2; do
+    output="$WORK/stage1-zeroed-possible-alias-head-chain-O$level.ll"
+    log="$output.log"
+    if "$STAGE1" -emit llvm "-O$level" -o "$output" "$ROOT/test/repro/zeroed_possible_alias_head_chain.elisa" >"$log" 2>&1; then
+        echo "zeroed reference smoke: Stage1 accepted a possible chained alias to sview at -O$level" >&2
+        exit 1
+    fi
+    [[ ! -e "$output" ]] || {
+        echo "zeroed reference smoke: failed chained-alias compilation left an LLVM artifact" >&2
+        exit 1
+    }
+    invalid_zeroed_count="$(grep -Eci '(sview.*zeroed|zeroed.*sview)' "$log" || true)"
+    [[ "$invalid_zeroed_count" == "1" ]] || {
+        echo "zeroed reference smoke: expected one invalid chained-alias sview diagnostic, got $invalid_zeroed_count" >&2
+        cat "$log" >&2
+        exit 1
+    }
 done
 
 # Runtime inclusion must not suppress checks on invalid user values in the same unit.
