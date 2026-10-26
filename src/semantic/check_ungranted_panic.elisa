@@ -16,117 +16,282 @@
 
 extend Semantic:
     private:
-        # The declaration name of a direct call. Module qualification does not change the
-        # function registry key: both `build()` and `Boxes::build()` resolve to `build`.
-        def called_function_name(expression: Ast::Expr) -> sview @source:
-            match expression:
-                Expr.Call(callee, arguments, argument_names, call_line):
-                    match callee:
-                        Expr.Ident(callee_name, ident_line):
-                            return callee_name
-                        Expr.Scope(scope_base, scoped_name, scope_line):
-                            return scoped_name
-                        _:
-                            return sview("", 0, 0)
-                _:
-                    return sview("", 0, 0)
-
-
-        # Whether a statement list performs a `panic(...)` NOT enclosed by a `trusted` block.
-        # A `can` block discharges the panic locally but STILL propagates the Abort effect to
-        # the function's row (verified against stage0), so `can`-wrapped panics count here;
-        # only `trusted` drops the effect. Pure (no table) — a reachability predicate.
-        def body_has_untrusted_panic(statements: darray[Ast::Stmt], in_trusted: bool) -> bool:
+        def body_effect_facts_merge(left: (has_panic: bool, effect_refs: darray[sview]), right: (has_panic: bool, effect_refs: darray[sview])) -> (has_panic: bool, effect_refs: darray[sview]):
             can Memory.Allocate, Abort.Panic:
-                for statement in statements:
+                effect_refs: mutable darray[sview] = [effect_ref for effect_ref in left.effect_refs]
+                for candidate in right.effect_refs |effect_refs|:
+                    effect_refs.push(candidate) if candidate != "" and not (any known in effect_refs where known == candidate)
+                return (left.has_panic or right.has_panic, effect_refs)
+
+        # Read the selected callee's forwarded effect. Extern rows use their module index;
+        # regular functions use module-tagged inferred rows when source resolution selects
+        # one declaration. Same-leaf signature/gap rows without module identity fail closed.
+        def body_effect_refs_for_call(expression: Ast::Expr, line: u32, caller_module: sview @source, visible_names: darray[sview], table: lmut SymbolTable) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                rebind target: (name: sview @source, qualifier: sview @source), table = extern_call_target(expression, table)
+                return [] if target.name == "" or target.qualifier == "" and names_contains(visible_names, target.name)
+                return [] if target.name == "panic" and target.qualifier == ""
+                call_position: Ast::Pos = called_function_position(expression, line)
+                requester: Ast::EnumAnnotation = Ast::EnumAnnotation{owner: "__call_site", name: "", module: caller_module, line: call_position.line, offset: call_position.offset, pos: call_position}
+                if target.qualifier != "":
+                    rebind resolved: (resolved: bool, module: sview @source), table = extern_qualified_module(target.qualifier, caller_module, requester, table)
+                    return [] if not resolved.resolved
+                    if extern_declaration_index_has(resolved.module, target.name, table):
+                        return [] if not extern_module_owner_is_extern_only(resolved.module, target.name, table)
+                        return extern_effect_index_refs(resolved.module, target.name, table)
+                    module_function: bool = any symbol in table.symbols where symbol.kind == SymbolKind.Func and symbol.name == target.name and symbol.module_owner == resolved.module
+                    return [] if not module_function or not extern_regular_function_owner_is_unique(resolved.module, target.name, table)
+                    return function_effect_refs(table, target.name, resolved.module, true) if function_has_effect(table, target.name, resolved.module, true)
+                    return []
+                selected: (resolved: bool, module: sview) = extern_bare_module_for_call(target.name, caller_module, requester, table)
+                return [] if not selected.resolved
+                if extern_declaration_index_has(selected.module, target.name, table):
+                    return [] if not extern_module_owner_is_extern_only(selected.module, target.name, table)
+                    return extern_effect_index_refs(selected.module, target.name, table)
+                module_function: bool = any symbol in table.symbols where symbol.kind == SymbolKind.Func and symbol.name == target.name and symbol.module_owner == selected.module
+                return [] if not module_function or not extern_regular_function_owner_is_unique(selected.module, target.name, table)
+                return function_effect_refs(table, target.name, selected.module, true) if function_has_effect(table, target.name, selected.module, true)
+                return []
+
+        # Names introduced by statements in a value block remain visible in its tail value.
+        # Nested statement bodies keep their own binders and therefore do not leak here.
+        def body_assignment_bound_names(target: Ast::Expr, names: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match target:
+                    Expr.Ident(name, position):
+                        names.push(name)
+                    Expr.Array(targets, position) | Expr.Tuple(targets, position):
+                        for child in targets |names|:
+                            body_assignment_bound_names(child, names)
+                    Expr.Paren(inner, position):
+                        body_assignment_bound_names(inner, names)
+                    _:
+                        pass
+
+        def body_block_tail_visible_names(statements: darray[Ast::Stmt], bound_names: darray[sview]) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                visible_names: mutable darray[sview] = [known for known in bound_names]
+                for statement in statements |visible_names|:
                     match statement:
-                        Stmt.Expr(expression, line):
-                            source_callee: sview = called_function_name(expression)
-                            return true if not in_trusted and source_callee == "panic"
-                        Stmt.Block(kind, clause, binding, body, line):
-                            block_kind: sview = kind
-                            block_trusted: mutable bool = in_trusted
-                            block_trusted <- true if block_kind == "trusted"
-                            return true if body_has_untrusted_panic(body, block_trusted)
-                        Stmt.If(condition, then_body, else_body, line):
-                            return true if body_has_untrusted_panic(then_body, in_trusted) or body_has_untrusted_panic(else_body, in_trusted)
-                        Stmt.While(condition, body, line):
-                            return true if body_has_untrusted_panic(body, in_trusted)
-                        Stmt.For(bind, variables, iterable, body, line):
-                            return true if body_has_untrusted_panic(body, in_trusted)
-                        Stmt.Match(scrutinee, arms, line):
-                            for arm in arms:
-                                return true if body_has_untrusted_panic(arm.body, in_trusted)
-                        Stmt.Return(value, line):
-                            pass
-                        Stmt.Contract(kind, expression, line):
-                            pass
-                        Stmt.Invalid:
-                            pass
-                        Stmt.Break(label, line):
-                            pass
-                        Stmt.Continue(label, line):
-                            pass
                         Stmt.VarDecl(name, type_expression, value, line):
-                            pass
+                            visible_names.push(name)
                         Stmt.Assign(target, operator, value, line):
+                            body_assignment_bound_names(target, visible_names) if operator == TokenKind.Assign
+                        _:
                             pass
-                return false
+                return visible_names
 
-
-        def body_has_untrusted_effect_call(statements: darray[Ast::Stmt], in_trusted: bool, table: SymbolTable&) -> bool:
+        # Analyze a lambda only when the callee is that lambda, optionally wrapped in
+        # transparent parentheses. Other expression forms leave lambda bodies deferred.
+        def body_immediate_lambda_call_facts(callee: Ast::Expr, line: u32, caller_module: sview @source, visible_names: darray[sview], table: lmut SymbolTable) -> (has_panic: bool, effect_refs: darray[sview]):
             can Memory.Allocate, Abort.Panic:
-                for statement in statements:
+                match callee:
+                    Expr.Lambda(parameters, body, lambda_pos):
+                        lambda_names: mutable darray[sview] = [known for known in visible_names]
+                        lambda_names.extend(parameters)
+                        rebind lambda_facts: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(body, false, caller_module, lambda_names, table)
+                        return lambda_facts
+                    Expr.Paren(inner, paren_pos):
+                        rebind parenthesized_facts: (has_panic: bool, effect_refs: darray[sview]), table = body_immediate_lambda_call_facts(inner, line, caller_module, visible_names, table)
+                        return parenthesized_facts
+                    _:
+                        return (false, [])
+
+        # Traverse expressions without treating a bare callback parameter/local as a
+        # declaration call. `panic` is a source only for a visible bare builtin call;
+        # module-qualified calls resolve through the ordinary extern/function owner path.
+        def body_expression_effect_facts(expression: Ast::Expr, line: u32, caller_module: sview @source, visible_names: darray[sview], table: lmut SymbolTable) -> (has_panic: bool, effect_refs: darray[sview]):
+            can Memory.Allocate, Abort.Panic:
+                facts: mutable (has_panic: bool, effect_refs: darray[sview]) = (false, [])
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        rebind body_effect_facts_1: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(callee, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_1)
+                        # A lambda value is deferred in every other expression context.
+                        # When it is the direct callee, with only parentheses around it,
+                        # its body runs at this call site.
+                        rebind immediate_lambda_facts: (has_panic: bool, effect_refs: darray[sview]), table = body_immediate_lambda_call_facts(callee, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, immediate_lambda_facts)
+                        for argument in arguments |facts, table|:
+                            rebind body_effect_facts_2: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(argument, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_2)
+                        rebind target: (name: sview @source, qualifier: sview @source), table = extern_call_target(expression, table)
+                        panic_call: bool = target.name == "panic" and target.qualifier == "" and not names_contains(visible_names, "panic")
+                        rebind direct_refs: darray[sview], table = body_effect_refs_for_call(expression, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, (panic_call, direct_refs))
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, call_pos):
+                        for candidate in candidates |facts, table|:
+                            for capture in candidate.captures |facts, table|:
+                                rebind body_effect_facts_3: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(capture, line, caller_module, visible_names, table)
+                                facts <- body_effect_facts_merge(facts, body_effect_facts_3)
+                        for argument in arguments |facts, table|:
+                            rebind body_effect_facts_4: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(argument, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_4)
+                    Expr.Field(object, field, field_pos) | Expr.Scope(object, field, field_pos):
+                        rebind body_effect_facts_5: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(object, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_5)
+                    Expr.Index(object, index, index_pos):
+                        rebind body_effect_facts_6: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(object, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_6)
+                        rebind body_effect_facts_7: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(index, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_7)
+                    Expr.IndexN(object, arguments, index_pos):
+                        rebind body_effect_facts_8: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(object, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_8)
+                        for argument in arguments |facts, table|:
+                            rebind body_effect_facts_9: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(argument, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_9)
+                    Expr.Slice(object, low, high, slice_pos):
+                        rebind body_effect_facts_10: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(object, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_10)
+                        rebind body_effect_facts_11: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(low, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_11)
+                        rebind body_effect_facts_12: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(high, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_12)
+                    Expr.Binary(left, operator, right, binary_pos):
+                        rebind body_effect_facts_13: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(left, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_13)
+                        rebind body_effect_facts_14: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(right, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_14)
+                    Expr.Unary(operator, operand, unary_pos) | Expr.Move(operand, unary_pos) | Expr.RegionNew(operand, region, unary_pos) | Expr.Paren(operand, unary_pos):
+                        rebind body_effect_facts_15: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(operand, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_15)
+                    Expr.Refinement(base, predicate, refinement_pos):
+                        rebind body_effect_facts_16: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(base, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_16)
+                        rebind body_effect_facts_17: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(predicate, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_17)
+                    Expr.Array(elements, element_pos) | Expr.Tuple(elements, element_pos) | Expr.SetLit(elements, element_pos):
+                        for element in elements |facts, table|:
+                            rebind body_effect_facts_18: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(element, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_18)
+                    Expr.DictLit(entries, dict_pos):
+                        for entry in entries |facts, table|:
+                            rebind body_effect_facts_19: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(entry.key, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_19)
+                            rebind body_effect_facts_20: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(entry.value, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_20)
+                    Expr.Construct(type_name, fields, construct_pos):
+                        for field in fields |facts, table|:
+                            rebind body_effect_facts_21: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(field.value, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_21)
+                    Expr.RecordUpdate(base, fields, update_pos):
+                        rebind body_effect_facts_22: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(base, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_22)
+                        for field in fields |facts, table|:
+                            rebind body_effect_facts_23: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(field.value, line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_23)
+                    Expr.If(condition, then_expression, else_expression, if_pos):
+                        rebind body_effect_facts_24: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(condition, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_24)
+                        rebind body_effect_facts_25: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(then_expression, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_25)
+                        rebind body_effect_facts_26: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(else_expression, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_26)
+                    Expr.Match(scrutinee, arms, match_pos) | Expr.Catch(scrutinee, arms, match_pos):
+                        rebind body_effect_facts_27: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(scrutinee, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_27)
+                        for arm in arms |facts, table|:
+                            arm_names: mutable darray[sview] = [known for known in visible_names]
+                            pattern_bound_names(arm.pattern, arm_names)
+                            rebind body_effect_facts_28: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(arm.guard, line, caller_module, arm_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_28)
+                            rebind body_effect_facts_29: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(arm.body, false, caller_module, arm_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_29)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, scope_id):
+                        rebind body_effect_facts_30: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(iterable, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_30)
+                        comprehension_names: mutable darray[sview] = [known for known in visible_names]
+                        comprehension_names.push(variable)
+                        rebind body_effect_facts_31: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(condition, line, caller_module, comprehension_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_31)
+                        rebind body_effect_facts_32: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(body, line, caller_module, comprehension_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_32)
+                    Expr.GetElse(guarded, recovery, get_else_pos):
+                        rebind body_effect_facts_33: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(guarded, line, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_33)
+                        rebind body_effect_facts_34: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(recovery, false, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_34)
+                    Expr.Block(block_statements, value, captures, block_pos):
+                        tail_names: darray[sview] = body_block_tail_visible_names(block_statements, visible_names)
+                        rebind body_effect_facts_35: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(block_statements, false, caller_module, visible_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_35)
+                        rebind body_effect_facts_36: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(value, line, caller_module, tail_names, table)
+                        facts <- body_effect_facts_merge(facts, body_effect_facts_36)
+                    _:
+                        pass
+                return facts
+
+        # Traverse a body in source order. Local declarations and binders are visible only
+        # after their introduction and within their lexical child scope. A trusted block
+        # drops its sources; `can` blocks still propagate them to the enclosing function.
+        def body_statement_effect_facts(statements: darray[Ast::Stmt], in_trusted: bool, caller_module: sview @source, bound_names: darray[sview], table: lmut SymbolTable) -> (has_panic: bool, effect_refs: darray[sview]):
+            can Memory.Allocate, Abort.Panic:
+                return (false, []) if in_trusted
+                facts: mutable (has_panic: bool, effect_refs: darray[sview]) = (false, [])
+                visible_names: mutable darray[sview] = [known for known in bound_names]
+                for statement in statements |facts, visible_names, table|:
                     match statement:
                         Stmt.Expr(expression, line):
-                            callee: sview = called_function_name(expression)
-                            return true if not in_trusted and callee != "" and direct_function_count(table, callee) == 1 and function_has_effect(table, callee)
+                            rebind body_effect_facts_37: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(expression, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_37)
                         Stmt.Block(kind, clause, binding, body, line):
-                            block_kind: sview = kind
-                            nested_trusted: mutable bool = in_trusted
-                            nested_trusted <- true if block_kind == "trusted"
-                            return true if body_has_untrusted_effect_call(body, nested_trusted, table)
+                            continue if kind == "trusted"
+                            block_names: mutable darray[sview] = [known for known in visible_names]
+                            block_names.push(binding) if binding != ""
+                            rebind body_effect_facts_38: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(body, false, caller_module, block_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_38)
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            rebind body_effect_facts_39: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(value, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_39)
+                            visible_names.push(name)
+                        Stmt.Assign(target, operator, value, line):
+                            rebind body_effect_facts_40: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(target, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_40)
+                            rebind body_effect_facts_41: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(value, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_41)
+                            body_assignment_bound_names(target, visible_names) if operator == TokenKind.Assign
+                        Stmt.Return(value, line):
+                            if value is return_expression:
+                                rebind return_facts: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(return_expression, line.line, caller_module, visible_names, table)
+                                facts <- body_effect_facts_merge(facts, return_facts)
                         Stmt.If(condition, then_body, else_body, line):
-                            return true if body_has_untrusted_effect_call(then_body, in_trusted, table) or body_has_untrusted_effect_call(else_body, in_trusted, table)
+                            rebind body_effect_facts_42: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(condition, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_42)
+                            rebind body_effect_facts_43: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(then_body, false, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_43)
+                            rebind body_effect_facts_44: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(else_body, false, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_44)
                         Stmt.While(condition, body, line):
-                            return true if body_has_untrusted_effect_call(body, in_trusted, table)
+                            rebind body_effect_facts_45: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(condition, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_45)
+                            rebind body_effect_facts_46: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(body, false, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_46)
                         Stmt.For(bind, variables, iterable, body, line):
-                            return true if body_has_untrusted_effect_call(body, in_trusted, table)
+                            rebind body_effect_facts_47: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(iterable, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_47)
+                            loop_names: mutable darray[sview] = [known for known in visible_names]
+                            loop_names.extend(variables)
+                            rebind body_effect_facts_48: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(body, false, caller_module, loop_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_48)
                         Stmt.Match(scrutinee, arms, line):
-                            for arm in arms:
-                                return true if body_has_untrusted_effect_call(arm.body, in_trusted, table)
-                        Stmt.Return(value, line):
-                            if value is returned:
-                                callee: sview = called_function_name(returned)
-                                return true if not in_trusted and callee != "" and direct_function_count(table, callee) == 1 and function_has_effect(table, callee)
+                            rebind body_effect_facts_49: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(scrutinee, line.line, caller_module, visible_names, table)
+                            facts <- body_effect_facts_merge(facts, body_effect_facts_49)
+                            for arm in arms |facts, visible_names, table|:
+                                arm_names: mutable darray[sview] = [known for known in visible_names]
+                                pattern_bound_names(arm.pattern, arm_names)
+                                rebind body_effect_facts_50: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(arm.guard, line.line, caller_module, arm_names, table)
+                                facts <- body_effect_facts_merge(facts, body_effect_facts_50)
+                                rebind body_effect_facts_51: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(arm.body, false, caller_module, arm_names, table)
+                                facts <- body_effect_facts_merge(facts, body_effect_facts_51)
+                        Stmt.Contract(kind, expression, line):
+                            runtime_contract: bool = kind == "requires" or kind == "require" or kind == "assert" or kind == "ensure" or kind == "ensures"
+                            if runtime_contract:
+                                rebind body_effect_facts_52: (has_panic: bool, effect_refs: darray[sview]), table = body_expression_effect_facts(expression, line.line, caller_module, visible_names, table)
+                                facts <- body_effect_facts_merge(facts, body_effect_facts_52)
                         _:
                             pass
-                return false
-
-
-        # The effect REF of the first untrusted effect source in `statements`:
-        # "Abort.Panic" for a panic, the callee's own first effect ref for a
-        # forwarded call. "" when the body has no untrusted source.
-        def body_first_untrusted_effect_ref(statements: darray[Ast::Stmt], in_trusted: bool, table: SymbolTable&) -> sview:
-            can Memory.Allocate, Abort.Panic:
-                return "Abort.Panic" if body_has_untrusted_panic(statements, in_trusted)
-                for statement in statements:
-                    match statement:
-                        Stmt.Expr(expression, line):
-                            callee: sview = called_function_name(expression)
-                            if not in_trusted and callee != "" and direct_function_count(table, callee) == 1 and function_has_effect(table, callee):
-                                forwarded: sview = function_first_effect_ref(table, callee)
-                                return forwarded if forwarded != ""
-                        Stmt.Return(value, line):
-                            if value is returned:
-                                callee: sview = called_function_name(returned)
-                                if not in_trusted and callee != "" and direct_function_count(table, callee) == 1 and function_has_effect(table, callee):
-                                    forwarded: sview = function_first_effect_ref(table, callee)
-                                    return forwarded if forwarded != ""
-                        _:
-                            pass
-                return ""
-
+                return facts
 
         # Whether `family` appears among the granted refs of a block-grant clause.
         def clause_covers_family(clause: darray[sview]&, required_ref: sview) -> bool:
@@ -142,35 +307,149 @@ extend Semantic:
 
         # One-hop effect propagation (stage0 parity): a call inside a `can` BLOCK
         # whose clause omits one of the callee's declared families leaves that
-        # family REQUIRED by the enclosing function — register it as a declared
-        # effect row so caller-side grant checks see it (arena_free's Unsafe.Alias).
-        def register_block_grant_gaps(owner: sview @source, statements: darray[Ast::Stmt], enclosing_clause: darray[sview], in_can_block: bool, table: lmut SymbolTable) -> void:
+        # family REQUIRED by the enclosing function — register it as a module-scoped
+        # effect row so resolved caller checks see it (arena_free's Unsafe.Alias).
+        def register_block_gap_ref(owner: sview @source, owner_module: sview @source, required_ref: sview @source, enclosing_clause: darray[sview], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                return if required_ref == "" or not extern_regular_function_owner_is_unique(owner_module, owner, table) or clause_covers_family(enclosing_clause, required_ref)
+                already_registered: mutable bool = false
+                for known_index in 0..<table.function_effect_owner.count:
+                    already_registered <- true if table.function_effect_owner[known_index] == owner and known_index < table.function_effect_module.count and table.function_effect_module[known_index] == owner_module and table.function_effect_name[known_index] == required_ref
+                if not already_registered:
+                    table.function_effect_owner <- table.function_effect_owner.push(owner)
+                    table.function_effect_name <- table.function_effect_name.push(required_ref)
+                    table.function_effect_module <- table.function_effect_module.push(owner_module)
+                    table <- index_effect_owner_rows(table) can Global{Read,Write}
+
+        def register_block_grant_call_gap(owner: sview @source, expression: Ast::Expr, line: u32, enclosing_clause: darray[sview], caller_module: sview @source, visible_names: darray[sview], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                rebind target: (name: sview @source, qualifier: sview @source), table = extern_call_target(expression, table)
+                gap_callee: sview = target.name
+                return if gap_callee == "" or gap_callee == owner
+                return if target.qualifier == "" and names_contains(visible_names, gap_callee)
+                call_position: Ast::Pos = called_function_position(expression, line)
+                requester: Ast::EnumAnnotation = Ast::EnumAnnotation{owner: "__call_site", name: "", module: caller_module, line: call_position.line, offset: call_position.offset, pos: call_position}
+                if target.qualifier != "":
+                    rebind resolved: (resolved: bool, module: sview @source), table = extern_qualified_module(target.qualifier, caller_module, requester, table)
+                    return if not resolved.resolved
+                    if extern_effect_index_has_declaration(resolved.module, gap_callee, table):
+                        if extern_module_owner_is_extern_only(resolved.module, gap_callee, table):
+                            for required_ref in extern_effect_index_refs(resolved.module, gap_callee, table) |table, owner, enclosing_clause|:
+                                table <- register_block_gap_ref(owner, caller_module, required_ref, enclosing_clause, table) can Global{Read,Write}
+                        return
+                    return if not extern_regular_function_owner_is_unique(resolved.module, gap_callee, table)
+                    for required_ref in function_effect_refs(table, gap_callee, resolved.module, true) |table, owner, enclosing_clause|:
+                        table <- register_block_gap_ref(owner, caller_module, required_ref, enclosing_clause, table) can Global{Read,Write}
+                else:
+                    selected_module: (resolved: bool, module: sview) = extern_bare_module_for_call(gap_callee, caller_module, requester, table)
+                    if selected_module.resolved and extern_effect_index_has_declaration(selected_module.module, gap_callee, table):
+                        if extern_module_owner_is_extern_only(selected_module.module, gap_callee, table):
+                            for required_ref in extern_effect_index_refs(selected_module.module, gap_callee, table) |table, owner, enclosing_clause|:
+                                table <- register_block_gap_ref(owner, caller_module, required_ref, enclosing_clause, table) can Global{Read,Write}
+                        return
+                    return if not selected_module.resolved or not extern_regular_function_owner_is_unique(selected_module.module, gap_callee, table)
+                    for required_ref in function_effect_refs(table, gap_callee, selected_module.module, true) |table, owner, enclosing_clause|:
+                        table <- register_block_gap_ref(owner, caller_module, required_ref, enclosing_clause, table) can Global{Read,Write}
+
+        # Traverse expressions evaluated inside a grant block, collecting call effects from
+        # nested operands as well as direct call statements. Lambdas are deferred bodies and
+        # are left to the function-value effect analysis.
+        def register_block_grant_expression_gaps(owner: sview @source, expression: Ast::Expr, line: u32, enclosing_clause: darray[sview], caller_module: sview @source, visible_names: darray[sview], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_pos):
+                        table <- register_block_grant_call_gap(owner, expression, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, callee, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        for argument in arguments |table|:
+                            table <- register_block_grant_expression_gaps(owner, argument, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, call_pos):
+                        for candidate in candidates |table|:
+                            for capture in candidate.captures |table|:
+                                table <- register_block_grant_expression_gaps(owner, capture, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        for argument in arguments |table|:
+                            table <- register_block_grant_expression_gaps(owner, argument, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Field(object, field, field_pos) | Expr.Scope(object, field, field_pos):
+                        table <- register_block_grant_expression_gaps(owner, object, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Index(object, index, index_pos):
+                        table <- register_block_grant_expression_gaps(owner, object, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, index, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.IndexN(object, arguments, index_pos):
+                        table <- register_block_grant_expression_gaps(owner, object, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        for argument in arguments |table|:
+                            table <- register_block_grant_expression_gaps(owner, argument, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Slice(object, low, high, slice_pos):
+                        table <- register_block_grant_expression_gaps(owner, object, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, low, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, high, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Binary(left, operator, right, binary_pos):
+                        table <- register_block_grant_expression_gaps(owner, left, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, right, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Unary(operator, operand, unary_pos) | Expr.Move(operand, unary_pos) | Expr.RegionNew(operand, region, unary_pos) | Expr.Paren(operand, unary_pos):
+                        table <- register_block_grant_expression_gaps(owner, operand, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Refinement(base, predicate, refinement_pos):
+                        table <- register_block_grant_expression_gaps(owner, base, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, predicate, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Array(elements, element_pos) | Expr.Tuple(elements, element_pos) | Expr.SetLit(elements, element_pos):
+                        for element in elements |table|:
+                            table <- register_block_grant_expression_gaps(owner, element, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.DictLit(entries, dict_pos):
+                        for entry in entries |table|:
+                            table <- register_block_grant_expression_gaps(owner, entry.key, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                            table <- register_block_grant_expression_gaps(owner, entry.value, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Construct(type_name, fields, construct_pos):
+                        for field in fields |table|:
+                            table <- register_block_grant_expression_gaps(owner, field.value, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.RecordUpdate(base, fields, update_pos):
+                        table <- register_block_grant_expression_gaps(owner, base, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        for field in fields |table|:
+                            table <- register_block_grant_expression_gaps(owner, field.value, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.If(condition, then_expression, else_expression, if_pos):
+                        table <- register_block_grant_expression_gaps(owner, condition, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, then_expression, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, else_expression, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Match(scrutinee, arms, match_pos) | Expr.Catch(scrutinee, arms, match_pos):
+                        table <- register_block_grant_expression_gaps(owner, scrutinee, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        for arm in arms |table|:
+                            arm_names: mutable darray[sview] = [known for known in visible_names]
+                            pattern_bound_names(arm.pattern, arm_names)
+                            table <- register_block_grant_expression_gaps(owner, arm.guard, line, enclosing_clause, caller_module, arm_names, table) can Global{Read,Write}
+                            table <- register_block_grant_gaps(owner, arm.body, enclosing_clause, true, caller_module, arm_names, table) can Global{Read,Write}
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, scope_id):
+                        table <- register_block_grant_expression_gaps(owner, iterable, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        comprehension_names: mutable darray[sview] = [known for known in visible_names]
+                        comprehension_names.push(variable)
+                        table <- register_block_grant_expression_gaps(owner, condition, line, enclosing_clause, caller_module, comprehension_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, body, line, enclosing_clause, caller_module, comprehension_names, table) can Global{Read,Write}
+                    Expr.GetElse(guarded, recovery, get_else_pos):
+                        table <- register_block_grant_expression_gaps(owner, guarded, line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_gaps(owner, recovery, enclosing_clause, true, caller_module, visible_names, table) can Global{Read,Write}
+                    Expr.Block(block_statements, value, captures, block_pos):
+                        tail_names: darray[sview] = body_block_tail_visible_names(block_statements, visible_names)
+                        table <- register_block_grant_gaps(owner, block_statements, enclosing_clause, true, caller_module, visible_names, table) can Global{Read,Write}
+                        table <- register_block_grant_expression_gaps(owner, value, line, enclosing_clause, caller_module, tail_names, table) can Global{Read,Write}
+                    _:
+                        pass
+
+        def register_block_grant_gaps(owner: sview @source, statements: darray[Ast::Stmt], enclosing_clause: darray[sview], in_can_block: bool, caller_module: sview @source, bound_names: darray[sview], table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                visible_names: mutable darray[sview] = [known for known in bound_names]
                 for statement in statements |table|:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- register_block_grant_gaps(owner, body, clause, true, table) can Global{Read,Write} if kind == "can"
-                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, table) can Global{Read,Write} if kind != "can" and kind != "trusted"
+                            block_names: mutable darray[sview] = [known for known in visible_names]
+                            block_names.push(binding) if binding != ""
+                            if kind == "can":
+                                combined_clause: mutable darray[sview] = [grant for grant in enclosing_clause]
+                                combined_clause.extend(clause)
+                                table <- register_block_grant_gaps(owner, body, combined_clause, true, caller_module, block_names, table) can Global{Read,Write}
+                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, caller_module, block_names, table) can Global{Read,Write} if kind != "can" and kind != "trusted"
                         Stmt.Expr(expression, line):
                             continue if not in_can_block
-                            gap_callee: sview = called_function_name(expression)
-                            continue if gap_callee == "" or gap_callee == owner or direct_function_count(table, gap_callee) != 1
-                            # Snapshot the row count: pushes below grow the table and must
-                            # not extend this scan (self-feeding loop).
-                            row_count: usize = table.function_effect_owner.count
-                            while ref_index < row_count |ref_index: usize = 0, table|:
-                                if table.function_effect_owner[ref_index] == gap_callee:
-                                    required_ref: sview = table.function_effect_name[ref_index]
-                                    if not clause_covers_family(enclosing_clause, required_ref):
-                                        already_registered: bool =
-                                            for known_index in 0..<table.function_effect_owner.count |already_registered: bool = false| -> already_registered:
-                                                already_registered <- true if table.function_effect_owner[known_index] == owner and table.function_effect_name[known_index] == required_ref
-                                        if not already_registered:
-                                            table.function_effect_owner <- table.function_effect_owner.push(owner)
-                                            table.function_effect_name <- table.function_effect_name.push(required_ref)
-                                            table <- index_effect_owner_rows(table) can Global{Read,Write}
-                                ref_index <- ref_index + 1
+                            table <- register_block_grant_expression_gaps(owner, expression, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
                         Stmt.Assign(target, operator, value, line):
+                            table <- register_block_grant_expression_gaps(owner, target, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block
+                            table <- register_block_grant_expression_gaps(owner, value, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block
+                            body_assignment_bound_names(target, visible_names) if operator == TokenKind.Assign
                             # A reinterpret-assign (`x as ! <- v` / `x as & <- v`) is an
                             # Unsafe.Alias operation; inside a `can` block that omits the
                             # Unsafe family it leaves Unsafe.Alias required by the
@@ -179,20 +458,41 @@ extend Semantic:
                                 Expr.Binary(as_left, as_operator, as_right, as_line): as_operator == TokenKind.As
                                 _: false
                             if target_is_reinterpret and in_can_block and not clause_covers_family(enclosing_clause, "Unsafe"):
-                                already: bool =
-                                    for row_index in 0..<table.function_effect_owner.count |already: bool = false| -> already:
-                                        already <- true if table.function_effect_owner[row_index] == owner and table.function_effect_name[row_index] == "Unsafe.Alias"
+                                already: mutable bool = false
+                                for row_index in 0..<table.function_effect_owner.count:
+                                    already <- true if table.function_effect_owner[row_index] == owner and row_index < table.function_effect_module.count and table.function_effect_module[row_index] == caller_module and table.function_effect_name[row_index] == "Unsafe.Alias"
                                 if not already:
                                     table.function_effect_owner <- table.function_effect_owner.push(owner)
                                     table.function_effect_name <- table.function_effect_name.push("Unsafe.Alias")
+                                    table.function_effect_module <- table.function_effect_module.push(caller_module)
                                     table <- index_effect_owner_rows(table) can Global{Read,Write}
-                        Stmt.If(condition, then_body, else_body, line):
-                            table <- register_block_grant_gaps(owner, then_body, enclosing_clause, in_can_block, table) can Global{Read,Write}
-                            table <- register_block_grant_gaps(owner, else_body, enclosing_clause, in_can_block, table) can Global{Read,Write}
-                        Stmt.While(condition, body, line):
-                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, table) can Global{Read,Write}
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, table) can Global{Read,Write}
+                            table <- register_block_grant_expression_gaps(owner, iterable, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block
+                            loop_names: mutable darray[sview] = [known for known in visible_names]
+                            loop_names.extend(variables)
+                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, caller_module, loop_names, table) can Global{Read,Write}
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- register_block_grant_expression_gaps(owner, scrutinee, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block
+                            for arm in arms |table|:
+                                arm_names: mutable darray[sview] = [known for known in visible_names]
+                                pattern_bound_names(arm.pattern, arm_names)
+                                table <- register_block_grant_expression_gaps(owner, arm.guard, line.line, enclosing_clause, caller_module, arm_names, table) can Global{Read,Write} if in_can_block
+                                table <- register_block_grant_gaps(owner, arm.body, enclosing_clause, in_can_block, caller_module, arm_names, table) can Global{Read,Write}
+                        Stmt.VarDecl(name, type_expression, value, line):
+                            table <- register_block_grant_expression_gaps(owner, value, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block
+                            visible_names.push(name)
+                        Stmt.Return(value, line):
+                            if value is return_expression and in_can_block:
+                                table <- register_block_grant_expression_gaps(owner, return_expression, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write}
+                        Stmt.If(condition, then_body, else_body, line):
+                            table <- register_block_grant_expression_gaps(owner, condition, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block
+                            table <- register_block_grant_gaps(owner, then_body, enclosing_clause, in_can_block, caller_module, visible_names, table) can Global{Read,Write}
+                            table <- register_block_grant_gaps(owner, else_body, enclosing_clause, in_can_block, caller_module, visible_names, table) can Global{Read,Write}
+                        Stmt.While(condition, body, line):
+                            table <- register_block_grant_expression_gaps(owner, condition, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block
+                            table <- register_block_grant_gaps(owner, body, enclosing_clause, in_can_block, caller_module, visible_names, table) can Global{Read,Write}
+                        Stmt.Contract(kind, expression, line):
+                            table <- register_block_grant_expression_gaps(owner, expression, line.line, enclosing_clause, caller_module, visible_names, table) can Global{Read,Write} if in_can_block and (kind == "requires" or kind == "require" or kind == "assert" or kind == "ensure" or kind == "ensures")
                         _:
                             pass
 
@@ -200,8 +500,9 @@ extend Semantic:
         # Populate the effect-source registry from untrusted panic operations and direct
         # calls to already-known effect-bearing functions. Runs before call-site checking.
         # Surface `can Unsafe.X:` block grants as the function's required effects.
-        def register_unsafe_can_grants(owner: sview @source, statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
+        def register_unsafe_can_grants(owner: sview @source, owner_module: sview @source, statements: darray[Ast::Stmt], table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
+                return if not extern_regular_function_owner_is_unique(owner_module, owner, table)
                 for statement in statements |table| -> table:
                     match statement:
                         Stmt.Block(kind, clause, binding, body, line):
@@ -211,46 +512,23 @@ extend Semantic:
                                     surfaced: sview = "Unsafe.StaleRef" if grant == "StaleRef" or grant == "Unsafe.StaleRef" else sview("", 0, 0)
                                     continue if surfaced == ""
                                     already: mutable bool = false
-                                    while row_index < table.function_effect_owner.count |row_index: usize = 0, already|:
-                                        already <- true if table.function_effect_owner[row_index] == owner and table.function_effect_name[row_index] == surfaced
+                                    while row_index < table.function_effect_owner.count |row_index: mutable usize = 0, already|:
+                                        already <- true if table.function_effect_owner[row_index] == owner and row_index < table.function_effect_module.count and table.function_effect_module[row_index] == owner_module and table.function_effect_name[row_index] == surfaced
                                         row_index <- row_index + 1
                                     if not already:
                                         table.function_effect_owner <- table.function_effect_owner.push(owner)
                                         table.function_effect_name <- table.function_effect_name.push(surfaced)
+                                        table.function_effect_module <- table.function_effect_module.push(owner_module)
                                         table <- index_effect_owner_rows(table) can Global{Read,Write}
-                            table <- register_unsafe_can_grants(owner, body, table) can Global{Read,Write}
+                            table <- register_unsafe_can_grants(owner, owner_module, body, table) can Global{Read,Write}
                         Stmt.If(condition, then_body, else_body, if_line):
-                            table <- register_unsafe_can_grants(owner, then_body, table) can Global{Read,Write}
-                            table <- register_unsafe_can_grants(owner, else_body, table) can Global{Read,Write}
+                            table <- register_unsafe_can_grants(owner, owner_module, then_body, table) can Global{Read,Write}
+                            table <- register_unsafe_can_grants(owner, owner_module, else_body, table) can Global{Read,Write}
                         Stmt.While(condition, while_body, while_line):
-                            table <- register_unsafe_can_grants(owner, while_body, table) can Global{Read,Write}
+                            table <- register_unsafe_can_grants(owner, owner_module, while_body, table) can Global{Read,Write}
                         _:
                             pass
 
-
-        # A `signal Effect.Family` statement (parsed as an inert Block("signal", [ref], …)) is an
-        # effect REQUIREMENT source, like a panic: the enclosing function surfaces the effect and its
-        # callers must grant it. Recurse through blocks (the signal often sits inside its own grant).
-        def body_has_untrusted_signal(statements: darray[Ast::Stmt], in_trusted: bool) -> bool:
-            can Memory.Allocate, Abort.Panic:
-                for statement in statements:
-                    match statement:
-                        Stmt.Block(kind, clause, binding, body, line):
-                            return true if kind == "signal" and not in_trusted and clause.count > 0
-                            nested_trusted: bool = in_trusted or kind == "trusted"
-                            return true if body_has_untrusted_signal(body, nested_trusted)
-                        Stmt.If(condition, then_body, else_body, line):
-                            return true if body_has_untrusted_signal(then_body, in_trusted) or body_has_untrusted_signal(else_body, in_trusted)
-                        Stmt.While(condition, body, line):
-                            return true if body_has_untrusted_signal(body, in_trusted)
-                        Stmt.For(bind, variables, iterable, body, line):
-                            return true if body_has_untrusted_signal(body, in_trusted)
-                        Stmt.Match(scrutinee, arms, line):
-                            for arm in arms:
-                                return true if body_has_untrusted_signal(arm.body, in_trusted)
-                        _:
-                            pass
-                return false
 
         # The effect ref of the first `signal` statement (recursing through blocks), or "".
         def body_first_signal_ref(statements: darray[Ast::Stmt]) -> sview:
@@ -322,7 +600,7 @@ extend Semantic:
                 return owner < snapshot.functions.count and snapshot.functions[owner].direct_fact_count == 0
 
 
-        def collect_effect_sources[@snapshot_storage, @snapshot_borrow](declarations: darray[Ast::Decl], table: lmut SymbolTable, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: dict[u64, usize]&, effect_source_bodies_skipped: mutable u64&, use_snapshot_facts: bool) -> void:
+        def collect_effect_sources[@snapshot_storage, @snapshot_borrow](declarations: darray[Ast::Decl], current_module: sview @source, table: lmut SymbolTable, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: dict[u64, usize]&, effect_source_bodies_skipped: mutable u64&, use_snapshot_facts: bool) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table, effect_source_bodies_skipped| -> table:
                     match declaration:
@@ -330,25 +608,31 @@ extend Semantic:
                             if use_snapshot_facts and incremental_current_body_has_zero_direct_facts(at, snapshot, offsets):
                                 effect_source_bodies_skipped <- effect_source_bodies_skipped + 1
                             else:
-                                table <- register_block_grant_gaps(name, body, [], false, table) can Global{Read,Write}
+                                bound_names: mutable darray[sview] = []
+                                for parameter in parameters:
+                                    bound_names.push(parameter.name)
+                                table <- register_block_grant_gaps(name, body, [], false, current_module, bound_names, table) can Global{Read,Write}
                                 # A `can Unsafe.X:` GRANT block propagates the assumption
                                 # upward: the function surfaces Unsafe.X and its callers need
                                 # the grant (a `trusted` block is the firewall and does not).
-                                table <- register_unsafe_can_grants(name, body, table) can Global{Read,Write}
-                                has_signal: bool = body_has_untrusted_signal(body, false)
-                                inferred_source: bool = body_has_untrusted_panic(body, false) or body_has_untrusted_effect_call(body, false, table) or has_signal
-                                table.function_effect_source_owner <- table.function_effect_source_owner.push(name) if inferred_source
-                                # The signal's own effect ref takes precedence so the surfaced family
-                                # matches the signalled effect (Progress), not a panic default.
-                                panic_ref: sview = body_first_untrusted_effect_ref(body, false, table)
+                                table <- register_unsafe_can_grants(name, current_module, body, table) can Global{Read,Write}
+                                rebind body_facts: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(body, false, current_module, bound_names, table)
                                 signal_ref: sview = body_first_signal_ref(body)
-                                source_ref: sview = signal_ref if panic_ref == "" and signal_ref != "" else panic_ref
-                                table.function_effect_source_ref <- table.function_effect_source_ref.push(source_ref) if inferred_source
+                                source_refs: mutable darray[sview] = []
+                                source_refs.push("Abort.Panic") if body_facts.has_panic
+                                for effect_ref in body_facts.effect_refs |source_refs|:
+                                    source_refs.push(effect_ref) if not (any known in source_refs where known == effect_ref)
+                                source_refs.push(signal_ref) if signal_ref != "" and not (any known in source_refs where known == signal_ref)
+                                for source_ref in source_refs |table, name, current_module|:
+                                    table.function_effect_source_owner <- table.function_effect_source_owner.push(name)
+                                    table.function_effect_source_module <- table.function_effect_source_module.push(current_module)
+                                    table.function_effect_source_ref <- table.function_effect_source_ref.push(source_ref)
                             table <- index_effect_source_rows(table) can Global{Read,Write}
                         Decl.Module(name, body, line):
-                            table <- collect_effect_sources(body, table, snapshot, offsets, effect_source_bodies_skipped, false) can Global{Read,Write}
+                            rebind nested_module: sview @source, table = extern_join_module_scope(current_module, name, table)
+                            table <- collect_effect_sources(body, nested_module, table, snapshot, offsets, effect_source_bodies_skipped, false) can Global{Read,Write}
                         Decl.Scoped(body, line):
-                            table <- collect_effect_sources(body, table, snapshot, offsets, effect_source_bodies_skipped, false) can Global{Read,Write}
+                            table <- collect_effect_sources(body, current_module, table, snapshot, offsets, effect_source_bodies_skipped, false) can Global{Read,Write}
                         _:
                             pass
 
@@ -359,20 +643,264 @@ extend Semantic:
         # `__extern_effect` marker and its ref, so a next-index probe misses the ref and
         # falls back to the "Permission" placeholder (a spurious ungranted-call fire). The
         # declaration offset also keeps a same-`#line` sibling from donating its effect.
-        def extern_effect_ref_at(annotations: darray[Ast::EnumAnnotation]&, line: u32, offset: u32) -> sview:
+        def extern_effect_ref_at(annotations: darray[Ast::EnumAnnotation]&, module: sview, line: u32, offset: u32) -> sview:
             can Abort.Panic:
-                while probe < annotations.count |probe: usize = 0|:
-                    return annotations[probe].name if annotations[probe].owner == "__extern_effect_ref" and annotations[probe].line == line and annotations[probe].offset == offset
+                while probe < annotations.count |probe: mutable usize = 0|:
+                    return annotations[probe].name if annotations[probe].owner == "__extern_effect_ref" and annotations[probe].module == module and annotations[probe].line == line and annotations[probe].offset == offset
                     probe <- probe + 1
                 return ""
 
+        # The complete can-row slice is keyed by the extern's exact token position. An empty
+        # slice with a complete marker means an explicitly pure `can[]` row; an absent or
+        # incomplete pair leaves the legacy first-ref path below as a conservative fallback.
+        def extern_effect_row_at(annotations: darray[Ast::EnumAnnotation]&, owner: sview, module: sview, line: u32, offset: u32) -> (complete: bool, text: sview):
+            can Abort.Panic:
+                complete_count: mutable usize = 0
+                text_count: mutable usize = 0
+                text: mutable sview = ""
+                for annotation in annotations |complete_count, text_count, text, owner, line, offset|:
+                    continue if annotation.module != module or annotation.line != line or annotation.offset != offset
+                    if annotation.owner == owner and annotation.name == "__extern_effect_row_complete":
+                        complete_count <- complete_count + 1
+                    elif annotation.owner == "__extern_effect_row_text":
+                        text <- annotation.name
+                        text_count <- text_count + 1
+                return (complete_count == 1 and text_count == 1, text)
+
+        def extern_effect_index_declare(module: sview @source, owner: sview @source, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for row in 0..<min(table.extern_effect_modules.count, table.extern_effect_owners.count) |table, module, owner|:
+                    return if table.extern_effect_modules[row] == module and table.extern_effect_owners[row] == owner
+                table.extern_effect_modules <- table.extern_effect_modules.push(module)
+                table.extern_effect_owners <- table.extern_effect_owners.push(owner)
+
+        def extern_declaration_index_add(module: sview @source, owner: sview @source, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for row in 0..<min(table.extern_declaration_modules.count, min(table.extern_declaration_owners.count, table.extern_declaration_counts.count)) |table, module, owner|:
+                    if table.extern_declaration_modules[row] == module and table.extern_declaration_owners[row] == owner:
+                        table.extern_declaration_counts[row] <- table.extern_declaration_counts[row] + 1.usize()
+                        return
+                table.extern_declaration_modules <- table.extern_declaration_modules.push(module)
+                table.extern_declaration_owners <- table.extern_declaration_owners.push(owner)
+                table.extern_declaration_counts <- table.extern_declaration_counts.push(1.usize())
+
+        def extern_effect_index_add_ref(module: sview @source, owner: sview @source, effect_ref: sview @source, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                table <- extern_effect_index_declare(module, owner, table) can Global{Read,Write}
+                return if effect_ref == ""
+                for row in 0..<min(table.extern_effect_row_modules.count, table.extern_effect_row_names.count) |table, module, owner, effect_ref|:
+                    return if table.extern_effect_row_modules[row] == module and table.extern_effect_row_owners[row] == owner and table.extern_effect_row_names[row] == effect_ref
+                table.extern_effect_row_modules <- table.extern_effect_row_modules.push(module)
+                table.extern_effect_row_owners <- table.extern_effect_row_owners.push(owner)
+                table.extern_effect_row_names <- table.extern_effect_row_names.push(effect_ref)
+
+        def extern_effect_index_has_declaration(module: sview, owner: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for row in 0..<min(table.extern_effect_modules.count, table.extern_effect_owners.count) |table, module, owner|:
+                    return true if table.extern_effect_modules[row] == module and table.extern_effect_owners[row] == owner
+                return false
+
+        def extern_declaration_index_has(module: sview, owner: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                for row in 0..<min(table.extern_declaration_modules.count, table.extern_declaration_owners.count) |table, module, owner|:
+                    return true if table.extern_declaration_modules[row] == module and table.extern_declaration_owners[row] == owner
+                return false
+
+        def extern_regular_function_owner_is_unique(module: sview, owner: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                count: mutable usize = 0
+                for symbol in table.symbols |count, module, owner|:
+                    count <- count + 1.usize() if symbol.kind == SymbolKind.Func and symbol.name == owner and symbol.module_owner == module
+                    return false if count > 1.usize()
+                return count == 1.usize()
+
+        # The scoped index is keyed by module and leaf, so it selects a declaration only
+        # when exactly one callable function owns that key and that function is an extern.
+        # Same-module extern overloads and mixed extern/regular declarations cannot be
+        # distinguished by this projection and must fail closed at scoped call sites.
+        def extern_module_owner_is_extern_only(module: sview, owner: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                function_count: mutable usize = 0
+                for symbol in table.symbols |function_count, module, owner|:
+                    function_count <- function_count + 1.usize() if symbol.kind == SymbolKind.Func and symbol.name == owner and symbol.module_owner == module
+                declaration_count: mutable usize = 0
+                for row in 0..<min(table.extern_declaration_modules.count, min(table.extern_declaration_owners.count, table.extern_declaration_counts.count)) |declaration_count, module, owner, table|:
+                    declaration_count <- table.extern_declaration_counts[row] if table.extern_declaration_modules[row] == module and table.extern_declaration_owners[row] == owner
+                return function_count == 1.usize() and declaration_count == 1.usize()
+
+        def extern_effect_index_refs(module: sview, owner: sview, table: SymbolTable&) -> darray[sview]:
+            can Memory.Allocate, Abort.Panic:
+                refs: mutable darray[sview] = []
+                for row in 0..<min(table.extern_effect_row_modules.count, min(table.extern_effect_row_owners.count, table.extern_effect_row_names.count)) |refs, table, module, owner|:
+                    if table.extern_effect_row_modules[row] == module and table.extern_effect_row_owners[row] == owner:
+                        seen: mutable bool = false
+                        for known in refs |seen, table|:
+                            seen <- true if known == table.extern_effect_row_names[row]
+                        refs.push(table.extern_effect_row_names[row]) if not seen
+                return refs
+
+        # Find the lexical module for a function from its exact symbol position. A line-zero
+        # or same-name sibling must not select another declaration's module.
+        def extern_join_module_scope(parent: sview @source, child: sview @source, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                for cursor in 0..<child.len |parent, child, table|:
+                    return child if cursor + 1.usize() < child.len and child[cursor] == 58 and child[cursor + 1.usize()] == 58
+                if parent != "":
+                    joined: mutable sview @source = ""
+                    trusted Unsafe{PointerArithmetic,RawExtern}:
+                        rebind joined, table = errorset_join_module_path(parent, child, table)
+                    return joined
+                return child
+
+        def extern_module_path_exists(module_path: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return errorset_module_symbol_exists(module_path, table)
+
+        # Resolve qualified module paths in source order: a concrete lexical candidate,
+        # then an unambiguous alias registered before the call, then a concrete root path.
+        # Unknown or ambiguous aliases fail closed instead of borrowing a same-leaf extern row.
+        def extern_qualified_module(qualifier: sview @source, caller_module: sview @source, requester: Ast::EnumAnnotation, table: lmut SymbolTable) -> (resolved: bool, module: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                return (false, "") if qualifier == ""
+                module_scope: mutable sview = caller_module
+                while module_scope != "" |module_scope, qualifier, caller_module, table|:
+                    candidate: mutable sview @source = ""
+                    trusted Unsafe{PointerArithmetic,RawExtern}:
+                        rebind candidate, table = errorset_join_module_path(module_scope, qualifier, table)
+                    return (true, candidate) if extern_module_path_exists(candidate, table)
+                    module_scope <- errorset_module_parent(module_scope)
+                alias_end: mutable usize = qualifier.len
+                for cursor in 0..<qualifier.len |alias_end, qualifier|:
+                    if cursor + 1.usize() < qualifier.len and qualifier[cursor] == 58 and qualifier[cursor + 1.usize()] == 58:
+                        alias_end <- cursor
+                        break
+                    elif qualifier[cursor] == 46:
+                        alias_end <- cursor
+                        break
+                alias_head: sview = qualifier[0:alias_end]
+                alias_row: u32 = binding_module_alias_row_before(alias_head, requester, table)
+                return (false, "") if alias_row == BINDING_MODULE_ALIAS_ROW_AMBIGUOUS
+                if alias_row != SYMBOL_INDEX_ROW_NONE:
+                    canonical: mutable sview @source = ""
+                    trusted Unsafe{PointerArithmetic,RawExtern}:
+                        rebind canonical, table = binding_resolve_module_alias_target(qualifier, requester, table)
+                    return (true, canonical) if canonical != "" and extern_module_path_exists(canonical, table)
+                    return (false, "")
+                return (true, qualifier) if extern_module_path_exists(qualifier, table)
+                return (false, "")
+
+        def extern_call_target(expression: Ast::Expr, table: lmut SymbolTable) -> (name: sview @source, qualifier: sview @source):
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, call_line):
+                        target: mutable (name: sview @source, module_path: sview @source) = ("", "")
+                        trusted Unsafe{PointerArithmetic,RawExtern}:
+                            rebind target, table = errorset_call_target(callee, table)
+                        return (target.name, target.module_path)
+                    _:
+                        return ("", "")
+
+        # Select a bare callee module only when the source's direct lexical/import bindings
+        # identify one module. Import precedence uses the exact call position; a possible
+        # import keeps this resolver closed because it could change the selected owner.
+        def extern_bare_module_for_call(name: sview, caller_module: sview, requester: Ast::EnumAnnotation, table: SymbolTable&) -> (resolved: bool, module: sview):
+            can Memory.Allocate, Abort.Panic:
+                return (false, "") if name == ""
+                call_offset_present: bool = requester.offset != 0 or requester.pos.end_offset > requester.pos.offset
+                selected: mutable sview = ""
+                best_rank: mutable usize = 0
+                found: mutable bool = false
+                ambiguous: mutable bool = false
+                selected_direct: mutable bool = false
+                for symbol in table.symbols |selected, best_rank, found, ambiguous, selected_direct, name, caller_module, requester, call_offset_present, table|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != name
+                    candidate_module: sview = symbol.module_owner
+                    direct: bool = errorset_module_is_lexical_ancestor(candidate_module, caller_module)
+                    imported: (visible: bool, scope_length: usize) = errorset_import_scope(table.definite_import_annotations, candidate_module, name, caller_module, requester.line, requester.offset, call_offset_present) if not direct else (false, 0.usize())
+                    continue if not direct and not imported.visible
+                    rank: usize = candidate_module.len if direct else imported.scope_length
+                    if not found or rank > best_rank or rank == best_rank and direct and not selected_direct:
+                        selected <- candidate_module
+                        best_rank <- rank
+                        found <- true
+                        ambiguous <- false
+                        selected_direct <- direct
+                    elif rank == best_rank and direct == selected_direct and selected != candidate_module:
+                        ambiguous <- true
+                return (false, "") if ambiguous
+                for symbol in table.symbols |selected, best_rank, found, selected_direct, name, caller_module, requester, call_offset_present, table|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != name or symbol.module_owner == selected
+                    candidate_module: sview = symbol.module_owner
+                    direct: bool = errorset_module_is_lexical_ancestor(candidate_module, caller_module)
+                    continue if direct
+                    possible_import: (visible: bool, scope_length: usize) = errorset_import_scope(table.possible_import_annotations, candidate_module, name, caller_module, requester.line, requester.offset, call_offset_present)
+                    continue if not possible_import.visible
+                    possible_rank: usize = possible_import.scope_length
+                    return (false, "") if not found or possible_rank > best_rank or (possible_rank == best_rank and not selected_direct)
+                return (true, selected) if found
+                return (false, "")
+
+        def extern_effect_add_ref(module: sview @source, owner: sview @source, effect_ref: sview @source, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if effect_ref == ""
+                while row < table.function_effect_owner.count |row: mutable usize = 0, module, owner, effect_ref, table|:
+                    return if table.function_effect_owner[row] == owner and row < table.function_effect_module.count and table.function_effect_module[row] == module and table.function_effect_name[row] == effect_ref
+                    row <- row + 1
+                table.function_effect_owner <- table.function_effect_owner.push(owner)
+                table.function_effect_name <- table.function_effect_name.push(effect_ref)
+                table.function_effect_module <- table.function_effect_module.push(module)
+                table <- index_effect_owner_rows(table) can Global{Read,Write}
+
+        def extern_effect_add_declared_ref(module: sview @source, owner: sview @source, effect_ref: sview @source, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if effect_ref == ""
+                table <- extern_effect_add_ref(module, owner, effect_ref, table) can Global{Read,Write}
+                table <- extern_effect_index_add_ref(module, owner, effect_ref, table) can Global{Read,Write}
+                via_ref: sview = effect_ref_via(effect_ref)
+                table <- extern_effect_add_ref(module, owner, via_ref, table) can Global{Read,Write} if via_ref != ""
+                table <- extern_effect_index_add_ref(module, owner, via_ref, table) can Global{Read,Write} if via_ref != ""
+
+        # Split only top-level commas so permission arguments such as Effect[A, B] and
+        # grouped refs retain their own punctuation. The source slice is backed by the parser.
+        def collect_extern_effect_row(module: sview @source, owner: sview @source, row: sview @source, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                start: mutable usize = 0
+                depth: mutable int = 0
+                for index in 0..<row.len |start, depth, owner, row, table|:
+                    byte: u8 = row[index]
+                    if depth == 0 and byte == 44:
+                        effect_ref: sview = effect_ref_trim_layout(row[start:index])
+                        table <- extern_effect_add_declared_ref(module, owner, effect_ref, table) can Global{Read,Write}
+                        start <- index + 1.usize()
+                    depth <- depth + 1 if byte == 91 or byte == 40 or byte == 123
+                    depth <- depth - 1 if depth > 0 and (byte == 93 or byte == 41 or byte == 125)
+                final_ref: sview = effect_ref_trim_layout(row[start:row.len])
+                table <- extern_effect_add_declared_ref(module, owner, final_ref, table) can Global{Read,Write}
+
         def collect_extern_effects(annotations: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                while annotation_index < annotations.count |annotation_index: usize = 0|:
+                table.extern_effect_modules <- table.extern_effect_modules.clear()
+                table.extern_effect_owners <- table.extern_effect_owners.clear()
+                table.extern_effect_row_modules <- table.extern_effect_row_modules.clear()
+                table.extern_effect_row_owners <- table.extern_effect_row_owners.clear()
+                table.extern_effect_row_names <- table.extern_effect_row_names.clear()
+                table.extern_declaration_modules <- table.extern_declaration_modules.clear()
+                table.extern_declaration_owners <- table.extern_declaration_owners.clear()
+                table.extern_declaration_counts <- table.extern_declaration_counts.clear()
+                while annotation_index < annotations.count |annotation_index: mutable usize = 0|:
                     annotation: Ast::EnumAnnotation = annotations[annotation_index]
-                    if annotation.name == "__extern_effect" or annotation.name == "__extern_effect_blocking":
-                        ref: sview = "Blocking.RawExtern" if annotation.name == "__extern_effect_blocking" else extern_effect_ref_at(annotations, annotation.line, annotation.offset)
-                        table.function_effect_owner <- table.function_effect_owner.push(annotation.owner)
-                        table.function_effect_name <- table.function_effect_name.push(ref if ref != "" else "Permission")
-                        table <- index_effect_owner_rows(table) can Global{Read,Write}
+                    if annotation.name == "__extern_decl":
+                        table <- extern_declaration_index_add(annotation.module, annotation.owner, table) can Global{Read,Write}
+                    elif annotation.name == "__extern_effect_blocking":
+                        table <- extern_effect_index_declare(annotation.module, annotation.owner, table) can Global{Read,Write}
+                        table <- extern_effect_add_ref(annotation.module, annotation.owner, "Blocking.RawExtern", table) can Global{Read,Write}
+                        table <- extern_effect_index_add_ref(annotation.module, annotation.owner, "Blocking.RawExtern", table) can Global{Read,Write}
+                    elif annotation.name == "__extern_effect":
+                        table <- extern_effect_index_declare(annotation.module, annotation.owner, table) can Global{Read,Write}
+                        complete_row: (complete: bool, text: sview) = extern_effect_row_at(annotations, annotation.owner, annotation.module, annotation.line, annotation.offset)
+                        if complete_row.complete:
+                            table <- collect_extern_effect_row(annotation.module, annotation.owner, complete_row.text, table) can Global{Read,Write}
+                        else:
+                            first_ref: sview = extern_effect_ref_at(annotations, annotation.module, annotation.line, annotation.offset)
+                            table <- extern_effect_add_declared_ref(annotation.module, annotation.owner, first_ref if first_ref != "" else "Permission", table) can Global{Read,Write}
                     annotation_index <- annotation_index + 1

@@ -321,13 +321,400 @@ extend Semantic:
                         _:
                             pass
 
+        # Rebuild the lexical module path for source-row joins. Canonical scopes store
+        # path components plus parent links, while function_effect_source_module stores
+        # the joined spelling used by the effect-source collector.
+        def fver_module_scope_path(module_scope: usize, context: GlobalAuthority&, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                return "" if module_scope == 0
+                return "" if module_scope >= context.modules.count or module_scope >= context.parents.count
+                parts: mutable darray[sview] = []
+                cursor: mutable usize = module_scope
+                while cursor != 0 |cursor, parts, context|:
+                    return "" if cursor >= context.modules.count or cursor >= context.parents.count or cursor >= context.module_starts.count or cursor >= context.module_lengths.count
+                    start: usize = context.module_starts[cursor]
+                    length: usize = context.module_lengths[cursor]
+                    return "" if start > context.modules[cursor].len or length > context.modules[cursor].len - start
+                    parts.push(context.modules[cursor][start:start + length])
+                    cursor <- context.parents[cursor]
+                bytes: mutable darray[u8] = []
+                for index in 0..<parts.count |bytes, parts|:
+                    push_str(bytes, "::") if index > 0
+                    segment: sview = parts[parts.count - index - 1.usize()]
+                    push_sview(bytes, segment)
+                return intern_joined_text(bytes, table)
+
+        # Collect exact, owner-scoped extern effects from expressions in a lambda or
+        # callback body. The resolver observes import/alias source order at each call;
+        # local/global roots are excluded before the lookup so a callback cannot borrow
+        # a same-named extern row.
+        def fver_external_call_effects(file: Ast::File&, callee: Ast::Expr, call_pos: Ast::Pos, current_module: sview, locals: darray[sview]&, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                name: sview = typestate_call_leaf(callee)
+                return false if name == "" or gp_namespace_root_is_local(callee, locals) or gp_namespace_root_is_global(callee, context, locals)
+                rebind qualifier: sview, table = typestate_call_qualifier(callee, table)
+                rebind selected: (found: bool, owner: sview), table = typestate_resolve_callable_owner(name, current_module, qualifier, call_pos, file, table)
+                return false if not selected.found or not extern_module_owner_is_extern_only(selected.owner, name, table)
+                unknown_row: mutable bool = false
+                for effect_ref in extern_effect_index_refs(selected.owner, name, table) |table, unknown_row| -> table:
+                    unknown_row <- true if effect_ref == "Permission"
+                    table <- fver_add_memo(target, effect_ref, table) if effect_ref != "" and effect_ref != "Permission" and not fver_trusted_covers_unsafe(annotations, firewalls, effect_ref)
+                return not unknown_row
+
+        # Match GP's short-circuit and pattern-binding rules when a call appears in a
+        # condition. This keeps an `is`/`as`/pattern-bound local from resolving as an
+        # imported extern in the right side of a condition or its selected branch.
+        def fver_external_condition_calls(file: Ast::File&, condition: Ast::Expr, locals: mutable darray[sview]&, current_module: sview, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Paren(inner, _):
+                        rebind result: usize, table = fver_external_condition_calls(file, inner, locals, current_module, target, context, annotations, firewalls, table)
+                        return result
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And:
+                            rebind left_count: usize, table = fver_external_condition_calls(file, left, locals, current_module, target, context, annotations, firewalls, table)
+                            rebind right_count: usize, table = fver_external_condition_calls(file, right, locals, current_module, target, context, annotations, firewalls, table)
+                            return left_count + right_count
+                        if operator == TokenKind.Or:
+                            left_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, left_locals)
+                            rebind left_count: usize, table = fver_external_condition_calls(file, left, left_locals, current_module, target, context, annotations, firewalls, table)
+                            right_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, right_locals)
+                            rebind right_count: usize, table = fver_external_condition_calls(file, right, right_locals, current_module, target, context, annotations, firewalls, table)
+                            gp_condition_bindings(condition, locals)
+                            return left_count + right_count
+                        if operator == TokenKind.Is or operator == TokenKind.As:
+                            rebind left_count: usize, table = fver_external_expr_calls(file, left, locals, current_module, target, context, annotations, firewalls, table)
+                            gp_condition_target_bindings(right, locals)
+                            return left_count
+                        rebind left_count: usize, table = fver_external_expr_calls(file, left, locals, current_module, target, context, annotations, firewalls, table)
+                        rebind right_count: usize, table = fver_external_expr_calls(file, right, locals, current_module, target, context, annotations, firewalls, table)
+                        return left_count + right_count
+                    _:
+                        rebind result: usize, table = fver_external_expr_calls(file, condition, locals, current_module, target, context, annotations, firewalls, table)
+                        return result
+
+        def fver_external_filter_calls(file: Ast::File&, condition: Ast::Expr, locals: mutable darray[sview]&, current_module: sview, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                match condition:
+                    Expr.Binary(left, operator, right, _):
+                        if operator == TokenKind.And and gp_is_bare_pattern_filter(left):
+                            gp_condition_target_bindings(left, locals)
+                            rebind result: usize, table = fver_external_condition_calls(file, right, locals, current_module, target, context, annotations, firewalls, table)
+                            return result
+                    _:
+                        pass
+                if gp_is_bare_pattern_filter(condition):
+                    gp_condition_target_bindings(condition, locals)
+                    return 0.usize()
+                rebind result: usize, table = fver_external_condition_calls(file, condition, locals, current_module, target, context, annotations, firewalls, table)
+                return result
+
+        def fver_external_for_calls(file: Ast::File&, iterable: Ast::Expr, variables: darray[sview]&, locals: darray[sview]&, current_module: sview, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                base_expression: mutable Ast::Expr = iterable
+                filter_expression: mutable Ast::Expr? = null
+                filter_guard: mutable Ast::Expr? = null
+                match iterable:
+                    Expr.Refinement(filter_base, filter_predicate, _):
+                        match filter_base:
+                            Expr.Refinement(inner_base, inner_predicate, _):
+                                base_expression <- inner_base
+                                filter_expression <- inner_predicate
+                                filter_guard <- filter_predicate
+                            _:
+                                base_expression <- filter_base
+                                filter_expression <- filter_predicate
+                    _:
+                        pass
+                rebind base_count: usize, table = fver_external_expr_calls(file, base_expression, locals, current_module, target, context, annotations, firewalls, table)
+                resolved: mutable usize = base_count
+                loop_locals: mutable darray[sview] = []
+                gp_call_locals_copy(locals, loop_locals)
+                loop_locals.extend(variables)
+                if filter_expression is filter_value:
+                    rebind filter_count: usize, table = fver_external_filter_calls(file, filter_value, loop_locals, current_module, target, context, annotations, firewalls, table)
+                    resolved <- resolved + filter_count
+                if filter_guard is guard_value:
+                    guard_locals: mutable darray[sview] = []
+                    gp_call_locals_copy(loop_locals, guard_locals)
+                    rebind guard_count: usize, table = fver_external_condition_calls(file, guard_value, guard_locals, current_module, target, context, annotations, firewalls, table)
+                    resolved <- resolved + guard_count
+                return resolved
+
+        def fver_external_callback_argument_calls(file: Ast::File&, argument: Ast::Expr, locals: darray[sview]&, current_module: sview, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                match argument:
+                    Expr.Lambda(parameters, body, _):
+                        lambda_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, lambda_locals)
+                        lambda_locals.extend(parameters)
+                        rebind result: usize, table = fver_external_body_calls(file, body, lambda_locals, current_module, target, context, annotations, firewalls, table)
+                        return result
+                    Expr.Paren(inner, _):
+                        rebind result: usize, table = fver_external_callback_argument_calls(file, inner, locals, current_module, target, context, annotations, firewalls, table)
+                        return result
+                    _:
+                        rebind result: usize, table = fver_external_expr_calls(file, argument, locals, current_module, target, context, annotations, firewalls, table)
+                        return result
+
+        def fver_external_body_calls(file: Ast::File&, body: darray[Ast::Stmt], locals: darray[sview]&, current_module: sview, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                resolved: mutable usize = 0
+                scoped_locals: mutable darray[sview] = []
+                gp_call_locals_copy(locals, scoped_locals)
+                for statement in body |resolved, scoped_locals, table|:
+                    match statement:
+                        Stmt.Expr(expression, _):
+                            rebind statement_count: usize, table = fver_external_expr_calls(file, expression, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + statement_count
+                        Stmt.VarDecl(name, _, value, _):
+                            rebind statement_count: usize, table = fver_external_expr_calls(file, value, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + statement_count
+                            scoped_locals.push(name)
+                        Stmt.Assign(place, operator, value, _):
+                            rebind place_count: usize, table = fver_external_expr_calls(file, place, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + place_count
+                            rebind value_count: usize, table = fver_external_expr_calls(file, value, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + value_count
+                            if operator == TokenKind.Assign and place is Expr.Ident(binding_name, _):
+                                scoped_locals.push(binding_name) if not gp_call_name_is_local(binding_name, scoped_locals)
+                        Stmt.Return(value, _):
+                            if value is returned:
+                                rebind return_count: usize, table = fver_external_expr_calls(file, returned, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                                resolved <- resolved + return_count
+                        Stmt.If(condition, then_body, else_body, _):
+                            then_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(scoped_locals, then_locals)
+                            rebind condition_count: usize, table = fver_external_condition_calls(file, condition, then_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + condition_count
+                            gp_condition_bindings(condition, then_locals)
+                            rebind then_count: usize, table = fver_external_body_calls(file, then_body, then_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + then_count
+                            else_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(scoped_locals, else_locals)
+                            rebind else_count: usize, table = fver_external_body_calls(file, else_body, else_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + else_count
+                        Stmt.While(condition, nested_body, _):
+                            while_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(scoped_locals, while_locals)
+                            rebind condition_count: usize, table = fver_external_condition_calls(file, condition, while_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + condition_count
+                            gp_condition_bindings(condition, while_locals)
+                            rebind body_count: usize, table = fver_external_body_calls(file, nested_body, while_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + body_count
+                        Stmt.For(_, variables, iterable, nested_body, _):
+                            rebind iterable_count: usize, table = fver_external_for_calls(file, iterable, variables, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + iterable_count
+                            loop_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(scoped_locals, loop_locals)
+                            loop_locals.extend(variables)
+                            rebind body_count: usize, table = fver_external_body_calls(file, nested_body, loop_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + body_count
+                        Stmt.Block(kind, clause, binding, nested_body, _):
+                            block_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(scoped_locals, block_locals)
+                            block_locals.push(binding) if binding != ""
+                            nested_firewalls: mutable darray[sview] = []
+                            nested_firewalls.extend(firewalls)
+                            nested_firewalls.extend(clause) if kind == "trusted"
+                            rebind body_count: usize, table = fver_external_body_calls(file, nested_body, block_locals, current_module, target, context, annotations, nested_firewalls, table)
+                            resolved <- resolved + body_count
+                        Stmt.Match(scrutinee, arms, _):
+                            rebind scrutinee_count: usize, table = fver_external_expr_calls(file, scrutinee, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + scrutinee_count
+                            for arm in arms |resolved, scoped_locals, table|:
+                                arm_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(scoped_locals, arm_locals)
+                                arm_names: mutable darray[sview] = []
+                                collect_pattern_binding_names(arm.pattern, arm_names)
+                                arm_locals.extend(arm_names)
+                                rebind guard_count: usize, table = fver_external_condition_calls(file, arm.guard, arm_locals, current_module, target, context, annotations, firewalls, table)
+                                resolved <- resolved + guard_count
+                                gp_condition_bindings(arm.guard, arm_locals)
+                                rebind arm_count: usize, table = fver_external_body_calls(file, arm.body, arm_locals, current_module, target, context, annotations, firewalls, table)
+                                resolved <- resolved + arm_count
+                        Stmt.Contract(_, expression, _):
+                            rebind contract_count: usize, table = fver_external_expr_calls(file, expression, scoped_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + contract_count
+                        _:
+                            pass
+                return resolved
+
+        def fver_external_expr_calls(file: Ast::File&, expression: Ast::Expr, locals: darray[sview]&, current_module: sview, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                resolved: mutable usize = 0
+                match expression:
+                    Expr.Call(callee, arguments, _, call_pos):
+                        rebind external_call_found: bool, table = fver_external_call_effects(file, callee, call_pos, current_module, locals, target, context, annotations, firewalls, table)
+                        resolved <- 1.usize() if external_call_found
+                        match callee:
+                            Expr.Lambda(parameters, body, _):
+                                lambda_locals: mutable darray[sview] = []
+                                gp_call_locals_copy(locals, lambda_locals)
+                                lambda_locals.extend(parameters)
+                                rebind lambda_count: usize, table = fver_external_body_calls(file, body, lambda_locals, current_module, target, context, annotations, firewalls, table)
+                                resolved <- resolved + lambda_count
+                            _:
+                                rebind callee_count: usize, table = fver_external_expr_calls(file, callee, locals, current_module, target, context, annotations, firewalls, table)
+                                resolved <- resolved + callee_count
+                        for argument in arguments |resolved, locals, table|:
+                            rebind argument_count: usize, table = fver_external_callback_argument_calls(file, argument, locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + argument_count
+                    Expr.StaticEffectCall(candidates: candidates, arguments: arguments, _):
+                        for candidate in candidates |resolved, locals, table|:
+                            for capture in candidate.captures |resolved, locals, table|:
+                                rebind capture_count: usize, table = fver_external_expr_calls(file, capture, locals, current_module, target, context, annotations, firewalls, table)
+                                resolved <- resolved + capture_count
+                        for argument in arguments |resolved, locals, table|:
+                            rebind argument_count: usize, table = fver_external_callback_argument_calls(file, argument, locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + argument_count
+                    Expr.Field(object, _, _) | Expr.Scope(object, _, _) | Expr.Paren(object, _) | Expr.Unary(_, object, _) | Expr.Move(object, _) | Expr.RegionNew(object, _, _):
+                        rebind child_count: usize, table = fver_external_expr_calls(file, object, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + child_count
+                    Expr.Binary(left, _, right, _) | Expr.Index(left, right, _):
+                        rebind left_count: usize, table = fver_external_expr_calls(file, left, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + left_count
+                        rebind right_count: usize, table = fver_external_expr_calls(file, right, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + right_count
+                    Expr.Refinement(base, predicate, _):
+                        rebind base_count: usize, table = fver_external_expr_calls(file, base, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + base_count
+                        predicate_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, predicate_locals)
+                        rebind predicate_count: usize, table = fver_external_condition_calls(file, predicate, predicate_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + predicate_count
+                    Expr.Slice(object, low, high, _):
+                        rebind object_count: usize, table = fver_external_expr_calls(file, object, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + object_count
+                        rebind low_count: usize, table = fver_external_expr_calls(file, low, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + low_count
+                        rebind high_count: usize, table = fver_external_expr_calls(file, high, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + high_count
+                    Expr.IndexN(object, arguments, _):
+                        rebind object_count: usize, table = fver_external_expr_calls(file, object, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + object_count
+                        for argument in arguments |resolved, locals, table|:
+                            rebind argument_count: usize, table = fver_external_expr_calls(file, argument, locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + argument_count
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _) | Expr.SetLit(elements, _):
+                        for element in elements |resolved, locals, table|:
+                            rebind element_count: usize, table = fver_external_expr_calls(file, element, locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + element_count
+                    Expr.DictLit(entries, _):
+                        for entry in entries |resolved, locals, table|:
+                            rebind key_count: usize, table = fver_external_expr_calls(file, entry.key, locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + key_count
+                            rebind value_count: usize, table = fver_external_expr_calls(file, entry.value, locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + value_count
+                    Expr.Construct(_, fields, _) | Expr.RecordUpdate(_, fields, _):
+                        match expression:
+                            Expr.RecordUpdate(base, _, _):
+                                rebind base_count: usize, table = fver_external_expr_calls(file, base, locals, current_module, target, context, annotations, firewalls, table)
+                                resolved <- resolved + base_count
+                            _:
+                                pass
+                        for field in fields |resolved, locals, table|:
+                            rebind field_count: usize, table = fver_external_expr_calls(file, field.value, locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + field_count
+                    Expr.If(condition, yes, no, _):
+                        branch_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, branch_locals)
+                        rebind condition_count: usize, table = fver_external_condition_calls(file, condition, branch_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + condition_count
+                        gp_condition_bindings(condition, branch_locals)
+                        rebind yes_count: usize, table = fver_external_expr_calls(file, yes, branch_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + yes_count
+                        else_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, else_locals)
+                        rebind no_count: usize, table = fver_external_expr_calls(file, no, else_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + no_count
+                    Expr.Match(scrutinee, arms, _) | Expr.Catch(scrutinee, arms, _):
+                        rebind scrutinee_count: usize, table = fver_external_expr_calls(file, scrutinee, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + scrutinee_count
+                        for arm in arms |resolved, locals, table|:
+                            arm_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, arm_locals)
+                            arm_names: mutable darray[sview] = []
+                            collect_pattern_binding_names(arm.pattern, arm_names)
+                            arm_locals.extend(arm_names)
+                            rebind guard_count: usize, table = fver_external_condition_calls(file, arm.guard, arm_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + guard_count
+                            gp_condition_bindings(arm.guard, arm_locals)
+                            rebind arm_count: usize, table = fver_external_body_calls(file, arm.body, arm_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + arm_count
+                    Expr.GetElse(guarded, recovery, _):
+                        rebind guarded_count: usize, table = fver_external_expr_calls(file, guarded, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + guarded_count
+                        recovery_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, recovery_locals)
+                        rebind recovery_count: usize, table = fver_external_body_calls(file, recovery, recovery_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + recovery_count
+                    Expr.Comprehension(variable, iterable, condition, body, _, query_scope_id):
+                        rebind iterable_count: usize, table = fver_external_expr_calls(file, iterable, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + iterable_count
+                        query_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, query_locals)
+                        query_locals.push(variable)
+                        gp_query_binders_add(query_scope_id, table, query_locals)
+                        rebind condition_count: usize, table = fver_external_filter_calls(file, condition, query_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + condition_count
+                        rebind body_count: usize, table = fver_external_expr_calls(file, body, query_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + body_count
+                    Expr.Block(statements, value, _, _):
+                        block_locals: mutable darray[sview] = []
+                        gp_call_locals_copy(locals, block_locals)
+                        rebind statements_count: usize, table = fver_external_body_calls(file, statements, block_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + statements_count
+                        rebind value_count: usize, table = fver_external_expr_calls(file, value, block_locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- resolved + value_count
+                    Expr.Lambda(_, _, _) | Expr.IntLit(_, _) | Expr.FloatLit(_, _) | Expr.StringLit(_, _) | Expr.CharLit(_, _) | Expr.BoolLit(_, _) | Expr.Ident(_, _) | Expr.ShorthandMember(_, _) | Expr.Absent | Expr.Invalid:
+                        pass
+                    _:
+                        pass
+                return resolved
+
+        # Count only the calls represented in this statement's current GP edge list.
+        # Nested statement bodies are walked separately by fver_body_rows; match guards
+        # are the exception because that pass adds them to the scrutinee's edge list.
+        def fver_external_statement_calls(file: Ast::File&, statement: Ast::Stmt, locals: mutable darray[sview]&, current_module: sview, target: sview @source, context: GlobalAuthority&, annotations: darray[Ast::EnumAnnotation]&, firewalls: darray[sview]&, table: lmut SymbolTable) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                resolved: mutable usize = 0
+                match statement:
+                    Stmt.If(condition, _, _, _ ) | Stmt.While(condition, _, _):
+                        rebind condition_count: usize, table = fver_external_condition_calls(file, condition, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- condition_count
+                    Stmt.For(_, variables, iterable, _, _):
+                        rebind iterable_count: usize, table = fver_external_for_calls(file, iterable, variables, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- iterable_count
+                    Stmt.Match(scrutinee, arms, _):
+                        rebind scrutinee_count: usize, table = fver_external_expr_calls(file, scrutinee, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- scrutinee_count
+                        for arm in arms |resolved, locals, table|:
+                            arm_locals: mutable darray[sview] = []
+                            gp_call_locals_copy(locals, arm_locals)
+                            arm_names: mutable darray[sview] = []
+                            collect_pattern_binding_names(arm.pattern, arm_names)
+                            arm_locals.extend(arm_names)
+                            rebind guard_count: usize, table = fver_external_condition_calls(file, arm.guard, arm_locals, current_module, target, context, annotations, firewalls, table)
+                            resolved <- resolved + guard_count
+                    Stmt.Block(_, _, _, _, _):
+                        pass
+                    _:
+                        single: darray[Ast::Stmt] = [statement]
+                        rebind body_count: usize, table = fver_external_body_calls(file, single, locals, current_module, target, context, annotations, firewalls, table)
+                        resolved <- body_count
+                return resolved
+
         # TARGET's rows from one BODY: Global when it reads or writes a global, and every
         # unique direct callee's row. (The declared `can[...]` and the `can` block clauses
         # are recorded by the caller, which holds them rooted at the AST.)
-        def fver_body_rows(body: darray[Ast::Stmt], locals: darray[sview]&, target: sview @source, declarations: darray[Ast::Decl]&, globals: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, inline_index: InlineEffectIndex&, firewalls: darray[sview]&, table: lmut SymbolTable, module_scope: usize, context: mutable GlobalAuthority&) -> void:
+        def fver_body_rows(file: Ast::File&, body: darray[Ast::Stmt], locals: darray[sview]&, target: sview @source, declarations: darray[Ast::Decl]&, globals: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, inline_index: InlineEffectIndex&, firewalls: darray[sview]&, table: lmut SymbolTable, module_scope: usize, context: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
                 context.module_scope <- module_scope
                 caller_slot: usize = ga_resolve_function(target, module_scope, false, context)
+                rebind current_module: sview @source, table = fver_module_scope_path(module_scope, context, table)
                 read_locals: mutable darray[sview] = []
                 read_locals.extend(locals)
                 write_locals: mutable darray[sview] = []
@@ -337,6 +724,10 @@ extend Semantic:
                 for statement in body |table, read_locals, write_locals, call_locals, context| -> table:
                     callees: mutable darray[usize] = []
                     call_edges_from: mutable darray[usize] = []
+                    statement_locals: mutable darray[sview] = []
+                    gp_call_locals_copy(call_locals, statement_locals)
+                    rebind resolved_extern_call_count: usize, table = fver_external_statement_calls(file, statement, statement_locals, current_module, target, context, annotations, firewalls, table)
+                    resolved_extern_calls: mutable usize = resolved_extern_call_count
                     direct: mutable darray[Ast::Stmt] = []
                     match statement:
                         Stmt.Block(_, _, _, _, _):
@@ -362,20 +753,20 @@ extend Semantic:
                             block_locals: mutable darray[sview] = []
                             gp_call_locals_copy(call_locals, block_locals)
                             block_locals.push(binding) if binding != ""
-                            table <- fver_body_rows(nested_body, block_locals, target, declarations, globals, annotations, inline_index, nested_firewalls, table, module_scope, context)
+                            table <- fver_body_rows(file, nested_body, block_locals, target, declarations, globals, annotations, inline_index, nested_firewalls, table, module_scope, context)
                         Stmt.If(condition, then_body, else_body, _):
                             then_locals: mutable darray[sview] = []
                             gp_call_locals_copy(call_locals, then_locals)
                             gp_condition_calls(condition, caller_slot, context, then_locals, call_edges_from, callees, table)
                             else_locals: mutable darray[sview] = []
                             gp_call_locals_copy(call_locals, else_locals)
-                            table <- fver_body_rows(then_body, then_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
-                            table <- fver_body_rows(else_body, else_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
+                            table <- fver_body_rows(file, then_body, then_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
+                            table <- fver_body_rows(file, else_body, else_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
                         Stmt.While(condition, nested_body, _):
                             while_locals: mutable darray[sview] = []
                             gp_call_locals_copy(call_locals, while_locals)
                             gp_condition_calls(condition, caller_slot, context, while_locals, call_edges_from, callees, table)
-                            table <- fver_body_rows(nested_body, while_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
+                            table <- fver_body_rows(file, nested_body, while_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
                         Stmt.For(_, variables, iterable, nested_body, _):
                             base_expression: mutable Ast::Expr = iterable
                             filter_expression: mutable Ast::Expr? = null
@@ -403,12 +794,12 @@ extend Semantic:
                                 guard_locals: mutable darray[sview] = []
                                 guard_locals.extend(loop_locals)
                                 gp_condition_calls(guard_value, caller_slot, context, guard_locals, call_edges_from, callees, table)
-                            table <- fver_body_rows(nested_body, loop_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
+                            table <- fver_body_rows(file, nested_body, loop_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
                         Stmt.Match(scrutinee, arms, _):
                             scrutinee_call_locals: mutable darray[sview] = []
                             gp_call_locals_copy(call_locals, scrutinee_call_locals)
                             gp_expression_calls(scrutinee, caller_slot, context, scrutinee_call_locals, call_edges_from, callees, table)
-                            for arm in arms |table, callees, context| -> table:
+                            for arm in arms |table, callees, call_edges_from, context| -> table:
                                 arm_locals: mutable darray[sview] = []
                                 gp_call_locals_copy(call_locals, arm_locals)
                                 arm_names: mutable darray[sview] = []
@@ -430,11 +821,11 @@ extend Semantic:
                                 body_locals: mutable darray[sview] = []
                                 body_locals.extend(arm_locals)
                                 gp_condition_bindings(arm.guard, body_locals)
-                                table <- fver_body_rows(arm.body, body_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
+                                table <- fver_body_rows(file, arm.body, body_locals, target, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
                         _:
                             single_statement: darray[Ast::Stmt] = [statement]
                             gp_body_calls(single_statement, caller_slot, context, call_locals, call_edges_from, callees, table)
-                    for callee_slot in callees |table, context| -> table:
+                    for callee_slot in callees |table, context, resolved_extern_calls| -> table:
                         if callee_slot < context.functions.count:
                             start: usize = table.effect_canonical_function_row_start[callee_slot]
                             end: usize = start + table.effect_canonical_function_row_count[callee_slot]
@@ -442,25 +833,28 @@ extend Semantic:
                                 effect: sview = table.effect_canonical_refs[table.effect_canonical_row_ref[row]]
                                 table <- fver_add_memo(target, effect, table) if not fver_trusted_covers_unsafe(annotations, firewalls, effect)
                         elif callee_slot == GLOBAL_AUTHORITY_NONE:
-                            for candidate in 0..<context.functions.count |table| -> table:
-                                start: usize = table.effect_canonical_function_row_start[candidate]
-                                end: usize = start + table.effect_canonical_function_row_count[candidate]
-                                for row in start..<end |table| -> table:
-                                    effect: sview = table.effect_canonical_refs[table.effect_canonical_row_ref[row]]
-                                    table <- fver_add_memo(target, effect, table) if not fver_trusted_covers_unsafe(annotations, firewalls, effect)
+                            if resolved_extern_calls > 0:
+                                resolved_extern_calls <- resolved_extern_calls - 1
+                            else:
+                                for candidate in 0..<context.functions.count |table| -> table:
+                                    start: usize = table.effect_canonical_function_row_start[candidate]
+                                    end: usize = start + table.effect_canonical_function_row_count[candidate]
+                                    for row in start..<end |table| -> table:
+                                        effect: sview = table.effect_canonical_refs[table.effect_canonical_row_ref[row]]
+                                        table <- fver_add_memo(target, effect, table) if not fver_trusted_covers_unsafe(annotations, firewalls, effect)
 
         # Complete the rows of the function NAME (a free function or callable extern
         # declared exactly once) and merge them into TARGET's. An ambiguous or unknown name
         # contributes nothing. A function is marked done BEFORE its body is read, so a
         # recursive call graph terminates (a cycle member sees the partial row — never a
         # wider one than stage0's).
-        def fver_function_rows(name: sview, target: sview @source, declarations: darray[Ast::Decl]&, globals: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, inline_index: InlineEffectIndex&, table: lmut SymbolTable, module_scope: usize, context: mutable GlobalAuthority&) -> void:
+        def fver_function_rows(file: Ast::File&, name: sview, target: sview @source, declarations: darray[Ast::Decl]&, globals: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, inline_index: InlineEffectIndex&, table: lmut SymbolTable, module_scope: usize, context: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
                 return if name == ""
                 finished: bool = any done in table.fn_value_effect_done where done == name
                 if not finished:
                     return if fver_function_count(table, name) != 1
-                    table <- fver_declared_rows(name, declarations, globals, annotations, inline_index, table, module_scope, context)
+                    table <- fver_declared_rows(file, name, declarations, globals, annotations, inline_index, table, module_scope, context)
                 return if target == "" or target == name
                 # The memo grows while it is read (TARGET's rows), so the scan is bounded by
                 # the count at entry.
@@ -472,7 +866,7 @@ extend Semantic:
                     row <- row + 1
 
         # NAME's own rows from its declaration (the memo stores the DECLARATION's name).
-        def fver_declared_rows(name: sview, declarations: darray[Ast::Decl]&, globals: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, inline_index: InlineEffectIndex&, table: lmut SymbolTable, module_scope: usize, context: mutable GlobalAuthority&) -> void:
+        def fver_declared_rows(file: Ast::File&, name: sview, declarations: darray[Ast::Decl]&, globals: darray[sview]&, annotations: darray[Ast::EnumAnnotation]&, inline_index: InlineEffectIndex&, table: lmut SymbolTable, module_scope: usize, context: mutable GlobalAuthority&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table, context| -> table:
                     match declaration:
@@ -496,7 +890,7 @@ extend Semantic:
                                 locals: mutable darray[sview] = []
                                 for parameter in parameters |locals|:
                                     locals.push(parameter.name)
-                                table <- fver_body_rows(body, locals, function_name, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
+                                table <- fver_body_rows(file, body, locals, function_name, declarations, globals, annotations, inline_index, firewalls, table, module_scope, context)
                         Decl.Extern(extern_name, param_start, arity, variadic, callable, return_type_name, decorators, line):
                             if extern_name == name:
                                 table.fn_value_effect_done <- table.fn_value_effect_done.push(extern_name)
@@ -508,9 +902,9 @@ extend Semantic:
                                         table <- fver_add_memo(extern_name, extern_ref, table) if extern_ref != "Permission"
                                     row <- row + 1
                         Decl.Module(module_name, module_body, module_line):
-                            table <- fver_declared_rows(name, module_body, globals, annotations, inline_index, table, canonical_effect_module(module_scope, module_name, table), context)
+                            table <- fver_declared_rows(file, name, module_body, globals, annotations, inline_index, table, canonical_effect_module(module_scope, module_name, table), context)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- fver_declared_rows(name, scoped_body, globals, annotations, inline_index, table, module_scope, context)
+                            table <- fver_declared_rows(file, name, scoped_body, globals, annotations, inline_index, table, module_scope, context)
                         _:
                             pass
 

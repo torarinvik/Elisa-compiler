@@ -528,7 +528,7 @@ qualified_module_match = compact_inline(function_section(source_text, "callable_
 if not all(fragment in qualified_module_match for fragment in (
         "callable_module_path_matches_suffix(symbol.module_owner, scope_module, callee_qualifier)",
         "callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, enclosing_module)",
-        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, 4294967295, table)",
+        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, before_offset, table)",
         "semantic_possible_import_alias_target_prefix(symbol.module_owner, alias.raw_target, alias.scope, alias.offset, table)",
         "candidate_module == callee_qualifier and callable_named_visible_declaration_in_module(table, annotations, name, candidate_module, enclosing_module)")) or "module_last_segment(candidate_module)" in qualified_module_match:
     raise SystemExit("Try qualified overload ranking must use exact lexical modules, the shared global alias winner, and an exact root path")

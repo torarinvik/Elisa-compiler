@@ -248,18 +248,23 @@ if not all(fragment in param_call_target for fragment in (
         "alias_class: (found: bool, branch: bool, offset: u32, order_index: usize) = type_path_alias_branch_at(alias_names[alias_index], alias_scopes[alias_index], alias_occurrence, table)",
         "type_path_canonical_alias_target(alias_raw_targets[alias_index], alias_names, alias_raw_targets, alias_scopes, alias_uncertain, table, alias_scopes[alias_index], alias_class.offset, alias_class.order_index, alias_class.branch, true)",
         "alias_uncertain[alias_index] <- true",
-        "type_path_alias_selection(alias_name, alias_names, alias_targets, alias_scopes, alias_uncertain, table)",
+        "eligible_alias_rows.push(errorset_import_precedes_call(alias_row, call_line, call_offset, call_offset_present))",
+        "eligible_possible_rows.push(errorset_import_precedes_call(possible_annotation, call_line, call_offset, call_offset_present))",
+        "type_path_alias_selection(alias_name, alias_names, alias_targets, alias_scopes, alias_uncertain, table, \"\", 0, 0, false, false, eligible_alias_rows, eligible_possible_rows)",
         "not selected.known")) or not all(fragment in param_qualified_module for fragment in (
         "errorset_module_symbol_exists(candidate, table)",
-        "errorset_qualified_alias_target(qualifier, table)",
+        "errorset_qualified_alias_target(lookup_qualifier, call_line, call_offset, call_offset_present, table)",
         "alias.target",
-        "errorset_module_symbol_exists(qualifier, table)")) or \
+        "errorset_module_symbol_exists(lookup_qualifier, table)")) or \
         "table.possible_import_annotations" not in type_path_alias_selection or \
-        param_qualified_module.find("errorset_module_symbol_exists(candidate, table)") > param_qualified_module.find("errorset_qualified_alias_target(qualifier, table)") or \
-        param_qualified_module.find("errorset_qualified_alias_target(qualifier, table)") > param_qualified_module.find("errorset_module_symbol_exists(qualifier, table)") or \
+        "eligible_alias_rows.count > 0 and not eligible_alias_rows[alias_index]" not in type_path_alias_selection or \
+        "eligible_possible_rows.count > 0 and not eligible_possible_rows[possible_index]" not in type_path_alias_selection or \
+        param_qualified_module.find("errorset_module_symbol_exists(candidate, table)") > param_qualified_module.find("errorset_qualified_alias_target(lookup_qualifier, call_line, call_offset, call_offset_present, table)") or \
+        param_qualified_module.find("errorset_qualified_alias_target(lookup_qualifier, call_line, call_offset, call_offset_present, table)") > param_qualified_module.find("errorset_module_symbol_exists(lookup_qualifier, table)") or \
+        "errorset_qualified_module_for_call(qualified_module, current_module, call_line, call_offset, call_offset_present, table)" not in param_scope_lookup or \
         "module_last_segment" in param_qualified_module:
     raise SystemExit("qualified ErrorSet calls must resolve an exact module identity after lexical, alias, and root lookup")
 
 print(
-    '{"source_bound": true, "candidate_order": 5, "declaration_id_cycle_guard": true, "raw_import_path": true, "static_import_branch": true, "nested_expression_walk": true, "declaration_defaults": true, "runtime_contracts_only": true, "runtime_value_children_only": true, "errorset_parameter_module_identity": true, "qualified_call_path": true, "alias_qualified_call_path": true}'
+    '{"source_bound": true, "candidate_order": 5, "declaration_id_cycle_guard": true, "raw_import_path": true, "static_import_branch": true, "nested_expression_walk": true, "declaration_defaults": true, "runtime_contracts_only": true, "runtime_value_children_only": true, "errorset_parameter_module_identity": true, "qualified_call_path": true, "alias_qualified_call_path": true, "qualified_alias_source_cutoff": true}'
 )

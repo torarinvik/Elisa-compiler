@@ -30,6 +30,7 @@ IMPL_CONFORMANCE = ROOT / "src/semantic/check_impl_conformance.elisa"
 POSITIVE = HERE / "global_authority_origin_policy.elisa"
 NEGATIVE = HERE / "global_authority_origin_policy_rejected.elisa"
 SMOKE = ROOT / "test/parity/mutable_global_grants_smoke.py"
+GLOBAL_AUTHORITY_SMOKE = ROOT / "test/parity/mutable_global_authority_smoke.sh"
 ALIAS_FIXTURE = ROOT / "test/fixtures/effects/qualified_permission_using_alias.elisa"
 ALIAS_CONFLICT_FIXTURE = ROOT / "test/fixtures/effects/global_authority_nested_alias_conflict.elisa"
 STATIC_BRANCH_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_static_branch_alias_conflict.elisa"
@@ -120,11 +121,11 @@ if 'marker.owner=="__static_if_branch"' not in alias_static_branch or \
         'owner:"__static_if_branch"' not in static_branch_marker_parser or \
         "identity_id:branch_identity" not in static_branch_marker_parser or \
         "identity_id:4294967295" not in static_branch_marker_parser or \
-        'parser.record_static_if_branch_markers(marker_name,detail_name,parser.current_module,token.line,token.start)' not in alias_static_branch_parser or \
+        'parser.record_static_if_branch_markers(marker_name,detail_name,token.line,token.start)' not in alias_static_branch_parser or \
         'parser.record_static_if_branch_rows("__using_alias_static_branch",alias_name,alias_token)' not in using_alias_parser or \
         'parser.record_static_if_branch_rows("__from_member_static_branch",member,token)' not in import_member_parser or \
         'parser.record_static_if_branch_rows("__binding_wildcard_import_static_branch",full_text,target_token)' not in wildcard_import_parser or \
-        'parser.record_static_if_branch_markers("__private_member_static_branch",member_name,parser.current_module,section_line,member_position.offset)' not in private_member_parser or \
+        'parser.record_static_if_branch_markers("__private_member_static_branch",member_name,section_line,member_position.offset)' not in private_member_parser or \
         'parser.record_static_if_branch_rows("__const_static_branch",Lexer::text_or_empty(name_token,parser.source,parser.source_length),token)' not in bare_const_member_parser or \
         'parser.record_static_if_branch_rows("__const_static_branch",Lexer::text_or_empty(name_token,parser.source,parser.source_length),token)' not in const_declaration_parser or \
         "branch_row:u32=parser.static_if_lines.count.u32()-1" not in declaration_static_if_parser or \
@@ -243,6 +244,10 @@ alias_root = alias_resolve.find("raw_root:usize=ga_child(state,0,first)")
 if min(alias_lexical, alias_choice_position, alias_suffix, alias_root) < 0 or not alias_lexical < alias_choice_position < alias_suffix < alias_root:
     raise SystemExit("GlobalAuthority text paths must try complete lexical candidates, alias suffixes, then root spelling")
 alias_target = compact(function_section(authority_text, "ga_module_alias_target_resolve"))
+exact_target_path = alias_target.find("exact_path:usize=ga_module_path_exact(path,declaration_scope,state)")
+alias_target_choice = alias_target.find("ga_module_alias_choice(first,declaration_scope,state,depth,before_offset)")
+if exact_target_path < 0 or alias_target_choice < 0 or exact_target_path >= alias_target_choice:
+    raise SystemExit("GlobalAuthority alias targets must prefer a complete concrete path in their declaration module")
 if "ga_module_alias_choice(first,declaration_scope,state,depth,before_offset)" not in alias_target or \
         "ga_module_alias_target_resolve(target.path,alias.scope,state,depth+1,alias_row.offset)" not in alias_target:
     raise SystemExit("GlobalAuthority alias-target recursion drops its source registration cutoff")
@@ -256,6 +261,12 @@ if not all(fragment in alias_choice for fragment in (
 text_module = compact(function_section(authority_text, "ga_text_module"))
 if "ga_module_alias_resolve(path,lexical_scope,state,0,true,before_offset)" not in text_module:
     raise SystemExit("GlobalAuthority text module lookup drops its source offset")
+global_authority_smoke = GLOBAL_AUTHORITY_SMOKE.read_text()
+if 'run_case alias_target_concrete_before_alias ' not in global_authority_smoke or \
+        "using Other as A" not in global_authority_smoke or \
+        "using A::Foo as F" not in global_authority_smoke or \
+        "return F::Bar::hot" not in global_authority_smoke:
+    raise SystemExit("GlobalAuthority alias-target precedence regression must exercise a concrete path shadowed by an alias")
 for helper_name in ("ga_module", "ga_module_readonly"):
     helper = compact(function_section(authority_text, helper_name))
     if "ga_module_parts_resolve(parts,resolved_scope,state,depth,Ast::expr_pos(expression).offset)" not in helper:

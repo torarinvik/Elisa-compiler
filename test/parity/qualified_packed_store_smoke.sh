@@ -18,6 +18,7 @@
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/test/proofs/check_packed_new_store_owner_identity.py" || exit $?
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
@@ -68,7 +69,7 @@ for name in qualified_packed_ctor_without_store qualified_packed_match_without_s
         echo "FAIL $name: stage1 rejected, but not with the packed store diagnostic:"; head -3 "$WORK/s1.err"; fail=1; }
 done
 
-for spec in packed_samename_plain_enum_match:7 packed_value_match_two_binders:42 packed_value_match_two_binders_module:42 \
+for spec in packed_samename_plain_enum_match:7 packed_value_match_two_binders:42 packed_value_match_two_binders_module:42 packed_new_store_owner_line_zero:0 \
             packed_inline_common_match_slot:12 packed_inline_common_nested_is:42; do
     name="${spec%%:*}"; want="${spec##*:}"
     src="$ROOT/test/repro/$name.pos.elisa"

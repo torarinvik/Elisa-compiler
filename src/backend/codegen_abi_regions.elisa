@@ -6,36 +6,35 @@
 extend Backend:
     private:
 
-            # `def f[@r](xs: darray[T] @r)` — a REGION PARAMETER. The body's `@r`-annotated locals
-            # allocate from the caller's region, and the values they build are written back into
-            # caller-visible storage, so the region must be threaded in. Nothing in such a
-            # signature need be a reference: `easm_prune_conditional_inputs[@r]` takes a
-            # `mutable darray[Function] @r` BY VALUE (the header is copied; the element storage is
-            # shared) and rebuilds each element's `inputs`/`params` darrays. With no arena
-            # threaded, stage1 gave it an auto region, allocated those darrays there, and
-            # `arena_free`d the region on return -- handing the caller freed memory. That is the
-            # intermittent (~3%) `easm_lockstep_parse_smoke` segfault: whether the munmap'd block
-            # had been remapped by the time `verify_function_header` read it was pure luck.
-            #
-            # Measured against stage0, which is the same rule: `def prune[@r](boxes: mutable
-            # darray[Box] @r)` emits `void @prune(%DynArray__Box, ptr)`; drop the `[@r]` and the
-            # trailing `ptr` disappears.
-        def line_has_region_parameter(line: u32, structs: StructTable&) -> bool:
-            return BackendRegionParameterScan::first_matching_index(structs.regions.region_param_lines, line) < structs.regions.region_param_lines.count
+        # Count only the region parameters owned by this exact function. Their order is the
+        # hidden caller-arena order, and same-line declarations after `#line` resets are distinct.
+        def region_parameter_count(line: u32, owner_offset: u32, structs: StructTable&) -> usize can[Abort.Panic]:
+            row_count: usize = structs.regions.region_param_lines.count
+            return 0.usize() if:
+                row_count != structs.regions.region_param_owner_offsets.count
+                row_count != structs.regions.region_param_names.count
+            count: mutable usize = 0.usize()
+            for row in 0..<row_count |count, line, owner_offset, structs|:
+                count <- count + 1.usize() if structs.regions.region_param_lines[row] == line and structs.regions.region_param_owner_offsets[row] == owner_offset
+            return count
 
 
 
 
         # The hidden caller-region slot selected by a generic region name such as `r` in
         # `new[r] value`. The parser records one row per `@r` parameter in declaration order;
-        # the ABI uses that same order for the hidden arena values. Return -1 when the current
-        # function has no matching region parameter so ordinary named Arena locals and packed
-        # store selectors keep their existing paths.
-        def region_parameter_index(line: u32, name: sview, structs: StructTable&) -> i64 can[Abort.Panic]:
-            slot: mutable i64 = 0
-            for row in 0..<structs.regions.region_param_lines.count |slot, row, line, name, structs|:
-                continue if structs.regions.region_param_lines[row] != line
-                if row < structs.regions.region_param_names.count and structs.regions.region_param_names[row] == name:
+        # the ABI uses that same order for the hidden arena values. Match the enclosing function
+        # by both logical line and source offset so same-line siblings cannot borrow its slots.
+        def region_parameter_index(line: u32, owner_offset: u32, name: sview, caller_region_parameter_start: i64, structs: StructTable&) -> i64 can[Abort.Panic]:
+            row_count: usize = structs.regions.region_param_lines.count
+            return -1 if:
+                caller_region_parameter_start < 0
+                row_count != structs.regions.region_param_owner_offsets.count
+                row_count != structs.regions.region_param_names.count
+            slot: mutable i64 = caller_region_parameter_start
+            for row in 0..<row_count |slot, row, line, owner_offset, name, structs|:
+                continue if structs.regions.region_param_lines[row] != line or structs.regions.region_param_owner_offsets[row] != owner_offset
+                if structs.regions.region_param_names[row] == name:
                     return slot
                 slot <- slot + 1
             return -1
@@ -86,19 +85,24 @@ extend Backend:
 
 
 
-        def region_fact_row(name: sview, line: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+        def region_fact_row(name: sview, owner: sview, line: u32, owner_offset: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+            return -1 if:
+                structs.regions.region_fact_names.count != structs.regions.region_fact_owners.count
+                structs.regions.region_fact_names.count != structs.regions.region_fact_offsets.count
+                structs.regions.region_fact_names.count != structs.regions.region_fact_lines.count
             row: mutable i64 = line_chain_first(structs.regions.region_fact_line_buckets, structs.regions.region_fact_line_next, structs.regions.region_fact_lines, line)
-            while row >= 0 |row, structs, name, line|:
-                return row if row.usize() < structs.regions.region_fact_names.count and structs.regions.region_fact_names[row.usize()] == name
+            while row >= 0 |row, structs, name, owner, line, owner_offset|:
+                if row.usize() < structs.regions.region_fact_names.count:
+                    return row if structs.regions.region_fact_names[row.usize()] == name and structs.regions.region_fact_owners[row.usize()] == owner and structs.regions.region_fact_offsets[row.usize()] == owner_offset
                 row <- line_chain_next(structs.regions.region_fact_line_buckets, structs.regions.region_fact_line_next, structs.regions.region_fact_lines, line, row)
             return -1
 
 
 
 
-        def region_flags_for_function(params: darray[ParamDecl]&, body: darray[Stmt], line: u32, structs: mutable StructTable&, flags: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def region_flags_for_function(name: sview, owner: sview, params: darray[ParamDecl]&, body: darray[Stmt], line: u32, owner_offset: u32, structs: mutable StructTable&, flags: mutable darray[bool]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
-                row: i64 = region_fact_row_from_params(params, line, structs)
+                row: i64 = region_fact_row_from_params(name, owner, params, line, owner_offset, structs)
                 if row >= 0:
                     start: usize = structs.regions.region_fact_starts[row.usize()]
                     for parameter_index in 0..<params.count |flags, structs, start, row|:
@@ -114,16 +118,25 @@ extend Backend:
                 # a fact graph belonging to another function.
                 scratch_graph_slot: usize = structs.regions.region_fact_names.count
                 previous_graph_slot: usize = structs.regions.region_alias_graph_active_slot
+                previous_owner: sview = structs.visibility.current_owner
+                structs.visibility.current_owner <- owner
                 body_region_parameter_flags(params, body, scratch_graph_slot, structs, flags)
+                structs.visibility.current_owner <- previous_owner
                 structs.regions.region_alias_graph_active_slot <- previous_graph_slot
 
 
 
 
-        def region_fact_row_from_params(params: darray[ParamDecl]&, line: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+        def region_fact_row_from_params(name: sview, owner: sview, params: darray[ParamDecl]&, line: u32, owner_offset: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+            return -1 if:
+                structs.regions.region_fact_lines.count != structs.regions.region_fact_offsets.count
+                structs.regions.region_fact_lines.count != structs.regions.region_fact_names.count
+                structs.regions.region_fact_lines.count != structs.regions.region_fact_owners.count
+                structs.regions.region_fact_lines.count != structs.regions.region_fact_counts.count
             row: mutable i64 = line_chain_first(structs.regions.region_fact_line_buckets, structs.regions.region_fact_line_next, structs.regions.region_fact_lines, line)
-            while row >= 0 |row, structs, params, line|:
-                return row if structs.regions.region_fact_counts[row.usize()] == params.count
+            while row >= 0 |row, structs, name, owner, params, line, owner_offset|:
+                if row.usize() < structs.regions.region_fact_offsets.count:
+                    return row if structs.regions.region_fact_names[row.usize()] == name and structs.regions.region_fact_owners[row.usize()] == owner and structs.regions.region_fact_offsets[row.usize()] == owner_offset and structs.regions.region_fact_counts[row.usize()] == params.count
                 row <- line_chain_next(structs.regions.region_fact_line_buckets, structs.regions.region_fact_line_next, structs.regions.region_fact_lines, line, row)
             return -1
 
@@ -133,7 +146,7 @@ extend Backend:
         # Number of hidden caller-region parameters required by this function. Return storage and
         # explicit function region parameters remain signature facts; reference-parameter slots
         # come only from `body_region_parameter_flags`, matching stage0's inference pass.
-        def signature_arena_count(params: darray[ParamDecl]&, return_value_type: ValueType, body: darray[Stmt], line: u32, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def signature_arena_count(name: sview, owner: sview, params: darray[ParamDecl]&, return_value_type: ValueType, body: darray[Stmt], line: u32, owner_offset: u32, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 # A returned value has one ownership region even when several structural
                 # predicates describe it (Parser is both an AST-bearing value and a struct
@@ -145,10 +158,10 @@ extend Backend:
                 arena_managed: bool = params_manage_arena(params, structs)
                 count: mutable usize = 1 if value_type_returns_caller_region(return_value_type, structs) and not arena_managed else 0
                 flags: mutable darray[bool] = []
-                region_flags_for_function(params, body, line, structs, flags)
+                region_flags_for_function(name, owner, params, body, line, owner_offset, structs, flags)
                 for parameter_index in 0..<flags.count |flags, count|:
                     count <- count + 1.usize() if flags[parameter_index]
-                count <- count + 1.usize() if line_has_region_parameter(line, structs)
+                count <- count + region_parameter_count(line, owner_offset, structs)
                 return count
 
 
@@ -209,6 +222,19 @@ extend Backend:
                 return false if fn_index < 0 or fn_index.usize() >= fns.param_start.count
                 flat_index: usize = fns.param_start[fn_index.usize()] + parameter_position
                 return flat_index < fns.param_region_slots.count and fns.param_region_slots[flat_index]
+
+
+
+
+        # Number of hidden caller arenas that precede the return and explicit-region suffixes.
+        # These are the body-derived parameter slots that direct calls push first.
+        def function_parameter_region_count(fns: FnTable&, fn_index: i64) -> usize can[Abort.Panic]:
+            can Abort.Panic:
+                return 0 if fn_index < 0 or fn_index.usize() >= fns.param_start.count or fn_index.usize() >= fns.param_count.count
+                count: mutable usize = 0
+                for parameter_position in 0..<fns.param_count[fn_index.usize()] |count, fns, fn_index|:
+                    count <- count + 1 if function_parameter_has_region(fns, fn_index, parameter_position)
+                return count
 
 
 

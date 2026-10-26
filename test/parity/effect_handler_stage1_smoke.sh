@@ -13,6 +13,11 @@ if [[ ! -x "$STAGE1" ]]; then
     exit 1
 fi
 python3 "$ROOT/test/proofs/check_effect_generic_owner_line_zero.py"
+python3 "$ROOT/test/proofs/check_effect_install_owner_identity.py"
+python3 "$ROOT/test/proofs/check_effect_target_identity.py"
+python3 "$ROOT/test/proofs/check_effect_operation_identity.py"
+python3 "$ROOT/test/proofs/check_effect_module_alias_identity.py"
+python3 "$ROOT/test/proofs/check_effect_install_annotation_index.py"
 
 run_positive() {
     local fixture="$1"
@@ -183,11 +188,17 @@ run_positive "static_handler_capture.elisa"
 run_positive "static_handler_scope_named.elisa"
 run_positive "static_handler_qualified.elisa"
 run_positive "static_handler_qualified_generic.elisa"
+run_positive "chained_module_alias_effect_identity.elisa"
 run_positive "handler_default_capture.elisa"
 run_positive "handler_tail_resume.elisa"
 run_positive "handler_resume_tail.elisa"
 run_positive "nested_handler_forwarding.elisa"
 run_positive "nested_handler_capture_forwarding.elisa"
+run_positive "nested_install_same_line_identity.elisa"
+run_positive "handler_same_leaf_effect_identity.elisa"
+run_positive "operation_identity_same_leaf_signature.elisa"
+run_positive "install_same_name_handler_identity.elisa"
+run_positive "module_local_handler_helper_cross_module.elisa"
 run_positive "static_handler_via.elisa"
 run_positive "static_handler_generic_explicit.elisa"
 run_positive "handler_via_install.elisa"
@@ -227,6 +238,12 @@ run_positive "helper_error_union_capture.elisa"
 run_positive "helper_mutual_recursive.elisa"
 run_native_contract "helper_mutual_recursive.elisa"
 run_native_result "helper_namespace.elisa" 22
+run_native_result "nested_install_same_line_identity.elisa" 42
+run_native_result "handler_same_leaf_effect_identity.elisa" 42
+run_native_result "operation_identity_same_leaf_signature.elisa" 42
+run_native_result "install_same_name_handler_identity.elisa" 42
+run_native_result "module_local_handler_helper_cross_module.elisa" 42
+run_native_result "chained_module_alias_effect_identity.elisa" 42
 run_native_result "helper_explicit_chain.elisa" 31
 run_native_result "helper_qualified_chain.elisa" 47
 run_native_result "helper_multiple_effects.elisa" 33
@@ -248,8 +265,13 @@ run_positive "via_grant_covers_both_rows.elisa"
 run_positive "via_grant_bare_block.elisa"
 run_positive "via_grant_bare_multi_rows.elisa"
 run_zero_overhead_ir "static_handler_capture.elisa"
+run_zero_overhead_ir "nested_install_same_line_identity.elisa"
+run_zero_overhead_ir "handler_same_leaf_effect_identity.elisa"
+run_zero_overhead_ir "install_same_name_handler_identity.elisa"
+run_zero_overhead_ir "module_local_handler_helper_cross_module.elisa"
 run_zero_overhead_ir "static_handler_scope_named.elisa"
 run_zero_overhead_ir "static_handler_qualified.elisa"
+run_zero_overhead_ir "chained_module_alias_effect_identity.elisa"
 run_zero_overhead_ir "static_handler_qualified_generic.elisa"
 run_zero_overhead_ir "handler_default_capture.elisa"
 run_zero_overhead_ir "nested_handler_forwarding.elisa"
@@ -355,6 +377,13 @@ run_negative "missing_operation.neg.elisa" 'effect "Tick" has no operation "pong
 run_negative "unhandled_effect.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
 run_negative "handler_signature_mismatch.neg.elisa" 'handler "Bad" operation "ping" does not match the abstract operation signature'
 run_negative "abstract_operation_value.neg.elisa" 'abstract effect operation Tick.ping cannot be used as a value'
+run_negative "operation_identity_same_leaf_missing_call.neg.elisa" 'effect "Tick" has no operation "ping"'
+run_negative "operation_identity_same_leaf_missing_value.neg.elisa" 'effect "Tick" has no operation "ping"'
+run_negative "operation_identity_same_leaf_generic_arity.neg.elisa" 'abstract effect specialization Tick expects 1 type argument(s), got 2'
+run_negative "operation_identity_ambiguous_bare.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
+run_negative "late_duplicate_bare_operation_identity.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
+run_negative "late_nested_effect_identity.neg.elisa" 'handler "H" operation "ping" does not match the abstract operation signature'
+run_negative "helper_ambiguous_bare_operation_identity.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
 run_negative "handler_specialization_call_mismatch.neg.elisa" 'abstract effect operation Writer[sview].write does not match the active handler specialization'
 run_negative "handler_qualified_namespace_mismatch.neg.elisa" 'abstract effect operation A::Tick.ping does not match the active handler specialization; runtime effect dispatch is unavailable in the zero-overhead effect subset'
 # Both modules declare the same effect family AND the same operation, so nothing but
@@ -387,6 +416,9 @@ run_negative "handler_target_via_unknown_permission.neg.elisa" 'unknown permissi
 run_negative "permission_member_mismatch.neg.elisa" 'permission "LocalConsole" has no member "Read"'
 run_negative "handler_implementation_access.neg.elisa" 'compiler-generated static effect operation "__handler__H__ping" is private'
 run_negative "handler_capture_arity.neg.elisa" 'effect handler "Sink" requires 1 capture argument(s), got 0'
+run_negative "nested_install_same_line_capture_count.neg.elisa" 'effect handler "Add" requires 1 capture argument(s), got 0'
+run_negative "handler_unresolved_effect_target_identity.neg.elisa" 'unknown interface "Tick"'
+run_negative "install_handler_outside_module.neg.elisa" 'undefined identifier "H"'
 run_negative "handler_nested_resume.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
 run_negative "handler_resume_non_tail.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
 run_negative "handler_resume_nonvoid.neg.elisa" 'handler "Bad" operation "ping" is outside the zero-overhead resumable subset'
@@ -405,5 +437,6 @@ if grep -Fq 'requires can[RootTarget::slot.Read]' "$static_alias_log"; then
     exit 1
 fi
 run_positive "global_authority_active_static_alias.elisa"
+run_positive "global_authority_nested_qualified_path.elisa"
 
 echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"

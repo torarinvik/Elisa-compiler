@@ -30,141 +30,547 @@ extend Semantic:
                         return sview("", 0, 0)
 
         # Whether some `ensures FUNCTION.PARAM => state` postcondition exists.
-        def fn_has_typestate_ensures(postconditions: darray[Ast::TypestatePostcondition]&, function_name: sview, parameter_name: sview) -> bool:
+        def fn_has_typestate_ensures(postconditions: darray[Ast::TypestatePostcondition]&, function_name: sview, parameter_name: sview, function_line: u32, function_offset: u32) -> bool:
             can Abort.Panic:
-                return any pc in postconditions where pc.function_name == function_name and pc.parameter_name == parameter_name
+                return any pc in postconditions where pc.function_name == function_name and pc.parameter_name == parameter_name and pc.line == function_line and pc.function_offset == function_offset
 
         # The declared `ensures FUNCTION.PARAM => STATE` target state, or "".
-        def fn_typestate_ensured_state(postconditions: darray[Ast::TypestatePostcondition]&, function_name: sview, parameter_name: sview) -> sview:
+        def fn_typestate_ensured_state(postconditions: darray[Ast::TypestatePostcondition]&, function_name: sview, parameter_name: sview, function_line: u32, function_offset: u32) -> sview:
             can Memory.Allocate, Abort.Panic:
                 for pc in postconditions:
-                    return pc.state if pc.function_name == function_name and pc.parameter_name == parameter_name
+                    return pc.state if pc.function_name == function_name and pc.parameter_name == parameter_name and pc.line == function_line and pc.function_offset == function_offset
                 return sview("", 0, 0)
 
-        # Whether an extern declares a `=> state` postcondition for the param at POSITION.
-        def extern_has_postcondition_at(postconditions: darray[Ast::TypestatePostcondition]&, extern_name: sview, position: u32) -> bool:
+        # Whether this exact extern declaration declares a `=> state` postcondition for the
+        # parameter at POSITION. A same-named `def` is a different owner and cannot restore
+        # an opaque extern's state.
+        def extern_has_postcondition_at(postconditions: darray[Ast::TypestatePostcondition]&, extern_name: sview, position: u32, extern_line: u32, extern_offset: u32) -> bool:
             can Abort.Panic:
-                return any pc in postconditions where pc.function_name == extern_name and pc.position == position
+                return any pc in postconditions where pc.function_name == extern_name and pc.position == position and pc.line == extern_line and pc.function_offset == extern_offset
 
-        # Whether the extern named EXTERN_NAME has a MUTABLE-ref parameter at POSITION.
-        def extern_param_mutable_at(extern_names: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, extern_name: sview, position: u32) -> bool:
+        # Whether an extern can accept this call's argument labels and count. This intentionally
+        # mirrors the backend's call-shape filter; types are not ranked here, so same-shape
+        # overloads remain ambiguous and fail closed below.
+        def extern_call_shape_matches(extern_index: usize, argument_count: usize, argument_names: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_variadics: darray[bool]&, extern_params: darray[Ast::ExternParam]&) -> bool:
             can Abort.Panic:
-                probe: mutable usize = 0
-                while probe < extern_names.count |probe|:
-                    if extern_names[probe] == extern_name and position.usize() < extern_arities[probe].usize():
-                        slot: usize = extern_starts[probe] + position.usize()
-                        return extern_params[slot].mutable_ref if slot < extern_params.count else false
-                    probe <- probe + 1
+                return false if extern_index >= extern_starts.count or extern_index >= extern_arities.count or extern_index >= extern_variadics.count
+                return false if argument_names.count != 0 and argument_names.count != argument_count
+                fixed_count: usize = extern_arities[extern_index].usize()
+                parameter_start: usize = extern_starts[extern_index]
+                return false if parameter_start > extern_params.count or fixed_count > extern_params.count - parameter_start
+                variadic: bool = extern_variadics[extern_index]
+                return false if variadic and (any argument_name in argument_names where argument_name != "")
+                return false if argument_count > fixed_count and not variadic
+                has_named_argument: bool = any argument_name in argument_names where argument_name != ""
+                if not has_named_argument:
+                    return false if argument_count < fixed_count
+                    return true
+                assigned: mutable darray[bool] = [false for _slot in 0..<fixed_count]
+                next_position: mutable usize = 0
+                for source_position in 0..<argument_count |assigned, next_position, argument_names, parameter_start, fixed_count, variadic, extern_params|:
+                    argument_name: sview = argument_names[source_position] if argument_names.count != 0 else ""
+                    if source_position >= fixed_count:
+                        return false if not variadic or argument_name != ""
+                        continue
+                    selected: mutable usize = fixed_count
+                    if argument_name != "":
+                        for parameter_position in 0..<fixed_count |selected, argument_name, parameter_start, extern_params|:
+                            if extern_params[parameter_start + parameter_position].name == argument_name:
+                                selected <- parameter_position
+                                break
+                    else:
+                        while next_position < fixed_count and assigned[next_position] |next_position, assigned|:
+                            next_position <- next_position + 1
+                        selected <- next_position
+                        next_position <- next_position + 1 if next_position < fixed_count
+                    return false if selected >= fixed_count or assigned[selected]
+                    assigned[selected] <- true
+                for parameter_position in 0..<fixed_count |assigned|:
+                    return false if not assigned[parameter_position]
+                return true
+
+        # Whether a def can accept this call's shape. If any same-module def is a viable
+        # candidate, this pass cannot know whether the backend selects it or the extern by
+        # argument types, so it declines the warning.
+        def function_call_shape_matches(function_index: usize, argument_count: usize, argument_names: darray[sview]&, function_param_starts: darray[usize]&, function_arities: darray[u32]&, function_variadics: darray[bool]&, function_params: darray[Ast::ParamDecl]&) -> bool:
+            can Abort.Panic:
+                return false if function_index >= function_param_starts.count or function_index >= function_arities.count or function_index >= function_variadics.count
+                return false if argument_names.count != 0 and argument_names.count != argument_count
+                fixed_count: usize = function_arities[function_index].usize()
+                parameter_start: usize = function_param_starts[function_index]
+                return false if parameter_start > function_params.count or fixed_count > function_params.count - parameter_start
+                variadic: bool = function_variadics[function_index]
+                return false if variadic and (any argument_name in argument_names where argument_name != "")
+                return false if argument_count > fixed_count and not variadic
+                has_named_argument: bool = any argument_name in argument_names where argument_name != ""
+                if not has_named_argument:
+                    if argument_count < fixed_count:
+                        for parameter_position in argument_count..<fixed_count |parameter_position, parameter_start, function_params|:
+                            return false if not function_params[parameter_start + parameter_position].has_default
+                    return true
+                assigned: mutable darray[bool] = [false for _slot in 0..<fixed_count]
+                next_position: mutable usize = 0
+                for source_position in 0..<argument_count |assigned, next_position, argument_names, parameter_start, fixed_count, variadic, function_params|:
+                    argument_name: sview = argument_names[source_position] if argument_names.count != 0 else ""
+                    if source_position >= fixed_count:
+                        return false if not variadic or argument_name != ""
+                        continue
+                    selected: mutable usize = fixed_count
+                    if argument_name != "":
+                        for parameter_position in 0..<fixed_count |selected, argument_name, parameter_start, function_params|:
+                            if function_params[parameter_start + parameter_position].name == argument_name:
+                                selected <- parameter_position
+                                break
+                    else:
+                        while next_position < fixed_count and assigned[next_position] |next_position, assigned|:
+                            next_position <- next_position + 1
+                        selected <- next_position
+                        next_position <- next_position + 1 if next_position < fixed_count
+                    return false if selected >= fixed_count or assigned[selected]
+                    assigned[selected] <- true
+                for parameter_position in 0..<fixed_count |assigned, parameter_start, function_params|:
+                    return false if not assigned[parameter_position] and not function_params[parameter_start + parameter_position].has_default
+                return true
+
+        def typestate_call_leaf(callee: Ast::Expr) -> sview:
+            can Abort.Panic:
+                match callee:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Scope(_, name, _):
+                        return name
+                    Expr.Paren(inner, _):
+                        return typestate_call_leaf(inner)
+                    _:
+                        return ""
+
+        # Preserve the complete namespace spelling from a qualified call. The shared
+        # callable resolver expands lexical namespaces and module aliases against this path.
+        def typestate_module_path(expression: Ast::Expr, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Scope(base, name, _):
+                        rebind prefix: sview @source, table = typestate_module_path(base, table)
+                        return "" if prefix == ""
+                        bytes: mutable darray[u8] = []
+                        bytes.reserve(prefix.len + 2.usize() + name.len)
+                        for offset in 0..<prefix.len |bytes, prefix|:
+                            bytes.push(prefix[offset])
+                        bytes.push(58)
+                        bytes.push(58)
+                        for offset in 0..<name.len |bytes, name|:
+                            bytes.push(name[offset])
+                        joined: sview @source = intern_joined_text(bytes, table)
+                        return joined
+                    Expr.Paren(inner, _):
+                        rebind inner_path: sview @source, table = typestate_module_path(inner, table)
+                        return inner_path
+                    _:
+                        return ""
+
+        def typestate_call_qualifier(callee: Ast::Expr, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Scope(base, _, _):
+                        rebind qualifier: sview @source, table = typestate_module_path(base, table)
+                        return qualifier
+                    Expr.Paren(inner, _):
+                        rebind qualifier: sview @source, table = typestate_call_qualifier(inner, table)
+                        return qualifier
+                    _:
+                        return ""
+
+        def typestate_import_row(annotation: Ast::EnumAnnotation) -> bool:
+            can Abort.Panic:
+                return annotation.owner == "__from_member" or annotation.owner == "__from_src" or annotation.name == "__using_member" or annotation.name == "__using" or annotation.name == "__binding_wildcard_import" or annotation.name == "__using_alias" or annotation.name == "__using_alias_target"
+
+        # Preserve declarations and visibility metadata, but expose only imports already
+        # written before this call. Import visibility is source ordered even when display
+        # lines reset with #line directives.
+        def typestate_import_annotations_before_call(annotations: darray[Ast::EnumAnnotation]&, call_position: Ast::Pos, file: Ast::File&, table: SymbolTable&) -> darray[Ast::EnumAnnotation]:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable darray[Ast::EnumAnnotation] = []
+                call_offset_present: bool = call_position.offset != 0 or call_position.end_offset > call_position.offset
+                for annotation in annotations |result, call_position, call_offset_present, file, table|:
+                    inactive_static_import: mutable bool = false
+                    if typestate_import_row(annotation):
+                        inactive_static_import <- pma_import_annotation_in_inactive_static_branch(annotation, table.protocol_annotations, file, table)
+                    result.push(annotation) if not inactive_static_import and (not typestate_import_row(annotation) or errorset_import_precedes_call(annotation, call_position.line, call_position.offset, call_offset_present))
+                return result
+
+        # An unresolved import that precedes this call could change a bare callable's
+        # owner. A later row cannot retroactively claim the call.
+        def typestate_possible_import_may_select(name: sview, lexical_module: sview, possible_imports: darray[Ast::EnumAnnotation]&) -> bool:
+            can Abort.Panic:
+                for annotation in possible_imports:
+                    continue if not errorset_module_is_lexical_ancestor(annotation.module, lexical_module)
+                    return true if annotation.owner == "__from_member" and annotation.name == name
+                    return true if annotation.name == "__binding_wildcard_import" or annotation.name == "__using"
                 return false
 
-        # Scan an expression for an extern call widening PARAM; emit at the call line.
-        def typestate_widen_scan(expression: Ast::Expr, function_name: sview @source, param: sview @source, extern_names: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, postconditions: darray[Ast::TypestatePostcondition]&, table: lmut SymbolTable) -> void:
+        # Return one module owner only when ordinary callable lookup can establish it.
+        # Qualified references use the shared alias/namespace resolver. Bare references
+        # prefer the nearest lexical declaration, then a unique visible import; possible
+        # imports and multiple imported owners fail closed.
+        def typestate_function_candidate_may_be_active(file: Ast::File&, name: sview, symbol: Symbol, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                branch: (known: bool, active: bool) = pma_static_if_function_branch_selection(file, name, symbol, table, 0)
+                return not branch.known or branch.active
+
+        def typestate_named_visible_declaration_in_module(file: Ast::File&, table: SymbolTable&, annotations: darray[Ast::EnumAnnotation]&, name: sview, module: sview, enclosing_module: sview) -> bool:
+            can Abort.Panic:
+                for symbol in table.symbols |file, table, annotations, name, module, enclosing_module|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != name or symbol.module_owner != module
+                    continue if not typestate_function_candidate_may_be_active(file, name, symbol, table)
+                    return true if callable_function_declaration_visible(annotations, name, module, symbol.line, symbol.offset, enclosing_module)
+                return false
+
+        def typestate_resolve_callable_owner(name: sview, lexical_module: sview, qualifier: sview @source, call_position: Ast::Pos, file: Ast::File&, table: lmut SymbolTable) -> (found: bool, owner: sview):
+            can Memory.Allocate, Abort.Panic:
+                return (false, "") if name == ""
+                annotations: darray[Ast::EnumAnnotation] = typestate_import_annotations_before_call(table.protocol_annotations, call_position, file, table)
+                if qualifier != "":
+                    owners: mutable darray[sview] = []
+                    for symbol in table.symbols |owners, annotations, lexical_module, qualifier, name, file, table|:
+                        continue if symbol.kind != SymbolKind.Func or symbol.name != name
+                        continue if not typestate_function_candidate_may_be_active(file, name, symbol, table)
+                        if callable_qualified_module_matches_candidate(annotations, symbol.module_owner, lexical_module, qualifier, name, table, call_position.offset):
+                            owners.push(symbol.module_owner) if not (any owner in owners where owner == symbol.module_owner)
+                    return (false, "") if owners.count != 1.usize()
+                    return (true, owners[0])
+
+                module_scope: mutable sview = lexical_module
+                while true |module_scope, annotations, lexical_module, name, file, table|:
+                    if typestate_named_visible_declaration_in_module(file, table, annotations, name, module_scope, lexical_module):
+                        return (true, module_scope)
+                    break if module_scope == ""
+                    module_scope <- try_noncall_module_parent(module_scope)
+
+                possible_imports: darray[Ast::EnumAnnotation] = typestate_import_annotations_before_call(table.possible_import_annotations, call_position, file, table)
+                return (false, "") if typestate_possible_import_may_select(name, lexical_module, possible_imports)
+                imported_owners: mutable darray[sview] = []
+                for symbol in table.symbols |imported_owners, annotations, lexical_module, name, file, table|:
+                    continue if symbol.kind != SymbolKind.Func or symbol.name != name
+                    continue if not typestate_function_candidate_may_be_active(file, name, symbol, table)
+                    continue if not callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)
+                    wildcard: (found: bool, matches: bool) = callable_first_wildcard_imported_row(annotations, table, name, symbol.module_owner, lexical_module)
+                    import_visible: bool = wildcard.matches if wildcard.found else callable_program_selective_import_row_visible(annotations, name, symbol.module_owner, lexical_module)
+                    continue if not import_visible
+                    imported_owners.push(symbol.module_owner) if not (any owner in imported_owners where owner == symbol.module_owner)
+                return (false, "") if imported_owners.count != 1.usize()
+                return (true, imported_owners[0])
+
+        # Resolve the source-level shape after the call's namespace owner is known. A unique
+        # extern that accepts this call is usable only when no same-owner def accepts it and
+        # no second extern has the same shape.
+        def extern_owner_index_at(extern_names: darray[sview]&, extern_modules: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_variadics: darray[bool]&, extern_params: darray[Ast::ExternParam]&, function_names: darray[sview]&, function_modules: darray[sview]&, function_param_starts: darray[usize]&, function_arities: darray[u32]&, function_variadics: darray[bool]&, function_params: darray[Ast::ParamDecl]&, extern_name: sview, resolved_module: sview, argument_count: usize, argument_names: darray[sview]&) -> usize:
+            can Abort.Panic:
+                for fn_index in 0..<function_names.count:
+                    if function_names[fn_index] == extern_name and fn_index < function_modules.count and function_modules[fn_index] == resolved_module and function_call_shape_matches(fn_index, argument_count, argument_names, function_param_starts, function_arities, function_variadics, function_params):
+                        return extern_names.count
+                selected: mutable usize = extern_names.count
+                for index in 0..<extern_names.count |selected, extern_name, resolved_module, argument_count, argument_names|:
+                    if extern_names[index] == extern_name and extern_modules[index] == resolved_module and extern_call_shape_matches(index, argument_count, argument_names, extern_starts, extern_arities, extern_variadics, extern_params):
+                        return extern_names.count if selected < extern_names.count
+                        selected <- index
+                return selected
+
+        # Map a source argument back to the selected extern's formal position. Named arguments
+        # need this mapping before the mutability and postcondition rows can be queried.
+        def extern_call_parameter_position_at(extern_index: usize, source_position: usize, argument_names: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&) -> usize:
+            can Abort.Panic:
+                return 0 if extern_index >= extern_starts.count or extern_index >= extern_arities.count
+                return source_position if argument_names.count == 0
+                fixed_count: usize = extern_arities[extern_index].usize()
+                parameter_start: usize = extern_starts[extern_index]
+                assigned: mutable darray[bool] = [false for _slot in 0..<fixed_count]
+                next_position: mutable usize = 0
+                for current_source in 0..<argument_names.count |assigned, next_position, source_position, argument_names, fixed_count, parameter_start, extern_params|:
+                    argument_name: sview = argument_names[current_source]
+                    if current_source >= fixed_count:
+                        return fixed_count if current_source == source_position
+                        continue
+                    selected: mutable usize = fixed_count
+                    if argument_name != "":
+                        for parameter_position in 0..<fixed_count |selected, argument_name, parameter_start, extern_params|:
+                            if extern_params[parameter_start + parameter_position].name == argument_name:
+                                selected <- parameter_position
+                                break
+                    else:
+                        while next_position < fixed_count and assigned[next_position] |next_position, assigned|:
+                            next_position <- next_position + 1
+                        selected <- next_position
+                        next_position <- next_position + 1 if next_position < fixed_count
+                    return fixed_count if selected >= fixed_count or assigned[selected]
+                    return selected if current_source == source_position
+                    assigned[selected] <- true
+                return fixed_count
+
+        # Whether one selected extern declaration has a MUTABLE-ref parameter at POSITION.
+        def extern_param_mutable_at(extern_index: usize, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, position: u32) -> bool:
+            can Abort.Panic:
+                return false if extern_index >= extern_starts.count or extern_index >= extern_arities.count
+                return false if position.usize() >= extern_arities[extern_index].usize()
+                slot: usize = extern_starts[extern_index] + position.usize()
+                return extern_params[slot].mutable_ref if slot < extern_params.count else false
+
+        # Scan an expression once for calls that widen any typestate parameter.
+        def typestate_widen_scan(expression: Ast::Expr, file: Ast::File&, function_name: sview @source, typestate_params: darray[Ast::ParamDecl]&, current_module: sview, extern_names: darray[sview]&, extern_modules: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_variadics: darray[bool]&, extern_lines: darray[u32]&, extern_offsets: darray[u32]&, extern_params: darray[Ast::ExternParam]&, function_names: darray[sview]&, function_modules: darray[sview]&, function_param_starts: darray[usize]&, function_arities: darray[u32]&, function_variadics: darray[bool]&, function_params: darray[Ast::ParamDecl]&, postconditions: darray[Ast::TypestatePostcondition]&, widening_param_indices: mutable darray[usize]&, widening_positions: mutable darray[Ast::Pos]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
-                        called: sview = ident_name_of(callee)
-                        if called != "" and (any e in extern_names where e == called):
-                            position: mutable usize = 0
-                            while position < arguments.count |position, table| -> table:
-                                is_param: bool = ident_name_of(arguments[position]) == param
-                                pos32: u32 = position.u32()
-                                widens: bool = is_param and extern_param_mutable_at(extern_names, extern_starts, extern_arities, extern_params, called, pos32) and not extern_has_postcondition_at(postconditions, called, pos32)
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypestateWidenedByCall, name: param, pos: call_line, line: call_line.line, expected: function_name, actual: ""}) if widens
-                                position <- position + 1
-                        for argument in arguments |table| -> table:
-                            table <- typestate_widen_scan(argument, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                        called: sview = typestate_call_leaf(callee)
+                        qualifier: mutable sview = ""
+                        resolved_owner: mutable (found: bool, owner: sview) = (false, "")
+                        if called != "":
+                            rebind qualifier, table = typestate_call_qualifier(callee, table)
+                            rebind resolved_owner, table = typestate_resolve_callable_owner(called, current_module, qualifier, call_line, file, table)
+                        extern_index: usize = extern_owner_index_at(extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, called, resolved_owner.owner, arguments.count, argument_names) if resolved_owner.found else extern_names.count
+                        if extern_index < extern_names.count:
+                            for position in 0..<arguments.count |table, widening_param_indices, widening_positions| -> table:
+                                argument_name: sview = ident_name_of(arguments[position])
+                                continue if not (any typestate_param in typestate_params where typestate_param.name == argument_name)
+                                parameter_position: usize = extern_call_parameter_position_at(extern_index, position, argument_names, extern_starts, extern_arities, extern_params)
+                                pos32: u32 = parameter_position.u32()
+                                widens: bool = extern_param_mutable_at(extern_index, extern_starts, extern_arities, extern_params, pos32) and not extern_has_postcondition_at(postconditions, called, pos32, extern_lines[extern_index], extern_offsets[extern_index])
+                                if widens:
+                                    for typestate_param_index in 0..<typestate_params.count |widening_param_indices, widening_positions, typestate_params, argument_name, call_line|:
+                                        if typestate_params[typestate_param_index].name == argument_name:
+                                            already_recorded: mutable bool = false
+                                            for widening_index in 0..<widening_param_indices.count |already_recorded, widening_param_indices, widening_positions, typestate_param_index, call_line|:
+                                                if widening_param_indices[widening_index] == typestate_param_index and widening_positions[widening_index].line == call_line.line and widening_positions[widening_index].offset == call_line.offset:
+                                                    already_recorded <- true
+                                                    break
+                                            if not already_recorded:
+                                                widening_param_indices.push(typestate_param_index)
+                                                widening_positions.push(call_line)
+                        # A method/field call can have an effectful receiver. Scan the
+                        # callee after this call, once, so the current call is diagnosed only here.
+                        table <- typestate_widen_scan(callee, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        for argument in arguments |table, widening_param_indices, widening_positions| -> table:
+                            table <- typestate_widen_scan(argument, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                     Expr.Binary(left, operator, right, line):
-                        table <- typestate_widen_scan(left, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
-                        table <- typestate_widen_scan(right, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                        table <- typestate_widen_scan(left, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(right, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                     Expr.Unary(operator, operand, line):
-                        table <- typestate_widen_scan(operand, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                        table <- typestate_widen_scan(operand, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Move(operand, line) | Expr.RegionNew(operand, region, line):
+                        table <- typestate_widen_scan(operand, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                     Expr.Paren(inner, line):
-                        table <- typestate_widen_scan(inner, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                        table <- typestate_widen_scan(inner, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, line):
+                        for candidate in candidates |table|:
+                            for capture in candidate.captures |table|:
+                                table <- typestate_widen_scan(capture, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        for argument in arguments |table|:
+                            table <- typestate_widen_scan(argument, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Field(object, field, line) | Expr.Scope(object, field, line):
+                        table <- typestate_widen_scan(object, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Index(object, index, line):
+                        table <- typestate_widen_scan(object, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(index, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Slice(object, low, high, line):
+                        table <- typestate_widen_scan(object, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(low, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(high, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.IndexN(object, arguments, line):
+                        table <- typestate_widen_scan(object, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        for argument in arguments |table|:
+                            table <- typestate_widen_scan(argument, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Array(elements, line) | Expr.Tuple(elements, line) | Expr.SetLit(elements, line):
+                        for element in elements |table|:
+                            table <- typestate_widen_scan(element, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.DictLit(entries, line):
+                        for entry in entries |table|:
+                            table <- typestate_widen_scan(entry.key, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            table <- typestate_widen_scan(entry.value, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Construct(type_expression, fields, line):
+                        for field in fields |table|:
+                            table <- typestate_widen_scan(field.value, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.RecordUpdate(base, fields, line):
+                        table <- typestate_widen_scan(base, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        for field in fields |table|:
+                            table <- typestate_widen_scan(field.value, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.If(condition, then_expression, else_expression, line):
+                        table <- typestate_widen_scan(condition, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(then_expression, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(else_expression, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Match(scrutinee, arms, line) | Expr.Catch(scrutinee, arms, line):
+                        table <- typestate_widen_scan(scrutinee, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        for arm in arms |table|:
+                            table <- typestate_widen_scan(arm.guard, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            table <- typestate_widen_statements(arm.body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Comprehension(variable, iterable, condition, body, line, scope_id):
+                        table <- typestate_widen_scan(iterable, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(condition, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Refinement(base, predicate, line):
+                        table <- typestate_widen_scan(base, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(predicate, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.GetElse(guarded, recovery, line):
+                        table <- typestate_widen_scan(guarded, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_statements(recovery, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    Expr.Block(block_statements, value, captures, line):
+                        table <- typestate_widen_statements(block_statements, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        table <- typestate_widen_scan(value, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                    # Lambda bodies are deferred and execute only if the closure is invoked.
                     _:
                         pass
 
-        def typestate_widen_statements(statements: darray[Ast::Stmt], function_name: sview @source, param: sview @source, extern_names: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, postconditions: darray[Ast::TypestatePostcondition]&, table: lmut SymbolTable) -> void:
+        def typestate_widen_statements(statements: darray[Ast::Stmt], file: Ast::File&, function_name: sview @source, typestate_params: darray[Ast::ParamDecl]&, current_module: sview, extern_names: darray[sview]&, extern_modules: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_variadics: darray[bool]&, extern_lines: darray[u32]&, extern_offsets: darray[u32]&, extern_params: darray[Ast::ExternParam]&, function_names: darray[sview]&, function_modules: darray[sview]&, function_param_starts: darray[usize]&, function_arities: darray[u32]&, function_variadics: darray[bool]&, function_params: darray[Ast::ParamDecl]&, postconditions: darray[Ast::TypestatePostcondition]&, widening_param_indices: mutable darray[usize]&, widening_positions: mutable darray[Ast::Pos]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in statements |table| -> table:
+                for statement in statements |table, widening_param_indices, widening_positions| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- typestate_widen_scan(expression, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            table <- typestate_widen_scan(expression, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- typestate_widen_scan(value, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            table <- typestate_widen_scan(value, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         Stmt.Assign(target, operator, value, line):
-                            table <- typestate_widen_scan(value, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            table <- typestate_widen_scan(target, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            table <- typestate_widen_scan(value, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         Stmt.Return(value, line):
                             if value is returned:
-                                table <- typestate_widen_scan(returned, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                                table <- typestate_widen_scan(returned, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         Stmt.If(condition, then_body, else_body, line):
-                            table <- typestate_widen_statements(then_body, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
-                            table <- typestate_widen_statements(else_body, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            table <- typestate_widen_scan(condition, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            table <- typestate_widen_statements(then_body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            table <- typestate_widen_statements(else_body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         Stmt.While(condition, body, line):
-                            table <- typestate_widen_statements(body, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            table <- typestate_widen_scan(condition, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            table <- typestate_widen_statements(body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         Stmt.For(bind, variables, iterable, body, line):
-                            table <- typestate_widen_statements(body, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            table <- typestate_widen_scan(iterable, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            table <- typestate_widen_statements(body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        Stmt.Match(scrutinee, arms, line):
+                            table <- typestate_widen_scan(scrutinee, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                            for arm in arms |table, widening_param_indices, widening_positions| -> table:
+                                table <- typestate_widen_scan(arm.guard, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                                table <- typestate_widen_statements(arm.body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                        Stmt.Contract(kind, expression, line):
+                            table <- typestate_widen_scan(expression, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         Stmt.Block(kind, clause, binding, body, line):
-                            table <- typestate_widen_statements(body, function_name, param, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            if kind == "static":
+                                continue if not typestate_static_scope_may_be_active(file, line, current_module, table)
+                            table <- typestate_widen_statements(body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
                         _:
                             pass
 
-        def typestate_widen_walk(declarations: darray[Ast::Decl], typestate_structs: darray[sview]&, extern_names: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_params: darray[Ast::ExternParam]&, postconditions: darray[Ast::TypestatePostcondition]&, table: lmut SymbolTable) -> void:
+        # Unknown static-if conditions stay possible; prune only a branch the semantic
+        # selector proves inactive. This prevents inactive overloads from claiming calls.
+        def typestate_static_scope_may_be_active(file: Ast::File&, position: Ast::Pos, current_module: sview, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                branch_row: usize = pma_static_if_row_for_position(file, position)
+                return true if branch_row >= file.static_if_lines.count
+                branch: (known: bool, selected: bool) = pma_static_if_row_selection(file, branch_row, current_module, table)
+                return not branch.known or branch.selected
+
+        def typestate_widen_walk(file: Ast::File&, declarations: darray[Ast::Decl], current_module: sview, typestate_structs: darray[sview]&, extern_names: darray[sview]&, extern_modules: darray[sview]&, extern_starts: darray[usize]&, extern_arities: darray[u32]&, extern_variadics: darray[bool]&, extern_lines: darray[u32]&, extern_offsets: darray[u32]&, extern_params: darray[Ast::ExternParam]&, function_names: darray[sview]&, function_modules: darray[sview]&, function_param_starts: darray[usize]&, function_arities: darray[u32]&, function_variadics: darray[bool]&, function_params: darray[Ast::ParamDecl]&, postconditions: darray[Ast::TypestatePostcondition]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
                         Decl.Func(function_name, parameters, return_type, body, effects, decorators, line):
-                            for parameter in parameters |table| -> table:
+                            typestate_params: mutable darray[Ast::ParamDecl] = []
+                            for parameter in parameters |typestate_params, typestate_structs|:
                                 struct_name: sview = bracketed_typestate_name(parameter.type_expression, typestate_structs)
-                                continue if struct_name == ""
+                                typestate_params.push(parameter) if struct_name != ""
+                            if typestate_params.count > 0:
                                 # A declared `ensures p => State` does NOT excuse the widening: an
                                 # opaque extern that carries no restoring postcondition of its own
                                 # leaves the state indeterminate, so the ensures itself becomes
                                 # unprovable (stage0 errors either way). The extern-postcondition
                                 # guard in the scan still exempts an extern that restores the state.
-                                table <- typestate_widen_statements(body, function_name, parameter.name, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                                widening_param_indices: mutable darray[usize] = []
+                                widening_positions: mutable darray[Ast::Pos] = []
+                                table <- typestate_widen_statements(body, file, function_name, typestate_params, current_module, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, widening_param_indices, widening_positions, table)
+                                for typestate_param_index in 0..<typestate_params.count |table, typestate_params, widening_param_indices, widening_positions| -> table:
+                                    for widening_index in 0..<widening_param_indices.count |table, widening_param_indices, widening_positions, typestate_params| -> table:
+                                        continue if widening_param_indices[widening_index] != typestate_param_index
+                                        call_line: Ast::Pos = widening_positions[widening_index]
+                                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.TypestateWidenedByCall, name: typestate_params[typestate_param_index].name, pos: call_line, line: call_line.line, expected: function_name, actual: ""})
                         Decl.Module(module_name, module_body, module_line):
-                            table <- typestate_widen_walk(module_body, typestate_structs, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            table <- typestate_widen_walk(file, module_body, module_name, typestate_structs, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- typestate_widen_walk(scoped_body, typestate_structs, extern_names, extern_starts, extern_arities, extern_params, postconditions, table)
+                            continue if not typestate_static_scope_may_be_active(file, scoped_line, current_module, table)
+                            table <- typestate_widen_walk(file, scoped_body, current_module, typestate_structs, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, postconditions, table)
                         _:
                             pass
 
-        def collect_typestate_structs(declarations: darray[Ast::Decl], out: mutable darray[sview]&) -> void:
+        def collect_typestate_structs(file: Ast::File&, declarations: darray[Ast::Decl], current_module: sview, table: SymbolTable&, out: mutable darray[sview]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |out|:
+                for declaration in declarations |file, current_module, table, out|:
                     match declaration:
                         Decl.Struct(name, members, affinity, has_named_states, has_derive, invariants, struct_line):
                             out.push(name) if has_named_states
                         Decl.Module(module_name, module_body, module_line):
-                            collect_typestate_structs(module_body, out)
+                            collect_typestate_structs(file, module_body, module_name, table, out)
                         Decl.Scoped(scoped_body, scoped_line):
-                            collect_typestate_structs(scoped_body, out)
+                            continue if not typestate_static_scope_may_be_active(file, scoped_line, current_module, table)
+                            collect_typestate_structs(file, scoped_body, current_module, table, out)
                         _:
                             pass
 
-        def collect_extern_signatures(declarations: darray[Ast::Decl], names: mutable darray[sview]&, starts: mutable darray[usize]&, arities: mutable darray[u32]&) -> void:
+        def collect_function_names(file: Ast::File&, declarations: darray[Ast::Decl], current_module: sview, annotations: darray[Ast::EnumAnnotation]&, table: SymbolTable&, names: mutable darray[sview]&, modules: mutable darray[sview]&, param_starts: mutable darray[usize]&, arities: mutable darray[u32]&, variadics: mutable darray[bool]&, params_out: mutable darray[Ast::ParamDecl]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |names, starts, arities|:
+                for declaration in declarations |file, current_module, annotations, table, names, modules, param_starts, arities, variadics, params_out|:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, line):
+                            names.push(name)
+                            modules.push(current_module)
+                            param_starts.push(params_out.count)
+                            arities.push(parameters.count.u32())
+                            variadics.push(any annotation in annotations where annotation.owner == "__variadic" and annotation.line == line.line and annotation.offset == line.offset)
+                            for parameter in parameters |params_out|:
+                                params_out.push(parameter)
+                        Decl.Module(module_name, module_body, module_line):
+                            collect_function_names(file, module_body, module_name, annotations, table, names, modules, param_starts, arities, variadics, params_out)
+                        Decl.Scoped(scoped_body, scoped_line):
+                            continue if not typestate_static_scope_may_be_active(file, scoped_line, current_module, table)
+                            collect_function_names(file, scoped_body, current_module, annotations, table, names, modules, param_starts, arities, variadics, params_out)
+                        _:
+                            pass
+
+        def collect_extern_signatures(file: Ast::File&, declarations: darray[Ast::Decl], current_module: sview, table: SymbolTable&, names: mutable darray[sview]&, modules: mutable darray[sview]&, starts: mutable darray[usize]&, arities: mutable darray[u32]&, variadics: mutable darray[bool]&, lines: mutable darray[u32]&, offsets: mutable darray[u32]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |file, current_module, table, names, modules, starts, arities, variadics, lines, offsets|:
                     match declaration:
                         Decl.Extern(name, param_start, arity, variadic, callable, return_type_name, decorators, extern_line):
-                            names.push(name)
-                            starts.push(param_start.usize())
-                            arities.push(arity)
+                            if callable:
+                                names.push(name)
+                                modules.push(current_module)
+                                starts.push(param_start.usize())
+                                arities.push(arity)
+                                variadics.push(variadic)
+                                lines.push(extern_line.line)
+                                offsets.push(extern_line.offset)
                         Decl.Module(module_name, module_body, module_line):
-                            collect_extern_signatures(module_body, names, starts, arities)
+                            collect_extern_signatures(file, module_body, module_name, table, names, modules, starts, arities, variadics, lines, offsets)
                         Decl.Scoped(scoped_body, scoped_line):
-                            collect_extern_signatures(scoped_body, names, starts, arities)
+                            continue if not typestate_static_scope_may_be_active(file, scoped_line, current_module, table)
+                            collect_extern_signatures(file, scoped_body, current_module, table, names, modules, starts, arities, variadics, lines, offsets)
                         _:
                             pass
 
         def check_typestate_call_widening(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 typestate_structs: mutable darray[sview] = []
-                collect_typestate_structs(file.top_decls, typestate_structs)
+                collect_typestate_structs(file, file.top_decls, "", table, typestate_structs)
                 return if typestate_structs.count == 0
                 extern_names: mutable darray[sview] = []
+                extern_modules: mutable darray[sview] = []
                 extern_starts: mutable darray[usize] = []
                 extern_arities: mutable darray[u32] = []
-                collect_extern_signatures(file.top_decls, extern_names, extern_starts, extern_arities)
+                extern_variadics: mutable darray[bool] = []
+                extern_lines: mutable darray[u32] = []
+                extern_offsets: mutable darray[u32] = []
+                function_names: mutable darray[sview] = []
+                function_modules: mutable darray[sview] = []
+                function_param_starts: mutable darray[usize] = []
+                function_arities: mutable darray[u32] = []
+                function_variadics: mutable darray[bool] = []
+                function_params: mutable darray[Ast::ParamDecl] = []
+                collect_function_names(file, file.top_decls, "", file.enum_annotations, table, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params)
+                collect_extern_signatures(file, file.top_decls, "", table, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets)
                 return if extern_names.count == 0
-                table <- typestate_widen_walk(file.top_decls, typestate_structs, extern_names, extern_starts, extern_arities, file.extern_params, file.typestate_postconditions, table)
+                table <- typestate_widen_walk(file, file.top_decls, "", typestate_structs, extern_names, extern_modules, extern_starts, extern_arities, extern_variadics, extern_lines, extern_offsets, file.extern_params, function_names, function_modules, function_param_starts, function_arities, function_variadics, function_params, file.typestate_postconditions, table)

@@ -6,6 +6,8 @@ export REPO_ROOT
 export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
+python3 "$REPO_ROOT/test/proofs/check_try_variant_alias_owner_identity.py"
+python3 "$REPO_ROOT/test/proofs/check_codegen_variant_alias_owner_identity.py"
 
 optional=$(printf 'def maybe(flag: bool) -> int?:\n    return 7 if flag else null\ndef bad(flag: bool) -> int:\n    return try maybe(flag)\n' | "$RPT")
 grep -q 'try without else requires an error union' <<< "$optional"
@@ -102,6 +104,13 @@ grep -q 'try without else requires the current function to return an error union
     echo "try_fallible FAILED: a #line 0 non-error caller did not receive the required error-union diagnostic: $line_zero_nonerror"
     exit 1
 }
+
+variant_alias_owner=$(cat "$REPO_ROOT/test/repro/try_variant_alias_owner_line_zero.elisa" | "$RPT")
+variant_alias_owner_count=$(grep -Fc 'cannot propagate OriginFault from a function returning CallerFault' <<< "$variant_alias_owner" || true)
+if [[ "$variant_alias_owner_count" -ne 1 ]]; then
+    echo "try_fallible FAILED: a same-line sibling variant target shadowed the outer fallible payload: $variant_alias_owner"
+    exit 1
+fi
 
 callback_return_occurrence='error CallbackFault:
     Bad

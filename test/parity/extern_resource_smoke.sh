@@ -4,6 +4,7 @@
 # 0 from each, the boundary declarations are byte-identical, and D2/D3 reject identically.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/test/proofs/check_extern_resource_owner_identity.py"
 STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
@@ -32,6 +33,7 @@ assert codes == [0, 0], codes
 print('extern_resource: declarations byte-identical, runtime PASS', flush=True)
 rejected = {
     'resource_nodrop': 'extern resource NoDrop\n\ndef main() -> i64:\n    return 0\n',
+    'resource_same_line_owner': (root / 'test/repro/extern_resource_owner_line_zero.elisa').read_text(),
     'resource_borrowed_return': 'extern resource Borrowed\ndef __drop__(self: Borrowed) -> void:\n    pass\n\n@callconv(c)\nextern peek() -> Borrowed&\n\ndef main() -> i64:\n    return 0\n',
 }
 for name, text in rejected.items():
@@ -39,6 +41,9 @@ for name, text in rejected.items():
     results = [subprocess.run([c, '-emit', 'obj', '-o', str(work/'out.o'), str(src)], capture_output=True, timeout=60) for c in (stage0, stage1)]
     assert all(r.returncode != 0 for r in results), (name, [(r.returncode, r.stderr) for r in results])
     assert results[0].stderr == results[1].stderr, (name, results[0].stderr, results[1].stderr)
+    if name == 'resource_same_line_owner':
+        expected = b'extern resource "MissingDrop" declares no `__drop__`'
+        assert all(r.stderr.count(expected) == 1 for r in results), (name, [r.stderr for r in results])
     print(f'{name}: stage0/stage1 byte-identical rejection PASS', flush=True)
 
 # docs/127 D4 — no use after native release. The handle is consumed by fclose and then read.

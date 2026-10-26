@@ -7,10 +7,15 @@ export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 source "$REPO_ROOT/test/parity/build_parse_report.sh"
 
+python3 "$REPO_ROOT/test/proofs/check_block_lambda_context_owner_identity.py"
+
 missing=$(printf 'def run() -> void:\n    _ = fn(value):\n        return value\n' | "$RPT")
 grep -q 'block lambda requires an explicit return type or contextual function type' <<< "$missing"
 
 typed=$(printf 'def run() -> void:\n    _ = fn(value) -> int:\n        return 1\n' | "$RPT")
 grep -q '^D 0$' <<< "$typed"
+
+collision=$("$RPT" < "$REPO_ROOT/test/repro/block_lambda_context_owner_line_collision.elisa")
+grep -q 'block lambda requires an explicit return type or contextual function type' <<< "$collision"
 
 echo "block lambda context smoke OK" >&2

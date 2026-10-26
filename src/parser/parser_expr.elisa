@@ -13,6 +13,40 @@ extend Parser:
         # All allocations happen implicitly in inferred region
         # ============================================================
 
+        # `new[store] Enum.Variant(...)` is lowered through a RegionNew wrapper, while the
+        # packed-constructor backend later sees only the inner call. When the operand is a
+        # call through a field/scope (possibly parenthesized), keep the selector marker at
+        # that callee position so same-line allocations can choose different stores. Other
+        # expression shapes retain the `new` token position.
+        def new_region_use_position(expression: Ast::Expr, fallback: Ast::Pos) -> Ast::Pos:
+            match expression:
+                Expr.Call(callee, arguments, argument_names, call_pos):
+                    match callee:
+                        Expr.Field(_, _, field_pos) | Expr.Scope(_, _, field_pos):
+                            return field_pos
+                        Expr.Paren(inner, _):
+                            return new_region_use_position(inner, fallback)
+                        _:
+                            pass
+                Expr.Paren(inner, _):
+                    return new_region_use_position(inner, fallback)
+                _:
+                    pass
+            return fallback
+
+
+        # `new` is erased from the expression tree. Keep its marker at the exact AST node
+        # consumers inspect (the call or array node), unwrapping only transparent parentheses
+        # and nested RegionNew wrappers. The keyword position cannot identify that node.
+        def new_construct_target_position(expression: Ast::Expr) -> Ast::Pos:
+            match expression:
+                Expr.Paren(inner, _):
+                    return new_construct_target_position(inner)
+                Expr.RegionNew(inner, _, _):
+                    return new_construct_target_position(inner)
+                _:
+                    return Ast::expr_pos(expression)
+
         def primary_literal(parser: lmut Parser, kind: TokenKind, token: Token) -> Ast::Expr?:
             # Literal parsing is a closed token-kind table. A match keeps each token's
             # side effects adjacent to its construction and avoids a fall-through chain of
@@ -260,9 +294,9 @@ extend Parser:
             # legacy token slot remains reserved. Lower it to the constructor
             # expression itself, exactly like the TokenKind.New compatibility arm.
             if head_text == "new" and (parser.peek_at(1) == TokenKind.Ident or parser.peek_at(1) == TokenKind.LBracket):
-                parser <- parser.record_new_construct(token.line)
                 parser, _ <- parser.advance()
                 new_region_name: mutable sview = sview("", 0, 0)
+                new_auto_form: mutable bool = false
                 rebind accepted_new_region: bool, parser = parser.accept(TokenKind.LBracket)
                 if accepted_new_region:
                     # `new[auto] T(...)` is the deprecated explicit auto-region form
@@ -270,11 +304,7 @@ extend Parser:
                     # so the semantic pass can emit the deprecation.
                     region_token: Token = parser.cursor()
                     region_selector: sview = Lexer::text_or_empty(region_token, parser.source, parser.source_length)
-                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__new_auto", name: "__new_auto", line: token.line}) if parser.peek() == TokenKind.Ident and region_selector == "auto"
-                    # Record a named region selector (`new[scratch] …`) so the semantic
-                    # pass can see the region is USED as an allocation target — an
-                    # otherwise-untouched region owner is a leak, a used one is not.
-                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: region_selector, name: "__region_use", line: token.line}) if parser.peek() == TokenKind.Ident and region_selector != "auto"
+                    new_auto_form <- parser.peek() == TokenKind.Ident and region_selector == "auto"
                     new_region_name <- region_selector if parser.peek() == TokenKind.Ident and region_selector != "auto"
                     machine over parser.position while true:
                         state Scan
@@ -298,9 +328,18 @@ extend Parser:
                     # `RegionNew(seed) + 1` -- pointer arithmetic on the allocation.
                     rebind region_new_operand: Ast::Expr?, parser = parser.expression() can Global{Read,Write}
                     if region_new_operand is region_new_allocated:
+                        new_construct_pos: Ast::Pos = new_construct_target_position(region_new_allocated)
+                        parser <- parser.record_new_construct(new_construct_pos)
+                        region_use_position: Ast::Pos = new_region_use_position(region_new_allocated, Ast::pos_of_token(token))
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: new_region_name, name: "__region_use", line: region_use_position.line, offset: region_use_position.offset})
                         return (Ast::Expr.RegionNew(region_new_allocated, new_region_name, Ast::pos_of_token(token)))
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: new_region_name, name: "__region_use", line: token.line, offset: token.start})
                     return region_new_operand
-                    rebind contextual_new: Ast::Expr?, parser = parser.postfix_expression() can Global{Read,Write}, Memory.Allocate
+                rebind contextual_new: Ast::Expr?, parser = parser.postfix_expression() can Global{Read,Write}, Memory.Allocate
+                if contextual_new is new_construct_operand:
+                    new_construct_pos: Ast::Pos = new_construct_target_position(new_construct_operand)
+                    parser <- parser.record_new_construct(new_construct_pos)
+                    parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__new_auto", name: "__new_auto", line: token.line, offset: token.start}) if new_auto_form
                 return contextual_new
             # Ownership/concurrency value wrappers are semantically transparent
             # to name/type resolution: retain and walk their operand instead of
@@ -486,10 +525,8 @@ extend Parser:
 
             if kind == TokenKind.New:
                     # `new [region] Type(...)`: skip the keyword and optional region
-                    # bracket, then parse the constructor expression as the value.
-                    # The keyword is erased from the AST, so record the line — the
-                    # brace-only construction check exempts new-form paren calls.
-                    parser <- parser.record_new_construct(token.line)
+                    # bracket, then parse the constructor expression as the value. The marker
+                    # is recorded against the resulting AST target after it has been parsed.
                     parser, _ <- parser.advance()
                     rebind accepted_lbracket_2: bool, parser = parser.accept(TokenKind.LBracket)
                     if accepted_lbracket_2:
@@ -505,6 +542,9 @@ extend Parser:
                                 -> Scan
                         parser, _ <- parser.accept(TokenKind.RBracket)
                     rebind __v_141: Ast::Expr?, parser = parser.postfix_expression() can Global{Read,Write}, Memory.Allocate
+                    if __v_141 is new_construct_operand:
+                        new_construct_pos: Ast::Pos = new_construct_target_position(new_construct_operand)
+                        parser <- parser.record_new_construct(new_construct_pos)
                     return __v_141
 
             if kind == TokenKind.LParen:

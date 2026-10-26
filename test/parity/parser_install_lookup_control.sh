@@ -31,4 +31,4 @@ for opt in 0 2; do
         $ELISA_LD_STACK_512M
     "$WORK/control-$opt"
 done
-echo "parser install lookup OK: missing/duplicate rows, ordered captures, scan fallback"
+echo "parser install lookup OK: exact source positions, unique parent IDs, scoped captures, scan fallback"

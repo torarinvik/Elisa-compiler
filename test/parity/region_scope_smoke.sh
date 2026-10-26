@@ -12,6 +12,7 @@ python3 "$REPO_ROOT/test/proofs/check_function_param_region_owner_identity.py"
 python3 "$REPO_ROOT/test/proofs/check_region_binding_owner_identity.py"
 python3 "$REPO_ROOT/test/proofs/check_region_return_owner_offset_identity.py"
 python3 "$REPO_ROOT/test/proofs/check_region_escape_param_owner_identity.py"
+python3 "$REPO_ROOT/test/proofs/check_region_strategy_owner_identity.py"
 
 fail() { echo "region-scope smoke FAIL: $1" >&2; exit 1; }
 clean() {
@@ -32,6 +33,13 @@ grep -q 'cannot return reference: region dependency facts include local region "
 clean $'def f() -> void:\n    region a(1024) using reserve_commit\n    region b(1024) using fixed\n    region c(1024) using chained\n    region d(1024) using scratch\n    destroy a\n    destroy b\n    destroy c\n    destroy d\n'
 out=$(printf 'def f() -> void:\n    region a(1024) using bogus\n    destroy a\n' | "$RPT")
 grep -q 'unknown region backing "bogus"' <<< "$out" || fail "unknown backing strategy was not flagged: $out"
+region_strategy_owner_out=$(cat "$REPO_ROOT/test/repro/region_strategy_owner_line_zero.elisa" | "$RPT")
+first_strategy_count=$(grep -Fc 'unknown region backing "bogus_first"' <<< "$region_strategy_owner_out" || true)
+last_strategy_count=$(grep -Fc 'unknown region backing "bogus_last"' <<< "$region_strategy_owner_out" || true)
+known_strategy_count=$(grep -Fc 'unknown region backing "fixed"' <<< "$region_strategy_owner_out" || true)
+if [[ "$first_strategy_count" -ne 1 || "$last_strategy_count" -ne 1 || "$known_strategy_count" -ne 0 ]]; then
+    fail "same-line region strategy rows did not stay with their owning statements: $region_strategy_owner_out"
+fi
 clean $'def id[T, @r](value: T& @r) -> T& @r:\n    return value\n'
 clean "$(cat "$REPO_ROOT/test/repro/region_binding_owner_line0.elisa")"
 clean "$(cat "$REPO_ROOT/test/repro/region_local_shadow_owner_offset.elisa")"

@@ -641,6 +641,26 @@ using Box as B
 def main() -> i64:
     return B::hot
 CASE
+run_case alias_target_concrete_before_alias 'accesses a global mutable binding without Global.Read' <<'CASE'
+module A:
+    public:
+        module Foo:
+            public:
+                module Bar:
+                    public:
+                        global mutable hot: i64 = 1
+module Other:
+    public:
+        module Foo:
+            public:
+                module Bar:
+                    public:
+                        global mutable cold: i64 = 2
+using Other as A
+using A::Foo as F
+def main() -> i64:
+    return F::Bar::hot
+CASE
 run_case chained_alias_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Outer:
     module Inner:

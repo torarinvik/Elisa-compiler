@@ -172,28 +172,52 @@ if operational_shape(function_section(scan_source, "first_matching_index")) != \
     raise SystemExit("proof-only scan loop no longer exactly matches the production executable loop")
 
 region_source = REGIONS.read_text()
-expected_wrapper = """
-def line_has_region_parameter(line: u32, structs: StructTable&) -> bool:
-    return BackendRegionParameterScan::first_matching_index(structs.regions.region_param_lines, line) < structs.regions.region_param_lines.count
+expected_owner_scan = """
+def region_parameter_count(line: u32, owner_offset: u32, structs: StructTable&) -> usize can[Abort.Panic]:
+    row_count: usize = structs.regions.region_param_lines.count
+    return 0.usize() if:
+        row_count != structs.regions.region_param_owner_offsets.count
+        row_count != structs.regions.region_param_names.count
+    count: mutable usize = 0.usize()
+    for row in 0..<row_count |count, line, owner_offset, structs|:
+        count <- count + 1.usize() if structs.regions.region_param_lines[row] == line and structs.regions.region_param_owner_offsets[row] == owner_offset
+    return count
 """
-if compact_code(function_section(region_source, "line_has_region_parameter")) != compact_code(expected_wrapper):
-    raise SystemExit("ABI region-parameter lookup no longer derives membership from the verified witness index")
+if compact_code(function_section(region_source, "region_parameter_count")) != compact_code(expected_owner_scan):
+    raise SystemExit("ABI region-parameter count no longer matches the exact (line, owner-offset) pair")
 
 signature = compact_code(function_section(region_source, "signature_arena_count"))
 expected_signature = """
-def signature_arena_count(params: darray[ParamDecl]&, return_value_type: ValueType, body: darray[Stmt], line: u32, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+def signature_arena_count(name: sview, owner: sview, params: darray[ParamDecl]&, return_value_type: ValueType, body: darray[Stmt], line: u32, owner_offset: u32, structs: mutable StructTable&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
     can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
         arena_managed: bool = params_manage_arena(params, structs)
         count: mutable usize = 1 if value_type_returns_caller_region(return_value_type, structs) and not arena_managed else 0
         flags: mutable darray[bool] = []
-        region_flags_for_function(params, body, line, structs, flags)
+        region_flags_for_function(name, owner, params, body, line, owner_offset, structs, flags)
         for parameter_index in 0..<flags.count |flags, count|:
             count <- count + 1.usize() if flags[parameter_index]
-        count <- count + 1.usize() if line_has_region_parameter(line, structs)
+        count <- count + region_parameter_count(line, owner_offset, structs)
         return count
 """
 if signature != compact_code(expected_signature):
-    raise SystemExit("signature arena count no longer adds the explicit-region slot in the source-bound count path")
+    raise SystemExit("signature arena count no longer adds exact function-owned region slots in the source-bound count path")
+
+expected_fact_row = """
+def region_fact_row_from_params(name: sview, owner: sview, params: darray[ParamDecl]&, line: u32, owner_offset: u32, structs: StructTable&) -> i64 can[Abort.Panic]:
+    return -1 if:
+        structs.regions.region_fact_lines.count != structs.regions.region_fact_offsets.count
+        structs.regions.region_fact_lines.count != structs.regions.region_fact_names.count
+        structs.regions.region_fact_lines.count != structs.regions.region_fact_owners.count
+        structs.regions.region_fact_lines.count != structs.regions.region_fact_counts.count
+    row: mutable i64 = line_chain_first(structs.regions.region_fact_line_buckets, structs.regions.region_fact_line_next, structs.regions.region_fact_lines, line)
+    while row >= 0 |row, structs, name, owner, params, line, owner_offset|:
+        if row.usize() < structs.regions.region_fact_offsets.count:
+            return row if structs.regions.region_fact_names[row.usize()] == name and structs.regions.region_fact_owners[row.usize()] == owner and structs.regions.region_fact_offsets[row.usize()] == owner_offset and structs.regions.region_fact_counts[row.usize()] == params.count
+        row <- line_chain_next(structs.regions.region_fact_line_buckets, structs.regions.region_fact_line_next, structs.regions.region_fact_lines, line, row)
+    return -1
+"""
+if compact_code(function_section(region_source, "region_fact_row_from_params")) != compact_code(expected_fact_row):
+    raise SystemExit("body-derived arena flags must be selected by exact function offset, not line and arity alone")
 
 abi_includes = include_targets(ABI_FACTS.read_text())
 scan_include = "./codegen_region_parameter_scan.elisa"

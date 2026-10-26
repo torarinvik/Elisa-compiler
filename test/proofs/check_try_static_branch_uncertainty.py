@@ -70,8 +70,8 @@ if not all(fragment in facts for fragment in (
 if not all(fragment in nominal_owner for fragment in (
     'binding.owner == "__try_unresolved_static_binding"',
     'binding.name == "__from_member"',
-    "try_overload_unresolved_selective_import_can_bind_type(binding, name, lexical_module, annotations, table)",
-    "try_overload_unresolved_wildcard_type_owner(name, lexical_module, annotations, table)",
+    "try_overload_unresolved_selective_import_can_bind_type(file, binding, name, lexical_module, annotations, table)",
+    "try_overload_unresolved_wildcard_type_owner(file, name, lexical_module, annotations, table)",
     "unresolved_wildcard_can_change_owner",
 )) or not all(fragment in unresolved_wildcard for fragment in (
     'binding.owner != "__try_unresolved_static_binding"',
