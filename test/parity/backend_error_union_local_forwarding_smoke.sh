@@ -120,14 +120,15 @@ compile_and_run() {
     fi
 }
 
-# The minimal fieldless and full-family local-source fixtures are independent positives.
-# The subset local-source and ErrorUnion-parameter fixtures remain non-gating controls.
+# Exercise fieldless, full-family, widened-subset and parameter forwarding.
 for level in 0 2; do
     for stage in 0 1; do
         compiler="$STAGE0"
         [[ "$stage" -eq 0 ]] || compiler="$STAGE1"
         compile_and_run "$stage" "$compiler" "$FIXTURE_DIR/return_error_union_local_forwarding_minimal.elisa" 42 "$level"
         compile_and_run "$stage" "$compiler" "$FIXTURE_DIR/return_error_union_local_source_full_family.elisa" 0 "$level"
+        compile_and_run "$stage" "$compiler" "$FIXTURE_DIR/return_error_union_local_source_forwarding.elisa" 0 "$level"
+        compile_and_run "$stage" "$compiler" "$FIXTURE_DIR/return_error_union_local_forwarding.elisa" 0 "$level"
     done
 done
 
@@ -146,21 +147,4 @@ fi
 "$OPT" -passes=verify -disable-output "$ir"
 check_failure_payload_order "$ir" forward_local
 
-record_diagnostic_control() {
-    local name="$1"
-    local fixture="$2"
-    local control_ir="$WORK/$name.ll"
-    local control_log="$WORK/$name.log"
-    local status
-    set +e
-    "$STAGE1" -emit llvm -O0 -o "$control_ir" "$fixture" >"$control_log" 2>&1
-    status=$?
-    set -e
-    local declined=0
-    rg -q '!elisa\.declined' "$control_ir" 2>/dev/null && declined=1 || true
-    printf 'return forwarding diagnostic control %s: status=%s declined-marker=%s\n' "$name" "$status" "$declined"
-}
-record_diagnostic_control subset "$FIXTURE_DIR/return_error_union_local_source_forwarding.elisa"
-record_diagnostic_control parameter "$FIXTURE_DIR/return_error_union_local_forwarding.elisa"
-
-echo "return forwarding smoke OK: minimal and full-family local forwarding run at O0/O2; failure CFG skips the success payload load"
+echo "return forwarding smoke OK: fieldless, full-family, subset and parameter cases run at O0/O2; failure CFG skips the success payload load"

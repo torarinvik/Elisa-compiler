@@ -49,19 +49,18 @@ assert "error[Fault{Busy}]" not in full_fixture
 assert "inspect_local(false) != 42" in full_fixture and "inspect_local(true) != 9" in full_fixture
 assert full_fixture.count("trace != 1") == 2
 
-# Keep the two known non-gating cases separate from the passing full-family local source.
+# The subset and parameter paths now have native regression coverage too.
 assert "value: i64 error[Fault{Busy}]" in parameter_control
 assert "source: i64 error[Fault{Busy}] = produce(fail)" in subset_control
-assert "record_diagnostic_control subset" in smoke
-assert "record_diagnostic_control parameter" in smoke
 positive_loop = smoke[smoke.index("for level in 0 2;"):smoke.index("ir=\"$WORK/full-family-stage1-O0.ll\"")]
 assert "return_error_union_local_forwarding_minimal.elisa" in positive_loop
 assert "return_error_union_local_source_full_family.elisa" in positive_loop
-assert "return_error_union_local_source_forwarding.elisa" not in positive_loop
+assert "return_error_union_local_source_forwarding.elisa" in positive_loop
+assert "return_error_union_local_forwarding.elisa" in positive_loop
 
 assert "-emit exe" in smoke and "elisa_run_timeout 10" in smoke
 assert "check_failure_payload_order \"$ir\" forward_local" in smoke
 assert "try\\.union\\.payload\\.ptr" in smoke and "try.union.success.payload" in smoke
 assert "try.union.success" in smoke and "CFG reaches its success/done block" in smoke
 
-print("source proof passed: helper cleanup, full-family gate, non-gating controls, and native/IR smoke coverage")
+print("source proof passed: helper cleanup, forwarding cases, and native/IR smoke coverage")
