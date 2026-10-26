@@ -354,7 +354,7 @@ profile_patterns() {
                     match_*_smoke.sh struct_*_smoke.sh namespace_*_smoke.sh
                     slice_*_smoke.sh assign_target_smoke.sh' ;;
     answers)  echo 'behavioural* driver_acceptance_smoke.sh differential*' ;;
-    backend)  echo 'backend_*_smoke.sh lambda_body_source_region_smoke.sh catch_error_union_local_scope_smoke.sh error_union_subset_capture_smoke.sh extern_fallible_ensure_smoke.sh self_host_gen3_smoke.sh opt_pipeline_smoke.sh
+    backend)  echo 'backend_*_smoke.sh lambda_body_source_region_smoke.sh catch_error_union_local_scope_smoke.sh error_union_subset_capture_smoke.sh extern_fallible_ensure_smoke.sh extern_unsupported_ensure_decline_smoke.sh self_host_gen3_smoke.sh opt_pipeline_smoke.sh
                     array_*_smoke.sh slice_*_smoke.sh struct_*_smoke.sh' ;;
     parser)   echo 'lexer* parser* return_guard_style_smoke.sh
                     emit_tokens_parity_smoke.sh emit_ast_parity_smoke.sh' ;;
