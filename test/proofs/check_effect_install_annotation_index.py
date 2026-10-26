@@ -45,6 +45,24 @@ if "low: mutable usize" not in position_lookup or \
     raise SystemExit("install lookup must lower-bound offsets and confirm the full line/offset key")
 
 summary_builder = function_source(semantic, "ae_effect_install_position_index")
+install_row_init = summary_builder.split("for annotation_row", 1)[0]
+for marker in (
+    "index.lines.push(annotation.line)",
+    "index.offsets.push(annotation.offset)",
+    "index.handler_names.push(annotation.name)",
+    "index.handler_ids.push(annotation.identity_id)",
+    'index.effect_refs.push("")',
+    "index.effect_ids.push(0)",
+    "index.effect_annotation_rows.push(AE_EFFECT_INDEX_NONE)",
+    "index.capture_counts.push(0)",
+    "index.identity_mismatches.push(false)",
+    'index.target_refs.push("")',
+    "index.target_effect_ids.push(0)",
+    "index.target_annotation_rows.push(AE_EFFECT_INDEX_NONE)",
+):
+    if marker not in install_row_init:
+        raise SystemExit(f"every install row must initialize its parallel summary vector: {marker}")
+
 for marker in (
     'annotation.owner != "__effect_install"',
     'annotation.owner == "__effect_install_effect"',

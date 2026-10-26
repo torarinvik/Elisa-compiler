@@ -187,6 +187,8 @@ required_contracts = (
     "if row != SYMBOL_INDEX_ROW_NONE or last_row != expected_tail",
     "if not lookup_valid:",
     "for step in 0..<expected_count",
+    "assert last_row != SYMBOL_INDEX_ROW_NONE or row.usize() == head",
+    "assert last_row == SYMBOL_INDEX_ROW_NONE or (last_row.usize() < table.ref_owner_next.count and row == table.ref_owner_next[last_row.usize()])",
     "selected_binding_id: BindingId = table.ref_binding_ids[result_index]",
     "assert ownership_lookup_candidate_matches(table, result_index, owner, position, selected_binding_id)",
     "return OwnershipBindingLookupResult{known: true, binding_id: table.ref_binding_ids[result_index], witness_index: result_index}",
@@ -221,14 +223,14 @@ if sum(line.lstrip().startswith("ensure ") for line in lookup_contract_lines) !=
 helper_contract = lookup_text.split("def ownership_lookup_candidate_matches(", 1)[1].split("public:", 1)[0]
 if sum(line.lstrip().startswith("ensure ") for line in helper_contract.splitlines()) != 1:
     raise AssertionError("selected-row witness helper contract changed; review this proof gate")
-if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 4:
+if sum(line.lstrip().startswith("invariant ") for line in lookup_lines) != 3:
     raise AssertionError("ownership lookup loop invariant set changed; review this proof gate")
 if sum(line.lstrip().startswith("decreases ") for line in lookup_lines) != 0:
     raise AssertionError("ownership lookup should use bounded for loops; review this proof gate")
 
 if ARGS.source_only:
     print(json.dumps({"source_bound": True, "contract_count": 16,
-                      "invariant_count": 4,
+                      "invariant_count": 3,
                       "scope": "named-result exact witness contract with concrete fail-closed regression cases"}, sort_keys=True))
     raise SystemExit(0)
 

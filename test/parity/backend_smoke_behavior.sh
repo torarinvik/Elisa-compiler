@@ -177,6 +177,10 @@ run_case f32_arithmetic   'def main() -> i64:\n    x: f32 = 2.5\n    y: f32 = x 
 run_case struct_basic     'struct Point:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: Point = Point{x: 40, y: 2}\n    return p.x + p.y\n'  42
 run_case struct_partial   'struct Point:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: Point = Point{x: 40}\n    return p.x + p.y + 2\n'  42
 run_case struct_positional 'struct Point:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: Point = Point{40, 2}\n    return p.x + p.y\n'  42
+# Named `move` fields are selected by label, not by their order in the pattern.
+# With declaration order left/right = 2/4, `{right, left}` must bind right=4 and left=2;
+# an ordinal extraction would bind right=2 and left=4, producing 24 instead of 42.
+run_case move_named_fields 'struct Pair:\n    left: i64\n    right: i64\n\ndef main() -> i64:\n    raw: Pair = Pair{left: 2, right: 4}\n    move raw as {right, left}\n    return right * 10 + left\n' 42
 # Mixed field widths/kinds in one layout: u8 + i64 + f64. 200 + 5 + 2 - 165 == 42.
 run_case struct_mixed     'struct Rec:\n    a: u8\n    b: i64\n    c: f64\n\ndef main() -> i64:\n    r: Rec = Rec{a: 200, b: 5, c: 2.5}\n    return r.a.i64() + r.b + r.c.i64() - 165\n'  42
 # Fields given OUT OF ORDER: construction maps by NAME, not by position. If it mapped

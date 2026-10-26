@@ -87,13 +87,14 @@ if "ae_operation_declared(annotations, effect_name, operation)" in check_express
         "ae_effect_generic_names(annotations, effect_name)" in check_expression:
     raise SystemExit("ordinary operation checking must not fall back to terminal-name joins")
 
-mismatch_record = function_source(parser, "record_effect_specialization_mismatch")
+mismatch_record = function_source(parser, "record_effect_specialization_mismatch_for")
 mismatch_lookup = function_source(heads, "ae_specialization_mismatch_at_site")
 if not all(fragment in mismatch_record for fragment in (
     'owner: "__effect_specialization_mismatch"',
     "module: parser.handler_rewrite_owner()",
     "offset: position.offset",
     "identity_id: identity_id",
+    "return if not parser.effect_declarations_complete",
 )) or "annotation.offset == offset" not in mismatch_lookup:
     raise SystemExit("specialization mismatch metadata must be keyed to the exact member site")
 rewrite_guard = function_source(parser, "handler_operation_ref_matches_active")
@@ -107,6 +108,9 @@ if "requested_identity_id != 0 and requested_identity_id == active_identity_id" 
 if post_parse_rewrite.count("parser.handler_operation_ref_matches_effect(operation, field_pos, effect_name)") != 1 or \
         post_parse_rewrite.count("parser.handler_operation_ref_matches_effect(operation, scope_pos, effect_name)") != 1:
     raise SystemExit("post-parse Field and Scope rewrites must require the exact active effect identity")
+if post_parse_rewrite.count("parser.record_effect_specialization_mismatch_for(effect_name, field_pos)") != 1 or \
+        post_parse_rewrite.count("parser.record_effect_specialization_mismatch_for(effect_name, scope_pos)") != 1:
+    raise SystemExit("post-parse Field and Scope rewrites must record only resolved specialization mismatches")
 
 for fixture in (missing_call, missing_value, generic_arity, signature_fixture, ambiguous_bare, ambiguous_helper):
     if "module A:" not in fixture or "module B:" not in fixture or "effect Tick" not in fixture:

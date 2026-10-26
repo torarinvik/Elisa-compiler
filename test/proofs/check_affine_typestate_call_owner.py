@@ -6,6 +6,7 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 FLOW = (ROOT / "src/semantic/check_affine_use_linear_flow.elisa").read_text()
 WALK = (ROOT / "src/semantic/check_affine_use_linear.elisa").read_text()
+PARSER = (ROOT / "src/parser/parser_decl_typestate.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/affine_typestate_postcondition_overload_owner.elisa").read_text()
 SMOKE = (ROOT / "test/parity/affine_typestate_postcondition_overload_owner_smoke.sh").read_text()
 
@@ -24,12 +25,17 @@ candidate_count = function_source(FLOW, "affine_call_candidate_count")
 argument_map = function_source(FLOW, "affine_call_argument_map")
 argument_exact = function_source(FLOW, "affine_call_argument_is_exact")
 declaration_generic = function_source(FLOW, "affine_call_declaration_is_generic")
+legacy_typestate_declaration = function_source(PARSER, "typestate_declaration")
 type_ids_exact = function_source(FLOW, "affine_call_type_ids_are_exact")
+state_family_index = function_source(FLOW, "affine_call_state_family_index")
+state_family_index_for_type = function_source(FLOW, "affine_call_state_family_index_for_type")
+state_index_in_family = function_source(FLOW, "affine_call_state_index_in_family")
 type_pattern_match = function_source(FLOW, "affine_call_type_pattern_may_match")
 structured_match = function_source(FLOW, "affine_call_structured_argument_may_match")
 qualified_type_id = function_source(FLOW, "affine_call_type_expression_type_id")
 argument_type_id = function_source(FLOW, "affine_call_argument_type_id")
 type_alias_application = function_source(FLOW, "affine_call_type_alias_application_id")
+alias_target_type_id = function_source(FLOW, "affine_call_alias_target_type_id")
 canonical_actual_type = function_source(FLOW, "affine_call_canonical_actual_type_id_with_alias_substitution")
 canonical_actual_wrapper = function_source(FLOW, "affine_call_canonical_actual_type_id")
 alias_row_at = function_source(FLOW, "affine_call_type_alias_row_at")
@@ -75,6 +81,19 @@ if "Expr.Scope(_, _, _)" not in type_expression_scope or \
         "return false if formal_id == 0" not in structured_match or \
         "return true if formal_id == 0" not in structured_match:
     raise SystemExit("unresolved qualified formals must fail closed instead of acting as wildcard candidates")
+
+if "family.module_name != module_owner or family.owner != owner" not in state_family_index or \
+        "return AFFINE_STATE_FAMILY_NONE if selected != AFFINE_STATE_FAMILY_NONE" not in state_family_index or \
+        "affine_call_nominal_identity(interned_name(type_id, table), module, table)" not in state_family_index_for_type or \
+        "family.states[state_index] != state_name" not in state_index_in_family or \
+        "affine_call_state_index_in_family(state_family_index, interned_name(formal_id, table), table)" not in type_ids_exact or \
+        "affine_call_state_index_in_family(state_family_index, interned_name(actual_id, table), table)" not in type_ids_exact or \
+        "return formal_state_index != AFFINE_STATE_FAMILY_NONE and formal_state_index == actual_state_index" not in type_ids_exact or \
+        "affine_call_state_family_index_for_type(formal_id, declaration_module, table)" not in type_ids_exact or \
+        "Ast::StateFamily{owner: Lexer::text_or_empty(name_token, parser.source, parser.source_length), module_name: parser.current_module, declaration_line: token.line, states: states, affinity: affinity, has_derive: false, pos: Ast::pos_of_token(token)}" not in legacy_typestate_declaration or \
+        "def consume_imported_structural_alias[T](ticket: Ticket[Fresh], values: T) -> void:" not in FIXTURE or \
+        "consume_imported_structural_alias(imported_structural_alias_ticket, values)" not in FIXTURE:
+    raise SystemExit("typestate state arguments must match only within the verified module/owner family, including the generic-catchall regression")
 
 if "affine_call_argument_map(params, line" not in candidate_count or \
         "affine_extern_call_argument_map(param_start, arity" not in candidate_count or \
@@ -136,7 +155,7 @@ if "argument_names[argument_index] != \"\"" not in argument_map or \
         "Expr.Index(indexed_head, index_argument, _)" not in qualified_type_id or \
         "Expr.IndexN(indexed_head, index_arguments, _)" not in qualified_type_id or \
         "affine_call_type_alias_application_id(alias_row, alias_arguments" not in qualified_type_id or \
-        "affine_call_type_expression_type_id(alias_declaration.target, alias_declaration.module_owner" not in type_alias_application or \
+        "affine_call_alias_target_type_id(alias_declaration.target, alias_declaration.module_owner, alias_declaration.pos, alias_formals.names" not in type_alias_application or \
         "affine_call_canonical_actual_type_id_with_alias_substitution(target_id, alias_declaration.module_owner, alias_declaration.pos, no_generic_owner, annotations, alias_formals.names, alias_actuals" not in type_alias_application or \
         "affine_call_type_expression_type_id(parameter_type, declaration_module, declaration_line, declaration_line, annotations, 0, table)" not in argument_exact or \
         "affine_call_canonical_actual_type_id(formal_id, declaration_module, declaration_line, declaration_line, annotations" not in type_pattern_match or \
@@ -146,17 +165,24 @@ if "argument_names[argument_index] != \"\"" not in argument_map or \
         "original_formal_kind == SemTypeKind.Region or type_id_contains_region(formal_id, table)" not in type_pattern_match or \
         "type_id_contains_region(formal_id, table)" not in type_pattern_match or \
         "interned_elem_count(formal_id, table) != interned_elem_count(actual_id, table)" not in type_pattern_match or \
-        "annotation_type_id(alias_declaration.target, table)" not in canonical_actual_type or \
+        "affine_call_alias_target_type_id(alias_declaration.target, alias_declaration.module_owner, alias_declaration.pos, nested_alias_formals.names" not in canonical_actual_type or \
+        "if formal_name == type_name:" not in alias_target_type_id or \
+        "intern_type(SemTypeKind.Named, type_name, no_elements, table)" not in alias_target_type_id or \
+        "affine_call_alias_target_type_id(index_argument, module, alias_pos, alias_formals" not in alias_target_type_id or \
+        "Expr.IndexN(indexed_head, index_arguments, _)" not in alias_target_type_id or \
+        "intern_type(SemTypeKind.Container, head_path, arguments, table)" not in alias_target_type_id or \
+        "intern_type(SemTypeKind.Tuple, \"tuple\", element_ids, table)" not in alias_target_type_id or \
         "affine_call_type_alias_row_at(type_name, module, call_pos, annotations, table)" not in canonical_actual_type or \
         "table.type_row_region_ids[region_row] == 0" not in canonical_actual_type or \
         "affine_call_alias_formal_names(table.type_alias_name[alias_row.usize()], alias_declaration.pos, annotations)" not in canonical_actual_type or \
         "alias_formals: darray[sview @source]&" not in canonical_actual_type or \
         "alias_actuals: darray[u32]&" not in canonical_actual_type or \
         "alias_actuals[formal_index] if alias_formals[formal_index] == type_name" not in canonical_actual_type or \
+        "return 0 if not nested_alias_formals.known" not in canonical_actual_type or \
         "affine_call_canonical_actual_type_id_with_alias_substitution(alias_target_id, alias_declaration.module_owner, alias_declaration.pos, no_generic_owner, annotations, nested_alias_formals.names, nested_alias_actuals" not in canonical_actual_type or \
         "affine_call_canonical_actual_type_id_with_alias_substitution(type_id, module, call_pos, generic_owner, annotations, empty_alias_formals, empty_alias_actuals" not in canonical_actual_wrapper or \
-        "affine_call_type_id_qualify_nominal_owners(alias_argument_id, module" not in canonical_actual_type or \
-        "affine_call_type_id_qualify_nominal_owners(canonical_target, alias_declaration.module_owner" not in canonical_actual_type or \
+        "affine_call_type_id_qualify_nominal_owners(alias_argument_id, module" in canonical_actual_type or \
+        "affine_call_type_id_qualify_nominal_owners(canonical_target, alias_declaration.module_owner" in canonical_actual_type or \
         "affine_call_import_annotations_before_call(table.possible_import_annotations, use_pos)" not in alias_row_at or \
         "errorset_import_scope(annotations, candidate_module, alias_name, module" not in alias_row_at or \
         "annotation.owner != \"__alias_param\"" not in alias_formal_names or \
@@ -348,11 +374,11 @@ if "symbol.line != declaration_line" not in symbol_visible or \
         "affine_call_postcondition_argument_index(current_module, file, consume_callee" not in call_walk or \
         "affine_root(consume_args[argument_index])" not in call_walk:
     raise SystemExit("consumption must follow the exact visible callable and mapped actual argument")
-if FIXTURE.count("#line 0 affine-postcondition-call-owner.elisa") != 89 or \
+if FIXTURE.count("#line 0 affine-postcondition-call-owner.elisa") != 95 or \
         "def consume(ticket: Ticket[Fresh], mode: bool) -> void ensures ticket => Used:" not in FIXTURE or \
         "def consume(ticket: Ticket[Fresh], mode: i64) -> void:" not in FIXTURE or \
         "type BoolMode = bool" not in FIXTURE or \
-        "type TextMode = string" not in FIXTURE or \
+        "type TextMode = sview" not in FIXTURE or \
         "struct T:\n    value: i64" not in FIXTURE or \
         "type Boxed[Elem] = darray[Elem]" not in FIXTURE or \
         "type BoxedWithOwner[Elem] = Pair[T, Elem]" not in FIXTURE or \
@@ -364,6 +390,13 @@ if FIXTURE.count("#line 0 affine-postcondition-call-owner.elisa") != 89 or \
         "consume_provider_box(generic_provider_box_ticket, value)" not in FIXTURE or \
         "def concrete_provider_box_actual(value: ImportedProvider::BoxedWithOwner[bool]) -> void:" not in FIXTURE or \
         "redeem(concrete_provider_box_ticket)" not in FIXTURE or \
+        "type Outer[Elem] = BoxedWithOwner[Elem]" not in FIXTURE or \
+        "def nested_provider_box_actual[T](value: ImportedProviderOuter::Outer[T]) -> void:" not in FIXTURE or \
+        "consume_provider_box(nested_provider_box_ticket, value)" not in FIXTURE or \
+        "redeem(nested_concrete_provider_box_ticket)" not in FIXTURE or \
+        "type RootOwnedBox[Elem] = RootPair[T, Elem]" not in FIXTURE or \
+        "consume_root_box(generic_root_box_ticket, value)" not in FIXTURE or \
+        "redeem(concrete_root_box_ticket)" not in FIXTURE or \
         "def consume_nominal_t(ticket: Ticket[Fresh], value: T) -> void ensures ticket => Used:" not in FIXTURE or \
         "def generic_actual_does_not_select_nominal[T](value: T) -> void:" not in FIXTURE or \
         "consume_nominal_t(generic_nominal_ticket, value)" not in FIXTURE or \
@@ -446,8 +479,8 @@ if FIXTURE.count("#line 0 affine-postcondition-call-owner.elisa") != 89 or \
         "def consume_module_alias_nominal(ticket: Ticket[Fresh], value: ImportedNominalAlias::Foo) -> void ensures ticket => Used:" not in FIXTURE or \
         "def module_alias_nominal_selects_postcondition(value: ImportedNominalAlias::Foo) -> void:" not in FIXTURE or \
         "consume_module_alias_nominal(module_alias_nominal_match_ticket, value)" not in FIXTURE or \
-        "def consume_qualified_nominal_pair(ticket: Ticket[Fresh], pair: (ImportedNominal::Foo, i64)) -> void ensures ticket => Used:" not in FIXTURE or \
-        "def qualified_nominal_tuple_selects_postcondition(pair: (ImportedNominal::Foo, i64)) -> void:" not in FIXTURE or \
+        "def consume_qualified_nominal_pair(ticket: Ticket[Fresh], pair: (first: ImportedNominal::Foo, second: i64)) -> void ensures ticket => Used:" not in FIXTURE or \
+        "def qualified_nominal_tuple_selects_postcondition(pair: (first: ImportedNominal::Foo, second: i64)) -> void:" not in FIXTURE or \
         "consume_qualified_nominal_pair(qualified_nominal_tuple_ticket, pair)" not in FIXTURE or \
         "def consume_qualified_nominal_array(ticket: Ticket[Fresh], values: darray[ImportedNominal::Foo]) -> void ensures ticket => Used:" not in FIXTURE or \
         "def qualified_nominal_array_selects_postcondition(values: darray[ImportedNominal::Foo]) -> void:" not in FIXTURE or \
@@ -455,7 +488,7 @@ if FIXTURE.count("#line 0 affine-postcondition-call-owner.elisa") != 89 or \
         "def consume_qualified_structural_alias(ticket: Ticket[Fresh], values: ImportedProvider::Items[bool]) -> void ensures ticket => Used:" not in FIXTURE or \
         "def qualified_structural_alias_selects_postcondition(values: ImportedProvider::Items[bool]) -> void:" not in FIXTURE or \
         "consume_qualified_structural_alias(qualified_structural_alias_ticket, values)" not in FIXTURE or \
-        "type ImportedFooPair = (Foo, i64)" not in FIXTURE or \
+        "type ImportedFooPair = (first: Foo, second: i64)" not in FIXTURE or \
         "def consume_qualified_nominal_pair_alias(ticket: Ticket[Fresh], pair: ImportedNominal::ImportedFooPair) -> void ensures ticket => Used:" not in FIXTURE or \
         "def qualified_nominal_pair_alias_selects_postcondition(pair: ImportedNominal::ImportedFooPair) -> void:" not in FIXTURE or \
         "consume_qualified_nominal_pair_alias(qualified_nominal_pair_alias_ticket, pair)" not in FIXTURE or \
@@ -486,8 +519,8 @@ if "Other::bool_value()" not in FIXTURE or \
         "Other::make_item().mode" not in FIXTURE or \
         "def qualified_return_field_owner_stays_unknown() -> void:" not in FIXTURE or \
         "consume_field_owner(field_owner_ticket, Other::make_item().mode)" not in FIXTURE or \
-        "get mode else return" not in FIXTURE or \
-        "pair: (i64, i64)" not in FIXTURE or \
+        "get mode else false" not in FIXTURE or \
+        "pair: (first: i64, second: i64)" not in FIXTURE or \
         "consume_pair(pair_ticket, (1, 2))" not in FIXTURE:
     raise SystemExit("scoped inference must preserve firm qualified-call, get-else, and tuple argument types")
 if "affine_typestate_postcondition_overload_owner.elisa" not in SMOKE or \
@@ -508,6 +541,10 @@ if "affine_typestate_postcondition_overload_owner.elisa" not in SMOKE or \
         '[[ "$nominal_generic_count" -ne 1 ]]' not in SMOKE or \
         'generic_boxed_ticket' not in SMOKE or \
         'generic_provider_box_ticket' not in SMOKE or \
+        'nested_provider_box_ticket' not in SMOKE or \
+        'nested_concrete_provider_box_ticket' not in SMOKE or \
+        'generic_root_box_ticket' not in SMOKE or \
+        'concrete_root_box_ticket' not in SMOKE or \
         'concrete_provider_box_ticket' not in SMOKE or \
         'generic_nominal_ticket' not in SMOKE or \
         "linear value \"ticket\" must be consumed before scope exit" not in SMOKE:

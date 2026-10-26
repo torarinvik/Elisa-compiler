@@ -14,7 +14,7 @@ cleanup() {
 }
 trap cleanup EXIT
 for optimization in 0 2; do
-    for fixture in region_parameter_owner_offset region_fact_owner_offset region_fact_cross_module_owner region_generic_owner_offset; do
+    for fixture in region_parameter_owner_offset region_local_pin_owner_offset region_fact_owner_offset region_fact_cross_module_owner region_generic_owner_offset; do
         elisa_run_timeout 30 env DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}" \
             "$STAGE1" -emit exe "-O$optimization" -o "$WORK/native" \
             "$ROOT/test/repro/$fixture.elisa" >"$WORK/native.log" 2>&1 || {

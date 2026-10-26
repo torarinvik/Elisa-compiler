@@ -113,9 +113,17 @@ for source, fragments, label in (
 backend = (ROOT / "src/backend/codegen_template_registry.elisa").read_text()
 semantic_handlers = (ROOT / "src/semantic/check_effect_handlers.elisa").read_text()
 semantic_effects = (ROOT / "src/semantic/check_abstract_effects.elisa").read_text()
-if "annotation.offset == line.offset" not in backend or \
-        "annotation.offset == line.offset" not in semantic_handlers or \
-        "declaration_pos.line, declaration_pos.offset" not in semantic_effects:
+backend_template = function_source(backend, "declaration_is_effect_template")
+semantic_template = function_source(semantic_handlers, "ae_effect_template_declared")
+if not all(fragment in backend_template for fragment in (
+    "annotation.line == line.line",
+    "annotation.offset == line.offset",
+)) or not all(fragment in semantic_template for fragment in (
+    "line: u32, offset: u32",
+    "annotation.line == line",
+    "annotation.offset == offset",
+)) or \
+        "ae_effect_template_declared(annotations, name, declaration_pos.line, declaration_pos.offset)" not in semantic_effects:
     raise SystemExit("backend template selection must match the exact declaration offset")
 if "check_effect_generic_owner_line_zero.py" not in smoke or \
         smoke.count('run_positive "helper_generic_effect_line_zero.elisa"') != 1 or \

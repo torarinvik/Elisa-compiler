@@ -113,9 +113,7 @@ bare_const_member_parser = compact(function_section(parser_decl_module, "bare_co
 const_declaration_parser = compact(function_section((ROOT / "src/parser/parser_types_aggregate.elisa").read_text(), "const_declaration"))
 declaration_static_if_parser = compact(function_section((ROOT / "src/parser/parser_decl_impl.elisa").read_text(), "static_if_declaration"))
 statement_static_if_parser = compact(function_section((ROOT / "src/parser/parser_stmt.elisa").read_text(), "statement_inner"))
-if 'marker.owner=="__static_if_branch"' not in alias_static_branch or \
-        'marker.name=="__using_alias_static_branch"' not in alias_static_branch or \
-        'marker.detail_name==alias.owner' not in alias_static_branch or \
+if 'ga_static_branch_marker_exists("__using_alias_static_branch",alias.owner,alias.module,alias.line,alias.offset,state)' not in alias_static_branch or \
         "parser.static_if_branch_rows.count.u32()!=parser.static_if_depth" not in static_branch_marker_parser or \
         "forbranch_identityinparser.static_if_branch_rows" not in static_branch_marker_parser or \
         'owner:"__static_if_branch"' not in static_branch_marker_parser or \
@@ -165,27 +163,29 @@ if not all(fragment in static_row_selection for fragment in (
         "return(false,false)ifcondition.backend_folds",
         "return(true,row==branch_row)",
         "return(true,false)ifrow==branch_row")) or not all(fragment in alias_branch_selection for fragment in (
-        'marker.owner!="__static_if_branch"',
-        'marker.name!="__using_alias_static_branch"',
-        "marker.detail_name!=alias.owner",
-        "ga_static_if_row_selection(marker.identity_id.usize(),alias.module,state)",
-        "return(true,false)ifbranch.knownandnotbranch.selected",
-        "unknown<-trueifnotbranch.known",
-        "return(false,false)ifunknown")):
+        'ga_static_branch_marker_selection("__using_alias_static_branch",alias.owner,alias.module,alias.line,alias.offset,alias.module,state)',
+        "return(true,false)ifmarkers.inactive",
+        "return(true,true)ifnotmarkers.found",
+        "return(false,false)ifmarkers.unknown")):
     raise SystemExit("GlobalAuthority must follow known static-if selection and fail closed on unknown branch ancestry")
 import_branch_selection = compact(function_section(authority_text, "ga_import_annotation_branch_selection"))
 import_index = compact(function_section((ROOT / "src/semantic/check_global_authority/annotation_index.elisa").read_text(), "ga_index_import_annotations"))
 if not all(fragment in import_branch_selection for fragment in (
-        'marker_owner:sview="__static_if_branch"',
         'marker_name:sview="__from_member_static_branch"ifimport_row.owner=="__from_member"else"__binding_wildcard_import_static_branch"',
-        "marker.owner!=marker_owner",
-        "marker.detail_name!=marker_detail",
-        "ga_static_if_row_selection(marker.identity_id.usize(),import_row.module,state)",
-        "return(false,false)ifunknown")) or \
+        "ga_static_branch_marker_selection(marker_name,marker_detail,import_row.module,import_row.line,import_row.offset,import_row.module,state)",
+        "return(true,false)ifmarkers.inactive",
+        "return(false,false)ifmarkers.unknown")) or \
         "ga_import_annotation_branch_selection(annotation,state)" not in import_index or \
         "ifnotbranch.known:state.static_import_uncertain<-true" not in import_index or \
         "continueifnotbranch.active" not in import_index:
     raise SystemExit("GlobalAuthority import indexing must exclude inactive imports and preserve uncertainty for possible imports")
+for relative_path, state_name in (
+        ("src/semantic/check_global_authority/incremental.elisa", "state"),
+        ("src/semantic/check_fn_value_effect_row_signatures.elisa", "context"),
+        ("src/semantic/check_global_permissions/axis_projection.elisa", "authority"),
+        ("src/semantic/check_strict_unsafe_ops_views.elisa", "authority")):
+    if f"ga_index_import_annotations(&{state_name})" not in (ROOT / relative_path).read_text():
+        raise SystemExit(f"production GlobalAuthority constructor bypasses shared alias-index preparation: {relative_path}")
 import_uncertainty = compact((ROOT / "src/semantic/check_global_authority/incremental.elisa").read_text())
 if "ga_mark_all_possible_global_effects(&state)ifstate.static_import_uncertain" not in import_uncertainty:
     raise SystemExit("uncertain static imports must conservatively retain possible global effects")
@@ -202,13 +202,9 @@ if not all(fragment in import_uncertainty for fragment in (
 const_branch_selection = compact(function_section(authority_text, "ga_static_if_const_branch_selection"))
 named_const_fold = compact(function_section(authority_text, "ga_static_if_named_constant_value"))
 if not all(fragment in const_branch_selection for fragment in (
-        'marker.owner!="__static_if_branch"',
-        'marker.name!="__const_static_branch"',
-        "marker.detail_name!=state.static_const_names[const_index]",
-        "marker.module!=state.static_const_owners[const_index]",
-        "marker.line!=state.static_const_lines[const_index]",
-        "marker.offset!=state.static_const_offsets[const_index]",
-        "ga_static_if_row_selection(marker.identity_id.usize(),state.static_const_owners[const_index],state,depth+1)")) or not all(fragment in named_const_fold for fragment in (
+        'ga_static_branch_marker_selection("__const_static_branch",state.static_const_names[const_index],state.static_const_owners[const_index],state.static_const_lines[const_index],state.static_const_offsets[const_index],state.static_const_owners[const_index],state,depth+1)',
+        "return(true,false)ifmarkers.inactive",
+        "return(false,false)ifmarkers.unknown")) or not all(fragment in named_const_fold for fragment in (
         "ga_static_if_const_branch_selection(index,state,depth+1)",
         "continueifnotbranch.active",
         "exact_unknown",
@@ -216,14 +212,20 @@ if not all(fragment in const_branch_selection for fragment in (
         "any_unknown")):
     raise SystemExit("GlobalAuthority source-constant folding must select only the active static-branch declaration")
 alias_registration_index = compact(function_section(authority_text, "ga_module_alias_registration_index"))
-if 'alias.name!="__using_alias"' not in alias_registration_index or \
-        "alias.offset!=offset" not in alias_registration_index or \
-        "ga_module_text(alias.module,state)!=scope" not in alias_registration_index:
+if "state.module_alias_rows.count" not in alias_registration_index or \
+        'alias.name=="__using_alias"' not in alias_registration_index or \
+        "alias.offset==offset" not in alias_registration_index or \
+        "ga_module_text(alias.module,state)==scope" not in alias_registration_index or \
+        "foralias_indexin0..<state.annotations.count" not in alias_registration_index:
     raise SystemExit("GlobalAuthority alias-target cutoffs are not bound to the declaration's registration position")
+alias_choice_consider = compact(function_section(authority_text, "ga_module_alias_choice_consider"))
+if "state.module_alias_rows.count" not in alias_choice or \
+        "foralias_indexin0..<state.annotations.count" not in alias_choice:
+    raise SystemExit("GlobalAuthority alias selection must use the prepared source-ordered alias rows with a safe fallback")
 if "source_positioned:bool=before_offset!=GLOBAL_AUTHORITY_OFFSET_NONE" not in alias_choice or \
-        "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,selected_scope,selected_alias.offset,selected_index,state)" not in alias_choice or \
-        "ga_module_alias_registration_precedes(selected_scope,selected_alias.offset,selected_index,alias_scope,alias.offset,alias_index,state)" not in alias_choice or \
-        "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,lexical_scope,before_alias.offset,before_index,state)" not in alias_choice or \
+        "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,selected_scope,selected_alias.offset,selected_index,state)" not in alias_choice_consider or \
+        "ga_module_alias_registration_precedes(selected_scope,selected_alias.offset,selected_index,alias_scope,alias.offset,alias_index,state)" not in alias_choice_consider or \
+        "ga_module_alias_registration_precedes(alias_scope,alias.offset,alias_index,lexical_scope,before_alias.offset,before_index,state)" not in alias_choice_consider or \
         "before_index:usize=ga_module_alias_registration_index(lexical_scope,before_offset,state)" not in alias_choice:
     raise SystemExit("GlobalAuthority alias lookup must keep first registration without a cutoff and the latest eligible registration with one")
 parts_resolve = compact(function_section(authority_text, "ga_module_parts_resolve"))
@@ -251,13 +253,39 @@ if exact_target_path < 0 or alias_target_choice < 0 or exact_target_path >= alia
 if "ga_module_alias_choice(first,declaration_scope,state,depth,before_offset)" not in alias_target or \
         "ga_module_alias_target_resolve(target.path,alias.scope,state,depth+1,alias_row.offset)" not in alias_target:
     raise SystemExit("GlobalAuthority alias-target recursion drops its source registration cutoff")
-if not all(fragment in alias_choice for fragment in (
+if not all(fragment in alias_choice_consider for fragment in (
         "branch_selection:(known:bool,active:bool)=ga_module_alias_branch_selection(alias_index,state)",
-        "continueifbranch_selection.knownandnotbranch_selection.active",
+        "returnifbranch_selection.knownandnotbranch_selection.active",
         "ifnotbranch_selection.known:",
-        "uncertain_index<-alias_index",
-        "return(true,true,uncertain_index,uncertain_scope)")):
+        "uncertain_index<-alias_index")) or "return(true,true,uncertain_index,uncertain_scope)" not in alias_choice:
     raise SystemExit("alias choice must skip proven-inactive branches and preserve unknown branch precedence conservatively")
+marker_selection = compact(function_section(authority_text, "ga_static_branch_marker_selection"))
+marker_exists = compact(function_section(authority_text, "ga_static_branch_marker_exists"))
+annotation_index_text = (ROOT / "src/semantic/check_global_authority/annotation_index.elisa").read_text()
+alias_index_builder = compact(function_section(annotation_index_text, "ga_index_module_alias_annotations"))
+import_index_builder = compact(function_section(annotation_index_text, "ga_index_import_annotations"))
+if not all(fragment in alias_index_builder for fragment in (
+        "state.module_alias_rows.clear()",
+        "state.static_branch_marker_rows.clear()",
+        'annotation.name=="__using_alias"',
+        "state.module_alias_rows.push(annotation_index)",
+        'annotation.owner=="__static_if_branch"',
+        'annotation.name=="__using_alias_static_branch"',
+        'annotation.name=="__from_member_static_branch"',
+        'annotation.name=="__binding_wildcard_import_static_branch"',
+        'annotation.name=="__const_static_branch"',
+        "state.static_branch_marker_rows.push(annotation_index)",
+        "state.module_alias_index_annotation_count<-state.annotations.count",
+        "state.module_alias_index_ready<-true")) or \
+        "ga_index_module_alias_annotations(state)" not in import_index_builder or \
+        import_index_builder.find("ga_index_module_alias_annotations(state)") >= import_index_builder.find("forannotationinstate.annotations") or \
+        not all(fragment in marker_selection for fragment in (
+            "state.static_branch_marker_rows.count",
+            "ga_static_branch_marker_consider(marker_index,marker_name,detail_name,module,line,offset,current_module,state,selection_depth,found_marker,unknown)",
+            "formarker_indexin0..<state.annotations.count")) or \
+        "state.static_branch_marker_rows.count" not in marker_exists or \
+        "formarkerinstate.annotations" not in marker_exists:
+    raise SystemExit("GlobalAuthority alias and static-branch lookups must use source-ordered row views with exact checks and a fallback")
 text_module = compact(function_section(authority_text, "ga_text_module"))
 if "ga_module_alias_resolve(path,lexical_scope,state,0,true,before_offset)" not in text_module:
     raise SystemExit("GlobalAuthority text module lookup drops its source offset")

@@ -81,12 +81,12 @@ def compact(source: str) -> str:
 
 
 def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}\(", source))
+    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\n]*\])?\(", source))
     if len(matches) != 1:
         raise SystemExit(f"expected exactly one function named {name}")
     match = matches[0]
     indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*\(", source[match.end():])
+    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*\])?\(", source[match.end():])
     end = match.end() + following.start() if following else len(source)
     return source[match.start():end]
 
@@ -264,6 +264,7 @@ prepare_symbol_table = compact(function_section(table_setup_text, "prepare_symbo
 unresolved_table_setup = compact(function_section(diagnostic_output_text, "unresolved_table"))
 unresolved_references_setup = compact(function_section(diagnostic_output_text, "unresolved_references"))
 possible_import_name_visible = compact(function_section(import_visibility_text, "semantic_possible_import_name_visible"))
+possible_import_member_visible = compact(function_section(import_visibility_text, "semantic_possible_import_member_visible"))
 possible_import_alias = compact(function_section(import_visibility_text, "semantic_possible_import_module_alias"))
 possible_import_module_visible = compact(function_section(import_visibility_text, "semantic_possible_import_module_visible"))
 possible_import_module_member = compact(function_section(import_visibility_text, "semantic_possible_import_module_member_visible"))
@@ -304,7 +305,7 @@ resolver_name_known = compact(function_section(resolve_scope_text, "name_known")
 resolver_module_alias = compact(function_section(resolve_scope_text, "name_is_module"))
 resolver_name_classification = compact(function_section(resolve_scope_text, "resolver_name_classification"))
 resolver_wildcard_uncertainty = compact(function_section(resolve_expr_walk_text, "rew_ambiguous_wildcard_type_name"))
-resolver_qualified_alias_uncertainty = compact(function_section(resolve_expr_walk_context_text, "walk_expression_with_context"))
+resolver_qualified_alias_uncertainty = compact(function_section(resolve_expr_walk_context_text, "walk_expression_inner_with_context"))
 binding_nominal_lookup = compact(function_section(resolve_binding_capabilities_text, "binding_nominal_declaration"))
 named_struct_lookup = compact(function_section(check_named_type_mismatch_text, "named_struct_target"))
 enum_owner_lookup = compact(function_section(resolve_enum_owners_text, "operator_named_type_symbol"))
@@ -543,10 +544,14 @@ if not all(fragment in prepare_symbol_table for fragment in (
     ):
     raise SystemExit("raw pre-collect using-alias ordering and post-collect import selection must remain separate")
 if not all(fragment in possible_import_name_visible for fragment in (
-        'semantic_import_scope_visible(annotation.module,current_scope)',
+        'semantic_possible_import_member_visible(table,name,current_scope)',
+        'semantic_possible_import_module_alias(table,name,current_scope)',
+        'module_import:bool=annotation.name=="__using"orannotation.name=="__using_alias_target"orannotation.name=="__binding_wildcard_import"',
+        'module_importandsemantic_import_scope_visible(annotation.module,current_scope)',
+        'semantic_possible_import_import_row_member_visible(table,annotation,name,current_scope)')) or not all(fragment in possible_import_member_visible for fragment in (
         'annotation.owner=="__from_member"',
-        'annotation.name=="__using_alias"',
-        'semantic_possible_import_import_row_member_visible(table,annotation,name,current_scope)')) or not all(fragment in possible_import_type_selection for fragment in (
+        'annotation.name==name',
+        'semantic_import_scope_visible(annotation.module,current_scope)')) or not all(fragment in possible_import_type_selection for fragment in (
         'semantic_import_scope_visible(annotation.module,current_scope)',
         'source.owner!="__from_src"',
         'semantic_possible_import_type_path_candidate_matches(table,symbol.module_owner,source.name,name,kind,include_constants,source.module,source.offset)',
@@ -568,10 +573,12 @@ if not all(fragment in possible_import_name_visible for fragment in (
         'semantic_possible_import_alias_target_row_can_win(target,current_scope,table)',
         'semantic_possible_import_module_path_member_visible(table,target.owner,name,target.module,target.offset)')) or not all(fragment in possible_import_module_path for fragment in (
         'candidate_owner==target',
-        'prefix_length==import_scope.len',
-        'import_scope[prefix_length]==58',
-        'import_scope[prefix_length+1.usize()]==58',
-        'candidate_owner[prefix_length+2.usize()+index]==target[index]')):
+        'at_scope_boundary:bool=prefix_length==import_scope.lenor(prefix_length+1.usize()<import_scope.lenandimport_scope[prefix_length]==58andimport_scope[prefix_length+1.usize()]==58)',
+        'expected_length:usize=prefix_length+2.usize()+target.len',
+        'candidate_owner.len==expected_length',
+        'candidate_owner[prefix_length]==58andcandidate_owner[prefix_length+1.usize()]==58',
+        'matches_target<-falseifcandidate_owner[prefix_length+2.usize()+index]!=target[index]',
+        'returntrueifmatches_target')):
     raise SystemExit("possible imports must preserve ordinary scope visibility and resolve candidate paths through the selected alias or raw root")
 if not all(fragment in possible_import_alias_target_row_can_win for fragment in (
         'target_row.name!="__using_alias_target"',
@@ -622,7 +629,7 @@ if not all(fragment in possible_import_alias_target_row_can_win for fragment in 
         'alias.owner==symbol.name',
         'alias.line==symbol.line',
         'alias.offset==symbol.offset')) or not all(fragment in possible_import_module_path_alias_module for fragment in (
-        'for module_row in table.module_symbol_rows',
+        'formodule_rowintable.module_symbol_rows',
         'semantic_possible_import_module_symbol_is_using_alias(symbol,table)',
         'semantic_possible_import_alias_target_alias_matches(symbol.name,target_path,import_scope,before_offset,table)')) or not all(fragment in possible_import_module_path_module_candidate for fragment in (
         'semantic_possible_import_alias_target_head_status(target_path,import_scope,before_offset,table)',
@@ -669,7 +676,7 @@ if any(fragment in function for function in (possible_import_module_visible, pos
         'semantic_possible_import_alias_module_path_matches(symbol.module_owner,source.name,source.module,source.offset,table)')):
     raise SystemExit("possible-import consumers must not OR alias targets with raw root-path matches")
 if not all(fragment in possible_import_module_path_suffix for fragment in (
-        'tail_length:=target.len+2.usize()+suffix.len',
+        'tail_length:usize=target.len+2.usize()+suffix.len',
         'candidate_owner.len==tail_length',
         'candidate_owner[target_end]==58',
         'candidate_owner[target_end+1.usize()]==58')) or not all(fragment in possible_import_alias_module_path for fragment in (
@@ -773,7 +780,7 @@ if 'UNKNOWN_DUPLICATE_IMPORT' not in module_alias_precedence_text or 'using Secr
     raise SystemExit("aliased using branch regression must cover a wildcard row followed by a same-target alias on one source line")
 if not all(fragment in compact(parser_text) for fragment in (
         'parser<-parser.record_static_if_branch_rows("__from_member_static_branch",member,token)',
-        'parser<-parser.record_static_if_branch_markers(marker_name,detail_name,parser.current_module,token.line,token.start)',
+        'parser<-parser.record_static_if_branch_markers(marker_name,detail_name,token.line,token.start)',
         'owner:"__static_if_branch",name:marker_name,detail_name:detail_name,module:marker_module',
         'identity_id:branch_identity')):
     raise SystemExit("selective import parser rows must carry the member token's enclosing static-if branch identities")
@@ -785,7 +792,7 @@ if 'parser.record_static_if_branch_rows("__const_static_branch",Lexer::text_or_e
     raise SystemExit("immutable const declarations must carry static-if branch identities for PMA condition folding")
 private_markers = compact(function_section(parser_text, "record_static_if_branch_markers"))
 if not all(fragment in private_record for fragment in (
-        'parser<-parser.record_static_if_branch_markers("__private_member_static_branch",member_name,parser.current_module,section_line,member_position.offset)')) or not all(fragment in private_markers for fragment in (
+        'parser<-parser.record_static_if_branch_markers("__private_member_static_branch",member_name,section_line,member_position.offset)',)) or not all(fragment in private_markers for fragment in (
         'marker_name',
         'detail_name',
         'marker_module',
@@ -824,7 +831,7 @@ if not all(fragment in import_using_row_alias_pair for fragment in (
         'candidate.line!=using_row.line',
         'candidate.offset<=using_row.offset',
         'candidate.offset<next_using_offset',
-        'for candidate in table.possible_import_annotations',
+        'forcandidateintable.possible_import_annotations',
         'target_row.owner!=using_row.owner',
         'target_row.module!=using_row.module',
         'target_row.line!=using_row.line',
@@ -834,8 +841,8 @@ if not all(fragment in import_using_row_alias_pair for fragment in (
         'alias_row.module==target_row.module',
         'alias_row.line==target_row.line',
         'alias_row.offset==target_row.offset',
-        'for alias_row in table.possible_import_annotations',
-        'for target_row in table.possible_import_annotations')):
+        'foralias_rowintable.possible_import_annotations',
+        'fortarget_rowintable.possible_import_annotations')):
     raise SystemExit("alias-associated legacy using rows must be identified without altering the raw import views")
 if not all(fragment in binding_import_builder for fragment in (
         'annotation.name=="__using_alias_target"',
@@ -883,11 +890,12 @@ for setup in (prepare_symbol_table, unresolved_table_setup, unresolved_reference
             'table.imported_modules.push(canonical_target)ifcanonical_target!=""',
             'semantic_import_alias_is_global_winner(annotation,table)')):
         raise SystemExit("every symbol-table construction path must project only exact alias winners and canonical targets")
-    binding_metadata_index = setup.find('binding_import_metadata(table.definite_import_annotations,table)')
-    alias_members_index = setup.find('register_using_alias_members(table.definite_import_annotations,table)')
+    definite_import_view_index = setup.find('definite_import_annotations:darray[Ast::EnumAnnotation]=table.definite_import_annotations')
+    binding_metadata_index = setup.find('binding_import_metadata(definite_import_annotations,table)')
+    alias_members_index = setup.find('register_using_alias_members(definite_import_annotations,table)')
     canonical_target_index = setup.find('semantic_import_alias_target_canonical_owner(annotation,table)')
-    if binding_metadata_index < 0 or alias_members_index < 0 or canonical_target_index < 0 or not (
-            binding_metadata_index < alias_members_index < canonical_target_index):
+    if definite_import_view_index < 0 or binding_metadata_index < 0 or alias_members_index < 0 or canonical_target_index < 0 or not (
+            definite_import_view_index < binding_metadata_index < alias_members_index < canonical_target_index):
         raise SystemExit("canonical alias projections must run after binding import metadata is built")
 if not all(fragment in using_alias_target for fragment in (
         'target_row.name=="__using_alias_target"',

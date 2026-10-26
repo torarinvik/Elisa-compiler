@@ -39,6 +39,22 @@ if [[ "$provider_generic_count" -ne 0 ]]; then
     echo "affine typestate call-owner smoke FAIL: alias-owned ImportedProvider::T collided with caller generic T and rejected its matching generic overload: $out" >&2
     exit 1
 fi
+if grep -Fq 'linear value "nested_provider_box_ticket" must be consumed before scope exit' <<< "$out"; then
+    echo "affine typestate call-owner smoke FAIL: cross-module nested alias lost its caller generic substitution: $out" >&2
+    exit 1
+fi
+if grep -Fq 'linear value "generic_root_box_ticket" must be consumed before scope exit' <<< "$out"; then
+    echo "affine typestate call-owner smoke FAIL: root nominal T collided with caller generic T during alias expansion: $out" >&2
+    exit 1
+fi
+if grep -Eq 'linear value "concrete_root_box_ticket"|concrete_root_box_ticket.*(state|typestate|transition)' <<< "$out"; then
+    echo "affine typestate call-owner smoke FAIL: concrete root alias selected a consuming generic overload: $out" >&2
+    exit 1
+fi
+if grep -Eq 'linear value "nested_concrete_provider_box_ticket"|nested_concrete_provider_box_ticket.*(state|typestate|transition)' <<< "$out"; then
+    echo "affine typestate call-owner smoke FAIL: nested concrete alias selected a consuming generic overload: $out" >&2
+    exit 1
+fi
 if grep -Eq 'linear value "concrete_provider_box_ticket"|concrete_provider_box_ticket.*(state|typestate|transition)' <<< "$out"; then
     echo "affine typestate call-owner smoke FAIL: concrete BoxedWithOwner[bool] must select the non-consuming overload before explicit redeem: $out" >&2
     exit 1
@@ -58,7 +74,7 @@ if [[ "$qualified_nominal_alias_count" -ne 1 ]]; then
     echo "affine typestate call-owner smoke FAIL: a zero-TypeId qualified nominal alias must not select a same-spelled but different-owner postcondition: $out" >&2
     exit 1
 fi
-for selected_name in qualified_ticket imported_return_ticket get_else_ticket pair_ticket structured_ticket imported_structural_alias_ticket imported_nominal_ticket qualified_nominal_match_ticket module_alias_nominal_match_ticket qualified_nominal_tuple_ticket qualified_nominal_array_ticket qualified_structural_alias_ticket qualified_nominal_pair_alias_ticket qualified_nominal_ref_ticket qualified_nominal_optional_ticket qualified_type_alias_ticket imported_type_alias_ticket module_alias_type_ticket same_region_ticket generic_boxed_ticket; do
+for selected_name in qualified_ticket imported_return_ticket get_else_ticket pair_ticket structured_ticket imported_structural_alias_ticket imported_nominal_ticket qualified_nominal_match_ticket module_alias_nominal_match_ticket qualified_nominal_tuple_ticket qualified_nominal_array_ticket qualified_structural_alias_ticket qualified_nominal_pair_alias_ticket qualified_nominal_ref_ticket qualified_nominal_optional_ticket qualified_type_alias_ticket imported_type_alias_ticket module_alias_type_ticket same_region_ticket generic_boxed_ticket branch_ticket; do
     if grep -Fq "linear value \"$selected_name\" must be consumed before scope exit" <<< "$out"; then
         echo "affine typestate call-owner smoke FAIL: a firmly typed qualified/imported type alias, qualified/imported-return, get-else, or tuple argument lost its consuming postcondition: $out" >&2
         exit 1

@@ -29,6 +29,7 @@ def function_source(source: str, name: str) -> str:
 
 
 parser_decl = PARSER_DECL.read_text()
+rewrite_members = function_source(parser_decl, "rewrite_handler_members")
 parser_effects = PARSER_EFFECTS.read_text()
 parser_install = PARSER_INSTALL.read_text()
 parser_specialization = PARSER_SPECIALIZATION.read_text()
@@ -50,6 +51,12 @@ if "detail_line: effect_start_token.line" not in parser_decl or "offset: effect_
     raise SystemExit("handler target rows must retain the exact alias-resolver requester position")
 if 'line: 3900000087, module: parser.current_module, identity_id: handler_identity_id, referenced_identity_id: method_effect_identity_id' not in parser_decl:
     raise SystemExit("handler realization rows must retain the identity of each method effect")
+if "shadowed_by_operation_arg: bool = any operation_parameter in method_params where operation_parameter.name == capture.name" not in rewrite_members or \
+        "duplicate_capture_name: bool = any previous_capture_name in capture_names_seen where previous_capture_name == capture.name" not in rewrite_members or \
+        "if shadowed_by_operation_arg and not duplicate_capture_name" not in rewrite_members or \
+        "parser.handler_capture_name(handler_name, method_line.line)" not in rewrite_members or \
+        "parameters.extend(method_params)" not in rewrite_members:
+    raise SystemExit("lowered handler captures must retain a distinct binding owner when an operation parameter shadows them")
 
 resolve = function_source(semantic_decls, "ae_effect_identity_for_ref")
 if "EffectDeclarationIdentityIndex&" not in resolve or \

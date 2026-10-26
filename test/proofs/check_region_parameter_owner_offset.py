@@ -24,8 +24,11 @@ generic_layout = read("src/backend/codegen_packed_meta.elisa")
 call = read("src/backend/codegen_call.elisa")
 new_expr = read("src/backend/codegen_expr_literals.elisa")
 in_block = read("src/backend/codegen_stmt_blocks_exprs.elisa")
+var_decl = read("src/backend/codegen_stmt_vardecl_emit.elisa")
+source_queries = read("src/backend/codegen_env_source_queries.elisa")
 signature = read("src/backend/codegen_declare_signature.elisa")
 fixture = read("test/repro/region_parameter_owner_offset.elisa")
+pin_fixture = read("test/repro/region_local_pin_owner_offset.elisa")
 fact_fixture = read("test/repro/region_fact_owner_offset.elisa")
 cross_module_fact_fixture = read("test/repro/region_fact_cross_module_owner.elisa")
 generic_fact_fixture = read("test/repro/region_generic_owner_offset.elisa")
@@ -38,6 +41,11 @@ if "owner_offset: u32" not in ast or \
 if "region_param_owner_offsets: mutable darray[u32] = []" not in table or \
         "region_param_owner_offsets <- structs.regions.region_param_owner_offsets.push(region_annotation.owner_offset + 1)" not in collector:
     raise SystemExit("backend collection must normalize parser owner offsets into the function offset+1 domain")
+if "local_region_offsets: mutable darray[u32] = []" not in table or \
+        "local_region_offsets <- structs.regions.local_region_offsets.push(region_annotation.owner_offset)" not in collector or \
+        "local_region_name_at(var_line.line, var_line.offset, structs)" not in var_decl or \
+        "structs.regions.local_region_offsets[probe] != offset" not in source_queries:
+    raise SystemExit("local arena pins must retain the exact declaration token offset")
 
 if "def region_parameter_count(line: u32, owner_offset: u32" not in regions or \
         "region_param_owner_offsets[row] == owner_offset" not in regions or \
@@ -83,8 +91,10 @@ if "function_offset: mutable u32 = 0" not in runtime or \
         "value_type_returns_caller_region(return_value_type, structs) and not params_manage_arena(params, structs)" not in body:
     raise SystemExit("runtime copies must carry the explicit-region suffix base after hidden parameter and return slots")
 if "region_parameter_index(runtime.function_line, runtime.function_offset, region_new_name, runtime.caller_region_parameter_start, structs)" not in new_expr or \
-        "region_parameter_index(runtime.function_line, runtime.function_offset, block_clause[0], runtime.caller_region_parameter_start, structs)" not in in_block:
-    raise SystemExit("`new[r]` and `in r:` must resolve names with the current function offset")
+        "region_parameter_index(runtime.function_line, runtime.function_offset, block_clause[0], runtime.caller_region_parameter_start, structs)" not in in_block or \
+        "region_parameter_index(runtime.function_line, runtime.function_offset, pinned_region, runtime.caller_region_parameter_start, structs)" not in var_decl or \
+        "pinned_arena <- runtime.caller_arenas[pinned_parameter_index.usize()]" not in var_decl:
+    raise SystemExit("region allocation, block selectors, and declaration pins must resolve the current function's hidden slot")
 if "inst_arena_region_parameter_starts: mutable darray[i64]" not in generic_inference or \
         "instantiation_arena_layout(function_name, instantiation_arena_owner, params, body, line.line, line.offset + 1, instantiation_needs_arena, structs, instantiation_param_slots, instantiation_region_parameter_start)" not in generic_layout or \
         "generics.inst_arena_region_parameter_starts <- generics.inst_arena_region_parameter_starts.push(instantiation_region_parameter_start)" not in generic_layout or \
@@ -108,7 +118,7 @@ if fixture.count("#line 0 region-parameter-owner.elisa") != 2 or not all(fragmen
     "new[r] value",
     "region inner(1024):",
     "result <- allocate_after_hidden[outer](young, old, 41)",
-    "read_r[caller](anchor) + allocate_s[caller](anchor, 41) == 42",
+    "read_r[caller](anchor) + allocate_s[caller](anchor, 41) == 43",
 )):
     raise SystemExit("regression must collide region owners and verify selectors after hidden parameter and return slots")
 if fact_fixture.count("#line 0 region-fact-owner.elisa") != 2 or not all(fragment in fact_fixture for fragment in (
@@ -137,10 +147,15 @@ if generic_fact_fixture.count("#line 0 region-generic-owner.elisa") != 2 or not 
 )):
     raise SystemExit("generic regression must distinguish same-line same-name templates by owner and formal bindings")
 if "region_parameter_owner_offset" not in smoke or \
+        "region_local_pin_owner_offset" not in smoke or \
         "region_fact_owner_offset" not in smoke or \
         "region_fact_cross_module_owner" not in smoke or \
         "region_generic_owner_offset" not in smoke or \
         "for optimization in 0 2" not in smoke:
     raise SystemExit("behavioral smoke must run both same-line region ABI regressions")
+if pin_fixture.count("#line 0 ") != 2 or "result: mutable darray[i64] @r = []" not in pin_fixture or \
+        "result: mutable darray[i64] @s = []" not in pin_fixture or \
+        "target[outer](young, 42)" not in pin_fixture or "result[0] == 42" not in pin_fixture:
+    raise SystemExit("local pin regression must collide declaration lines across distinct region owners")
 
 print("region ABI owner offset source proof OK")
