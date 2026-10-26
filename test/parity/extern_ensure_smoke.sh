@@ -65,7 +65,9 @@ same_line_guards = []
 for stage, compiler in enumerate((stage0, stage1)):
     ll = work / f'same-line{stage}.ll'
     subprocess.run([compiler, '-emit', 'llvm', '-O0', '-o', str(ll), str(same_line)], check=True, timeout=60)
-    same_line_guards.append(ll.read_text().count('call void @abort'))
+    # Panic-report helpers may centralize abort or retain a defensive abort at each
+    # call site. Count the actual contract failure blocks, not that implementation detail.
+    same_line_guards.append(len(re.findall(r'^contract\.fail[0-9.]*:', ll.read_text(), re.M)))
 assert same_line_guards == [2, 2], f'one exact ensure per same-line extern call: {same_line_guards}'
 print('extern_ensure: same-line declaration owners stay isolated in both PASS', flush=True)
 
