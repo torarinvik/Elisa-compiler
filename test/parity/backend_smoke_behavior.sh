@@ -40,6 +40,13 @@ run_case() {
     pass=$((pass + 1))
 }
 
+run_fixture_case() {
+    local name="$1" fixture="$2" want="$3"
+    local src
+    src="$(cat "$ROOT/$fixture")"
+    run_case "$name" "$src" "$want"
+}
+
 # The spine's modeled subset: a parameterless `-> i64` returning an int expression.
 run_case return_42        'def main() -> i64:\n    return 42\n'   42
 run_case return_0         'def main() -> i64:\n    return 0\n'     0
@@ -80,6 +87,15 @@ run_case discard_call     'def helper(x: i64) -> i64:\n    return x + 1\n\ndef m
 # `f()` — both were declined edge cases (empty arg array). Plain and capturing.
 run_case lambda_noarg     'def call(f: fn() -> i64) -> i64:\n    return f()\n\ndef main() -> i64:\n    return call(fn() => 42)\n'  42
 run_case lambda_noarg_cap 'def call(f: fn() -> i64) -> i64:\n    return f()\n\ndef main() -> i64:\n    n: i64 = 42\n    return call(fn() => n)\n'  42
+
+# Arrow lambda bodies use single_statement_body while colon bodies use parse_block. Keep
+# both spellings under plain and fallible contextual function types so their stored body
+# buffers have identical packed-node lifetime and observable behavior.
+python3 "$ROOT/test/proofs/check_lambda_arrow_body_source_region.py"
+run_fixture_case lambda_body_plain_arrow test/fixtures/backend/lambda_body_source/plain_arrow.elisa 17
+run_fixture_case lambda_body_plain_block test/fixtures/backend/lambda_body_source/plain_block.elisa 17
+run_fixture_case lambda_body_fallible_arrow test/fixtures/backend/lambda_body_source/fallible_arrow.elisa 14
+run_fixture_case lambda_body_fallible_block test/fixtures/backend/lambda_body_source/fallible_block.elisa 14
 
 # Membership `x in [literal array]` over a numeric element type: an OR-chain of equality
 # compares. Asserted by VALUE (hit vs miss), in both a ternary condition and an if-condition,
