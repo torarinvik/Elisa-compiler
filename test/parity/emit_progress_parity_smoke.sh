@@ -58,8 +58,8 @@ if ! s1 -emit progress -o "$step_fixture" "$REPO_ROOT/test/repro/progress_step_s
     echo "emit_progress parity FAILED: progress_step_signs fixture did not produce a Stage1 report"
     exit 1
 fi
-if ! grep -q '^warnings: 21$' "$step_fixture" || [ "$(grep -c 'evidence=none' "$step_fixture")" -ne 21 ] || [ "$(grep -c 'evidence=progress' "$step_fixture")" -ne 4 ]; then
-    echo "emit_progress parity FAILED: progress_step_signs did not classify all 21 unproven and 4 valid steps as expected"
+if ! grep -q '^warnings: 19$' "$step_fixture" || [ "$(grep -c 'evidence=none' "$step_fixture")" -ne 19 ] || [ "$(grep -c 'evidence=progress' "$step_fixture")" -ne 6 ]; then
+    echo "emit_progress parity FAILED: progress_step_signs did not classify all 19 unproven and 6 valid steps as expected"
     exit 1
 fi
 if ! grep -q '^  valid_compound_increment: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
@@ -86,8 +86,12 @@ if ! grep -q '^  unrecognized_compound_increment_negative_subtract: obligations=
     echo "emit_progress parity FAILED: noncanonical negative step was incorrectly accepted for an increasing bound"
     exit 1
 fi
-if ! grep -q '^  unrecognized_explicit_increment_parenthesized_positive_step: obligations=Loop:1 evidence=none ' "$step_fixture"; then
-    echo "emit_progress parity FAILED: unsupported parenthesized step was incorrectly accepted as progress"
+if ! grep -q '^  valid_compound_increment_parenthesized_positive_step: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: normalized parenthesized compound step was not accepted as progress"
+    exit 1
+fi
+if ! grep -q '^  valid_explicit_increment_parenthesized_positive_step: obligations=Loop:1 evidence=progress ' "$step_fixture"; then
+    echo "emit_progress parity FAILED: normalized parenthesized explicit step was not accepted as progress"
     exit 1
 fi
 if ! grep -q '^  compound_decrement_rhs_mimics_explicit_increment: obligations=Loop:1 evidence=none ' "$step_fixture"; then
