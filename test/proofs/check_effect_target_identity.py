@@ -104,6 +104,12 @@ for fragment in (
 ):
     if fragment not in semantic_effects:
         raise SystemExit(f"handler validation must use the target effect ID: {fragment}")
+if not all(fragment in semantic_effects for fragment in (
+    "target_member: sview = effect_ref_member(target_ref)",
+    "ae_validate_effect_ref(target_ref, handler_line, file.enum_annotations, table)",
+    "not target_validation_reported",
+)):
+    raise SystemExit("dotted handler targets must use the shared effect-row diagnostics before the generic unknown-interface fallback")
 
 if "target_matches_install: bool = target_identity_id != 0 and installed_identity_id != 0 and target_identity_id == installed_identity_id and ae_effect_ref_same_specialization(target_ref, installed)" not in semantic_effects:
     raise SystemExit("install authority must require a resolved matching effect identity and specialization")

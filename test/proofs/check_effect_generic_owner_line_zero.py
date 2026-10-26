@@ -90,9 +90,9 @@ if "if parser.effect_clone_source_active:" not in rewrite_expression or \
 if fixture.count("#line 0 ") != 2 or not all(fragment in fixture for fragment in (
     "#line 0 generic-effect-helper.elisa\ndef apply[T](value: T) -> T can[Identity[T]]:",
     "return Identity[T].transform(value)",
-    "#line 0 generic-effect-helper.elisa\ndef apply[T](value: T, again: bool) -> T can[Identity[T]]:",
+    "#line 0 generic-effect-helper.elisa\ndef apply[T](again: bool, value: T) -> T can[Identity[T]]:",
     "handler static Increment() for Identity[i64]",
-    "return apply(41) + apply(40, true)",
+    "return apply(41) + apply(true, 40)",
 )):
     raise SystemExit("regression must specialize same-name generic effect overloads at logical line zero")
 for source, fragments, label in (

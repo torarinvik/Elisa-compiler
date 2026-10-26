@@ -240,13 +240,59 @@ extend Backend:
 
 
 
+        # Split a first-class `T error[E]` at the propagation boundary. This is shared by
+        # function-value calls and a source-marked `try value` whose AST root is an ErrorUnion
+        # local. Failure copies the payload to the enclosing error slot, runs defers before
+        # region unwind, and forwards the remapped status; success returns the payload.
+        def emit_propagating_error_union_value_try(union_value: LLVMValueRef, union_type: ValueType, local_scope: mutable Scope&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if union_type.kind != TypeKind.ErrorUnion or not runtime.in_error_fn
+            union_payload_type: ValueType = error_union_payload_of(union_type, structs)
+            union_error_family: sview = resolved_error_family(error_union_family_of(union_type, structs), structs)
+            union_return_family: sview = current_error_return_family(runtime, structs)
+            return null if union_payload_type.kind == TypeKind.Unmodeled or union_error_family == ""
+            return null if not error_status_remap_supported(union_error_family, union_return_family, structs)
+            union_payload_llvm: LLVMTypeRef = llvm_type_of(union_payload_type, structs, ctx)
+            union_status: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 0, "try.union.status")
+            union_code: LLVMValueRef = error_union_code_of(union_value, union_type, structs, ctx, builder)
+            union_payload_pointer: LLVMValueRef = LLVMBuildExtractValue(builder, union_value, 1, "try.union.payload.ptr")
+            union_code_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, union_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "try.union.ok")
+            union_enclosing: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+            union_success_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, union_enclosing, "try.union.success")
+            union_failure_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, union_enclosing, "try.union.failure")
+            union_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, union_enclosing, "try.union.done")
+            union_result_slot: LLVMValueRef = build_entry_alloca(builder, union_payload_llvm, "try.union.result")
+            _ = LLVMBuildCondBr(builder, union_code_ok, union_success_block, union_failure_block)
+            LLVMPositionBuilderAtEnd(builder, union_failure_block)
+            # A propagating try exits the function. Deferred actions run before the region
+            # unwind so deferred bodies can still read region-backed memory.
+            return null if not (emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
+            (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
+            # The caller's `error_out` stores its own success payload type, which may be
+            # narrower than this union's payload. The status alone represents propagation;
+            # copying the source payload here can overwrite the caller's result slot.
+            mutable forwarded_union_status: LLVMValueRef = union_status
+            if union_error_family != union_return_family:
+                if remap_error_status(union_status, union_error_family, union_return_family, structs, ctx, builder) is remapped_union_status:
+                    forwarded_union_status <- remapped_union_status
+                else:
+                    return null
+            if error_set_has_payload(structs, union_return_family):
+                _ = LLVMBuildRet(builder, forwarded_union_status)
+            else:
+                _ = LLVMBuildRet(builder, error_status_code(forwarded_union_status, ctx, builder))
+            LLVMPositionBuilderAtEnd(builder, union_success_block)
+            union_success_payload: LLVMValueRef = LLVMBuildLoad2(builder, union_payload_llvm, union_payload_pointer, "try.union.success.payload")
+            _ = LLVMBuildStore(builder, union_success_payload, union_result_slot)
+            _ = LLVMBuildBr(builder, union_done_block)
+            LLVMPositionBuilderAtEnd(builder, union_done_block)
+            return LLVMBuildLoad2(builder, union_payload_llvm, union_result_slot, "try.union.value")
+
+
+
+
         # `try f(args)` where `f` is a function-valued local/parameter. Function values use
-        # the tagged raw/closure representation, so this cannot reuse the named-callee helper
-        # above. `emit_fn_value_call` deliberately returns a first-class error union; split it
-        # here at the propagation boundary, copying the failure payload into this function's
-        # error slot and returning the status. The success path returns the payload value to
-        # the enclosing variable/return emitter. No handler object or dynamic allocation is
-        # introduced: this is the same two-way CFG and hidden out-slot ABI as a direct call.
+        # the tagged raw/closure representation and yield the same first-class ErrorUnion
+        # descriptor consumed by the shared propagation helper above.
         def emit_propagating_fn_value_try(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, loops: mutable LoopStack&, regions: mutable RegionStack&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             fn_value_type: mutable ValueType = expression_type(callee, local_scope, fns, structs, generics)
             fn_value_type <- optional_payload_of(fn_value_type, structs) if fn_value_type.kind == TypeKind.Optional and optional_payload_of(fn_value_type, structs).kind == TypeKind.Fn
@@ -255,58 +301,47 @@ extend Backend:
             fn_error_family: sview = resolved_error_family(fn_error_family_of(fn_value_type, structs), structs)
             return null if fn_error_family == ""
             fn_return_family: sview = current_error_return_family(runtime, structs)
-            return null if not error_status_remap_supported(fn_error_family, fn_return_family, structs)
+            return null if not runtime.in_error_fn or not error_status_remap_supported(fn_error_family, fn_return_family, structs)
             fn_result_type: ValueType = intern_error_union_type(fn_result_payload_type, fn_error_family, structs)
             fn_payload_type: ValueType = error_union_payload_of(fn_result_type, structs)
-            return null if fn_payload_type.kind == TypeKind.Unmodeled or not runtime.in_error_fn
+            return null if fn_payload_type.kind == TypeKind.Unmodeled
             if (emit_fn_value_call(callee, arguments, fn_result_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is fn_union_value:
-                fn_status: LLVMValueRef = LLVMBuildExtractValue(builder, fn_union_value, 0, "fn.try.status")
-                fn_code: LLVMValueRef = error_union_code_of(fn_union_value, fn_result_type, structs, ctx, builder)
-                fn_payload_pointer: LLVMValueRef = LLVMBuildExtractValue(builder, fn_union_value, 1, "fn.try.payload.ptr")
-                fn_payload_llvm: LLVMTypeRef = llvm_type_of(fn_payload_type, structs, ctx)
-                fn_code_ok: LLVMValueRef = LLVMBuildICmp(builder, 32, fn_code, LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), "fn.try.ok")
-                fn_enclosing: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
-                fn_success_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn_enclosing, "fn.try.success")
-                fn_failure_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn_enclosing, "fn.try.failure")
-                fn_done_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, fn_enclosing, "fn.try.done")
-                fn_result_slot: LLVMValueRef = build_entry_alloca(builder, fn_payload_llvm, "fn.try.result")
-                _ = LLVMBuildCondBr(builder, fn_code_ok, fn_success_block, fn_failure_block)
-                LLVMPositionBuilderAtEnd(builder, fn_failure_block)
-                # A `try` PROPAGATE is a function EXIT, so it unwinds `defer` exactly as
-                # `return` and `raise` do. It did not: `defer function:` + `try g(x)`
-                # ran the deferred body on the success exit and DROPPED it on the
-                # failure exit -- stage0 ran it on both (measured 2 vs stage1's 1).
-                # Deferred actions run BEFORE the region unwind, the order every other
-                # exit path uses: a deferred body may still read region-backed memory.
-                return null if not (emit_deferred_actions(local_scope, false, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
-                (emit_region_unwind(regions, runtime, builder) can Global{Read,Write})
-                fn_failed_payload: LLVMValueRef = LLVMBuildLoad2(builder, fn_payload_llvm, fn_payload_pointer, "fn.try.failure.payload")
-                _ = LLVMBuildStore(builder, fn_failed_payload, runtime.error_out)
-                mutable forwarded_status: LLVMValueRef = fn_status
-                if fn_error_family != fn_return_family:
-                    if remap_error_status(fn_status, fn_error_family, fn_return_family, structs, ctx, builder) is remapped_fn_status:
-                        forwarded_status <- remapped_fn_status
-                    else:
-                        return null
-                if error_set_has_payload(structs, fn_return_family):
-                    _ = LLVMBuildRet(builder, forwarded_status)
-                else:
-                    _ = LLVMBuildRet(builder, error_status_code(forwarded_status, ctx, builder))
-                LLVMPositionBuilderAtEnd(builder, fn_success_block)
-                fn_success_payload: LLVMValueRef = LLVMBuildLoad2(builder, fn_payload_llvm, fn_payload_pointer, "fn.try.success.payload")
-                _ = LLVMBuildStore(builder, fn_success_payload, fn_result_slot)
-                _ = LLVMBuildBr(builder, fn_done_block)
-                LLVMPositionBuilderAtEnd(builder, fn_done_block)
-                return LLVMBuildLoad2(builder, fn_payload_llvm, fn_result_slot, "fn.try.value")
+                return emit_propagating_error_union_value_try(fn_union_value, fn_result_type, local_scope, regions, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
             return null
 
 
 
+        # Resolve the same lexical owner as ordinary call emission before selecting a row.
+        # `selected` distinguishes a chosen owner with an ambiguous/unmatched overload from
+        # a generic call which should stay on the generic path below.
+        def error_union_monomorphic_call_owner[@structs_region, @fns_region, @generics_region](name: sview, arguments: darray[Expr]&, argument_names: darray[sview @source]&, local_scope: mutable Scope&, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, owner_hint: sview) -> (selected: bool, owner_row: i64) can[Abort.Panic, Memory.Allocate]:
+            if owner_hint != "":
+                scoped_generic: i64 = generic_index_of_owner(generics, owner_hint, name)
+                if scoped_generic >= 0 and arguments.count > 0:
+                    scoped_inferred: darray[ValueType] = infer_generic_args(scoped_generic.usize(), arguments, local_scope, fns, structs, generics)
+                    return (false, -1) if scoped_inferred.count > 0
+                return (true, function_index_of(fns, owner_hint, name))
+            if structs.visibility.current_owner != "" and function_has_call_shape(fns, structs.visibility.current_owner, name, arguments, argument_names):
+                return (true, function_index_of(fns, structs.visibility.current_owner, name))
+            if generic_index_of(generics, name) >= 0 and not exact_overload_exists_for_call_args(fns, name, arguments, argument_names, local_scope, structs, generics, 0):
+                return (false, -1)
+            root_row: i64 = function_index_of(fns, "", name)
+            return (true, root_row) if root_row >= 0
+            owner_row: i64 = function_index_for_unique_call_owner(fns, name, arguments, argument_names)
+            return (true, owner_row) if owner_row >= 0
+            return (false, -1)
+
+
 
         # Emit an error-returning call as a first-class `T error[E]` descriptor rather than
-        # consuming it with `try`. This is selected when the destination local explicitly has
-        # an error-union type; the existing split status/out-payload call ABI remains unchanged.
-        def emit_error_union_call_value[@scope_region, @fns_region, @structs_region, @generics_region](name: sview, arguments: darray[Expr], expected: ValueType, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, owner_hint: sview = "") -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # consuming it with `try`. Concrete calls pass through the selected FnTable row so
+        # payload, parameter labels/defaults, arena/store slots, extern ABI and family agree.
+        def emit_error_union_call_value[@scope_region, @fns_region, @structs_region, @generics_region](name: sview, arguments: darray[Expr], argument_names: darray[sview @source]&, expected: ValueType, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, owner_hint: sview = "") -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            monomorphic_owner: (selected: bool, owner_row: i64) = error_union_monomorphic_call_owner(name, arguments, argument_names, local_scope, fns, structs, generics, owner_hint)
+            if monomorphic_owner.selected:
+                return null if monomorphic_owner.owner_row < 0 or monomorphic_owner.owner_row.usize() >= fns.owners.count
+                selected_owner: sview = fns.owners[monomorphic_owner.owner_row.usize()]
+                return emit_direct_call_as_error_union(selected_owner, name, arguments, argument_names, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
             return null if expected.kind != TypeKind.ErrorUnion or not error_callee_is(fns, structs, generics, name, owner_hint)
             payload_type: ValueType = error_callee_value_type(name, arguments, local_scope, fns, structs, generics, owner_hint)
             expected_payload: ValueType = error_union_payload_of(expected, structs)
@@ -345,10 +380,10 @@ extend Backend:
                 return result
             return null
 
-        def emit_error_union_call_value_from_callee[@scope_region, @fns_region, @structs_region, @generics_region, @runtime_region](callee: Expr, arguments: darray[Expr], expected: ValueType, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_error_union_call_value_from_callee[@scope_region, @fns_region, @structs_region, @generics_region, @runtime_region](callee: Expr, arguments: darray[Expr], argument_names: darray[sview @source]&, expected: ValueType, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             match try_callee_as_ident_with_generics(callee, fns, structs, generics):
                 Expr.Ident(name, _):
-                    return emit_error_union_call_value(name, arguments, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder, try_callee_owner_with_generics(callee, fns, structs, generics)) can Global{Read,Write}
+                    return emit_error_union_call_value(name, arguments, argument_names, expected, local_scope, fns, structs, generics, runtime, m, ctx, builder, try_callee_owner_with_generics(callee, fns, structs, generics)) can Global{Read,Write}
                 _:
                     return null
 

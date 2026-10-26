@@ -8,6 +8,16 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-effect-handler.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
+# Run the same gate in bounded batches when a host caps individual test processes.
+EFFECT_SMOKE_PHASE="${ELISA_EFFECT_SMOKE_PHASE-all}"
+case "$EFFECT_SMOKE_PHASE" in
+    all|compile|native|ir|diagnostics) ;;
+    *) echo "unknown effect smoke phase: $EFFECT_SMOKE_PHASE" >&2; exit 2 ;;
+esac
+effect_smoke_phase() {
+    [[ "$EFFECT_SMOKE_PHASE" == all || "$EFFECT_SMOKE_PHASE" == "$1" ]]
+}
+
 if [[ ! -x "$STAGE1" ]]; then
     echo "effect_handler_stage1_smoke FAIL: no stage1 seed at $STAGE1" >&2
     exit 1
@@ -181,9 +191,18 @@ run_direct_equivalence() {
     fi
 }
 
+if effect_smoke_phase compile; then
 run_positive "static_handler_bare.elisa"
 run_positive "grouped_permission_family_rows.elisa"
 run_positive "qualified_permission_using_alias.elisa"
+run_negative "qualified_permission_late_alias_conflict.neg.elisa" 'conflicting alias: "CapabilityScope" already aliases module "Backend.Parent", cannot also alias "Backend.Alternate"'
+late_permission_alias_log="$WORK/qualified_permission_late_alias_conflict.neg.log"
+[[ $(grep -cF 'conflicting alias:' "$late_permission_alias_log") == 1 ]] \
+    || { echo "late permission alias fixture emitted an extra alias conflict: $(cat "$late_permission_alias_log")" >&2; exit 1; }
+if grep -Fq 'requires can[Backend::Parent::Cap.Read]' "$late_permission_alias_log"; then
+    echo "late permission alias fixture lost the earlier grant's canonical Backend.Parent target: $(cat "$late_permission_alias_log")" >&2
+    exit 1
+fi
 run_positive "static_handler_capture.elisa"
 run_positive "static_handler_scope_named.elisa"
 run_positive "static_handler_qualified.elisa"
@@ -235,7 +254,12 @@ run_positive "helper_multiple_effects.elisa"
 run_positive "helper_module_install.elisa"
 run_positive "helper_nested_capture.elisa"
 run_positive "helper_error_union_capture.elisa"
+run_positive "helper_error_union_overload_capture.elisa"
+run_positive "helper_inferred_try_binding.elisa"
 run_positive "helper_mutual_recursive.elisa"
+fi
+
+if effect_smoke_phase native; then
 run_native_contract "helper_mutual_recursive.elisa"
 run_native_result "helper_namespace.elisa" 22
 run_native_result "nested_install_same_line_identity.elisa" 42
@@ -248,7 +272,9 @@ run_native_result "helper_explicit_chain.elisa" 31
 run_native_result "helper_qualified_chain.elisa" 47
 run_native_result "helper_multiple_effects.elisa" 33
 run_native_result "helper_nested_capture.elisa" 22
-run_native_result "helper_error_union_capture.elisa" 22
+run_native_result "helper_error_union_capture.elisa" 42
+run_native_result "helper_error_union_overload_capture.elisa" 42
+run_native_result "helper_inferred_try_binding.elisa" 130
 run_native_result "module_duplicate_handler_names.elisa" 1
 run_native_result "module_forward_handler.elisa" 7
 run_native_result "module_forward_duplicate_handler_names.elisa" 1
@@ -260,10 +286,16 @@ run_native_result "helper_generic_const_enum_selection.elisa" 34
 run_native_result "helper_generic_equivalence.elisa" 17
 run_native_result "helper_generic_equivalence_manual.elisa" 17
 run_direct_equivalence
+fi
+
+if effect_smoke_phase compile; then
 run_positive "handler_target_via_forward.elisa"
 run_positive "via_grant_covers_both_rows.elisa"
 run_positive "via_grant_bare_block.elisa"
 run_positive "via_grant_bare_multi_rows.elisa"
+fi
+
+if effect_smoke_phase ir; then
 run_zero_overhead_ir "static_handler_capture.elisa"
 run_zero_overhead_ir "nested_install_same_line_identity.elisa"
 run_zero_overhead_ir "handler_same_leaf_effect_identity.elisa"
@@ -308,11 +340,11 @@ run_zero_overhead_ir "helper_sibling_capture.elisa"
 run_zero_overhead_ir "helper_multiple_effects.elisa"
 run_zero_overhead_ir "helper_module_install.elisa"
 run_zero_overhead_ir "helper_nested_capture.elisa"
-grep -Eq 'call i64 @__effect__emit__Sink__14__at_[0-9]+\(' "$WORK/helper_namespace.ll" || {
+grep -Eq 'call i64 @__effect__emit__Sink__14__src_[0-9]+__at_[0-9]+\(' "$WORK/helper_namespace.ll" || {
     echo "qualified helper selected the wrong module" >&2
     exit 1
 }
-grep -Eq 'call void @__effect__emit__Other__12__at_[0-9]+\(' "$WORK/helper_nested_selection.ll" || {
+grep -Eq 'call void @__effect__emit__Other__12__src_[0-9]+__at_[0-9]+\(' "$WORK/helper_nested_selection.ll" || {
     echo "nested helper selected the outer handler" >&2
     exit 1
 }
@@ -372,6 +404,9 @@ if grep -Eiq 'effect(_|\\.)?(handler|dispatch|install)|continuation|resume' "$WO
     exit 1
 fi
 
+fi
+
+if effect_smoke_phase diagnostics; then
 run_negative "mismatched_handler.neg.elisa" 'effect handler "Wrong" realizes "Other"'
 run_negative "missing_operation.neg.elisa" 'effect "Tick" has no operation "pong"'
 run_negative "unhandled_effect.neg.elisa" 'abstract effect operation Tick.ping requires an installed handler'
@@ -427,6 +462,7 @@ run_negative "helper_mixed_unhandled.neg.elisa" 'effectful helper "emit_tick" re
 run_interpret_warning "deep_permission_alias_uncovered.warn.elisa" 'requires can[Deep00]'
 run_negative "helper_generic_specialization_mismatch.neg.elisa" 'abstract effect specialization mismatch'
 run_negative "helper_clone_private.neg.elisa" 'is private'
+run_positive "global_authority_same_target_aliases.elisa"
 run_negative "global_authority_nested_alias_conflict.elisa" 'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "Parent.NestedTarget"'
 run_negative "global_authority_static_branch_alias_conflict.elisa" 'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "NestedTarget"'
 static_alias_log="$WORK/global_authority_static_branch_alias_conflict.log"
@@ -438,5 +474,10 @@ if grep -Fq 'requires can[RootTarget::slot.Read]' "$static_alias_log"; then
 fi
 run_positive "global_authority_active_static_alias.elisa"
 run_positive "global_authority_nested_qualified_path.elisa"
+fi
 
-echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"
+if [[ "$EFFECT_SMOKE_PHASE" == all ]]; then
+    echo "effect handler stage1 smoke OK: handled effects, captures, nesting, resume, via permissions, and diagnostics are stable"
+else
+    echo "effect handler stage1 smoke phase $EFFECT_SMOKE_PHASE OK"
+fi

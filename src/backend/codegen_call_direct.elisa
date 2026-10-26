@@ -86,6 +86,28 @@ extend Backend:
             return default_value
 
 
+        # Resolve one actual region selector to the arena value passed by its caller.
+        # A local region is stored directly in an Arena slot; an Arena reference needs one
+        # load; a region parameter is itself one of this function's hidden arena arguments.
+        def explicit_region_call_arena(name: sview, local_scope: mutable Scope&, runtime: Runtime&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic]:
+            local_type: ValueType = lookup_type(local_scope, name)
+            if lookup_slot(local_scope, name) is local_slot:
+                if local_type.kind == TypeKind.Arena:
+                    return local_slot
+                if local_type.kind == TypeKind.Ref and ref_target_of(local_type, structs).kind == TypeKind.Arena:
+                    return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), local_slot, "region.argument")
+            parameter_index: i64 = region_parameter_index(runtime.function_line, runtime.function_offset, name, runtime.caller_region_parameter_start, structs)
+            if parameter_index >= 0 and parameter_index.usize() < runtime.caller_arenas.count:
+                return runtime.caller_arenas[parameter_index.usize()]
+            # `perm` without a local binding denotes the process-lifetime arena, matching
+            # the existing `in perm:` lowering.
+            if name == "perm" and lookup_index(local_scope, name) < 0:
+                perm_index: i64 = mutable_global_index_of(structs, "perm_arena")
+                if perm_index >= 0 and perm_index.usize() < structs.globals.mutable_global_handles.count:
+                    return structs.globals.mutable_global_handles[perm_index.usize()]
+            return null
+
+
         # Emit a call to an ALREADY-RESOLVED FnTable row.
         #
         # Split out of emit_direct_call, whose body below this point uses neither the
@@ -97,7 +119,7 @@ extend Backend:
         # first made `print(42)` print "*" once, because char and i64 are one ValueType
         # here). The bound type says which impl is meant, so the caller resolves the
         # row and hands it over.
-        def emit_direct_call_indexed[@scope_region, @fns_region, @structs_region, @generics_region, @runtime_region](fn_index: i64, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, argument_names: darray[sview @source]&, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, sret_destination: LLVMValueRef?) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        def emit_direct_call_indexed_result[@scope_region, @fns_region, @structs_region, @generics_region, @runtime_region](fn_index: i64, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, argument_names: darray[sview @source]&, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, sret_destination: LLVMValueRef?, error_union_expected: ValueType?) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             return null if not direct_call_argument_names_are_well_formed(arguments, argument_names)
             total_arguments: usize = arguments.count + 1 if has_receiver else arguments.count
             target: LLVMValueRef = fns.handles[fn_index.usize()]
@@ -108,10 +130,16 @@ extend Backend:
             wants_arena: bool = arena_count > 0
             wants_store: bool = fns.needs_store[fn_index.usize()]
             call_return_type: ValueType = copied_type(fns.returns[fn_index.usize()])
+            direct_error_family: mutable sview = ""
+            if error_union_expected is union_expected:
+                return null if union_expected.kind != TypeKind.ErrorUnion or not fns.is_error[fn_index.usize()]
+                union_payload: ValueType = error_union_payload_of(union_expected, structs)
+                return null if not value_type_identity_equal(call_return_type, union_payload)
             sret_return: bool = not fns.is_error[fn_index.usize()] and value_type_uses_sret(call_return_type, structs, ctx)
             extern_error_sret: mutable bool = false
             if fns.is_extern[fn_index.usize()] and fns.is_error[fn_index.usize()]:
                 extern_error_family: sview = resolved_error_family(line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_offsets, structs.errors.error_fn_set_names, fns.lines[fn_index.usize()], fns.offsets[fn_index.usize()]), structs)
+                direct_error_family <- extern_error_family
                 if error_set_has_payload(structs, extern_error_family):
                     extern_error_type: LLVMTypeRef = error_set_llvm_type(structs, extern_error_family, ctx)
                     extern_error_plan: CabiRetPlan = cabi_classify_ret_llvm(extern_error_type, true, structs, ctx)
@@ -367,6 +395,48 @@ extend Backend:
                 return null if llvm_value_is_null(direct_arena)
                 argument_values.push(direct_arena)
                 direct_arena_slot <- direct_arena_slot + 1
+
+            # An explicit region-only call such as `target[outer](...)` supplies the callee's
+            # trailing region-parameter slots. Those selectors are part of the ABI, not a type
+            # argument list: forward each selected local/parameter arena in declaration order.
+            # The suffix starts after body-derived parameter slots and the return-region slot.
+            explicit_region_names: mutable darray[sview @source] = []
+            explicit_region_selectors_valid: mutable bool = true
+            if not has_receiver:
+                match receiver:
+                    Expr.Index(_, region_selector, _):
+                        if region_selector is Expr.Ident(region_selector_name, _):
+                            explicit_region_names.push(region_selector_name)
+                        else:
+                            explicit_region_selectors_valid <- false
+                    Expr.IndexN(_, region_selectors, _):
+                        for region_selector in region_selectors |explicit_region_names, explicit_region_selectors_valid|:
+                            if region_selector is Expr.Ident(region_selector_name, _):
+                                explicit_region_names.push(region_selector_name)
+                            else:
+                                explicit_region_selectors_valid <- false
+                    _:
+                        pass
+            explicit_region_count: mutable usize = 0
+            if explicit_region_names.count > 0:
+                return null if not explicit_region_selectors_valid
+                return null if fn_index.usize() >= fns.lines.count or fn_index.usize() >= fns.offsets.count
+                explicit_region_count <- region_parameter_count(fns.lines[fn_index.usize()], fns.offsets[fn_index.usize()], structs)
+                return null if explicit_region_count != explicit_region_names.count or explicit_region_count > arena_count
+            explicit_region_suffix_start: usize = arena_count - explicit_region_count
+            return null if direct_arena_slot > explicit_region_suffix_start
+            while direct_arena_slot < explicit_region_suffix_start |argument_values, direct_arena_slot, call_threaded_arena|:
+                argument_values.push(call_threaded_arena)
+                direct_arena_slot <- direct_arena_slot + 1
+            for explicit_region_position in 0..<explicit_region_count |argument_values, direct_arena_slot, explicit_region_position, explicit_region_names, explicit_region_suffix_start, fn_index, fns, structs, runtime, local_scope, ctx, builder|:
+                # Actual selector names belong to the caller; formal names belong to the
+                # callee and need not match (e.g. `target[outer]` for `target[@s]`). The
+                # validated selector list and callee region rows share declaration order.
+                if explicit_region_call_arena(explicit_region_names[explicit_region_position], local_scope, runtime, structs, ctx, builder) is selected_region_arena:
+                    argument_values.push(selected_region_arena)
+                    direct_arena_slot <- direct_arena_slot + 1
+                else:
+                    return null
             while direct_arena_slot < arena_count |argument_values, direct_arena_slot, call_threaded_arena|:
                 argument_values.push(call_threaded_arena)
                 direct_arena_slot <- direct_arena_slot + 1
@@ -445,8 +515,9 @@ extend Backend:
             # Every path below either assigns a call result or declines.
             call_result: mutable LLVMValueRef = LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
             if fns.is_error[fn_index.usize()]:
-                direct_error_family: mutable sview = line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_offsets, structs.errors.error_fn_set_names, fns.lines[fn_index.usize()], fns.offsets[fn_index.usize()])
-                direct_error_family <- resolved_error_family(direct_error_family, structs)
+                direct_error_family <- resolved_error_family(line_error_set_name(structs.errors.error_fn_lines, structs.errors.error_fn_offsets, structs.errors.error_fn_set_names, fns.lines[fn_index.usize()], fns.offsets[fn_index.usize()]), structs)
+                if error_union_expected is union_expected:
+                    return null if direct_error_family == "" or error_union_family_of(union_expected, structs) != direct_error_family
                 if emit_error_status_call(target, argument_values, direct_error_family, fns.is_extern[fn_index.usize()], structs, ctx, builder) is direct_error_result:
                     call_result <- direct_error_result
                 else:
@@ -461,7 +532,7 @@ extend Backend:
             add_call_type_attribute(call_result, 1, "sret", llvm_type_of(call_return_type, structs, ctx), ctx) if sret_return
             # An `extern resource` came back as its bare handle: wrap it into the struct, and
             # for `Name?` into the aggregate optional from a null test (docs/127 §3.2).
-            if fns.is_extern[fn_index.usize()]:
+            if fns.is_extern[fn_index.usize()] and not fns.is_error[fn_index.usize()]:
                 resource_kind: u32 = resource_return_kind_of(fns, fns.names[fn_index.usize()])
                 if resource_kind != 0:
                     resource_payload_type: ValueType = optional_payload_of(call_return_type, structs) if resource_kind == 2 else copied_type(call_return_type)
@@ -491,7 +562,24 @@ extend Backend:
                 return null if not (emit_extern_ensure_checks(fn_index, ensure_arguments, ensure_hidden, ensure_result, call_return_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write})
             return sret_slot if sret_return and sret_destination is destination
             return LLVMBuildLoad2(builder, llvm_type_of(call_return_type, structs, ctx), sret_slot, "call.sret.value") if sret_return
+            if error_union_expected is union_expected:
+                union_llvm: LLVMTypeRef = llvm_type_of(union_expected, structs, ctx)
+                union_value: mutable LLVMValueRef = LLVMGetUndef(union_llvm)
+                # Keep the native status aggregate intact for payload error sets. The
+                # second field points at the call's output slot, which remains valid for
+                # both success and failure arms of the first-class descriptor.
+                union_value <- LLVMBuildInsertValue(builder, union_value, call_result, 0, "error.union.status")
+                union_value <- LLVMBuildInsertValue(builder, union_value, error_out_slot, 1, "error.union.payload")
+                return union_value
             return call_result
+
+
+        def emit_direct_call_indexed[@scope_region, @fns_region, @structs_region, @generics_region, @runtime_region](fn_index: i64, receiver: Expr, has_receiver: bool, arguments: darray[Expr]&, argument_names: darray[sview @source]&, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef, sret_destination: LLVMValueRef?) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return emit_direct_call_indexed_result(fn_index, receiver, has_receiver, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder, sret_destination, null) can Global{Read,Write}
+
+
+        def emit_direct_call_indexed_as_error_union[@scope_region, @fns_region, @structs_region, @generics_region, @runtime_region](fn_index: i64, arguments: darray[Expr]&, argument_names: darray[sview @source]&, expected: ValueType, local_scope: mutable Scope& @scope_region, fns: FnTable& @fns_region, structs: mutable StructTable& @structs_region, generics: mutable GenericTable& @generics_region, runtime: Runtime& @runtime_region, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return emit_direct_call_indexed_result(fn_index, Expr.Absent, false, arguments, argument_names, local_scope, fns, structs, generics, runtime, m, ctx, builder, null, expected) can Global{Read,Write}
 
 
         def resource_return_kind_of(fns: FnTable&, name: sview) -> u32 can[Abort.Panic]:

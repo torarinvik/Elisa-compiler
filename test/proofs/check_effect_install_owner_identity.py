@@ -221,8 +221,8 @@ if "handler H(value: i64) for Tick:" not in cross_module_helper_fixture or \
         "can Tick with H(42):" not in cross_module_helper_fixture or \
         "return Util::emit_tick()" not in cross_module_helper_fixture or \
         "module Util:" not in cross_module_helper_fixture or \
-        "def emit_tick() -> i64 can[Tick]:" not in cross_module_helper_fixture or \
-        "return Tick.ping()" not in cross_module_helper_fixture:
+        "def emit_tick() -> i64 can[A::Tick]:" not in cross_module_helper_fixture or \
+        "return A::Tick.ping()" not in cross_module_helper_fixture:
     raise SystemExit("cross-module helper fixture must lower through its installing module's exact handler")
 if "check_effect_install_owner_identity.py" not in smoke or \
         'run_positive "nested_install_same_line_identity.elisa"' not in smoke or \

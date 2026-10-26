@@ -32,9 +32,14 @@ NEGATIVE = HERE / "global_authority_origin_policy_rejected.elisa"
 SMOKE = ROOT / "test/parity/mutable_global_grants_smoke.py"
 GLOBAL_AUTHORITY_SMOKE = ROOT / "test/parity/mutable_global_authority_smoke.sh"
 ALIAS_FIXTURE = ROOT / "test/fixtures/effects/qualified_permission_using_alias.elisa"
+ALIAS_LATE_CONFLICT_FIXTURE = ROOT / "test/fixtures/effects/qualified_permission_late_alias_conflict.neg.elisa"
 ALIAS_CONFLICT_FIXTURE = ROOT / "test/fixtures/effects/global_authority_nested_alias_conflict.elisa"
 STATIC_BRANCH_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_static_branch_alias_conflict.elisa"
 ACTIVE_STATIC_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_active_static_alias.elisa"
+SAME_TARGET_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_same_target_aliases.elisa"
+ALIAS_CONFLICT_CHECKER = ROOT / "src/semantic/check_import_conflict.elisa"
+ALIAS_CONFLICT_DIAGNOSTICS = ROOT / "src/semantic/diagnostic_messages/proofs.elisa"
+DIAGNOSTIC_KINDS = ROOT / "src/semantic/semantic_types_diagnostic_kind.elisa"
 ALIAS_SMOKE = ROOT / "test/parity/effect_handler_stage1_smoke.sh"
 
 parser = argparse.ArgumentParser()
@@ -441,12 +446,45 @@ if not (
     alias_fixture.index("using Backend::Parent as ParentAlias") <
     alias_fixture.index("using ParentAlias as CapabilityScope") <
     alias_fixture.index("def caller()") <
-    alias_fixture.index("can CapabilityScope::Cap.Read") <
-    alias_fixture.rindex("using Backend::Alternate as CapabilityScope")
-):
-    raise SystemExit("qualified permission alias fixture no longer shadows after the earlier grant")
+    alias_fixture.index("can CapabilityScope::Cap.Read")
+) or "using Backend::Alternate as CapabilityScope" in alias_fixture:
+    raise SystemExit("positive qualified permission alias fixture must retain only the chained canonical target")
 if 'run_positive "qualified_permission_using_alias.elisa"' not in alias_smoke:
     raise SystemExit("qualified permission alias fixture is not bound to the Stage1 effect smoke")
+late_alias_conflict_fixture = ALIAS_LATE_CONFLICT_FIXTURE.read_text()
+if not (
+    late_alias_conflict_fixture.index("using Backend::Parent as ParentAlias") <
+    late_alias_conflict_fixture.index("using ParentAlias as CapabilityScope") <
+    late_alias_conflict_fixture.index("def caller()") <
+    late_alias_conflict_fixture.index("can CapabilityScope::Cap.Read") <
+    late_alias_conflict_fixture.rindex("using Backend::Alternate as CapabilityScope")
+) or 'run_negative "qualified_permission_late_alias_conflict.neg.elisa" \'conflicting alias: "CapabilityScope" already aliases module "Backend.Parent", cannot also alias "Backend.Alternate"\'' not in alias_smoke:
+    raise SystemExit("late alias conflict must be isolated in its own negative fixture and assert the exact conflicting target")
+if not all(fragment in alias_smoke for fragment in (
+        'late_permission_alias_log="$WORK/qualified_permission_late_alias_conflict.neg.log"',
+        "grep -cF 'conflicting alias:' \"$late_permission_alias_log\") == 1",
+        "requires can[Backend::Parent::Cap.Read]",
+)):
+    raise SystemExit("late alias conflict smoke must reject extra conflicts and missing facts for the earlier canonical permission owner")
+alias_conflict_source = ALIAS_CONFLICT_CHECKER.read_text()
+alias_conflict_checker = compact(function_section(alias_conflict_source, "check_module_alias_conflicts"))
+alias_target_source = compact(function_section(alias_conflict_source, "ic_module_alias_canonical_target"))
+alias_diagnostic_source = ALIAS_CONFLICT_DIAGNOSTICS.read_text()
+if not all(fragment in alias_conflict_checker for fragment in (
+        "forcurrent_aliasintable.definite_import_annotations",
+        "semantic_import_alias_is_global_winner(winner,table)",
+        "semantic_possible_import_alias_precedes(winner,current_alias,table)",
+        "current_target.target",
+        "winner_target.target",
+        "DiagnosticKind.ConflictingModuleAlias")) or \
+        "table.binding_import_annotations" not in alias_target_source or \
+        "DiagnosticKind.ConflictingModuleAlias" not in alias_diagnostic_source or \
+        "push_dot_module_path(buffer,diagnostic.expected)" not in compact(alias_diagnostic_source) or \
+        "push_dot_module_path(buffer,diagnostic.actual)" not in compact(alias_diagnostic_source):
+    raise SystemExit("module alias conflict diagnostics must compare definite canonical targets by registration order and format dotted owners")
+same_target_alias_fixture = SAME_TARGET_ALIAS_FIXTURE.read_text()
+if same_target_alias_fixture.count("using Target as Shared") != 2 or 'run_positive "global_authority_same_target_aliases.elisa"' not in alias_smoke:
+    raise SystemExit("same-target alias repetitions must remain a positive Stage1 control")
 if "run_negative \"global_authority_nested_alias_conflict.elisa\" 'conflicting alias: \"Shared\" already aliases module \"RootTarget\", cannot also alias \"Parent.NestedTarget\"'" not in alias_smoke:
     raise SystemExit("nested alias-conflict fixture is not bound to its expected negative diagnostic")
 alias_conflict_fixture = ALIAS_CONFLICT_FIXTURE.read_text()
@@ -905,7 +943,8 @@ stage1_provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_CONFLICT_FIXTURE, STATIC_BRANCH_ALIAS_FIXTURE, ACTIVE_STATIC_ALIAS_FIXTURE, ALIAS_SMOKE,
+    POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_LATE_CONFLICT_FIXTURE, ALIAS_CONFLICT_FIXTURE, STATIC_BRANCH_ALIAS_FIXTURE, ACTIVE_STATIC_ALIAS_FIXTURE, SAME_TARGET_ALIAS_FIXTURE, ALIAS_SMOKE,
+    ALIAS_CONFLICT_CHECKER, ALIAS_CONFLICT_DIAGNOSTICS, DIAGNOSTIC_KINDS,
     ROOT / "test/atoms/authority_coverage.elisa", POSITIVE, NEGATIVE, *source_closure,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

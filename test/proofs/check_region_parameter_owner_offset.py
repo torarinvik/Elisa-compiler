@@ -22,6 +22,7 @@ body = read("src/backend/codegen_declare.elisa")
 generic_inference = read("src/backend/codegen_generic_inference.elisa")
 generic_layout = read("src/backend/codegen_packed_meta.elisa")
 call = read("src/backend/codegen_call.elisa")
+call_direct = read("src/backend/codegen_call_direct.elisa")
 new_expr = read("src/backend/codegen_expr_literals.elisa")
 in_block = read("src/backend/codegen_stmt_blocks_exprs.elisa")
 var_decl = read("src/backend/codegen_stmt_vardecl_emit.elisa")
@@ -95,6 +96,14 @@ if "region_parameter_index(runtime.function_line, runtime.function_offset, regio
         "region_parameter_index(runtime.function_line, runtime.function_offset, pinned_region, runtime.caller_region_parameter_start, structs)" not in var_decl or \
         "pinned_arena <- runtime.caller_arenas[pinned_parameter_index.usize()]" not in var_decl:
     raise SystemExit("region allocation, block selectors, and declaration pins must resolve the current function's hidden slot")
+if "explicit_region_call_arena(name: sview" not in call_direct or \
+        "region_parameter_index(runtime.function_line, runtime.function_offset, name, runtime.caller_region_parameter_start, structs)" not in call_direct or \
+        "explicit_region_count != explicit_region_names.count" not in call_direct or \
+        "explicit_region_suffix_start: usize = arena_count - explicit_region_count" not in call_direct or \
+        "explicit_region_names[explicit_region_position]" not in call_direct or \
+        "explicit_region_position in 0..<explicit_region_count" not in call_direct or \
+        "explicit_region_call_arena(explicit_region_names[explicit_region_position]" not in call_direct:
+    raise SystemExit("region-only calls must forward actual local/parameter arenas into the explicit ABI suffix")
 if "inst_arena_region_parameter_starts: mutable darray[i64]" not in generic_inference or \
         "instantiation_arena_layout(function_name, instantiation_arena_owner, params, body, line.line, line.offset + 1, instantiation_needs_arena, structs, instantiation_param_slots, instantiation_region_parameter_start)" not in generic_layout or \
         "generics.inst_arena_region_parameter_starts <- generics.inst_arena_region_parameter_starts.push(instantiation_region_parameter_start)" not in generic_layout or \
@@ -155,7 +164,9 @@ if "region_parameter_owner_offset" not in smoke or \
     raise SystemExit("behavioral smoke must run both same-line region ABI regressions")
 if pin_fixture.count("#line 0 ") != 2 or "result: mutable darray[i64] @r = []" not in pin_fixture or \
         "result: mutable darray[i64] @s = []" not in pin_fixture or \
-        "target[outer](young, 42)" not in pin_fixture or "result[0] == 42" not in pin_fixture:
-    raise SystemExit("local pin regression must collide declaration lines across distinct region owners")
+        "def forward[@t](young: mutable darray[i64]&" not in pin_fixture or \
+        "return move target[t](young, value)" not in pin_fixture or \
+        "forward[outer](young, 42)" not in pin_fixture or "result[0] == 42" not in pin_fixture:
+    raise SystemExit("local pin regression must cover local and forwarded region selectors across colliding declaration lines")
 
 print("region ABI owner offset source proof OK")
