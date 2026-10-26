@@ -44,7 +44,7 @@ def strip_elisa_line_comment(line: str) -> str:
                 escaped = True
             elif char == quote:
                 quote = None
-        elif char in ("\\\"", "'"):
+        elif char in ('"', "'"):
             quote = char
         elif char == "#":
             return line[:index]
@@ -66,7 +66,7 @@ def normalize_code_line(code: str) -> str:
                 escaped = True
             elif char == quote:
                 quote = None
-        elif char in ("\\\"", "'"):
+        elif char in ('"', "'"):
             if pending_space and output:
                 output.append(" ")
             pending_space = False
@@ -88,9 +88,9 @@ def compact_code(text: str) -> tuple[str, ...]:
     for line in text.splitlines():
         uncommented = strip_elisa_line_comment(line)
         if uncommented.strip():
-            expanded = uncommented.expandtabs(4)
-            indent = len(expanded) - len(expanded.lstrip())
-            code_lines.append((indent, normalize_code_line(expanded.lstrip())))
+            leading = len(uncommented) - len(uncommented.lstrip())
+            indent = len(uncommented[:leading].expandtabs(4))
+            code_lines.append((indent, normalize_code_line(uncommented[leading:])))
     if not code_lines:
         return ()
     base_indent = min(indent for indent, _ in code_lines)
@@ -110,6 +110,14 @@ def include_targets(text: str) -> list[str]:
 
 if compact_code("return index") == compact_code("returnindex"):
     raise SystemExit("source normalizer collapses a token boundary")
+if strip_elisa_line_comment('return "a#b" # comment') != 'return "a#b" ':
+    raise SystemExit("comment stripper treats a quoted hash as comment syntax")
+if compact_code('return "a  b"') == compact_code('return "a b"'):
+    raise SystemExit("source normalizer changes whitespace inside a quoted literal")
+if compact_code('return "a\tb"') == compact_code('return "a   b"'):
+    raise SystemExit("source normalizer expands tabs inside a quoted literal")
+if strip_elisa_line_comment(r'return "a\"#b" # comment') != r'return "a\"#b" ':
+    raise SystemExit("comment stripper loses an escaped quote inside a literal")
 if compact_code("if test:\n    return 1\nreturn 2") == compact_code("if test:\nreturn 1\nreturn 2"):
     raise SystemExit("source normalizer discards indentation-sensitive structure")
 if include_targets('# include "./codegen_region_parameter_scan.elisa"\ninclude "./codegen_abi_regions.elisa" # actual') != ["./codegen_abi_regions.elisa"]:
