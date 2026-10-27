@@ -1650,6 +1650,27 @@ replay, avoiding complete LLVM generation/optimization, persistence, normal CLI
 integration and representative edit-to-executable qualification remain required
 for the full professional incremental-compilation goal.
 
+## Fresh-process partitioned-submit cache check (2026-10-27)
+
+Core `963744f2` enables the guarded O0 partitioned-submit path for a mutable
+pool and a generic permission parameter. The focused
+`TestPartitionedStoreCapturingSubmitRuntime` matrix passed all ten serial,
+generic, disk-cold/warm, and experimental partitioned cases under the 28-second
+outer test limit. Each child compiles, links, and runs the fixture; the retained
+server is disabled. `TestPartitionedIRDiskCacheFreshSessions` also passed its
+four revisions (20, 20, 21, 20), including a changed body and a revert, with
+native-status parity and disk partitions reused by newly created sessions.
+
+Two separate fresh `go test` processes with a shared disk-cache directory and
+the retained server disabled confirm the experimental submit fixture emits two
+native partition objects on the first invocation and zero on the repeat. Its
+internal phase samples were 5 ms partition generation plus 14 ms merge on the
+first run, and 2 ms generation plus 14 ms merge on the repeat; both whole test
+processes took about 0.4 seconds. This tiny fixture verifies disk reuse and
+runtime correctness, but the end-to-end timing is dominated by fixed work and
+does not establish a speedup. The full Stage1 self-host build, normal CLI
+integration, and representative edit timings remain unqualified.
+
 ## Self-host bottleneck review (2026-10-18)
 
 The recorded Stage1 self-host profile puts semantic checking at 46% of samples,
