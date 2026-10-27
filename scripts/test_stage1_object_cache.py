@@ -41,7 +41,7 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertIsNotNone(function)
         script = (
             'set -uo pipefail\n'
-            'driver_args=("$SOURCE_INPUT" -o output.o)\n'
+            'driver_args=("$SOURCE_INPUT" -o "${OUTPUT_DEST:-output.o}")\n'
             'stage1_cache_out=""\n'
             'stage1_cache_environment() { return 1; }\n'
             + function.group()
@@ -557,6 +557,68 @@ class CacheIntegrityTest(unittest.TestCase):
         disabled = self.run_cache_key(compiler, source, root=root, cache_toggle="0")
         self.assertEqual(disabled.returncode, 7)
         self.assertEqual(Path(self.source.parent / "dependency-compiler-calls").read_bytes(), compiler_calls)
+
+    def test_cache_declines_symlink_output(self):
+        root = self.cache_project()
+        source = root / "source.elisa"
+        compiler = root / "bin" / "fake-compiler"
+        self.fake_dependency_compiler(compiler, source)
+        target = self.source.parent / "symlink-target.o"
+        output = self.source.parent / "symlink-output.o"
+        target.write_bytes(b"prior target")
+        output.symlink_to(target)
+
+        result = self.run_cache_key(
+            compiler,
+            source,
+            root=root,
+            cache_toggle=None,
+            extra_env={"OUTPUT_DEST": str(output)},
+        )
+        self.assertEqual(result.returncode, 7)
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(target.read_bytes(), b"prior target")
+        self.assertFalse(Path(self.source.parent / "dependency-compiler-calls").exists())
+
+    def test_wrapper_hit_does_not_replace_symlink_output(self):
+        root = self.cache_project()
+        wrapper = (Path(__file__).resolve().parent.parent / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_restore_if_unchanged\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        entry = root / "cache" / "key.o"
+        stdout = self.source.parent / "cached.stdout"
+        stderr = self.source.parent / "cached.stderr"
+        stdout.write_bytes(b"cached output\n")
+        stderr.write_bytes(b"cached warning\n")
+        self.assertTrue(cache.publish(entry, self.source, "key", stdout, stderr))
+
+        target = root / "target.o"
+        output = root / "output-link.o"
+        target.write_bytes(b"prior target")
+        output.symlink_to(target)
+        script = (
+            'set -uo pipefail\n'
+            + function.group()
+            + '\nstage1_cache_prepare() { stage1_cache_key="key"; stage1_cache_dependency_identity="identity"; return 0; }\n'
+            + 'stage1_cache_restore_if_unchanged\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=dict(
+                os.environ,
+                ROOT=str(root),
+                stage1_cache_entry=str(entry),
+                stage1_cache_out=str(output),
+                stage1_cache_key="key",
+                stage1_cache_dependency_identity="identity",
+            ),
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(target.read_bytes(), b"prior target")
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
 
     def test_contract_override_participates_in_cache_identity(self):
         root = Path(__file__).resolve().parent.parent

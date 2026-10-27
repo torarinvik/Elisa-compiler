@@ -354,6 +354,9 @@ stage1_cache_prepare() {
     index=$((index + 1))
   done
   [[ "$emit" == obj && "$emit_count" -le 1 && "$output_count" == 1 && "$source_count" == 1 && -n "$source" ]] || return 1
+  # The ordinary compiler opens -o paths and follows symlinks. A cache-hit rename would
+  # replace the link itself, so leave symlink destinations on the ordinary compile path.
+  [[ ! -L "$stage1_cache_out" ]] || return 1
   [[ -f "$provenance_file" && -r "$provenance_file" ]] || return 1
   stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
   stage1_cache_base_key="$(
@@ -469,6 +472,12 @@ stage1_cache_restore_if_unchanged() {
     return "$restore_rc"
   fi
   if ! stage1_cache_prepare || [[ "$stage1_cache_key" != "$admitted_key" || "$stage1_cache_dependency_identity" != "$admitted_identity" ]]; then
+    rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
+    return 1
+  fi
+  # Keep the final rename from changing output semantics if the destination became a
+  # symlink while the dependency snapshot was being revalidated.
+  if [[ -L "$destination" ]]; then
     rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
     return 1
   fi
