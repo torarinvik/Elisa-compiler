@@ -2072,3 +2072,12 @@ gain, so the default remains 10 workers and `GOGC=300` on this host.
 Oversubscribing did not help either: 12 workers measured 3.152 s in the backend
 and 5.451 s total; 16 workers measured 3.207 s and 5.637 s. Their object hashes
 also matched.
+
+After `fe66d2c3`, the commit hook rebuilt Core as binary SHA-256
+`00928e5510688dca9f2c6d9032ee346cf2f8ee3988508977abfca98d5fd577ba`. With
+`GOGC` and `GOMEMLIMIT` unset, that binary compiled
+`test/breadth/parallel_range_fixture.elisa` at O3 in 0.617 s, producing the
+same object SHA-256 (`be9e456b68d90c9c7878d422d68e0bb549f92dc0c029b9af688d0c18ad30c865`)
+as the previous binary with explicit `GOGC=100` and `GOGC=300`; all three runs
+had zero diagnostics. This is an output-preservation smoke test, not full O3
+self-host quality qualification.
