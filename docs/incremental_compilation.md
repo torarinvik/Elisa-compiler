@@ -1901,6 +1901,16 @@ this cache-on/cache-off pair does not measure that source change against `main`.
 It also does not qualify a body edit, O3 object quality, or a cold build under the
 30-second cap. The earlier timed-out attempt above predates this completed run.
 
+With timing and analysis-debug observers removed, the Core whole-object cache
+stored this self-host object in 4.080 s and restored it in 0.220 s on the next
+fresh process. A further fresh process with `ELISACORE_BUILD_CACHE` unset also
+reported a hit in 0.218 s, confirming the default-on behavior. The retained server
+was disabled. Populate and hit objects were byte-identical at the SHA-256 above,
+and the combined compiler output transcript was byte-identical after removing the
+cache status line. This meets the 0.5 s unchanged-object target for this machine
+and invocation. It does not accelerate changed-source builds; those still run the
+analysis and codegen paths measured below.
+
 ## Chunked semantic dispatcher codegen (2026-10-27)
 
 The 221-pass dispatcher now routes through ten helpers, each owning a contiguous
