@@ -1971,3 +1971,64 @@ the partition cache avoids native emission but does not avoid generating the
 current module IR. This is a correctness-qualified cache hit and a small
 measured wall-time reduction, not qualification of the 2-second body-edit target.
 More samples and reuse before whole-module IR generation remain necessary.
+
+## Partition-local parallel-for workers on a current-source edit (2026-10-28)
+
+Core commit `336081e5e2b2728974dd531b8bb5849590809919` gives O0 partitioned IR
+generation a safe local identity for each generated parallel-for chunk, worker,
+and chunk-specific `pool_submit1` specialization. The generated submit
+specialization is emitted privately in the same module as its caller. Previously,
+parallel-for lowering marked that partition unsafe, causing the IR-partitioned
+attempt to fall back to whole-module lowering.
+
+The focused Go verification passed under the 28-second outer limit:
+
+```
+go test ./src/backend -run '^(TestPartitionedParallelWorkerUsesPartitionLocalIdentity|TestPartitionedParallelWorkerRuntimeMatchesSerial|TestGenerateLLVMIRLowersParallelForOverFrozenPackedStoreForIndexSOA|TestPartitionedDistinctLambdaBodies|TestPartitionedGenericLambdaAcrossPartitions)$' -count=1 -timeout=23s
+```
+
+The regression checks that the worker and submit specialization are private
+definitions in the owning partition, verifies the LLVM module, and emits both
+IR partitions. A second fixture runs the generated worker callback and returns
+the same status (`9`) after partitioned and serial compilation. The packed-store
+parallel-for lowering control, distinct lambda identities, and generic lambda
+partition tests also passed.
+
+The Stage1 tree was clean at
+`46925506e08ebdc6134dd7fc4c454c0e1fb90f09`. I built a Core CLI with SHA-256
+`466c3249a84100df724409a07b4608014c47c3aca611430048e4c95b38a64bd6`; build
+metadata records Core revision `bb7b6bd181d0c61f7fb01e74df30f81362d544b1`
+and `vcs.modified=true` because the binary also includes diagnostic-only local
+work. The commit above pins the parallel-for change, while the binary hash pins
+the exact compiler used for measurement. A fresh 696,852,126-byte analysis
+snapshot was seeded for that binary through resumable compiler processes. Each
+compiler invocation had an external 28.5-second process-group timeout, used
+`-O0 -emit obj`, kept `ELISACORE_RETAINED_SERVER` empty, enabled persistent
+analysis and object partition caches, bypassed whole-object replay with
+`ELISACORE_BUILD_TIMING=1`, and held 96 object partitions constant.
+
+Three reversed-order comparisons used the same one-body edit in
+`emit_ast_annotation_private` (`name.len >= 2` to equivalent `name.len > 1`).
+Every request reported `analysis-disk update changed=1 fast=true` in 731–751 ms.
+The partitioned object phase plus merge was 4.087, 3.974, and 4.002 seconds;
+the whole-module IR phase plus native partitions and merge was 10.065, 9.915,
+and 10.114 seconds. Their medians were 4.002 and 10.065 seconds, a 60.2%
+reduction in the measured object-backend phase. The first changed partitioned
+build emitted one native partition (178 ms); the next two emitted none. The
+whole-module route still lowered the full module on every edit.
+
+In the third fresh-process pair, total compiler wall time was 6.186 seconds for
+partitioned IR and 12.322 seconds for whole-module IR. Both produced an object
+successfully; the partitioned object hash was
+`f99c0b19df095de0198257765bae32376b48180f790cd7917c779cd42015b95c`, while
+the whole-module object hash was
+`52b800ed780f081f5d1ed786c9de3088b96c7d5b149ac83c6907125115010005`. The
+hashes differ because the partitioned path generates private, partition-named
+helpers. The two paths emitted exactly the same 29,468 warning/error lines. The
+runtime parity check covers the dedicated parallel-for fixture; the full
+self-host object was not linked and run in this measurement.
+
+This change brings this O0 body edit below 10 seconds in the measured setup, but
+does not meet the 2-second body-edit target. It also does not qualify O3,
+signatures, contracts, major edits, exact-repeat latency, or the full linked
+self-host gate. Those remain part of the active target.
