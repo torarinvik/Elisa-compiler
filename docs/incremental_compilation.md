@@ -1802,3 +1802,46 @@ project-target subcommands and `c-archive` are not wired into this session bound
 The wrapper preserves stdin for this mode and applies its usual process memory guard.
 This source change has only had static review so far; no build or runtime control has
 qualified it, so it makes no performance claim.
+
+## Fresh-process disk-cache measurements (2026-10-27)
+
+The Core Go compiler's persistent analysis cache was measured separately from the
+Stage1 CLI. The compiler was `/tmp/elisac-stage0-active`, Core main revision
+`963744f2b903924ff0f10bf2a2bbae8b7ed6d6c7`, SHA-256
+`c713b49457634fb8013a47bd7cbdde614180b77c858a316e6ebff2e1bb57ef3e`. The Core
+worktree also contained uncommitted diagnostic-only IR-input/source-locator work;
+the executable hash pins the tested binary. The deterministic fixture contained
+8,192 functions of the form `def fN(x: i64) -> i64: return x + N` and a `main`
+calling `f0`. One edit changed `f0` from `return x + 0` to `return x + 1`.
+Base and edited source SHA-256 values were respectively
+`9645a1cb5e2d3f8a3cdf5c5cf5e2efca3354a303db2a22e8c6fd90148b04b1de` and
+`94e6e860227ab47d6f9c4d9b4a01580988adad6b3b6c97a5ebbc8d72a95bfb78`.
+
+Three sequential fresh-process cycles used `-O0 -emit llvm`, a new persistent
+analysis-cache directory per cycle, `ELISACORE_ANALYSIS_CACHE=1`,
+`ELISACORE_BUILD_CACHE=0`, and an empty `ELISACORE_RETAINED_SERVER`. Every compiler
+command had an external 28-second limit. Median wall times were 0.993 s for the
+cold baseline that populated the cache, 0.178 s for an unchanged rebuild,
+0.244 s for the edited build from the disk snapshot, and 0.403 s for an independent
+cold compile of that edited source. The changed build restored a 22.9 MB analysis
+snapshot, reported `update changed=1` and `fast=true`, and took about 60 ms in the
+semantic update. Across all three cycles, generated LLVM IR matched the cold edit
+after normalizing only generated identifiers matching `__([a-z_]+)_[0-9]+`, and
+diagnostics matched exactly. This qualifies a medium synthetic LLVM workload; it
+does not stand in for the full compiler tree or native runtime results.
+
+The Stage1 wrapper's object cache remains opt-in. On a one-function `-O0 -emit obj`
+fixture, three exact-repeat cache hits had a 0.566 s median while three uncached
+compiles had a 0.317 s median; the cached and uncached object bytes matched. Cache
+admission and dependency validation cost more than compiling this small input, so
+the default was restored to `ELISA_STAGE1_CACHE=0`/unset. Explicit
+`ELISA_STAGE1_CACHE=1` remains available for workloads where a full-source cache hit
+has measured value. Symlink output paths bypass the cache so cache-hit publication
+preserves the ordinary compiler's output-path behavior.
+
+A separate Stage1 O0 self-host attempt on `src/driver/elisac.elisa` exceeded the
+28-second external limit without producing an object. A five-second stack sample
+captured 4,202 main-thread samples; 3,917 were in
+`frontend_parser_parse_file_with_length`. This points to parsing the whole compiler
+source as the next measured bottleneck. No Stage1 whole-tree speedup is claimed by
+the synthetic disk-cache result above.

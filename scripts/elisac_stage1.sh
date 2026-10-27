@@ -269,9 +269,8 @@ resolve_python_tools
 
 driver_args=("$@")
 
-# Content-addressed object cache, enabled by default (set ELISA_STAGE1_CACHE=0 to
-# disable; ELISA_STAGE1_CACHE_DIR selects a directory, default ~/.cache/elisac-stage1).
-# Only a plain object compile
+# Opt-in content-addressed object cache (ELISA_STAGE1_CACHE=1; ELISA_STAGE1_CACHE_DIR
+# selects a directory, default ~/.cache/elisac-stage1). Only a plain object compile
 # (`-o OUT` with no `-emit` other than obj) is cached. The key covers these inputs:
 # the product binary, the argument vector with OUT
 # normalised, every ELISA_* variable, every file of the source's include graph
@@ -298,7 +297,7 @@ stage1_cache_environment() {
   env | LC_ALL=C grep -E '^(ELISA_|ELISACORE_)' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
 }
 stage1_cache_prepare() {
-  [[ "${ELISA_STAGE1_CACHE:-1}" == 1 ]] || return 1
+  [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
   [[ "${ELISA_ALLOW_STALE_STAGE1:-0}" != 1 ]] || return 1
   # Selected provenance does not attest loader overrides or their referenced bytes.
   # Inspect shell variable names without invoking another dynamically loaded tool.

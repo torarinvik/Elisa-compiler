@@ -543,20 +543,25 @@ class CacheIntegrityTest(unittest.TestCase):
         symlink_result = self.run_cache_key(symlink, source, root=root)
         self.assertEqual(symlink_result.returncode, 7)
 
-    def test_cache_is_enabled_by_default_and_can_be_disabled(self):
+    def test_cache_is_opt_in_and_can_be_enabled_explicitly(self):
         root = self.cache_project()
         source = root / "source.elisa"
         compiler = root / "bin" / "fake-compiler"
         self.fake_dependency_compiler(compiler, source)
 
-        enabled = self.run_cache_key(compiler, source, root=root, cache_toggle=None)
+        disabled_by_default = self.run_cache_key(compiler, source, root=root, cache_toggle=None)
+        self.assertEqual(disabled_by_default.returncode, 7)
+        calls = Path(self.source.parent / "dependency-compiler-calls")
+        self.assertFalse(calls.exists())
+
+        enabled = self.run_cache_key(compiler, source, root=root, cache_toggle="1")
         self.assertEqual(enabled.returncode, 0, enabled.stderr.decode())
-        compiler_calls = Path(self.source.parent / "dependency-compiler-calls").read_bytes()
+        compiler_calls = calls.read_bytes()
         self.assertTrue(compiler_calls)
 
         disabled = self.run_cache_key(compiler, source, root=root, cache_toggle="0")
         self.assertEqual(disabled.returncode, 7)
-        self.assertEqual(Path(self.source.parent / "dependency-compiler-calls").read_bytes(), compiler_calls)
+        self.assertEqual(calls.read_bytes(), compiler_calls)
 
     def test_cache_declines_symlink_output(self):
         root = self.cache_project()
