@@ -34,7 +34,7 @@ class CacheIntegrityTest(unittest.TestCase):
             shutil.copyfile(scripts / name, root / "scripts" / name)
         return root
 
-    def run_cache_key(self, compiler, source, *, root=None, cwd=None, allow_stale=False, extra_env=None):
+    def run_cache_key(self, compiler, source, *, root=None, cwd=None, allow_stale=False, extra_env=None, cache_toggle="1"):
         repo_root = Path(__file__).resolve().parent.parent
         wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
@@ -51,11 +51,14 @@ class CacheIntegrityTest(unittest.TestCase):
             os.environ,
             ROOT=str(root if root is not None else compiler.parent.parent),
             BIN=str(compiler),
-            ELISA_STAGE1_CACHE="1",
             ELISA_STAGE1_CACHE_DIR=str(self.source.parent / "object-cache"),
             SOURCE_INPUT=str(source),
             COMPILER_CALL_LOG=str(self.source.parent / "dependency-compiler-calls"),
         )
+        if cache_toggle is None:
+            env.pop("ELISA_STAGE1_CACHE", None)
+        else:
+            env["ELISA_STAGE1_CACHE"] = str(cache_toggle)
         if extra_env:
             env.update(extra_env)
         if allow_stale:
@@ -539,6 +542,21 @@ class CacheIntegrityTest(unittest.TestCase):
         symlink.symlink_to(external)
         symlink_result = self.run_cache_key(symlink, source, root=root)
         self.assertEqual(symlink_result.returncode, 7)
+
+    def test_cache_is_enabled_by_default_and_can_be_disabled(self):
+        root = self.cache_project()
+        source = root / "source.elisa"
+        compiler = root / "bin" / "fake-compiler"
+        self.fake_dependency_compiler(compiler, source)
+
+        enabled = self.run_cache_key(compiler, source, root=root, cache_toggle=None)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr.decode())
+        compiler_calls = Path(self.source.parent / "dependency-compiler-calls").read_bytes()
+        self.assertTrue(compiler_calls)
+
+        disabled = self.run_cache_key(compiler, source, root=root, cache_toggle="0")
+        self.assertEqual(disabled.returncode, 7)
+        self.assertEqual(Path(self.source.parent / "dependency-compiler-calls").read_bytes(), compiler_calls)
 
     def test_contract_override_participates_in_cache_identity(self):
         root = Path(__file__).resolve().parent.parent
