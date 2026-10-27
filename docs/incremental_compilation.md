@@ -2032,3 +2032,32 @@ This change brings this O0 body edit below 10 seconds in the measured setup, but
 does not meet the 2-second body-edit target. It also does not qualify O3,
 signatures, contracts, major edits, exact-repeat latency, or the full linked
 self-host gate. Those remain part of the active target.
+
+## macOS GC target for partitioned body edits (2026-10-28)
+
+The Core CLI's default macOS Go GC target is now 300 (`fe66d2c3`); an explicit
+`GOGC` value still overrides it. This follows two reversed-order pairs on the
+same M5 Mac, with 24 GiB installed RAM and the existing 60%-of-RAM soft heap
+limit. Each fresh process compiled `src/driver/elisac.elisa` with `-O0 -emit
+obj`, an empty retained-server setting, the same persistent analysis and native
+partition caches, whole-object replay bypassed for timing, and 96 O0 IR
+partitions. The only measured change was `GOGC=100` versus `GOGC=300`; the
+single function-body edit was the equivalent `name.len >= 2` to `name.len > 1`
+change in `emit_ast_annotation_private`. The restored analysis state was
+696,852,126 bytes; both edits reported `changed=1`, `fast=true` (746–764 ms).
+
+Median CLI wall time fell from 6.543 s at 100 to 5.478 s at 300 (16.3%). The
+partitioned backend phase plus merge fell from 4.299 s to 3.141 s (26.9%). No
+native partitions needed emission in these already-warm runs. Both settings
+produced the same object SHA-256
+`f99c0b19df095de0198257765bae32376b48180f790cd7917c779cd42015b95c` and the
+same 29,468 warning/error lines. A sampled peak-RSS pair was 5,314 MiB at 100
+and 5,329 MiB at 300. The tracked binary used for these runs had SHA-256
+`466c3249a84100df724409a07b4608014c47c3aca611430048e4c95b38a64bd6`; it was
+invoked with explicit `GOGC=100` and `GOGC=300`, which match the old and new
+runtime settings. The Core unit tests for platform selection and explicit
+override passed.
+
+This is a measured macOS O0 body-edit improvement on a warm disk cache. It does
+not qualify other platforms, O3, other edit classes, cold-build time, or the
+full linked self-host gate, and does not change the 2-second target status.
