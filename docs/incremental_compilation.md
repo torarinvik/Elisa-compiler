@@ -2069,3 +2069,6 @@ measured 5.478 s total and 3.152 s in the backend, essentially even with 300;
 `GOGC=600` measured 6.017 s total and 3.711 s in the backend. All output
 objects had the same hash as the edit above. These controls showed no further
 gain, so the default remains 10 workers and `GOGC=300` on this host.
+Oversubscribing did not help either: 12 workers measured 3.152 s in the backend
+and 5.451 s total; 16 workers measured 3.207 s and 5.637 s. Their object hashes
+also matched.
