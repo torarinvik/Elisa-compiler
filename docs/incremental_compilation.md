@@ -2081,3 +2081,39 @@ same object SHA-256 (`be9e456b68d90c9c7878d422d68e0bb549f92dc0c029b9af688d0c18ad
 as the previous binary with explicit `GOGC=100` and `GOGC=300`; all three runs
 had zero diagnostics. This is an output-preservation smoke test, not full O3
 self-host quality qualification.
+
+## Fresh-process object hits and contract edits (2026-10-28)
+
+I also checked the ordinary CLI path with the retained server disabled. The
+Stage1 source tree was clean at `10897143b6d8`; the Core binary was
+`/tmp/elisacore-parallel-local`, SHA-256
+`466c3249a84100df724409a07b4608014c47c3aca611430048e4c95b38a64bd6`, whose
+build metadata records Core revision `bb7b6bd181d0c61f7fb01e74df30f81362d544b1`
+and `vcs.modified=true`. Each fresh process used `-O0 -emit obj`, persistent
+analysis and object caches under `/tmp/elisa-parallel-local-qualification/cache`,
+96 IR partitions, `GOGC=300`, and an empty `ELISACORE_RETAINED_SERVER`. The
+ordinary-path measurements left analysis-debug, build-timing, and profile
+observers unset; each compiler process had an external 28.5-second timeout.
+
+For the exact unchanged source, the initial cache-populating compile took
+3.886 s. Two subsequent fresh-process whole-object hits took 0.260 s and
+0.244 s; the latter emitted an explicit `build-object hit` status. They restored
+the same 33,121,480-byte object (SHA-256
+`fbe43b81a0b879eea30991122237bddb1fd9cb69b3cb6acaf302ba0fd43f3575`) and
+replayed the same 29,468 warnings with zero errors. This qualifies the 0.5-second
+unchanged-object target for this O0 command and cache state. The hit still reads
+and expands the input, validates cache identities and artifacts, and replays the
+diagnostic transcript; it does not depend on a retained server.
+
+For a contract-edit miss, I reordered the equivalent conjuncts in the
+`previous_scan_index` precondition in
+`src/semantic/linear_exit_leak_policy.elisa`. The fresh-process compile took
+8.296 s and stored a new whole-object entry; the next fresh-process invocation
+reported a cache hit in 0.258 s. Both emitted 29,468 warnings, zero errors, and
+the warning lines matched byte-for-byte. The original and edited object hashes
+were respectively `fbe43b81a0b879eea30991122237bddb1fd9cb69b3cb6acaf302ba0fd43f3575`
+and `29411e900d231da4cd2f268ea4d55d647b76c95444a426e613aa3c1000efdfbf`;
+this timing exercise did not link or run either full self-host object. The
+first contract-edit compile exceeds the 3-second target, so contract invalidation
+and code generation remain optimization work. Exact object replay is qualified
+only for the tested O0 command; O3 and broader edit classes remain open.
