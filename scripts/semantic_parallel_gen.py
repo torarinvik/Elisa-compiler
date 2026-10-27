@@ -374,6 +374,32 @@ def mask_string_literals(text):
     return "".join(chars)
 
 
+_FIELD_DOT_SPACING_RE = re.compile(r"(?<=[\w\]\)])(?:[ \t]+\.[ \t]*|\.[ \t]+)(?=\w)")
+
+
+def audit_normalize_field_dots(text):
+    """Normalize horizontal dot spacing in code while preserving literal bytes.
+
+    The mask retains f-string interpolation. Validate each candidate against
+    the original text: masked literal bytes look like spaces and must never be
+    removed from the original string.
+    """
+    masked = mask_string_literals(text)
+    pieces, masked_pieces, start = [], [], 0
+    for match in _FIELD_DOT_SPACING_RE.finditer(masked):
+        piece = text[match.start():match.end()]
+        if not re.fullmatch(r"[ \t]*\.[ \t]*", piece):
+            continue
+        pieces.extend((text[start:match.start()], "."))
+        masked_pieces.extend((masked[start:match.start()], "."))
+        start = match.end()
+    if not pieces:
+        return text, masked
+    pieces.append(text[start:])
+    masked_pieces.append(masked[start:])
+    return "".join(pieces), "".join(masked_pieces)
+
+
 def par_run_calls(lines, offset=0):
     """Parse every par_pass_run call in a line sequence, rejecting partial matches."""
     calls, errors = [], []
@@ -2084,8 +2110,7 @@ def analyze(
     for name, bodies in defs.items():
         writes, reads_diag, callees = set(), False, set()
         for d in bodies:
-            text = strip_comments("".join(d["body"]))
-            code_text = mask_string_literals(text)
+            text, code_text = audit_normalize_field_dots(strip_comments("".join(d["body"])))
             handled_cast_sites = set()
             tables = set(TABLE_DECL_RE.findall(d["params"])) | set(TABLE_DECL_RE.findall(text))
             table_aliases = local_table_aliases(text, tables)
