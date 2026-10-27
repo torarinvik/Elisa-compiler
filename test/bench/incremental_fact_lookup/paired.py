@@ -213,6 +213,17 @@ def run_compiler(command, env, cwd, *, measure_counters=False):
 rows = []
 report_pattern = re.compile(r"^incremental-ga-cache:.*$", re.MULTILINE)
 
+def expected_incremental_coverage(report, workload):
+    expected_matches = 1 if "supported_helpers" in workload else workload["helpers"]
+    # `visited` counts bodies actually rescanned; matched eligible bodies are
+    # reused, while ineligible and changed bodies account for the remainder.
+    expected_visits = workload["functions"] - expected_matches
+    return (
+        re.search(r"\bmatched=" + str(expected_matches) + r"\b", report) is not None
+        and re.search(r"\bmatched_eligible_bodies=" + str(expected_matches) + r"\b", report) is not None
+        and re.search(r"\bvisited=" + str(expected_visits) + r"\b", report) is not None
+    )
+
 def enforce_load_gate(stage, *, preflight=False):
     load = load_average()
     try:
@@ -256,8 +267,7 @@ def correctness_evidence(workload, source, original, edited, cache_directory, ar
     reports = report_pattern.findall(stderr)
     if len(reports) != 1 or 'prior=valid' not in reports[0] or 'published=yes' not in reports[0]:
         raise RuntimeError(f"{workload['directory']}/{arm} incremental preflight report mismatch: {reports}")
-    expected_matches = 1 if 'supported_helpers' in workload else workload['helpers']
-    if not re.search(r' matched=' + str(expected_matches) + r' visited=' + str(workload['functions']) + r' ', reports[0]):
+    if not expected_incremental_coverage(reports[0], workload):
         raise RuntimeError(f"{workload['directory']}/{arm} incremental preflight coverage mismatch: {reports}")
     clean = report_pattern.sub('', stderr)
     return {
@@ -318,7 +328,7 @@ for path, expected in pins.items():
     if digest(Path(path)) != expected:
         raise SystemExit(f"pinned input changed during correctness preflight: {path}")
 for arm, (root, binary) in products.items():
-    if inputs(root, toolchain_envs[arm]) != fingerprints[arm]:
+    if inputs(root, toolchain_envs[arm], binary) != fingerprints[arm]:
         raise SystemExit(f"Stage1 source or toolchain inputs changed during correctness preflight: {arm}")
 
 # Establish exact parent/candidate output, diagnostics, cache snapshots, and cache reports
@@ -374,8 +384,7 @@ for workload in manifest['workloads']:
             reports = report_pattern.findall(stderr)
             if len(reports) != 1 or 'prior=valid' not in reports[0] or 'published=yes' not in reports[0]:
                 raise RuntimeError(f"{name}/{arm} timed cache report mismatch: {reports}")
-            expected_matches = 1 if 'supported_helpers' in workload else workload['helpers']
-            if not re.search(r' matched=' + str(expected_matches) + r' visited=' + str(workload['functions']) + r' ', reports[0]):
+            if not expected_incremental_coverage(reports[0], workload):
                 raise RuntimeError(f"{name}/{arm} timed cache coverage mismatch: {reports}")
             clean = report_pattern.sub('', stderr)
             evidence[arm] = (result.stdout, clean, reports, prior_hash)
@@ -406,7 +415,7 @@ for path, expected in pins.items():
     if digest(Path(path)) != expected:
         raise RuntimeError(f"pinned input changed during timing: {path}")
 for arm, (root, binary) in products.items():
-    if inputs(root, toolchain_envs[arm]) != fingerprints[arm]:
+    if inputs(root, toolchain_envs[arm], binary) != fingerprints[arm]:
         raise RuntimeError(f"Stage1 source or toolchain inputs changed during timing: {arm}")
 with (args.output / 'samples.csv').open('w', newline='') as stream:
     writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
