@@ -1937,3 +1937,37 @@ for `test/breadth/parallel_range_fixture.elisa` (SHA-256
 qualifies the measured O0 phase gain and that semantic fixture only; it does not
 qualify all pass combinations, O3 output quality, edit-to-executable latency, or
 the 30-second cold-build target.
+
+## Persistent partition cache on a current-source O0 body edit (2026-10-27)
+
+The first current-source edit comparison used four fresh Core CLI processes in
+two reversed-order pairs. The Stage1 tree was clean at
+`59f1c081275585d0300285691f7ff5e5eadde149`.
+The Core CLI binary SHA-256 was
+`a3419e7303a1eae76a349633faf8cdc5b02a7697e41235deb91e8a87654316e3`; its Go
+build metadata records VCS revision `eb16f6a2eac9091803eee04eb10ce51ba85c3727`
+and `vcs.modified=true`, so the binary hash, rather than a clean-source claim,
+pins the measured compiler. Every command had an external 28.5-second timeout,
+used `-O0 -emit obj` on `src/driver/elisac.elisa`, restored semantic state from
+one persistent disk cache, and ran with an empty retained-server setting. The
+whole-object cache was bypassed with timing/debug observers; native partition
+caching was enabled for the warm runs and disabled for the comparison runs.
+`ELISACORE_PARALLEL_IR=1` and 96 object partitions were held constant.
+
+The edit changed `emit_ast_annotation_private` in
+`src/driver/elisac_emit_ast_decl.elisa` from `name.len >= 2` to the equivalent
+`name.len > 1`. Each process reported one changed declaration and a fast semantic
+update (739–780 ms). The two cached runs took 14.779 s and 14.385 s; the two
+cache-disabled runs took 15.920 s and 15.795 s. Their medians were 14.582 s and
+15.858 s respectively, a 1.276 s (8.0%) reduction in this two-pair sample.
+Native emission dropped from 45 and 43 partitions in the cache-disabled runs to
+one partition on the first cached edit and zero on the next, after that changed
+partition had been stored. Both paths produced the same 33,117,088-byte object
+(SHA-256 `52b800ed780f081f5d1ed786c9de3088b96c7d5b149ac83c6907125115010005`)
+and the same 29,468 warning/error lines.
+
+The whole edit still took about 14.6 seconds. IR generation alone was 8.6–8.8 s;
+the partition cache avoids native emission but does not avoid generating the
+current module IR. This is a correctness-qualified cache hit and a small
+measured wall-time reduction, not qualification of the 2-second body-edit target.
+More samples and reuse before whole-module IR generation remain necessary.
