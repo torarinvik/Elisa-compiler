@@ -111,6 +111,7 @@ MUTABLE_POINTER_CAST_RE = re.compile(
 )
 PAR_PASS_ARM_RE = re.compile(r"^([ \t]*)(if|elif) pass_id == (\d+):[ \t]*$")
 PAR_PASS_ARM_ANY_RE = re.compile(r"\bpass_id\s*==")
+PAR_PASS_DISPATCH_CHUNK_SIZE = 24
 
 
 def elisa_files():
@@ -425,74 +426,92 @@ def normalized_par_run_line(line, match):
 def parse_parallel_dispatch(source):
     """Return dispatcher arms as (id, pass name, args, condition), plus structural errors."""
     lines = source.splitlines()
-    definition = next((i for i, line in enumerate(lines)
-                       if re.match(r"^[ \t]*def par_pass_call(?:\[[^\]\n]+\])?\(", line)), None)
-    if definition is None:
+    definitions = []
+    for index, line in enumerate(lines):
+        match = re.match(
+            r"^[ \t]*def (par_pass_call(?:_chunk_\d+)?)(?:\[[^\]\n]+\])?\(",
+            line,
+        )
+        if match is not None:
+            definitions.append((index, match.group(1)))
+    if not definitions:
         return [], ["semantic_parallel_passes.elisa: missing par_pass_call dispatcher"]
 
-    def_indent = len(lines[definition]) - len(lines[definition].lstrip())
-    end = definition + 1
-    while end < len(lines):
-        line = lines[end]
-        if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= def_indent:
-            break
-        end += 1
-
-    arms, errors = [], []
-    for index in range(definition + 1, end):
-        code = strip_comments(lines[index]).strip()
-        if not PAR_PASS_ARM_ANY_RE.search(code):
-            continue
-        match = PAR_PASS_ARM_RE.fullmatch(lines[index])
-        if match is None:
-            errors.append("semantic_parallel_passes.elisa:%d: malformed pass_id arm" % (index + 1))
-            continue
-        arms.append((index, len(match.group(1)), match.group(2), int(match.group(3))))
-
+    errors = []
     records = []
-    for arm_index, (line_index, arm_indent, arm_kind, pass_id) in enumerate(arms):
-        # Accept the legacy chain and the shallow independent-if dispatcher.
-        # All later arms must use the same form; mixed shapes remain an error.
-        expected_kind = "if" if arm_index == 0 or len(arms) < 2 else arms[1][2]
-        if arm_kind != expected_kind:
-            errors.append("semantic_parallel_passes.elisa:%d: expected %s for pass_id %d" %
-                          (line_index + 1, expected_kind, pass_id))
-        stop = arms[arm_index + 1][0] if arm_index + 1 < len(arms) else end
-        body = []
-        for index in range(line_index + 1, stop):
-            code = strip_comments(lines[index]).strip()
-            if code:
-                body.append((index, len(lines[index]) - len(lines[index].lstrip()), code))
-        statement = None
-        body_index = line_index
-        if len(body) == 1 and body[0][1] > arm_indent:
-            body_index, _indent, statement = body[0]
-        elif (
-            len(body) == 2
-            and body[0][1] > arm_indent
-            and re.fullmatch(r"can\b.*:", body[0][2])
-            and body[1][1] > body[0][1]
-        ):
-            # Some dispatcher calls need an explicit local effect scope. Treat its
-            # single nested table update as the arm's statement, while rejecting
-            # scopes that contain multiple operations.
-            body_index, _indent, statement = body[1]
-        else:
-            errors.append("semantic_parallel_passes.elisa:%d: pass_id %d must have exactly one body statement" %
-                          (line_index + 1, pass_id))
-            continue
-        parsed = parse_table_call_statement(statement)
-        if parsed is None:
-            errors.append("semantic_parallel_passes.elisa:%d: unrecognized dispatcher call for pass_id %d" %
-                          (body_index + 1, pass_id))
-            continue
-        records.append({"id": pass_id, "name": parsed["name"], "args": parsed["args"],
-                        "condition": parsed["cond"]})
+    for definition, _name in definitions:
+        def_indent = len(lines[definition]) - len(lines[definition].lstrip())
+        end = definition + 1
+        while end < len(lines):
+            line = lines[end]
+            if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= def_indent:
+                break
+            end += 1
 
-    table_calls = [line for line in lines[definition:end]
-                   if re.match(r"^[ \t]*table <- \w+\(", strip_comments(line))]
-    if len(table_calls) != len(records):
-        errors.append("semantic_parallel_passes.elisa: dispatcher table calls do not map one-to-one to pass_id arms")
+        arms = []
+        for index in range(definition + 1, end):
+            code = strip_comments(lines[index]).strip()
+            if not PAR_PASS_ARM_ANY_RE.search(code):
+                continue
+            match = PAR_PASS_ARM_RE.fullmatch(lines[index])
+            if match is None:
+                errors.append("semantic_parallel_passes.elisa:%d: malformed pass_id arm" % (index + 1))
+                continue
+            arms.append((index, len(match.group(1)), match.group(2), int(match.group(3))))
+
+        # The top-level wrapper has range checks and calls to the chunk helpers, but
+        # no individual pass arms. Legacy generated files keep their arms directly
+        # in par_pass_call, and are still accepted by this audit.
+        if not arms:
+            continue
+
+        function_records = []
+        for arm_index, (line_index, arm_indent, arm_kind, pass_id) in enumerate(arms):
+            # Accept the legacy chain and the shallow independent-if dispatcher.
+            # All later arms in one function must use the same form; mixed shapes remain an error.
+            expected_kind = "if" if arm_index == 0 or len(arms) < 2 else arms[1][2]
+            if arm_kind != expected_kind:
+                errors.append("semantic_parallel_passes.elisa:%d: expected %s for pass_id %d" %
+                              (line_index + 1, expected_kind, pass_id))
+            stop = arms[arm_index + 1][0] if arm_index + 1 < len(arms) else end
+            body = []
+            for index in range(line_index + 1, stop):
+                code = strip_comments(lines[index]).strip()
+                if code:
+                    body.append((index, len(lines[index]) - len(lines[index].lstrip()), code))
+            statement = None
+            scope = ""
+            body_index = line_index
+            if len(body) == 1 and body[0][1] > arm_indent:
+                body_index, _indent, statement = body[0]
+            elif (
+                len(body) == 2
+                and body[0][1] > arm_indent
+                and re.fullmatch(r"can\b.*:", body[0][2])
+                and body[1][1] > body[0][1]
+            ):
+                # Some dispatcher calls need an explicit local effect scope. Treat its
+                # single nested table update as the arm's statement, while rejecting
+                # scopes that contain multiple operations.
+                body_index, _indent, statement = body[1]
+                scope = body[0][2][:-1].strip()
+            else:
+                errors.append("semantic_parallel_passes.elisa:%d: pass_id %d must have exactly one body statement" %
+                              (line_index + 1, pass_id))
+                continue
+            parsed = parse_table_call_statement(statement)
+            if parsed is None:
+                errors.append("semantic_parallel_passes.elisa:%d: unrecognized dispatcher call for pass_id %d" %
+                              (body_index + 1, pass_id))
+                continue
+            function_records.append({"id": pass_id, "name": parsed["name"], "args": parsed["args"],
+                                    "condition": parsed["cond"], "suffix": parsed["suffix"], "scope": scope})
+
+        table_calls = [line for line in lines[definition:end]
+                       if re.match(r"^[ \t]*table <- \w+\(", strip_comments(line))]
+        if len(table_calls) != len(function_records):
+            errors.append("semantic_parallel_passes.elisa: dispatcher table calls do not map one-to-one to pass_id arms")
+        records.extend(function_records)
 
     return records, errors
 
@@ -2988,18 +3007,24 @@ def parallel_runtime_lmut_errors(source, passes):
     if not re.search(r"\btable:[ \t]*mutable SymbolTable&[ \t]*@\w+,", line):
         errors.append("semantic_parallel.elisa: par_pass_run must borrow the caller's table descriptor in a named region")
     if not re.search(
-        r"def par_pass_call\[@table_region\]\(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: mutable SymbolTable& @table_region\) -> void:",
+        r"def par_pass_call\[@table_region\]\(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: mutable SymbolTable& @table_region\) -> void can\[Unsafe\{PointerArithmetic,PointerCast,RawExtern\}\]:",
         passes,
     ):
-        errors.append("semantic_parallel_passes.elisa: dispatcher must tie its table borrow to an explicit named region")
+        errors.append("semantic_parallel_passes.elisa: dispatcher must tie its table borrow to an explicit named region and preserve its Unsafe effect requirement")
     if not re.search(r"\(&frozen_table\)\.cast\[mutable void&\], table\.cast\[void&\], size_of\(SymbolTable\)", source):
         errors.append("semantic_parallel.elisa: par_pass_run must copy bytes from the borrowed table descriptor")
-    if not re.search(r"table <- par_pass_call\[destination\]\(first \+ offset, file, &loop_view, flags, table\)", source):
-        errors.append("semantic_parallel.elisa: serial dispatcher must instantiate the caller's table region")
+    if not re.search(
+        r"table <- par_pass_call\[destination\]\(first \+ offset, file, &loop_view, flags, table\) can Global\{Read,Write\}, Unsafe\{PointerArithmetic,PointerCast,RawExtern\}",
+        source,
+    ):
+        errors.append("semantic_parallel.elisa: serial dispatcher must instantiate the caller's table region and grant its required effects")
     if not re.search(r"table <- par_pass_parent_diagnostic\[destination\]\(source_bits, table\)", source):
         errors.append("semantic_parallel.elisa: parent diagnostic splice must instantiate its explicit table region")
-    if not re.search(r"table <- par_pass_call\(job\.pass_id, file, view, job\.flags, table\)", source):
-        errors.append("semantic_parallel.elisa: worker dispatcher call must explicitly update its local table")
+    if not re.search(
+        r"table <- par_pass_call\(job\.pass_id, file, view, job\.flags, table\) can Global\{Read,Write\}, Unsafe\{PointerArithmetic,PointerCast,RawExtern\}",
+        source,
+    ):
+        errors.append("semantic_parallel.elisa: worker dispatcher call must explicitly update its local table and grant its required effects")
     if not re.search(r"\) -> void:", line):
         errors.append("semantic_parallel.elisa: par_pass_run must mutate the borrowed table in place")
     return errors
@@ -3024,20 +3049,142 @@ extend Semantic:
             "        # check_full_into_pipeline's flags, for the passes' arguments and conditions.",
             "        struct ParPassFlags:"]
     body += ["            %s: %s" % (f, types[f]) for f in flags]
+    signature = "(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: mutable SymbolTable& @table_region) -> void:"
     body += ["",
-            "        def par_pass_call[@table_region](pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: mutable SymbolTable& @table_region) -> void:",
-            "            can Memory.Allocate, Abort.Panic:"]
-    for n, (pid, s) in enumerate(calls):
-        args = re.sub(r"\b(" + "|".join(flags) + r")\b", r"flags.\1", s["args"]) if flags else s["args"]
-        suffix = s.get("suffix", "")
-        if suffix and flags:
-            suffix = re.sub(r"\b(" + "|".join(flags) + r")\b", r"flags.\1", suffix)
-        # pass_id is immutable and IDs are unique. Independent branches preserve
-        # dispatch while avoiding a nested AST proportional to the pass count.
-        body.append("                if pass_id == %d:" % pid)
-        body.append("                    table <- %s(%s)%s" % (s["name"], args, (" " + suffix) if suffix else ""))
+             "        def par_pass_call[@table_region]" + signature[:-1] + " can[Unsafe{PointerArithmetic,PointerCast,RawExtern}]:",
+             "            can Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}:"]
+    chunks = [
+        calls[start:start + PAR_PASS_DISPATCH_CHUNK_SIZE]
+        for start in range(0, len(calls), PAR_PASS_DISPATCH_CHUNK_SIZE)
+    ]
+    for chunk_index, chunk in enumerate(chunks):
+        first, last = chunk[0][0], chunk[-1][0]
+        condition = "pass_id <= %d" % last if first == 0 else "pass_id >= %d and pass_id <= %d" % (first, last)
+        body.append("                if %s:" % condition)
+        body.append(
+            "                    table <- par_pass_call_chunk_%d(pass_id, file, loop_view, flags, table)"
+            % chunk_index
+        )
+    for chunk_index, chunk in enumerate(chunks):
+        body += ["",
+                 "        def par_pass_call_chunk_%d[@table_region]%s" % (chunk_index, signature),
+                 "            can Memory.Allocate, Abort.Panic:"]
+        for pid, s in chunk:
+            flag_names = r"(?<!\.)\b(" + "|".join(flags) + r")\b" if flags else ""
+            args = re.sub(flag_names, r"flags.\1", s["args"]) if flags else s["args"]
+            suffix = s.get("suffix", "")
+            if suffix and flags:
+                suffix = re.sub(flag_names, r"flags.\1", suffix)
+            # pass_id is immutable and IDs are unique. Each helper owns a bounded range.
+            body.append("                if pass_id == %d:" % pid)
+            call = "table <- %s(%s)%s" % (s["name"], args, (" " + suffix) if suffix else "")
+            scope = s.get("scope", "")
+            if scope:
+                body.append("                    %s:" % scope)
+                body.append("                        " + call)
+            else:
+                body.append("                    " + call)
     body.extend(["", parallel_safety_gate_source(pid for pid, _statement in calls)])
     return head + "\n".join(body) + "\n"
+
+
+def parallel_dispatch_chunk_errors(source, expected_ids):
+    """Verify chunk helpers and their range checks form an exact dispatch cover."""
+    lines = source.splitlines()
+    chunk_defs = set()
+    base = None
+    for index, line in enumerate(lines):
+        match = re.match(r"^[ \t]*def (par_pass_call(?:_chunk_(\d+))?)(?:\[[^\]\n]+\])?\(", line)
+        if match is None:
+            continue
+        if match.group(2) is None:
+            base = index
+        else:
+            chunk_defs.add(int(match.group(2)))
+    if not chunk_defs:
+        return []
+    if not expected_ids:
+        return ["semantic_parallel_passes.elisa: chunk helpers exist for an empty dispatcher"]
+
+    errors = []
+    expected_chunks = [
+        (index, expected_ids[start], expected_ids[min(start + PAR_PASS_DISPATCH_CHUNK_SIZE, len(expected_ids)) - 1])
+        for index, start in enumerate(range(0, len(expected_ids), PAR_PASS_DISPATCH_CHUNK_SIZE))
+    ]
+    expected_defs = {index for index, _first, _last in expected_chunks}
+    if chunk_defs != expected_defs:
+        errors.append("semantic_parallel_passes.elisa: dispatcher chunk helper set does not match the pass count")
+    if base is None:
+        return errors + ["semantic_parallel_passes.elisa: missing top-level chunk dispatcher"]
+
+    base_indent = len(lines[base]) - len(lines[base].lstrip())
+    end = base + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= base_indent:
+            break
+        end += 1
+
+    if not any(
+        re.fullmatch(
+            r"[ \t]*can Memory\.Allocate, Abort\.Panic, Global\{Read,Write\}, Unsafe\{PointerArithmetic,PointerCast,RawExtern\}:[ \t]*",
+            strip_comments(lines[index]),
+        )
+        for index in range(base + 1, end)
+    ):
+        errors.append("semantic_parallel_passes.elisa: chunk dispatcher must locally grant helper Global and Unsafe effects")
+    if not re.search(
+        r"def par_pass_call\[@table_region\]\(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, flags: ParPassFlags, table: mutable SymbolTable& @table_region\) -> void can\[Unsafe\{PointerArithmetic,PointerCast,RawExtern\}\]:",
+        lines[base],
+    ):
+        errors.append("semantic_parallel_passes.elisa: chunk dispatcher must preserve its inferred Unsafe effect requirement")
+
+    actual_chunks = []
+    for index in range(base + 1, end):
+        code = strip_comments(lines[index])
+        condition = re.fullmatch(r"[ \t]*if pass_id <= (\d+):[ \t]*", code)
+        if condition is not None:
+            first, last = 0, int(condition.group(1))
+        else:
+            condition = re.fullmatch(
+                r"[ \t]*if pass_id >= (\d+) and pass_id <= (\d+):[ \t]*",
+                code,
+            )
+            if condition is None:
+                continue
+            first, last = int(condition.group(1)), int(condition.group(2))
+        indent = len(lines[index]) - len(lines[index].lstrip())
+        body = []
+        for body_index in range(index + 1, end):
+            line = lines[body_index]
+            code = strip_comments(line).strip()
+            if not code:
+                continue
+            if len(line) - len(line.lstrip()) <= indent:
+                break
+            body.append(code)
+        if len(body) != 1:
+            errors.append("semantic_parallel_passes.elisa:%d: chunk range must have exactly one dispatch call" % (index + 1))
+            continue
+        call = re.fullmatch(
+            r"table <- par_pass_call_chunk_(\d+)\(pass_id, file, loop_view, flags, table\)",
+            body[0],
+        )
+        if call is None:
+            errors.append("semantic_parallel_passes.elisa:%d: chunk range has an unrecognized dispatch call" % (index + 1))
+            continue
+        actual_chunks.append((int(call.group(1)), first, last))
+
+    expected_set = set(expected_chunks)
+    if len(actual_chunks) != len(expected_chunks) or set(actual_chunks) != expected_set:
+        errors.append("semantic_parallel_passes.elisa: chunk range checks do not dispatch every pass exactly once")
+    chunk_calls = [
+        line for line in lines[base:end]
+        if re.search(r"\bpar_pass_call_chunk_\d+\(", strip_comments(line))
+    ]
+    if len(chunk_calls) != len(expected_chunks):
+        errors.append("semantic_parallel_passes.elisa: chunk helper calls do not match the checked ranges")
+    return errors
 
 
 def refresh_max_batch(source, max_batch):
@@ -3084,13 +3231,15 @@ def refresh_dispatch_table_region(source):
     indent = lines[index][:len(lines[index]) - len(lines[index].lstrip())]
     expected = (
         indent + "def par_pass_call[@table_region](pass_id: u32, file: Ast::File&, loop_view: Ast::File&, "
-        "flags: ParPassFlags, table: mutable SymbolTable& @table_region) -> void:"
+        "flags: ParPassFlags, table: mutable SymbolTable& @table_region) -> void can[Unsafe{PointerArithmetic,PointerCast,RawExtern}]:"
     )
     accepted = {
         indent + "def par_pass_call(pass_id: u32, file: Ast::File&, loop_view: Ast::File&, "
         "flags: ParPassFlags, table: lmut SymbolTable) -> void:",
         indent + "def par_pass_call[@table_region](pass_id: u32, file: Ast::File&, loop_view: Ast::File&, "
         "flags: ParPassFlags, table: lmut SymbolTable& @table_region) -> void:",
+        indent + "def par_pass_call[@table_region](pass_id: u32, file: Ast::File&, loop_view: Ast::File&, "
+        "flags: ParPassFlags, table: mutable SymbolTable& @table_region) -> void:",
         expected,
     }
     if lines[index] not in accepted:
@@ -3147,6 +3296,7 @@ def generated_parallel_errors(info):
     dispatch, dispatch_errors = parse_parallel_dispatch(passes)
     errors.extend(dispatch_errors)
     dispatch_ids = [record["id"] for record in dispatch]
+    errors.extend(parallel_dispatch_chunk_errors(passes, pipeline_ids))
     if dispatch_ids != pipeline_ids:
         errors.append("semantic_parallel_passes.elisa: dispatcher pass IDs/order do not match semantic_api.elisa ranges")
     if len({record["id"] for record in dispatch}) != len(dispatch):
@@ -3308,6 +3458,17 @@ def main(argv):
         else:
             max_batch = max(generated_counts)
             current = open(PASSES, encoding="utf-8").read()
+            dispatch, dispatch_errors = parse_parallel_dispatch(current)
+            if dispatch_errors:
+                print("semantic_parallel_gen: refusing --write: " + "; ".join(dispatch_errors))
+                return 1
+            dispatch_calls = [(record["id"], record) for record in dispatch]
+            current = passes_source(flags, dispatch_calls, max_batch)
+            safe_ids = {
+                record["id"] for record in dispatch
+                if append_only(info, record["name"])[0]
+            }
+            current = refresh_parallel_safety_gate(current, safe_ids)
             current = refresh_max_batch(current, max_batch)
             current = refresh_pass_flags(current, flags)
             current = refresh_dispatch_table_region(current)

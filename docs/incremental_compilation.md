@@ -1900,3 +1900,30 @@ contained local, uncommitted 24-pass dispatcher chunking and its effect grants;
 this cache-on/cache-off pair does not measure that source change against `main`.
 It also does not qualify a body edit, O3 object quality, or a cold build under the
 30-second cap. The earlier timed-out attempt above predates this completed run.
+
+## Chunked semantic dispatcher codegen (2026-10-27)
+
+The 221-pass dispatcher now routes through ten helpers, each owning a contiguous
+range of 24 pass IDs (the final range is shorter). The generator audit verifies
+that each existing ID and call remains covered exactly once, and the generated
+file round-trips byte-for-byte. Its 96 Python generator tests pass; the audit
+reports 146 parallel-eligible and 75 serialized passes. A Stage0 semantic compile
+also removed the two new dispatcher-call effect warnings after the wrapper and
+both call sites declared the helper's Unsafe requirements.
+
+For a source-to-source comparison, both the current `main` dispatcher and the
+chunked version compiled `src/driver/elisac.elisa` at O0 with native object cache
+disabled, persistent analysis cache enabled, and the retained server disabled.
+Across two runs per version, the `ir+partitions` phase median fell from 5.691 s on
+`main` to 5.064 s with chunking (11.0%). Each build emitted 96 native partitions;
+the median total native time was effectively unchanged (14.095 s vs. 14.316 s),
+so the observed difference is in IR and partition preparation. The complete CLI
+wall times are not used as the comparison because the restored analysis snapshot
+replayed different source deltas for the two versions.
+
+Both compiled self-host binaries linked and emitted the same 109-byte interface
+for `test/breadth/parallel_range_fixture.elisa` (SHA-256
+`ad580dc7737ebf528a22917fc4e9ff7428f31e6f07c1ad9c7b336535591fefe9`). This
+qualifies the measured O0 phase gain and that semantic fixture only; it does not
+qualify all pass combinations, O3 output quality, edit-to-executable latency, or
+the 30-second cold-build target.

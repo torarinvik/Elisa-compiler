@@ -190,6 +190,21 @@ lookalike = sharedness
             "                        unsafe_pass <- true\n",
         )
         self.assertTrue(audit.parallel_runtime_serial_guard_errors(late_gate))
+
+    def test_dispatcher_callers_grant_the_declared_unsafe_effects(self):
+        source = (audit.SRC + "/semantic/semantic_parallel.elisa")
+        passes = (audit.SRC + "/semantic/semantic_parallel_passes.elisa")
+        with open(source, encoding="utf-8") as f:
+            runtime = f.read()
+        with open(passes, encoding="utf-8") as f:
+            dispatcher = f.read()
+        self.assertEqual(audit.parallel_runtime_lmut_errors(runtime, dispatcher), [])
+        missing_grant = runtime.replace(
+            "can Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}",
+            "can Global{Read,Write}",
+            1,
+        )
+        self.assertTrue(audit.parallel_runtime_lmut_errors(missing_grant, dispatcher))
         dedented_fallback = runtime.replace(
             "                for offset in 0..<count:\n",
             "            for offset in 0..<count:\n",
@@ -338,8 +353,10 @@ lookalike = sharedness
         self.assertEqual(
             records,
             [
-                {"id": 0, "name": "check_plain", "args": "file, table", "condition": None},
-                {"id": 1, "name": "check_global", "args": "file, table", "condition": None},
+                {"id": 0, "name": "check_plain", "args": "file, table", "condition": None,
+                 "suffix": "", "scope": ""},
+                {"id": 1, "name": "check_global", "args": "file, table", "condition": None,
+                 "suffix": "", "scope": "can Global{Read,Write}"},
             ],
         )
 
@@ -367,6 +384,65 @@ lookalike = sharedness
         self.assertEqual([record['name'] for record in records], [f'check_{pid}' for pid in range(221)])
         _records, errors = audit.parse_parallel_dispatch(source.replace('if pass_id == 123:', 'elif pass_id == 123:'))
         self.assertTrue(any('expected if' in error for error in errors))
+
+    def test_chunked_dispatcher_preserves_order_and_checks_range_coverage(self):
+        calls = [
+            (pid, {"name": f"check_{pid}", "args": "file, table", "suffix": "", "scope": ""})
+            for pid in range(55)
+        ]
+        source = audit.passes_source([], calls, 3)
+        self.assertIn(
+            "-> void can[Unsafe{PointerArithmetic,PointerCast,RawExtern}]:",
+            source,
+        )
+        self.assertIn(
+            "can Memory.Allocate, Abort.Panic, Global{Read,Write}, Unsafe{PointerArithmetic,PointerCast,RawExtern}:",
+            source,
+        )
+        records, errors = audit.parse_parallel_dispatch(source)
+        self.assertEqual(errors, [])
+        self.assertEqual([record["id"] for record in records], list(range(55)))
+        self.assertEqual(
+            audit.parallel_dispatch_chunk_errors(source, list(range(55))),
+            [],
+        )
+        broken = source.replace(
+            "if pass_id >= 24 and pass_id <= 47:",
+            "if pass_id >= 24 and pass_id <= 46:",
+            1,
+        )
+        self.assertTrue(audit.parallel_dispatch_chunk_errors(broken, list(range(55))))
+
+    def test_generated_chunk_dispatcher_write_round_trip_is_stable(self):
+        definitions, globals_, mutable_refs, aliases, table_fields, struct_fields, variants = audit.parse_functions()
+        info = audit.analyze(
+            definitions, globals_, mutable_refs, aliases, table_fields, struct_fields, variants
+        )
+        flat, flags, calls, runs = audit.emit(info)
+        self.assertFalse(calls, "fixture expects a fully generated semantic pipeline")
+        generated_counts = [
+            int(match.group(5))
+            for line in flat
+            for match in [audit.PAR_RUN_RE.search(line)]
+            if match
+        ]
+        max_batch = max(generated_counts)
+        path = Path(audit.PASSES)
+        original = path.read_text(encoding="utf-8")
+        records, errors = audit.parse_parallel_dispatch(original)
+        self.assertEqual(errors, [])
+
+        regenerated = audit.passes_source(flags, [(record["id"], record) for record in records], max_batch)
+        safe_ids = {record["id"] for record in records if audit.append_only(info, record["name"])[0]}
+        regenerated = audit.refresh_parallel_safety_gate(regenerated, safe_ids)
+        regenerated = audit.refresh_max_batch(regenerated, max_batch)
+        regenerated = audit.refresh_pass_flags(regenerated, flags)
+        regenerated = audit.refresh_dispatch_table_region(regenerated)
+        records, errors = audit.parse_parallel_dispatch(regenerated)
+        self.assertEqual(errors, [])
+        safe_ids = {record["id"] for record in records if audit.append_only(info, record["name"])[0]}
+        regenerated = audit.refresh_parallel_safety_gate(regenerated, safe_ids)
+        self.assertEqual(regenerated, original)
 
     def test_method_receiver_stops_at_nested_index_boundary(self):
         self.assertEqual(
