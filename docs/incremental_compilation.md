@@ -1880,3 +1880,23 @@ captured 4,202 main-thread samples; 3,917 were in
 `frontend_parser_parse_file_with_length`. This points to parsing the whole compiler
 source as the next measured bottleneck. No Stage1 whole-tree speedup is claimed by
 the synthetic disk-cache result above.
+
+## Full-source O0 disk-partition repeat (2026-10-27)
+
+A later no-server run compiled `src/driver/elisac.elisa` to an O0 object with the
+Core partition cache enabled and then disabled, holding source, compiler, flags,
+and the warm persistent analysis cache constant. The exact-repeat wall times were
+3.835 s with `ELISACORE_BUILD_CACHE=1` and 4.894 s with
+`ELISACORE_BUILD_CACHE=0`; this is one pair, not a median. The hit reported
+`native 0s x0`; the uncached repeat emitted 96 native partitions, totaling 11.889 s
+of native work. Both objects were 33,121,480 bytes with identical SHA-256
+`fbe43b81a0b879eea30991122237bddb1fd9cb69b3cb6acaf302ba0fd43f3575`. Both linked
+and ran the same Stage1 `-emit ast` smoke fixture successfully with byte-identical
+output. The retained server was empty for both runs.
+
+This is a measured 1.06 s (about 22%) reduction for an exact full-source O0 object
+repeat, but it remains above the 0.5 s exact-repeat target. The measured tree
+contained local, uncommitted 24-pass dispatcher chunking and its effect grants;
+this cache-on/cache-off pair does not measure that source change against `main`.
+It also does not qualify a body edit, O3 object quality, or a cold build under the
+30-second cap. The earlier timed-out attempt above predates this completed run.
