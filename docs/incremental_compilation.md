@@ -2061,3 +2061,11 @@ override passed.
 This is a measured macOS O0 body-edit improvement on a warm disk cache. It does
 not qualify other platforms, O3, other edit classes, cold-build time, or the
 full linked self-host gate, and does not change the 2-second target status.
+
+Follow-up controls used the same edit and warm cache. With Go's default 10
+workers at `GOGC=300`, backend medians were 3.14 s. Setting `GOMAXPROCS=8`
+gave 3.305 and 3.500 s; setting it to 4 gave 4.015 and 4.111 s. `GOGC=400`
+measured 5.478 s total and 3.152 s in the backend, essentially even with 300;
+`GOGC=600` measured 6.017 s total and 3.711 s in the backend. All output
+objects had the same hash as the edit above. These controls showed no further
+gain, so the default remains 10 workers and `GOGC=300` on this host.
