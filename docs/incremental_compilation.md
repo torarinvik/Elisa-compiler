@@ -1828,7 +1828,21 @@ snapshot, reported `update changed=1` and `fast=true`, and took about 60 ms in t
 semantic update. Across all three cycles, generated LLVM IR matched the cold edit
 after normalizing only generated identifiers matching `__([a-z_]+)_[0-9]+`, and
 diagnostics matched exactly. This qualifies a medium synthetic LLVM workload; it
-does not stand in for the full compiler tree or native runtime results.
+does not stand in for the full compiler tree.
+
+The identical three-cycle matrix at `-O3` had median times of 0.975 s cold
+baseline, 0.164 s exact repeat, 0.230 s cached body edit, and 0.386 s cold edited
+compile. Each cached edit reported `update changed=1` and `fast=true`; generated IR
+and diagnostics matched the independent cold compile in all cycles. The timings
+show that this analysis-cache path retains the selected optimization level rather
+than meeting the edit target by lowering optimization.
+
+Separate Core regressions also passed for the seven-edit fresh-process IR oracle,
+fresh-process native execution, and proof retraction after a contract edit:
+`go test ./src -run '^(TestAnalysisDiskCacheFreshProcessEditOracle|TestAnalysisDiskCacheFreshProcessNativeExecution|TestAnalysisDiskCacheRetractsProofAfterContractEdit)$' -count=1`
+completed in 2.968 s. The edit oracle includes a body change, record-field layout,
+contract, effect, overload, and signature edits, and compares each result with a
+cold compile.
 
 The Stage1 wrapper's object cache remains opt-in. On a one-function `-O0 -emit obj`
 fixture, three exact-repeat cache hits had a 0.566 s median while three uncached
