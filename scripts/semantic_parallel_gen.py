@@ -1990,10 +1990,35 @@ def mutable_actual_indexes(arguments, candidates):
     return possibly_mutable
 
 
+def _matched_source_names(text, names):
+    """Equivalent to individual word-boundary searches for each name."""
+    words = set(re.findall(r"\w+", text))
+    return {name for name in names if name in words or (
+        not re.fullmatch(r"\w+", name) and re.search(r"\b" + re.escape(name) + r"\b", text)
+    )}
+
+
+def _global_callable_names(text, names):
+    """Match invoked global paths while scanning ordinary identifiers once."""
+    result = set()
+    for match in re.finditer(r"\b\w+\b", text):
+        name = match.group()
+        if name in names and global_path_is_invoked(text, match.end()):
+            result.add(name)
+    # Keep the original behavior for non-identifier names supplied by clients.
+    for name in names:
+        if re.fullmatch(r"\w+", name):
+            continue
+        for match in re.finditer(r"\b" + re.escape(name) + r"\b", text):
+            if global_path_is_invoked(text, match.end()):
+                result.add(name)
+    return result
+
+
 def argument_global_names(argument, globals_, aliases):
     """Return mutable globals named directly or through a simple local alias."""
-    names = {name for name in globals_ if re.search(r"\b" + re.escape(name) + r"\b", argument)}
-    if any(re.search(r"\b" + re.escape(alias) + r"\b", argument) for alias in aliases):
+    names = _matched_source_names(argument, globals_)
+    if _matched_source_names(argument, aliases):
         # Alias provenance is intentionally collapsed: any write through an alias
         # already disqualifies the defining pass, and mutable calls must do the same.
         names.add("aliased-global")
@@ -2424,10 +2449,7 @@ def analyze(
                     writes.add("unknown-receiver-call:" + callee)
             # Reject calls through global function values, including nested indexing
             # and parenthesized callables which the name-only CALL_RE cannot resolve.
-            for callable_name in globals_ | global_aliases:
-                for match in re.finditer(r"\b" + re.escape(callable_name) + r"\b", text):
-                    if global_path_is_invoked(text, match.end()):
-                        writes.add("global-callable:" + callable_name)
+            writes.update("global-callable:" + name for name in _global_callable_names(text, globals_ | global_aliases))
             # A table field can be mutated through a helper's mutable container parameter
             # or a user method's mutable receiver without the helper receiving a
             # SymbolTable. The direct table-field checks above cannot see that alias, so
