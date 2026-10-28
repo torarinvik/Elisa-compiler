@@ -1,0 +1,248 @@
+# Experimental, unvalidated. Only valid after module verification, LLVM 23, debug off.
+# Exact known layout avoids missing LLVM-C pointer-index-width APIs.
+extern LLVMGetPreviousInstruction(inst: LLVMValueRef) -> LLVMValueRef?
+extern LLVMGetCalledValue(inst: LLVMValueRef) -> LLVMValueRef
+extern LLVMIsInBounds(inst: LLVMValueRef) -> i32
+
+extend Backend:
+    private:
+        struct ZFLocation:
+            valid: bool
+            base: LLVMValueRef?
+            offset: u64
+            bytes: u64
+
+        struct ZFBudget:
+            work: mutable usize
+            debug_fn: void&
+            debug_kind: u32
+
+        def zf_clean(inst: LLVMValueRef, budget: ZFBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            LLVMHasMetadata(inst) == 0 and (budget.debug_fn.call_as[fn(LLVMValueRef) -> void&?](inst) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]) == null
+
+        def zf_location(pointer: LLVMValueRef, budget: mutable ZFBudget&) -> ZFLocation can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            bad: ZFLocation = ZFLocation{valid: false, base: null, offset: 0, bytes: 0}
+            current: mutable LLVMValueRef = pointer
+            offset: mutable u64 = 0
+            steps: mutable usize = 0
+            while LLVMIsAInstruction(current) != null |current, offset, steps, budget, bad|:
+                return bad if budget.work == 0 or steps >= 32
+                budget.work <- budget.work - 1
+                steps <- steps + 1
+                pointer_type: LLVMTypeRef = LLVMTypeOf(current)
+                return bad if LLVMGetTypeKind(pointer_type) != 12 or LLVMGetPointerAddressSpace(pointer_type) != 0
+                opcode: u32 = LLVMGetInstructionOpcode(current)
+                if opcode == 26: # alloca
+                    return bad if not (zf_clean(current, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                    ty: LLVMTypeRef = LLVMGetAllocatedType(current)
+                    return bad if LLVMGetTypeKind(ty) != 11
+                    elem: LLVMTypeRef = LLVMGetElementType(ty)
+                    return bad if LLVMGetTypeKind(elem) != 8 or LLVMGetIntTypeWidth(elem) != 64
+                    count: u64 = LLVMGetArrayLength2(ty)
+                    return bad if count == 0 or count > 65536
+                    return bad if LLVMGetNumOperands(current) != 1
+                    quantity: LLVMValueRef = LLVMGetOperand(current, 0)
+                    return bad if not zf_small_constant(quantity) or LLVMConstIntGetZExtValue(quantity) != 1
+                    return ZFLocation{valid: true, base: current, offset: offset, bytes: count * 8}
+                return bad if opcode != 29 or LLVMIsInBounds(current) == 0
+                return bad if not (zf_clean(current, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                return bad if LLVMGetNumIndices(current) != 1
+                ty: LLVMTypeRef = LLVMGetGEPSourceElementType(current)
+                return bad if LLVMGetTypeKind(ty) != 8 or LLVMGetIntTypeWidth(ty) != 8
+                idx: LLVMValueRef = LLVMGetOperand(current, 1)
+                return bad if not zf_small_constant(idx)
+                return bad if LLVMGetTypeKind(LLVMTypeOf(idx)) != 8 or LLVMGetIntTypeWidth(LLVMTypeOf(idx)) > 64
+                signed: i64 = LLVMConstIntGetSExtValue(idx)
+                return bad if signed < 0 or signed > 524288
+                offset <- offset + signed.u64()
+                return bad if offset > 524288
+                current <- LLVMGetOperand(current, 0)
+            bad
+
+        # No escape: every pointer use must be an instruction GEP, a load/store
+        # in pointer position, or a direct memset in destination position. Unknown
+        # calls, pointer-as-data stores, casts, PHIs and all metadata fail closed.
+        def zf_no_escape(value: LLVMValueRef, memset_fn: LLVMValueRef, depth: usize, budget: mutable ZFBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return false if depth > 32
+            use_opt: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+            while use_opt is use |use_opt, value, memset_fn, depth, budget|:
+                return false if budget.work == 0
+                budget.work <- budget.work - 1
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if LLVMIsAInstruction(user) == null
+                return false if not (zf_clean(user, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                op: u32 = LLVMGetInstructionOpcode(user)
+                if op == 29:
+                    return false if LLVMGetOperand(user, 0) != value
+                    return false if not (zf_no_escape(user, memset_fn, depth + 1, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                elif op == 27:
+                    return false if LLVMGetNumOperands(user) != 1 or LLVMGetOperand(user, 0) != value
+                    return false if LLVMGetVolatile(user) != 0 or LLVMGetOrdering(user) != 0
+                elif op == 28:
+                    return false if LLVMGetNumOperands(user) != 2 or LLVMGetOperand(user, 1) != value or LLVMGetOperand(user, 0) == value
+                    return false if LLVMGetVolatile(user) != 0 or LLVMGetOrdering(user) != 0
+                elif op == 45: # call
+                    return false if LLVMGetCalledValue(user) != memset_fn or LLVMGetNumOperands(user) != 5 or LLVMGetOperand(user, 0) != value
+                else:
+                    return false
+                use_opt <- LLVMGetNextUse(use)
+            true
+
+        def zf_small_constant(value: LLVMValueRef) -> bool:
+            return false if LLVMIsAConstantInt(value) == null
+            ty: LLVMTypeRef = LLVMTypeOf(value)
+            LLVMGetTypeKind(ty) == 8 and LLVMGetIntTypeWidth(ty) <= 64
+
+        def zf_users_clean(value: LLVMValueRef, budget: mutable ZFBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            use_opt: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+            while use_opt is use |use_opt, budget|:
+                return false if budget.work == 0
+                budget.work <- budget.work - 1
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if LLVMIsAInstruction(user) == null or not (zf_clean(user, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                use_opt <- LLVMGetNextUse(use)
+            true
+
+        def zf_int_width(value: LLVMValueRef) -> u64:
+            ty: LLVMTypeRef = LLVMTypeOf(value)
+            return 0 if LLVMGetTypeKind(ty) != 8
+            bits: u32 = LLVMGetIntTypeWidth(ty)
+            return 0 if bits != 8 and bits != 16 and bits != 32 and bits != 64
+            bits.u64() / 8
+
+        def zf_contains(start: u64, length: u64, outer_start: u64, outer_length: u64) -> bool:
+            start >= outer_start and start - outer_start <= outer_length and length <= outer_length - (start - outer_start)
+
+        def zf_try_load(load: LLVMValueRef, memset_fn: LLVMValueRef, budget: mutable ZFBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return false if LLVMGetInstructionOpcode(load) != 27 or LLVMGetVolatile(load) != 0 or LLVMGetOrdering(load) != 0
+            return false if not (zf_clean(load, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+            return false if not (zf_users_clean(load, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+            bytes: u64 = zf_int_width(load)
+            return false if bytes == 0
+            loc: ZFLocation = zf_location(LLVMGetOperand(load, 0), budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]
+            return false if not loc.valid or not zf_contains(loc.offset, bytes, 0, loc.bytes)
+            if loc.base is base:
+                alignment: u64 = LLVMGetAlignment(load).u64()
+                return false if alignment == 0 or alignment > LLVMGetAlignment(base).u64() or loc.offset % alignment != 0
+                return false if not (zf_no_escape(base, memset_fn, 0, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                cursor: mutable LLVMValueRef? = LLVMGetPreviousInstruction(load)
+                scanned: mutable usize = 0
+                while cursor is inst |cursor, scanned, load, loc, base, bytes, memset_fn, budget|:
+                    return false if scanned >= 1024 or budget.work == 0
+                    scanned <- scanned + 1
+                    budget.work <- budget.work - 1
+                    op: u32 = LLVMGetInstructionOpcode(inst)
+                    if op == 45:
+                        return false if LLVMGetCalledValue(inst) != memset_fn or LLVMGetNumOperands(inst) != 5
+                        fill: LLVMValueRef = LLVMGetOperand(inst, 1)
+                        count: LLVMValueRef = LLVMGetOperand(inst, 2)
+                        volatile_arg: LLVMValueRef = LLVMGetOperand(inst, 3)
+                        return false if not zf_small_constant(fill) or LLVMConstIntGetZExtValue(fill) != 0
+                        return false if not zf_small_constant(count) or not zf_small_constant(volatile_arg) or LLVMConstIntGetZExtValue(volatile_arg) != 0
+                        amount: u64 = LLVMConstIntGetZExtValue(count)
+                        dest: ZFLocation = zf_location(LLVMGetOperand(inst, 0), budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]
+                        return false if not dest.valid or not zf_contains(dest.offset, amount, 0, loc.bytes)
+                        if dest.base is dest_base:
+                            return false if dest_base != base
+                        else:
+                            return false
+                        return false if not zf_contains(loc.offset, bytes, dest.offset, amount)
+                        LLVMReplaceAllUsesWith(load, LLVMConstInt(LLVMTypeOf(load), 0, 0))
+                        LLVMInstructionEraseFromParent(load)
+                        return true
+                    elif op == 28:
+                        return false if LLVMGetVolatile(inst) != 0 or LLVMGetOrdering(inst) != 0
+                        stored: LLVMValueRef = LLVMGetOperand(inst, 0)
+                        store_bytes: u64 = zf_int_width(stored)
+                        return false if store_bytes == 0
+                        dest: ZFLocation = zf_location(LLVMGetOperand(inst, 1), budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]
+                        return false if not dest.valid or not zf_contains(dest.offset, store_bytes, 0, loc.bytes)
+                        if dest.base is dest_base:
+                            return false if dest_base != base
+                        else:
+                            return false
+                        return false if dest.offset < loc.offset + bytes and loc.offset < dest.offset + store_bytes
+                    elif op == 27:
+                        return false if LLVMGetVolatile(inst) != 0 or LLVMGetOrdering(inst) != 0
+                    # Whitelist pure non-memory opcodes; reject all unknown opcodes,
+                    # including atomics, fences, invokes, lifetime and other calls.
+                    elif op != 29 and op != 26 and op != 8 and op != 9 and op != 10 and op != 11 and op != 12 and op != 13 and op != 14 and op != 15 and op != 16 and op != 17 and op != 18 and op != 19 and op != 20 and op != 21 and op != 22 and op != 23 and op != 24 and op != 25 and op != 30 and op != 31 and op != 32 and op != 33 and op != 34 and op != 35 and op != 36 and op != 37 and op != 38 and op != 39 and op != 40 and op != 41 and op != 42 and op != 43 and op != 46 and op != 50:
+                        return false
+                    cursor <- LLVMGetPreviousInstruction(inst)
+            false
+
+        # Scan before mutating; if any debug records exist, skip the whole function.
+        def zf_function_has_debug(fn: LLVMValueRef, budget: mutable ZFBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return true if LLVMGetSubprogram(fn) != zeroed
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(fn)
+            while block_opt is block |block_opt, budget|:
+                inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while inst_opt is inst |inst_opt, budget|:
+                    return true if budget.work == 0
+                    budget.work <- budget.work - 1
+                    return true if LLVMGetMetadata(inst, budget.debug_kind) != null
+                    return true if (budget.debug_fn.call_as[fn(LLVMValueRef) -> void&?](inst) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]) != null
+                    inst_opt <- LLVMGetNextInstruction(inst)
+                block_opt <- LLVMGetNextBasicBlock(block)
+            false
+
+        def zf_run(module: LLVMModuleRef, memset_fn: LLVMValueRef, debug_fn: void&) -> usize can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            budget: mutable ZFBudget = ZFBudget{work: 1048576, debug_fn: debug_fn, debug_kind: LLVMGetMDKindIDInContext(LLVMGetModuleContext(module), "dbg", 3)}
+            changed: mutable usize = 0
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_opt is function |function_opt, budget, changed, memset_fn|:
+                if (zf_function_has_debug(function, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]):
+                    function_opt <- LLVMGetNextFunction(function)
+                    continue
+                block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_opt is block |block_opt, budget, changed, memset_fn|:
+                    inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while inst_opt is inst |inst_opt, budget, changed, memset_fn|:
+                        return changed if budget.work == 0
+                        budget.work <- budget.work - 1
+                        next: LLVMValueRef? = LLVMGetNextInstruction(inst)
+                        if (zf_try_load(inst, memset_fn, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]):
+                            changed <- changed + 1
+                        inst_opt <- next
+                    block_opt <- LLVMGetNextBasicBlock(block)
+                function_opt <- LLVMGetNextFunction(function)
+            changed
+
+        static if ELISA_TARGET_OS_POSIX:
+            def zf_platform(module: LLVMModuleRef) -> usize can[Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]:
+                # Restriction to the exact measured Apple arm64 layout also establishes
+                # the default address-space pointer index width and i64 allocation size.
+                return 0 if LLVMGetDataLayoutStr(module) != "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
+                # Legacy debug intrinsics can refer to values through metadata,
+                # outside the ordinary LLVM use graph. Decline if present.
+                return 0 if LLVMGetNamedFunction(module, "llvm.dbg.value") != null
+                return 0 if LLVMGetNamedFunction(module, "llvm.dbg.declare") != null
+                return 0 if LLVMGetNamedFunction(module, "llvm.dbg.assign") != null
+                if LLVMGetNamedFunction(module, "llvm.memset.p0.i64") is memset_fn:
+                    direct_anchor: void& = LLVMContextCreate.cast[void&] can Unsafe.PointerCast
+                    if artifact_identity_dlopen(null, 2) is handle:
+                        defer block:
+                            _ = artifact_identity_dlclose(handle)
+                        if artifact_identity_dlsym(handle, "LLVMContextCreate") is llvm_base:
+                            return 0 if not (split_same_llvm_image(direct_anchor, llvm_base) can Global.Read)
+                            if artifact_identity_dlsym(handle, "LLVMGetVersion") is version_fn:
+                                return 0 if not (split_same_llvm_image(llvm_base, version_fn) can Global.Read)
+                                direct_version: void& = LLVMGetVersion.cast[void&] can Unsafe.PointerCast
+                                return 0 if not (split_same_llvm_image(llvm_base, direct_version) can Global.Read)
+                                major: mutable u32 = 0
+                                minor: mutable u32 = 0
+                                patch: mutable u32 = 0
+                                LLVMGetVersion(&major, &minor, &patch)
+                                return 0 if major != 23
+                                if artifact_identity_dlsym(handle, "LLVMGetFirstDbgRecord") is debug_fn:
+                                    return 0 if not (split_same_llvm_image(llvm_base, debug_fn) can Global.Read)
+                                    return zf_run(module, memset_fn, debug_fn) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]
+                0
+        static else:
+            def zf_platform(module: LLVMModuleRef) -> usize:
+                0
+
+    public:
+        def forward_zeroed_stack_loads(module: LLVMModuleRef) -> usize can[Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]:
+            can Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read:
+                zf_platform(module)
