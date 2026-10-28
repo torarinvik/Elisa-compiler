@@ -2151,3 +2151,21 @@ object SHA-256 `131d262e69349611e960f6674c618bf2e98cd050cd0068fcb4b2be63a882794b
 and identical 29,468 diagnostic lines. Three unprofiled warm runs took
 5.321–5.593 seconds, so this allocation reduction does not establish a wall-time
 improvement.
+
+## Exact partition-cache hits skip redundant LLVM verification (2026-10-28)
+
+Core commit `8fa84af7` moves the ordinary partition verifier past finalization
+and the exact-bitcode object-cache lookup. A miss still verifies the finalized
+module before native emission and cache publication. A hit reuses an object
+whose exact bitcode already passed that check when it was cached. Unsafe-helper
+and finalization declines retain verification, as do nonpartition and
+specialization paths.
+
+The focused test populated the disk cache in one session, loaded the exact entry
+in a fresh session, and observed zero verifier calls on that hit. A source edit
+missed the cache and observed one verifier call before emission. The exact-hit
+object matched the original bytes. This and the neighboring partition disk
+cache, partial-reuse/native-parity, and declaration-worklist tests passed; the
+Core compiler also built. This verifies that a cache hit avoids one full module
+verification, but no end-to-end wall-time A/B was measured, so the body-edit
+latency target is unchanged.
