@@ -2141,3 +2141,13 @@ from disk checkpoints; it does not establish a one-shot cold-build time below
 (analysis restore 1.130 seconds, update 0.737 seconds, partitioned backend
 3.066 seconds). This is not a latency improvement claim; the 2-second body-edit
 target remains unmet.
+
+Core commit `287534c6` also memory-maps the immutable `.src` baseline sidecar
+while checking whether a restore looks like a body edit. The previous profile
+attributed 24.81 MB to that read path; the mapped path no longer appeared as an
+allocating function, and `os.readFileContents` fell from 50.88 MB to 27.54 MB
+in the sampled compiler invocation. The reverse body edit kept the previous
+object SHA-256 `131d262e69349611e960f6674c618bf2e98cd050cd0068fcb4b2be63a882794b`
+and identical 29,468 diagnostic lines. Three unprofiled warm runs took
+5.321–5.593 seconds, so this allocation reduction does not establish a wall-time
+improvement.
