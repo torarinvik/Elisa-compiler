@@ -29,6 +29,7 @@ fi
 
 # Isolate from stage0: no ELISACORE_BIN, no ~/.elisac on PATH for the compile step.
 unset ELISACORE_BIN || true
+export ELISACORE_RETAINED_SERVER=
 export ELISA_STAGE1_BIN="$BIN"
 export PATH="${ELISA_TOOL_SHIM_DIR:+$ELISA_TOOL_SHIM_DIR:}/usr/bin:/bin:${ELISA_BREW_BIN:+$ELISA_BREW_BIN:}$ELISA_LLVM_BIN_DIR${ELISA_LLVM_BIN_DIR:+:$ELISA_LLVM_BIN_DIR}"
 
@@ -68,6 +69,27 @@ fi
 echo "stage1_product_smoke OK: product $BIN compiled fixture → exit 42 (no stage0)"
 
 python3 "$ROOT/test/parity/stage1_region_constant_smoke.py" "$BIN"
+
+# Exercise program-lived arenas in linked Stage1 output. The first case covers
+# a global-region selector passed to a region-parameterized function; the second
+# covers `in source`, a pinned local container and `new[source]` at runtime.
+for region_fixture in region_only_specialization global_region_native; do
+  region_source="$ROOT/test/fixtures/self_parse_syntax/$region_fixture.elisa"
+  region_obj="$SCRATCH_DIR/$region_fixture.o"
+  region_prog="$SCRATCH_DIR/$region_fixture"
+  bash "$WRAPPER" -o "$region_obj" "$region_source"
+  [[ -s "$region_obj" ]] || { echo "stage1_product_smoke FAIL: no object for $region_fixture"; exit 1; }
+  clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$region_prog" "$region_obj" "$RUNTIME"
+  set +e
+  "$region_prog"
+  region_status=$?
+  set -e
+  if [[ "$region_status" -ne 0 ]]; then
+    echo "stage1_product_smoke FAIL: $region_fixture exited $region_status (want 0)" >&2
+    exit 1
+  fi
+  echo "stage1_product_smoke OK: $region_fixture linked and ran (no stage0)"
+done
 
 # The installed snapshot has no .git directory. Exercise its public wrapper so
 # startup cannot accidentally depend on running from the compiler checkout.
