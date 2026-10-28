@@ -2166,6 +2166,21 @@ in a fresh session, and observed zero verifier calls on that hit. A source edit
 missed the cache and observed one verifier call before emission. The exact-hit
 object matched the original bytes. This and the neighboring partition disk
 cache, partial-reuse/native-parity, and declaration-worklist tests passed; the
-Core compiler also built. This verifies that a cache hit avoids one full module
-verification, but no end-to-end wall-time A/B was measured, so the body-edit
-latency target is unchanged.
+Core compiler also built.
+
+I then measured three fresh-process Stage1 O0 body edits with the committed
+Stage0 binary (SHA-256
+`1798c945b07024656ab8d7495c38388f9009644aaa416496aea4dc00c11f0054`), no
+retained server, persistent analysis and partition caches, `GOGC=300`, 96
+partitions, and whole-object replay bypassed for timing. Each invocation
+restored the 697,022,113-byte state in 1.089–1.120 s, updated one body in
+733–756 ms, and reused all partition objects without native emission. Total
+times were 5.44, 5.48, and 5.51 s; partitioned backend times were 3.214–3.234 s.
+All three objects matched SHA-256
+`d033c45a0479dfbbf211d3277a4c8b46ab816aeda4a9ebd326110344da34382b`, and all
+29,468 warning/error lines matched the prior compiler's digest
+`df6e44138f7f4f13f94a82481218630a2c40b7465e2ebe4b888eeeae69802b8d`. These
+times overlap the prior 5.321–5.593 s range, so the change avoids a verifier
+call per exact partition hit but has not demonstrated a wall-time improvement.
+The 2-second body-edit target remains unmet; this does not qualify O3 or linked
+runtime behavior.
