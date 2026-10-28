@@ -268,9 +268,13 @@ out of the incremental fact lane, regardless of target or RHS; literal
 `Stmt.VarDecl` bindings remain independently eligible. This conservative cache
 boundary avoids relying on incomplete name indexes while the Global-permission
 and Global-authority walkers disagree about fresh identifier targets. It
-preserves cold/warm parity without deciding assignment semantics. The source
-change has not been compiled or tested; the reference study records the
-required Stage0 oracle and cold/warm parity cases.
+preserves cold/warm parity without deciding assignment semantics. The current
+source has now been compiled into a provenance-checked O0 Stage1 product. On
+2026-10-28, `test/parity/incremental_ga_cache_control.sh` passed with
+`ELISACORE_RETAINED_SERVER` explicitly empty. It compares diagnostics and exit
+status across cold, first-cache, warm, body-edited, strict/permissive, forged,
+and corrupt-sidecar runs, and checks the current-source Global-authority,
+effect-source, panic-coverage, and Global-permission skip counters.
 
 The panic pass still builds its wrapper index and annotation views and visits
 declarations; only bound-name collection and its body walkers are skipped. The
@@ -887,7 +891,9 @@ diagnostics; it does not replay results. In the opt-in session host, only the
 self-assignment linter currently replays complete rebound diagnostics; all other
 semantic diagnostics are recomputed. The current serialized controls cover body edits, semantic-option
 changes, a valid-checksum forged sidecar, and corrupt cache data, but the expanded
-current-source skip and tighter eligibility need fresh parity qualification.
+current-source skip and tighter eligibility are covered by the passing
+`test/parity/incremental_ga_cache_control.sh` control. Dependency-change
+invalidation and whole-source latency remain separate qualification work.
 Dependency-change invalidation remains to be added before eligibility expands. The manual
 `INCREMENTAL_SEMANTIC_ENGINE_VERSION` must be bumped whenever changes can alter
 collector eligibility or the meaning of facts consumed by replay.
@@ -2184,3 +2190,31 @@ times overlap the prior 5.321–5.593 s range, so the change avoids a verifier
 call per exact partition hit but has not demonstrated a wall-time improvement.
 The 2-second body-edit target remains unmet; this does not qualify O3 or linked
 runtime behavior.
+
+## Stage1 disk-sidecar parity on a fresh O0 product (2026-10-28)
+
+The Stage1 product from source revision
+`bab2efd0eb061097b9f6b981c43d04b0cecc30d8` was rebuilt with the current Stage0
+binary (SHA-256
+`99a6b82b0fb06ebc251d961ca77b77bcf4a67ca367ccd11d750675494b226431`) at
+`-O0`. Its Stage1 provenance passes `check-exact`. The bundled runtime object
+was then built by that product at `-O2` and has its input stamp.
+
+With `ELISACORE_RETAINED_SERVER` empty, the bounded
+`test/parity/incremental_ga_cache_control.sh` control passed. It checks cold,
+first-cache, warm, body-edit, strict/permissive, forged-sidecar, and corrupt-cache
+diagnostic/status parity, as well as direct-call, effect-source, panic-coverage,
+and Global-permission skip counters.
+
+A separate fresh-process object probe used 129 scalar functions, changed one
+function body, and compiled the edited source with and without
+`ELISA_STAGE1_INCREMENTAL_CACHE_DIR`. The cached edit matched 128 of 129
+eligible bodies and reported 129 Global-authority walks, 128 effect-source
+scans, and 128 panic-coverage walks skipped. Cached and cold edited objects
+were byte-identical (SHA-256
+`0ab822873172087be4818a26bf99f4ab1995d6100ed10e229315b8126a75cb1b1`); the
+diagnostics matched after removing the cache-report line. On this small fixture
+the cached invocation took 88 ms versus 72 ms cold, so the result verifies
+reuse and parity but shows no wall-time gain. The whole-compiler Stage1 edit,
+O3 product, and linked runtime gates remain open; this fixture does not qualify
+the 2-second whole-compiler edit target.
