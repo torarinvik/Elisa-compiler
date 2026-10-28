@@ -2041,7 +2041,7 @@ self-host gate. Those remain part of the active target.
 
 ## macOS GC target for partitioned body edits (2026-10-28)
 
-The Core CLI's default macOS Go GC target is now 300 (`fe66d2c3`); an explicit
+After `fe66d2c3`, the Core CLI's default macOS Go GC target was 300; an explicit
 `GOGC` value still overrides it. This follows two reversed-order pairs on the
 same M5 Mac, with 24 GiB installed RAM and the existing 60%-of-RAM soft heap
 limit. Each fresh process compiled `src/driver/elisac.elisa` with `-O0 -emit
@@ -2073,8 +2073,8 @@ workers at `GOGC=300`, backend medians were 3.14 s. Setting `GOMAXPROCS=8`
 gave 3.305 and 3.500 s; setting it to 4 gave 4.015 and 4.111 s. `GOGC=400`
 measured 5.478 s total and 3.152 s in the backend, essentially even with 300;
 `GOGC=600` measured 6.017 s total and 3.711 s in the backend. All output
-objects had the same hash as the edit above. These controls showed no further
-gain, so the default remains 10 workers and `GOGC=300` on this host.
+objects had the same hash as the edit above. At the time, these controls showed
+no further gain, and the default remained 10 workers and `GOGC=300` on this host.
 Oversubscribing did not help either: 12 workers measured 3.152 s in the backend
 and 5.451 s total; 16 workers measured 3.207 s and 5.637 s. Their object hashes
 also matched.
@@ -2087,6 +2087,16 @@ same object SHA-256 (`be9e456b68d90c9c7878d422d68e0bb549f92dc0c029b9af688d0c18ad
 as the previous binary with explicit `GOGC=100` and `GOGC=300`; all three runs
 had zero diagnostics. This is an output-preservation smoke test, not full O3
 self-host quality qualification.
+
+A later Core change, `ab0d0a6c`, raised the macOS default from `GOGC=300` to
+`GOGC=500`. Three fresh-process, source-matched warm O0 body-edit runs measured
+median CLI time of 4.92 s at 500 versus 5.39 s at 300, and partition/backend
+time of 2.55 s versus 3.10 s. The runs produced identical object bytes and
+diagnostics. Peak RSS increased by 68 MiB and stayed under the existing
+60%-of-RAM soft limit. This demonstrates a gain for macOS/M5 warm O0 body edits;
+it does not qualify cold builds, O3, other platforms, or the linked self-host
+gate.
+
 
 ## Fresh-process object hits and contract edits (2026-10-28)
 
