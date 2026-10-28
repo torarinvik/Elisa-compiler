@@ -10,6 +10,15 @@ extern LLVMGetCondition(inst: LLVMValueRef) -> LLVMValueRef
 extern LLVMCountIncoming(phi: LLVMValueRef) -> u32
 extern LLVMGetIncomingValue(phi: LLVMValueRef, index: u32) -> LLVMValueRef
 extern LLVMGetIncomingBlock(phi: LLVMValueRef, index: u32) -> LLVMBasicBlockRef
+extern LLVMGetFirstNamedMetadata(module: LLVMModuleRef) -> void&?
+extern LLVMGetModuleIdentifier(module: LLVMModuleRef, length: mutable usize&) -> u8&
+extern LLVMGetModuleInlineAsm(module: LLVMModuleRef, length: mutable usize&) -> u8&
+extern LLVMBasicBlockAsValue(block: LLVMBasicBlockRef) -> LLVMValueRef
+extern LLVMGetFirstParam(function: LLVMValueRef) -> LLVMValueRef?
+extern LLVMGetNextParam(param: LLVMValueRef) -> LLVMValueRef?
+extern LLVMGetAttributeCountAtIndex(function: LLVMValueRef, index: u32) -> u32
+extern LLVMGetAttributesAtIndex(function: LLVMValueRef, index: u32, attributes: void&) -> void
+extern LLVMIsStringAttribute(attribute: void&) -> i32
 
 extend Backend:
     private:
@@ -204,14 +213,134 @@ extend Backend:
                 return false
             true
 
-        def tu_execute(module: LLVMModuleRef, ctx: LLVMContextRef, machine: void&?, debug_fn: void&, pass_fn: void&, trial_attempts: mutable usize&, eligibility_checks: mutable usize&, graph_work: mutable usize&) -> i32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+        # LLVMCloneModule clones module-level owners as well as instructions.
+        # Count declarations and globals and cap initializer operand traversal;
+        # data-array leaves carry elements without reporting operands.
+        def tu_constant_budget(value: LLVMValueRef, depth: usize, work: mutable usize&) -> bool:
+            return false if depth > 24 or work == 0
+            work <- work - 1
+            return true if LLVMIsAGlobalVariable(value) != null or LLVMIsAFunction(value) != null
+            return false if LLVMIsAConstant(value) == null
+            kind: u32 = LLVMGetValueKind(value)
+            if kind == 18: # ConstantInt: do not admit unbounded APInt payloads.
+                ty: LLVMTypeRef = LLVMTypeOf(value)
+                return false if LLVMGetTypeKind(ty) != 8 or LLVMGetIntTypeWidth(ty) > 64
+            if kind == 16 or kind == 17: # ConstantDataArray / ConstantDataVector (LLVM 23)
+                ty: LLVMTypeRef = LLVMTypeOf(value)
+                size: mutable u64 = 0
+                if kind == 16 and LLVMGetTypeKind(ty) == 11:
+                    size <- LLVMGetArrayLength2(ty)
+                elif kind == 17 and LLVMGetTypeKind(ty) == 13:
+                    size <- LLVMGetVectorSize(ty).u64()
+                else:
+                    return false
+                return false if size > 4096 or size > work.u64()
+                work <- work - size.usize()
+            operands: u32 = LLVMGetNumOperands(value)
+            return false if operands.usize() > work
+            for index in 0..<operands |value, depth, work|:
+                return false if not tu_constant_budget(LLVMGetOperand(value, index), depth + 1, work)
+            true
+
+        def tu_name_budget(value: LLVMValueRef, bytes: mutable usize&) -> bool:
+            length: mutable usize = 0
+            _ = LLVMGetValueName2(value, &length)
+            return false if length > 1024 or length > bytes
+            bytes <- bytes - length
+            true
+
+        # Function attributes are copied by the clone. Reject string attributes
+        # rather than retaining attacker-controlled unbounded key/value storage.
+        def tu_attribute_budget(function: LLVMValueRef, index: u32, work: mutable usize&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Read]:
+            count: usize = LLVMGetAttributeCountAtIndex(function, index).usize()
+            return false if count > 32 or count > work
+            work <- work - count
+            return true if count == 0
+            attributes: mutable darray[void&?] = [null for _ in 0..<count]
+            LLVMGetAttributesAtIndex(function, index, (&attributes[0]).cast[void&] can Unsafe.PointerCast)
+            can Global.Read:
+                for attribute_index in 0..<attributes.count |attributes|:
+                    if attributes[attribute_index] is valid:
+                        return false if LLVMIsStringAttribute(valid) != 0
+                    else:
+                        return false
+            true
+
+        def tu_module_budget(module: LLVMModuleRef) -> bool:
+            # Metadata graphs may be arbitrarily large even with few named roots.
+            return false if LLVMGetFirstNamedMetadata(module) != null
+            return false if LLVMGetFirstGlobalAlias(module) != null or LLVMGetFirstGlobalIFunc(module) != null
+            globals: mutable usize = 0
+            work: mutable usize = 65536
+            names: mutable usize = 262144
+            length: mutable usize = 0
+            _ = LLVMGetModuleIdentifier(module, &length)
+            return false if length > 1024 or length > names
+            names <- names - length
+            _ = LLVMGetSourceFileName(module, &length)
+            return false if length > 1024 or length > names
+            names <- names - length
+            _ = LLVMGetModuleInlineAsm(module, &length)
+            return false if length != 0
+            current: mutable LLVMValueRef? = LLVMGetFirstGlobal(module)
+            while current is global_value |current, globals, work, names|:
+                globals <- globals + 1
+                return false if globals > 1024 or not tu_name_budget(global_value, &names)
+                if LLVMIsDeclaration(global_value) == 0:
+                    return false if not tu_constant_budget(LLVMGetInitializer(global_value), 0, &work)
+                current <- LLVMGetNextGlobal(global_value)
+            true
+
+        def tu_function_budget(function: LLVMValueRef, names: mutable usize&, attrs: mutable usize&, constants: mutable usize&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Read]:
+            return false if not tu_name_budget(function, names)
+            count: usize = LLVMCountParams(function).usize()
+            return false if count > 256
+            can Global.Read:
+                return false if not (tu_attribute_budget(function, 4294967295, attrs) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Read])
+            can Global.Read:
+                return false if not (tu_attribute_budget(function, 0, attrs) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Read])
+            arg: mutable LLVMValueRef? = LLVMGetFirstParam(function)
+            index: mutable usize = 1
+            while arg is param |arg, index, function, names, attrs|:
+                return false if index > count or not tu_name_budget(param, names)
+                can Global.Read:
+                    return false if not (tu_attribute_budget(function, index.u32(), attrs) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Read])
+                index <- index + 1
+                arg <- LLVMGetNextParam(param)
+            return false if index != count + 1
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_opt is block |block_opt, names, constants|:
+                return false if not tu_name_budget(LLVMBasicBlockAsValue(block), names)
+                inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while inst_opt is inst |inst_opt, names, constants|:
+                    return false if not tu_name_budget(inst, names)
+                    operand_count: usize = LLVMGetNumOperands(inst).usize()
+                    return false if operand_count > 256 or operand_count > constants
+                    for operand_index in 0..<operand_count |inst, constants|:
+                        operand: LLVMValueRef = LLVMGetOperand(inst, operand_index.u32())
+                        if LLVMIsAConstant(operand) != null:
+                            return false if not tu_constant_budget(operand, 0, constants)
+                    inst_opt <- LLVMGetNextInstruction(inst)
+                block_opt <- LLVMGetNextBasicBlock(block)
+            true
+
+        def tu_execute(module: LLVMModuleRef, ctx: LLVMContextRef, machine: void&?, debug_fn: void&, pass_fn: void&, trial_attempts: mutable usize&, eligibility_checks: mutable usize&, graph_work: mutable usize&) -> i32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]:
             # Cloning a very large module for an optional profitability trial is
             # counterproductive. Bound the entire scan and decline large modules.
+            return 0 if not tu_module_budget(module)
             scan_function: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
             scan_count: mutable usize = 0
-            while scan_function is scanned |scan_function, scan_count|:
+            function_count: mutable usize = 0
+            name_budget: mutable usize = 262144
+            attribute_budget: mutable usize = 8192
+            constant_budget: mutable usize = 65536
+            while scan_function is scanned |scan_function, scan_count, function_count, name_budget, attribute_budget, constant_budget|:
+                function_count <- function_count + 1
+                return 0 if function_count > 2048
                 scan_count <- scan_count + tu_count_function(scanned)
                 return 0 if scan_count > 8192
+                can Global.Read:
+                    return 0 if not (tu_function_budget(scanned, &name_budget, &attribute_budget, &constant_budget) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Read])
                 scan_function <- LLVMGetNextFunction(scanned)
             budget: mutable ZFBudget = ZFBudget{work: 1048576, debug_fn: debug_fn, debug_kind: LLVMGetMDKindIDInContext(ctx, "dbg", 3)}
             function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
@@ -363,7 +492,8 @@ extend Backend:
                                 if artifact_identity_dlsym(handle, "LLVMRunPassesOnFunction") is pass_fn:
                                     return 0 if not (split_same_llvm_image(llvm_base, debug_fn) can Global.Read)
                                     return 0 if not (split_same_llvm_image(llvm_base, pass_fn) can Global.Read)
-                                    return tu_execute(module, ctx, machine, debug_fn, pass_fn, trial_attempts, eligibility_checks, graph_work) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]
+                                    can Global.Read:
+                                        return tu_execute(module, ctx, machine, debug_fn, pass_fn, trial_attempts, eligibility_checks, graph_work) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]
                 0
         static else:
             def tu_platform(module: LLVMModuleRef, ctx: LLVMContextRef, machine: void&?, trial_attempts: mutable usize&, eligibility_checks: mutable usize&, graph_work: mutable usize&) -> i32:

@@ -15,6 +15,7 @@ trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/test/parity"
 cp "$ROOT/test/parity/stage1_table_unroll_fixture.ll" "$ROOT/test/parity/stage1_table_unroll_noop_fixture.ll" "$ROOT/test/parity/stage1_table_unroll_attempts_fixture.ll" "$ROOT/test/parity/stage1_table_unroll_graph_budget_fixture.ll" "$T/test/parity/"
 cd "$T"
+run python3 "$ROOT/test/parity/stage1_table_unroll_clean_fixture.py"
 run "$STAGE1" -O0 -emit obj -o "$T/probe.o" "$ROOT/test/parity/stage1_table_unroll_probe.elisa"
 run "${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}" "$T/probe.o" "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}" -L"$ELISA_LLVM_LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$ELISA_LLVM_LIBDIR" -o "$T/probe"
 run "$T/probe"
@@ -33,7 +34,7 @@ def body(name, source=text):
 for name in ('positive','trip2','trip16'):
  assert '\nloop:' not in body(name), f'{name} eligible loop did not unroll'
 assert body('multiple_loops') == body('multiple_loops', original), 'multiple-loop function was modified'
-for name in ('trip17','small_trip','mutable','loop_metadata','large','debug','dynamic','counter_independent','volatile','atomic','extra_volatile','extra_atomic','side_effect','poison_bound','optnone'):
+for name in ('trip17','small_trip','mutable','loop_metadata','large','dynamic','counter_independent','volatile','atomic','extra_volatile','extra_atomic','side_effect','poison_bound','optnone'):
  assert '\nloop:' in body(name), f'{name} unexpectedly changed'
  assert body(name) == body(name, original), f'{name} IR was modified'
 print('table unroll positive and negative IR probes passed')
@@ -88,3 +89,19 @@ after=Path(sys.argv[2]).read_text().splitlines()[1:]
 assert before == after, 'graph budget decline modified the module'
 print('table unroll graph budget probe passed')
 PY
+
+# Oversized module owner/constant graphs and aliases decline without cloning.
+run "$STAGE1" -O0 -emit obj -o "$T/clone-budget-probe.o" "$ROOT/test/parity/stage1_table_unroll_clone_budget_probe.elisa"
+run "${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}" "$T/clone-budget-probe.o" "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}" -L"$ELISA_LLVM_LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$ELISA_LLVM_LIBDIR" -o "$T/clone-budget-probe"
+for kind in globals functions constant alias metadata integer longname stringattr debug; do
+    run python3 "$ROOT/test/parity/stage1_table_unroll_clone_budget_gen.py" "$kind"
+    run "$T/clone-budget-probe"
+    run "$ELISA_LLVM_BIN_DIR/llvm-as" "test/parity/stage1_table_unroll_clone_budget_fixture.ll" -o "$T/clone-budget-input.bc"
+    run "$ELISA_LLVM_BIN_DIR/llvm-dis" "$T/clone-budget-input.bc" -o "$T/clone-budget-input.ll"
+    run "$ELISA_LLVM_BIN_DIR/llvm-dis" "test/parity/stage1_table_unroll_clone_budget_output.bc" -o "$T/clone-budget-output.ll"
+    run python3 - "$T/clone-budget-input.ll" "$T/clone-budget-output.ll" <<'PYCODE'
+from pathlib import Path
+import sys
+assert Path(sys.argv[1]).read_text().splitlines()[1:] == Path(sys.argv[2]).read_text().splitlines()[1:], 'clone-budget decline modified module'
+PYCODE
+done
