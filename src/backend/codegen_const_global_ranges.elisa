@@ -1,0 +1,404 @@
+# Fold integer comparisons whose value comes from an immutable, local integer array.
+#
+# The proof is deliberately narrow: the loaded value must be an i64 element of a private
+# or internal constant `[N x i64]` with a fully enumerated integer initializer. The load
+# pointer must be derived from that global by an instruction-only GEP chain whose byte
+# displacement is always a multiple of eight. For non-inbounds GEPs this uses LLVM's
+# pointer-association rule: a defined load through a pointer based on a global must access
+# storage associated with that global. We never infer that a possibly out-of-bounds index
+# is safe; such an access has no defined loaded value to preserve.
+#
+# This runs after default<O3>, changes only proved ICmp results, and leaves branches, PHIs,
+# loop metadata, and all other optimizer decisions in place. It declines debug builds,
+# metadata-bearing proof instructions or users, volatile/atomic loads, unsupported flags,
+# unknown LLVM versions, and work beyond explicit budgets.
+extend Backend:
+    private:
+        const RANGE_ICMP: u32 = 42
+        const RANGE_LOAD: u32 = 27
+        const RANGE_GEP: u32 = 29
+        const RANGE_INTEGER_TYPE: u32 = 8
+        const RANGE_ARRAY_TYPE: u32 = 11
+        const RANGE_POINTER_TYPE: u32 = 12
+        const RANGE_PRIVATE_LINKAGE: u32 = 9
+        const RANGE_INTERNAL_LINKAGE: u32 = 8
+        const RANGE_GEP_INBOUNDS_FLAG: u32 = 1
+        const RANGE_ALLOWED_GEP_FLAGS: u32 = 1
+        const RANGE_EQ: i32 = 32
+        const RANGE_NE: i32 = 33
+        const RANGE_UGT: i32 = 34
+        const RANGE_UGE: i32 = 35
+        const RANGE_ULT: i32 = 36
+        const RANGE_ULE: i32 = 37
+        const RANGE_SGT: i32 = 38
+        const RANGE_SGE: i32 = 39
+        const RANGE_SLT: i32 = 40
+        const RANGE_SLE: i32 = 41
+
+        struct RangeBudget:
+            instruction_work: mutable usize
+            pointer_work: mutable usize
+            initializer_work: mutable usize
+            compare_work: mutable usize
+            user_work: mutable usize
+            debug_fn: void&
+            same_sign_fn: void&
+            gep_flags_fn: void&
+
+        struct ConstantGlobalRange:
+            global_value: LLVMValueRef
+            valid: mutable bool
+            min_unsigned: mutable u64
+            max_unsigned: mutable u64
+            min_signed: mutable i64
+            max_signed: mutable i64
+
+        struct ConstantGlobalPointerProof:
+            valid: bool
+            global_value: LLVMValueRef?
+            byte_residue: u32
+
+        def range_has_debug_record(value: LLVMValueRef, budget: RangeBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            (budget.debug_fn.call_as[fn(LLVMValueRef) -> void&?](value) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]) != null
+
+        def range_pointer_type_is_default_address_space(value: LLVMValueRef) -> bool:
+            pointer_type: LLVMTypeRef = LLVMTypeOf(value)
+            return false if LLVMGetTypeKind(pointer_type) != RANGE_POINTER_TYPE
+            LLVMGetPointerAddressSpace(pointer_type) == 0
+
+        def range_add_offset_residue(current: u32, index: i64, stride: u64) -> u32:
+            index_mod: mutable i64 = index % 8
+            index_mod <- index_mod + 8 if index_mod < 0
+            (current + index_mod.u32() * (stride & 7).u32()) % 8
+
+        # The DataLayout pointer index width may be smaller than the source index type.
+        # Compute the contribution for the only special widths that affect modulo 8. For
+        # widths >= 3 the low three bits are exactly the source value's low three bits.
+        def range_constant_index_contribution(index: i64, stride: u64, width: u32) -> u32:
+            effective: mutable i64 = index
+            if width == 1:
+                effective <- -1 if (index & 1) != 0 else 0
+            elif width == 2:
+                low: i64 = index & 3
+                effective <- low - 4 if (low & 2) != 0 else low
+            range_add_offset_residue(0, effective, stride)
+
+        def range_index_type_is_integer_at_most_64(value: LLVMValueRef) -> bool:
+            index_type: LLVMTypeRef = LLVMTypeOf(value)
+            return false if LLVMGetTypeKind(index_type) != RANGE_INTEGER_TYPE
+            width: u32 = LLVMGetIntTypeWidth(index_type)
+            width > 0 and width <= 64
+
+        # Only ask DataLayout for fixed scalar i8/i64 or a one-dimensional array of
+        # those scalars. LLVMTypeIsSized also returns true for some scalable vectors;
+        # asking LLVMABISizeOfType for those can assert rather than return a size.
+        def range_fixed_stride(ty: LLVMTypeRef, target_data: LLVMTargetDataRef) -> u64?:
+            type_kind: u32 = LLVMGetTypeKind(ty)
+            if type_kind == RANGE_INTEGER_TYPE:
+                width: u32 = LLVMGetIntTypeWidth(ty)
+                return null if width != 8 and width != 64
+                size: u64 = LLVMABISizeOfType(target_data, ty)
+                return null if size != 1 and size != 8
+                return size
+            if type_kind == RANGE_ARRAY_TYPE:
+                element_type: LLVMTypeRef = LLVMGetElementType(ty)
+                return null if LLVMGetTypeKind(element_type) != RANGE_INTEGER_TYPE
+                element_width: u32 = LLVMGetIntTypeWidth(element_type)
+                return null if element_width != 8 and element_width != 64
+                element_size: u64 = LLVMABISizeOfType(target_data, element_type)
+                return null if element_size != 1 and element_size != 8
+                count: u64 = LLVMGetArrayLength2(ty)
+                return null if count == 0 or count > 65536
+                count * element_size
+            else:
+                null
+
+        def range_is_load_instruction(value: LLVMValueRef) -> bool:
+            return false if LLVMIsAInstruction(value) == null
+            LLVMGetInstructionOpcode(value) == RANGE_LOAD
+
+        # Add the displacement of one GEP index modulo the eight-byte element stride. A
+        # dynamic index is accepted only when its scale is itself divisible by eight.
+        def range_gep_index_residue(index: LLVMValueRef, stride: u64, current: u32) -> u32?:
+            return null if not range_index_type_is_integer_at_most_64(index)
+            if LLVMIsAConstantInt(index) is constant_index:
+                signed_index: i64 = LLVMConstIntGetSExtValue(constant_index)
+                contribution_one: u32 = range_constant_index_contribution(signed_index, stride, 1)
+                contribution_two: u32 = range_constant_index_contribution(signed_index, stride, 2)
+                contribution_three: u32 = range_constant_index_contribution(signed_index, stride, 3)
+                return null if contribution_one != contribution_two or contribution_one != contribution_three
+                (current + contribution_three) % 8
+            else:
+                return null if (stride & 7) != 0
+                current
+
+        # Resolve only direct GlobalVariable/GEP chains. Casts, aliases, PHIs, selects,
+        # integer round-trips, and function arguments are unsupported and fail closed.
+        def range_pointer_proof(pointer: LLVMValueRef, target_data: LLVMTargetDataRef, depth: usize, residue: u32, budget: mutable RangeBudget&) -> ConstantGlobalPointerProof can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            empty: ConstantGlobalPointerProof = ConstantGlobalPointerProof{valid: false, global_value: null, byte_residue: 0}
+            return empty if depth > 8 or budget.pointer_work == 0
+            budget.pointer_work <- budget.pointer_work - 1
+            return empty if not (range_pointer_type_is_default_address_space(pointer))
+            if LLVMIsAGlobalVariable(pointer) is global_value:
+                return ConstantGlobalPointerProof{valid: true, global_value: global_value, byte_residue: residue}
+            return empty if LLVMIsAInstruction(pointer) == null
+            gep: LLVMValueRef = pointer
+            return empty if LLVMGetInstructionOpcode(gep) != RANGE_GEP
+            return empty if LLVMHasMetadata(gep) != 0 or (range_has_debug_record(gep, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+            flags: u32 = budget.gep_flags_fn.call_as[fn(LLVMValueRef) -> u32](gep) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]
+            # LLVM 23 currently defines only inbounds, nusw and nuw for instruction GEPs.
+            # Accept inbounds; reject no-wrap promises and every unrecognized future bit.
+            return empty if (flags & (4294967295 - RANGE_ALLOWED_GEP_FLAGS)) != 0
+            index_count: u32 = LLVMGetNumIndices(gep)
+            return empty if index_count == 0 or index_count > 16
+            source_type: LLVMTypeRef = LLVMGetGEPSourceElementType(gep)
+            maybe_stride: u64? = range_fixed_stride(source_type, target_data)
+            stride: mutable u64 = 0
+            if maybe_stride is actual_stride:
+                stride <- actual_stride
+            else:
+                return empty
+            new_residue: mutable u32 = residue
+            maybe_residue: mutable u32? = range_gep_index_residue(LLVMGetOperand(gep, 1), stride, new_residue)
+            return empty if maybe_residue == null
+            new_residue <- maybe_residue
+            current_type: mutable LLVMTypeRef = source_type
+            for index in 1..<index_count |gep, index, current_type, new_residue, target_data, budget|:
+                index_value: LLVMValueRef = LLVMGetOperand(gep, index + 1)
+                type_kind: u32 = LLVMGetTypeKind(current_type)
+                if type_kind == RANGE_ARRAY_TYPE:
+                    element_type: LLVMTypeRef = LLVMGetElementType(current_type)
+                    maybe_element_stride: u64? = range_fixed_stride(element_type, target_data)
+                    element_stride: mutable u64 = 0
+                    if maybe_element_stride is actual_element_stride:
+                        element_stride <- actual_element_stride
+                    else:
+                        return empty
+                    maybe_residue <- range_gep_index_residue(index_value, element_stride, new_residue)
+                    return empty if maybe_residue == null
+                    new_residue <- maybe_residue
+                    current_type <- element_type
+                else:
+                    return empty
+            range_pointer_proof(LLVMGetOperand(gep, 0), target_data, depth + 1, new_residue, budget) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]
+
+        def range_lookup_global_summary(global_value: LLVMValueRef, module: LLVMModuleRef, target_data: LLVMTargetDataRef, ranges: mutable darray[ConstantGlobalRange]&, budget: mutable RangeBudget&) -> ConstantGlobalRange can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<ranges.count |index, ranges, global_value|:
+                if ranges[index].global_value == global_value:
+                    return ranges[index]
+            invalid: ConstantGlobalRange = ConstantGlobalRange{global_value: global_value, valid: false, min_unsigned: 0, max_unsigned: 0, min_signed: 0, max_signed: 0}
+            return invalid if ranges.count >= 64
+            ranges.push(invalid)
+            cache_index: usize = ranges.count - 1
+            return invalid if LLVMGetGlobalParent(global_value) != module
+            return invalid if LLVMGetLinkage(global_value) != RANGE_PRIVATE_LINKAGE and LLVMGetLinkage(global_value) != RANGE_INTERNAL_LINKAGE
+            return invalid if LLVMIsDeclaration(global_value) != 0 or LLVMIsGlobalConstant(global_value) == 0
+            return invalid if LLVMGetThreadLocalMode(global_value) != 0 or LLVMIsExternallyInitialized(global_value) != 0
+            global_type: LLVMTypeRef = LLVMGlobalGetValueType(global_value)
+            return invalid if LLVMGetTypeKind(global_type) != RANGE_ARRAY_TYPE
+            element_type: LLVMTypeRef = LLVMGetElementType(global_type)
+            return invalid if LLVMGetTypeKind(element_type) != RANGE_INTEGER_TYPE or LLVMGetIntTypeWidth(element_type) != 64
+            # The range summarizes complete i64 elements at eight-byte intervals. A
+            # target that gives i64 a different allocation stride could have padding
+            # between elements; decline rather than interpreting padding as a table value.
+            return invalid if LLVMABISizeOfType(target_data, element_type) != 8
+            element_count: u64 = LLVMGetArrayLength2(global_type)
+            return invalid if element_count == 0 or element_count > 4096 or element_count > budget.initializer_work
+            return invalid if element_count > 4294967295
+            initializer: LLVMValueRef = LLVMGetInitializer(global_value)
+            return invalid if LLVMGetTypeKind(LLVMTypeOf(initializer)) != RANGE_ARRAY_TYPE
+            return invalid if LLVMGetArrayLength2(LLVMTypeOf(initializer)) != element_count
+            min_u: mutable u64 = 18446744073709551615
+            max_u: mutable u64 = 0
+            min_s: mutable i64 = 9223372036854775807
+            max_s: mutable i64 = -9223372036854775807 - 1
+            for element_index in 0..<element_count.usize() |initializer, element_count, element_index, min_u, max_u, min_s, max_s, budget|:
+                budget.initializer_work <- budget.initializer_work - 1
+                raw_element: void&? = LLVMGetAggregateElementRaw(initializer, element_index.u32())
+                if raw_element is element:
+                    return invalid if LLVMIsAConstantIntRaw(element) == null
+                    unsigned_value: u64 = LLVMConstIntGetZExtValueRaw(element)
+                    signed_value: i64 = LLVMConstIntGetSExtValueRaw(element)
+                    min_u <- unsigned_value if unsigned_value < min_u
+                    max_u <- unsigned_value if unsigned_value > max_u
+                    min_s <- signed_value if signed_value < min_s
+                    max_s <- signed_value if signed_value > max_s
+                else:
+                    return invalid
+            ranges[cache_index].valid <- true
+            ranges[cache_index].min_unsigned <- min_u
+            ranges[cache_index].max_unsigned <- max_u
+            ranges[cache_index].min_signed <- min_s
+            ranges[cache_index].max_signed <- max_s
+            ranges[cache_index]
+
+        def range_swap_predicate(predicate: i32) -> i32:
+            return RANGE_UGT if predicate == RANGE_ULT
+            return RANGE_UGE if predicate == RANGE_ULE
+            return RANGE_ULT if predicate == RANGE_UGT
+            return RANGE_ULE if predicate == RANGE_UGE
+            return RANGE_SLT if predicate == RANGE_SGT
+            return RANGE_SLE if predicate == RANGE_SGE
+            return RANGE_SGT if predicate == RANGE_SLT
+            return RANGE_SGE if predicate == RANGE_SLE
+            predicate
+
+        # Return -1 when the interval straddles the comparison, otherwise 0/1.
+        def range_decide_compare(predicate: i32, range: ConstantGlobalRange, unsigned_bound: u64, signed_bound: i64) -> i32:
+            if predicate == RANGE_EQ:
+                return 1 if range.min_unsigned == range.max_unsigned and range.min_unsigned == unsigned_bound
+                return 0 if unsigned_bound < range.min_unsigned or unsigned_bound > range.max_unsigned
+                return -1
+            if predicate == RANGE_NE:
+                return 0 if range.min_unsigned == range.max_unsigned and range.min_unsigned == unsigned_bound
+                return 1 if unsigned_bound < range.min_unsigned or unsigned_bound > range.max_unsigned
+                return -1
+            if predicate == RANGE_ULT:
+                return 1 if range.max_unsigned < unsigned_bound
+                return 0 if range.min_unsigned >= unsigned_bound
+                return -1
+            if predicate == RANGE_ULE:
+                return 1 if range.max_unsigned <= unsigned_bound
+                return 0 if range.min_unsigned > unsigned_bound
+                return -1
+            if predicate == RANGE_UGT:
+                return 1 if range.min_unsigned > unsigned_bound
+                return 0 if range.max_unsigned <= unsigned_bound
+                return -1
+            if predicate == RANGE_UGE:
+                return 1 if range.min_unsigned >= unsigned_bound
+                return 0 if range.max_unsigned < unsigned_bound
+                return -1
+            if predicate == RANGE_SLT:
+                return 1 if range.max_signed < signed_bound
+                return 0 if range.min_signed >= signed_bound
+                return -1
+            if predicate == RANGE_SLE:
+                return 1 if range.max_signed <= signed_bound
+                return 0 if range.min_signed > signed_bound
+                return -1
+            if predicate == RANGE_SGT:
+                return 1 if range.min_signed > signed_bound
+                return 0 if range.max_signed <= signed_bound
+                return -1
+            if predicate == RANGE_SGE:
+                return 1 if range.min_signed >= signed_bound
+                return 0 if range.max_signed < signed_bound
+                return -1
+            -1
+
+        def range_compare_users_unannotated(compare: LLVMValueRef, budget: mutable RangeBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            use_opt: mutable LLVMUseRef? = LLVMGetFirstUse(compare)
+            use_count: mutable usize = 0
+            while use_opt is use_value |use_opt, use_count, compare, budget|:
+                return false if use_count >= 256 or budget.user_work == 0
+                use_count <- use_count + 1
+                budget.user_work <- budget.user_work - 1
+                user: LLVMValueRef = LLVMGetUser(use_value)
+                return false if LLVMIsAInstruction(user) == null
+                return false if LLVMHasMetadata(user) != 0 or (range_has_debug_record(user, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                use_opt <- LLVMGetNextUse(use_value)
+            true
+
+        def range_try_fold_compare(compare: LLVMValueRef, module: LLVMModuleRef, target_data: LLVMTargetDataRef, context: LLVMContextRef, ranges: mutable darray[ConstantGlobalRange]&, budget: mutable RangeBudget&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return false if LLVMGetInstructionOpcode(compare) != RANGE_ICMP
+            return false if budget.compare_work == 0
+            budget.compare_work <- budget.compare_work - 1
+            return false if LLVMHasMetadata(compare) != 0 or (range_has_debug_record(compare, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+            return false if (budget.same_sign_fn.call_as[fn(LLVMValueRef) -> i32](compare) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]) != 0
+            return false if not (range_compare_users_unannotated(compare, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+            return false if LLVMGetNumOperands(compare) != 2
+            predicate: mutable i32 = LLVMGetICmpPredicate(compare)
+            left: LLVMValueRef = LLVMGetOperand(compare, 0)
+            right: LLVMValueRef = LLVMGetOperand(compare, 1)
+            constant: mutable LLVMValueRef? = null
+            loaded: mutable LLVMValueRef? = null
+            if LLVMIsAConstantInt(left) is left_constant and range_is_load_instruction(right):
+                constant <- left_constant
+                loaded <- right
+                predicate <- range_swap_predicate(predicate)
+            elif LLVMIsAConstantInt(right) is right_constant and range_is_load_instruction(left):
+                constant <- right_constant
+                loaded <- left
+            else:
+                return false
+            return false if loaded == null or constant == null
+            load: LLVMValueRef = loaded
+            bound: LLVMValueRef = constant
+            comparison_type: LLVMTypeRef = LLVMTypeOf(compare)
+            load_type: LLVMTypeRef = LLVMTypeOf(load)
+            return false if LLVMGetTypeKind(comparison_type) != RANGE_INTEGER_TYPE or LLVMGetIntTypeWidth(comparison_type) != 1
+            return false if LLVMGetTypeKind(load_type) != RANGE_INTEGER_TYPE or LLVMGetIntTypeWidth(load_type) != 64
+            return false if LLVMTypeOf(bound) != load_type
+            return false if LLVMGetNumOperands(load) != 1 or LLVMGetVolatile(load) != 0 or LLVMGetOrdering(load) != 0
+            return false if LLVMHasMetadata(load) != 0 or (range_has_debug_record(load, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+            pointer: LLVMValueRef = LLVMGetOperand(load, 0)
+            pointer_proof: ConstantGlobalPointerProof = range_pointer_proof(pointer, target_data, 0, 0, budget) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]
+            return false if not pointer_proof.valid or pointer_proof.byte_residue != 0
+            if pointer_proof.global_value is global_value:
+                summary: ConstantGlobalRange = range_lookup_global_summary(global_value, module, target_data, ranges, budget) can[Abort.Panic, Memory.Allocate]
+                return false if not summary.valid
+                decision: i32 = range_decide_compare(predicate, summary, LLVMConstIntGetZExtValue(bound), LLVMConstIntGetSExtValue(bound))
+                return false if decision < 0
+                truth: u64 = 1 if decision != 0 else 0
+                LLVMReplaceAllUsesWith(compare, LLVMConstInt(comparison_type, truth, 0))
+                LLVMInstructionEraseFromParent(compare)
+                true
+            else:
+                false
+
+        def range_rewrite_impl(module: LLVMModuleRef, context: LLVMContextRef, target_data: LLVMTargetDataRef, debug_fn: void&, same_sign_fn: void&, gep_flags_fn: void&) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            budget: mutable RangeBudget = RangeBudget{instruction_work: 262144, pointer_work: 32768, initializer_work: 65536, compare_work: 4096, user_work: 65536, debug_fn: debug_fn, same_sign_fn: same_sign_fn, gep_flags_fn: gep_flags_fn}
+            ranges: mutable darray[ConstantGlobalRange] = []
+            changed: mutable usize = 0
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_opt is function |function_opt, budget, ranges, changed, module, target_data, context|:
+                block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_opt is block |block_opt, budget, ranges, changed, function, module, target_data, context|:
+                    instruction_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while instruction_opt is instruction |instruction_opt, budget, ranges, changed, module, target_data, context|:
+                        return changed if budget.instruction_work == 0
+                        budget.instruction_work <- budget.instruction_work - 1
+                        next: LLVMValueRef? = LLVMGetNextInstruction(instruction)
+                        if (range_try_fold_compare(instruction, module, target_data, context, ranges, budget) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]):
+                            changed <- changed + 1
+                        instruction_opt <- next
+                    block_opt <- LLVMGetNextBasicBlock(block)
+                function_opt <- LLVMGetNextFunction(function)
+            changed
+
+        static if ELISA_TARGET_OS_POSIX:
+            def range_fold_platform_impl(module: LLVMModuleRef, context: LLVMContextRef) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]:
+                # This handle borrows the module-owned DataLayout; it must not be disposed.
+                target_data: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+                direct_anchor: void& = LLVMContextCreate.cast[void&] can Unsafe.PointerCast
+                if artifact_identity_dlopen(null, 2) is handle:
+                    defer block:
+                        _ = artifact_identity_dlclose(handle)
+                    if artifact_identity_dlsym(handle, "LLVMContextCreate") is llvm_base:
+                        return 0 if not (split_same_llvm_image(direct_anchor, llvm_base) can Global.Read)
+                        if artifact_identity_dlsym(handle, "LLVMGetVersion") is version_fn:
+                            direct_version: void& = LLVMGetVersion.cast[void&] can Unsafe.PointerCast
+                            return 0 if not (split_same_llvm_image(llvm_base, version_fn) can Global.Read)
+                            return 0 if not (split_same_llvm_image(llvm_base, direct_version) can Global.Read)
+                            major: mutable u32 = 0
+                            minor: mutable u32 = 0
+                            patch: mutable u32 = 0
+                            LLVMGetVersion(&major, &minor, &patch)
+                            return 0 if major != 23
+                            if artifact_identity_dlsym(handle, "LLVMGetFirstDbgRecord") is debug_fn:
+                                if artifact_identity_dlsym(handle, "LLVMGetICmpSameSign") is same_sign_fn:
+                                    if artifact_identity_dlsym(handle, "LLVMGEPGetNoWrapFlags") is gep_flags_fn:
+                                        return 0 if not (split_same_llvm_image(llvm_base, debug_fn) can Global.Read)
+                                        return 0 if not (split_same_llvm_image(llvm_base, same_sign_fn) can Global.Read)
+                                        return 0 if not (split_same_llvm_image(llvm_base, gep_flags_fn) can Global.Read)
+                                        return range_rewrite_impl(module, context, target_data, debug_fn, same_sign_fn, gep_flags_fn) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]
+                0
+        static else:
+            def range_fold_platform_impl(module: LLVMModuleRef, context: LLVMContextRef) -> usize:
+                0
+
+    public:
+        def fold_constant_global_ranges(module: LLVMModuleRef, context: LLVMContextRef) -> usize can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read:
+                range_fold_platform_impl(module, context)

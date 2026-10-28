@@ -1,0 +1,217 @@
+# Direct LLVM-C integration probe for the post-O3 range pass. It is intentionally small:
+# the regular Stage1 seed has a high memory cost, while this checks the real Elisa bindings,
+# shared loader declarations, LLVM 23 dynamic API gate, rewrites, and module verification.
+module Backend:
+    public:
+        def range_probe_backend_placeholder() -> i32:
+            0
+
+include "../../src/backend/llvm_c.elisa"
+include "../../src/driver/elisac_artifact_identity.elisa"
+include "../../src/backend/codegen_split_half.elisa"
+include "../../src/backend/codegen_const_global_ranges.elisa"
+
+extern LLVMSetVolatile(inst: LLVMValueRef, is_volatile: i32) -> void
+extern LLVMGEPSetNoWrapFlags(inst: LLVMValueRef, flags: u32) -> void
+
+struct RangeProbeCase:
+    ret_instruction: LLVMValueRef
+    should_fold: bool
+    expected_value: u64
+
+
+def probe_add_table(module: LLVMModuleRef, i64_type: LLVMTypeRef, name: cstr, values: darray[u64]&, is_constant: bool, linkage: u32) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    array_type: LLVMTypeRef = LLVMArrayType(i64_type, values.count.u32())
+    elements: mutable darray[LLVMValueRef] = []
+    for index in 0..<values.count |values, elements|:
+        elements.push(LLVMConstInt(i64_type, values[index], 0))
+    elements_pointer: void& = (&elements[0]).cast[void&] can Unsafe.PointerCast
+    initializer: LLVMValueRef = LLVMConstArray2(i64_type, elements_pointer, elements.count.u64())
+    global_value: LLVMValueRef = LLVMAddGlobal(module, array_type, name)
+    LLVMSetInitializer(global_value, initializer)
+    LLVMSetLinkage(global_value, linkage)
+    LLVMSetGlobalConstant(global_value, 1 if is_constant else 0)
+    global_value
+
+
+def probe_add_compare(builder: LLVMBuilderRef, module: LLVMModuleRef, ctx: LLVMContextRef, i64_type: LLVMTypeRef, bool_type: LLVMTypeRef, global_value: LLVMValueRef, source_type: LLVMTypeRef, predicate: i32, bound: u64, name: cstr, byte_offset: bool) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    parameter_types: mutable darray[LLVMTypeRef] = [i64_type]
+    parameter_types_pointer: void& = (&parameter_types[0]).cast[void&] can Unsafe.PointerCast
+    function_type: LLVMTypeRef = LLVMFunctionType(bool_type, parameter_types_pointer, 1, 0)
+    function: LLVMValueRef = LLVMAddFunction(module, name, function_type)
+    block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "entry")
+    LLVMPositionBuilderAtEnd(builder, block)
+    pointer_indices: mutable darray[LLVMValueRef] = []
+    if byte_offset:
+        pointer_indices.push(LLVMConstInt(i64_type, 1, 0))
+    else:
+        pointer_indices.push(LLVMConstInt(i64_type, 0, 0))
+        pointer_indices.push(LLVMGetParam(function, 0))
+    indices_pointer: void& = (&pointer_indices[0]).cast[void&] can Unsafe.PointerCast
+    pointer: LLVMValueRef = LLVMBuildGEP2(builder, source_type, global_value, indices_pointer, pointer_indices.count.u32(), "element.ptr")
+    loaded: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, pointer, "element")
+    comparison: LLVMValueRef = LLVMBuildICmp(builder, predicate, loaded, LLVMConstInt(i64_type, bound, 0), "range.check")
+    LLVMBuildRet(builder, comparison)
+
+
+
+# Create a byte GEP with a dynamic index, optionally followed by a constant GEP.
+# With an unscaled index this must be declined even if the return is unused elsewhere.
+def probe_dynamic_byte_gep(builder: LLVMBuilderRef, module: LLVMModuleRef, context: LLVMContextRef, i64_type: LLVMTypeRef, bool_type: LLVMTypeRef, global_value: LLVMValueRef, name: cstr) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    params: mutable darray[LLVMTypeRef] = [i64_type]
+    params_ptr: void& = (&params[0]).cast[void&] can Unsafe.PointerCast
+    fn_type: LLVMTypeRef = LLVMFunctionType(bool_type, params_ptr, 1, 0)
+    function: LLVMValueRef = LLVMAddFunction(module, name, fn_type)
+    block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, function, "entry")
+    LLVMPositionBuilderAtEnd(builder, block)
+    byte_type: LLVMTypeRef = LLVMInt8TypeInContext(context)
+    indices: mutable darray[LLVMValueRef] = [LLVMGetParam(function, 0)]
+    indices_ptr: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+    ptr: LLVMValueRef = LLVMBuildGEP2(builder, byte_type, global_value, indices_ptr, 1, "byte.ptr")
+    loaded: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, ptr, "value")
+    comparison: LLVMValueRef = LLVMBuildICmp(builder, 36, loaded, LLVMConstInt(i64_type, 4, 0), "cmp")
+    LLVMBuildRet(builder, comparison)
+
+# GEP through an aligned i64 index followed by an unaligned byte displacement.
+def probe_nested_byte_gep(builder: LLVMBuilderRef, module: LLVMModuleRef, context: LLVMContextRef, i64_type: LLVMTypeRef, bool_type: LLVMTypeRef, global_value: LLVMValueRef, name: cstr, offset: i64) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+    params: mutable darray[LLVMTypeRef] = [i64_type]
+    params_ptr: void& = (&params[0]).cast[void&] can Unsafe.PointerCast
+    fn_type: LLVMTypeRef = LLVMFunctionType(bool_type, params_ptr, 1, 0)
+    function: LLVMValueRef = LLVMAddFunction(module, name, fn_type)
+    block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, function, "entry")
+    LLVMPositionBuilderAtEnd(builder, block)
+    indices: mutable darray[LLVMValueRef] = [LLVMGetParam(function, 0)]
+    indices_ptr: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+    first: LLVMValueRef = LLVMBuildGEP2(builder, i64_type, global_value, indices_ptr, 1, "word.ptr")
+    offsets: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, offset.u64(), 0)]
+    offsets_ptr: void& = (&offsets[0]).cast[void&] can Unsafe.PointerCast
+    ptr: LLVMValueRef = LLVMBuildGEP2(builder, LLVMInt8TypeInContext(context), first, offsets_ptr, 1, "offset.ptr")
+    loaded: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, ptr, "value")
+    comparison: LLVMValueRef = LLVMBuildICmp(builder, 36, loaded, LLVMConstInt(i64_type, 4, 0), "cmp")
+    LLVMBuildRet(builder, comparison)
+
+
+def probe_expect_case(case: RangeProbeCase) -> bool:
+    result: LLVMValueRef = LLVMGetOperand(case.ret_instruction, 0)
+    if case.should_fold:
+        return false if LLVMIsAConstantInt(result) == null
+        return LLVMConstIntGetZExtValue(result) == case.expected_value
+    return false if LLVMIsAInstruction(result) == null
+    LLVMGetInstructionOpcode(result) == 42
+
+
+def main() -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Global.Read]:
+    context: LLVMContextRef = LLVMContextCreate()
+    module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("const.global.range.probe", context)
+    layout: cstr = "e-p:64:64:64:64-i64:64-n8:16:32:64-S128"
+    LLVMSetDataLayout(module, layout)
+    builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+    i64_type: LLVMTypeRef = LLVMInt64TypeInContext(context)
+    bool_type: LLVMTypeRef = LLVMInt1TypeInContext(context)
+
+    small_values: mutable darray[u64] = [0, 1, 2, 3]
+    mixed_values: mutable darray[u64] = [0, 7, 11, 20]
+    sparse_values: mutable darray[u64] = [0, 2, 3, 8]
+    signed_values: mutable darray[u64] = [18446744073709551606, 18446744073709551611, 5, 10]
+    small: LLVMValueRef = probe_add_table(module, i64_type, "small", small_values, true, 8) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    mixed: LLVMValueRef = probe_add_table(module, i64_type, "mixed", mixed_values, true, 8) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    sparse: LLVMValueRef = probe_add_table(module, i64_type, "sparse", sparse_values, true, 8) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    signed: LLVMValueRef = probe_add_table(module, i64_type, "signed", signed_values, true, 9) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    mutable_table: LLVMValueRef = probe_add_table(module, i64_type, "mutable", small_values, false, 8) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    external_const: LLVMValueRef = probe_add_table(module, i64_type, "external.const", small_values, true, 0) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    array_type: LLVMTypeRef = LLVMArrayType(i64_type, 4)
+    byte_type: LLVMTypeRef = LLVMInt8TypeInContext(context)
+
+    cases: mutable darray[RangeProbeCase] = []
+    ret: mutable LLVMValueRef = probe_add_compare(builder, module, context, i64_type, bool_type, small, array_type, 36, 4, "small.lt.four", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 1})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, small, array_type, 34, 4, "small.gt.four", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 0})
+    # Constant-left reversed predicate exercises UGT -> ULT predicate swapping.
+    # This one is generated manually to keep the helper's bounds in the RHS position.
+    reversed_parameters: mutable darray[LLVMTypeRef] = [i64_type]
+    reversed_parameters_pointer: void& = (&reversed_parameters[0]).cast[void&] can Unsafe.PointerCast
+    reversed_type: LLVMTypeRef = LLVMFunctionType(bool_type, reversed_parameters_pointer, 1, 0)
+    reversed_fn: LLVMValueRef = LLVMAddFunction(module, "reversed.small", reversed_type)
+    reversed_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, reversed_fn, "entry")
+    LLVMPositionBuilderAtEnd(builder, reversed_block)
+    reversed_indices: mutable darray[LLVMValueRef] = [LLVMConstInt(i64_type, 0, 0), LLVMGetParam(reversed_fn, 0)]
+    reversed_indices_pointer: void& = (&reversed_indices[0]).cast[void&] can Unsafe.PointerCast
+    reversed_ptr: LLVMValueRef = LLVMBuildGEP2(builder, array_type, small, reversed_indices_pointer, 2, "reversed.ptr")
+    reversed_load: LLVMValueRef = LLVMBuildLoad2(builder, i64_type, reversed_ptr, "reversed.load")
+    reversed_cmp: LLVMValueRef = LLVMBuildICmp(builder, 34, LLVMConstInt(i64_type, 16, 0), reversed_load, "reversed.cmp")
+    ret <- LLVMBuildRet(builder, reversed_cmp)
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 1})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, signed, array_type, 40, 20, "signed.lt.twenty", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 1})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, mixed, array_type, 36, 10, "mixed.lt.ten", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, sparse, array_type, 32, 3, "sparse.eq.three", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, mutable_table, array_type, 36, 4, "mutable.lt.four", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, external_const, array_type, 36, 4, "external.lt.four", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, small, byte_type, 36, 100, "unaligned.byte.offset", true) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+
+    # Boundary decisions: singleton equality, unsigned extrema, and signed extrema.
+    singleton_values: mutable darray[u64] = [18446744073709551615, 18446744073709551615]
+    singleton: LLVMValueRef = probe_add_table(module, i64_type, "singleton", singleton_values, true, 8) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    singleton_type: LLVMTypeRef = LLVMArrayType(i64_type, 2)
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, singleton, singleton_type, 32, 18446744073709551615, "singleton.eq.max", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 1})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, singleton, singleton_type, 33, 18446744073709551615, "singleton.ne.max", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 0})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, singleton, singleton_type, 37, 18446744073709551615, "singleton.ule.max", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 1})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, signed, array_type, 39, 18446744073709551606, "signed.ge.min", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 1})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, signed, array_type, 40, 18446744073709551606, "signed.lt.min", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 0})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, signed, array_type, 38, 0, "signed.straddles.zero", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+
+    ret <- probe_dynamic_byte_gep(builder, module, context, i64_type, bool_type, small, "dynamic.byte.gep") can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+    ret <- probe_nested_byte_gep(builder, module, context, i64_type, bool_type, small, "nested.misaligned", 1) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+    # For an unknown narrow pointer-index width, a multiple-of-eight displacement
+    # remains aligned even if index arithmetic wraps.
+    ret <- probe_nested_byte_gep(builder, module, context, i64_type, bool_type, small, "nested.aligned", 8) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: true, expected_value: 1})
+
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, small, array_type, 36, 4, "volatile.load", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    volatile_cmp: LLVMValueRef = LLVMGetOperand(ret, 0)
+    LLVMSetVolatile(LLVMGetOperand(volatile_cmp, 0), 1)
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+    ret <- probe_add_compare(builder, module, context, i64_type, bool_type, small, array_type, 36, 4, "nowrap.gep", false) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    nowrap_cmp: LLVMValueRef = LLVMGetOperand(ret, 0)
+    nowrap_load: LLVMValueRef = LLVMGetOperand(nowrap_cmp, 0)
+    LLVMGEPSetNoWrapFlags(LLVMGetOperand(nowrap_load, 0), 4)
+    cases.push(RangeProbeCase{ret_instruction: ret, should_fold: false, expected_value: 0})
+
+    changed: usize = Backend::fold_constant_global_ranges(module, context) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]
+    return 91 if LLVMVerifyModule(module, 2, null) != 0
+    for index in 0..<cases.count |cases|:
+        return (100 + index.u64()).i64() if not probe_expect_case(cases[index])
+    return 90 if changed != 10
+
+    # Exercise unusual eight-bit GEP index arithmetic. A 256-byte offset wraps
+    # to zero, while a one-byte offset must still be declined.
+    narrow_module: LLVMModuleRef = LLVMModuleCreateWithNameInContext("narrow.index.probe", context)
+    LLVMSetDataLayout(narrow_module, "e-p:64:64:64:8-i64:64")
+    narrow_table: LLVMValueRef = probe_add_table(narrow_module, i64_type, "narrow.table", small_values, true, 8) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    narrow_bad: LLVMValueRef = probe_nested_byte_gep(builder, narrow_module, context, i64_type, bool_type, narrow_table, "narrow.one", 1) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    narrow_good: LLVMValueRef = probe_nested_byte_gep(builder, narrow_module, context, i64_type, bool_type, narrow_table, "narrow.wrapped", 256) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+    narrow_changed: usize = Backend::fold_constant_global_ranges(narrow_module, context) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]
+    return 92 if LLVMVerifyModule(narrow_module, 1, null) != 0
+    return 93 if narrow_changed != 1
+    return 94 if not probe_expect_case(RangeProbeCase{ret_instruction: narrow_bad, should_fold: false, expected_value: 0})
+    return 95 if not probe_expect_case(RangeProbeCase{ret_instruction: narrow_good, should_fold: true, expected_value: 1})
+    LLVMDisposeModule(narrow_module)
+
+    LLVMDisposeBuilder(builder)
+    LLVMDisposeModule(module)
+    LLVMContextDispose(context)
+    0
