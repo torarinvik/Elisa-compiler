@@ -2117,3 +2117,27 @@ this timing exercise did not link or run either full self-host object. The
 first contract-edit compile exceeds the 3-second target, so contract invalidation
 and code generation remain optimization work. Exact object replay is qualified
 only for the tested O0 command; O3 and broader edit classes remain open.
+
+## Self-host lexer token reservation (2026-10-28)
+
+Core commit `ab140d584154` changes `sourceTokenCapacityDivisor` from 5 to 7 for
+fresh source tokenization. Two Go allocation profiles each tokenized the same
+Stage1 `src/driver/elisac.elisa` body-edit input exactly once. The flat
+`alloc_space` attributed to the initial token-slice allocation fell from
+516.04 MB to 368.60 MB (147.44 MB, 28.6%). The old and new Core CLI binary
+SHA-256 values were respectively
+`0c530734b732164dc7e8ce18efcd47a8c45cd0cf97e816a634b94b972d6cf79c` and
+`ec79663dc989d7ff606a2ce96435a5f768227aacea6c240f6145086d020fc9ea`. The lexer
+package tests passed.
+
+The new binary completed a full O0 self-host object compile with the retained
+server disabled and disk state enabled. The emitted object matched the previous
+binary byte-for-byte (SHA-256
+`d033c45a0479dfbbf211d3277a4c8b46ab816aeda4a9ebd326110344da34382b`); all
+29,468 diagnostic lines also matched exactly, with zero errors. Because the new
+compiler identity required analysis-state bootstrap, that qualification resumed
+from disk checkpoints; it does not establish a one-shot cold-build time below
+30 seconds. A subsequent fresh-process warm body edit took 5.487 seconds
+(analysis restore 1.130 seconds, update 0.737 seconds, partitioned backend
+3.066 seconds). This is not a latency improvement claim; the 2-second body-edit
+target remains unmet.
