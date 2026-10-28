@@ -1,0 +1,378 @@
+# Experimental bounded table-driven loop unrolling; isolated prototype only.
+# LLVM decides transformation legality. No soundness fact is derived from the
+# heuristic: the latter only decides whether to ask LLVM to unroll a loop.
+extern LLVMIsAFunction(value: LLVMValueRef) -> LLVMValueRef?
+extern LLVMGetIntrinsicID(function: LLVMValueRef) -> u32
+extern LLVMConsumeError(error_value: void&) -> void
+extern LLVMGetNumSuccessors(inst: LLVMValueRef) -> u32
+extern LLVMGetSuccessor(inst: LLVMValueRef, index: u32) -> LLVMBasicBlockRef
+extern LLVMGetCondition(inst: LLVMValueRef) -> LLVMValueRef
+extern LLVMCountIncoming(phi: LLVMValueRef) -> u32
+extern LLVMGetIncomingValue(phi: LLVMValueRef, index: u32) -> LLVMValueRef
+extern LLVMGetIncomingBlock(phi: LLVMValueRef, index: u32) -> LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        def tu_const_u64(value: LLVMValueRef) -> u64?:
+            return null if LLVMIsAConstantInt(value) == null
+            ty: LLVMTypeRef = LLVMTypeOf(value)
+            return null if LLVMGetTypeKind(ty) != 8 or LLVMGetIntTypeWidth(ty) > 64
+            LLVMConstIntGetZExtValue(value)
+
+        # Used only as a profitability filter; LLVM retains responsibility for all
+        # transformations and no range, alias, or dereferenceability facts are added.
+        def tu_const_global_root(pointer: LLVMValueRef) -> bool:
+            current: mutable LLVMValueRef = pointer
+            for depth in 0..<8 |current|:
+                if LLVMIsAGlobalVariable(current) != null:
+                    linkage: u32 = LLVMGetLinkage(current)
+                    return false if linkage != 8 and linkage != 9
+                    return false if LLVMIsDeclaration(current) != 0 or LLVMIsGlobalConstant(current) == 0
+                    return false if LLVMIsExternallyInitialized(current) != 0
+                    return true
+                return false if LLVMIsAInstruction(current) == null or LLVMGetInstructionOpcode(current) != 29
+                current <- LLVMGetOperand(current, 0)
+            false
+
+        def tu_function_eligible(function: LLVMValueRef, budget: mutable ZFBudget&) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return false if (zf_function_has_debug(function, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            loads: mutable usize = 0
+            count: mutable usize = 0
+            while block_opt is block |block_opt, loads, count|:
+                inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while inst_opt is inst |inst_opt, loads, count|:
+                    count <- count + 1
+                    return false if count > 8192 or LLVMHasMetadata(inst) != 0
+                    opcode: u32 = LLVMGetInstructionOpcode(inst)
+                    return false if opcode == 55 or opcode == 56 or opcode == 57
+                    if opcode == 27 or opcode == 28:
+                        return false if LLVMGetVolatile(inst) != 0 or LLVMGetOrdering(inst) != 0
+                    if opcode == 27:
+                        loads <- loads + 1 if tu_const_global_root(LLVMGetOperand(inst, 0))
+                    inst_opt <- LLVMGetNextInstruction(inst)
+                block_opt <- LLVMGetNextBasicBlock(block)
+            loads >= 4
+
+        def tu_depends(value: LLVMValueRef, counter: LLVMValueRef, depth: usize, work: mutable usize&) -> bool:
+            return false if work == 0
+            work <- work - 1
+            return true if value == counter
+            return false if depth >= 12 or LLVMIsAInstruction(value) == null
+            count: u32 = LLVMGetNumOperands(value)
+            return false if count > 4
+            for index in 0..<count |value, counter, depth, work|:
+                return true if tu_depends(LLVMGetOperand(value, index), counter, depth + 1, work)
+            false
+
+        # The only calls accepted in a candidate loop are the pure i64 funnel
+        # shift intrinsic. Unknown calls and side effects remain untouched.
+        def tu_pure_call(inst: LLVMValueRef) -> bool can[Unsafe.PointerArithmetic]:
+            callee: LLVMValueRef = LLVMGetCalledValue(inst)
+            return false if LLVMIsAFunction(callee) == null or LLVMGetIntrinsicID(callee) == 0
+            name_length: mutable usize = 0
+            name: u8& = LLVMGetValueName2(callee, &name_length)
+            return false if name_length != 13
+            expected: sview = "llvm.fshl.i64"
+            for index in 0..<name_length |name, expected|:
+                letter: u8& = name + index
+                return false if letter != expected[index]
+            true
+
+        # Find a strict linear loop path through unconditional or constant branches.
+        # The profitability filter proves the bounded source pattern only; the LLVM
+        # unroller itself remains responsible for transformation legality.
+        def tu_loop_growth(header: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, branch: LLVMValueRef) -> usize can[Unsafe.PointerArithmetic]:
+            return 0 if LLVMGetNumSuccessors(branch) != 2 or LLVMGetSuccessor(branch, 0) == header or LLVMGetSuccessor(branch, 1) != header
+            cmp: LLVMValueRef = LLVMGetCondition(branch)
+            return 0 if LLVMIsAInstruction(cmp) == null or LLVMGetInstructionOpcode(cmp) != 42 or LLVMGetICmpPredicate(cmp) != 32
+            next: LLVMValueRef = LLVMGetOperand(cmp, 0)
+            trip: mutable u64 = 0
+            if tu_const_u64(LLVMGetOperand(cmp, 1)) is n:
+                trip <- n
+            else:
+                return 0
+            return 0 if trip < 2 or trip > 16
+            return 0 if LLVMIsAInstruction(next) == null or LLVMGetInstructionOpcode(next) != 8
+            counter: LLVMValueRef = LLVMGetOperand(next, 0)
+            if tu_const_u64(LLVMGetOperand(next, 1)) is step:
+                return 0 if step != 1
+            else:
+                return 0
+            return 0 if LLVMIsAInstruction(counter) == null or LLVMGetInstructionOpcode(counter) != 44
+            return 0 if LLVMGetInstructionParent(counter) != header or LLVMGetInstructionParent(next) != latch
+            return 0 if LLVMCountIncoming(counter) != 2
+            incoming0: LLVMValueRef = LLVMGetIncomingValue(counter, 0)
+            incoming1: LLVMValueRef = LLVMGetIncomingValue(counter, 1)
+            block0: LLVMBasicBlockRef = LLVMGetIncomingBlock(counter, 0)
+            block1: LLVMBasicBlockRef = LLVMGetIncomingBlock(counter, 1)
+            initial: mutable LLVMValueRef = incoming0
+            if block0 == latch:
+                return 0 if incoming0 != next or block1 == latch
+                initial <- incoming1
+            elif block1 == latch:
+                return 0 if incoming1 != next
+            else:
+                return 0
+            if tu_const_u64(initial) is start:
+                return 0 if start != 0
+            else:
+                return 0
+            instructions: mutable usize = 0
+            loads: mutable usize = 0
+            block: mutable LLVMBasicBlockRef = header
+            for path_index in 0..<128 |block, instructions, loads, latch, counter|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is inst |cursor, instructions, loads, counter|:
+                    instructions <- instructions + 1
+                    return 0 if instructions > 400 or LLVMHasMetadata(inst) != 0
+                    opcode: u32 = LLVMGetInstructionOpcode(inst)
+                    return 0 if opcode == 45 and not (tu_pure_call(inst) can Unsafe.PointerArithmetic)
+                    if opcode == 27 and LLVMGetVolatile(inst) == 0 and LLVMGetOrdering(inst) == 0:
+                        pointer: LLVMValueRef = LLVMGetOperand(inst, 0)
+                        dependency_work: mutable usize = 256
+                        loads <- loads + 1 if tu_const_global_root(pointer) and tu_depends(pointer, counter, 0, dependency_work)
+                    cursor <- LLVMGetNextInstruction(inst)
+                if block == latch:
+                    return 0 if loads < 4
+                    growth: usize = instructions * trip.usize()
+                    return growth if growth <= 5000
+                    return 0
+                if LLVMGetBasicBlockTerminator(block) is term:
+                    op: u32 = LLVMGetInstructionOpcode(term)
+                    if op == 70 and LLVMGetNumSuccessors(term) == 1:
+                        block <- LLVMGetSuccessor(term, 0)
+                    elif op == 71 and LLVMGetNumSuccessors(term) == 2:
+                        if tu_const_u64(LLVMGetCondition(term)) is cond:
+                            block <- LLVMGetSuccessor(term, 0 if cond != 0 else 1)
+                        else:
+                            return 0
+                    else:
+                        return 0
+                else:
+                    return 0
+            0
+
+        def tu_count_function(function: LLVMValueRef) -> usize:
+            count: mutable usize = 0
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_opt is block |block_opt, count|:
+                inst_opt: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while inst_opt is inst |inst_opt, count|:
+                    count <- count + 1
+                    return 200001 if count > 16384
+                    inst_opt <- LLVMGetNextInstruction(inst)
+                block_opt <- LLVMGetNextBasicBlock(block)
+            count
+
+        def tu_find_function(module: LLVMModuleRef, index: usize) -> LLVMValueRef?:
+            current: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            seen: mutable usize = 0
+            while current is function |current, seen, index|:
+                return function if seen == index
+                seen <- seen + 1
+                current <- LLVMGetNextFunction(function)
+            null
+
+        def tu_find_block(function: LLVMValueRef, index: usize) -> LLVMBasicBlockRef?:
+            current: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            seen: mutable usize = 0
+            while current is block |current, seen, index|:
+                return block if seen == index
+                seen <- seen + 1
+                current <- LLVMGetNextBasicBlock(block)
+            null
+
+        def tu_tag(branch: LLVMValueRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name: LLVMMetadataRef = LLVMMDStringInContext2(ctx, "llvm.loop.unroll.full", 21)
+            operands: mutable darray[LLVMMetadataRef] = [name]
+            ptr: void& = (&operands[0]).cast[void&] can Unsafe.PointerCast
+            hint: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, ptr, 1)
+            temporary: LLVMMetadataRef = LLVMTemporaryMDNode(ctx, null, 0)
+            loop_ops: mutable darray[LLVMMetadataRef] = [temporary, hint]
+            loop_ptr: void& = (&loop_ops[0]).cast[void&] can Unsafe.PointerCast
+            loop_id: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, loop_ptr, 2)
+            LLVMMetadataReplaceAllUsesWith(temporary, loop_id)
+            LLVMSetMetadata(branch, LLVMGetMDKindIDInContext(ctx, "llvm.loop", 9), LLVMMetadataAsValue(ctx, loop_id))
+
+        def tu_run_function(pass_fn: void&, function: LLVMValueRef, machine: void&?, pipeline: cstr) -> bool can[Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            opts: LLVMPassBuilderOptionsRef = LLVMCreatePassBuilderOptions()
+            pass_error: void&? = pass_fn.call_as[fn(LLVMValueRef, cstr, void&?, LLVMPassBuilderOptionsRef) -> void&?](function, pipeline, machine, opts) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]
+            LLVMDisposePassBuilderOptions(opts)
+            if pass_error is failure:
+                LLVMConsumeError(failure)
+                return false
+            true
+
+        def tu_execute(module: LLVMModuleRef, ctx: LLVMContextRef, machine: void&?, debug_fn: void&, pass_fn: void&, trial_attempts: mutable usize&, eligibility_checks: mutable usize&, graph_work: mutable usize&) -> i32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            # Cloning a very large module for an optional profitability trial is
+            # counterproductive. Bound the entire scan and decline large modules.
+            scan_function: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            scan_count: mutable usize = 0
+            while scan_function is scanned |scan_function, scan_count|:
+                scan_count <- scan_count + tu_count_function(scanned)
+                return 0 if scan_count > 8192
+                scan_function <- LLVMGetNextFunction(scanned)
+            budget: mutable ZFBudget = ZFBudget{work: 1048576, debug_fn: debug_fn, debug_kind: LLVMGetMDKindIDInContext(ctx, "dbg", 3)}
+            function_opt: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            function_index: mutable usize = 0
+            candidates: mutable usize = 0
+            growth_total: mutable usize = 0
+            while function_opt is function |function_opt, function_index, budget, candidates, growth_total, pass_fn, machine, ctx, module, trial_attempts, eligibility_checks, graph_work|:
+                next: LLVMValueRef? = LLVMGetNextFunction(function)
+                if (tu_function_eligible(function, budget) can[Unsafe.PointerCast, Unsafe.PointerArithmetic]):
+                    block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                    block_index: mutable usize = 0
+                    while block_opt is block |block_opt, block_index, function_index, candidates, growth_total, pass_fn, machine, ctx, module, function, trial_attempts, eligibility_checks, graph_work|:
+                        if LLVMGetBasicBlockTerminator(block) is branch:
+                            if LLVMGetInstructionOpcode(branch) == 71 and LLVMGetNumSuccessors(branch) == 2:
+                                return 1 if eligibility_checks >= 64 and candidates > 0
+                                return 0 if eligibility_checks >= 64
+                                eligibility_checks <- eligibility_checks + 1
+                                header: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+                                growth: usize = tu_loop_growth(header, block, branch) can Unsafe.PointerArithmetic
+                                if growth > 0 and trial_attempts < 4 and growth_total + growth <= 8192 and (tu_acyclic(function, block, header, true, graph_work) can[Abort.Panic, Memory.Allocate]):
+                                    # Trial on a clone first: only commit a transformation whose
+                                    # actual growth fits the budget, leaving misses untouched.
+                                    trial_attempts <- trial_attempts + 1
+                                    clone: LLVMModuleRef = LLVMCloneModule(module)
+                                    original_count: usize = tu_count_function(function)
+                                    accepted: mutable bool = false
+                                    if tu_find_function(clone, function_index) is trial:
+                                        if tu_find_block(trial, block_index) is trial_block:
+                                            if LLVMGetBasicBlockTerminator(trial_block) is trial_branch:
+                                                tu_tag(trial_branch, ctx) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+                                                trial_ok: bool = tu_run_function(pass_fn, trial, machine, "simplifycfg,loop-unroll,instcombine,simplifycfg") can[Unsafe.PointerCast, Unsafe.PointerArithmetic]
+                                                trial_count: usize = tu_count_function(trial)
+                                                if LLVMGetFirstBasicBlock(trial) is surviving_block:
+                                                    trial_graph_work: mutable usize = 200000
+                                                    accepted <- trial_ok and (tu_acyclic(trial, surviving_block, surviving_block, false, trial_graph_work) can[Abort.Panic, Memory.Allocate]) and trial_count <= original_count + growth and trial_count <= original_count + 8192 - growth_total
+                                    LLVMDisposeModule(clone)
+                                    if accepted:
+                                        tu_tag(branch, ctx) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]
+                                        return 2 if not (tu_run_function(pass_fn, function, machine, "simplifycfg,loop-unroll,instcombine,simplifycfg") can[Unsafe.PointerCast, Unsafe.PointerArithmetic])
+                                        final_count: usize = tu_count_function(function)
+                                        return 2 if final_count > original_count + growth or final_count > original_count + 8192 - growth_total
+                                        if LLVMGetFirstBasicBlock(function) is final_block:
+                                            actual_graph_work: mutable usize = 200000
+                                            return 2 if not (tu_acyclic(function, final_block, final_block, false, actual_graph_work) can[Abort.Panic, Memory.Allocate])
+                                        else:
+                                            return 2
+                                        candidates <- candidates + 1
+                                        growth_total <- growth_total + growth
+                                        # The function pass mutates CFG; do not continue iterating
+                                        # stale blocks and conservatively process at most one loop.
+                                        break
+                        block_index <- block_index + 1
+                        block_opt <- LLVMGetNextBasicBlock(block)
+                function_index <- function_index + 1
+                function_opt <- next
+            1 if candidates > 0 else 0
+
+        def tu_block_index(blocks: darray[LLVMBasicBlockRef]&, target: LLVMBasicBlockRef, work: mutable usize&) -> usize?:
+            for index in 0..<blocks.count |blocks, target, work|:
+                return null if work == 0
+                work <- work - 1
+                return index if blocks[index] == target
+            null
+
+        # Kahn's algorithm rejects all cycles, including unreachable ones. Before
+        # trial, ignore precisely the selected latch->header edge: a pass means
+        # it was the function's only cycle. After trial, no edge is ignored.
+        def tu_acyclic(function: LLVMValueRef, latch: LLVMBasicBlockRef, header: LLVMBasicBlockRef, ignore_edge: bool, work: mutable usize&) -> bool can[Abort.Panic, Memory.Allocate]:
+            blocks: mutable darray[LLVMBasicBlockRef] = []
+            degrees: mutable darray[usize] = []
+            removed: mutable darray[bool] = []
+            block_opt: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_opt is block |block_opt, blocks, degrees, removed, work|:
+                return false if work == 0 or blocks.count >= 256
+                work <- work - 1
+                blocks.push(block)
+                degrees.push(0)
+                removed.push(false)
+                block_opt <- LLVMGetNextBasicBlock(block)
+            for index in 0..<blocks.count |blocks, degrees, latch, header, ignore_edge, work|:
+                return false if work == 0
+                work <- work - 1
+                source: LLVMBasicBlockRef = blocks[index]
+                if LLVMGetBasicBlockTerminator(source) is term:
+                    successors: u32 = LLVMGetNumSuccessors(term)
+                    return false if successors > 2
+                    for successor_index in 0..<successors |blocks, degrees, latch, header, ignore_edge, source, term, work|:
+                        return false if work == 0
+                        work <- work - 1
+                        destination: LLVMBasicBlockRef = LLVMGetSuccessor(term, successor_index)
+                        if ignore_edge and source == latch and destination == header:
+                            continue
+                        if tu_block_index(blocks, destination, work) is target_index:
+                            degrees[target_index] <- degrees[target_index] + 1
+                        else:
+                            return false
+                else:
+                    return false
+            remaining: mutable usize = blocks.count
+            for round in 0..<blocks.count |blocks, degrees, removed, remaining, latch, header, ignore_edge, work|:
+                return false if work == 0
+                work <- work - 1
+                progress: mutable bool = false
+                for index in 0..<blocks.count |blocks, degrees, removed, remaining, progress, latch, header, ignore_edge, work|:
+                    return false if work == 0
+                    work <- work - 1
+                    if not removed[index] and degrees[index] == 0:
+                        removed[index] <- true
+                        remaining <- remaining - 1
+                        progress <- true
+                        source: LLVMBasicBlockRef = blocks[index]
+                        if LLVMGetBasicBlockTerminator(source) is term:
+                            for successor_index in 0..<LLVMGetNumSuccessors(term) |blocks, degrees, latch, header, ignore_edge, source, term, work|:
+                                return false if work == 0
+                                work <- work - 1
+                                destination: LLVMBasicBlockRef = LLVMGetSuccessor(term, successor_index)
+                                if ignore_edge and source == latch and destination == header:
+                                    continue
+                                if tu_block_index(blocks, destination, work) is target_index:
+                                    return false if degrees[target_index] == 0
+                                    degrees[target_index] <- degrees[target_index] - 1
+                                else:
+                                    return false
+                        else:
+                            return false
+                return true if remaining == 0
+                return false if not progress
+            remaining == 0
+
+        static if ELISA_TARGET_OS_POSIX:
+            def tu_platform(module: LLVMModuleRef, ctx: LLVMContextRef, machine: void&?, trial_attempts: mutable usize&, eligibility_checks: mutable usize&, graph_work: mutable usize&) -> i32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]:
+                return 0 if LLVMGetNamedFunction(module, "llvm.dbg.value") != null or LLVMGetNamedFunction(module, "llvm.dbg.declare") != null or LLVMGetNamedFunction(module, "llvm.dbg.assign") != null
+                direct_anchor: void& = LLVMContextCreate.cast[void&] can Unsafe.PointerCast
+                if artifact_identity_dlopen(null, 2) is handle:
+                    defer block:
+                        _ = artifact_identity_dlclose(handle)
+                    if artifact_identity_dlsym(handle, "LLVMContextCreate") is llvm_base:
+                        return 0 if not (split_same_llvm_image(direct_anchor, llvm_base) can Global.Read)
+                        if artifact_identity_dlsym(handle, "LLVMGetVersion") is version_fn:
+                            return 0 if not (split_same_llvm_image(llvm_base, version_fn) can Global.Read)
+                            direct_version: void& = LLVMGetVersion.cast[void&] can Unsafe.PointerCast
+                            return 0 if not (split_same_llvm_image(llvm_base, direct_version) can Global.Read)
+                            major: mutable u32 = 0
+                            minor: mutable u32 = 0
+                            patch: mutable u32 = 0
+                            LLVMGetVersion(&major, &minor, &patch)
+                            return 0 if major != 23
+                            if artifact_identity_dlsym(handle, "LLVMGetFirstDbgRecord") is debug_fn:
+                                if artifact_identity_dlsym(handle, "LLVMRunPassesOnFunction") is pass_fn:
+                                    return 0 if not (split_same_llvm_image(llvm_base, debug_fn) can Global.Read)
+                                    return 0 if not (split_same_llvm_image(llvm_base, pass_fn) can Global.Read)
+                                    return tu_execute(module, ctx, machine, debug_fn, pass_fn, trial_attempts, eligibility_checks, graph_work) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]
+                0
+        static else:
+            def tu_platform(module: LLVMModuleRef, ctx: LLVMContextRef, machine: void&?, trial_attempts: mutable usize&, eligibility_checks: mutable usize&, graph_work: mutable usize&) -> i32:
+                0
+
+    public:
+        def experimental_table_unroll(module: LLVMModuleRef, ctx: LLVMContextRef, machine: void&?) -> i32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]:
+            trial_attempts: mutable usize = 0
+            eligibility_checks: mutable usize = 0
+            graph_work: mutable usize = 200000
+            can Global.Read:
+                return tu_platform(module, ctx, machine, trial_attempts, eligibility_checks, graph_work) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic, Global.Read]
