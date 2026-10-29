@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -109,6 +110,148 @@ class CacheIntegrityTest(unittest.TestCase):
         self.publish()
         self.assertTrue(cache.restore(self.entry, self.output, "key"))
         self.assertEqual(self.output.read_bytes(), self.source.read_bytes())
+
+    def test_restore_declines_symlink_output(self):
+        self.publish()
+        target = self.output.parent / "output-target.o"
+        target.write_bytes(b"previous valid output")
+        self.output.unlink()
+        self.output.symlink_to(target)
+        self.assertFalse(cache.restore(self.entry, self.output, "key"))
+        self.assertTrue(self.output.is_symlink())
+        self.assertEqual(target.read_bytes(), b"previous valid output")
+
+    def test_restore_declines_hardlinked_output(self):
+        self.publish()
+        alias = self.output.parent / "output-alias.o"
+        os.link(self.output, alias)
+        original_inode = self.output.stat().st_ino
+        self.assertFalse(cache.restore(self.entry, self.output, "key"))
+        self.assertEqual(self.output.stat().st_ino, original_inode)
+        self.assertEqual(alias.stat().st_ino, original_inode)
+        self.assertEqual(alias.read_bytes(), b"previous valid output")
+
+    def test_restore_does_not_create_missing_output_directories(self):
+        self.publish()
+        missing_output = self.output.parent / "missing" / "nested.o"
+        self.assertFalse(cache.restore(self.entry, missing_output, "key"))
+        self.assertFalse(missing_output.parent.exists())
+
+    def test_fifo_dependency_fingerprint_does_not_block(self):
+        fifo = self.source.parent / "dependency.fifo"
+        os.mkfifo(fifo)
+        script = "import sys; import stage1_object_cache as cache; cache.fingerprint(sys.argv[1])"
+        env = dict(os.environ, PYTHONPATH=str(Path(cache.__file__).parent))
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(fifo)],
+                env=env,
+                capture_output=True,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("fingerprinting a FIFO blocked instead of declining it")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_dependency_report_path_limit_is_checked_during_scan(self):
+        report = self.source.parent / "dependencies.txt"
+        report.write_bytes(b"source\n" * (cache.MAX_DEPENDENCIES + 1))
+        with self.assertRaisesRegex(ValueError, "path limit"):
+            cache.dependencies_from_output(report, self.source)
+
+    def test_dependency_report_rejects_multiple_trailing_newlines(self):
+        report = self.source.parent / "dependencies.txt"
+        report.write_bytes((str(self.source) + "\n\n").encode())
+        with self.assertRaisesRegex(ValueError, "empty path"):
+            cache.dependencies_from_output(report, self.source)
+
+    def test_copy_declines_source_replacement_during_read(self):
+        target = self.source.parent / "copy-target"
+        replacement = self.source.parent / "replacement.o"
+        target.write_bytes(b"")
+        original_read = os.read
+        changed = False
+
+        def replace_after_read(descriptor, maximum):
+            nonlocal changed
+            chunk = original_read(descriptor, maximum)
+            if chunk and not changed:
+                replacement.write_bytes(b"replacement" * 100)
+                os.replace(replacement, self.source)
+                changed = True
+            return chunk
+
+        with patch.object(cache.os, "read", side_effect=replace_after_read):
+            with self.assertRaisesRegex(OSError, "source changed"):
+                cache.copy_digest(self.source, target)
+
+    def test_copy_declines_replaced_staging_file_before_truncation(self):
+        target, identity = cache.temporary(self.source.parent / "copy-target")
+        target.unlink()
+        target.write_bytes(b"preserve this unrelated file")
+        with self.assertRaisesRegex(OSError, "staging file was replaced"):
+            cache.copy_digest(self.source, target, target_identity=identity)
+        self.assertEqual(target.read_bytes(), b"preserve this unrelated file")
+
+    def test_fifo_cached_object_does_not_block_restore(self):
+        self.entry.parent.mkdir(parents=True)
+        os.mkfifo(self.entry)
+        empty_stream = {"size": 0, "sha256": hashlib.sha256(b"").hexdigest()}
+        payload = {
+            "schema": cache.SCHEMA,
+            "key": "key",
+            "object": {
+                "size": len(self.source.read_bytes()),
+                "sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+                "mode": 0o644,
+            },
+            "streams": {"stdout": empty_stream, "stderr": empty_stream},
+        }
+        Path(str(self.entry) + ".json").write_text(json.dumps(payload))
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(cache.__file__)), "restore", str(self.entry), str(self.output), "key"],
+                capture_output=True,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("restoring a FIFO cache entry blocked instead of rejecting it")
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertEqual(self.output.read_bytes(), b"previous valid output")
+
+    def test_fifo_manifest_does_not_block_restore(self):
+        self.entry.parent.mkdir(parents=True)
+        os.mkfifo(Path(str(self.entry) + ".json"))
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(cache.__file__)), "restore", str(self.entry), str(self.output), "key"],
+                capture_output=True,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("reading a FIFO cache manifest blocked instead of rejecting it")
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertEqual(self.output.read_bytes(), b"previous valid output")
+
+    def test_fifo_diagnostic_stream_does_not_block_restore(self):
+        stdout = self.source.parent / "stdout"
+        stderr = self.source.parent / "stderr"
+        stdout.write_bytes(b"cached stdout\n")
+        stderr.write_bytes(b"cached stderr\n")
+        self.assertTrue(cache.publish(self.entry, self.source, "key", stdout, stderr))
+        cached_stderr = Path(str(self.entry) + ".stderr")
+        cached_stderr.unlink()
+        os.mkfifo(cached_stderr)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(cache.__file__)), "restore", str(self.entry), str(self.output), "key"],
+                capture_output=True,
+                timeout=2,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("reading a FIFO diagnostic stream blocked instead of rejecting it")
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertEqual(self.output.read_bytes(), b"previous valid output")
 
     def test_restore_preserves_cached_object_permissions(self):
         self.source.chmod(0o751)

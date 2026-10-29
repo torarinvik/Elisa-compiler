@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import sys
 import tempfile
@@ -17,21 +16,144 @@ MAX_DEPENDENCY_INDEX_BYTES = 16 * 1024**2
 MAX_DEPENDENCIES = 100_000
 
 
+def file_identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def inode_identity(info):
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode)
+
+
+def open_regular(path, flags=os.O_RDONLY):
+    """Open one regular file without following a swapped symlink or waiting on a FIFO."""
+    safe_flags = flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(os.fspath(path), safe_flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("cache input is not a regular file")
+        current = os.lstat(path)
+        if file_identity(before) != file_identity(current):
+            raise OSError("cache input changed while it was opened")
+        return descriptor, before
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def read_regular_file(path, maximum, expected_identity=None):
+    """Read a bounded, stable regular file with nonblocking, no-follow open semantics."""
+    descriptor, before = open_regular(path)
+    try:
+        if expected_identity is not None and inode_identity(before) != expected_identity:
+            raise OSError("cache staging file was replaced before it was read")
+        if maximum is not None and before.st_size > maximum:
+            raise ValueError("cache input exceeds its size limit")
+        data = bytearray()
+        while True:
+            remaining = (1 << 20) if maximum is None else min(
+                1 << 20, maximum + 1 - len(data)
+            )
+            if remaining <= 0:
+                raise ValueError("cache input exceeds its size limit")
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if maximum is not None and len(data) > maximum:
+                raise ValueError("cache input exceeds its size limit")
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            file_identity(before) != file_identity(after)
+            or file_identity(after) != file_identity(current)
+        ):
+            raise OSError("cache input changed while it was read")
+        if len(data) != after.st_size:
+            raise OSError("cache input size changed while it was read")
+        return bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def write_regular_file(path, data, expected_identity=None):
+    """Write a staging file without following or blocking on a replacement."""
+    descriptor, before = open_regular(path, os.O_WRONLY)
+    try:
+        if expected_identity is not None and inode_identity(before) != expected_identity:
+            raise OSError("cache metadata staging file was replaced")
+        os.ftruncate(descriptor, 0)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while staging cache metadata")
+            view = view[written:]
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            inode_identity(before) != inode_identity(after)
+            or file_identity(after) != file_identity(current)
+            or after.st_size != len(data)
+        ):
+            raise OSError("cache metadata staging file changed while it was written")
+    finally:
+        os.close(descriptor)
+
+
+def chmod_regular_file(path, mode, expected_identity):
+    """Change permissions only on the original staging inode."""
+    descriptor, before = open_regular(path)
+    try:
+        if inode_identity(before) != expected_identity:
+            raise OSError("cache staging file was replaced before chmod")
+        os.fchmod(descriptor, mode)
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or stat.S_IFMT(after.st_mode) != stat.S_IFMT(before.st_mode)
+            or file_identity(after) != file_identity(current)
+            or stat.S_IMODE(after.st_mode) != mode
+        ):
+            raise OSError("cache staging file changed while permissions were set")
+        return inode_identity(after)
+    finally:
+        os.close(descriptor)
+
+
+def require_staged_path(path, expected_identity):
+    current = os.lstat(path)
+    if not stat.S_ISREG(current.st_mode) or inode_identity(current) != expected_identity:
+        raise OSError("cache staging path was replaced before publication")
+
+
 def fingerprint(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError("dependency is not a regular file")
+    descriptor, before = open_regular(path)
+    try:
         size = 0
-        while chunk := stream.read(1024 * 1024):
+        while chunk := os.read(descriptor, 1024 * 1024):
             size += len(chunk)
             digest.update(chunk)
-        after = os.fstat(stream.fileno())
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-    if identity_before != identity_after or size != after.st_size:
-        raise OSError("dependency changed while it was being hashed")
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            file_identity(before) != file_identity(after)
+            or file_identity(after) != file_identity(current)
+            or size != after.st_size
+        ):
+            raise OSError("dependency changed while it was being hashed")
+    finally:
+        os.close(descriptor)
     # Keep stable identity alongside content. Cache keys use content alone, while
     # the separate postflight identity snapshot catches a file that changed during
     # compilation and was restored to identical bytes before publication.
@@ -60,9 +182,17 @@ def unchanged_fingerprint(path, previous):
         or any(character not in "0123456789abcdef" for character in digest)
     ):
         return None
-    info = Path(path).stat()
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("dependency is not a regular file")
+    descriptor, info = open_regular(path)
+    try:
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            file_identity(info) != file_identity(after)
+            or file_identity(after) != file_identity(current)
+        ):
+            raise OSError("dependency changed while its cached identity was checked")
+    finally:
+        os.close(descriptor)
     identity = {
         "device": info.st_dev,
         "inode": info.st_ino,
@@ -139,28 +269,33 @@ def write_dependency_manifest(index, manifest):
 
 
 def dependencies_from_output(path, root):
-    raw = Path(path).read_bytes()
-    if len(raw) > MAX_DEPENDENCY_INDEX_BYTES:
-        raise ValueError("dependency report exceeds its size limit")
+    raw = read_regular_file(path, MAX_DEPENDENCY_INDEX_BYTES)
     if raw.endswith(b"\n"):
         raw = raw[:-1]
+        if raw.endswith(b"\n"):
+            raise ValueError("dependency report contains an empty path")
     if not raw:
         raise ValueError("empty dependency report")
     # `-emit deps` emits one path per line. Reject ambiguous empty/interior lines.
-    spellings = [os.fsdecode(item) for item in raw.split(b"\n")]
-    if spellings[-1] == "":
-        spellings.pop()
-    if any(not spelling for spelling in spellings):
-        raise ValueError("dependency report contains an empty path")
+    spellings = []
+    start = 0
+    while start < len(raw):
+        newline = raw.find(b"\n", start)
+        end = len(raw) if newline < 0 else newline
+        if end == start:
+            raise ValueError("dependency report contains an empty path")
+        if len(spellings) >= MAX_DEPENDENCIES:
+            raise ValueError("dependency report exceeds its path limit")
+        spellings.append(os.fsdecode(raw[start:end]))
+        if newline < 0:
+            break
+        start = newline + 1
     return dependency_records(spellings, root)
 
 
 def read_dependencies(index, base_key, root):
     try:
-        with Path(index).open("rb") as stream:
-            raw = stream.read(MAX_DEPENDENCY_INDEX_BYTES + 1)
-        if len(raw) > MAX_DEPENDENCY_INDEX_BYTES:
-            return None
+        raw = read_regular_file(index, MAX_DEPENDENCY_INDEX_BYTES)
         manifest = json.loads(raw)
         if not isinstance(manifest, dict) or set(manifest) != {
             "schema", "base_key", "root", "dependencies", "graph_sha256", "identity_sha256"
@@ -170,6 +305,8 @@ def read_dependencies(index, base_key, root):
         if manifest["schema"] != DEPENDENCY_INDEX_SCHEMA or manifest["base_key"] != base_key:
             return None
         if manifest["root"] != expected_root or not isinstance(manifest["dependencies"], list):
+            return None
+        if len(manifest["dependencies"]) > MAX_DEPENDENCIES:
             return None
         paths = []
         previous_records = {}
@@ -217,7 +354,7 @@ def confirm_dependencies(snapshot, index, base_key, report, root):
     state = read_dependencies(snapshot, base_key, root)
     if state is None:
         return None
-    manifest = json.loads(Path(snapshot).read_bytes())
+    manifest = json.loads(read_regular_file(snapshot, MAX_DEPENDENCY_INDEX_BYTES))
     root_value, records = dependencies_from_output(report, root)
     if root_value != manifest["root"] or records != manifest["dependencies"]:
         return None
@@ -230,16 +367,47 @@ def confirm_dependencies(snapshot, index, base_key, report, root):
     return graph, identity
 
 
-def copy_digest(source, target, *, allow_empty=False, limit=None):
+def copy_digest(source, target, *, allow_empty=False, limit=None, target_identity=None):
     digest = hashlib.sha256()
     size = 0
-    with open(source, "rb") as src, open(target, "wb") as dst:
-        while chunk := src.read(1024 * 1024):
+    source_fd, source_before = open_regular(source)
+    target_fd = None
+    try:
+        target_fd, target_before = open_regular(target, os.O_RDWR)
+        if target_identity is not None and inode_identity(target_before) != target_identity:
+            raise OSError("cache staging file was replaced")
+        os.ftruncate(target_fd, 0)
+        while chunk := os.read(source_fd, 1024 * 1024):
             size += len(chunk)
             if size > (MAX_OBJECT_BYTES if limit is None else limit):
                 raise ValueError("cache payload exceeds limit")
             digest.update(chunk)
-            dst.write(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_fd, view)
+                if written <= 0:
+                    raise OSError("short write while staging cache payload")
+                view = view[written:]
+        source_after = os.fstat(source_fd)
+        source_path_after = os.lstat(source)
+        target_after = os.fstat(target_fd)
+        target_path_after = os.lstat(target)
+        if (
+            file_identity(source_before) != file_identity(source_after)
+            or file_identity(source_after) != file_identity(source_path_after)
+            or source_after.st_size != size
+        ):
+            raise OSError("cache source changed while it was copied")
+        if (
+            inode_identity(target_before) != inode_identity(target_after)
+            or file_identity(target_after) != file_identity(target_path_after)
+            or target_after.st_size != size
+        ):
+            raise OSError("cache staging file changed while it was written")
+    finally:
+        os.close(source_fd)
+        if target_fd is not None:
+            os.close(target_fd)
     if size == 0 and not allow_empty:
         raise ValueError("empty cache object")
     return {"size": size, "sha256": digest.hexdigest()}
@@ -248,22 +416,39 @@ def copy_digest(source, target, *, allow_empty=False, limit=None):
 def temporary(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=path.name + ".incoming.", dir=path.parent)
-    os.close(fd)
-    return Path(name)
+    try:
+        identity = inode_identity(os.fstat(fd))
+    finally:
+        os.close(fd)
+    return Path(name), identity
 
 
 def restore(entry, output, key, *, stdout=None, stderr=None):
     staged = []
     admitted = False
     try:
-        with open(str(entry) + ".json", "rb") as stream:
-            raw = stream.read(16385)
-        if len(raw) > 16384:
+        try:
+            output_parent = Path(output).parent.stat()
+        except OSError:
             return False
+        if not stat.S_ISDIR(output_parent.st_mode):
+            return False
+        try:
+            output_before = os.lstat(output)
+        except FileNotFoundError:
+            output_identity = None
+        else:
+            # A compiler opened with -o follows symlinks and writes through hard
+            # links. Replacing either directory entry on a cache hit would change
+            # observable output-path behavior, so let the compiler handle it.
+            if not stat.S_ISREG(output_before.st_mode) or output_before.st_nlink != 1:
+                return False
+            output_identity = file_identity(output_before)
+        raw = read_regular_file(str(entry) + ".json", 16384)
         metadata = json.loads(raw)
         if metadata.get("schema") != SCHEMA or metadata.get("key") != key:
             return False
-        obj = temporary(output)
+        obj, obj_identity = temporary(output)
         staged.append(obj)
         expected_object = metadata.get("object")
         if not isinstance(expected_object, dict):
@@ -271,26 +456,52 @@ def restore(entry, output, key, *, stdout=None, stderr=None):
         mode = expected_object.get("mode")
         if type(mode) is not int or mode < 0 or mode > 0o777:
             return False
-        copied_object = copy_digest(entry, obj)
+        copied_object = copy_digest(entry, obj, target_identity=obj_identity)
         if copied_object != {key: expected_object.get(key) for key in ("size", "sha256")}:
             return False
-        os.chmod(obj, mode)
+        obj_identity = chmod_regular_file(obj, mode, obj_identity)
         streams = {}
         for name in ("stdout", "stderr"):
-            target = temporary(output)
+            target, target_identity = temporary(output)
             staged.append(target)
             source = Path(str(entry) + "." + name)
-            copied = copy_digest(source, target, allow_empty=True, limit=MAX_DIAGNOSTIC_BYTES)
+            copied = copy_digest(
+                source,
+                target,
+                allow_empty=True,
+                limit=MAX_DIAGNOSTIC_BYTES,
+                target_identity=target_identity,
+            )
             if copied != metadata["streams"][name]:
                 return False
-            streams[name] = target
+            streams[name] = (target, target_identity)
         # Verify the exact copied object AND both streams before any publication.
+        try:
+            output_after = os.lstat(output)
+        except FileNotFoundError:
+            if output_identity is not None:
+                return False
+        else:
+            if (
+                output_identity is None
+                or not stat.S_ISREG(output_after.st_mode)
+                or output_after.st_nlink != 1
+                or file_identity(output_after) != output_identity
+            ):
+                return False
+        require_staged_path(obj, obj_identity)
         os.replace(obj, output)
         admitted = True
         for name, destination in (("stderr", stderr), ("stdout", stdout)):
             destination = destination if destination is not None else getattr(sys, name).buffer
-            with open(streams[name], "rb") as source:
-                shutil.copyfileobj(source, destination, 1024 * 1024)
+            stream_path, stream_identity = streams[name]
+            destination.write(
+                read_regular_file(
+                    stream_path,
+                    MAX_DIAGNOSTIC_BYTES,
+                    expected_identity=stream_identity,
+                )
+            )
             destination.flush()
         return True
     except (OSError, ValueError, TypeError, AttributeError, KeyError):
@@ -307,29 +518,43 @@ def restore(entry, output, key, *, stdout=None, stderr=None):
 def publish(entry, output, key, stdout=None, stderr=None):
     staged = []
     try:
-        obj = temporary(entry)
+        obj, obj_identity = temporary(entry)
         staged.append(obj)
-        mode = stat.S_IMODE(os.stat(output).st_mode) & 0o777
-        object_digest = copy_digest(output, obj)
-        if (stat.S_IMODE(os.stat(output).st_mode) & 0o777) != mode:
+        output_before = os.lstat(output)
+        if not stat.S_ISREG(output_before.st_mode):
+            return False
+        mode = stat.S_IMODE(output_before.st_mode) & 0o777
+        object_digest = copy_digest(output, obj, target_identity=obj_identity)
+        output_after = os.lstat(output)
+        if (not stat.S_ISREG(output_after.st_mode)
+                or file_identity(output_before) != file_identity(output_after)
+                or (stat.S_IMODE(output_after.st_mode) & 0o777) != mode):
             return False
         metadata = {"schema": SCHEMA, "key": key,
                     "object": {**object_digest, "mode": mode}, "streams": {}}
-        payloads = [(obj, entry)]
+        payloads = [(obj, obj_identity, entry)]
         for name, source in (("stdout", stdout), ("stderr", stderr)):
-            target = temporary(entry)
+            target, target_identity = temporary(entry)
             staged.append(target)
             if source is None:
                 metadata["streams"][name] = {"size": 0, "sha256": hashlib.sha256(b"").hexdigest()}
             else:
-                metadata["streams"][name] = copy_digest(source, target, allow_empty=True, limit=MAX_DIAGNOSTIC_BYTES)
-            payloads.append((target, Path(str(entry) + "." + name)))
-        stamp = temporary(Path(str(entry) + ".json"))
+                metadata["streams"][name] = copy_digest(
+                    source,
+                    target,
+                    allow_empty=True,
+                    limit=MAX_DIAGNOSTIC_BYTES,
+                    target_identity=target_identity,
+                )
+            payloads.append((target, target_identity, Path(str(entry) + "." + name)))
+        stamp, stamp_identity = temporary(Path(str(entry) + ".json"))
         staged.append(stamp)
-        stamp.write_text(json.dumps(metadata))
+        write_regular_file(stamp, json.dumps(metadata).encode(), stamp_identity)
         # Publish metadata last. Partial or racing generations fail validation.
-        for source, target in payloads:
+        for source, source_identity, target in payloads:
+            require_staged_path(source, source_identity)
             os.replace(source, target)
+        require_staged_path(stamp, stamp_identity)
         os.replace(stamp, str(entry) + ".json")
         return True
     except (OSError, ValueError):
