@@ -254,7 +254,8 @@ static_if_row_selection = compact(function_section(consumer_text, "pma_static_if
 static_if_row_for_position = compact(function_section(consumer_text, "pma_static_if_row_for_position"))
 import_branch_selection = compact(function_section(consumer_text, "pma_import_branch_selection"))
 using_alias_for_using = compact(function_section(consumer_text, "pma_using_alias_for_using_row"))
-import_annotation_branch_selection = compact(function_section(consumer_text, "pma_import_annotation_branch_selection"))
+import_annotation_branch_selection = compact(function_section(consumer_text, "pma_import_annotation_branch_selection_indexed"))
+import_annotation_branch_wrapper = compact(function_section(consumer_text, "pma_import_annotation_branch_selection"))
 build_import_views = compact(function_section(table_setup_text, "semantic_build_import_annotation_views"))
 synthetic_import_marker = compact(function_section(import_visibility_text, "semantic_is_synthetic_unknown_import_marker"))
 wildcard_import_builder = compact(function_section(symbols_hash_index_text, "index_wildcard_imports"))
@@ -498,11 +499,20 @@ if not all(fragment in static_if_condition_value for fragment in (
         'marker.owner=="__pma_unknown_static_import"',
         'marker.name==import_owner',
         'marker.detail_name==import_name')) or not all(fragment in active_import_annotations for fragment in (
-        'pma_import_annotation_branch_selection(annotation,file.enum_annotations,file,table)',
+        'pma_import_annotation_branch_selection_indexed(annotation,relevant,markers,file,table)',
+        'markers.push(candidate)ifcandidate.owner=="__static_if_branch"',
+        'branch_rowandmarkers.count>0',
+        'candidate.owner=="__from_member"',
+        'candidate.owner=="__private_member_module"',
+        'candidate.name=="__using"',
+        'candidate.name=="__using_alias"',
+        'candidate.name=="__using_alias_target"',
         'owner:"__pma_unknown_static_import"',
         'annotation.name=="__using_alias"',
         'notbranch.known')):
     raise SystemExit("PMA import visibility must filter known-inactive rows and mark unresolved static-arm imports as uncertain")
+if "pma_import_annotation_branch_selection_indexed(annotation,annotations,annotations,file,table)" not in import_annotation_branch_wrapper:
+    raise SystemExit("non-indexed PMA callers must retain their complete annotation view")
 if not all(fragment in selective_import_status for fragment in (
         'pma_import_row_branch_uncertain(annotations,"__from_member",member_annotation.name,member_annotation.module,member_annotation.line,member_annotation.offset)',
         'known_order<-false')) or not all(fragment in public_import_visibility for fragment in (
@@ -804,7 +814,7 @@ if not all(fragment in private_record for fragment in (
 if not all(fragment in import_annotation_branch_selection for fragment in (
         'annotation.owner=="__private_member"',
         'module_annotation.owner!="__private_member_module"',
-        'pma_import_branch_selection(annotations,file,table,"__static_if_branch","__private_member_static_branch",annotation.name,member_module,annotation.line,annotation.offset)',
+        'pma_import_branch_selection(markers,file,table,"__static_if_branch","__private_member_static_branch",annotation.name,member_module,annotation.line,annotation.offset)',
         'annotation.name=="__using"',
         '"__binding_wildcard_import_static_branch"',
         'annotation.name=="__using_alias"',
