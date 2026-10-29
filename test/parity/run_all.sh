@@ -21,9 +21,9 @@ set -uo pipefail
 # ---------------------------------------------------------------- RESULT CACHE
 # A check whose INPUTS have not changed cannot have changed its answer, and most gate
 # invocations during iteration re-verify a product identical to the last green run. The
-# cache key covers everything a check can read: its own script, the stage1 product, the
-# stage0 oracle, the runtime object, and a stat-walk of test/ + scripts/ (so editing any
-# fixture or helper invalidates every check — conservative, but never wrong).
+# cache key covers everything a check can read: its command, the stage1 product, the stage0
+# oracle, the runtime object, shared generated helpers, and a content/mode walk of test/,
+# scripts/, src/, tools/, and the compiler source inputs used by direct Go tests.
 #
 # ONLY SUCCESSES ARE CACHED. A failure re-runs every time: the common painful case is
 # re-running the full gate after fixing one red check, and with this cache that run
@@ -31,51 +31,127 @@ set -uo pipefail
 # A cached row is printed as "ok  (cached)" so a stamped run is never mistaken for a
 # measured one. ELISA_GATE_NO_CACHE=1 bypasses; the cache lives in build/ and is ignored.
 gate_cache_key() {
-  # $1 = the check's script path (first word of the command). Portable md5 via python.
+  # $1 = check name, $2 = repo root, remaining arguments = exact command. Portable SHA-256 via python.
   #
-  # The three binaries are keyed by CONTENT HASH, not mtime: several checks rebuild
+  # Shared artifacts are keyed by CONTENT HASH, not mtime: several checks rebuild
   # the runtime object mid-gate with byte-identical output, and an mtime key then
   # rotates under every entry written earlier in the same run — the first full-gate
   # cache produced ZERO hits on its own immediate re-run because of exactly that.
   # The parent computes the combined hash once per gate (ELISA_GATE_BINS_HASH);
   # a standalone exec-one without it falls back to hashing the binaries itself.
-  local script="$1" root="$2"
-  python3 - "$script" "$root" <<'KEYEOF'
+  local check_name="$1" root="$2"; shift 2
+  local script="$1"
+  python3 - "$check_name" "$root" "$@" <<'KEYEOF'
 import hashlib, os, sys
 h = hashlib.sha256()
-script, root = sys.argv[1], sys.argv[2]
+h.update(b"elisa-gate-cache-content-v2\0")
+check_name, root, *command = sys.argv[1:]
+h.update(b"check-name\0" + check_name.encode("utf-8", "surrogateescape") + b"\0")
+for arg in command:
+    encoded = arg.encode("utf-8", "surrogateescape")
+    h.update(len(encoded).to_bytes(8, "big"))
+    h.update(encoded)
+script = command[0]
+
+def update_file(path):
+    path = os.path.abspath(path)
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise OSError("non-regular parity cache input")
+    h.update(path.encode()); h.update(b"\0file\0")
+    h.update(str(os.stat(path).st_mode & 0o7777).encode()); h.update(b"\0")
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    h.update(digest.digest())
+
 bins = os.environ.get("ELISA_GATE_BINS_HASH", "")
 if bins:
     h.update(bins.encode())
 else:
     for f in (os.path.join(root, "bin/elisac-stage1"),
+              os.environ.get("ELISA_STAGE1_BIN") or os.path.join(root, "bin/elisac-stage1"),
+              (os.environ.get("ELISA_STAGE1_BIN") or os.path.join(root, "bin/elisac-stage1")) + ".provenance.json",
               os.environ.get("ELISA_S0_REAL") or os.environ.get("ELISACORE_BIN", ""),
-              os.path.join(root, "build/runtime/elisacore_runtime.o")):
+              (os.environ.get("ELISA_S0_REAL") or os.environ.get("ELISACORE_BIN", "")) + ".provenance.json",
+              os.environ.get("ELISA_RUNTIME_OBJ") or os.path.join(root, "build/runtime/elisacore_runtime.o"),
+              os.environ.get("ELISA_PARSE_REPORT") or os.path.join(root, "build/parse_report"),
+              os.path.join(root, "build/easm_project_driver"),
+              os.environ.get("ELISA_EMIT_NATIVE") or os.path.join(root, "build/emit_native")):
         try:
-            h.update(hashlib.sha256(open(f, "rb").read()).digest())
+            update_file(f)
         except OSError:
-            h.update(f.encode()); h.update(b"missing")
-for f in (script,):
-    try:
-        st = os.stat(f)
-        h.update(f.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
-    except OSError:
-        h.update(f.encode()); h.update(b"missing")
+            raise SystemExit(1)
+try:
+    update_file(script)
+    update_file(os.path.join(root, "scripts/gate_toolchain_fingerprint.py"))
+except OSError:
+    raise SystemExit(1)
 tree = os.environ.get("ELISA_GATE_TREE_HASH", "")
 if tree:
     h.update(tree.encode())
 else:
-    for top in ("test", "scripts", "elisacore_std"):
-        base = os.path.join(root, top)
-        for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+    h.update(b"tree-content-v2\0")
+    bases = [os.path.join(root, top) for top in ("test", "scripts", "elisacore_std", "src", "tools")]
+    probe = os.path.join(root, ".probe")
+    if os.path.lexists(probe):
+        bases.append(probe)
+    core = os.path.abspath(os.environ.get("ELISA_CORE") or os.path.join(root, "../../Go projects/Elisa-core"))
+    bases.extend(os.path.join(core, "compiler", top) for top in ("src", "test", "vendor"))
+    bases.append(os.path.join(core, "compiler/runtime/elisacore_std"))
+    for name in ("go.mod", "go.sum"):
+        try:
+            update_file(os.path.join(core, "compiler", name))
+        except OSError:
+            raise SystemExit(1)
+    for base in bases:
+        if os.path.islink(base) or not os.path.isdir(base):
+            raise SystemExit(1)
+        h.update(base.encode()); h.update(b"\0dir\0")
+        h.update(str(os.stat(base).st_mode & 0o7777).encode()); h.update(b"\0")
+        def fail_walk(error):
+            raise error
+        for dirpath, dirnames, filenames in os.walk(base, onerror=fail_walk):
+            dirnames[:] = sorted(d for d in dirnames if base == probe or not d.startswith("."))
+            for name in dirnames:
+                path = os.path.join(dirpath, name)
+                if os.path.islink(path):
+                    raise SystemExit(1)
+                try:
+                    mode = os.stat(path).st_mode & 0o7777
+                except OSError:
+                    raise SystemExit(1)
+                h.update(path.encode()); h.update(b"\0dir\0")
+                h.update(str(mode).encode()); h.update(b"\0")
             for name in sorted(filenames):
                 fp = os.path.join(dirpath, name)
                 try:
-                    st = os.stat(fp)
+                    update_file(fp)
                 except OSError:
-                    continue
-                h.update(fp.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
+                    raise SystemExit(1)
+for name, value in sorted(os.environ.items()):
+    # Timeout/retry settings and worker counts change whether a check can
+    # complete honestly under resource pressure, so stamp them with the result.
+    if not name.startswith("ELISA_"):
+        continue
+    if not (name.endswith("_TIMEOUT") or name.endswith("_TIMEOUT_SCALE")
+            or name.endswith("_JOBS") or name in {"ELISA_TIMEOUT_ESCALATE", "ELISA_GATE_NICE"}):
+        continue
+    h.update(name.encode("utf-8", "surrogateescape") + b"=")
+    h.update(value.encode("utf-8", "surrogateescape") + b"\0")
+toolchain = os.environ.get("ELISA_GATE_TOOLCHAIN_HASH", "")
+if len(toolchain) != 64 or any(c not in "0123456789abcdef" for c in toolchain):
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, os.path.join(root, "scripts/gate_toolchain_fingerprint.py")],
+        capture_output=True, text=True, timeout=25, check=False,
+    )
+    if result.returncode:
+        raise SystemExit(1)
+    toolchain = result.stdout.strip()
+    if len(toolchain) != 64 or any(c not in "0123456789abcdef" for c in toolchain):
+        raise SystemExit(1)
+h.update(b"toolchain\0" + toolchain.encode("ascii"))
 print(h.hexdigest())
 KEYEOF
 }
@@ -89,7 +165,12 @@ if [[ "${1:-}" == "--exec-one" ]]; then
   _cachedir="$_root/build/.gate-cache"
   _key=""
   if [[ "${ELISA_GATE_NO_CACHE:-0}" != 1 ]]; then
-    _key="$(gate_cache_key "$1" "$_root" 2>/dev/null)" || _key=""
+    _key="$(gate_cache_key "$_name" "$_root" "$@" 2>/dev/null)" || _key=""
+  fi
+  # Log capture is also the evidence source for the SKIP census below. A green
+  # stamp cannot satisfy that request because it has no current invocation log.
+  if [[ -n "${ELISA_GATE_LOG_DIR:-}" ]]; then
+    _key=""
   fi
   _cachefile=""
   if [[ -n "$_key" ]]; then
@@ -272,44 +353,124 @@ export ELISA_JOBS="${ELISA_JOBS:-$_fair}"
 _heavy=$(( (_host_w + 1) / 2 )); (( _heavy < _fair )) && _heavy=$_fair
 export ELISA_HEAVY_JOBS="${ELISA_HEAVY_JOBS:-$_heavy}"
 
-# The tree hash is taken ONCE here, pre-dispatch, on a quiesced tree — checks that
+# The tree content hash is taken ONCE here, pre-dispatch, on a quiesced tree — checks that
 # create and delete scratch files inside test/ mid-run otherwise make every
 # per-check walk observe a different transient state, and no key ever matches
 # across runs (v6: 0 cache hits on a byte-identical tree).
-export ELISA_GATE_TREE_HASH="$(python3 - "$REPO_ROOT" <<'TREEEOF'
+if _tree_hash="$(python3 - "$REPO_ROOT" <<'TREEEOF'
 import hashlib, os, sys
 h = hashlib.sha256()
+h.update(b"elisa-parity-tree-content-v2\0")
 root = sys.argv[1]
-for top in ("test", "scripts", "elisacore_std"):
-    base = os.path.join(root, top)
-    for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+bases = [os.path.join(root, top) for top in ("test", "scripts", "elisacore_std", "src", "tools")]
+probe = os.path.join(root, ".probe")
+if os.path.lexists(probe):
+    bases.append(probe)
+core = os.path.abspath(os.environ.get("ELISA_CORE") or os.path.join(root, "../../Go projects/Elisa-core"))
+bases.extend(os.path.join(core, "compiler", top) for top in ("src", "test", "vendor"))
+bases.append(os.path.join(core, "compiler/runtime/elisacore_std"))
+for base in bases:
+    if os.path.islink(base) or not os.path.isdir(base):
+        raise SystemExit(1)
+    h.update(base.encode()); h.update(b"\0dir\0")
+    h.update(str(os.stat(base).st_mode & 0o7777).encode()); h.update(b"\0")
+    def fail_walk(error):
+        raise error
+    for dirpath, dirnames, filenames in os.walk(base, onerror=fail_walk):
+        dirnames[:] = sorted(d for d in dirnames if base == probe or not d.startswith("."))
+        for name in dirnames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                raise SystemExit(1)
+            try:
+                mode = os.stat(path).st_mode & 0o7777
+            except OSError:
+                raise SystemExit(1)
+            h.update(path.encode()); h.update(b"\0dir\0")
+            h.update(str(mode).encode()); h.update(b"\0")
         for name in sorted(filenames):
             fp = os.path.join(dirpath, name)
             try:
-                st = os.stat(fp)
+                if os.path.islink(fp) or not os.path.isfile(fp):
+                    raise OSError("non-regular parity cache input")
+                digest = hashlib.sha256()
+                with open(fp, "rb") as source:
+                    for chunk in iter(lambda: source.read(1 << 20), b""):
+                        digest.update(chunk)
             except OSError:
-                continue
-            h.update(fp.encode()); h.update(str((st.st_mtime_ns, st.st_size)).encode())
+                raise SystemExit(1)
+            h.update(fp.encode()); h.update(b"\0file\0")
+            h.update(str(os.stat(fp).st_mode & 0o7777).encode()); h.update(b"\0")
+            h.update(digest.digest())
+for name in ("go.mod", "go.sum"):
+    fp = os.path.join(core, "compiler", name)
+    try:
+        if os.path.islink(fp) or not os.path.isfile(fp):
+            raise OSError("non-regular parity cache input")
+        digest = hashlib.sha256()
+        with open(fp, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        raise SystemExit(1)
+    h.update(fp.encode()); h.update(b"\0file\0")
+    h.update(str(os.stat(fp).st_mode & 0o7777).encode()); h.update(b"\0")
+    h.update(digest.digest())
 print(h.hexdigest())
 TREEEOF
-)"
+)"; then
+  export ELISA_GATE_TREE_HASH="$_tree_hash"
+else
+  # A tree we cannot fully fingerprint must never produce cache hits. Keep the
+  # parity checks running and bypass their result cache instead of trusting a
+  # partial identity.
+  export ELISA_GATE_NO_CACHE=1
+  unset ELISA_GATE_TREE_HASH
+fi
 
-# One content hash of the three product binaries for the whole run — see gate_cache_key.
+# One content hash of the selected product binaries and shared helpers for the whole run.
 export ELISA_GATE_BINS_HASH="$(python3 - "$REPO_ROOT" <<'BINSEOF'
 import hashlib, os, sys
 h = hashlib.sha256()
 root = sys.argv[1]
 for f in (os.path.join(root, "bin/elisac-stage1"),
+          os.environ.get("ELISA_STAGE1_BIN") or os.path.join(root, "bin/elisac-stage1"),
+          (os.environ.get("ELISA_STAGE1_BIN") or os.path.join(root, "bin/elisac-stage1")) + ".provenance.json",
           os.environ.get("ELISA_S0_REAL") or os.environ.get("ELISACORE_BIN", ""),
-          os.path.join(root, "build/runtime/elisacore_runtime.o")):
+          (os.environ.get("ELISA_S0_REAL") or os.environ.get("ELISACORE_BIN", "")) + ".provenance.json",
+          os.environ.get("ELISA_RUNTIME_OBJ") or os.path.join(root, "build/runtime/elisacore_runtime.o"),
+          os.environ.get("ELISA_PARSE_REPORT") or os.path.join(root, "build/parse_report"),
+          os.path.join(root, "build/easm_project_driver"),
+          os.environ.get("ELISA_EMIT_NATIVE") or os.path.join(root, "build/emit_native")):
     try:
-        h.update(hashlib.sha256(open(f, "rb").read()).digest())
+        path = os.path.abspath(f)
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise OSError("non-regular parity cache product")
+        h.update(path.encode()); h.update(b"\0file\0")
+        h.update(str(os.stat(path).st_mode & 0o7777).encode()); h.update(b"\0")
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                digest.update(chunk)
+        h.update(digest.digest())
     except OSError:
-        h.update(f.encode()); h.update(b"missing")
+        raise SystemExit(1)
 print(h.hexdigest())
 BINSEOF
 )"
+
+# Hash the external execution environment, tool binaries and their direct shared
+# libraries once for the worker pool. If any selected input cannot be inspected,
+# disable result caching for this run instead of accepting an incomplete key.
+if [[ "${ELISA_GATE_NO_CACHE:-0}" != 1 ]]; then
+  if _toolchain_hash="$(python3 "$REPO_ROOT/scripts/gate_toolchain_fingerprint.py" 2>/dev/null)" \
+      && [[ "$_toolchain_hash" =~ ^[0-9a-f]{64}$ ]]; then
+    export ELISA_GATE_TOOLCHAIN_HASH="$_toolchain_hash"
+  else
+    export ELISA_GATE_NO_CACHE=1
+    unset ELISA_GATE_TOOLCHAIN_HASH
+  fi
+fi
 
 # ---------------------------------------------------------------- PROFILES
 # The full gate is ~11 minutes. That is the right cost before a COMMIT and the wrong cost
@@ -460,6 +621,8 @@ HEAVY_FIRST=(
   "$REPO_ROOT/test/parity/region_pool_release_lifetime_smoke.sh"
   "$REPO_ROOT/test/parity/json_opaque_dom_smoke.sh"
   "$REPO_ROOT/test/parity/no_partial_backend_output_smoke.sh"
+  "$REPO_ROOT/test/parity/gate_cache_key_smoke.sh"
+  "$REPO_ROOT/test/parity/s0cache_output_failure_smoke.sh"
   "$REPO_ROOT/test/parity/dict_index_optional_type_smoke.sh"
   "$REPO_ROOT/test/parity/loop_smoke.sh"                 # 121s
   "$REPO_ROOT/test/parity/extern_view_abi_smoke.sh"
