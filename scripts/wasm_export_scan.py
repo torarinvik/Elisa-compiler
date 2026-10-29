@@ -9,7 +9,9 @@ include graph the same way the compiler does.
 """
 from __future__ import annotations
 
+import os
 import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,11 @@ MAIN_RE = re.compile(
     r"^\s*def\s+main\s*\((.*)\)\s*(?:->\s*([^:]+?))?\s*:\s*$"
 )
 INCLUDE_RE = re.compile(r"^\s*(?:#\s*)?include\s+['\"]([^'\"]+)['\"]\s*$")
+MAX_FLATTENED_SOURCE_BYTES = 8 * 1024 * 1024
+MAX_SOURCE_FILES = 4096
+MAX_INCLUDE_DEPTH = 256
+MAX_SOURCE_LINES = 262144
+LINE_BREAKS = frozenset("\n\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
 
 
@@ -105,27 +112,100 @@ def split_assignment(text: str) -> tuple[str, str | None]:
 def read_flat_source(path: Path, seen: set[Path] | None = None, stack: list[Path] | None = None) -> str:
     seen = set() if seen is None else seen
     stack = [] if stack is None else stack
-    path = path.resolve()
+    chunks: list[str] = []
+    _read_flat_source(path, seen, stack, [0, 0], chunks)
+    return "".join(chunks)
+
+
+def _read_flat_source(
+    path: Path,
+    seen: set[Path],
+    stack: list[Path],
+    totals: list[int],
+    chunks: list[str],
+) -> None:
+    try:
+        # Resolve first so normal symlink includes keep working, then refuse a
+        # symlink swap at open time with O_NOFOLLOW.
+        path = path.resolve()
+    except (OSError, RuntimeError) as error:
+        raise WasmBuildError(f"cannot resolve source/include {path}: {error}") from error
     if path in stack:
         chain = " -> ".join(str(item) for item in [*stack, path])
         raise WasmBuildError(f"cyclic include while building WASM: {chain}")
     if path in seen:
-        return ""
-    if not path.is_file():
-        raise WasmBuildError(f"missing source/include: {path}")
+        return
+    if len(seen) >= MAX_SOURCE_FILES:
+        raise WasmBuildError(f"source/include closure exceeds {MAX_SOURCE_FILES} files")
+    if len(stack) >= MAX_INCLUDE_DEPTH:
+        raise WasmBuildError(f"source/include nesting exceeds {MAX_INCLUDE_DEPTH} files")
+    remaining = MAX_FLATTENED_SOURCE_BYTES - totals[0]
+    if remaining < 0:
+        raise WasmBuildError(f"flattened source exceeds {MAX_FLATTENED_SOURCE_BYTES} bytes")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise WasmBuildError(f"source/include is not a regular file: {path}")
+            if before.st_size > remaining:
+                raise WasmBuildError(f"flattened source exceeds {MAX_FLATTENED_SOURCE_BYTES} bytes")
+            data = source.read(remaining + 1)
+            after = os.fstat(source.fileno())
+        current = os.lstat(path)
+    except FileNotFoundError as error:
+        raise WasmBuildError(f"missing source/include: {path}") from error
+    except OSError as error:
+        raise WasmBuildError(f"cannot read source/include {path}: {error}") from error
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size,
+                             info.st_mtime_ns, info.st_ctime_ns)
+    if (not stat.S_ISREG(current.st_mode)
+            or identity(before) != identity(after)
+            or identity(after) != identity(current)
+            or len(data) != before.st_size
+            or len(data) > remaining):
+        raise WasmBuildError(f"source/include changed or exceeded size limit while reading: {path}")
+    try:
+        # Path.read_text() uses universal newline handling; preserve it while
+        # keeping the byte read bounded before decoding.
+        text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError as error:
+        raise WasmBuildError(f"source/include is not UTF-8: {path}") from error
     seen.add(path)
+    totals[0] += len(data)
     stack.append(path)
-    output: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
-        match = INCLUDE_RE.match(line.rstrip("\r\n"))
-        if match:
-            include = Path(match.group(1))
-            include = include if include.is_absolute() else path.parent / include
-            output.append(read_flat_source(include, seen, stack))
-        else:
-            output.append(line)
-    stack.pop()
-    return "".join(output)
+    try:
+        line_start = 0
+        for line_end, char in enumerate(text):
+            if char not in LINE_BREAKS:
+                continue
+            line = text[line_start : line_end + 1]
+            line_start = line_end + 1
+            totals[1] += 1
+            if totals[1] > MAX_SOURCE_LINES:
+                raise WasmBuildError(f"source/include closure exceeds {MAX_SOURCE_LINES} lines")
+            match = INCLUDE_RE.match(line.rstrip("\r\n"))
+            if match:
+                include = Path(match.group(1))
+                include = include if include.is_absolute() else path.parent / include
+                _read_flat_source(include, seen, stack, totals, chunks)
+            else:
+                chunks.append(line)
+        if line_start < len(text):
+            line = text[line_start:]
+            totals[1] += 1
+            if totals[1] > MAX_SOURCE_LINES:
+                raise WasmBuildError(f"source/include closure exceeds {MAX_SOURCE_LINES} lines")
+            match = INCLUDE_RE.match(line)
+            if match:
+                include = Path(match.group(1))
+                include = include if include.is_absolute() else path.parent / include
+                _read_flat_source(include, seen, stack, totals, chunks)
+            else:
+                chunks.append(line)
+    finally:
+        stack.pop()
 
 
 def normalize_type(text: str) -> str:
