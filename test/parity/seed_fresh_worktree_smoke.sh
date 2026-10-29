@@ -195,6 +195,9 @@ grep -F "seed: building Stage1 product with stage0 bootstrap compiler $WORK/core
 [[ -f "$WORK/build/elisac_stage1.o" ]]
 [[ ! -e "$WORK/build/.elisac-stage1-seed.lock" ]]
 [[ ! -e "$WORK/tmp/elisac-stage1-global-seed.lock" ]]
+seed_link_output="$(awk 'previous == "-o" { print; exit } { previous = $0 }' "$WORK/clang.args")"
+[[ "$(basename "$seed_link_output")" == "elisac-stage1" ]]
+[[ ! -e "$(dirname "$seed_link_output")" ]]
 FAKE_LINKER="$WORK/ld" \
 FAKE_LLVM_BINDIR="$WORK" \
 FAKE_LLVM_LIBDIR="$WORK/lib" \
