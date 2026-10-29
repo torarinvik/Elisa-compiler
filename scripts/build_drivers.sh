@@ -30,6 +30,14 @@ if ! clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"; then
     exit 1
 fi
 
+LLVM_BRIDGE_OBJ="$BUILD/llvm_validation_peel.o"
+if ! bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$LLVM_BRIDGE_OBJ"; then
+    echo "build_drivers FAILED: could not compile LLVM bridge" >&2
+    exit 1
+fi
+CXX_RUNTIME=-lc++
+[[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
+
 status=0
 for driver in emit_native emit_obj; do
     log="$BUILD/$driver.buildlog"
@@ -42,7 +50,7 @@ for driver in emit_native emit_obj; do
     # recurses once per AST level — see the depth guard in codegen_scope.elisa's
     # expression_type and scripts/elisac_stage1.sh's seed_build for the same flag on the
     # product binary.
-    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M 2>>"$log"; then
+    if ! clang -o "$BUILD/$driver" "$BUILD/$driver.o" "$FALLBACK_OBJ" "$PROFILE_OBJ" "$LLVM_BRIDGE_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M 2>>"$log"; then
         echo "build_drivers FAILED: could not link $driver"; status=1; continue
     fi
     echo "build_drivers ok: $driver"

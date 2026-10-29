@@ -233,8 +233,11 @@ fi
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || fail "no runtime object at $RUNTIME_OBJ (run scripts/build_runtime_object.sh)"
-clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/elisac-stage1-gen3" "$WORK/gen3.o" "$RUNTIME_OBJ" \
-      -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" >"$WORK/gen3.link.log" 2>&1 \
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$WORK/llvm_validation_peel.o" || fail "LLVM bridge failed to build"
+CXX_RUNTIME=-lc++
+[[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/elisac-stage1-gen3" "$WORK/gen3.o" "$RUNTIME_OBJ" "$WORK/llvm_validation_peel.o" \
+      -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" >"$WORK/gen3.link.log" 2>&1 \
   || fail "gen3 object did not link (see $WORK/gen3.link.log)"
 
 { printf '%s\n' "$WORK/gen4.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen4.request"

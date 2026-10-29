@@ -194,6 +194,8 @@ with tempfile.TemporaryDirectory() as directory:
         "    raise SystemExit(2)\n"
     )
     clang.chmod(0o755)
+    (bindir / "clang++").write_text(clang.read_text())
+    (bindir / "clang++").chmod(0o755)
     llvm_config = bindir / "llvm-config"
     llvm_config.write_text(
         f"#!{sys.executable}\n"
@@ -203,6 +205,8 @@ with tempfile.TemporaryDirectory() as directory:
         "    print('23.1.3')\n"
         "elif args == ['--bindir']:\n"
         f"    print({str(bindir)!r})\n"
+        "elif args == ['--cxxflags']:\n"
+        "    print('-std=c++17')\n"
         "elif args == ['--libdir']:\n"
         f"    print({str(libdir)!r})\n"
         "elif args == ['--link-shared', '--libfiles']:\n"
@@ -240,6 +244,12 @@ with tempfile.TemporaryDirectory() as directory:
         with patch.object(stage1_provenance, "sha256_file", side_effect=AssertionError("unchanged artifact was rehashed")):
             unchanged = stage1_provenance.llvm_toolchain_fingerprint(original)
         assert unchanged == original
+        cxx = bindir / "clang++"
+        cxx_source = cxx.read_text()
+        cxx.write_text(cxx_source + "\n# changed C++ compiler\n")
+        cxx_changed = stage1_provenance.llvm_toolchain_fingerprint(original)
+        assert cxx_changed["llvm_cxx_artifact"]["sha256"] != original["llvm_cxx_artifact"]["sha256"]
+        cxx.write_text(cxx_source)
 
         alternate_linker = bindir / "ld64"
         alternate_linker.write_text(

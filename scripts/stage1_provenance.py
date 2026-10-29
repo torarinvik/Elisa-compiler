@@ -25,6 +25,7 @@ BUILD_RECIPES = (
     "scripts/assert_stage1_fresh.sh",
     "scripts/process_rss.sh",
     "scripts/build_runtime_object.sh",
+    "scripts/build_stage1_llvm_bridge.sh",
     "scripts/write_profiler_hook_fallbacks.sh",
     "scripts/stage1_provenance.py",
 )
@@ -457,7 +458,7 @@ def llvm_toolchain_fingerprint(previous=None, exact=False):
     if not raw_config:
         raise RuntimeError("LLVM_CONFIG is required to fingerprint Stage1; source scripts/platform.sh first")
     previous_artifacts = {}
-    for key in ("llvm_config_artifact", "clang_artifact"):
+    for key in ("llvm_config_artifact", "clang_artifact", "llvm_cxx_artifact"):
         artifact = previous.get(key)
         if isinstance(artifact, dict) and isinstance(artifact.get("path"), str):
             previous_artifacts[artifact["path"]] = artifact
@@ -547,6 +548,12 @@ def llvm_toolchain_fingerprint(previous=None, exact=False):
     if not clang.is_file() or not os.access(clang, os.X_OK):
         raise RuntimeError(f"selected LLVM clang is not executable: {clang}")
     clang_artifact = artifact_record(clang)
+    raw_cxx = os.environ.get("ELISA_LLVM_CXX") or str(Path(llvm_config("--bindir")) / "clang++")
+    cxx = Path(shutil.which(raw_cxx) or raw_cxx).resolve()
+    if not cxx.is_file() or not os.access(cxx, os.X_OK):
+        raise RuntimeError(f"selected LLVM C++ compiler is not executable: {cxx}")
+    llvm_cxx_artifact = artifact_record(cxx)
+    llvm_cxxflags = llvm_config("--cxxflags")
     clang_unchanged = artifact_unchanged(previous.get("clang_artifact"), clang_artifact)
     clang_version = previous.get("clang_version") if clang_unchanged else None
     if not clang_version:
@@ -674,6 +681,8 @@ def llvm_toolchain_fingerprint(previous=None, exact=False):
         "llvm_config_libdir": config_libdir,
         "clang_path": str(clang),
         "clang_artifact": clang_artifact,
+        "llvm_cxx_artifact": llvm_cxx_artifact,
+        "llvm_cxxflags": llvm_cxxflags,
         "clang_version": clang_version,
         "external_linker": external_linker,
         "link_mode": link_mode,

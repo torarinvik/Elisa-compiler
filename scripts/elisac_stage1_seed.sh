@@ -105,6 +105,7 @@ seed_build() {
   ELISA_SEED_OUTPUT="$seed_output"
   ELISA_SEED_OBJECT="$seed_object"
   ELISA_SEED_PROFILE_HOOK_SOURCE="$seed_profile_hook_source"
+  ELISA_SEED_LLVM_BRIDGE="$ROOT/build/elisac_stage1_llvm_bridge.tmp.$$.o"
   cleanup_seed_lock() {
     if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
       rm -f "$ELISA_SEED_OUTPUT"
@@ -115,6 +116,7 @@ seed_build() {
     if [[ -n "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}" ]]; then
       rm -f "$ELISA_SEED_PROFILE_HOOK_SOURCE"
     fi
+    [[ -z "${ELISA_SEED_LLVM_BRIDGE:-}" ]] || rm -f "$ELISA_SEED_LLVM_BRIDGE"
     rm -f "$ELISA_SEED_LOCK_DIR/pid"
     rmdir "$ELISA_SEED_LOCK_DIR" 2>/dev/null || true
     if [[ -n "${ELISA_SEED_GLOBAL_LOCK_DIR:-}" ]]; then
@@ -316,7 +318,13 @@ seed_build() {
   else
     bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
   fi
-  "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "${seed_link_objects[@]}" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
+  local seed_llvm_bridge="$ELISA_SEED_LLVM_BRIDGE"
+  bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$seed_llvm_bridge"
+  seed_link_objects+=("$seed_llvm_bridge")
+  local seed_cxx_lib=-lc++
+  [[ "$(uname -s)" == Linux ]] && seed_cxx_lib=-lstdc++
+  "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "${seed_link_objects[@]}" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS "$seed_cxx_lib" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
+  rm -f "$seed_llvm_bridge"
   if [[ -n "$seed_runtime_obj" ]]; then
     seed_runtime_sha256_actual="$(elisa_sha256 "$seed_runtime_obj" | awk '{print $1}')"
     [[ "$seed_runtime_sha256_actual" == "$seed_runtime_sha256_expected" ]] || {

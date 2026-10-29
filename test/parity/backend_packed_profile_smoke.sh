@@ -21,7 +21,10 @@ RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 # the profiler ABI unconditionally), which is what kept this gate red.
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$BUILD/llvm_validation_peel.o"
+CXX_RUNTIME=-lc++
+[[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
+clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$BUILD/llvm_validation_peel.o" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
 
 src=$'@packed_profile(retained_reads)\npacked enum Node:\n    Leaf(v: i64)\n    Tag(t: i64)\n\ndef build(owner: Arena) -> i64:\n    store: Node.Store[Local] = Node.Store(owner)\n    result: mutable i64 = 0\n    in store:\n        n: Node = new Node.Leaf(v: 42)\n        result <- match n:\n            Node.Leaf(v): v\n            Node.Tag(t): t\n    return result\n\ndef main() -> i64:\n    region r(4096):\n        return build(r)\n'
 printf '%s' "$src" | "$BUILD/driver" > "$BUILD/profile.ll"

@@ -72,7 +72,10 @@ file "$BIN"
 run_guarded_stage1
 # -stack_size 512MB (arm64 ld64 max) — same rationale as scripts/elisac_stage1.sh's
 # seed_build: emit_expression recurses once per AST level, and this is the product binary.
-clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$OUT_DIR/llvm_validation_peel.o"
+CXX_RUNTIME=-lc++
+[[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" "$OUT_DIR/llvm_validation_peel.o" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
 echo "wrote $OUT_DIR/elisac-stage1-gen2"
 # Fixture parity with gen2
 printf 'def main() -> i64:\n    return 42\n' >"$OUT_DIR/fix.elisa"

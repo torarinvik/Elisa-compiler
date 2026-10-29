@@ -29,6 +29,10 @@ FALLBACK_OBJ="$BUILD/runtime_fallback.o"
 clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
 PROFILE_OBJ="$BUILD/profile_hooks.o"
 clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
+LLVM_BRIDGE_OBJ="$BUILD/llvm_validation_peel.o"
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$LLVM_BRIDGE_OBJ"
+CXX_RUNTIME=-lc++
+[[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
 
 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj.o" "$ROOT/test/breadth/emit_obj.elisa" 2>/dev/null \
   || { echo "backend_obj_smoke FAILED: could not compile emit_obj.elisa"; exit 1; }
@@ -45,7 +49,7 @@ elisa_native_optional_hook_objects "$BUILD" "$ROOT"
 # profiler hooks, no runtime object), because a driver carries its own runtime; the runtime
 # object exists for the SMALL programs the driver emits, and is used on the per-case link
 # below. Same flags as the seed so this gate measures the link the product actually gets.
-clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/emit_obj" "$BUILD/emit_obj.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$LLVM_BRIDGE_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M \
   || { echo "backend_obj_smoke FAILED: could not link emit_obj"; exit 1; }
 
 pass=0; total=0
@@ -348,7 +352,7 @@ debug_ir_case() {
     local dir="$BUILD/obj_dbgir"; mkdir -p "$dir"
     if [ ! -f "$BUILD/emit_obj_debug_ir" ]; then
         if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj_debug_ir.o" "$ROOT/test/breadth/emit_obj_debug_ir.elisa" 2>/dev/null \
-           || ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
+           || ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$LLVM_BRIDGE_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
             echo "  FAIL obj_dbgir_$name: could not build emit_obj_debug_ir"; return
         fi
     fi

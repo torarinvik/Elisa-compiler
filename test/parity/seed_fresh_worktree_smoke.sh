@@ -25,10 +25,14 @@ for part in \
   elisac_stage1_seed.sh \
   write_profiler_hook_fallbacks.sh \
   build_runtime_object.sh \
-  stage1_provenance.py; do
+  build_stage1_llvm_bridge.sh \
+  stage1_provenance.py \
+  stage0_provenance.py; do
   cp "$ROOT/scripts/$part" "$WORK/scripts/$part"
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
+mkdir -p "$WORK/src/backend"
+printf '%s\n' '// LLVM bridge fixture' > "$WORK/src/backend/llvm_validation_peel.cpp"
 # The seed builds the runtime object after the product (70589584), and that helper
 # reads elisacore_std/native_runtime_support.elisa and fingerprints the whole
 # directory. A clean worktree has one; this fixture stubs it, in keeping with the
@@ -47,7 +51,7 @@ git -C "$WORK" add scripts src elisacore_std
 git -C "$WORK" commit -qm 'seed smoke fixture source'
 
 cat > "$WORK/core/compiler/go.mod" <<'MOD'
-module seed-smoke.local/compiler
+module elisacore
 
 go 1.22
 MOD
@@ -89,6 +93,7 @@ case "$*" in
   --version) echo "23.1.3" ;;
   --bindir) echo "$FAKE_LLVM_BINDIR" ;;
   --libdir) echo "$FAKE_LLVM_LIBDIR" ;;
+  --cxxflags) echo "-std=c++17" ;;
   "--link-shared --libfiles") echo "$FAKE_LLVM_LIBDIR/libLLVM.dylib" ;;
   *) echo "unsupported llvm-config arguments: $*" >&2; exit 2 ;;
 esac
@@ -147,6 +152,18 @@ PRODUCT
 chmod +x "$out"
 STUB
 chmod +x "$WORK/clang"
+cat > "$WORK/clang++" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""; next=0
+for arg in "$@"; do
+  if [[ "$next" == 1 ]]; then out="$arg"; next=0; continue; fi
+  [[ "$arg" == "-o" ]] && next=1
+done
+[[ -n "$out" ]]
+printf 'fake bridge object\n' > "$out"
+STUB
+chmod +x "$WORK/clang++"
 
 # EVERY output path the seed honours must be pinned INSIDE the fixture. run_all exports
 # ELISA_RUNTIME_OBJ pointing at the REAL tree, and build_runtime_object.sh honours it over
@@ -178,6 +195,9 @@ grep -F "seed: building Stage1 product with stage0 bootstrap compiler $WORK/core
 [[ -f "$WORK/build/elisac_stage1.o" ]]
 [[ ! -e "$WORK/build/.elisac-stage1-seed.lock" ]]
 [[ ! -e "$WORK/tmp/elisac-stage1-global-seed.lock" ]]
+FAKE_LINKER="$WORK/ld" \
+FAKE_LLVM_BINDIR="$WORK" \
+FAKE_LLVM_LIBDIR="$WORK/lib" \
 LLVM_CONFIG="$WORK/llvm-config" \
 ELISA_CLANG="$WORK/clang" \
 ELISA_LLVM_BIN_DIR="$WORK" \

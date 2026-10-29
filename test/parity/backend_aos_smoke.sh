@@ -25,7 +25,10 @@ clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 # the profiler ABI unconditionally), which is what kept this gate red.
 source "$ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$BUILD/llvm_validation_peel.o"
+CXX_RUNTIME=-lc++
+[[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
+clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$BUILD/llvm_validation_peel.o" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
 "$BUILD/driver" < "$ROOT/test/breadth/packed_aos_fixture.elisa" > "$BUILD/aos.ll"
 grep -q 'declare ptr @ctx_aos_store_new(ptr, i64)' "$BUILD/aos.ll"
 grep -q 'declare.*@ctx_aos_store_alloc(ptr, ptr)' "$BUILD/aos.ll"
