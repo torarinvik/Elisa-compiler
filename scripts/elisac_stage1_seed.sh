@@ -104,24 +104,24 @@ seed_build() {
   # termination recoverable without leaving a misleading apparently-valid artifact.
   seed_object="$ROOT/build/elisac_stage1.o.tmp.$$"
   seed_object_output="${ELISA_STAGE1_OBJECT:-$ROOT/build/elisac_stage1.o}"
-  seed_profile_hook_source="$ROOT/build/elisac_stage1_profile_hooks.tmp.$$.c"
+  seed_profile_hook_source=""
   ELISA_SEED_OUTPUT=""
   ELISA_SEED_OUTPUT_DIR=""
   ELISA_SEED_OBJECT="$seed_object"
-  ELISA_SEED_PROFILE_HOOK_SOURCE="$seed_profile_hook_source"
+  ELISA_SEED_PROFILE_HOOK_SOURCE=""
   ELISA_SEED_LLVM_BRIDGE="$ROOT/build/elisac_stage1_llvm_bridge.tmp.$$.o"
   cleanup_seed_lock() {
     if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
       rm -f "$ELISA_SEED_OUTPUT"
-    fi
-    if [[ -n "${ELISA_SEED_OUTPUT_DIR:-}" ]]; then
-      rmdir "$ELISA_SEED_OUTPUT_DIR" 2>/dev/null || true
     fi
     if [[ -n "${ELISA_SEED_OBJECT:-}" ]]; then
       rm -f "$ELISA_SEED_OBJECT"
     fi
     if [[ -n "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}" ]]; then
       rm -f "$ELISA_SEED_PROFILE_HOOK_SOURCE"
+    fi
+    if [[ -n "${ELISA_SEED_OUTPUT_DIR:-}" ]]; then
+      rmdir "$ELISA_SEED_OUTPUT_DIR" 2>/dev/null || true
     fi
     [[ -z "${ELISA_SEED_LLVM_BRIDGE:-}" ]] || rm -f "$ELISA_SEED_LLVM_BRIDGE"
     rm -f "$ELISA_SEED_LOCK_DIR/pid"
@@ -135,6 +135,10 @@ seed_build() {
   ELISA_SEED_OUTPUT_DIR="$(mktemp -d "${BIN}.tmp.XXXXXXXX")"
   seed_output="$ELISA_SEED_OUTPUT_DIR/$(basename "$BIN")"
   ELISA_SEED_OUTPUT="$seed_output"
+  # ELF symbol tables retain the C source basename. A PID in that name makes
+  # an otherwise identical executable miss the runtime's compiler digest.
+  seed_profile_hook_source="$ELISA_SEED_OUTPUT_DIR/elisac_stage1_profile_hooks.c"
+  ELISA_SEED_PROFILE_HOOK_SOURCE="$seed_profile_hook_source"
   libdir="$("$LLVM_CONFIG" --libdir)"
   if [[ ! -x "$BOOTSTRAP_BIN" ]]; then
     echo "seed requires an executable bootstrap compiler at ELISACORE_BIN=$BOOTSTRAP_BIN" >&2
@@ -351,6 +355,7 @@ seed_build() {
   mv -f "$seed_output" "$BIN"
   mv -f "$seed_object" "$seed_object_output"
   ELISA_SEED_OUTPUT=""
+  rm -f "$seed_profile_hook_source"
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
   echo "seed: wrote $BIN" >&2
   # The runtime object is built BY the product just written, from the same std it
