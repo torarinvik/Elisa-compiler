@@ -142,12 +142,18 @@ extend Semantic:
 
         def callable_function_declaration_visible(annotations: darray[Ast::EnumAnnotation]&, name: sview, candidate_module: sview, declaration_line: u32, declaration_offset: u32, lexical_module: sview) -> bool:
             can Abort.Panic:
-                return false if callable_function_declaration_is_static_inactive(annotations, name, candidate_module, declaration_line, declaration_offset)
+                return callable_function_declaration_visible_with(annotations, annotations, name, candidate_module, declaration_line, declaration_offset, lexical_module)
+
+        # DECLARATION_ROWS needs every row this declaration's own markers can match (see
+        # try_noncall_declaration_markers); module-alias visibility reads ANNOTATIONS.
+        def callable_function_declaration_visible_with(declaration_rows: darray[Ast::EnumAnnotation]&, annotations: darray[Ast::EnumAnnotation]&, name: sview, candidate_module: sview, declaration_line: u32, declaration_offset: u32, lexical_module: sview) -> bool:
+            can Abort.Panic:
+                return false if callable_function_declaration_is_static_inactive(declaration_rows, name, candidate_module, declaration_line, declaration_offset)
                 return false if not try_error_alias_module_visible(annotations, candidate_module, lexical_module)
                 exact_private: mutable bool = false
                 exact_public: mutable bool = false
                 legacy_private_marker: mutable bool = false
-                for annotation in annotations |exact_private, exact_public, legacy_private_marker, name, candidate_module, declaration_line, declaration_offset|:
+                for annotation in declaration_rows |exact_private, exact_public, legacy_private_marker, name, candidate_module, declaration_line, declaration_offset|:
                     continue if annotation.name != name or annotation.module != candidate_module or (annotation.owner != "__section_private" and annotation.owner != "__section_public")
                     offsets_known: bool = declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET and annotation.offset != FALLIBLE_FUNCTION_NO_OFFSET
                     exact_offset: bool = offsets_known and annotation.offset == declaration_offset
@@ -1811,6 +1817,61 @@ extend Semantic:
                         pass
                 return ("", 0.usize())
 
+        # Marker rows grouped by offset (each chain ascending) plus the offset-less rows.
+        struct TryMarkerOffsetIndex:
+            heads: mutable dict[u32, u32] = {}
+            tails: mutable dict[u32, u32] = {}
+            next: mutable darray[u32] = []
+            no_offset_rows: mutable darray[u32] = []
+
+        def try_noncall_marker_offset_index(markers: darray[Ast::EnumAnnotation]&, index: mutable TryMarkerOffsetIndex&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for row in 0..<markers.count |index, markers|:
+                    index.next.push(SYMBOL_INDEX_ROW_NONE)
+                    offset: u32 = markers[row].offset
+                    if offset == FALLIBLE_FUNCTION_NO_OFFSET:
+                        index.no_offset_rows.push(row.u32())
+                    else:
+                        if index.tails.get(offset) is tail_row:
+                            index.next[tail_row.usize()] <- row.u32()
+                        else:
+                            index.heads <- index.heads.put(offset, row.u32()) can Global{Read,Write}
+                        index.tails <- index.tails.put(offset, row.u32()) can Global{Read,Write}
+
+        # The marker rows a declaration at OFFSET can match, in marker order: rows at that
+        # offset, offset-less rows (matched by line), and the row after each kept
+        # `__error_return`, so callable_error_family_row still sees its true successor.
+        # Every per-declaration marker test either requires an equal offset or falls back
+        # to the line for offset-less rows, so this subset gives the same answers. An
+        # unknown declaration offset keeps every row.
+        def try_noncall_declaration_markers(markers: darray[Ast::EnumAnnotation]&, index: TryMarkerOffsetIndex&, offset: u32) -> darray[Ast::EnumAnnotation]:
+            can Memory.Allocate, Abort.Panic:
+                result: mutable darray[Ast::EnumAnnotation] = []
+                if offset == FALLIBLE_FUNCTION_NO_OFFSET or index.next.count != markers.count:
+                    for marker in markers |result|:
+                        result.push(marker)
+                    return result
+                cursor: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                if index.heads.get(offset) is head:
+                    cursor <- head
+                loose: mutable usize = 0
+                next_free: mutable usize = 0
+                while cursor != SYMBOL_INDEX_ROW_NONE or loose < index.no_offset_rows.count |cursor, loose, next_free, result, markers, index|:
+                    row: mutable usize = 0
+                    if cursor != SYMBOL_INDEX_ROW_NONE and (loose >= index.no_offset_rows.count or cursor < index.no_offset_rows[loose]):
+                        row <- cursor.usize()
+                        cursor <- index.next[cursor.usize()]
+                    else:
+                        row <- index.no_offset_rows[loose].usize()
+                        loose <- loose + 1
+                    continue if row < next_free
+                    result.push(markers[row])
+                    next_free <- row + 1
+                    if markers[row].name == "__error_return" and row + 1 < markers.count:
+                        result.push(markers[row + 1])
+                        next_free <- row + 2
+                return result
+
         # Callable fact collection reads only declaration markers: static-branch rows,
         # visibility sections, variadic rows, generic-parameter identities, and each
         # `__error_return` row with the family row that follows it. Keeping those rows in
@@ -1833,26 +1894,30 @@ extend Semantic:
                     result.push(annotations[row]) if keep[row]
                 return result
 
-        def try_noncall_callable_facts_add(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, environment: mutable TryNonCallErrorFamilyEnv&, current_module: sview @source, table: mutable SymbolTable&) -> void:
+        def try_noncall_callable_facts_add(declarations: darray[Ast::Decl], annotations: darray[Ast::EnumAnnotation]&, marker_index: TryMarkerOffsetIndex&, environment: mutable TryNonCallErrorFamilyEnv&, current_module: sview @source, table: mutable SymbolTable&) -> void:
             can Memory.Allocate, Abort.Panic:
-                for declaration in declarations |annotations, environment, current_module, table|:
+                for declaration in declarations |annotations, marker_index, environment, current_module, table|:
                     match declaration:
                         Decl.Func(name, params, return_type, _, _, _, function_position):
-                            continue if callable_function_declaration_is_static_inactive(annotations, name, current_module, function_position.line, function_position.offset)
-                            unresolved_static_branch: bool = callable_function_declaration_is_static_unresolved(annotations, name, current_module, function_position.line, function_position.offset)
+                            # Only rows at this declaration's offset (plus offset-less rows and each
+                            # `__error_return` successor) can match its markers; see
+                            # try_noncall_declaration_markers. Unknown offsets keep the full list.
+                            declaration_rows: darray[Ast::EnumAnnotation] = try_noncall_declaration_markers(annotations, marker_index, function_position.offset)
+                            continue if callable_function_declaration_is_static_inactive(declaration_rows, name, current_module, function_position.line, function_position.offset)
+                            unresolved_static_branch: bool = callable_function_declaration_is_static_unresolved(declaration_rows, name, current_module, function_position.line, function_position.offset)
                             family: mutable sview @source = ""
                             family_rows: mutable usize = 0
-                            for row in 0..<annotations.count |family, family_rows, annotations, name, function_position|:
-                                marker: Ast::EnumAnnotation = annotations[row]
+                            for row in 0..<declaration_rows.count |family, family_rows, declaration_rows, name, function_position|:
+                                marker: Ast::EnumAnnotation = declaration_rows[row]
                                 same_declaration: bool = marker.offset == function_position.offset if marker.offset != FALLIBLE_FUNCTION_NO_OFFSET and function_position.offset != FALLIBLE_FUNCTION_NO_OFFSET else marker.line == function_position.line
-                                if marker.owner == name and marker.name == "__error_return" and same_declaration and row + 1.usize() < annotations.count and callable_error_family_row(annotations, row + 1.usize()):
-                                    family <- annotations[row + 1.usize()].name if family_rows == 0 and not unresolved_static_branch
+                                if marker.owner == name and marker.name == "__error_return" and same_declaration and row + 1.usize() < declaration_rows.count and callable_error_family_row(declaration_rows, row + 1.usize()):
+                                    family <- declaration_rows[row + 1.usize()].name if family_rows == 0 and not unresolved_static_branch
                                     family_rows <- family_rows + 1.usize()
                             return_facts: mutable (known_nonfallible: bool, numeric: bool, integer: bool) = (false, false, false)
-                            if return_type is function_return_type and not try_noncall_function_return_is_generic(annotations, function_return_type, function_position, current_module):
+                            if return_type is function_return_type and not try_noncall_function_return_is_generic(declaration_rows, function_return_type, function_position, current_module):
                                 return_facts <- try_noncall_type_facts_with_aliases_at(function_return_type, environment, current_module)
                             generic_return_formal: mutable (name: sview @source, index: usize) = ("", 0.usize())
-                            generic_return_formal <- try_noncall_generic_return_formal(params, function_return_type, annotations, function_position, current_module) if return_type is function_return_type
+                            generic_return_formal <- try_noncall_generic_return_formal(params, function_return_type, declaration_rows, function_position, current_module) if return_type is function_return_type
                             first_param_name: mutable sview @source = ""
                             first_param_type_name: mutable sview @source = ""
                             first_param_is_generic: mutable bool = false
@@ -1860,17 +1925,17 @@ extend Semantic:
                             variadic: mutable bool = false
                             for parameter in params |has_default_param|:
                                 has_default_param <- true if parameter.has_default
-                            for marker in annotations |variadic, function_position|:
+                            for marker in declaration_rows |variadic, function_position|:
                                 variadic <- true if marker.owner == "__variadic" and marker.line == function_position.line and marker.offset == function_position.offset
                             if params.count > 0.usize():
                                 first_param_name <- params[0.usize()].name
                                 match params[0.usize()].type_expression:
                                     Expr.Ident(parameter_type, _):
                                         first_param_type_name <- parameter_type
-                                        first_param_is_generic <- try_noncall_function_return_is_generic(annotations, params[0.usize()].type_expression, function_position, current_module)
+                                        first_param_is_generic <- try_noncall_function_return_is_generic(declaration_rows, params[0.usize()].type_expression, function_position, current_module)
                                     _:
                                         pass
-                            callable_visible: bool = callable_function_declaration_visible(annotations, name, current_module, function_position.line, function_position.offset, environment.current_module)
+                            callable_visible: bool = callable_function_declaration_visible_with(declaration_rows, annotations, name, current_module, function_position.line, function_position.offset, environment.current_module)
                             environment.callable_names.push(name)
                             environment.callable_modules.push(current_module)
                             environment.callable_families.push(family)
@@ -1895,9 +1960,9 @@ extend Semantic:
                             # Decl.Module names are canonical qualified AST paths;
                             # try_noncall_module_path remains for relative imports.
                             nested_module: sview @source = module_name
-                            try_noncall_callable_facts_add(module_body, annotations, environment, nested_module, table)
+                            try_noncall_callable_facts_add(module_body, annotations, marker_index, environment, nested_module, table)
                         Decl.Scoped(scoped_body, _):
-                            try_noncall_callable_facts_add(scoped_body, annotations, environment, current_module, table)
+                            try_noncall_callable_facts_add(scoped_body, annotations, marker_index, environment, current_module, table)
                         _:
                             pass
 
