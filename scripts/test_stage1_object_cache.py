@@ -75,6 +75,98 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         return result.stdout
 
+    def test_parallel_custom_merger_is_not_cacheable(self):
+        root = self.cache_project()
+        compiler, source = root / "bin/compiler", root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        merger = root / "merger"
+        for content in ("first delegated linker", "replaced delegated linker"):
+            merger.write_text(content)
+            result = self.run_cache_key(compiler, source, root=root, extra_env={
+                "ELISA_STAGE1_JOBS": "2", "ELISA_LD": str(merger),
+            }, environment_status=None)
+            self.assertEqual(result.returncode, 7, "custom merger admitted without its dependency closure")
+        serial = self.run_cache_key(compiler, source, root=root, extra_env={
+            "ELISA_STAGE1_JOBS": "1", "ELISA_LD": str(merger),
+        }, environment_status=None)
+        self.assertEqual(serial.returncode, 0, serial.stderr.decode())
+
+    def test_parallel_path_launcher_is_not_cacheable(self):
+        root = self.cache_project()
+        compiler, source = root / "bin/compiler", root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        launcher = root / "bin/ld"
+        launcher.write_text("#!/bin/sh\nexec /custom/delegated-ld \"$@\"\n")
+        launcher.chmod(0o755)
+        result = self.run_cache_key(compiler, source, root=root, extra_env={
+            "ELISA_STAGE1_JOBS": "2suffix", "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
+        })
+        self.assertEqual(result.returncode, 7, "PATH launcher admitted without its delegate identity")
+
+    def test_default_parallel_merger_remains_cacheable(self):
+        root = self.cache_project()
+        compiler, source = root / "bin/compiler", root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        environment = {"ELISA_STAGE1_JOBS": "2", "PATH": "/usr/bin:/bin"}
+        first = self.run_cache_key(compiler, source, root=root, extra_env=environment)
+        second = self.run_cache_key(compiler, source, root=root, extra_env=environment)
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.assertEqual(second.returncode, 0, second.stderr.decode())
+        self.assertEqual(first.stdout, second.stdout)
+
+    def test_merger_job_parser_matches_backend_prefix_and_cap(self):
+        for value, expected in (("", 1), ("0", 1), ("1", 1), (" 2", 1),
+                                ("-2", 1), ("2suffix", 2), ("064", 64),
+                                ("999999999999999999999", 64), ("２", 1)):
+            self.assertEqual(cache.parallel_emit_jobs(value), expected, value)
+
+    def test_serial_merger_identity_needs_no_external_tool(self):
+        with patch.object(cache.shutil, "which", side_effect=AssertionError("serial lookup")):
+            self.assertEqual(cache.object_merger_key({"ELISA_STAGE1_JOBS": "1", "ELISA_LD": "anything"}),
+                             "serial-object-emission-v1")
+
+    def test_native_merger_same_mtime_replacement_changes_parallel_identity(self):
+        native = self.source.parent / "native-ld"
+        shutil.copyfile(shutil.which("true"), native)
+        native.chmod(0o755)
+        read_record = cache.native_merger_record
+        environment = {"ELISA_STAGE1_JOBS": "2", "PATH": "/usr/bin"}
+        with patch.object(cache.shutil, "which", return_value="/usr/bin/ld"), \
+                patch.object(cache, "native_merger_record", side_effect=lambda _: read_record(native)):
+            first = cache.object_merger_key(environment, "linux")
+            before = native.stat()
+            with native.open("ab") as output:
+                output.write(b"changed linker contents")
+            os.utime(native, ns=(before.st_atime_ns, before.st_mtime_ns))
+            second = cache.object_merger_key(environment, "linux")
+            self.assertNotEqual(first, second)
+            self.assertNotEqual(second, cache.object_merger_key(dict(environment, SDKROOT="other-sdk"), "linux"))
+        native.chmod(0o600)
+        with self.assertRaises(ValueError):
+            read_record(native)
+
+    def test_macos_merger_identity_includes_dispatch_and_selected_tool(self):
+        environment = {"ELISA_STAGE1_JOBS": "2", "PATH": "/usr/bin"}
+        contents = {"/usr/bin/ld": "dispatch", "/usr/bin/xcrun": "selector", "/selected/ld": "linker"}
+        def record(path):
+            return {"selected": path, "sha256": hashlib.sha256(contents[path].encode()).hexdigest()}
+        with patch.object(cache.shutil, "which", return_value="/usr/bin/ld"), \
+                patch.object(cache.os.path, "realpath", side_effect=lambda path: path), \
+                patch.object(cache, "native_merger_record", side_effect=record), \
+                patch.object(cache.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"/selected/ld\n")):
+            original = cache.object_merger_key(environment, "darwin")
+            for path in contents:
+                contents[path] += " replacement"
+                changed = cache.object_merger_key(environment, "darwin")
+                self.assertNotEqual(original, changed, path)
+                original = changed
+
+    def test_parallel_shell_overrides_and_empty_selector_decline(self):
+        for setting in ({"ELISA_LD": ""}, {"BASH_ENV": "/hook"}, {"ENV": "/hook"},
+                        {"BASH_FUNC_ld%%": "() { wrapper; }"}, {"ld": "()\n{ wrapper; }"}):
+            with self.assertRaises(ValueError):
+                cache.object_merger_key(dict(setting, ELISA_STAGE1_JOBS="2"))
+
     def fake_dependency_compiler(self, compiler, source):
         compiler.write_text(
             "#!/bin/bash\n"

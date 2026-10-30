@@ -368,6 +368,9 @@ stage1_cache_prepare() {
       printf '%s\0' "${normalized[@]}"
       printf '\n'
       stage1_cache_environment || exit 1
+      # Recomputed before restore/publication too: a stable selector must not
+      # conceal an in-place linker replacement or a changed developer toolchain.
+      python3 "$ROOT/scripts/stage1_object_cache.py" merger-key 2>/dev/null || exit 1
       if (( ${#auxiliary_inputs[@]} > 0 )); then
         shasum -a 256 "${auxiliary_inputs[@]}" || exit 1
       fi
