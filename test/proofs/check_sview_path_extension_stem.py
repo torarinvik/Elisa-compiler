@@ -85,7 +85,7 @@ if compact('return string_view_empty_at(p.data) if p.len < 0 or p.len.usize().i6
         or compact("assert slash >= -1 and slash < p.len") not in extension \
         or compact("assert name_start >= 0 and name_start <= p.len") not in extension \
         or compact("assert dot >= -1 and dot < p.len") not in extension \
-        or compact("if dot > name_start: trusted Unsafe.PointerCast: return StringView{data: p.data + sview_find_last_byte(p, 46).usize(), len: p.len - dot}") not in extension \
+        or compact("if dot > name_start: trusted Unsafe.PointerCast: return StringView{data: p.data + dot.usize(), len: p.len - dot}") not in extension \
         or compact("assert dot <= name_start") not in extension \
         or compact('return StringView{data: p.data, len: 0}') not in extension:
     raise SystemExit("Fs::extension no longer returns the final qualifying dot suffix")
@@ -98,10 +98,10 @@ if compact('return string_view_empty_at(p.data) if p.len < 0 or p.len.usize().i6
         or compact("assert dot == sview_find_last_byte(p, 46)") not in stem \
         or compact("assert name_start >= 0 and name_start <= p.len") not in stem \
         or compact("assert dot >= -1 and dot < p.len") not in stem \
-        or compact("if dot > name_start: if slash >= 0: trusted Unsafe.PointerCast: return StringView{data: p.data + (sview_find_last_byte(p, 47) + 1).usize(), len: dot - name_start}") not in stem \
+        or compact("if dot > name_start: if slash >= 0: trusted Unsafe.PointerCast: return StringView{data: p.data + (slash + 1).usize(), len: dot - name_start}") not in stem \
         or compact("assert slash == -1") not in stem \
         or compact("trusted Unsafe.PointerCast: return StringView{data: p.data, len: dot - name_start}") not in stem \
-        or compact("if slash >= 0: trusted Unsafe.PointerCast: return StringView{data: p.data + (sview_find_last_byte(p, 47) + 1).usize(), len: p.len - name_start}") not in stem \
+        or compact("if slash >= 0: trusted Unsafe.PointerCast: return StringView{data: p.data + (slash + 1).usize(), len: p.len - name_start}") not in stem \
         or compact("trusted Unsafe.PointerCast: return StringView{data: p.data, len: p.len - name_start}") not in stem:
     raise SystemExit("Fs::stem no longer cuts before the final qualifying dot")
 
