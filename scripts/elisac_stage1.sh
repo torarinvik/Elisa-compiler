@@ -295,7 +295,7 @@ stage1_cache_output_state=""
 # _FORCE_BOUNDS_CHECK, _OVERFLOW, _TARGET_CPU, ... from the environment, and a caller may set
 # them directly instead of through the CLI flags that are already in the argument vector.
 stage1_cache_environment() {
-  env | LC_ALL=C grep -E '^(ELISA_|ELISACORE_)' | LC_ALL=C grep -v '^ELISA_STAGE1_CACHE' | LC_ALL=C sort
+  python3 "$ROOT/scripts/stage1_object_cache.py" environment-key
 }
 stage1_cache_prepare() {
   [[ "${ELISA_STAGE1_CACHE:-0}" == 1 ]] || return 1
@@ -367,7 +367,7 @@ stage1_cache_prepare() {
       shasum -a 256 "$ROOT/scripts/elisac_stage1.sh" "$ROOT/scripts/stage1_object_cache.py" "$ROOT/scripts/platform.sh" | cut -d' ' -f1 || exit 1
       printf '%s\0' "${normalized[@]}"
       printf '\n'
-      stage1_cache_environment || true
+      stage1_cache_environment || exit 1
       if (( ${#auxiliary_inputs[@]} > 0 )); then
         shasum -a 256 "${auxiliary_inputs[@]}" || exit 1
       fi

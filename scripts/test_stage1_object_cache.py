@@ -35,16 +35,20 @@ class CacheIntegrityTest(unittest.TestCase):
             shutil.copyfile(scripts / name, root / "scripts" / name)
         return root
 
-    def run_cache_key(self, compiler, source, *, root=None, cwd=None, allow_stale=False, extra_env=None, cache_toggle="1"):
+    def run_cache_key(self, compiler, source, *, root=None, cwd=None, allow_stale=False, extra_env=None, cache_toggle="1", environment_status=0):
         repo_root = Path(__file__).resolve().parent.parent
         wrapper = (repo_root / "scripts/elisac_stage1.sh").read_text()
         function = re.search(r"stage1_cache_prepare\(\) \{\n.*?^\}", wrapper, re.M | re.S)
         self.assertIsNotNone(function)
+        if environment_status is None:
+            environment = re.search(r"stage1_cache_environment\(\) \{\n.*?^\}", wrapper, re.M | re.S).group()
+        else:
+            environment = f"stage1_cache_environment() {{ return {environment_status}; }}"
         script = (
             'set -uo pipefail\n'
             'driver_args=("$SOURCE_INPUT" -o "${OUTPUT_DEST:-output.o}")\n'
             'stage1_cache_out=""\n'
-            'stage1_cache_environment() { return 1; }\n'
+            + environment + '\n'
             + function.group()
             + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
         )
@@ -692,7 +696,7 @@ class CacheIntegrityTest(unittest.TestCase):
         source = root / "source.elisa"
         self.fake_dependency_compiler(compiler, source)
         profile = root / "profile.elisa"
-        script = 'set -uo pipefail\ndriver_args=("$SOURCE_INPUT" -o output.o -fprofile-use "$PROFILE_INPUT")\nstage1_cache_out=""\nstage1_cache_environment() { return 1; }\n' + function.group() + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
+        script = 'set -uo pipefail\ndriver_args=("$SOURCE_INPUT" -o output.o -fprofile-use "$PROFILE_INPUT")\nstage1_cache_out=""\nstage1_cache_environment() { return 0; }\n' + function.group() + '\nstage1_cache_prepare || exit 7\nprintf "%s" "$stage1_cache_key"\n'
         env = dict(os.environ, ROOT=str(root), BIN=str(compiler), ELISA_STAGE1_CACHE="1", SOURCE_INPUT=str(source), PROFILE_INPUT=str(profile))
         ordinary_script = script.replace(' -fprofile-use "$PROFILE_INPUT"', '')
         ordinary = subprocess.run(["bash", "-c", ordinary_script], env=env, check=True, capture_output=True)
@@ -852,11 +856,68 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertIsNotNone(function)
         values = []
         for forced in ("0", "1"):
-            env = {"PATH": os.environ["PATH"], "ELISACORE_FORCE_CONTRACTS": forced, "ELISA_STAGE1_CACHE_DIR": "/ignored/cache", "ELISA_STAGE1_CACHE": "1"}
+            env = {"PATH": os.environ["PATH"], "ROOT": str(root), "ELISACORE_FORCE_CONTRACTS": forced, "ELISA_STAGE1_CACHE_DIR": "/ignored/cache", "ELISA_STAGE1_CACHE": "1"}
             result = subprocess.run(["bash", "-c", function.group() + "\nstage1_cache_environment\n"], env=env, check=True, capture_output=True)
-            self.assertEqual(result.stdout, f"ELISACORE_FORCE_CONTRACTS={forced}\n".encode())
+            self.assertEqual(result.stdout, cache.environment_key({b"ELISACORE_FORCE_CONTRACTS": forced.encode()}))
             values.append(result.stdout)
         self.assertNotEqual(*values)
+
+    def test_multiline_environment_cannot_impersonate_another_setting(self):
+        root = Path(__file__).resolve().parent.parent
+        wrapper = (root / "scripts/elisac_stage1.sh").read_text()
+        function = re.search(r"stage1_cache_environment\(\) \{\n.*?^\}", wrapper, re.M | re.S)
+        self.assertIsNotNone(function)
+        configurations = (
+            {"ELISACORE_OVERFLOW": "wrap\nELISACORE_FORCE_BOUNDS_CHECK=1"},
+            {"ELISACORE_OVERFLOW": "wrap", "ELISACORE_FORCE_BOUNDS_CHECK": "1"},
+        )
+        identities = []
+        for configuration in configurations:
+            result = subprocess.run(
+                ["bash", "-c", function.group() + "\nstage1_cache_environment\n"],
+                env={"PATH": os.environ["PATH"], "ROOT": str(root), **configuration},
+                check=True, capture_output=True,
+            )
+            identities.append(result.stdout)
+        self.assertNotEqual(*identities)
+
+    def test_multiline_environment_changes_complete_cache_key(self):
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        keys = []
+        with patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True):
+            for configuration in (
+                {"ELISACORE_OVERFLOW": "wrap\nELISACORE_FORCE_BOUNDS_CHECK=1"},
+                {"ELISACORE_OVERFLOW": "wrap", "ELISACORE_FORCE_BOUNDS_CHECK": "1"},
+            ):
+                result = self.run_cache_key(compiler, source, root=root,
+                                            extra_env=configuration, environment_status=None)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertRegex(result.stdout.decode(), r"^[0-9a-f]{64}$")
+                keys.append(result.stdout)
+        self.assertNotEqual(*keys)
+
+    def test_environment_serialization_failure_declines_cache(self):
+        root = self.cache_project()
+        compiler = root / "bin" / "fake-compiler"
+        source = root / "source.elisa"
+        self.fake_dependency_compiler(compiler, source)
+        result = self.run_cache_key(compiler, source, root=root, environment_status=1)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse((self.source.parent / "dependency-compiler-calls").exists())
+
+    def test_environment_identity_preserves_bytes_and_empty_values(self):
+        self.assertNotEqual(cache.environment_key({}), cache.environment_key({b"ELISA_FLAG": b""}))
+        self.assertNotEqual(cache.environment_key({b"ELISA_FLAG": b"\xff"}),
+                            cache.environment_key({b"ELISA_FLAG": b"\xfe"}))
+        first = {b"ELISA_A": b"one\ntwo=three", b"ELISACORE_Z": b""}
+        self.assertEqual(cache.environment_key(first), cache.environment_key(dict(reversed(list(first.items())))))
+        self.assertEqual(cache.environment_key(first), cache.environment_key({
+            **first, b"ELISA_STAGE1_CACHE": b"1", b"ELISA_STAGE1_CACHE_DIR": b"/elsewhere", b"PATH": b"ignored",
+        }))
 
     def test_codegen_env_flags_participate_in_cache_identity(self):
         root = Path(__file__).resolve().parent.parent
@@ -864,9 +925,9 @@ class CacheIntegrityTest(unittest.TestCase):
         function = re.search(r"stage1_cache_environment\(\) \{\n.*?^\}", wrapper, re.M | re.S)
         self.assertIsNotNone(function)
         for name, value in (("ELISACORE_FAST_MATH", "1"), ("ELISACORE_STRICT_FP", "1"), ("ELISACORE_NOALIAS_MUTABLE_REFS", "1"), ("ELISACORE_FORCE_BOUNDS_CHECK", "1"), ("ELISACORE_OVERFLOW", "wrap"), ("ELISACORE_TARGET_CPU", "generic")):
-            env = {"PATH": os.environ["PATH"], name: value}
+            env = {"PATH": os.environ["PATH"], "ROOT": str(root), name: value}
             result = subprocess.run(["bash", "-c", function.group() + "\nstage1_cache_environment\n"], env=env, check=True, capture_output=True)
-            self.assertEqual(result.stdout, f"{name}={value}\n".encode(), name)
+            self.assertEqual(result.stdout, cache.environment_key({name.encode(): value.encode()}), name)
 
     def test_corruption_and_truncation(self):
         for payload in (b"corrupt", b"", b"x" * self.source.stat().st_size):

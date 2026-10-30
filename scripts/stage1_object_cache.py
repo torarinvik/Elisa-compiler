@@ -18,6 +18,22 @@ MAX_DEPENDENCY_INDEX_BYTES = 16 * 1024**2
 MAX_DEPENDENCIES = 100_000
 
 
+def environment_key(environ=None):
+    """Serialize exact compiler environment records without line-boundary ambiguity."""
+    if environ is None:
+        environ = os.environb if os.supports_bytes_environ else {
+            os.fsencode(name): os.fsencode(value) for name, value in os.environ.items()
+        }
+    records = [b"elisac-stage1-environment-v1\0"]
+    for name, value in sorted(environ.items()):
+        if (name.startswith((b"ELISA_", b"ELISACORE_"))
+                and not name.startswith(b"ELISA_STAGE1_CACHE")):
+            # OS environment names cannot contain '=' or NUL, and values cannot
+            # contain NUL. Newlines and non-UTF-8 value bytes remain significant.
+            records.append(name + b"=" + value + b"\0")
+    return b"".join(records)
+
+
 def file_identity(info):
     return (
         info.st_dev,
@@ -765,7 +781,12 @@ def publish(entry, output, key, stdout=None, stderr=None):
 if __name__ == "__main__":
     operation, *arguments = sys.argv[1:]
     try:
-        if operation == "dependency-key":
+        if operation == "environment-key":
+            if arguments:
+                raise ValueError("environment-key accepts no arguments")
+            sys.stdout.buffer.write(environment_key())
+            sys.exit(0)
+        elif operation == "dependency-key":
             index, base_key, root = arguments
             state = read_dependencies(index, base_key, root)
             if state is None:
