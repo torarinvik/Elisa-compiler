@@ -134,6 +134,27 @@ extend Semantic:
                         allocation_region_note(out, regions[row_index])
 
 
+        # allocation_regions_in_source_interval, binary-searching the first row when the
+        # offsets are known sorted.
+        def allocation_regions_in_indexed_interval(start_offset: u32, end_offset: u32, regions: darray[sview @source]&, offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, out: mutable darray[sview @source]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if not call_spans.offsets_sorted or call_spans.offsets_count != offsets.count:
+                    allocation_regions_in_source_interval(start_offset, end_offset, regions, offsets, out)
+                    return
+                return if offsets.count != regions.count or end_offset <= start_offset
+                low: mutable usize = 0
+                high: mutable usize = offsets.count
+                while low < high |low, high, offsets, start_offset|:
+                    middle: usize = low + (high - low) / 2
+                    if offsets[middle] < start_offset:
+                        low <- middle + 1
+                    else:
+                        high <- middle
+                row_index: mutable usize = low
+                while row_index < offsets.count and offsets[row_index] < end_offset |row_index, out, regions, offsets|:
+                    allocation_region_note(out, regions[row_index]) if not allocation_region_is_inline_effect_row(regions, offsets, row_index)
+                    row_index <- row_index + 1
+
         def allocation_source_interval_has_region(start_offset: u32, end_offset: u32, region: sview, regions: darray[sview @source]&, offsets: darray[u32]&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return false if offsets.count != regions.count or end_offset <= start_offset
@@ -143,10 +164,61 @@ extend Semantic:
                 return false
 
 
+        # The allocation walkers read call_spans only for `__call_source_span` rows, keyed by
+        # the call offset they describe. The entry points index just those rows once, so a
+        # call expression visits its own span rows instead of scanning every call in the file.
+        # `heads` names the newest row for an offset and `next` chains the older ones.
+        struct CallSourceSpanIndex:
+            rows: mutable darray[Ast::EnumAnnotation] = []
+            heads: mutable dict[u32, u32] = {}
+            next: mutable darray[u32] = []
+            # Whether the file's allocation offsets (of length offsets_count) never decrease.
+            # Sorted rows let an interval lookup binary-search its first row and stop at its
+            # end, visiting the same rows in the same order as a full scan.
+            offsets_sorted: mutable bool = false
+            offsets_count: mutable usize = 0
+
+        def allocation_fill_call_source_spans(annotations: darray[Ast::EnumAnnotation]&, offsets: darray[u32]&, call_spans: mutable CallSourceSpanIndex&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                sorted: mutable bool = true
+                for row in 1..<offsets.count |sorted, offsets|:
+                    sorted <- false if offsets[row] < offsets[row - 1]
+                call_spans.offsets_sorted <- sorted
+                call_spans.offsets_count <- offsets.count
+                for row in 0..<annotations.count |call_spans|:
+                    annotation: Ast::EnumAnnotation = annotations[row]
+                    if annotation.owner == "__call_source_span":
+                        older: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                        if call_spans.heads.get(annotation.offset) is head:
+                            older <- head
+                        call_spans.next.push(older)
+                        call_spans.heads <- call_spans.heads.put(annotation.offset, call_spans.rows.count.u32()) can Global{Read,Write}
+                        call_spans.rows.push(annotation)
+
+        # The newest call-source span recorded for the call at `offset`, or `fallback`.
+        # Newest is the last such row in annotation order, which is what a full scan kept.
+        def allocation_call_source_span(call_spans: CallSourceSpanIndex&, offset: u32, fallback: Ast::Pos) -> Ast::Pos:
+            can Abort.Panic:
+                if call_spans.heads.get(offset) is head:
+                    return call_spans.rows[head.usize()].pos
+                return fallback
+
+        # The largest end among the call-source spans recorded for the call at `offset`.
+        def allocation_call_source_end(call_spans: CallSourceSpanIndex&, offset: u32, end_offset: u32) -> u32:
+            can Abort.Panic:
+                result: mutable u32 = end_offset
+                row: mutable u32 = SYMBOL_INDEX_ROW_NONE
+                if call_spans.heads.get(offset) is head:
+                    row <- head
+                while row != SYMBOL_INDEX_ROW_NONE |result, row, call_spans|:
+                    result <- call_spans.rows[row.usize()].pos.end_offset if call_spans.rows[row.usize()].pos.end_offset > result
+                    row <- call_spans.next[row.usize()]
+                return result
+
         # `Ast::Pos` for postfix brace forms may be only the opening brace token. Extend an
         # initializer's end through its child expressions so a removed prefix `new[r]` stays
         # inside the bounded statement interval.
-        def allocation_expression_end_offset(expression: Ast::Expr, call_spans: darray[Ast::EnumAnnotation]&) -> u32:
+        def allocation_expression_end_offset(expression: Ast::Expr, call_spans: CallSourceSpanIndex&) -> u32:
             can Abort.Panic:
                 end_offset: mutable u32 = Ast::expr_pos(expression).end_offset
                 match expression:
@@ -154,8 +226,7 @@ extend Semantic:
                         child_end: mutable u32 = allocation_expression_end_offset(operand, call_spans)
                         end_offset <- child_end if child_end > end_offset
                     Expr.Call(callee, arguments, _, call_pos):
-                        for annotation in call_spans |end_offset, call_pos|:
-                            end_offset <- annotation.pos.end_offset if annotation.owner == "__call_source_span" and annotation.offset == call_pos.offset and annotation.pos.end_offset > end_offset
+                        end_offset <- allocation_call_source_end(call_spans, call_pos.offset, end_offset)
                         child_end: mutable u32 = allocation_expression_end_offset(callee, call_spans)
                         end_offset <- child_end if child_end > end_offset
                         for argument in arguments |end_offset, call_spans|:
@@ -253,7 +324,7 @@ extend Semantic:
                 return end_offset
 
 
-        def allocation_statements_end_offset(statements: darray[Ast::Stmt], call_spans: darray[Ast::EnumAnnotation]&) -> u32:
+        def allocation_statements_end_offset(statements: darray[Ast::Stmt], call_spans: CallSourceSpanIndex&) -> u32:
             can Abort.Panic:
                 end_offset: mutable u32 = 0
                 for statement in statements |end_offset, call_spans|:
@@ -304,17 +375,11 @@ extend Semantic:
         # Exact `new[region]` token rows inside a call's full parser-recorded source span.
         # A lone Ast::Pos token is sufficient only for an exact-token hit. Logical line
         # fallback is reserved for synthetic positions or legacy/misaligned metadata.
-        def allocation_regions_in_call_span(call_pos: Ast::Pos, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+        def allocation_regions_in_call_span(call_pos: Ast::Pos, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, out: mutable darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
-                span: mutable Ast::Pos = call_pos
-                for annotation in call_spans |span|:
-                    if annotation.owner == "__call_source_span" and annotation.offset == call_pos.offset:
-                        span <- annotation.pos
+                span: Ast::Pos = allocation_call_source_span(call_spans, call_pos.offset, call_pos)
                 if offsets.count == regions.count and lines.count == regions.count and span.end_offset > span.offset:
-                    for row_index in 0..<regions.count |out, offsets, span|:
-                        allocation_offset: u32 = offsets[row_index]
-                        if allocation_offset >= span.offset and allocation_offset < span.end_offset and not allocation_region_is_inline_effect_row(regions, offsets, row_index):
-                            allocation_region_note(out, regions[row_index])
+                    allocation_regions_in_indexed_interval(span.offset, span.end_offset, regions, offsets, call_spans, out)
                     return
                 if offsets.count == regions.count and lines.count == regions.count and call_pos.end_offset > call_pos.offset:
                     for row_index in 0..<regions.count |out, offsets, call_pos|:
@@ -326,10 +391,10 @@ extend Semantic:
                     allocation_region_note(out, regions[row_index]) if row_index < lines.count and lines[row_index] == call_pos.line and not allocation_region_is_inline_effect_row(regions, offsets, row_index)
 
 
-        def allocation_regions_in_expression(expression: Ast::Expr, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+        def allocation_regions_in_expression(expression: Ast::Expr, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, out: mutable darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 position: Ast::Pos = Ast::expr_pos(expression)
-                allocation_regions_in_source_interval(position.offset, position.end_offset, regions, offsets, out)
+                allocation_regions_in_indexed_interval(position.offset, position.end_offset, regions, offsets, call_spans, out)
                 match expression:
                     Expr.RegionNew(operand, region, _):
                         allocation_region_note(out, region)
@@ -399,7 +464,7 @@ extend Semantic:
                         pass
 
 
-        def allocation_regions_in_statements(statements: darray[Ast::Stmt], regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+        def allocation_regions_in_statements(statements: darray[Ast::Stmt], regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, out: mutable darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |regions, lines, offsets, call_spans, out|:
                     match statement:
@@ -431,20 +496,20 @@ extend Semantic:
                             pass
 
 
-        def region_expression_has_recorded_allocation(expression: Ast::Expr, region: sview, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&) -> bool:
+        def region_expression_has_recorded_allocation(expression: Ast::Expr, region: sview, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: CallSourceSpanIndex&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 found_regions: mutable darray[sview @source] = []
                 allocation_regions_in_expression(expression, regions, lines, offsets, call_spans, found_regions)
                 return any found_region in found_regions where found_region == region
 
 
-        def region_expression_or_statement_has_recorded_allocation(expression: Ast::Expr, region: sview, statement_start: u32, statement_end: u32, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&) -> bool:
+        def region_expression_or_statement_has_recorded_allocation(expression: Ast::Expr, region: sview, statement_start: u32, statement_end: u32, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: CallSourceSpanIndex&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return true if region_expression_has_recorded_allocation(expression, region, regions, lines, offsets, call_spans)
                 return allocation_source_interval_has_region(statement_start, statement_end, region, regions, offsets)
 
 
-        def region_expression_recorded_allocations(expression: Ast::Expr, statement_start: u32, statement_end: u32, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, out: mutable darray[sview @source]&) -> void:
+        def region_expression_recorded_allocations(expression: Ast::Expr, statement_start: u32, statement_end: u32, regions: darray[sview @source]&, lines: darray[u32]&, offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, out: mutable darray[sview @source]&) -> void:
             can Memory.Allocate, Abort.Panic:
                 allocation_regions_in_expression(expression, regions, lines, offsets, call_spans, out)
                 allocation_regions_in_source_interval(statement_start, statement_end, regions, offsets, out)
@@ -732,7 +797,7 @@ extend Semantic:
         # Whether a value contains a region allocation flowing through a known
         # reference-returning call. The recorded call span still captures the allocation token
         # when parser call-argument lowering erases the `RegionNew` wrapper.
-        def region_expression_contains_reference_call_allocation(expression: Ast::Expr, region: sview, declarations: darray[Ast::Decl], allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&) -> bool:
+        def region_expression_contains_reference_call_allocation(expression: Ast::Expr, region: sview, declarations: darray[Ast::Decl], allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: CallSourceSpanIndex&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 match expression:
                     Expr.Call(callee, arguments, argument_names, call_line):
@@ -800,7 +865,7 @@ extend Semantic:
                         pass
 
 
-        def walk_local_region_dependencies(statements: darray[Ast::Stmt], region: sview @source, return_carries_reference: bool, declarations: darray[Ast::Decl], allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, tainted: mutable darray[sview]&, table: lmut SymbolTable) -> void:
+        def walk_local_region_dependencies(statements: darray[Ast::Stmt], region: sview @source, return_carries_reference: bool, declarations: darray[Ast::Decl], allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, tainted: mutable darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |tainted, table|:
                     match statement:
@@ -861,7 +926,7 @@ extend Semantic:
                             pass
 
 
-        def check_local_region_dependencies(statements: darray[Ast::Stmt], return_type: Ast::Expr, declarations: darray[Ast::Decl], allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        def check_local_region_dependencies(statements: darray[Ast::Stmt], return_type: Ast::Expr, declarations: darray[Ast::Decl], allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
@@ -886,7 +951,7 @@ extend Semantic:
                             pass
 
 
-        def check_region_assignment_statements(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, function_line: u32, function_offset: u32, return_type: Ast::Expr, table: lmut SymbolTable) -> void:
+        def check_region_assignment_statements(statements: darray[Ast::Stmt], declarations: darray[Ast::Decl]&, annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, function_line: u32, function_offset: u32, return_type: Ast::Expr, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table|:
                     match statement:
@@ -942,7 +1007,7 @@ extend Semantic:
                             pass
 
 
-        def check_region_assignment_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: darray[Ast::EnumAnnotation]&, table: lmut SymbolTable) -> void:
+        def check_region_assignment_declarations(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, allocation_regions: darray[sview @source]&, allocation_lines: darray[u32]&, allocation_offsets: darray[u32]&, call_spans: CallSourceSpanIndex&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table|:
                     match declaration:
