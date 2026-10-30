@@ -9,13 +9,13 @@ set -euo pipefail
 EXPECTED_CANONICAL_FINGERPRINT="${ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT:-}"
 unset ELISA_BENCH_EXPECT_CANONICAL_FINGERPRINT
 
-# Remove inherited DYLD_*/LD_* overrides and allocator tuning before any
+# Remove inherited driver/loader overrides and allocator tuning before any
 # compiler, linker, preflight executable, or timed executable is launched. Keep
 # bare LD intact for linker selection.
 # Keep inherited variable names for the run manifest without recording values.
 BENCH_ENV_OVERRIDES_CLEARED=()
 for env_name in \
-  "${!DYLD_@}" "${!LD_@}" GLIBC_TUNABLES \
+  "${!DYLD_@}" "${!LD_@}" GLIBC_TUNABLES CCC_OVERRIDE_OPTIONS \
   "${!MALLOC_@}" "${!Malloc@}" "${!JEMALLOC_@}" "${!TCMALLOC_@}" "${!MIMALLOC_@}"; do
   [[ -n "$env_name" ]] || continue
   if printenv "$env_name" >/dev/null 2>&1; then
