@@ -59,8 +59,20 @@ def main():
         assert recovered.returncode == repeated.returncode == 0
         assert recovered.stdout == repeated.stdout and recovered.stderr == repeated.stderr
         assert (root / "stats").read_text().splitlines() == [
-            "miss\tsemantic\t-", "miss\tsemantic\t-", "hit\tsemantic\t-"
+            "miss\tsemantic\t-", "miss\tsemantic\t-", "miss\tsemantic\t-"
         ]
+        # Script launchers cannot attest their delegated tool. Verify the
+        # positive caching path separately with the actual native solver.
+        env["ELISA_Z3"] = z3
+        native = run()
+        native_repeat = run()
+        assert native.returncode == native_repeat.returncode == 0
+        assert native.stdout == recovered.stdout and native.stderr == recovered.stderr
+        assert native_repeat.stdout == native.stdout and native_repeat.stderr == native.stderr
+        assert (root / "stats").read_text().splitlines()[-2:] == [
+            "miss\tsemantic\t-", "hit\tsemantic\t-"
+        ]
+        env["ELISA_Z3"] = str(solver)
         # A same-path replacement must invalidate the proof-backed answer.
         solver.write_text("#!/bin/sh\nexit 1\n")
         replaced = run()
@@ -90,7 +102,7 @@ def main():
         assert changed_selection.returncode == cold_selection.returncode != 0
         assert changed_selection.stderr == cold_selection.stderr
         assert (root / "stats").read_text().splitlines()[-4:] == [
-            "miss\tsemantic\t-", "hit\tsemantic\t-", "miss\tsemantic\t-", "bypass\t-\t-"
+            "miss\tsemantic\t-", "miss\tsemantic\t-", "miss\tsemantic\t-", "bypass\t-\t-"
         ]
     print("transient SMT failure is retried before a certified response is cached")
 

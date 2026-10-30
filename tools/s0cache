@@ -21,6 +21,13 @@ unchanged question cannot change, so this caches (rc, stdout, stderr, the -o art
 Only read-only single-input emit modes are cached; anything that links, runs, serves, filters,
 takes include dirs, reads stdin, or sets a BYPASS_ENV variable (one that makes the oracle write
 a side file or print nondeterministic timing) passes straight through.
+Object-mode caching requires an explicit ELISACORE_CODEGEN_JOBS integer within the signed
+32-bit range. Calls with an implicit host worker count or a non-empty ELISA_LD override pass
+through, as do calls whose default ld is outside the platform system tool directory. Selector
+dependencies must be native images; script launchers are uncertifiable. Compiled launchers and
+dynamic-library dependencies remain a trust boundary until their full closure is recorded.
+`ELISA_S0_REAL` is trusted to name the direct compiler executable; its own bytes are hashed,
+but launcher delegation behind that path is not followed transitively.
 
 Textual modes normalize closure paths relative to the input directory or REPO_ROOT, so the same
 probe written into per-worker `mktemp` directories can share an entry. Stage0 diagnostics and
@@ -32,7 +39,7 @@ recomputed on every call. ELISA_S0_CACHE=0 bypasses; ELISA_S0_CACHE_DIR relocate
 ~/.cache/elisa-s0cache). ELISA_S0_CACHE_STATS=<file> appends one `hit|miss|bypass` line per call
 so a gate run can report its hit rate.
 """
-import hashlib, json, os, shutil, stat, subprocess, sys, tempfile
+import hashlib, json, os, shutil, stat, subprocess, sys, tempfile, threading
 
 SAFE_MODES = {"obj", "llvm", "bc", "ast", "lowered", "semantic", "facts", "unsafe", "progress",
               "fmt", "doc", "iface", "deps", "deps-json", "ir", "packed", "header", "tokens",
@@ -86,7 +93,8 @@ BYPASS_ENV = (
     "ELISACORE_DUMP_MODULE_ON_VERIFY_FAILURE", "ELISACORE_KEEP_TEST_TEMP",
     "ELISACORE_BUILD_TIMING", "ELISACORE_TEST_TIMING", "ELISACORE_CACHE_DEBUG",
     "ELISACORE_TEST_CACHE_DEBUG", "ELISACORE_TEST_PHASE_DEBUG", "ELISACORE_ANALYSIS_CACHE_DEBUG",
-    "ELISACORE_BLOCKPROFILE", "ELISACORE_CPUPROFILE", "ELISACORE_CPUPROFILE_SECONDS",
+    "ELISACORE_PARTITION_DECLINE_DEBUG", "ELISACORE_BLOCKPROFILE",
+    "ELISACORE_CPUPROFILE", "ELISACORE_CPUPROFILE_SECONDS",
     "ELISACORE_GOROUTINEPROFILE", "ELISACORE_LEXER_CAPACITY_REPORT", "ELISACORE_LLVM_PASS_DEBUG",
     "ELISACORE_MEMPROFILE", "ELISACORE_MEMPROFILE_SECONDS", "ELISACORE_PART_KEEP",
     "ELISACORE_RETAINED_HEAPPROFILE", "ELISACORE_RETAINED_PROFILE_DIR",
@@ -103,6 +111,34 @@ BYPASS_ENV = (
 IN_MARK, DIR_MARK = b"\x00s0cache:in\x00", b"\x00s0cache:dir\x00"
 RESUMABLE_ANALYSIS_MARKER = b"build incomplete:"
 BYPASS_PRESENT_ENV = ("ELISACORE_RETAINED_SERVER", "ELISACORE_CACHE_CERTIFICATE")
+NATIVE_TOOL_MAGICS = {
+    b"\x7fELF", b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+}
+
+
+def is_native_tool_image(path):
+    descriptor = None
+    try:
+        nonblocking = getattr(os, "O_NONBLOCK", None)
+        if nonblocking is None:
+            return False
+        flags = os.O_RDONLY | nonblocking
+        descriptor = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return False
+        with os.fdopen(descriptor, "rb") as executable:
+            descriptor = None
+            return executable.read(4) in NATIVE_TOOL_MAGICS
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def stat_line(kind, mode="-", why="-"):
@@ -118,6 +154,301 @@ def stat_line(kind, mode="-", why="-"):
 def passthrough(real, argv, mode="-", why="-"):
     stat_line("bypass", mode, why)
     os.execv(real, [real] + argv)
+
+
+def _write_spool(spool, data):
+    view = memoryview(data)
+    total = 0
+    while view:
+        try:
+            written = spool.write(view)
+        except (OSError, ValueError, TypeError):
+            return total, False
+        if written is None or written <= 0:
+            return total, False
+        total += written
+        view = view[written:]
+    return total, True
+
+
+def _mark_capture_reason(state, reason, *, replace=False):
+    if state[0] is None or replace:
+        state[0] = reason
+
+
+def _write_sink(sink, data):
+    view = memoryview(data)
+    total = 0
+    while view:
+        try:
+            written = sink.write(view)
+        except (OSError, ValueError, TypeError):
+            return total, False
+        if written is None or written <= 0:
+            return total, False
+        total += written
+        view = view[written:]
+    return total, True
+
+
+def _copy_spool_to_sink(spool, sink, limit=CACHE_TEXT_MAX_BYTES, expected=None):
+    """Copy a bounded spool and return the number of bytes delivered."""
+    sent = 0
+    try:
+        size = min(os.fstat(spool.fileno()).st_size, limit)
+        spool.seek(0)
+        while sent < size:
+            chunk = spool.read(min(1024 * 1024, size - sent))
+            if not chunk:
+                return sent, False
+            if expected is not None and chunk != bytes(expected[sent:sent + len(chunk)]):
+                return sent, False
+            written, complete = _write_sink(sink, chunk)
+            sent += written
+            if not complete:
+                return sent, False
+        return sent, True
+    except (OSError, ValueError, TypeError):
+        return sent, False
+
+
+def _recover_spool_to_sink(spool, sink, sent=0, limit=CACHE_TEXT_MAX_BYTES):
+    """Retry a failed spool replay with positioned reads, if available."""
+    try:
+        size = min(os.fstat(spool.fileno()).st_size, limit)
+        if sent > size:
+            return False
+        if hasattr(os, "pread"):
+            while sent < size:
+                chunk = os.pread(spool.fileno(), min(1024 * 1024, size - sent), sent)
+                if not chunk:
+                    return False
+                written, complete = _write_sink(sink, chunk)
+                sent += written
+                if not complete:
+                    return False
+            return True
+        spool.seek(sent)
+        while sent < size:
+            chunk = spool.read(min(1024 * 1024, size - sent))
+            if not chunk:
+                return False
+            written, complete = _write_sink(sink, chunk)
+            sent += written
+            if not complete:
+                return False
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _fallback_spool_to_sink(spool, sink, captured_data, sent=0):
+    if captured_data is not None:
+        if sent > len(captured_data):
+            return False
+        written, complete = _write_sink(sink, captured_data[sent:])
+        return complete and sent + written == len(captured_data)
+    return _recover_spool_to_sink(spool, sink, sent)
+
+
+def _drain_child_stream(source, spool, sink, capture_state, already_replayed,
+                        spooled_size, captured_prefix):
+    """Spool child output while retaining only a cache-sized replay prefix in RAM."""
+    try:
+        while True:
+            # read1() maps to one underlying read on the subprocess pipe; plain
+            # read(n) may wait for n bytes and let a small-output child block.
+            chunk = source.read1(1024 * 1024)
+            if not chunk:
+                break
+            if already_replayed[0]:
+                written, complete = _write_sink(sink, chunk)
+                if not complete or written != len(chunk):
+                    _mark_capture_reason(capture_state, "output-write", replace=True)
+                try:
+                    sink.flush()
+                except (OSError, ValueError):
+                    _mark_capture_reason(capture_state, "output-write", replace=True)
+                continue
+            remaining = CACHE_TEXT_MAX_BYTES - spooled_size[0]
+            stored = chunk[:remaining]
+            overflow = chunk[remaining:]
+            written, stored_all = _write_spool(spool, stored)
+            spooled_size[0] += written
+            # Keep a bounded memory copy as an emergency replay source. The disk
+            # spool normally handles output; this preserves the compiler's bytes
+            # if a later spool read fails after the child has exited.
+            captured_prefix.extend(stored[:written])
+            if not stored_all:
+                # If scratch storage fails, replay the saved prefix and stream
+                # the rest. The compiler's status and output survive; this call
+                # is not eligible for cache publication.
+                _mark_capture_reason(capture_state, "spool-write")
+                overflow = chunk[written:]
+            elif overflow:
+                # Output beyond the cache bound is never a candidate. Replay the
+                # bounded prefix and pass subsequent bytes through without using
+                # more temporary storage.
+                _mark_capture_reason(capture_state, "output-limit")
+            else:
+                continue
+            sent, replayed = _copy_spool_to_sink(spool, sink, expected=captured_prefix)
+            if not replayed or sent != len(captured_prefix):
+                _mark_capture_reason(capture_state, "spool-replay", replace=True)
+                _fallback_spool_to_sink(spool, sink, captured_prefix, sent)
+            already_replayed[0] = True
+            written, complete = _write_sink(sink, overflow)
+            if not complete or written != len(overflow):
+                _mark_capture_reason(capture_state, "output-write", replace=True)
+            try:
+                sink.flush()
+            except (OSError, ValueError):
+                _mark_capture_reason(capture_state, "output-write", replace=True)
+    except (OSError, ValueError):
+        # A broken capture pipe is a cache decline. Closing it lets the child see
+        # the same write failure it would see if the caller closed its output.
+        _mark_capture_reason(capture_state, "pipe-read", replace=True)
+    finally:
+        try:
+            source.close()
+        except (OSError, ValueError):
+            _mark_capture_reason(capture_state, "pipe-close", replace=True)
+
+
+def _abort_spooled_child(proc, readers):
+    """Reap a child and join any readers if capture setup or waiting fails."""
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except (OSError, ValueError):
+        pass
+    try:
+        proc.wait()
+    except BaseException:
+        pass
+    streams = (getattr(proc, "stdout", None), getattr(proc, "stderr", None))
+    for index, stream in enumerate(streams):
+        if stream is None:
+            continue
+        reader = readers[index] if index < len(readers) else None
+        if reader is None or reader.ident is None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+    for reader in readers:
+        if reader.ident is not None:
+            try:
+                reader.join()
+            except RuntimeError:
+                pass
+
+
+def run_spooled(real, argv, env):
+    """Run with communicate()-like capture semantics and bounded in-memory output."""
+    stdout_spool = stderr_spool = None
+    try:
+        stdout_spool = tempfile.TemporaryFile(mode="w+b", buffering=0)
+        stderr_spool = tempfile.TemporaryFile(mode="w+b", buffering=0)
+    except OSError:
+        if stdout_spool is not None:
+            try:
+                stdout_spool.close()
+            except Exception:
+                pass
+        if stderr_spool is not None:
+            try:
+                stderr_spool.close()
+            except Exception:
+                pass
+        # If temporary storage is unavailable, preserve compiler output by letting
+        # it inherit the caller's descriptors. This result cannot be admitted to cache.
+        proc = subprocess.Popen([real] + argv, stdin=subprocess.DEVNULL, env=env)
+        proc.wait()
+        proc.stdout_data = proc.stderr_data = None
+        proc.output_spools = None
+        proc.output_capture_complete = False
+        proc.output_capture_reason = "spool-create"
+        return proc
+
+    proc = None
+    readers = []
+    try:
+        proc = subprocess.Popen([real] + argv, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        capture_state = [None]
+        already_replayed = [[False], [False]]
+        spooled_sizes = [[0], [0]]
+        captured_prefixes = [bytearray(), bytearray()]
+        readers = [
+            threading.Thread(target=_drain_child_stream,
+                             args=(proc.stdout, stdout_spool, sys.stdout.buffer,
+                                   capture_state, already_replayed[0], spooled_sizes[0],
+                                   captured_prefixes[0])),
+            threading.Thread(target=_drain_child_stream,
+                             args=(proc.stderr, stderr_spool, sys.stderr.buffer,
+                                   capture_state, already_replayed[1], spooled_sizes[1],
+                                   captured_prefixes[1])),
+        ]
+        for reader in readers:
+            reader.start()
+        proc.wait()
+        for reader in readers:
+            reader.join()
+        # The bounded bytearrays are exact copies of everything admitted to the
+        # spool. Keep them as the cache/replay source so a later disk read failure
+        # cannot discard output after the compiler has already exited.
+        proc.stdout_data, proc.stderr_data = captured_prefixes
+        proc.output_capture_reason = capture_state[0]
+        proc.output_capture_complete = capture_state[0] is None
+        proc.output_spools = (stdout_spool, stderr_spool,
+                              [flag[0] for flag in already_replayed])
+        return proc
+    except BaseException:
+        if proc is not None:
+            _abort_spooled_child(proc, readers)
+        for spool in (stdout_spool, stderr_spool):
+            try:
+                spool.close()
+            except Exception:
+                pass
+        raise
+
+
+def replay_spooled_output(proc):
+    spools = getattr(proc, "output_spools", None)
+    if spools is None:
+        return
+    stdout_spool, stderr_spool, already_replayed = spools
+    try:
+        # Under-bound streams retain the wrapper's original stdout-then-stderr
+        # replay after the child exits. Over-bound streams already replayed their
+        # prefix and passed the remainder through live.
+        for index, (spool, sink, data) in enumerate((
+            (stdout_spool, sys.stdout.buffer, getattr(proc, "stdout_data", None)),
+            (stderr_spool, sys.stderr.buffer, getattr(proc, "stderr_data", None)),
+        )):
+            if already_replayed[index]:
+                continue
+            sent, replayed = _copy_spool_to_sink(spool, sink, expected=data)
+            if not replayed or (data is not None and sent != len(data)):
+                proc.output_capture_complete = False
+                proc.output_capture_reason = "spool-replay"
+                _fallback_spool_to_sink(spool, sink, data, sent)
+            try:
+                sink.flush()
+            except (OSError, ValueError):
+                proc.output_capture_complete = False
+                proc.output_capture_reason = "output-write"
+    finally:
+        for spool in (stdout_spool, stderr_spool):
+            try:
+                spool.close()
+            except Exception:
+                proc.output_capture_complete = False
+                if proc.output_capture_reason is None:
+                    proc.output_capture_reason = "spool-close"
+        proc.output_spools = None
 
 
 def repo_root():
@@ -147,7 +478,7 @@ def unmask(data, inpath, base):
 
 
 def include_closure(root):
-    """Ordered list of (abspath, bytes) for root and its transitive includes, or None."""
+    """Ordered (abspath, bytes, identity) triples for source and includes, or None."""
     out, seen, stack = [], set(), [os.path.abspath(root)]
     total_bytes = 0
     while stack:
@@ -181,7 +512,7 @@ def include_closure(root):
         except OSError:
             return None
         total_bytes += len(data)
-        out.append((path, data))
+        out.append((path, data, identity(after)))
         base = os.path.dirname(path)
         for raw in data.split(b"\n"):
             line = raw.strip()
@@ -219,13 +550,45 @@ def include_closure(root):
     return out
 
 
-def binary_hash(real):
-    """sha256 of stage0, memoised by its path and filesystem change identity."""
-    st = os.stat(real)
+def include_closure_unchanged(closure):
+    """Reject reuse if any source/include inode changed since key construction."""
+    try:
+        return all(regular_file_identity(path) == identity
+                   for path, _, identity in closure)
+    except OSError:
+        return False
+
+
+def binary_hash(real, *, require_native=False):
+    """Hash one stable regular tool file, optionally requiring a native image."""
     identity = lambda info: (info.st_dev, info.st_ino, info.st_size,
                              info.st_mtime_ns, info.st_ctime_ns)
-    if not stat.S_ISREG(st.st_mode):
+    before = os.stat(real)
+    if not stat.S_ISREG(before.st_mode):
         raise OSError("tool is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(real, flags)
+    try:
+        source = os.fdopen(descriptor, "rb")
+        descriptor = None
+        with source as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or identity(before) != identity(st):
+                raise OSError("tool changed while opening")
+            first_bytes = f.read(4)
+            if require_native and first_bytes not in NATIVE_TOOL_MAGICS:
+                raise OSError("tool is not a native image")
+            f.seek(0)
+            return _binary_hash_open_file(real, f, st, identity)
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _binary_hash_open_file(real, source, st, identity):
     root = cache_root()
     # mtime and size alone are not enough: replacing a same-size compiler binary
     # and restoring its mtime would otherwise keep returning the old content hash.
@@ -236,18 +599,16 @@ def binary_hash(real):
     try:
         cached = read_cache_file_bounded(memo, 65).decode("ascii").strip()
         if (len(cached) == 64 and all(char in "0123456789abcdef" for char in cached)
+                and identity(os.fstat(source.fileno())) == identity(st)
                 and identity(os.stat(real)) == identity(st)):
             return cached
     except (OSError, ValueError, UnicodeDecodeError):
         pass
     h = hashlib.sha256()
-    with open(real, "rb") as f:
-        if identity(os.fstat(f.fileno())) != identity(st):
-            raise OSError("tool changed while opening")
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-        if identity(os.fstat(f.fileno())) != identity(st):
-            raise OSError("tool changed while hashing")
+    for chunk in iter(lambda: source.read(1 << 20), b""):
+        h.update(chunk)
+    if identity(os.fstat(source.fileno())) != identity(st):
+        raise OSError("tool changed while hashing")
     if identity(os.stat(real)) != identity(st):
         raise OSError("tool changed after hashing")
     digest = h.hexdigest()
@@ -336,7 +697,8 @@ def valid_certificate(data, pid=None):
         if certificate.get("version") != 3:
             return False
         certificate_pid = certificate.get("pid")
-        if not isinstance(certificate_pid, int):
+        # bool is an int subclass in Python and JSON true decodes to True.
+        if type(certificate_pid) is not int:
             return False
         if certificate_pid <= 0 or (pid is not None and certificate_pid != pid):
             return False
@@ -352,7 +714,8 @@ def valid_certificate(data, pid=None):
                 if selector == "@llc":
                     selected = shutil.which("llc")
                     if selected is None:
-                        selected = next((p for p in ("/opt/homebrew/opt/llvm/bin/llc", "/usr/local/opt/llvm/bin/llc") if os.path.exists(p)), None)
+                        selected = next((p for p in ("/opt/homebrew/opt/llvm/bin/llc", "/usr/local/opt/llvm/bin/llc")
+                                         if os.path.isfile(p) and os.access(p, os.X_OK)), None)
                 elif selector == "@merger":
                     fields = os.environ.get("ELISA_LD", "").split()
                     selected = shutil.which(fields[0] if fields else "ld")
@@ -372,11 +735,53 @@ def valid_certificate(data, pid=None):
                     selected = shutil.which(selector)
                 if not selected or os.path.abspath(selected) != path:
                     return False
-            if binary_hash(path) != digest:
+            if binary_hash(path, require_native=bool(selector)) != digest:
+                # Hashing a script launcher cannot identify the executable it
+                # delegates to. Such tool selectors are not certifiable here.
                 return False
         return True
     except (OSError, ValueError, TypeError, KeyError, AttributeError, UnicodeError):
         return False
+
+
+def explicit_codegen_jobs_setting():
+    """Whether Core will use the keyed worker setting instead of its host default."""
+    text = os.environ.get("ELISACORE_CODEGEN_JOBS", "").strip()
+    if not text:
+        return False
+    digits = text[1:] if text[:1] in ("+", "-") else text
+    if not digits or any(char < "0" or char > "9" for char in digits):
+        return False
+    try:
+        value = int(text, 10)
+    except ValueError:
+        return False
+    # Go's strconv.Atoi uses the compiler binary's int width. The wrapper may
+    # run under a different architecture (for example under translation), so
+    # admit only values valid on both 32-bit and 64-bit hosts; larger explicit
+    # values safely fall back to Core instead of guessing.
+    return -(1 << 31) <= value <= (1 << 31) - 1
+
+
+def default_linker_command_is_cacheable():
+    """Accept only a native linker from the platform's system tool directory."""
+    selected = shutil.which("ld")
+    if selected is None:
+        return False
+    resolved = os.path.realpath(selected)
+    if sys.platform == "darwin":
+        if resolved != "/usr/bin/ld":
+            return False
+    elif sys.platform.startswith("linux"):
+        if not any(resolved == root or resolved.startswith(root + os.sep)
+                   for root in ("/usr/bin", "/bin")):
+            return False
+    else:
+        return False
+    name = os.path.basename(selected).lower()
+    if name != "ld":
+        return False
+    return is_native_tool_image(selected)
 
 
 def main():
@@ -414,6 +819,20 @@ def main():
         suffix = ".o" if mode == "obj" else ".bc"
         base = os.path.splitext(inputs[0])[0]
         output = (base or inputs[0]) + suffix
+    if mode == "obj" and not explicit_codegen_jobs_setting():
+        # Core's default worker count comes from runtime.NumCPU(). The outer
+        # cache cannot safely infer that value on a shared cache root, so let
+        # Core resolve it and use its own count-aware object-cache identity.
+        passthrough(real, argv, mode, "implicit-codegen-jobs")
+    if mode == "obj" and os.environ.get("ELISA_LD", "").split():
+        # Explicit command strings may launch wrappers or consume untracked
+        # scripts, plugins, and response files. The certificate only identifies
+        # the first executable, so keep overrides out of the outer object cache.
+        passthrough(real, argv, mode, "elisa-ld-override")
+    if mode == "obj" and not default_linker_command_is_cacheable():
+        # A script launcher selected as the default ld can delegate to a linker
+        # that the certificate does not identify. Let Core handle it.
+        passthrough(real, argv, mode, "linker-wrapper")
     for name in BYPASS_ENV:
         if os.environ.get(name):
             passthrough(real, argv, mode, "env:" + name)
@@ -451,7 +870,7 @@ def main():
         # Binary artifacts keep their original bytes. Include exact source paths
         # in their key so debug paths never need a length-changing placeholder.
         h.update(b"binary-path\0" + inpath.encode() + b"\0" + base.encode() + b"\0")
-    elif any(inpath.encode() in data or base.encode() in data for _, data in closure):
+    elif any(inpath.encode() in data or base.encode() in data for _, data, _ in closure):
         # User text that literally names its source directory must not be
         # normalized as if it were a compiler-generated diagnostic path.
         h.update(b"text-literal-path\0" + inpath.encode() + b"\0" + base.encode() + b"\0")
@@ -459,7 +878,7 @@ def main():
         if name in os.environ:
             h.update(name.encode() + b"=" + os.environ[name].encode() + b"\0")
     h.update(b"\0closure\0")
-    for path, data in closure:
+    for path, data, _ in closure:
         h.update(key_name(path, base, repo).encode() + b"\0" + str(len(data)).encode() + b"\0")
         h.update(data)
     key = h.hexdigest()
@@ -493,6 +912,8 @@ def main():
                     art = unmask(art, inpath, base)
                     if len(art) > CACHE_OBJECT_MAX_BYTES:
                         raise ValueError("expanded cache artifact exceeds size limit")
+            if not include_closure_unchanged(closure):
+                raise ValueError("source/include changed during cache lookup")
             if art is not None:
                 with open(output, "wb") as f:
                     f.write(art)
@@ -510,7 +931,6 @@ def main():
             output_before = regular_file_identity(output)
         except OSError:
             output_tracking = False
-    stat_line("miss", mode)
     certified = False
     certificate_data = b""
     try:
@@ -522,25 +942,24 @@ def main():
             certificate = os.path.join(cert_dir, "certificate")
             child_env = os.environ.copy()
             child_env["ELISACORE_CACHE_CERTIFICATE"] = certificate
-            proc = subprocess.Popen([real] + argv, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    env=child_env)
-            proc.stdout_data, proc.stderr_data = proc.communicate()
+            proc = run_spooled(real, argv, child_env)
             try:
-                certificate_data = read_cache_file_bounded(certificate, 16384)
-                certified = valid_certificate(certificate_data, proc.pid)
-            except (OSError, ValueError):
-                pass
+                try:
+                    certificate_data = read_cache_file_bounded(certificate, 16384)
+                    certified = valid_certificate(certificate_data, proc.pid)
+                except (OSError, ValueError):
+                    pass
+            finally:
+                replay_spooled_output(proc)
     else:
         # If the private certificate directory cannot be created, execute the
-        # compiler normally but do not publish its result.
+        # compiler normally but do not publish its result. Spool capture keeps
+        # memory bounded while retaining the usual post-exit output replay.
         child_env = os.environ.copy()
         child_env.pop("ELISACORE_CACHE_CERTIFICATE", None)
-        proc = subprocess.run([real] + argv, stdin=subprocess.DEVNULL,
-                              capture_output=True, env=child_env)
-        proc.stdout_data, proc.stderr_data = proc.stdout, proc.stderr
-    sys.stdout.buffer.write(proc.stdout_data); sys.stderr.buffer.write(proc.stderr_data)
-    sys.stdout.flush(); sys.stderr.flush()
+        proc = run_spooled(real, argv, child_env)
+        replay_spooled_output(proc)
+    stat_line("miss", mode, proc.output_capture_reason or "-")
     have_art = False
     output_after = None
     produced_artifact = None
@@ -562,7 +981,11 @@ def main():
             have_art = False
             produced_artifact = None
     has_placeholder_marker = lambda data: IN_MARK in data or DIR_MARK in data
-    placeholder_safe = not has_placeholder_marker(proc.stdout_data) and not has_placeholder_marker(proc.stderr_data)
+    capture_complete = (proc.output_capture_complete
+                        and proc.stdout_data is not None and proc.stderr_data is not None)
+    placeholder_safe = (capture_complete
+                        and not has_placeholder_marker(proc.stdout_data)
+                        and not has_placeholder_marker(proc.stderr_data))
     if have_art and mode not in BINARY_MODES and has_placeholder_marker(produced_artifact):
         placeholder_safe = False
     cacheable_return = (output is None and proc.returncode in (0, 1)
@@ -570,9 +993,11 @@ def main():
     # Incomplete analysis checkpoints carry resumable work. Core currently uses
     # a dedicated non-cacheable exit status, but keep the marker check defensive
     # in case a wrapper or future status change makes the response look cacheable.
-    resumable_analysis = (RESUMABLE_ANALYSIS_MARKER in proc.stdout_data
-                          or RESUMABLE_ANALYSIS_MARKER in proc.stderr_data)
-    cacheable_return = cacheable_return and not resumable_analysis and certified
+    resumable_analysis = (capture_complete
+                          and (RESUMABLE_ANALYSIS_MARKER in proc.stdout_data
+                               or RESUMABLE_ANALYSIS_MARKER in proc.stderr_data))
+    cacheable_return = (cacheable_return and capture_complete and not resumable_analysis
+                        and certified and include_closure_unchanged(closure))
     cacheable_return = (cacheable_return
                         and len(proc.stdout_data) <= CACHE_TEXT_MAX_BYTES
                         and len(proc.stderr_data) <= CACHE_TEXT_MAX_BYTES)
@@ -610,6 +1035,8 @@ def main():
             with open(os.path.join(tmp, "rc"), "w") as f:
                 f.write(str(proc.returncode))
             try:
+                if not include_closure_unchanged(closure):
+                    raise OSError("source/include changed before cache publication")
                 os.rename(tmp, entry)
                 tmp = None
             except OSError:

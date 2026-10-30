@@ -32,8 +32,11 @@ with tempfile.TemporaryDirectory(prefix="s0cache-native-cert-") as temp:
                ELISA_S0_CACHE_DIR=str(root / "outer"),
                ELISA_S0_CACHE_STATS=str(root / "stats"),
                ELISAC_BUILD_CACHE_DIR=str(root / "core"),
+               ELISA_LD="",
+               ELISA_LLC="",
+               ELISACORE_CODEGEN_JOBS="1",
                TEST_REAL_LLC=llc,
-               PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+               PATH=os.pathsep.join((str(bindir), "/usr/bin", "/bin", os.environ["PATH"])))
     env.pop("ELISACORE_RETAINED_SERVER", None)
     env.pop("ELISACORE_CACHE_CERTIFICATE", None)
 
@@ -42,6 +45,8 @@ with tempfile.TemporaryDirectory(prefix="s0cache-native-cert-") as temp:
                                str(root / "main.o"), str(source)],
                               env=env, capture_output=True, timeout=10, check=False)
 
+    # A shell-script tool selector is not a complete certificate dependency.
+    # Recompute until the real native llc is selected below.
     assert run().returncode == 0
     original = (root / "main.o").read_bytes()
     assert run().returncode == 0
@@ -50,8 +55,10 @@ with tempfile.TemporaryDirectory(prefix="s0cache-native-cert-") as temp:
     fake_llc.write_text('#!/bin/sh\n# replacement\nexec "$TEST_REAL_LLC" "$@"\n')
     assert run().returncode == 0
     assert (root / "stats").read_text().splitlines() == [
-        "miss\tobj\t-", "hit\tobj\t-", "miss\tobj\t-"
+        "miss\tobj\t-", "miss\tobj\t-", "miss\tobj\t-"
     ]
+    # Explicit linker commands can be launchers or reference untracked script,
+    # plugin, and response files. The outer cache must fail closed for overrides.
     linker = bindir / "custom-ld"
     linker.write_text("#!/bin/sh\nexit 0\n")
     linker.chmod(0o755)
@@ -63,9 +70,12 @@ with tempfile.TemporaryDirectory(prefix="s0cache-native-cert-") as temp:
     linker.write_text("#!/bin/sh\n# replacement\nexit 0\n")
     assert run().returncode == 0
     assert (root / "stats").read_text().splitlines()[-3:] == [
-        "miss\tobj\t-", "hit\tobj\t-", "miss\tobj\t-"
+        "bypass\tobj\telisa-ld-override",
+        "bypass\tobj\telisa-ld-override",
+        "bypass\tobj\telisa-ld-override",
     ]
     # Exercise the system selector (including xcrun on macOS) as well.
+    fake_llc.unlink()
     env.pop("ELISA_LD")
     source.write_text("def main() -> i64:\n    return 44\n")
     assert run().returncode == 0
