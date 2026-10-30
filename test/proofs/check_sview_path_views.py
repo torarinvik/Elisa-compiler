@@ -100,7 +100,7 @@ for helper, fragments, label in (
         "last: i64 = sview_find_last_byte(view, sep)",
         "assert last == sview_find_last_byte(view, sep)",
         "assert last >= -1 and last < view.len",
-        "if last >= 0: trusted Unsafe.PointerCast: return StringView{data: view.data + (last + 1).usize(), len: view.len - (last + 1)}",
+        "if last >= 0: trusted Unsafe.PointerCast: return StringView{data: view.data + (sview_find_last_byte(view, sep) + 1).usize(), len: view.len - (last + 1)}",
         "assert last == -1",
         "trusted Unsafe.PointerCast: return StringView{data: view.data, len: view.len}",
     ), "basename"),
