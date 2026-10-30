@@ -38,6 +38,10 @@ stripped_case() {
     pass=$((pass + 1))
 }
 
+# A value local shadows a same-named hidden `@region` slot. The selector must not silently
+# bind to the hidden arena and turn the invalid local selector into a valid allocation.
+stripped_case new_shadowed_region_parameter 'def allocate[@owner](seed: i64& @owner) -> i64& @owner:\n    owner: i64 = 0\n    return new[owner] 7\ndef main() -> i64:\n    region arena(64):\n        seed: i64& @arena = new[arena] 42\n        result: i64& @arena = allocate(seed)\n        return result[0]\n'
+
 # `-> f64` is outside the modeled i64 subset.
 # Bitwise operators have no float form.
 # A NESTED struct field needs the inner layout resolved first; only scalar fields are modeled.
@@ -303,6 +307,8 @@ run_case addr_of_darray_ref_elem 'def head_addr(da: mutable darray[i64]&) -> uin
 run_case field_ref_index 'struct Buf:\n    items: mutable i64&\n    n: usize\ndef wr(b: Buf&, i: usize, v: i64) -> void:\n    b.items[i] <- v\ndef main() -> i64:\n    x: mutable i64 = 0\n    b: Buf = Buf { items: &x, n: 1.usize() }\n    wr(&b, 0.usize(), 42)\n    return x\n' 42
 # `in owner:` region block where owner is a BORROWED arena (`owner: mutable Arena&`) — the std
 # container ctors activate their arena this way. Allocations inside target the borrowed arena.
+run_case new_borrowed_arena 'def build(a: mutable Arena&) -> i64:\n    owner: mutable Arena& = a\n    value = new[owner] 42\n    return value[0]\ndef main() -> i64:\n    arena: mutable Arena = zeroed\n    return build(&arena)\n' 42
+run_case new_hidden_region_inferred_local 'def allocate[@owner](seed: i64& @owner) -> i64& @owner:\n    value = new[owner] 42\n    return value\ndef main() -> i64:\n    region arena(64):\n        seed: i64& @arena = new[arena] 0\n        result: i64& @arena = allocate(seed)\n        return result[0]\n' 42
 run_case in_borrowed_arena 'def build(a: mutable Arena&) -> i64 can[Memory.Allocate]:\n    xs: mutable darray[i64] = []\n    in a:\n        xs.push(42)\n    return xs[0]\ndef main() -> i64 can[Memory.Allocate]:\n    arena: mutable Arena = zeroed\n    return build(&arena)\n' 42
 # `match OPT: null: … v: …` — a match whose scrutinee is an OPTIONAL value: the binding arm
 # binds the payload on present, the null arm runs on absent (like `if OPT is v:` as a match).
@@ -327,11 +333,12 @@ diff_case variadic_extern 'extern printf(fmt: cstr, ...) -> i32\n\ndef main() ->
 # as this constructor -- it names a different program.
 decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() -> i64:\n    s: Shape = Shape.Circle(bogus: 42)\n    return match s:\n        Shape.Circle(r): r\n'
 # An explicit `new[NAME]` selector must resolve to an arena/region owner or a packed store.
-# The backend used to treat an unknown selector as transparent and emit the operand value,
+# The backend must not treat an unknown or non-Arena selector as transparent and emit the operand value,
 # silently changing a reference-producing allocation into a scalar expression. Keep this
 # backend-only gate because it protects callers that invoke the emitter without the CLI's
 # semantic diagnostics.
 decline_case new_unknown_region_selector 'def main() -> i64:\n    return new[missing] 7\n'
+decline_case new_non_arena_ref_selector 'def main() -> i64:\n    value: i64 = 41\n    pointer: i64& = &value\n    return new[pointer] 7\n'
 # A FILTERED comprehension declines: the output count is not known up front, so the presized
 # form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
 run_case comprehension_filtered 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10 if i > 5]\n    return xs.count.i64()\n' 4
