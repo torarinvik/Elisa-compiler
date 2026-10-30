@@ -290,6 +290,7 @@ stage1_cache_base_key=""
 stage1_cache_dependency_identity=""
 stage1_cache_dir=""
 stage1_cache_out=""
+stage1_cache_output_state=""
 # Every ELISACORE_* too: codegen reads ELISACORE_FAST_MATH, _STRICT_FP, _NOALIAS_MUTABLE_REFS,
 # _FORCE_BOUNDS_CHECK, _OVERFLOW, _TARGET_CPU, ... from the environment, and a caller may set
 # them directly instead of through the CLI flags that are already in the argument vector.
@@ -353,9 +354,9 @@ stage1_cache_prepare() {
     index=$((index + 1))
   done
   [[ "$emit" == obj && "$emit_count" -le 1 && "$output_count" == 1 && "$source_count" == 1 && -n "$source" ]] || return 1
-  # The ordinary compiler opens -o paths and follows symlinks. A cache-hit rename would
-  # replace the link itself, so leave symlink destinations on the ordinary compile path.
-  [[ ! -L "$stage1_cache_out" ]] || return 1
+  # A cache-hit rename must preserve the ordinary output's mode semantics and must not
+  # replace a symlink, multiply-linked file, or other non-regular destination.
+  stage1_cache_output_state="$(python3 "$ROOT/scripts/stage1_object_cache.py" output-state "$stage1_cache_out" 2>/dev/null)" || return 1
   [[ -f "$provenance_file" && -r "$provenance_file" ]] || return 1
   stage1_cache_dir="${ELISA_STAGE1_CACHE_DIR:-$HOME/.cache/elisac-stage1}"
   stage1_cache_base_key="$(
@@ -456,6 +457,7 @@ stage1_cache_publish_if_unchanged() {
 stage1_cache_restore_if_unchanged() {
   local admitted_key="$stage1_cache_key"
   local admitted_identity="$stage1_cache_dependency_identity"
+  local admitted_output_state="$stage1_cache_output_state"
   local restore_template="$stage1_cache_out.cache.XXXXXX"
   local staged_object staged_stdout staged_stderr restore_rc=0 destination="$stage1_cache_out"
   # Keep the staged object beside the requested output so the final rename is atomic.
@@ -465,21 +467,17 @@ stage1_cache_restore_if_unchanged() {
   staged_object="$(mktemp "$restore_template" 2>/dev/null)" || return 1
   staged_stdout="${staged_object}.stdout"
   staged_stderr="${staged_object}.stderr"
-  python3 "$ROOT/scripts/stage1_object_cache.py" restore "$stage1_cache_entry" "$staged_object" "$admitted_key" >"$staged_stdout" 2>"$staged_stderr" || restore_rc=$?
+  python3 "$ROOT/scripts/stage1_object_cache.py" restore "$stage1_cache_entry" "$staged_object" "$admitted_key" "$destination" >"$staged_stdout" 2>"$staged_stderr" || restore_rc=$?
   if [[ "$restore_rc" -ne 0 ]]; then
     rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
     return "$restore_rc"
   fi
-  if ! stage1_cache_prepare || [[ "$stage1_cache_key" != "$admitted_key" || "$stage1_cache_dependency_identity" != "$admitted_identity" ]]; then
+  if ! stage1_cache_prepare || [[ "$stage1_cache_key" != "$admitted_key" || "$stage1_cache_dependency_identity" != "$admitted_identity" || "$stage1_cache_output_state" != "$admitted_output_state" ]]; then
     rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
     return 1
   fi
-  # Keep the final rename from changing output semantics if the destination became a
-  # symlink while the dependency snapshot was being revalidated.
-  if [[ -L "$destination" ]]; then
-    rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
-    return 1
-  fi
+  # stage1_cache_prepare rechecks the destination identity, link count, and mode after
+  # source revalidation so the final rename cannot silently change -o behavior.
   if ! mv -f "$staged_object" "$destination"; then
     rm -f "$staged_object" "$staged_stdout" "$staged_stderr"
     return 1

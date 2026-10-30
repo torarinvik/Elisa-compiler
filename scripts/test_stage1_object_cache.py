@@ -260,6 +260,69 @@ class CacheIntegrityTest(unittest.TestCase):
         self.assertTrue(cache.restore(self.entry, self.output, "key"))
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o751)
 
+    def test_restore_uses_current_destination_permissions(self):
+        self.publish()
+        self.output.chmod(0o600)
+        staged = self.output.parent / "staged.o"
+        staged.write_bytes(b"")
+        self.assertTrue(cache.restore(self.entry, staged, "key", destination=self.output))
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
+
+    def test_restore_uses_current_umask_for_new_destination(self):
+        self.publish()
+        staged = self.output.parent / "staged.o"
+        staged.write_bytes(b"")
+        destination = self.output.parent / "new-output.o"
+        previous_mask = os.umask(0o027)
+        try:
+            self.assertTrue(cache.restore(self.entry, staged, "key", destination=destination))
+        finally:
+            os.umask(previous_mask)
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o640)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS provenance metadata")
+    def test_restore_declines_changed_provenance_without_publishing(self):
+        self.publish()
+        staged = self.output.parent / "staged.o"
+        staged.write_bytes(b"staging sentinel")
+        before = self.output.read_bytes()
+        with patch.object(cache, "descriptor_provenance", side_effect=["01", "02"]):
+            self.assertFalse(cache.restore(self.entry, staged, "key", destination=self.output))
+        self.assertEqual(staged.read_bytes(), b"staging sentinel")
+        self.assertEqual(self.output.read_bytes(), before)
+
+    def test_output_state_declines_hardlinked_destination(self):
+        alias = self.output.parent / "output-alias.o"
+        os.link(self.output, alias)
+        self.assertIsNone(cache.compiler_output_state(self.output))
+
+    def test_output_state_declines_destination_with_xattrs(self):
+        if sys.platform != "darwin" and not (
+            sys.platform.startswith("linux") and hasattr(os, "setxattr")
+        ):
+            self.skipTest("file extended attributes are unavailable")
+        try:
+            attribute = (
+                b"user.elisa-cache-test"
+                if sys.platform.startswith("linux")
+                else b"com.elisa.cache-test"
+            )
+            if sys.platform == "darwin" and not hasattr(os, "setxattr"):
+                subprocess.run(["/usr/bin/xattr", "-w", attribute.decode(), "preserve", str(self.output)],
+                               check=True, capture_output=True)
+            else:
+                os.setxattr(self.output, attribute, b"preserve")
+        except OSError as error:
+            self.skipTest(f"cannot set a test extended attribute: {error}")
+        self.assertIsNone(cache.compiler_output_state(self.output))
+
+    def test_output_state_declines_present_or_unverifiable_acl(self):
+        for acl_state in (True, None):
+            with self.subTest(acl_state=acl_state), patch.object(
+                cache, "descriptor_has_extended_acl", return_value=acl_state
+            ):
+                self.assertIsNone(cache.compiler_output_state(self.output))
+
     def test_invalid_cached_permissions_preserve_previous_output(self):
         self.publish()
         stamp = Path(str(self.entry) + ".json")
@@ -311,31 +374,44 @@ class CacheIntegrityTest(unittest.TestCase):
         script = (
             'set -uo pipefail\n'
             + function.group()
-            + '\nstage1_cache_prepare() { stage1_cache_key="$TEST_NEXT_KEY"; stage1_cache_dependency_identity="$TEST_NEXT_IDENTITY"; return 0; }\n'
+            + '\nstage1_cache_prepare() { stage1_cache_key="$TEST_NEXT_KEY"; stage1_cache_dependency_identity="$TEST_NEXT_IDENTITY"; stage1_cache_output_state="$TEST_NEXT_OUTPUT_STATE"; return 0; }\n'
             + 'stage1_cache_restore_if_unchanged\n'
         )
 
         output.write_bytes(b"prior output")
+        output.chmod(0o600)
         same = subprocess.run(
             ["bash", "-c", script],
-            env=dict(os.environ, ROOT=str(root), stage1_cache_entry=str(entry), stage1_cache_out=str(output), stage1_cache_key="key", stage1_cache_dependency_identity="identity", TEST_NEXT_KEY="key", TEST_NEXT_IDENTITY="identity"),
+            env=dict(os.environ, ROOT=str(root), stage1_cache_entry=str(entry), stage1_cache_out=str(output), stage1_cache_key="key", stage1_cache_dependency_identity="identity", stage1_cache_output_state="output-state", TEST_NEXT_KEY="key", TEST_NEXT_IDENTITY="identity", TEST_NEXT_OUTPUT_STATE="output-state"),
             capture_output=True,
         )
         self.assertEqual(same.returncode, 0, same.stderr.decode())
         self.assertEqual(output.read_bytes(), self.source.read_bytes())
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
         self.assertEqual(same.stdout, b"cached output\n")
         self.assertEqual(same.stderr, b"cached warning\n")
 
         output.write_bytes(b"prior output")
         changed = subprocess.run(
             ["bash", "-c", script],
-            env=dict(os.environ, ROOT=str(root), stage1_cache_entry=str(entry), stage1_cache_out=str(output), stage1_cache_key="key", stage1_cache_dependency_identity="identity", TEST_NEXT_KEY="key", TEST_NEXT_IDENTITY="replaced"),
+            env=dict(os.environ, ROOT=str(root), stage1_cache_entry=str(entry), stage1_cache_out=str(output), stage1_cache_key="key", stage1_cache_dependency_identity="identity", stage1_cache_output_state="output-state", TEST_NEXT_KEY="key", TEST_NEXT_IDENTITY="replaced", TEST_NEXT_OUTPUT_STATE="output-state"),
             capture_output=True,
         )
         self.assertEqual(changed.returncode, 1)
         self.assertEqual(output.read_bytes(), b"prior output")
         self.assertEqual(changed.stdout, b"")
         self.assertEqual(changed.stderr, b"")
+
+        output.write_bytes(b"prior output")
+        mode_changed = subprocess.run(
+            ["bash", "-c", script],
+            env=dict(os.environ, ROOT=str(root), stage1_cache_entry=str(entry), stage1_cache_out=str(output), stage1_cache_key="key", stage1_cache_dependency_identity="identity", stage1_cache_output_state="output-state", TEST_NEXT_KEY="key", TEST_NEXT_IDENTITY="identity", TEST_NEXT_OUTPUT_STATE="new-output-state"),
+            capture_output=True,
+        )
+        self.assertEqual(mode_changed.returncode, 1)
+        self.assertEqual(output.read_bytes(), b"prior output")
+        self.assertEqual(mode_changed.stdout, b"")
+        self.assertEqual(mode_changed.stderr, b"")
 
     def test_unreadable_dependency_refuses_cache_identity(self):
         root = self.cache_project()
@@ -759,6 +835,7 @@ class CacheIntegrityTest(unittest.TestCase):
                 stage1_cache_out=str(output),
                 stage1_cache_key="key",
                 stage1_cache_dependency_identity="identity",
+                stage1_cache_output_state="symlink-is-not-admitted",
             ),
             capture_output=True,
         )
