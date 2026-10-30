@@ -309,6 +309,10 @@ run_case field_ref_index 'struct Buf:\n    items: mutable i64&\n    n: usize\nde
 # container ctors activate their arena this way. Allocations inside target the borrowed arena.
 run_case new_borrowed_arena 'def build(a: mutable Arena&) -> i64:\n    owner: mutable Arena& = a\n    value = new[owner] 42\n    return value[0]\ndef main() -> i64:\n    arena: mutable Arena = zeroed\n    return build(&arena)\n' 42
 run_case new_hidden_region_inferred_local 'def allocate[@owner](seed: i64& @owner) -> i64& @owner:\n    value = new[owner] 42\n    return value\ndef main() -> i64:\n    region arena(64):\n        seed: i64& @arena = new[arena] 0\n        result: i64& @arena = allocate(seed)\n        return result[0]\n' 42
+stage1_ir_case new_perm_region_inferred_local 'global mutable perm_arena: Arena = zeroed\ndef main() -> i64:\n    value = new[perm] 42\n    return value[0]\n' 'call ptr @arena_alloc\(ptr @perm_arena, i64 8\)'
+run_case new_program_region_inferred_local 'global region scratch\ndef main() -> i64:\n    value = new[scratch] 42\n    return value[0]\n' 42
+decline_case new_shadowed_perm_region_selector 'def main() -> i64:\n    perm: i64 = 0\n    return new[perm] 7\n'
+decline_case new_shadowed_program_region_selector 'global region scratch\ndef main() -> i64:\n    scratch: i64 = 0\n    return new[scratch] 7\n'
 run_case in_borrowed_arena 'def build(a: mutable Arena&) -> i64 can[Memory.Allocate]:\n    xs: mutable darray[i64] = []\n    in a:\n        xs.push(42)\n    return xs[0]\ndef main() -> i64 can[Memory.Allocate]:\n    arena: mutable Arena = zeroed\n    return build(&arena)\n' 42
 # `match OPT: null: … v: …` — a match whose scrutinee is an OPTIONAL value: the binding arm
 # binds the payload on present, the null arm runs on absent (like `if OPT is v:` as a match).
@@ -338,6 +342,7 @@ decline_case penum_wrong_label 'enum Shape:\n    Circle(r: i64)\n\ndef main() ->
 # backend-only gate because it protects callers that invoke the emitter without the CLI's
 # semantic diagnostics.
 decline_case new_unknown_region_selector 'def main() -> i64:\n    return new[missing] 7\n'
+decline_case new_missing_perm_region_owner 'def main() -> i64:\n    return new[perm] 7\n'
 decline_case new_non_arena_ref_selector 'def main() -> i64:\n    value: i64 = 41\n    pointer: i64& = &value\n    return new[pointer] 7\n'
 # A FILTERED comprehension declines: the output count is not known up front, so the presized
 # form does not apply -- and stage0 itself says only the filter-free form auto-vectorizes.
