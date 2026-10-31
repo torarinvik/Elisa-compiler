@@ -1914,6 +1914,10 @@ struct CollectionArenaMemoEntry:
     begin: mutable uintptr
     last_table: mutable uintptr
     no_pooled: mutable bool
+    # When known, no pooled stack of the arena holds more than pooled_bound slots, so an
+    # acquire needing more skips the walk over the region chain.
+    pooled_bound_known: mutable bool
+    pooled_bound: mutable usize
 
 global mutable __elisa_collection_stack_memo: CollectionStackMemoEntry[COLLECTION_STACK_MEMO_SLOTS] = zeroed
 global mutable __elisa_collection_arena_memo: CollectionArenaMemoEntry[COLLECTION_ARENA_MEMO_SLOTS] = zeroed
@@ -2056,6 +2060,7 @@ def collection_arena_memo_set(a: Arena&, last_table: uintptr, no_pooled: bool):
                     entry.arena <- arena_key
                     entry.begin <- begin_key
                     entry.last_table <- 0.uintptr()
+                    entry.pooled_bound_known <- false
                 entry.last_table <- last_table if last_table != 0.uintptr()
                 entry.no_pooled <- no_pooled
         __elisa_arena_cache_lock_release() can Global{Read,Write}, Atomics.Store
@@ -2070,8 +2075,60 @@ def collection_arena_memo_pooled(a: Arena&):
         trusted Unsafe.MutableGlobal:
             can Global{Read,Write}:
                 entry: mutable CollectionArenaMemoEntry& = &__elisa_collection_arena_memo[slot]
-                entry.no_pooled <- false if entry.arena == arena_key
+                if entry.arena == arena_key:
+                    entry.no_pooled <- false
+                    entry.pooled_bound_known <- false
         __elisa_arena_cache_lock_release() can Global{Read,Write}, Atomics.Store
+
+# One stack of `capacity` slots was pooled: the no-pooled hint no longer holds, and a
+# known bound widens to cover it.
+@internal
+def collection_arena_memo_pool_one(a: Arena&, capacity: usize):
+    can Unsafe{PointerCast,UncheckedIndex}:
+        arena_key: uintptr = collection_arena_addr(a)
+        begin_key: uintptr = collection_arena_begin_addr(a)
+        slot: usize = collection_memo_hash(arena_key, COLLECTION_ARENA_MEMO_SLOTS)
+        __elisa_arena_cache_lock_acquire() can Global{Read,Write}, Atomics.Exchange
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                entry: mutable CollectionArenaMemoEntry& = &__elisa_collection_arena_memo[slot]
+                if entry.arena == arena_key and entry.begin == begin_key:
+                    entry.no_pooled <- false
+                    entry.pooled_bound <- capacity if entry.pooled_bound_known and capacity > entry.pooled_bound
+        __elisa_arena_cache_lock_release() can Global{Read,Write}, Atomics.Store
+
+# A full walk saw every pooled stack of `a`; none holds more than `bound` slots.
+@internal
+def collection_arena_memo_bound_set(a: Arena&, bound: usize):
+    can Unsafe{PointerCast,UncheckedIndex}:
+        arena_key: uintptr = collection_arena_addr(a)
+        begin_key: uintptr = collection_arena_begin_addr(a)
+        slot: usize = collection_memo_hash(arena_key, COLLECTION_ARENA_MEMO_SLOTS)
+        __elisa_arena_cache_lock_acquire() can Global{Read,Write}, Atomics.Exchange
+        trusted Unsafe.MutableGlobal:
+            can Global{Read,Write}:
+                entry: mutable CollectionArenaMemoEntry& = &__elisa_collection_arena_memo[slot]
+                if entry.arena == arena_key and entry.begin == begin_key:
+                    entry.pooled_bound_known <- true
+                    entry.pooled_bound <- bound
+        __elisa_arena_cache_lock_release() can Global{Read,Write}, Atomics.Store
+
+# Whether a pooled stack of `a` could hold `needed_slots`, as far as the memo knows.
+@internal
+def collection_arena_memo_may_fit(a: Arena&, needed_slots: usize) -> bool:
+    can Unsafe{PointerCast,UncheckedIndex}:
+        result: mutable bool = true
+        arena_key: uintptr = collection_arena_addr(a)
+        begin_key: uintptr = collection_arena_begin_addr(a)
+        slot: usize = collection_memo_hash(arena_key, COLLECTION_ARENA_MEMO_SLOTS)
+        __elisa_arena_cache_lock_acquire() can Global{Read,Write}, Atomics.Exchange
+        trusted Unsafe.MutableGlobal:
+            entry: CollectionArenaMemoEntry& = &__elisa_collection_arena_memo[slot] can Global.Read
+            can Global.Read:
+                if entry.arena == arena_key and entry.begin == begin_key:
+                    result <- false if entry.no_pooled or (entry.pooled_bound_known and needed_slots > entry.pooled_bound)
+        __elisa_arena_cache_lock_release() can Global{Read,Write}, Atomics.Store
+        return result
 
 # The table a stack holds: its data base.
 def collection_stack_table(r: heap Region&) -> mutable heap void&:
@@ -2140,9 +2197,10 @@ def collection_stack_acquire(a: mutable Arena&, live_table: void&?, needed_slots
                 spare: mutable heap Region&? = live_stack.owner_next
                 chosen <- spare if spare != null and spare.capacity >= needed_slots
 
-        if chosen == null and not (collection_arena_memo_no_pooled(a) can Global{Read,Write}):
+        if chosen == null and (collection_arena_memo_may_fit(a, needed_slots) can Global{Read,Write}):
             probe: mutable heap Region&? = a.begin
             saw_pooled: mutable bool = false
+            largest_pooled: mutable usize = 0
             trusted Unsafe.AssumeProgress:
                 while probe != null:
                     if probe.owner_tag == ARENA_OWNER_TAG_COLLECTION.uintptr() and probe.count == 0:
@@ -2151,12 +2209,16 @@ def collection_stack_acquire(a: mutable Arena&, live_table: void&?, needed_slots
                             chosen <- probe
                             probe <- null
                         else:
+                            largest_pooled <- probe.capacity if probe.capacity > largest_pooled
                             probe <- probe.next
                     else:
                         probe <- probe.next
             # A full walk that met no pooled stack at all: later acquires skip the walk
             # until something pools a stack again.
             (collection_arena_memo_set(a, 0.uintptr(), true) can Global{Read,Write}) if not saw_pooled
+            # A full walk that found no fit: later acquires larger than every pooled stack
+            # skip the walk until a reset pools stacks of unknown size.
+            (collection_arena_memo_bound_set(a, largest_pooled) can Global{Read,Write}) if chosen == null
 
         # Fresh, from the arena's own block source so arena_free's strategy-dispatched
         # free matches it. Running out is a panic inside new_region_*; there is no error
@@ -2205,7 +2267,7 @@ def collection_stack_acquire(a: mutable Arena&, live_table: void&?, needed_slots
                 dropped_stack: mutable heap Region& = dropped
                 dropped_stack.count <- 0
                 dropped_stack.owner_next <- null
-                (collection_arena_memo_set(a, 0.uintptr(), false) can Global{Read,Write})
+                (collection_arena_memo_pool_one(a, dropped_stack.capacity) can Global{Read,Write})
             old_live.owner_next <- null
             claimed.owner_next <- old_live
         else:
