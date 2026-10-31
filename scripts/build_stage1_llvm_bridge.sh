@@ -13,7 +13,7 @@ read -r -a cxxflags <<<"$("$LLVM_CONFIG" --cxxflags)"
 src="$ROOT/src/backend/llvm_validation_peel.cpp"
 # Every seed links the bridge; recompiling it costs ~1 s. Reuse an object keyed
 # on the source, the compiler binary and version, and the exact flags.
-key="$( { elisa_sha256 "$src" "$cxx"; "$cxx" --version; printf '%s\n' -O2 -fPIC "${cxxflags[@]}"; } | elisa_sha256 | awk '{print $1}')"
+key="$( { elisa_sha256 "$src" "$ROOT/src/backend/llvm_remainder_tail.cpp" "$cxx"; "$cxx" --version; printf '%s\n' -O2 -fPIC "${cxxflags[@]}"; } | elisa_sha256 | awk '{print $1}')"
 cache_dir="${ELISA_LLVM_BRIDGE_CACHE_DIR:-$ROOT/build/cache/llvm_bridge}"
 cached="$cache_dir/$key.o"
 if [[ ! -s "$cached" ]]; then

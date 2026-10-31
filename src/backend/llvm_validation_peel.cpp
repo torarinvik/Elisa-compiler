@@ -200,3 +200,6 @@ extern "C" unsigned elisacoreElideBoundedDivisionSums(LLVMModuleRef) {
 }
 extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef) { return 0; }
 #endif
+
+// Shared reduction-tail pass, also included in the bridge cache identity.
+#include "llvm_remainder_tail.cpp"
