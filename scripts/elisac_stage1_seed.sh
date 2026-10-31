@@ -248,11 +248,18 @@ seed_build() {
   # O3 (without imports it was ~36% slower). ELISACORE_PARALLEL_OPT=0 restores
   # whole-module O3.
   seed_parallel_opt="${ELISACORE_PARALLEL_OPT-1}"
+  # Generate the IR partitions concurrently, one generator per partition, instead of
+  # lowering the whole module serially and splitting it (IR 5.5 s -> 2.5 s wall for a
+  # one-line body edit; same check output and runtime speed). Each generator imports
+  # small foreign callees itself; a declined partition falls back to the module split
+  # above. ELISACORE_PARALLEL_IR=0 restores serial whole-module lowering.
+  seed_parallel_ir="${ELISACORE_PARALLEL_IR-1}"
   seed_parallel_opt_import="${ELISACORE_PARALLEL_OPT_IMPORT-100}"
   # Stage1 includes its own standard-library copy; authorize only that exact file. The
   # bootstrap loader still requires it to appear in the expanded include set.
   ELISACORE_RETAINED_SPLICED_CODEGEN="$seed_spliced_codegen" \
   ELISACORE_PARALLEL_OPT="$seed_parallel_opt" \
+  ELISACORE_PARALLEL_IR="$seed_parallel_ir" \
   ELISACORE_PARALLEL_OPT_IMPORT="$seed_parallel_opt_import" \
   ELISACORE_SMT_CACHE_DIR="$seed_smt_cache_dir" \
   ELISACORE_SMT_CACHE_DECLINED="$seed_smt_cache_declined" \
