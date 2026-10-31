@@ -240,9 +240,15 @@ seed_build() {
   # analysis byte for byte on this tree); ELISACORE_RETAINED_SPLICED_CODEGEN=0
   # restores the fresh analysis.
   seed_spliced_codegen="${ELISACORE_RETAINED_SPLICED_CODEGEN-1}"
+  # Optimize each object partition separately and cache it by its exact unoptimized
+  # bitcode, so a code edit re-optimizes only its own partition (70 s -> 16 s for a
+  # one-line body edit). Whole-module O3 inlines across partitions and produced a
+  # ~25% faster compiler; ELISACORE_PARALLEL_OPT=0 restores it for release builds.
+  seed_parallel_opt="${ELISACORE_PARALLEL_OPT-1}"
   # Stage1 includes its own standard-library copy; authorize only that exact file. The
   # bootstrap loader still requires it to appear in the expanded include set.
   ELISACORE_RETAINED_SPLICED_CODEGEN="$seed_spliced_codegen" \
+  ELISACORE_PARALLEL_OPT="$seed_parallel_opt" \
   ELISACORE_SMT_CACHE_DIR="$seed_smt_cache_dir" \
   ELISACORE_SMT_CACHE_DECLINED="$seed_smt_cache_declined" \
   ELISACORE_RETAINED_SERVER="$seed_retained_server" \
