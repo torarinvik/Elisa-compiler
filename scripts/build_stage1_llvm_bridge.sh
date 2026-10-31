@@ -10,4 +10,16 @@ cxx="${ELISA_LLVM_CXX:-$llvm_bindir/clang++}"
 [[ -x "$cxx" ]] || { echo "LLVM C++ compiler not found: $cxx" >&2; exit 2; }
 # llvm-config emits compiler options, not user shell code. Split them as arguments.
 read -r -a cxxflags <<<"$("$LLVM_CONFIG" --cxxflags)"
-"$cxx" -O2 -fPIC "${cxxflags[@]}" -c "$ROOT/src/backend/llvm_validation_peel.cpp" -o "$1"
+src="$ROOT/src/backend/llvm_validation_peel.cpp"
+# Every seed links the bridge; recompiling it costs ~1 s. Reuse an object keyed
+# on the source, the compiler binary and version, and the exact flags.
+key="$( { elisa_sha256 "$src" "$cxx"; "$cxx" --version; printf '%s\n' -O2 -fPIC "${cxxflags[@]}"; } | elisa_sha256 | awk '{print $1}')"
+cache_dir="${ELISA_LLVM_BRIDGE_CACHE_DIR:-$ROOT/build/cache/llvm_bridge}"
+cached="$cache_dir/$key.o"
+if [[ ! -s "$cached" ]]; then
+  mkdir -p "$cache_dir"
+  tmp="$cached.tmp.$$"
+  "$cxx" -O2 -fPIC "${cxxflags[@]}" -c "$src" -o "$tmp"
+  mv -f "$tmp" "$cached"
+fi
+cp -f "$cached" "$1"
