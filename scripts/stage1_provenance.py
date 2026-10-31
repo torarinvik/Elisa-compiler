@@ -845,9 +845,30 @@ def record(root, binary, expected_inputs=None):
     print(f"stage1 provenance: recorded {data['source_revision']} for {binary}")
 
 
-def check_inputs(root, expected_inputs):
+WRITE_FINGERPRINT_KEYS = ("source_tree_write_fingerprint", "build_recipe_write_fingerprint")
+
+
+def write_fingerprint(root):
+    """Stat-only (no content, no toolchain) snapshot of every source and recipe write."""
+    root = Path(root).resolve()
+    _, source_writes, _, _ = stat_inventory_digest(root, [root / name for name in SOURCE_DIRS])
+    _, recipe_writes, _, _ = stat_inventory_digest(root, [root / name for name in BUILD_RECIPES])
+    return dict(zip(WRITE_FINGERPRINT_KEYS, (source_writes, recipe_writes)))
+
+
+def check_inputs(root, expected_inputs, before_build=None):
     if not isinstance(expected_inputs, dict):
         raise RuntimeError("expected Stage1 input fingerprint must be a JSON object")
+    # A full fingerprint may be computed while the build runs. Then the stat-only
+    # snapshot taken before the build is the anchor: the full fingerprint and the
+    # current tree must both match it, so no write happened from before the build
+    # started until now and the hashed content is what the build read.
+    if before_build is not None:
+        if not isinstance(before_build, dict) or any(
+            expected_inputs.get(key) != before_build.get(key) for key in WRITE_FINGERPRINT_KEYS
+        ):
+            print("Stage1 inputs changed during seed: write fingerprint before build", file=sys.stderr)
+            return 2
     current = input_fingerprint(
         root,
         expected_inputs.get("llvm_toolchain"),
@@ -941,7 +962,7 @@ def check(root, binary, exact=False):
 
 def main(argv):
     if len(argv) < 2:
-        print("usage: stage1_provenance.py (bootstrap-kind|record|check|check-exact|inputs|check-inputs) ...", file=sys.stderr)
+        print("usage: stage1_provenance.py (bootstrap-kind|record|check|check-exact|inputs|write-fingerprint|check-inputs) ...", file=sys.stderr)
         return 2
     try:
         if argv[1] == "bootstrap-kind":
@@ -983,11 +1004,16 @@ def main(argv):
                 sort_keys=True,
             ))
             return 0
+        if argv[1] == "write-fingerprint":
+            if len(argv) != 3:
+                raise RuntimeError("usage: stage1_provenance.py write-fingerprint ROOT")
+            print(json.dumps(write_fingerprint(argv[2]), separators=(",", ":"), sort_keys=True))
+            return 0
         if argv[1] == "check-inputs":
-            if len(argv) != 4:
-                raise RuntimeError("usage: stage1_provenance.py check-inputs ROOT EXPECTED_INPUTS_JSON")
-            return check_inputs(argv[2], json.loads(argv[3]))
-        print("usage: stage1_provenance.py (bootstrap-kind|record|check|check-exact|inputs|check-inputs) ...", file=sys.stderr)
+            if len(argv) not in (4, 5):
+                raise RuntimeError("usage: stage1_provenance.py check-inputs ROOT EXPECTED_INPUTS_JSON [WRITE_FINGERPRINT_BEFORE_BUILD_JSON]")
+            return check_inputs(argv[2], json.loads(argv[3]), json.loads(argv[4]) if len(argv) == 5 else None)
+        print("usage: stage1_provenance.py (bootstrap-kind|record|check|check-exact|inputs|write-fingerprint|check-inputs) ...", file=sys.stderr)
         return 2
     except (OSError, RuntimeError) as error:
         print(f"stage1 provenance failed: {error}", file=sys.stderr)

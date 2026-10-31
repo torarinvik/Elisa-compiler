@@ -124,6 +124,7 @@ seed_build() {
       rmdir "$ELISA_SEED_OUTPUT_DIR" 2>/dev/null || true
     fi
     [[ -z "${ELISA_SEED_LLVM_BRIDGE:-}" ]] || rm -f "$ELISA_SEED_LLVM_BRIDGE"
+    [[ -z "${ELISA_SEED_INPUTS_FILE:-}" ]] || rm -f "$ELISA_SEED_INPUTS_FILE"
     rm -f "$ELISA_SEED_LOCK_DIR/pid"
     rmdir "$ELISA_SEED_LOCK_DIR" 2>/dev/null || true
     if [[ -n "${ELISA_SEED_GLOBAL_LOCK_DIR:-}" ]]; then
@@ -319,9 +320,17 @@ seed_build() {
   fi
   # Sources were read by the bootstrap compiler above; verify they did not change
   # meanwhile while the product links, and join before publishing it.
+  if [[ -n "${ELISA_SEED_INPUTS_PID:-}" ]]; then
+    if ! wait "$ELISA_SEED_INPUTS_PID"; then
+      echo "seed: could not fingerprint the Stage1 inputs" >&2
+      exit 2
+    fi
+    ELISA_SEED_INPUTS_PID=""
+    ELISA_STAGE1_SEED_INPUTS="$(cat "$ELISA_SEED_INPUTS_FILE")"
+  fi
   local seed_inputs_check_pid=""
   if [[ -n "${ELISA_STAGE1_SEED_INPUTS:-}" ]]; then
-    "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" &
+    "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" ${ELISA_STAGE1_SEED_WRITES:+"$ELISA_STAGE1_SEED_WRITES"} &
     seed_inputs_check_pid=$!
   fi
   # -stack_size: a deeply left-nested expression (adversarial input, see

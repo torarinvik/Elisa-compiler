@@ -189,10 +189,17 @@ if [[ "${1:-}" == "--seed" ]]; then
   # publishes a product.
   bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN" &
   ELISA_SEED_STAGE0_FRESH_PID=$!
-  seed_input_fingerprint="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT")"
-  ELISA_STAGE1_SEED_INPUTS="$seed_input_fingerprint"
+  # A stat-only write snapshot anchors the input fingerprint before the build reads
+  # anything; the full (content and toolchain) fingerprint is computed beside the
+  # build. seed_build joins it and requires both it and the tree after the build to
+  # match the anchor, so a write at any point of the build still refuses publication.
+  ELISA_STAGE1_SEED_WRITES="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" write-fingerprint "$ROOT")"
+  mkdir -p "$ROOT/build"
+  ELISA_SEED_INPUTS_FILE="$ROOT/build/.seed-inputs.$$"
+  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
+  ELISA_SEED_INPUTS_PID=$!
   seed_build
-  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record "$ROOT" "$BIN" "$seed_input_fingerprint"
+  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
   exit 0
 fi
 
