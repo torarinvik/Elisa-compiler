@@ -45,6 +45,10 @@ def main():
         "high_bit_divisor": IR.replace("10", "9223372036854775808"),
         "commuted_product": IR.replace("%q, -10", "-10, %q"),
         "arm64_alias": IR.replace("aarch64-unknown-linux-gnu", "arm64-apple-darwin"),
+        "unsigned_ge": IR.replace("icmp ult i64 %n, 10", "icmp uge i64 %n, 10"),
+        "signed_compare": IR.replace("icmp ult i64 %n, 10", "icmp slt i64 %n, 10"),
+        "different_bound": IR.replace("icmp ult i64 %n, 10", "icmp ult i64 %n, 11"),
+        "same_sign": IR.replace("icmp ult i64 %n, 10", "icmp samesign ult i64 %n, 10"),
     }
     negative = {
         "signed_divide": IR.replace("udiv", "sdiv"),
@@ -72,6 +76,13 @@ def main():
                 if should_change:
                     assert "add i64 %n, %neg" in after, name
                     assert "add i64 %elisa.remainder.grouped, %sum" in after, name
+                    if name in {"exact", "signed_compare", "different_bound", "arm64_alias"}:
+                        assert "icmp eq i64 %q, 0" not in after, name
+                        assert "icmp ne i64 %q, 0" not in after, name
+                    elif name == "unsigned_ge":
+                        assert "icmp ne i64 %q, 0" in after, name
+                    else:
+                        assert "icmp eq i64 %q, 0" in after, name
                     for line in before.splitlines():
                         if "%q = udiv" in line or "%neg = mul" in line:
                             assert line in after, f"{name}: arithmetic flags or operands changed"
