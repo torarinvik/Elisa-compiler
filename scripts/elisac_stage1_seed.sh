@@ -110,7 +110,19 @@ seed_build() {
   ELISA_SEED_OBJECT="$seed_object"
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
   ELISA_SEED_LLVM_BRIDGE="$ROOT/build/elisac_stage1_llvm_bridge.tmp.$$.o"
+  finish_seed_freshness_check() {
+    local status=0
+    if [[ -n "${ELISA_SEED_STAGE0_FRESH_PID:-}" ]]; then
+      wait "$ELISA_SEED_STAGE0_FRESH_PID" || status=$?
+      ELISA_SEED_STAGE0_FRESH_PID=""
+      cat "$ELISA_SEED_FRESH_OUT"
+      cat "$ELISA_SEED_FRESH_ERR" >&2
+      rm -f "$ELISA_SEED_FRESH_OUT" "$ELISA_SEED_FRESH_ERR"
+    fi
+    return "$status"
+  }
   cleanup_seed_lock() {
+    finish_seed_freshness_check || true
     if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
       rm -f "$ELISA_SEED_OUTPUT"
     fi
@@ -134,6 +146,10 @@ seed_build() {
   }
   trap cleanup_seed_lock EXIT INT TERM HUP
   ELISA_SEED_OUTPUT_DIR="$(mktemp -d "${BIN}.tmp.XXXXXXXX")"
+  ELISA_SEED_FRESH_OUT="$ELISA_SEED_OUTPUT_DIR/fresh.stdout"
+  ELISA_SEED_FRESH_ERR="$ELISA_SEED_OUTPUT_DIR/fresh.stderr"
+  bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN" >"$ELISA_SEED_FRESH_OUT" 2>"$ELISA_SEED_FRESH_ERR" &
+  ELISA_SEED_STAGE0_FRESH_PID=$!
   seed_output="$ELISA_SEED_OUTPUT_DIR/$(basename "$BIN")"
   ELISA_SEED_OUTPUT="$seed_output"
   # ELF symbol tables retain the C source basename. A PID in that name makes
@@ -312,11 +328,10 @@ seed_build() {
     exit "$seed_status"
   fi
   if [[ -n "${ELISA_SEED_STAGE0_FRESH_PID:-}" ]]; then
-    if ! wait "$ELISA_SEED_STAGE0_FRESH_PID"; then
+    if ! finish_seed_freshness_check; then
       echo "seed: refusing to link a product built by a stale or unverifiable Stage0" >&2
       exit 2
     fi
-    ELISA_SEED_STAGE0_FRESH_PID=""
   fi
   # Sources were read by the bootstrap compiler above; verify they did not change
   # meanwhile while the product links, and join before publishing it.

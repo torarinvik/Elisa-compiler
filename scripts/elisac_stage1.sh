@@ -187,8 +187,8 @@ if [[ "${1:-}" == "--seed" ]]; then
   # The freshness proof hashes Stage0's sources and binary (~0.4 s). It runs beside
   # the build; seed_build joins it before linking, so a stale Stage0 still never
   # publishes a product.
-  bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN" &
-  ELISA_SEED_STAGE0_FRESH_PID=$!
+  # seed_build starts this check after creating its private output directory,
+  # so its messages can be replayed without interleaving compiler diagnostics.
   # A stat-only write snapshot anchors the input fingerprint before the build reads
   # anything; the full (content and toolchain) fingerprint is computed beside the
   # build. seed_build joins it and requires both it and the tree after the build to
