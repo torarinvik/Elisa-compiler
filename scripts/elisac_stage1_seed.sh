@@ -241,14 +241,19 @@ seed_build() {
   # restores the fresh analysis.
   seed_spliced_codegen="${ELISACORE_RETAINED_SPLICED_CODEGEN-1}"
   # Optimize each object partition separately and cache it by its exact unoptimized
-  # bitcode, so a code edit re-optimizes only its own partition (70 s -> 16 s for a
-  # one-line body edit). Whole-module O3 inlines across partitions and produced a
-  # ~25% faster compiler; ELISACORE_PARALLEL_OPT=0 restores it for release builds.
+  # bitcode, so a code edit re-optimizes only the partitions it touches (70 s -> 18 s
+  # for a one-line body edit). Each partition imports available_externally copies of
+  # foreign functions of at most ELISACORE_PARALLEL_OPT_IMPORT instructions, so
+  # inlining still crosses partitions: the compiler runs as fast as with whole-module
+  # O3 (without imports it was ~36% slower). ELISACORE_PARALLEL_OPT=0 restores
+  # whole-module O3.
   seed_parallel_opt="${ELISACORE_PARALLEL_OPT-1}"
+  seed_parallel_opt_import="${ELISACORE_PARALLEL_OPT_IMPORT-100}"
   # Stage1 includes its own standard-library copy; authorize only that exact file. The
   # bootstrap loader still requires it to appear in the expanded include set.
   ELISACORE_RETAINED_SPLICED_CODEGEN="$seed_spliced_codegen" \
   ELISACORE_PARALLEL_OPT="$seed_parallel_opt" \
+  ELISACORE_PARALLEL_OPT_IMPORT="$seed_parallel_opt_import" \
   ELISACORE_SMT_CACHE_DIR="$seed_smt_cache_dir" \
   ELISACORE_SMT_CACHE_DECLINED="$seed_smt_cache_declined" \
   ELISACORE_RETAINED_SERVER="$seed_retained_server" \
