@@ -184,7 +184,11 @@ if [[ "${1:-}" == "--seed" ]]; then
   esac
   export ELISA_STAGE1_SEED_BOOTSTRAP_KIND
   export ELISA_STAGE1_SEED_CLANG="$ELISA_CLANG_TOOL"
-  bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN"
+  # The freshness proof hashes Stage0's sources and binary (~0.4 s). It runs beside
+  # the build; seed_build joins it before linking, so a stale Stage0 still never
+  # publishes a product.
+  bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN" &
+  ELISA_SEED_STAGE0_FRESH_PID=$!
   seed_input_fingerprint="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT")"
   ELISA_STAGE1_SEED_INPUTS="$seed_input_fingerprint"
   seed_build

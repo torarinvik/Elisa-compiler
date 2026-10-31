@@ -67,6 +67,11 @@ def stat_inventory_digest(root, paths, freshness_extensions=()):
         elif path.is_file():
             files.append(path)
     digest = hashlib.sha256()
+    # Without ctime: macOS bumps ctime when it attaches com.apple.macl/provenance
+    # attributes to a file about a second after an editor saves it, which says
+    # nothing about the bytes a build read. mtime, size and inode still change on
+    # every write, including a write that is reverted during the build.
+    write_digest = hashlib.sha256()
     newest_source_mtime_ns = None
     newest_source_path = None
     for path in sorted(set(files), key=lambda item: item.relative_to(root).as_posix()):
@@ -76,6 +81,11 @@ def stat_inventory_digest(root, paths, freshness_extensions=()):
         digest.update(b"\0")
         digest.update(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii"))
         digest.update(b"\0")
+        write_identity = {key: value for key, value in identity.items() if key != "ctime_ns"}
+        write_digest.update(relative.encode("utf-8"))
+        write_digest.update(b"\0")
+        write_digest.update(json.dumps(write_identity, sort_keys=True, separators=(",", ":")).encode("ascii"))
+        write_digest.update(b"\0")
         # Preserve the former `find ... -newer BIN` freshness rule while collecting it
         # during this inventory pass. `find -type f` does not follow file symlinks.
         if freshness_extensions and path.suffix in freshness_extensions and not path.is_symlink():
@@ -83,7 +93,7 @@ def stat_inventory_digest(root, paths, freshness_extensions=()):
             if newest_source_mtime_ns is None or mtime_ns > newest_source_mtime_ns:
                 newest_source_mtime_ns = mtime_ns
                 newest_source_path = relative
-    return digest.hexdigest(), newest_source_mtime_ns, newest_source_path
+    return digest.hexdigest(), write_digest.hexdigest(), newest_source_mtime_ns, newest_source_path
 
 
 def valid_sha256(value):
@@ -707,10 +717,10 @@ def input_fingerprint(
     previous_inputs = previous_inputs if isinstance(previous_inputs, dict) else {}
     source_paths = [root / name for name in SOURCE_DIRS]
     recipe_paths = [root / name for name in BUILD_RECIPES]
-    source_stats, source_max_mtime_ns, source_max_mtime_path = stat_inventory_digest(
+    source_stats, source_writes, source_max_mtime_ns, source_max_mtime_path = stat_inventory_digest(
         root, source_paths, freshness_extensions={".elisa", ".elisai"}
     )
-    recipe_stats, _, _ = stat_inventory_digest(root, recipe_paths)
+    recipe_stats, recipe_writes, _, _ = stat_inventory_digest(root, recipe_paths)
     source_digest = previous_inputs.get("source_tree_sha256")
     if exact_content or previous_inputs.get("source_tree_stat_fingerprint") != source_stats or not valid_sha256(source_digest):
         source_digest = digest_files(root, source_paths)
@@ -720,10 +730,12 @@ def input_fingerprint(
     return {
         "source_tree_sha256": source_digest,
         "source_tree_stat_fingerprint": source_stats,
+        "source_tree_write_fingerprint": source_writes,
         "source_tree_max_mtime_ns": source_max_mtime_ns,
         "source_tree_max_mtime_path": source_max_mtime_path,
         "build_recipe_sha256": recipe_digest,
         "build_recipe_stat_fingerprint": recipe_stats,
+        "build_recipe_write_fingerprint": recipe_writes,
         "llvm_toolchain": llvm_toolchain_fingerprint(previous_toolchain, exact=exact_toolchain),
         "seed_configuration": seed_configuration_fingerprint(
             previous_inputs.get("seed_configuration"), exact=exact_toolchain
@@ -842,10 +854,13 @@ def check_inputs(root, expected_inputs):
         exact_toolchain=True,
         previous_inputs=expected_inputs,
     )
+    # The write fingerprints and content digests decide whether inputs changed during
+    # the build; the ctime-bearing stat fingerprints only gate digest reuse.
+    reuse_only = {"source_tree_stat_fingerprint", "build_recipe_stat_fingerprint"}
     changed = [
         key
         for key, value in current.items()
-        if (
+        if key not in reuse_only and (
             toolchain_content_view(expected_inputs.get(key))
             != toolchain_content_view(value)
             if key in {"llvm_toolchain", "seed_configuration"}
@@ -890,9 +905,11 @@ def check(root, binary, exact=False):
     # HEAD without changing a single input byte.
     cache_metadata = {
         "source_tree_stat_fingerprint",
+        "source_tree_write_fingerprint",
         "source_tree_max_mtime_ns",
         "source_tree_max_mtime_path",
         "build_recipe_stat_fingerprint",
+        "build_recipe_write_fingerprint",
         "product_stat_identity",
     }
     changed = [key for key, value in current.items()

@@ -310,6 +310,20 @@ seed_build() {
     fi
     exit "$seed_status"
   fi
+  if [[ -n "${ELISA_SEED_STAGE0_FRESH_PID:-}" ]]; then
+    if ! wait "$ELISA_SEED_STAGE0_FRESH_PID"; then
+      echo "seed: refusing to link a product built by a stale or unverifiable Stage0" >&2
+      exit 2
+    fi
+    ELISA_SEED_STAGE0_FRESH_PID=""
+  fi
+  # Sources were read by the bootstrap compiler above; verify they did not change
+  # meanwhile while the product links, and join before publishing it.
+  local seed_inputs_check_pid=""
+  if [[ -n "${ELISA_STAGE1_SEED_INPUTS:-}" ]]; then
+    "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" &
+    seed_inputs_check_pid=$!
+  fi
   # -stack_size: a deeply left-nested expression (adversarial input, see
   # malformed_input_fuzz.py / the depth guard in codegen_scope.elisa's expression_type)
   # recurses once per AST level through emit_expression. 0x20000000 (512MB) is the max
@@ -364,11 +378,9 @@ seed_build() {
       exit 2
     }
   fi
-  if [[ -n "${ELISA_STAGE1_SEED_INPUTS:-}" ]]; then
-    "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" || {
-      echo "seed: refusing to publish a product built while its source inputs were changing" >&2
-      exit 2
-    }
+  if [[ -n "$seed_inputs_check_pid" ]] && ! wait "$seed_inputs_check_pid"; then
+    echo "seed: refusing to publish a product built while its source inputs were changing" >&2
+    exit 2
   fi
   mv -f "$seed_output" "$BIN"
   mv -f "$seed_object" "$seed_object_output"
