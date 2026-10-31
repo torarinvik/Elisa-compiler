@@ -19,7 +19,7 @@ static bool onlyUsers(Value *v, std::initializer_list<Value *> allowed) {
     for (Value *a : allowed)
       if (u == a)
         found = true;
-    if (!found)
+    if (!found && !(isa<ICmpInst>(u) && u->use_empty()))
       return false;
   }
   return true;
@@ -34,10 +34,22 @@ static bool matchAndRewrite(BasicBlock &h) {
   if (!br || !br->isConditional())
     return false;
   auto *cmp = dyn_cast<ICmpInst>(br->getCondition());
-  if (!cmp || cmp->getPredicate() != ICmpInst::ICMP_ULT || !cmp->hasOneUse())
+  if (!cmp || !cmp->hasOneUse())
     return false;
-  auto *n = dyn_cast<PHINode>(cmp->getOperand(0));
-  auto *d = dyn_cast<ConstantInt>(cmp->getOperand(1));
+  // Linux can already have replaced N < D by N / D == 0.
+  auto *branchQuotient = dyn_cast<BinaryOperator>(cmp->getOperand(0));
+  bool quotientTest = cmp->getPredicate() == ICmpInst::ICMP_EQ &&
+                      isa<ConstantInt>(cmp->getOperand(1)) &&
+                      cast<ConstantInt>(cmp->getOperand(1))->isZero() &&
+                      branchQuotient &&
+                      branchQuotient->getOpcode() == Instruction::UDiv &&
+                      !branchQuotient->isExact();
+  if (!quotientTest && cmp->getPredicate() != ICmpInst::ICMP_ULT)
+    return false;
+  auto *n = dyn_cast<PHINode>(quotientTest ? branchQuotient->getOperand(0)
+                                           : cmp->getOperand(0));
+  auto *d = dyn_cast<ConstantInt>(quotientTest ? branchQuotient->getOperand(1)
+                                               : cmp->getOperand(1));
   if (!n || n->getParent() != &h || !d || d->isZero() ||
       !n->getType()->isIntegerTy(64))
     return false;
@@ -63,7 +75,7 @@ static bool matchAndRewrite(BasicBlock &h) {
           x->getOperand(1) == d && !x->isExact())
         q = x;
     }
-  if (!q)
+  if (!q || (quotientTest && branchQuotient != q))
     return false;
   for (Instruction &i : h)
     if (auto *x = dyn_cast<BinaryOperator>(&i))
@@ -93,7 +105,12 @@ static bool matchAndRewrite(BasicBlock &h) {
   if (!sum || !onlyUsers(n, {q, rem, cmp}) || !onlyUsers(prod, {rem}) ||
       !onlyUsers(rem, {sum}))
     return false;
-  if (h.size() != 8 || q->getParent() != &h || prod->getParent() != &h)
+  unsigned deadComparisons = 0;
+  for (Instruction &i : h)
+    if (isa<ICmpInst>(i) && i.use_empty())
+      ++deadComparisons;
+  if (h.size() != 8 + deadComparisons || q->getParent() != &h ||
+      prod->getParent() != &h)
     return false;
   PHINode *lq = nullptr, *ls = nullptr;
   unsigned phis = 0;
@@ -107,7 +124,7 @@ static bool matchAndRewrite(BasicBlock &h) {
     else
       return false;
   }
-  if (phis != 2 || !lq || !ls || !onlyUsers(q, {prod, lq}) ||
+  if (phis != 2 || !lq || !ls || !onlyUsers(q, {prod, lq, cmp}) ||
       latch->size() != 3)
     return false;
   if (n->getBasicBlockIndex(latch) < 0 || acc->getBasicBlockIndex(latch) < 0 ||
@@ -157,6 +174,8 @@ static bool matchAndRewrite(BasicBlock &h) {
   out->replacePhiUsesWith(&h, tail);
   br->setSuccessor(0, tail);
   cmp->setOperand(0, q);
+  cmp->setOperand(1, d);
+  cmp->setPredicate(ICmpInst::ICMP_ULT);
 #if LLVM_VERSION_MAJOR >= 20
   cmp->setSameSign(false);
 #endif
