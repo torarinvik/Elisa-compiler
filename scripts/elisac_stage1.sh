@@ -199,7 +199,8 @@ if [[ "${1:-}" == "--seed" ]]; then
   "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
   ELISA_SEED_INPUTS_PID=$!
   seed_build
-  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
+  # seed_build's check-inputs proved these build-time inputs unchanged through the build.
+  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record-verified "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
   exit 0
 fi
 

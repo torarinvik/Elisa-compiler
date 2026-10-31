@@ -743,6 +743,15 @@ def input_fingerprint(
     }
 
 
+def input_fingerprint_keys():
+    return (
+        "source_tree_sha256", "source_tree_stat_fingerprint", "source_tree_write_fingerprint",
+        "source_tree_max_mtime_ns", "source_tree_max_mtime_path", "build_recipe_sha256",
+        "build_recipe_stat_fingerprint", "build_recipe_write_fingerprint", "llvm_toolchain",
+        "seed_configuration",
+    )
+
+
 def snapshot(
     root,
     binary,
@@ -750,6 +759,7 @@ def snapshot(
     exact_toolchain=False,
     previous_inputs=None,
     exact_content=True,
+    verified_inputs=None,
 ):
     root = Path(root).resolve()
     binary = Path(binary).resolve()
@@ -767,13 +777,13 @@ def snapshot(
     data = {
         "schema": SCHEMA,
         "source_revision": source_revision(root),
-        **input_fingerprint(
+        **(verified_inputs if verified_inputs is not None else input_fingerprint(
             root,
             previous_toolchain,
             exact_toolchain,
             previous_inputs=previous_inputs,
             exact_content=exact_content,
-        ),
+        )),
         "product_stat_identity": product_identity,
         "product_sha256": product_digest,
     }
@@ -811,6 +821,25 @@ def snapshot(
 
 def manifest_path(binary):
     return Path(f"{Path(binary)}.provenance.json")
+
+
+def record_verified(root, binary, inputs):
+    """Record a seed product against the exact input fingerprint its build used.
+
+    The seed computed `inputs` (content and toolchain, exactly) while the build ran
+    and check-inputs proved no write happened from before the build until after
+    it, so they describe the product exactly; only the product itself is hashed
+    here. A later edit still makes `check` report the product stale.
+    """
+    if not isinstance(inputs, dict) or set(inputs) != set(input_fingerprint_keys()):
+        raise RuntimeError("verified Stage1 input fingerprint is incomplete")
+    binary = Path(binary).resolve()
+    manifest = manifest_path(binary)
+    data = snapshot(root, binary, exact_content=True, verified_inputs=inputs)
+    temporary = manifest.with_name(f"{manifest.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, manifest)
+    print(f"stage1 provenance: recorded {data['source_revision']} for {binary}")
 
 
 def record(root, binary, expected_inputs=None):
@@ -975,6 +1004,11 @@ def main(argv):
                 raise RuntimeError("usage: stage1_provenance.py record ROOT BIN [EXPECTED_INPUTS_JSON]")
             expected_inputs = json.loads(argv[4]) if len(argv) == 5 else None
             record(argv[2], argv[3], expected_inputs)
+            return 0
+        if argv[1] == "record-verified":
+            if len(argv) != 5:
+                raise RuntimeError("usage: stage1_provenance.py record-verified ROOT BIN VERIFIED_INPUTS_JSON")
+            record_verified(argv[2], argv[3], json.loads(argv[4]))
             return 0
         if argv[1] == "check":
             if len(argv) != 4:
