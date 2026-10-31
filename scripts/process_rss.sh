@@ -32,8 +32,9 @@ process_observe() {
     done <"/proc/$pid/status" 2>/dev/null || true
     return 0
   fi
-  PROCESS_STATE="$(ps -o stat= -p "$pid" 2>/dev/null)" || PROCESS_STATE=""
-  PROCESS_RSS_KB="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print $1}')" || PROCESS_RSS_KB=""
+  # One snapshot keeps state and RSS consistent if the child exits between
+  # observations and avoids an extra ps and awk on each macOS poll.
+  read -r PROCESS_STATE PROCESS_RSS_KB < <(ps -o stat= -o rss= -p "$pid" 2>/dev/null) || true
 }
 
 # Sleep $1 seconds (a decimal such as 0.05). On Linux a `read -t` on a pipe nobody writes
