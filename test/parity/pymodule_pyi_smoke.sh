@@ -332,8 +332,8 @@ PYTHON_BIN="$PYTHON_BIN" bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-py
     -o "$WORK/optional_payload_errors.pyi" \
     "$ROOT/test/repro/pymodule_optional_payload_errors.elisa" >/dev/null
 grep -Fq 'def fail_int(value: int | None = None) -> int: ...' "$WORK/optional_payload_errors.pyi"
-grep -Fq 'def fail_text(value: str | bytes | None = None) -> int: ...' "$WORK/optional_payload_errors.pyi"
-grep -Fq 'def fail_cstr(value: str | bytes | None = None) -> int: ...' "$WORK/optional_payload_errors.pyi"
+grep -Fq 'def fail_text(value: str | bytes | None = "borrowed text payload default") -> int: ...' "$WORK/optional_payload_errors.pyi"
+grep -Fq 'def fail_cstr(value: str | bytes | None = "borrowed cstr payload default") -> int: ...' "$WORK/optional_payload_errors.pyi"
 grep -Fq 'def fail_object(value: Any | None = None) -> int: ...' "$WORK/optional_payload_errors.pyi"
 grep -Fq 'value: int | None' "$WORK/optional_payload_errors.pyi"
 grep -Fq '# error payload: int | None' "$WORK/optional_payload_errors.pyi"
@@ -343,15 +343,15 @@ grep -Fq '# error payload: StructuredOptionalPayloadErrorPayload' "$WORK/optiona
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi \
     -o "$WORK/dict_views.pyi" \
     "$ROOT/test/repro/pymodule_dict_views.elisa" >/dev/null
-grep -Fq 'def roundtrip(values: Mapping[int, Sequence[int]]) -> dict[int, list[int]]: ...' "$WORK/dict_views.pyi"
-grep -Fq 'def roundtrip_bytes(values: Mapping[str | bytes, Sequence[int]]) -> dict[str, bytes]: ...' "$WORK/dict_views.pyi"
+grep -Fq 'def roundtrip(values: Mapping[int, Sequence[int] | _elisa_buffers.Buffer]) -> dict[int, list[int]]: ...' "$WORK/dict_views.pyi"
+grep -Fq 'def roundtrip_bytes(values: Mapping[str | bytes, Sequence[int] | _elisa_buffers.Buffer]) -> dict[str, bytes]: ...' "$WORK/dict_views.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/dict_views.pyi"
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi \
     -o "$WORK/views.pyi" \
     "$ROOT/test/repro/pymodule_views.elisa" >/dev/null
-grep -Fq 'def identity_i64(values: Sequence[int]) -> list[int]: ...' "$WORK/views.pyi"
-grep -Fq 'def identity_u8(values: Sequence[int]) -> bytes: ...' "$WORK/views.pyi"
+grep -Fq 'def identity_i64(values: Sequence[int] | _elisa_buffers.Buffer) -> list[int]: ...' "$WORK/views.pyi"
+grep -Fq 'def identity_u8(values: Sequence[int] | _elisa_buffers.Buffer) -> bytes: ...' "$WORK/views.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/views.pyi"
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-pyi \
@@ -414,5 +414,7 @@ PY
 grep -Fq 'def call(_arg0: int, value: bool) -> int: ...' "$WORK/keyword_params.pyi"
 grep -Fq "_arg0 represents Elisa parameter 'class'" "$WORK/keyword_params.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/keyword_params.pyi"
+
+"$PYTHON_BIN" "$ROOT/scripts/test_pymodule_pyi_buffers.py"
 
 echo "pymodule pyi smoke OK"

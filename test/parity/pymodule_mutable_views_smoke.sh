@@ -38,7 +38,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/mutable_views$SUFFIX" \
     "$ROOT/test/repro/pymodule_mutable_views.elisa" >/dev/null
-grep -q "def scale(values: Any, factor: float) -> int" "$WORK/mutable_views.pyi"
+grep -q "def scale(values: _elisa_buffers.Buffer, factor: float) -> int" "$WORK/mutable_views.pyi"
 
 cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'

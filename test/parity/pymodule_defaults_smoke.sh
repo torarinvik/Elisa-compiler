@@ -20,6 +20,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/defaults.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_defaults.elisa" >/dev/null
 
+cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import inspect
 import sys
@@ -154,7 +155,7 @@ grep -Fq 'def mapping(values: Mapping[int, int] = {1: 2}) -> int: ...' "$WORK/de
 grep -Fq 'def unique(values: Iterable[int] = {1, 2}) -> int: ...' "$WORK/defaults_unsupported.pyi"
 grep -Fq 'def bytes_default(values: bytes | bytearray | memoryview = b"\x01\x02\xff") -> int: ...' "$WORK/defaults_unsupported.pyi"
 grep -Fq 'def nested(values: Sequence[Sequence[int]] = [[1, 2], [3]]) -> int: ...' "$WORK/defaults_unsupported.pyi"
-grep -Fq 'def viewed(values: Sequence[int] = [1, 2]) -> int: ...' "$WORK/defaults_unsupported.pyi"
+grep -Fq 'def viewed(values: Sequence[int] | _elisa_buffers.Buffer = [1, 2]) -> int: ...' "$WORK/defaults_unsupported.pyi"
 
 for invalid_default in negative_unsigned negative_usize negative_uintptr out_of_range i64_out_of_range u64_out_of_range usize_out_of_range bad_escape; do
     if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule \

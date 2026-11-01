@@ -54,6 +54,14 @@ are converted into temporary native storage. Mutable numeric views require a
 writable buffer with matching type, layout and alignment, since copying would
 discard updates. Rejected borrows release the buffer before conversion or error.
 
+Generated annotations describe numeric view inputs as `Sequence[T] | Buffer`
+and writable view inputs as `Buffer`. This accepts NumPy and other buffer
+exporters without widening writable arguments to `Any`. Element format,
+rank, contiguity, alignment and write permission remain runtime constraints.
+The stubs use `collections.abc.Buffer` on Python 3.12+, and the official
+`typing_extensions.Buffer` backport under a type-checking-only import for
+older Python targets. Native module imports gain no backport dependency.
+
 ### WebAssembly
 
 WASM is equally direct and includes the browser/Node integration layer:

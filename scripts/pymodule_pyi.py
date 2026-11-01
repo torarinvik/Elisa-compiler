@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a small, dependency-free Python stub from an Elisa pymodule manifest."""
+"""Render Python stubs from an Elisa pymodule manifest using only host stdlib tools."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import keyword
 import sys
 from pathlib import Path
+
+from pymodule_pyi_typing import buffer_imports, compatibility_imports, numeric_view, uses_buffers
 
 
 PRIMITIVES = {
@@ -151,7 +153,8 @@ def python_type(
     if type_name.startswith("view[") and type_name.endswith("]"):
         element = python_type(type_name[5:-1], known_structs, input_position=input_position, type_context=type_context)
         if input_position:
-            return f"{qualified_type_symbol('Sequence', type_context)}[{element}]"
+            sequence = f"{qualified_type_symbol('Sequence', type_context)}[{element}]"
+            return f"{sequence} | {qualified_type_symbol('Buffer', type_context)}" if numeric_view(type_name) else sequence
         if type_name == "view[u8]":
             return qualified_type_symbol("bytes", type_context)
         return f"{qualified_type_symbol('list', type_context)}[{element}]"
@@ -370,27 +373,25 @@ def render(manifest: dict) -> str:
             if name in reserved_names:
                 type_context[name] = typing_alias
 
+    buffer_alias = unique_private_alias("_elisa_buffers", reserved_names | {builtin_alias, typing_alias})
+    checking_alias = unique_private_alias("_elisa_type_checking", reserved_names | {buffer_alias})
+    optional_alias = unique_private_alias("_elisa_optional_typing", reserved_names | {buffer_alias, checking_alias})
+    if "NotRequired" in type_context:
+        type_context["NotRequired"] = optional_alias
+    if uses_buffers(manifest):
+        type_context["Buffer"] = buffer_alias
+
+    typing_imports = [name for name in ("Any", "Final", "Iterable", "Literal", "Mapping", "Protocol", "Sequence", "TypedDict")
+                      if name not in reserved_names]
     lines = [
         "from __future__ import annotations",
         "",
-        "from typing import Any, Final, Generic, Iterable, Literal, Mapping, Protocol, Sequence, TypedDict, TypeVar",
-        "import sys",
-        "if sys.version_info >= (3, 11):",
-        "    from typing import NotRequired",
-        "else:",
-        "    try:",
-        "        from typing_extensions import NotRequired  # type: ignore",
-        "    except ImportError:",
-        "        # Keep generated stubs importable on Python versions whose stdlib typing",
-        "        # predates NotRequired and where typing_extensions is not installed. Type",
-        "        # checkers that understand the marker still get the precise form above; older",
-        "        # checkers see a regular generic compatibility marker instead of an import error.",
-        "        _ElisaNotRequiredT = TypeVar(\"_ElisaNotRequiredT\")",
-        "        class NotRequired(Generic[_ElisaNotRequiredT]):",
-        "            pass",
-        "",
+        f"from typing import {', '.join(typing_imports)}" if typing_imports else "",
         "",
     ]
+    lines.extend(compatibility_imports(checking_alias, optional_alias if "NotRequired" in type_context else None))
+    if "Buffer" in type_context:
+        lines.extend(buffer_imports(buffer_alias, checking_alias))
     if any(prefix == builtin_alias for prefix in type_context.values()):
         lines.append(f"import builtins as {builtin_alias}")
     if any(prefix == typing_alias for prefix in type_context.values()):
@@ -503,10 +504,8 @@ def render(manifest: dict) -> str:
                     f"{qualified_type_symbol('bytes', type_context)}{optional_text_suffix}"
                 )
             elif parameter.get("mutable"):
-                # A mutable view borrows a writable buffer (a NumPy array, bytearray,
-                # array.array) and writes through to it; the typing module has no
-                # version-independent name for writable buffers.
-                parameter_type = qualified_type_symbol("Any", type_context)
+                # Mutability, format, rank and alignment remain runtime constraints.
+                parameter_type = qualified_type_symbol("Buffer", type_context)
             else:
                 parameter_type = python_type(
                     parameter_source_type,
