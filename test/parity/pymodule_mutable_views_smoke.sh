@@ -33,12 +33,14 @@ if bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule -o "$WORK/text.json" \
 fi
 grep -q "mutable views only of fixed-width numbers" "$WORK/text.err"
 
+SUFFIX="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
-    -o "$WORK/mutable_views.cpython-314-darwin.so" \
+    -o "$WORK/mutable_views$SUFFIX" \
     "$ROOT/test/repro/pymodule_mutable_views.elisa" >/dev/null
 grep -q "def scale(values: Any, factor: float) -> int" "$WORK/mutable_views.pyi"
 
+cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import array
 
@@ -52,6 +54,22 @@ assert mutable_views.bump(counts) == 2
 assert list(counts) == [2, 3]
 storage = bytearray(16)
 assert mutable_views.scale(memoryview(storage).cast("d"), 2.0) == 2
+
+# Copying an unaligned writable view would silently discard the caller's updates.
+storage = bytearray(17)
+unaligned = memoryview(storage)[1:].cast("d")
+unaligned[:] = memoryview(array.array("d", [1.0, 2.0]))
+before = bytes(storage)
+try:
+    mutable_views.scale(unaligned, 2.0)
+except TypeError as error:
+    assert "aligned" in str(error), error
+    assert error.function == "scale" and error.parameter == "values"
+else:
+    raise AssertionError("unaligned writable view accepted")
+assert bytes(storage) == before
+unaligned.release()
+storage.extend(b"x")
 
 # A mutable view writes through, so every input it cannot write through is refused:
 # sequences (a copy would drop the writes), read-only buffers, other element types.

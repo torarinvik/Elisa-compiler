@@ -22,6 +22,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
 grep -q "elisa_pymodule_borrow_buffer(arg0" < <(bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-c \
     -o /dev/stdout "$ROOT/test/repro/pymodule_buffer_views.elisa")
 
+cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 from array import array
 
@@ -44,6 +45,20 @@ assert b.sum_u64_list([2**64 - 2, 1]) == 2**64 - 1
 assert b.count_u8(b"abcd") == 4
 assert b.count_u8(bytearray(b"ab")) == 2
 assert b.count_u8(array("B", [1, 2, 3])) == 3
+
+# A contiguous byte-offset view can still violate the native element alignment.
+# The read-only boundary must materialize aligned storage, then release its borrow.
+storage = bytearray(1 + 3 * doubles.itemsize)
+unaligned = memoryview(storage)[1:].cast("d")
+unaligned[:] = memoryview(doubles)
+assert b.aligned_f64(unaligned)
+assert b.sum_f64(unaligned) == 4.0
+assert b.identity_f64(unaligned) == list(doubles)
+assert b.sum_f64(unaligned.toreadonly()) == 4.0
+unaligned.release()
+storage.extend(b"x")
+assert b.aligned_f64(doubles)
+assert b.aligned_f64(array("d"))
 
 # A borrowed buffer is released after the call, and when a later argument fails.
 doubles.append(3.0)

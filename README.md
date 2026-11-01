@@ -42,6 +42,12 @@ Throwing functions retain the ordinary typed Elisa exception interface, with
 `None` representing successful absence rather than an error. Nullable record
 inputs and nullable record-valued fields are not yet supported.
 
+Numeric read-only views borrow compatible one-dimensional C-contiguous,
+natively aligned buffers; other sequences and incompatible read-only buffers
+are converted into temporary native storage. Mutable numeric views require a
+writable buffer with matching type, layout and alignment, since copying would
+discard updates. Rejected borrows release the buffer before conversion or error.
+
 ### WebAssembly
 
 WASM is equally direct and includes the browser/Node integration layer:
