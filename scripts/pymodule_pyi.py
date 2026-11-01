@@ -502,6 +502,11 @@ def render(manifest: dict) -> str:
                     f"{qualified_type_symbol('str', type_context)} | "
                     f"{qualified_type_symbol('bytes', type_context)}{optional_text_suffix}"
                 )
+            elif parameter.get("mutable"):
+                # A mutable view borrows a writable buffer (a NumPy array, bytearray,
+                # array.array) and writes through to it; the typing module has no
+                # version-independent name for writable buffers.
+                parameter_type = qualified_type_symbol("Any", type_context)
             else:
                 parameter_type = python_type(
                     parameter_source_type,
