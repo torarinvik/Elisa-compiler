@@ -48,6 +48,12 @@ Throwing functions retain the ordinary typed Elisa exception interface, with
 `None` representing successful absence rather than an error. Nullable record
 inputs and nullable record-valued fields are not yet supported.
 
+Text inputs accept `str` or UTF-8 `bytes`, including inside records and
+containers. Invalid UTF-8 is rejected before calling native code. `cstr`
+rejects embedded NULs; `sview` preserves them. Nullable text also accepts
+`None`. Generated converters call Elisa's text helper explicitly, leaving
+the CPython API unchanged and avoiding redundant Unicode validation.
+
 Numeric read-only views borrow compatible one-dimensional C-contiguous,
 natively aligned buffers; other sequences and incompatible read-only buffers
 are converted into temporary native storage. Mutable numeric views require a

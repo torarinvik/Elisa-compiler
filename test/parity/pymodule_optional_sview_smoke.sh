@@ -27,11 +27,13 @@ assert row["parameters"] == [{"name": "value", "type": "sview?", "default": "Non
 assert row["return"] == "sview?"
 PY
 
+SUFFIX="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
-    -o "$WORK/optional_sview_probe.cpython-314-darwin.so" \
+    -o "$WORK/optional_sview_probe$SUFFIX" \
     "$ROOT/test/repro/pymodule_optional_sview_probe.elisa" >/dev/null
 
+cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import inspect
 import optional_sview_probe
@@ -41,6 +43,16 @@ assert optional_sview_probe.maybe_text(None) is None
 value = "hello\x00på\x00東京"
 assert optional_sview_probe.maybe_text(value) == value
 assert optional_sview_probe.maybe_text(b"bytes\x00ok") == "bytes\x00ok"
+for value in ("", b"", "på東京", "på東京".encode()):
+    assert optional_sview_probe.maybe_text(value) == (value.decode() if isinstance(value, bytes) else value)
+for value, error in ((b"\xff", UnicodeDecodeError), ("\ud800", UnicodeEncodeError),
+                     (object(), TypeError), (bytearray(b"text"), TypeError)):
+    try:
+        optional_sview_probe.maybe_text(value)
+    except error as exc:
+        assert exc.parameter == "value"
+    else:
+        raise AssertionError("invalid nullable text accepted")
 assert str(inspect.signature(optional_sview_probe.maybe_text)) == "(value=None)"
 try:
     optional_sview_probe.maybe_text(b"\xff")

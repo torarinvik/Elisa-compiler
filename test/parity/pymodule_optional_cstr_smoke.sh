@@ -14,11 +14,13 @@ if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -f "$ROO
     exit 0
 fi
 
+SUFFIX="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
-    -o "$WORK/optional_text.cpython-314-darwin.so" \
+    -o "$WORK/optional_text$SUFFIX" \
     "$ROOT/test/repro/pymodule_optional_cstr.elisa" >/dev/null
 
+cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import inspect
 import optional_text
@@ -28,6 +30,16 @@ assert optional_text.maybe(None) is None
 assert optional_text.maybe("hello") == "hello"
 assert optional_text.maybe(value="på") == "på"
 assert optional_text.maybe(b"bytes") == "bytes"
+for value in ("", b"", "på東京", "på東京".encode()):
+    assert optional_text.maybe(value) == (value.decode() if isinstance(value, bytes) else value)
+for value, error in ((b"\xff", UnicodeDecodeError), ("\ud800", UnicodeEncodeError),
+                     (object(), TypeError), (bytearray(b"text"), TypeError)):
+    try:
+        optional_text.maybe(value)
+    except error as exc:
+        assert exc.parameter == "value"
+    else:
+        raise AssertionError("invalid nullable text accepted")
 assert str(inspect.signature(optional_text.maybe)) == "(value=None)"
 try:
     optional_text.maybe("a\x00b")
