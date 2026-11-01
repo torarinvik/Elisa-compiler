@@ -85,7 +85,7 @@ def assert_cleanup_in_failure_branch(name, trigger, fragments):
 
 assert_cleanup_in_failure_branch(
     "fail_after_alias_list",
-    "if (arg1_number > UINT8_MAX)",
+    "if (arg1_bytes == NULL)",
     (
         "Py_XDECREF(arg0_seq); arg0_seq = NULL;",
         "PyMem_Free(arg0_items); arg0_items = NULL;",
@@ -95,7 +95,7 @@ assert_cleanup_in_failure_branch(
 )
 assert_cleanup_in_failure_branch(
     "fail_after_nested_alias_list",
-    "if (arg1_number > UINT8_MAX)",
+    "if (arg1_bytes == NULL)",
     (
         "elisa_pymodule_struct_refs_free(&arg0_struct_refs);",
         "arena_free(&arg0_struct_arena);",
@@ -122,6 +122,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/type_aliases.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_type_aliases.elisa" >/dev/null
 
+cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import gc
 import type_aliases
@@ -135,15 +136,15 @@ assert type_aliases.identity_optional(7) == 7
 assert type_aliases.identity_ids([1, 2, 3]) == [1, 2, 3]
 assert type_aliases.identity_map({"first": 1, "second": 2}) == {"first": 1, "second": 2}
 
-# A later list range failure must release aliased darray and dict inputs, including the
+# A later byte-sequence range failure must release aliased darray and dict inputs, including the
 # Python references and arena allocated for a named-struct element.
 gc.collect()
 tracemalloc.start()
 before, _ = tracemalloc.get_traced_memory()
 for _ in range(3000):
     for function, value, later_value, error_type in (
-        (type_aliases.fail_after_alias_list, [{"label": "point"}], [256], OverflowError),
-        (type_aliases.fail_after_nested_alias_list, [[{"label": "point"}]], [256], OverflowError),
+        (type_aliases.fail_after_alias_list, [{"label": "point"}], [256], ValueError),
+        (type_aliases.fail_after_nested_alias_list, [[{"label": "point"}]], [256], ValueError),
         (type_aliases.fail_after_alias_dict, {"first": {"label": "point"}}, object(), TypeError),
     ):
         try:

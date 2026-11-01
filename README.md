@@ -23,6 +23,25 @@ scripts/elisac_stage1.sh -fnoalias -o out.o path/to/program.elisa
 clang -o prog out.o build/runtime/elisacore_runtime.o
 ```
 
+### Python modules
+
+`export pymodule` generates a CPython extension and a typed `.pyi` interface:
+
+```sh
+PYTHON_BIN=python3 scripts/elisac_stage1.sh -emit pymodule-so -o model.so model.elisa
+```
+
+Use records for structured results rather than packing unrelated values into
+numeric arrays. A function returning `Result?` maps to a Python
+`Result | None`; `Result` is a generated `TypedDict` with named fields.
+Supported scalar, text, nested-record and array fields use the ordinary record
+converters. Arrays become independently owned lists, including nested rows;
+text becomes `str`, and Python object fields retain their references. Conversion
+finishes before temporary native arenas and input owners are released.
+Throwing functions retain the ordinary typed Elisa exception interface, with
+`None` representing successful absence rather than an error. Nullable record
+inputs and nullable record-valued fields are not yet supported.
+
 ### WebAssembly
 
 WASM is equally direct and includes the browser/Node integration layer:
