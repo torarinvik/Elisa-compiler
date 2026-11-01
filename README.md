@@ -23,6 +23,12 @@ scripts/elisac_stage1.sh -fnoalias -o out.o path/to/program.elisa
 clang -o prog out.o build/runtime/elisacore_runtime.o
 ```
 
+`scripts/install_stage1.sh` installs a self-contained snapshot. It verifies and
+freezes the recorded bootstrap compiler and optional bootstrap runtime, so
+later development rebuilds cannot invalidate the installed compiler. Snapshot
+integrity checks continue to detect changed installed artifacts; a producer
+that no longer matches the build receipt must be rebuilt before installation.
+
 ### Python modules
 
 `export pymodule` generates a CPython extension and a typed `.pyi` interface:

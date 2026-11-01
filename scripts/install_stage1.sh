@@ -47,8 +47,8 @@ fi
 [[ -s "$ROOT/build/runtime/elisacore_runtime.o.inputs.sha256" ]] || { echo "no runtime freshness stamp at $ROOT/build/runtime/elisacore_runtime.o.inputs.sha256" >&2; exit 2; }
 [[ -f "$ROOT/bin/elisac-stage1.provenance.json" ]] || { echo "no product provenance at $ROOT/bin/elisac-stage1.provenance.json -- run scripts/elisac_stage1.sh --seed first" >&2; exit 2; }
 
-STAGING="$PREFIX/.stage1.incoming.$$"
-rm -rf "$STAGING"
+STAGING="$(mktemp -d "$PREFIX/.stage1.incoming.XXXXXX")"
+trap 'rm -rf "$STAGING"' EXIT
 mkdir -p "$STAGING/bin" "$STAGING/build/runtime"
 # Sources first, product LAST: the driver's staleness guard compares source
 # mtimes against the binary, and a copy that lands the other way round would
@@ -60,6 +60,9 @@ cp "$ROOT/build/runtime/elisacore_runtime.o" "$STAGING/build/runtime/elisacore_r
 cp "$ROOT/build/runtime/elisacore_runtime.o.inputs.sha256" "$STAGING/build/runtime/elisacore_runtime.o.inputs.sha256"
 cp "$ROOT/bin/elisac-stage1" "$STAGING/bin/elisac-stage1"
 cp "$ROOT/bin/elisac-stage1.provenance.json" "$STAGING/bin/elisac-stage1.provenance.json"
+# Bootstrap tools are build inputs, not live dependencies on a development checkout.
+# Freeze only the bytes named by the product receipt; a changed producer is rejected.
+"${ELISA_TOOL_PYTHON:-python3}" "$ROOT/scripts/stage1_snapshot.py" "$STAGING" "$PREFIX/stage1"
 touch "$STAGING/bin/elisac-stage1"
 cat > "$STAGING/SNAPSHOT" <<META
 revision: ${REVISION}
