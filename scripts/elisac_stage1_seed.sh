@@ -224,9 +224,11 @@ seed_build() {
   # workstation before either invocation reports an error, so bound one seed by default.
   # The 5.5 GiB freeze came from two worktrees seeding at once; the host-wide global seed lock
   # above now serializes seeds, so one seed may use more. The compiler outgrew 4 GiB: seeds of
-  # main (2026-10-03) peak near it and were killed by the guard at 420 s. 6 GiB leaves a single
-  # serialized seed headroom; raise ELISA_STAGE1_SEED_MAX_RSS_KB further on large hosts.
-  seed_max_rss_kb="${ELISA_STAGE1_SEED_MAX_RSS_KB:-6291456}"
+  # main (2026-10-03) peak near it and were killed by the guard at 420 s. It then outgrew 6 GiB:
+  # seeds of main (2026-11-01) were stopped at 6.07 GiB and, in a resumed analysis pass, at
+  # 8.0 GiB, and complete under 10 GiB. 12 GiB leaves a single serialized seed headroom; raise
+  # ELISA_STAGE1_SEED_MAX_RSS_KB further on large hosts.
+  seed_max_rss_kb="${ELISA_STAGE1_SEED_MAX_RSS_KB:-12582912}"
   seed_rss_poll_seconds="${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
   seed_opt_level="${ELISA_STAGE1_SEED_OPT_LEVEL:--O3}"
   case "$seed_opt_level" in
