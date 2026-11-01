@@ -36,11 +36,11 @@ esac
 # shared platform setup themselves.
 . "$ROOT/scripts/platform.sh"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "cannot verify stage1 source provenance: python3 is unavailable" >&2
+if ! command -v "$ELISA_TOOL_PYTHON" >/dev/null 2>&1; then
+  echo "cannot verify stage1 source provenance: $ELISA_TOOL_PYTHON is unavailable" >&2
   exit 2
 fi
-python3 "$ROOT/scripts/stage1_provenance.py" check "$ROOT" "$BIN"
+"$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" check "$ROOT" "$BIN"
 provenance_status=$?
 if [[ "$provenance_status" -ne 0 ]]; then
   echo "run: $ROOT/scripts/elisac_stage1.sh --seed" >&2

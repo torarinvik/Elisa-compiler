@@ -170,7 +170,7 @@ seed_build() {
   fi
   seed_bootstrap_kind="${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}"
   if [[ -z "$seed_bootstrap_kind" ]]; then
-    seed_bootstrap_kind="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
+    seed_bootstrap_kind="$("$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
   fi
   case "$seed_bootstrap_kind" in
     stage0|stage1) ;;
@@ -345,7 +345,7 @@ seed_build() {
   fi
   local seed_inputs_check_pid=""
   if [[ -n "${ELISA_STAGE1_SEED_INPUTS:-}" ]]; then
-    "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" ${ELISA_STAGE1_SEED_WRITES:+"$ELISA_STAGE1_SEED_WRITES"} &
+    "$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" ${ELISA_STAGE1_SEED_WRITES:+"$ELISA_STAGE1_SEED_WRITES"} &
     seed_inputs_check_pid=$!
   fi
   # -stack_size: a deeply left-nested expression (adversarial input, see

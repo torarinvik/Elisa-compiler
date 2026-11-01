@@ -27,6 +27,12 @@
 #   ELISA_SHARED_MODULE_FLAGS  -bundle -undefined dynamic_lookup | -shared -fPIC
 #   ELISA_BREW_BIN           /opt/homebrew/bin on Darwin when present, else empty
 #   ELISA_PYTHON314_BIN / ELISA_PYTHON314_CONFIG / ELISA_PYTHON312_BIN / ELISA_PYTHON312_CONFIG
+#   ELISA_TOOL_PYTHON        the interpreter that records and checks Stage1 provenance:
+#                            ELISA_PYTHON314_BIN when executable, else python3. Never the
+#                            caller's `python3`: a virtualenv changes it, and macOS's
+#                            /usr/bin/python3 adds /usr/local/lib to LIBRARY_PATH and sets
+#                            SDKROOT for its children, so the recorded linker probe would
+#                            depend on who ran the compiler.
 #   ELISA_NPROC              online CPU count
 #   elisa_sha256 [FILE...]   sha256sum-compatible output (stdin when no file)
 if [[ -z "${ELISA_PLATFORM_SOURCED:-}" ]]; then
@@ -139,6 +145,10 @@ export ELISA_PYTHON314_CONFIG="${ELISA_PYTHON314_CONFIG:-$(_ep_py 3.14-config)}"
 export ELISA_PYTHON312_BIN="${ELISA_PYTHON312_BIN:-$(_ep_py 3.12)}"
 export ELISA_PYTHON312_CONFIG="${ELISA_PYTHON312_CONFIG:-$(_ep_py 3.12-config)}"
 unset -f _ep_py
+if [[ -z "${ELISA_TOOL_PYTHON:-}" ]]; then
+    if [[ -x "$ELISA_PYTHON314_BIN" ]]; then ELISA_TOOL_PYTHON="$ELISA_PYTHON314_BIN"; else ELISA_TOOL_PYTHON=python3; fi
+fi
+export ELISA_TOOL_PYTHON
 
 export ELISA_NPROC="${ELISA_NPROC:-$( (nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
 fi

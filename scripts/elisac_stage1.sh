@@ -176,7 +176,7 @@ source "$ROOT/scripts/elisac_stage1_seed.sh"
 if [[ "${1:-}" == "--seed" ]]; then
   export ELISA_STAGE1_SEED_BOOTSTRAP_BIN="$BOOTSTRAP_BIN"
   if [[ -z "${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}" ]]; then
-    ELISA_STAGE1_SEED_BOOTSTRAP_KIND="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
+    ELISA_STAGE1_SEED_BOOTSTRAP_KIND="$("$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
   fi
   case "$ELISA_STAGE1_SEED_BOOTSTRAP_KIND" in
     stage0|stage1) ;;
@@ -193,14 +193,14 @@ if [[ "${1:-}" == "--seed" ]]; then
   # anything; the full (content and toolchain) fingerprint is computed beside the
   # build. seed_build joins it and requires both it and the tree after the build to
   # match the anchor, so a write at any point of the build still refuses publication.
-  ELISA_STAGE1_SEED_WRITES="$("${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" write-fingerprint "$ROOT")"
+  ELISA_STAGE1_SEED_WRITES="$("$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" write-fingerprint "$ROOT")"
   mkdir -p "$ROOT/build"
   ELISA_SEED_INPUTS_FILE="$ROOT/build/.seed-inputs.$$"
-  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
+  "$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
   ELISA_SEED_INPUTS_PID=$!
   seed_build
   # seed_build's check-inputs proved these build-time inputs unchanged through the build.
-  "${PYTHON_HOST:-python3}" "$ROOT/scripts/stage1_provenance.py" record-verified "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
+  "$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" record-verified "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
   exit 0
 fi
 
