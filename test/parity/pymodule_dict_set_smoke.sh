@@ -17,7 +17,7 @@ if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -f "$ROO
 fi
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule -o "$WORK/manifest.json" "$SOURCE" >/dev/null
-python3 - "$WORK/manifest.json" <<'PY'
+"$PYTHON_BIN" - "$WORK/manifest.json" <<'PY'
 import json
 import sys
 
@@ -66,7 +66,7 @@ assert functions["unsigned_then_signed"]["parameters"] == [
 assert functions["unsigned_then_signed"]["return"] == "i64"
 assert functions["set_then_optional_uintptr"]["parameters"] == [
     {"name": "values", "type": "set[i64]"},
-    {"name": "value", "type": "uintptr?"},
+    {"name": "value", "type": "uintptr?", "default": "None"},
 ]
 assert functions["set_then_optional_uintptr"]["return"] == "usize"
 assert functions["contains_i8"]["parameters"] == [
@@ -97,17 +97,20 @@ grep -Fq 'def roundtrip_usize(values: Iterable[int]) -> set[int]: ...' "$WORK/di
 grep -Fq 'def roundtrip_uintptr(values: Iterable[int]) -> set[int]: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def roundtrip_u64(value: int) -> int: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def unsigned_then_signed(value: int, signed: int) -> int: ...' "$WORK/dict_set_probe.pyi"
-grep -Fq 'def set_then_optional_uintptr(values: Iterable[int], value: int | None) -> int: ...' "$WORK/dict_set_probe.pyi"
+grep -Fq 'def set_then_optional_uintptr(values: Iterable[int], value: int | None = None) -> int: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_i8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
 grep -Fq 'def contains_u8(values: Iterable[int], key: int) -> bool: ...' "$WORK/dict_set_probe.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/dict_set_probe.pyi"
 
+SUFFIX="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
-    -o "$WORK/dict_set_probe.cpython-314-darwin.so" "$SOURCE" >/dev/null
+    -o "$WORK/dict_set_probe$SUFFIX" "$SOURCE" >/dev/null
 
+cd "$WORK"
 PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
 import dict_set_probe
+import random
 import sys
 
 value = {1: {2, 3}, 4: set()}
@@ -143,6 +146,40 @@ unsigned_long_long_max = (1 << 64) - 1
 assert dict_set_probe.roundtrip_u64(unsigned_long_long_max) == unsigned_long_long_max
 assert dict_set_probe.contains_i8([-1, 4], -1)
 assert dict_set_probe.contains_u8([255, 4], 255)
+
+# Native probing must agree with Python membership, not merely round-trip the
+# materialized storage. Include full-width integers, duplicate text encodings,
+# and enough keys to exercise hash-table collisions.
+rng = random.Random(20261101)
+for function, values, probes in (
+    (dict_set_probe.contains_i64,
+     [-sys.maxsize - 1, sys.maxsize] + [rng.randrange(-2**63, 2**63) for _ in range(128)],
+     [0, 1, -1]),
+    (dict_set_probe.contains_u64,
+     [0, 2**63, 2**64 - 1] + [rng.randrange(2**64) for _ in range(128)],
+     [1, 2**63 - 1]),
+    (dict_set_probe.contains_usize,
+     [0, pointer_unsigned_max] + [rng.randrange(pointer_unsigned_max + 1) for _ in range(128)],
+     [1, pointer_unsigned_max - 1]),
+):
+    expected = set(values)
+    for key in values + probes:
+        assert function(values, key) == (key in expected), (function.__name__, key)
+    assert not function([], 0)
+
+text_values = ["", "α", "på東京", "a", "ab"] + [f"key-{i}" for i in range(128)]
+mixed = text_values + [value.encode() for value in text_values]
+for key in text_values + ["absent", "key-128"]:
+    for query in (key, key.encode()):
+        assert dict_set_probe.contains_cstr(mixed, query) == (key in text_values), query
+assert not dict_set_probe.contains_cstr([], "")
+
+for function, values, queries in (
+    (dict_set_probe.contains_i8, list(range(-128, 128, 2)), range(-128, 128)),
+    (dict_set_probe.contains_u8, list(range(0, 256, 2)), range(256)),
+):
+    for key in queries:
+        assert function(values, key) == (key in values)
 
 for bad in (-1, 1 << 64):
     try:

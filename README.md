@@ -54,6 +54,11 @@ rejects embedded NULs; `sview` preserves them. Nullable text also accepts
 `None`. Generated converters call Elisa's text helper explicitly, leaving
 the CPython API unchanged and avoiding redundant Unicode validation.
 
+Native collection methods require the standard-library collection helpers in
+scope. Text set queries currently support `set[cstr]`; `set[sview]` can cross
+the Python boundary for storage, counting and round-trips, but its native
+hash-table operations are not yet supported.
+
 Numeric read-only views borrow compatible one-dimensional C-contiguous,
 natively aligned buffers; other sequences and incompatible read-only buffers
 are converted into temporary native storage. Mutable numeric views require a
