@@ -174,6 +174,20 @@ for key in text_values + ["absent", "key-128"]:
         assert dict_set_probe.contains_cstr(mixed, query) == (key in text_values), query
 assert not dict_set_probe.contains_cstr([], "")
 
+view_values = text_values + ["a\x00b", "a\x00c", "\x00", "tail\x00"]
+mixed_views = view_values + [value.encode() for value in view_values]
+for key in view_values + ["absent", "a", "a\x00", "a\x00d", "tail"]:
+    for query in (key, key.encode()):
+        assert dict_set_probe.contains_sview(mixed_views, query) == (key in view_values), query
+# Compare the native builtin with an independent, length-aware FNV-1a fold.
+for key in view_values:
+    expected_hash = 0xcbf29ce484222325
+    for byte in key.encode():
+        expected_hash = ((expected_hash ^ byte) * 0x100000001b3) & (2**64 - 1)
+    assert dict_set_probe.hash_key(key) == expected_hash
+    assert dict_set_probe.hash_key(key.encode()) == expected_hash
+assert not dict_set_probe.contains_sview([], "")
+
 for function, values, queries in (
     (dict_set_probe.contains_i8, list(range(-128, 128, 2)), range(-128, 128)),
     (dict_set_probe.contains_u8, list(range(0, 256, 2)), range(256)),

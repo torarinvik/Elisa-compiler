@@ -55,9 +55,9 @@ rejects embedded NULs; `sview` preserves them. Nullable text also accepts
 the CPython API unchanged and avoiding redundant Unicode validation.
 
 Native collection methods require the standard-library collection helpers in
-scope. Text set queries currently support `set[cstr]`; `set[sview]` can cross
-the Python boundary for storage, counting and round-trips, but its native
-hash-table operations are not yet supported.
+scope. Text set queries support `set[cstr]` and `set[sview]`. String-view keys use
+length-aware byte-content hashing and equality, preserving embedded NULs.
+Borrowed key storage must remain alive and unchanged while the set uses it.
 
 Numeric read-only views borrow compatible one-dimensional C-contiguous,
 natively aligned buffers; other sequences and incompatible read-only buffers

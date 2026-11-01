@@ -62,11 +62,11 @@ negative_text = NEGATIVE.read_text()
 expected_classifier = '''
 def is_unsupported_spelling(element_spelling: sview) -> bool:
     ensure result == (
-        element_spelling == "sview" or element_spelling == "dstr" or
+        element_spelling == "dstr" or
         element_spelling == "f32" or element_spelling == "f64"
     )
     return match element_spelling:
-        "sview" | "dstr" | "f32" | "f64": true
+        "dstr" | "f32" | "f64": true
         _: false
 '''
 expected_display = '''
@@ -85,7 +85,9 @@ if consumer_text.count('include "./set_membership_element_policy.elisa"') != 1:
 if semantic_text.count('include "./check_set_membership_element.elisa"') != 1:
     raise SystemExit("semantic root must include the set membership checker exactly once")
 pass_dispatch = compact(function_section(semantic_passes_text, "par_pass_call"))
-if "ifpass_id==94:table<-check_set_membership_element(loop_view.top_decls,table)" not in pass_dispatch:
+pass_chunk = compact(function_section(semantic_passes_text, "par_pass_call_chunk_3"))
+if "ifpass_id>=72andpass_id<=95:table<-par_pass_call_chunk_3(pass_id,file,loop_view,flags,table)" not in pass_dispatch or \
+        "ifpass_id==94:table<-check_set_membership_element(loop_view.top_decls,table)" not in pass_chunk:
     raise SystemExit("semantic pass dispatcher no longer invokes the proved set-element checker")
 
 if compact(function_section(consumer_text, "set_element_spelling_unsupported")) != compact('''
@@ -183,9 +185,9 @@ if declarations(positive_text) != positive_names or declarations(negative_text) 
     raise SystemExit("set-element proof inventory changed")
 
 positive_claims = {
-    "unsupported_element_classifier_is_exact": 'SemanticSetMembershipElementPolicy::is_unsupported_spelling(spelling)==(spelling=="sview"orspelling=="dstr"orspelling=="f32"orspelling=="f64")',
+    "unsupported_element_classifier_is_exact": 'SemanticSetMembershipElementPolicy::is_unsupported_spelling(spelling)==(spelling=="dstr"orspelling=="f32"orspelling=="f64")',
     "diagnostic_spelling_is_exact_for_every_input": 'SemanticSetMembershipElementPolicy::diagnostic_spelling(spelling)==("darray[u8]"ifspelling=="dstr"elsespelling)',
-    "measured_rejected_and_accepted_element_spellings_are_distinguished": 'SemanticSetMembershipElementPolicy::is_unsupported_spelling("sview")andSemanticSetMembershipElementPolicy::is_unsupported_spelling("dstr")andSemanticSetMembershipElementPolicy::is_unsupported_spelling("f32")andSemanticSetMembershipElementPolicy::is_unsupported_spelling("f64")',
+    "measured_rejected_and_accepted_element_spellings_are_distinguished": 'notSemanticSetMembershipElementPolicy::is_unsupported_spelling("sview")andSemanticSetMembershipElementPolicy::is_unsupported_spelling("dstr")andSemanticSetMembershipElementPolicy::is_unsupported_spelling("f32")andSemanticSetMembershipElementPolicy::is_unsupported_spelling("f64")',
     "dstr_uses_its_lowered_type_in_the_diagnostic": 'SemanticSetMembershipElementPolicy::diagnostic_spelling("dstr")=="darray[u8]"andSemanticSetMembershipElementPolicy::diagnostic_spelling("sview")=="sview"andSemanticSetMembershipElementPolicy::diagnostic_spelling("f64")=="f64"',
 }
 for name, claim in positive_claims.items():
