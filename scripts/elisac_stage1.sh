@@ -85,7 +85,14 @@ else
   # compiler root instead of letting set -e abort the product launcher.
   main_checkout="$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
   main_checkout="${main_checkout%/.git}"
+  # A snapshot lives outside its source checkout, but records that checkout in
+  # SNAPSHOT. Prefer its sibling Stage0 when it is still available.
+  snapshot_source=""
+  if [[ -f "$ROOT/SNAPSHOT" ]]; then
+    snapshot_source="$(sed -n 's/^from:[[:space:]]*//p' "$ROOT/SNAPSHOT" | head -n 1)"
+  fi
   for bootstrap_candidate in \
+      "${snapshot_source:-$ROOT}/../../Go projects/Elisa-core/compiler/bin/elisac" \
       "${main_checkout:-$ROOT}/../../Go projects/Elisa-core/compiler/bin/elisac" \
       "$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac" \
       "$ROOT/../../../Go projects/Elisa-core/compiler/bin/elisac"; do

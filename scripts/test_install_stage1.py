@@ -81,4 +81,24 @@ with tempfile.TemporaryDirectory(prefix="elisa-install-control-") as directory:
         assert toolchain_content_view(seed_configuration_fingerprint(installed, exact=True)) != toolchain_content_view(installed)
     finally:
         os.environ.update(saved)
-print("Stage1 installation control passed: immutable seed inputs, tamper detection, atomic failure, runtime stamp")
+with tempfile.TemporaryDirectory(prefix="elisa bootstrap discovery ") as directory:
+    root = Path(directory)
+    source = root / "Elisa Projects" / "Elisa-compiler"
+    source.mkdir(parents=True)
+    bootstrap = root / "Go projects" / "Elisa-core" / "compiler" / "bin" / "elisac"
+    bootstrap.parent.mkdir(parents=True)
+    bootstrap.write_text("not a compiler\n")
+    bootstrap.chmod(0o755)
+    snapshot = root / "installed snapshot"
+    snapshot.mkdir()
+    shutil.copytree(installer.parent, snapshot / "scripts", symlinks=True)
+    (snapshot / "SNAPSHOT").write_text(f"from:     {source}\n")
+    env = os.environ.copy()
+    for key in ("ELISACORE_BIN", "ELISA_STAGE1_SEED_BOOTSTRAP_KIND", "ELISA_STAGE1_BIN"):
+        env.pop(key, None)
+    result = subprocess.run(["bash", str(snapshot / "scripts/elisac_stage1.sh"), "--seed"],
+                            env=env, capture_output=True, text=True)
+    # The fixture is deliberately not a compiler; bootstrap identification must
+    # fail on the discovered path before starting an expensive seed build.
+    assert result.returncode == 2 and str(bootstrap) in result.stderr, result
+print("Stage1 installation control passed: immutable seed inputs, tamper detection, atomic failure, runtime stamp, snapshot bootstrap discovery")
