@@ -46,7 +46,7 @@ check_diag() { # file char length
 }
 check_diag shorthand b 400000
 check_diag layout Q 700000
-RT="$ROOT/build/runtime/elisacore_runtime.o"
+RT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RT" ] || { echo "long_generated_name FAIL: no runtime object" >&2; exit 1; }
 if ! { "$BIN" -emit obj -O0 "$TMP/handler.elisa" -o "$TMP/handler.o" && clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$TMP/handler" "$TMP/handler.o" "$RT"; } >"$TMP/h.log" 2>&1; then
     echo "long_generated_name FAIL: handler program did not build" >&2; head -c 2000 "$TMP/h.log" >&2; fail=1

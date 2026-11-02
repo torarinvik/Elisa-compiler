@@ -237,3 +237,5 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 
 // Bounded AArch64 zero-fill expansion shared with Stage0.
 #include "llvm_small_zero.cpp"
+
+#include "llvm_bool_array_pack.cpp"
