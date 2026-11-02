@@ -203,3 +203,37 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef) { return 0;
 
 // Shared reduction-tail pass, also included in the bridge cache identity.
 #include "llvm_remainder_tail.cpp"
+
+// Keep Apple ARM layout policy identical to Stage0's O3 emitter.
+#include <llvm-c/Support.h>
+#include <llvm-c/Transforms/PassBuilder.h>
+#include <llvm-c/Error.h>
+extern "C" void elisacoreConfigureAppleCodeLayout() {
+#if defined(__APPLE__) && defined(__aarch64__)
+  static bool installed = false;
+  if (installed) return;
+  installed = true;
+  const char *args[] = {"elisac", "-enable-ext-tsp-block-placement=true"};
+  LLVMParseCommandLineOptions(2, args, nullptr);
+#endif
+}
+extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
+                                              LLVMTargetMachineRef target) {
+#if defined(__APPLE__) && defined(__aarch64__)
+  auto options = LLVMCreatePassBuilderOptions();
+  auto error = LLVMRunPasses(module,
+      "function(early-cse,instcombine<max-iterations=8>,loop-simplify,lcssa,loop(indvars),gvn,instcombine<max-iterations=8>,simplifycfg)",
+      target, options);
+  LLVMDisposePassBuilderOptions(options);
+  if (error) {
+    LLVMConsumeError(error);
+    return 2;
+  }
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+// Bounded AArch64 zero-fill expansion shared with Stage0.
+#include "llvm_small_zero.cpp"
