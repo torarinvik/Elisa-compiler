@@ -239,3 +239,5 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #include "llvm_small_zero.cpp"
 
 #include "llvm_bool_array_pack.cpp"
+
+#include "llvm_short_trip.cpp"
