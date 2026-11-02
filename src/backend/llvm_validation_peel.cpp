@@ -217,6 +217,8 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
   LLVMParseCommandLineOptions(2, args, nullptr);
 #endif
 }
+#include "llvm_checked_mul.cpp"
+
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -229,10 +231,8 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     LLVMConsumeError(error);
     return 2;
   }
-  return 1;
-#else
-  return 0;
 #endif
+  return elisacoreFastCheckedMul(module, target);
 }
 
 // Bounded AArch64 zero-fill expansion shared with Stage0.
