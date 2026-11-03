@@ -19,6 +19,14 @@ BUILD_SCRIPT="$ROOT/scripts/build_runtime_object.sh"
 PRODUCT="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 OUT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 RUNTIME_OVERFLOW="${ELISA_RUNTIME_OVERFLOW:-default}"
+# Match the backend's effective FP policy; strict overrides all fast-math
+# opt-ins, and a nonempty environment value enables either switch.
+RUNTIME_FP_MODE=default
+if [[ -n "${ELISACORE_STRICT_FP:-}" ]]; then
+  RUNTIME_FP_MODE=strict
+elif [[ -n "${ELISACORE_FAST_MATH:-}" ]]; then
+  RUNTIME_FP_MODE=fast
+fi
 ELISA_CLANG_TOOL="${ELISA_CLANG:-$(command -v clang || true)}"
 case "$RUNTIME_OVERFLOW" in
   default|wrap|trap) ;;
@@ -70,6 +78,7 @@ runtime_input_digest() {
     printf 'opt-level %s\n' "$RUNTIME_OPT_LEVEL"
     # And the arithmetic mode, which matters for a checked benchmark profile.
     printf 'overflow-mode %s\n' "$RUNTIME_OVERFLOW"
+    printf 'fp-mode %s\n' "$RUNTIME_FP_MODE"
     # And the target: an object stamped under other host flags must not count as fresh.
     printf 'host-flags linux=%s windows=%s x86_64=%s\n' "${ELISA_HOST_LINUX:-}" "${ELISA_HOST_WINDOWS:-}" "${ELISA_HOST_X86_64:-}"
   } | LC_ALL=C sort | "${HASH_COMMAND[@]}" | awk '{print $1}'
