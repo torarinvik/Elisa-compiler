@@ -218,6 +218,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #endif
 }
 #include "llvm_checked_mul.cpp"
+#include "llvm_bounded_unswitch.cpp"
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
@@ -232,7 +233,15 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     return 2;
   }
 #endif
-  return elisacoreFastCheckedMul(module, target);
+  unsigned status = elisacoreFastCheckedMul(module, target);
+  if (status == 2) return 2;
+#if defined(__APPLE__) && defined(__aarch64__)
+  // The linked macOS benchmark qualifies this late versioning. Keep Linux's
+  // existing output until the matching-PIE comparison demonstrates a gain.
+  return elisacoreBoundedLoopUnswitch(module) ? 1 : status;
+#else
+  return status;
+#endif
 }
 
 // Bounded AArch64 zero-fill expansion shared with Stage0.
