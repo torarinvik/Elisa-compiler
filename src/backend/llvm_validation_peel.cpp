@@ -4,6 +4,7 @@
 #if LLVM_VERSION_MAJOR == 23
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
@@ -112,7 +113,7 @@ extern "C" unsigned elisacoreUnrollNestedScans(LLVMModuleRef ref) {
                     if (auto *one = dyn_cast<ConstantInt>(add->getOperand(1 - i)))
                       if (one->isOne()) induction = true;
         if (!induction) continue;
-        unsigned loads = 0, stores = 0, instructions = 0, conditions = 0;
+        unsigned loads = 0, stores = 0, instructions = 0, conditions = 0, checkedAdds = 0;
         bool safe = true;
         for (BasicBlock *BB : L->blocks()) {
           if (BB->hasAddressTaken() || BB->isEHPad()) safe = false;
@@ -121,15 +122,22 @@ extern "C" unsigned elisacoreUnrollNestedScans(LLVMModuleRef ref) {
             if (auto *load = dyn_cast<LoadInst>(&I)) { ++loads; safe &= load->isSimple(); }
             else if (auto *store = dyn_cast<StoreInst>(&I)) { ++stores; safe &= store->isSimple(); }
             else if (isa<CondBrInst>(I)) ++conditions;
-            else if (isa<CallBase>(I) || isa<AllocaInst>(I) || isa<IndirectBrInst>(I) ||
+            else if (auto *call = dyn_cast<CallBase>(&I)) {
+              auto *intrinsic = dyn_cast<IntrinsicInst>(call);
+              if (!intrinsic || intrinsic->getIntrinsicID() != Intrinsic::sadd_with_overflow ||
+                  call->hasOperandBundles() || call->isConvergent() || call->cannotDuplicate()) safe = false;
+              else ++checkedAdds;
+            }
+            else if (isa<AllocaInst>(I) || isa<IndirectBrInst>(I) ||
                      I.getType()->isTokenTy()) safe = false;
           }
         }
         if (!safe || loads < 2 || stores < 1 || conditions < 3 || instructions > 65) continue;
+        if (checkedAdds && (checkedAdds != 1 || instructions > 40 || F.getInstructionCount() > 1000)) continue;
         simplifyLoop(L, &DT, &LI, &SE, &AC, nullptr, false);
         if (!L->isLoopSimplifyForm()) continue;
         formLCSSA(*L, DT, &LI, &SE);
-        UnrollLoopOptions options{2, true, true, false, true, false, nullptr, 1000, true, false};
+        UnrollLoopOptions options{checkedAdds ? 8u : 2u, true, true, false, true, false, nullptr, 1000, true, false};
         if (UnrollLoop(L, options, &LI, &SE, &DT, &AC, &TTI, &ORE, true) != LoopUnrollResult::Unmodified)
           ++changed;
         done = true; // Recompute analyses before considering another loop in this function.
