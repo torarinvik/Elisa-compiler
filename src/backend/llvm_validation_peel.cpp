@@ -219,6 +219,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 }
 #include "llvm_checked_mul.cpp"
 #include "llvm_bounded_unswitch.cpp"
+#include "llvm_shared_reciprocal.cpp"
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
@@ -233,7 +234,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     return 2;
   }
 #endif
+  unsigned sharedReciprocals = elisacoreShareReciprocals(module);
   unsigned status = elisacoreFastCheckedMul(module, target);
+  if (sharedReciprocals && status == 0) status = 1;
   if (status == 2) return 2;
 #if defined(__APPLE__) && defined(__aarch64__)
   // The linked macOS benchmark qualifies this late versioning. Keep Linux's
