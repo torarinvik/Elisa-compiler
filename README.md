@@ -28,6 +28,8 @@ freezes the recorded bootstrap compiler and optional bootstrap runtime, so
 later development rebuilds cannot invalidate the installed compiler. Snapshot
 integrity checks continue to detect changed installed artifacts; a producer
 that no longer matches the build receipt must be rebuilt before installation.
+Linker provenance ignores exact duplicate library-search directories while
+preserving search order, library options and selected artifact checks.
 
 ### Python modules
 

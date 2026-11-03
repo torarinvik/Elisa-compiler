@@ -330,7 +330,16 @@ def normalize_linker_probe_argv(argv):
     # and would make exact Stage1 input fingerprints differ on every invocation.
     temporary_directory = Path(tempfile.gettempdir()).resolve()
     normalized = []
+    search_directories = set()
     for argument in argv:
+        # Clang emits joined -L options, including inherited LIBRARY_PATH entries.
+        # Repeating exactly the same directory cannot alter its first-match search
+        # order. Preserve the first occurrence; do not normalize library options,
+        # distinct spellings, or the relative order of different directories.
+        if argument.startswith("-L") and len(argument) > 2:
+            if argument in search_directories:
+                continue
+            search_directories.add(argument)
         path = Path(argument)
         if (
             re.fullmatch(r"null-[A-Za-z0-9]+\.o", path.name)

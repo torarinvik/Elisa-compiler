@@ -2,6 +2,7 @@
 import contextlib
 import hashlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,24 @@ import tempfile
 from unittest.mock import patch
 
 import stage1_provenance
+
+
+# Duplicate search directories preserve first-match lookup, including when the
+# inherited environment repeats them. Distinct directory order and repeated
+# libraries remain significant and must not be erased from provenance.
+for count in range(5):
+    for directories in itertools.product(("-L/first", "-L/second", "-L/third"), repeat=count):
+        normalized = stage1_provenance.normalize_linker_probe_argv(
+            ["ld", *directories, "-lvalue", "-lvalue"]
+        )
+        assert normalized[0] == "ld" and normalized[-2:] == ["-lvalue", "-lvalue"]
+        assert len(normalized[1:-2]) == len(set(directories))
+        for present in itertools.product((False, True), repeat=3):
+            available = {name for name, exists in zip(("-L/first", "-L/second", "-L/third"), present) if exists}
+            assert next((name for name in normalized[1:-2] if name in available), None) == next(
+                (name for name in directories if name in available), None
+            )
+assert stage1_provenance.normalize_linker_probe_argv(["ld", "-L/first", "-L/second"]) != stage1_provenance.normalize_linker_probe_argv(["ld", "-L/second", "-L/first"])
 
 
 original_revision = stage1_provenance.source_revision
