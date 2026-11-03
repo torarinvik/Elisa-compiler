@@ -216,6 +216,12 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
   const char *args[] = {"elisac", "-enable-ext-tsp-block-placement=true",
                         "-aarch64-enable-early-ifcvt=false"};
   LLVMParseCommandLineOptions(3, args, nullptr);
+#elif defined(__aarch64__)
+  static bool installed = false;
+  if (installed) return;
+  installed = true;
+  const char *args[] = {"elisac", "-aarch64-enable-early-ifcvt=false"};
+  LLVMParseCommandLineOptions(2, args, nullptr);
 #endif
 }
 #include "llvm_checked_mul.cpp"
