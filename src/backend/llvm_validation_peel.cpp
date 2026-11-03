@@ -218,6 +218,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #endif
 }
 #include "llvm_checked_mul.cpp"
+#include "llvm_bounded_unswitch.cpp"
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
@@ -232,7 +233,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     return 2;
   }
 #endif
-  return elisacoreFastCheckedMul(module, target);
+  unsigned status = elisacoreFastCheckedMul(module, target);
+  if (status == 2) return 2;
+  return elisacoreBoundedLoopUnswitch(module) ? 1 : status;
 }
 
 // Bounded AArch64 zero-fill expansion shared with Stage0.
