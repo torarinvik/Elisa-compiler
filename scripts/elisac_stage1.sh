@@ -27,7 +27,7 @@ set -euo pipefail
 # requires an interactive license agreement. Prefer the installed Command Line
 # Tools for headless compiler gates unless the caller explicitly selected a
 # developer directory.
-if [[ -z "${DEVELOPER_DIR:-}" && -d /Library/Developer/CommandLineTools ]]; then
+if [[ "$(uname -s)" == Darwin && -z "${DEVELOPER_DIR:-}" && -d /Library/Developer/CommandLineTools ]]; then
   export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 fi
 
