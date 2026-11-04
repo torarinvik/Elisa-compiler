@@ -68,7 +68,7 @@ fi
 
 echo "stage1_product_smoke OK: product $BIN compiled fixture → exit 42 (no stage0)"
 
-python3 "$ROOT/test/parity/stage1_region_constant_smoke.py" "$BIN"
+"$ELISA_TOOL_PYTHON" "$ROOT/test/parity/stage1_region_constant_smoke.py" "$BIN"
 
 # Exercise program-lived arenas in linked Stage1 output. The first case covers
 # a global-region selector passed to a region-parameterized function; the second
