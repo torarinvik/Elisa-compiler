@@ -599,7 +599,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned boundedDivisionLoops = elisacoreUnrollBoundedDivisionLoops(module);
   if (boundedDivisionLoops) {
     auto options = LLVMCreatePassBuilderOptions();
-    auto error = LLVMRunPasses(module, "function(instcombine,simplifycfg)", target, options);
+    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg)", target, options);
     LLVMDisposePassBuilderOptions(options);
     if (error) { LLVMConsumeError(error); return 2; }
     status = 1;

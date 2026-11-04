@@ -115,7 +115,53 @@ int main(int argc,char **argv){
                                         capture_output=True, text=True, timeout=5)
                 if (result.returncode, result.stdout.strip()) != (code, output):
                     raise RuntimeError(f'{name}: {n}, {offset}: {result}')
-    print('bounded division unroll: 6 policy controls and 16 runtime/trap checks passed')
+        # Constant counter recurrences qualify only with a defined division seed.
+        # Exercise both step signs and the exact endpoints of the overflow proof.
+        runtime_checks = len(cases) * 2
+        for label, start, step in [('positive', 0, 1), ('negative', 17, -3),
+                                   ('maximum-safe', maximum-7, 1),
+                                   ('maximum-trap', maximum-6, 1),
+                                   ('minimum-safe', minimum+7, -1),
+                                   ('minimum-trap', minimum+6, -1)]:
+            constant = fixture.replace('i64 %n, i64 %offset', 'i64 noundef %n, i64 %offset')
+            constant = constant.replace('[%initial, %entry]',
+                                        f'[{{i64 {start}, i1 false}}, %entry]')
+            constant = constant.replace('i64 %count, i64 1)', f'i64 %count, i64 {step})')
+            original = work / (label + '-original.ll')
+            original.write_text(constant)
+            changed = work / (label + '-changed.ll')
+            result = run([transform, original])
+            if '@llvm.assume' not in result.stdout:
+                raise RuntimeError(label + ': missing proven division invariant')
+            safe_endpoint = minimum <= start + 7 * step <= maximum
+            has_checked_add = any('call ' in line and '@llvm.sadd.with.overflow' in line
+                                  for line in result.stdout.splitlines())
+            if safe_endpoint and has_checked_add:
+                raise RuntimeError(label + ': safe counter still checked')
+            if not safe_endpoint and 'call void @llvm.trap' not in result.stdout:
+                raise RuntimeError(label + ': overflow trap disappeared')
+            changed.write_text(result.stdout)
+            cleaned = work / (label + '-clean.ll')
+            run([bindir / 'opt', '-passes=function(correlated-propagation,instcombine,simplifycfg)',
+                 '-S', changed, '-o', cleaned])
+            for tag, ir in [('base', original), ('opt', cleaned)]:
+                binary = work / (label + '-' + tag)
+                run([clang, ir, harness, '-o', binary])
+                for n in [0, 1, 10, 999, 10000000, 99999999, 100000000]:
+                    expected = -1 if not 1 <= n <= 99999999 else start + (len(str(n))-1)*step
+                    code, output = (0, str(expected)) if minimum <= expected <= maximum else (77, '')
+                    result = subprocess.run([str(binary), str(n), '0'],
+                                            capture_output=True, text=True, timeout=5)
+                    if (result.returncode, result.stdout.strip()) != (code, output):
+                        raise RuntimeError(f'{label}/{tag}: {n}: {result}')
+                    runtime_checks += 1
+        for label, text in [('unknown-definedness', constant.replace('i64 noundef %n', 'i64 %n')),
+                            ('exact-division', constant.replace('udiv i64', 'udiv exact i64'))]:
+            path = work / (label + '.ll')
+            path.write_text(text)
+            if '@llvm.assume' in run([transform, path]).stdout:
+                raise RuntimeError(label + ': unproved invariant introduced')
+    print(f'bounded division unroll: 6 policy controls, 2 invariant exclusions and {runtime_checks} runtime/trap checks passed')
 
 
 if __name__ == '__main__':

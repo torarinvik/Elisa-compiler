@@ -1,13 +1,17 @@
 // Bounded unrolling for simple monotone unsigned-division loops.
 // This pass never weakens the loop's tests or arithmetic checks. The LVI range
 // is used only to derive an unroll factor/cap; LLVM's unroller retains runtime
-// exit checks and a remainder loop.
+// exit checks. Proven recurrence bounds expose invariants only when the
+// initial value is defined and every unsigned division remains defined.
+#include <algorithm>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/ConstantRange.h>
 #include <llvm/Analysis/LazyValueInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/AssumptionCache.h>
@@ -27,6 +31,7 @@ constexpr unsigned BDU_MaxTrips = 16;
 constexpr unsigned BDU_MaxFunctionInstructions = 800;
 constexpr unsigned BDU_MaxLoopInstructions = 64;
 constexpr unsigned BDU_MaxGrowthInstructions = 256;
+constexpr unsigned BDU_MaxModuleGrowth = 1024;
 
 static bool BDU_NoUnrollPolicy(const Loop &L) {
   MDNode *ID = L.getLoopID();
@@ -146,6 +151,8 @@ struct BDU_Candidate {
   BasicBlock *Pred = nullptr;
   unsigned Divisor = 0;
   unsigned Bound = 0;
+  ConstantInt *InitialMax = nullptr;
+  unsigned Growth = 0;
 };
 
 static bool BDU_FindCandidate(Loop &L, LazyValueInfo &LVI,
@@ -190,7 +197,7 @@ static bool BDU_FindCandidate(Loop &L, LazyValueInfo &LVI,
     bool TestMatches = false;
     if (Cmp->getPredicate() == ICmpInst::ICMP_ULT) {
       auto *K = dyn_cast<ConstantInt>(Other);
-      TestMatches = K && K->getValue().getActiveBits() <= 32 &&
+      TestMatches = Cmp->getOperand(0) == &P && K && K->getValue().getActiveBits() <= 32 &&
                     K->getZExtValue() == Divisor && L.contains(F) && !L.contains(T);
       ThresholdExit = true;
     } else if (Cmp->getPredicate() == ICmpInst::ICMP_NE) {
@@ -209,10 +216,13 @@ static bool BDU_FindCandidate(Loop &L, LazyValueInfo &LVI,
       if (++Trips > BDU_MaxTrips) break;
       Max = Max.udiv(C);
     }
-    if (!Trips || Trips > BDU_MaxTrips || LoopInsts * (Trips - 1) > BDU_MaxGrowthInstructions)
-      continue;
+    if (!Trips || Trips > BDU_MaxTrips) continue;
+    unsigned Count = std::min(Trips + 1, BDU_MaxTrips);
+    unsigned Growth = (LoopInsts + 2) * (Count - 1) + 2;
+    if (Growth > BDU_MaxGrowthInstructions) continue;
 
-    Out = {&L, &P, Div, P.getIncomingValue(PreIdx), Pred, Divisor, Trips};
+    Out = {&L, &P, Div, P.getIncomingValue(PreIdx), Pred, Divisor, Trips,
+           ConstantInt::get(P.getContext(), R.getUnsignedMax()), Growth};
     return true;
   }
   return false;
@@ -231,6 +241,51 @@ static PHINode *BDU_FindRecurrence(Loop &L, unsigned Divisor) {
   }
   return nullptr;
 }
+// A checked additive recurrence can use an ordinary add only when its known
+// constant initial value plus every update in this bounded loop fits exactly.
+// The division bound counts backedges, not header visits.
+static unsigned BDU_FoldCheckedCounter(Loop &L, unsigned Bound) {
+  SmallVector<CallInst *, 4> Erase;
+  for (PHINode &P : L.getHeader()->phis()) {
+    auto *ST = dyn_cast<StructType>(P.getType());
+    if (!ST || ST->getNumElements() != 2 || !ST->getElementType(0)->isIntegerTy() ||
+        !ST->getElementType(1)->isIntegerTy(1) || P.getNumIncomingValues() != 2) continue;
+    BasicBlock *Pred = L.getLoopPredecessor();
+    int InitialIdx = P.getBasicBlockIndex(Pred);
+    if (InitialIdx < 0) continue;
+    Value *Initial = P.getIncomingValue(InitialIdx);
+    auto *Start = dyn_cast_or_null<ConstantInt>(dyn_cast<Constant>(Initial)
+                     ? cast<Constant>(Initial)->getAggregateElement(0u) : nullptr);
+    auto *InitialOverflow = dyn_cast_or_null<ConstantInt>(dyn_cast<Constant>(Initial)
+                     ? cast<Constant>(Initial)->getAggregateElement(1u) : nullptr);
+    auto *Call = dyn_cast<IntrinsicInst>(P.getIncomingValue(1 - InitialIdx));
+    if (!Start || !InitialOverflow || !InitialOverflow->isZero() || !Call ||
+        Call->getIntrinsicID() != Intrinsic::sadd_with_overflow ||
+        Call->hasOperandBundles() || Call->isConvergent() ||
+        Call->getParent() != P.getIncomingBlock(1 - InitialIdx)) continue;
+    ConstantInt *Step = nullptr;
+    ExtractValueInst *Counter = nullptr;
+    for (unsigned I = 0; I != 2; ++I) {
+      auto *C = dyn_cast<ConstantInt>(Call->getArgOperand(I));
+      auto *E = dyn_cast<ExtractValueInst>(Call->getArgOperand(1-I));
+      if (C && E && E->getAggregateOperand() == &P &&
+          E->getNumIndices() == 1 && *E->idx_begin() == 0) {Step=C; Counter=E;}
+    }
+    if (!Step || !Counter) continue;
+    unsigned Width = Start->getBitWidth();
+    APInt First = Start->getValue().sext(Width + 6);
+    APInt Last = First + Step->getValue().sext(Width + 6) * APInt(Width + 6, Bound);
+    if (!First.isSignedIntN(Width) || !Last.isSignedIntN(Width)) continue;
+    IRBuilder<> B(Call);
+    Value *Sum = B.CreateNSWAdd(Counter, Step, "bounded.counter");
+    Value *Pair = B.CreateInsertValue(PoisonValue::get(P.getType()), Sum, 0);
+    Pair = B.CreateInsertValue(Pair, B.getFalse(), 1);
+    Call->replaceAllUsesWith(Pair);
+    Erase.push_back(Call);
+  }
+  for (CallInst *C : Erase) C->eraseFromParent();
+  return Erase.size();
+}
 } // namespace
 
 extern "C" unsigned elisacoreUnrollBoundedDivisionLoops(LLVMModuleRef Ref) {
@@ -248,6 +303,7 @@ extern "C" unsigned elisacoreUnrollBoundedDivisionLoops(LLVMModuleRef Ref) {
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   unsigned Changed = 0;
+  unsigned GrowthBudget = 0;
   unsigned AnalyzedFunctions = 0;
   unsigned AnalyzedLoops = 0;
   for (Function &F : M) {
@@ -265,16 +321,31 @@ extern "C" unsigned elisacoreUnrollBoundedDivisionLoops(LLVMModuleRef Ref) {
     auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
     auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
     auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
-    bool ChangedFunction = false;
     for (Loop *L : LI) {
       if (++AnalyzedLoops > 64) break;
       if (!L) continue;
       BDU_Candidate C;
       if (!BDU_FindCandidate(*L, LVI, C)) continue;
+      if (GrowthBudget + C.Growth > BDU_MaxModuleGrowth) continue;
+      GrowthBudget += C.Growth;
 
       // Range proof and shape recognition happen before CFG normalization, on
       // the actual outside predecessor edge. Only a proven candidate is
       // normalized; this avoids rewriting unrelated loops in the function.
+      bool DefinedRecurrence = !C.Div->isExact() &&
+          isGuaranteedNotToBeUndefOrPoison(C.Initial, &AC, C.Pred->getTerminator(), &DT);
+      unsigned Folded = DefinedRecurrence ? BDU_FoldCheckedCounter(*L, C.Bound) : 0;
+      if (DefinedRecurrence) {
+        // UDiv by a constant >= 2 cannot increase an unsigned value. InitialMax
+        // was proved on the unique entry edge. Reject exact division and
+        // potentially undef/poison inputs before making the invariant explicit.
+        IRBuilder<> B(L->getHeader()->getTerminator());
+        Value *Valid = B.CreateICmpULE(C.P, C.InitialMax);
+        AC.registerAssumption(cast<AssumeInst>(B.CreateAssumption(Valid)));
+        ++Changed;
+      }
+      Changed += Folded;
+      if (Folded || DefinedRecurrence) SE.forgetLoop(L);
       bool Normalized = simplifyLoop(L, &DT, &LI, &SE, &AC, nullptr, false);
       if (L->isLoopSimplifyForm()) Normalized |= formLCSSA(*L, DT, &LI, &SE);
       if (Normalized) ++Changed;
@@ -282,18 +353,16 @@ extern "C" unsigned elisacoreUnrollBoundedDivisionLoops(LLVMModuleRef Ref) {
       PHINode *P = BDU_FindRecurrence(*L, C.Divisor);
       if (!P) break; // Never query the stale pre-normalization LVI again.
 
-      UnrollLoopOptions Options{C.Bound, false, false, false, true, false,
+      UnrollLoopOptions Options{std::min(C.Bound + 1, BDU_MaxTrips), false, false, false, true, false,
                                 nullptr, 1000, true, false};
       Loop *Remainder = nullptr;
       LoopUnrollResult Result = UnrollLoop(L, Options, &LI, &SE, &DT, &AC,
                                            &TTI, &ORE, true, &Remainder);
       if (Result != LoopUnrollResult::Unmodified) {
         ++Changed;
-        ChangedFunction = true;
       }
       break; // Normalization/unrolling may invalidate LVI; never inspect next loop.
     }
-    (void)ChangedFunction;
   }
   return Changed;
 }
