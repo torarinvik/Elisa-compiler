@@ -230,6 +230,9 @@ extern "C" unsigned elisacoreBoundedProducts(LLVMModuleRef Ref) {
         }
         if (!Bound || Bound > 16)
           continue;
+        BasicBlock *Continue = L->contains(Branch->getSuccessor(0))
+                                   ? Branch->getSuccessor(0)
+                                   : Branch->getSuccessor(1);
         BDP_DivisionFact Fact{
             &P, ConstantInt::get(P.getContext(), Maximum), {}};
         for (PHINode &Counter : L->getHeader()->phis()) {
@@ -249,8 +252,12 @@ extern "C" unsigned elisacoreBoundedProducts(LLVMModuleRef Ref) {
               Call->getIntrinsicID() != Intrinsic::sadd_with_overflow ||
               Call->hasOperandBundles() || Call->isConvergent() ||
               Call->hasMetadataOtherThanDebugLoc() ||
-              LI.getLoopFor(Call->getParent()) != L)
+              LI.getLoopFor(Call->getParent()) != L ||
+              Call->getParent() == L->getHeader() ||
+              !DT.dominates(Continue, Call->getParent()))
             continue;
+          // Bound counts continuing body updates. A header call could also
+          // execute on the final zero/exit visit and exceed that bound.
           ConstantInt *Step = nullptr;
           for (unsigned I = 0; I < 2; ++I)
             if (Call->getArgOperand(I) == &Counter)

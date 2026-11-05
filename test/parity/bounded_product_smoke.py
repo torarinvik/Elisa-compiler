@@ -71,6 +71,18 @@ int main(int argc,char **argv){using namespace llvm;if(argc!=2)return 2;
         early = fixture.replace('%low = mul', '%early_use = add i64 %frozen_base, 1\n %low = mul')
         if 'freeze i64' not in apply('earlier-freeze-use', early):
             raise RuntimeError('freeze removed outside the proven use context')
+        # The last header visit takes no backedge, but its checked add still
+        # executes. Its overflowing flag is observable even without a trap.
+        header_text = (ROOT / 'test/parity/bounded_product_header_counter.ll').read_text()
+        header_original = work / 'header-counter.ll'
+        header_candidate = work / 'header-counter-candidate.ll'
+        header_candidate.write_text(apply('header-counter', header_text))
+        header_check = work / 'header-check.c'
+        header_check.write_text('#include <stdint.h>\nextern int64_t header_counter(void);\nint main(void){return header_counter()!=1;}\n')
+        for label, ir in [('base', header_original), ('candidate', header_candidate)]:
+            binary = work / ('header-' + label)
+            run([bindir/'clang', '-O0', ir, header_check, '-o', binary])
+            run([binary])
         harness = work / 'check.c'
         harness.write_text(r'''
 #include <stdint.h>
