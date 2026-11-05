@@ -640,6 +640,7 @@ extern "C" unsigned elisacoreCsscAbsoluteRangeChecks(LLVMModuleRef, LLVMTargetMa
 #include <llvm-c/Support.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <llvm-c/Error.h>
+#include "llvm_selective_scheduler.cpp"
 // Install before the first optimization, independent of optimization-level
 // ordering. Linux retains its faster Stage1 bounded-loop policy from LLVM.
 extern "C" void elisacoreConfigureBoundedUnroll() {
@@ -663,6 +664,18 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
   static bool installed = false;
   if (installed) return;
   installed = true;
+#if LLVM_VERSION_MAJOR == 23 && defined(__linux__)
+  // Respect an explicitly selected scheduler; otherwise use a selector that
+  // delegates unmarked functions to the target's unchanged default.
+  auto &registered = llvm::cl::getRegisteredOptions();
+  auto scheduler = registered.find("misched");
+  if (scheduler != registered.end() && scheduler->second->getNumOccurrences() == 0) {
+    const char *args[] = {"elisac", "-aarch64-enable-early-ifcvt=false",
+                          "-misched=elisa-ordered-selective"};
+    LLVMParseCommandLineOptions(3, args, nullptr);
+    return;
+  }
+#endif
   const char *args[] = {"elisac", "-aarch64-enable-early-ifcvt=false"};
   LLVMParseCommandLineOptions(2, args, nullptr);
 #endif
