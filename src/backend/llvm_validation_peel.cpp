@@ -569,6 +569,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_sqrt_proof.cpp"
 #include "llvm_bounded_sum.cpp"
 #include "llvm_index_bounds.cpp"
+#include "llvm_validation_layout.cpp"
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
@@ -644,6 +645,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     if (indexStatus) status = 1;
   }
 #endif
+  if (elisacoreBiasValidationReturns(module)) status = 1;
   return status;
 }
 
