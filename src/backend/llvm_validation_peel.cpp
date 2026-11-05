@@ -655,6 +655,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_index_bounds.cpp"
 #include "llvm_validation_layout.cpp"
 #include "llvm_guarded_increment.cpp"
+#include "llvm_guarded_counter.cpp"
 
 static bool shouldRevisitNestedVectorLoops(Module &M) {
   if (M.getNamedMetadata("llvm.dbg.cu") || !M.getTargetTriple().isAArch64())
@@ -767,7 +768,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     if (err) { LLVMConsumeError(err); return 2; }
     status = 1;
   }
-  if (foldGuardedIncrements(*unwrap(module))) {
+  unsigned guarded = foldGuardedIncrements(*unwrap(module));
+  guarded += foldGuardedCounters(*unwrap(module));
+  if (guarded) {
     auto opts = LLVMCreatePassBuilderOptions();
     auto err = LLVMRunPasses(module,
       "function(instcombine,simplifycfg,loop-simplify,lcssa,loop(indvars),instcombine,simplifycfg)", target, opts);
