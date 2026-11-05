@@ -567,6 +567,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_shared_reciprocal.cpp"
 #include "llvm_bounded_product.cpp"
 #include "llvm_sqrt_proof.cpp"
+#include "llvm_bounded_sum.cpp"
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
@@ -629,6 +630,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned sqrtStatus = elisacoreOptimizeSqrtNonNaN(module, target);
   if (sqrtStatus == 2) return 2;
   if (sqrtStatus) status = 1;
+  unsigned sumStatus = elisacoreOptimizeBoundedSums(module, target);
+  if (sumStatus == 2) return 2;
+  if (sumStatus) status = 1;
   return status;
 }
 
