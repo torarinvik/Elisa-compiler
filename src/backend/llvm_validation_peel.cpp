@@ -568,6 +568,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_bounded_product.cpp"
 #include "llvm_sqrt_proof.cpp"
 #include "llvm_bounded_sum.cpp"
+#include "llvm_index_bounds.cpp"
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
@@ -633,6 +634,16 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned sumStatus = elisacoreOptimizeBoundedSums(module, target);
   if (sumStatus == 2) return 2;
   if (sumStatus) status = 1;
+#if defined(__APPLE__) && defined(__aarch64__)
+  // This shortens the self-hosted Darwin entry sequence. On Linux the
+  // bounded-sum output is faster without another layout-changing cleanup.
+  if (unwrap(module)->getTargetTriple().isOSDarwin() &&
+      unwrap(module)->getTargetTriple().getArch() == Triple::aarch64) {
+    unsigned indexStatus = elisacoreOptimizeIndexBounds(module, target);
+    if (indexStatus == 2) return 2;
+    if (indexStatus) status = 1;
+  }
+#endif
   return status;
 }
 
