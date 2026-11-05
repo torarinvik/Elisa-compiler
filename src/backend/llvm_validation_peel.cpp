@@ -740,3 +740,5 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #include "llvm_bool_array_pack.cpp"
 
 #include "llvm_short_trip.cpp"
+
+#include "llvm_recursive_inline.cpp"
