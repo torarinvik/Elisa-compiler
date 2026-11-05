@@ -707,6 +707,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_nonnegative_remainder.cpp"
 #include "llvm_ordered_vector.cpp"
 #include "llvm_special_epilogue.cpp"
+#include "llvm_even_range.cpp"
 
 static bool shouldRevisitNestedVectorLoops(Module &M) {
   if (M.getNamedMetadata("llvm.dbg.cu") || !M.getTargetTriple().isAArch64())
@@ -840,6 +841,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     if (err) { LLVMConsumeError(err); return 2; }
     status = 1;
   }
+  if (elisacoreCompactEvenRanges(module)) status = 1;
   if (elisacoreBiasValidationReturns(module)) status = 1;
   return status;
 }
