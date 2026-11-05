@@ -68,6 +68,10 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
       // existing compact code for unknown and small trip-count bounds.
       unsigned MaxTrips = SE.getSmallConstantMaxTripCount(L);
       unsigned UnrollCount = MaxTrips >= 64 && MaxTrips <= 4096 ? 8 : 4;
+#if defined(__linux__) && defined(__aarch64__)
+      if (module.getTargetTriple().isOSLinux() && MaxTrips >= 64 && MaxTrips <= 4096)
+        UnrollCount = 16;
+#endif
       simplifyLoop(L, &DT, &LI, &SE, &AC, nullptr, false);
       if (!L->isLoopSimplifyForm() || !canPeel(L)) continue;
       formLCSSA(*L, DT, &LI, &SE);
