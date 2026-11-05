@@ -29,7 +29,13 @@ def main():
     flags = shlex.split(run([config, '--cxxflags']).stdout)
     links = shlex.split(run([config, '--ldflags', '--libs', '--system-libs']).stdout)
     libdir = run([config, '--libdir']).stdout.strip()
-    fixture = (ROOT / 'test/parity/bounded_product_fixture.ll').read_text()
+    host_target = run([config, '--host-target']).stdout.strip()
+    fixture = (ROOT / 'test/parity/bounded_product_fixture.ll').read_text().replace(
+        'target triple = "aarch64-unknown-linux-gnu"', f'target triple = "{host_target}"')
+    cleanup = 'function(correlated-propagation,instcombine,simplifycfg)'
+    if 'darwin' in host_target and host_target.startswith(('arm64', 'aarch64')):
+        cleanup = ('function(correlated-propagation,instcombine,simplifycfg,'
+                   'loop-simplify,lcssa,loop-vectorize,instcombine,simplifycfg)')
     with tempfile.TemporaryDirectory(prefix='elisa-product-proof-') as tmp:
         work = Path(tmp)
         driver = work / 'driver.cpp'
@@ -126,7 +132,7 @@ int main(void){struct sigaction action={0};action.sa_handler=caught;sigemptyset(
             changed = work / (label+'-changed.ll')
             changed.write_text(apply(label,text))
             clean = work / (label+'-clean.ll')
-            run([bindir/'opt','-passes=function(correlated-propagation,instcombine,simplifycfg)','-S',changed,'-o',clean])
+            run([bindir/'opt','-passes=' + cleanup,'-S',changed,'-o',clean])
             for name, ir in [('base',original),('candidate',clean)]:
                 binary = work/(label+'-'+name)
                 run([bindir/'clang','-O0','-D_POSIX_C_SOURCE=200809L',f'-DMODULUS={modulus}',ir,harness,'-o',binary])

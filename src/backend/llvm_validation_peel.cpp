@@ -605,8 +605,16 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     status = 1;
   }
   if (elisacoreBoundedProducts(module)) {
+    // Revisit reductions made vectorizable by the product proof. The first
+    // O3 vectorizer saw their checked-arithmetic side exits. The Darwin/ARM64
+    // ordering is qualified; retain Linux's measured scalar ordering.
+    const auto &triple = unwrap(module)->getTargetTriple();
+    const char *cleanup = triple.isOSDarwin() && triple.getArch() == Triple::aarch64
+        ? "function(correlated-propagation,instcombine,simplifycfg,"
+          "loop-simplify,lcssa,loop-vectorize,instcombine,simplifycfg)"
+        : "function(correlated-propagation,instcombine,simplifycfg)";
     auto options = LLVMCreatePassBuilderOptions();
-    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg)", target, options);
+    auto error = LLVMRunPasses(module, cleanup, target, options);
     LLVMDisposePassBuilderOptions(options);
     if (error) { LLVMConsumeError(error); return 2; }
     status = 1;
