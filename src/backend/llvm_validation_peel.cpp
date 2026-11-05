@@ -655,6 +655,33 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_index_bounds.cpp"
 #include "llvm_validation_layout.cpp"
 
+static bool shouldRevisitNestedVectorLoops(Module &M) {
+  if (M.getNamedMetadata("llvm.dbg.cu") || !M.getTargetTriple().isAArch64())
+    return false;
+  unsigned Functions = 0, Instructions = 0;
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    if (++Functions > 4 || (Instructions += F.getInstructionCount()) > 2000 ||
+        F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
+        F.hasFnAttribute(Attribute::SanitizeAddress) ||
+        F.hasFnAttribute(Attribute::SanitizeMemory) ||
+        F.hasFnAttribute(Attribute::SanitizeThread) ||
+        F.hasFnAttribute(Attribute::SanitizeHWAddress)) return false;
+  }
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    DominatorTree DT(F); LoopInfo LI(DT);
+    for (Loop *L : LI.getLoopsInPreorder()) {
+      if (!L->getParentLoop()) continue;
+      for (BasicBlock *B : L->blocks())
+        for (Instruction &I : *B)
+          if (auto *Load = dyn_cast<LoadInst>(&I))
+            if (Load->getType()->isVectorTy()) return true;
+    }
+  }
+  return false;
+}
+
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
   unsigned scans = elisacorePredicatePrivateBitUpdates(module);
@@ -729,6 +756,16 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     if (indexStatus) status = 1;
   }
 #endif
+  // Late scalar rewrites can expose outer-loop unrolling around an already
+  // vectorized inner loop. Keep this second full O3 pipeline bounded to small
+  // modules, so normal self-host builds do not pay its compile-time cost.
+  if (shouldRevisitNestedVectorLoops(*unwrap(module))) {
+    auto opts = LLVMCreatePassBuilderOptions();
+    auto err = LLVMRunPasses(module, "default<O3>", target, opts);
+    LLVMDisposePassBuilderOptions(opts);
+    if (err) { LLVMConsumeError(err); return 2; }
+    status = 1;
+  }
   if (elisacoreBiasValidationReturns(module)) status = 1;
   return status;
 }
