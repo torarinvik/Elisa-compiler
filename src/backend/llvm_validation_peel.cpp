@@ -63,6 +63,10 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
           for (auto *successor : branch->successors()) if (!L->contains(successor)) ++exits;
       }
       if (!safe || loads != 1 || instructions > 16 || exits != 2 || cmps != 2) continue;
+      // Larger bounded scans amortize the wider runtime unroll; retain the
+      // existing compact code for unknown and small trip-count bounds.
+      unsigned MaxTrips = SE.getSmallConstantMaxTripCount(L);
+      unsigned UnrollCount = MaxTrips >= 64 && MaxTrips <= 4096 ? 8 : 4;
       simplifyLoop(L, &DT, &LI, &SE, &AC, nullptr, false);
       if (!L->isLoopSimplifyForm() || !canPeel(L)) continue;
       formLCSSA(*L, DT, &LI, &SE);
@@ -72,7 +76,7 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
       // the runtime remainder without speculating accesses past an invalid item.
       auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
       auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
-      UnrollLoopOptions options{4, true, true, false, true, false, nullptr, 1000, true, false};
+      UnrollLoopOptions options{UnrollCount, true, true, false, true, false, nullptr, 1000, true, false};
       UnrollLoop(L, options, &LI, &SE, &DT, &AC, &TTI, &ORE, true);
       ++count;
       break; // Invalidate function analyses before inspecting another loop.
