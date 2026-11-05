@@ -565,7 +565,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_checked_mul.cpp"
 #include "llvm_bounded_unswitch.cpp"
 #include "llvm_shared_reciprocal.cpp"
-#include "llvm_bounded_division_unroll.cpp"
+#include "llvm_bounded_product.cpp"
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
@@ -598,6 +598,13 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (status == 2) return 2;
   unsigned boundedDivisionLoops = elisacoreUnrollBoundedDivisionLoops(module);
   if (boundedDivisionLoops) {
+    auto options = LLVMCreatePassBuilderOptions();
+    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg)", target, options);
+    LLVMDisposePassBuilderOptions(options);
+    if (error) { LLVMConsumeError(error); return 2; }
+    status = 1;
+  }
+  if (elisacoreBoundedProducts(module)) {
     auto options = LLVMCreatePassBuilderOptions();
     auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg)", target, options);
     LLVMDisposePassBuilderOptions(options);
