@@ -72,7 +72,13 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
       if (!L->isLoopSimplifyForm() || !canPeel(L)) continue;
       formLCSSA(*L, DT, &LI, &SE);
       ValueToValueMapTy values;
-      peelLoop(L, 1, false, &LI, &SE, DT, &AC, true, values);
+      // On Linux AArch64, the extra peeled iteration makes large bounded
+      // validation scans pay for a separate runtime remainder. Let the
+      // unroller handle those scans directly while preserving ordered exits.
+#if defined(__linux__) && defined(__aarch64__)
+      if (!(module.getTargetTriple().isOSLinux() && MaxTrips >= 64 && MaxTrips <= 4096))
+#endif
+        peelLoop(L, 1, false, &LI, &SE, DT, &AC, true, values);
       // Preserve every load and early exit in order. LLVM's unroller handles
       // the runtime remainder without speculating accesses past an invalid item.
       auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
