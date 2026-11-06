@@ -249,8 +249,10 @@ import_scope_visibility = compact(function_section(consumer_text, "pma_import_sc
 static_if_condition_value = compact(function_section(consumer_text, "pma_static_if_condition_value"))
 static_if_char_value = compact(function_section(consumer_text, "pma_static_if_char_value"))
 static_if_named_constant_value = compact(function_section(consumer_text, "pma_static_if_named_constant_value"))
-static_if_const_branch_selection = compact(function_section(consumer_text, "pma_static_if_const_branch_selection"))
-static_if_function_branch_selection = compact(function_section(consumer_text, "pma_static_if_function_branch_selection"))
+static_if_const_branch_wrapper = compact(function_section(consumer_text, "pma_static_if_const_branch_selection"))
+static_if_const_branch_selection = compact(function_section(consumer_text, "pma_static_if_const_branch_rows"))
+static_if_function_branch_wrapper = compact(function_section(consumer_text, "pma_static_if_function_branch_selection"))
+static_if_function_branch_selection = compact(function_section(consumer_text, "pma_static_if_function_branch_rows"))
 static_if_qualified_module_matches = compact(function_section(consumer_text, "pma_static_if_qualified_module_matches"))
 static_if_row_selection = compact(function_section(consumer_text, "pma_static_if_row_selection"))
 static_if_row_for_position = compact(function_section(consumer_text, "pma_static_if_row_for_position"))
@@ -388,6 +390,23 @@ if 'index.wildcard_rows.push(row)ifannotations[row].name=="__binding_wildcard_im
         'annotation:Ast::EnumAnnotation=annotations[row]',
         'annotation.owner!=ownerornotpma_import_scope_visible(current_module,annotation.module)')):
     raise SystemExit("wildcard row projection must preserve exact annotations and lexical visibility")
+
+# The indexed wrappers and the row walkers jointly implement branch selection.
+# Require both the guarded projection and the complete-source fallback; inspecting
+# only the wrapper misses the row identity/unknown-branch checks after extraction.
+for kind, wrapper in (("const", static_if_const_branch_wrapper), ("function", static_if_function_branch_wrapper)):
+    helper = "pma_static_if_" + kind + "_branch_rows"
+    if not all(fragment in wrapper for fragment in (
+            "table.static_if_branch_source_count==file.enum_annotations.countandfile.enum_annotations.count>0",
+            helper + "(table.static_if_branch_annotations,file,name,symbol,table,depth)",
+            helper + "(file.enum_annotations,file,name,symbol,table,depth)")):
+        raise SystemExit("static-if selection must validate its indexed rows and retain the complete-source fallback")
+static_if_projection = compact(function_section(consumer_text, "fill_static_if_branch_annotations"))
+if not all(fragment in static_if_projection for fragment in (
+        "table.static_if_branch_annotations<-[]",
+        'table.static_if_branch_annotations.push(annotation)ifannotation.owner=="__static_if_branch"',
+        "table.static_if_branch_source_count<-file.enum_annotations.count")):
+    raise SystemExit("static-if annotation projection must preserve complete exact branch rows")
 
 if not all(fragment in private_import_visibility for fragment in (
         'pma_visible_wildcard_import(index,annotations,current_module,owner,false)',
