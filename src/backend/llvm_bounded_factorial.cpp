@@ -223,7 +223,7 @@ static void BFP_CollectHorner(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LoopI
         D = Add->getArgOperand(1 - I);
     if (!Mul) continue;
     Value *A = Mul->getArgOperand(0), *B = Mul->getArgOperand(1);
-    auto *K = dyn_cast<ConstantInt>(A == &X ? B : (B == &X ? A : nullptr));
+    auto *K = dyn_cast_if_present<ConstantInt>(A == &X ? B : (B == &X ? A : nullptr));
     if (!K || !K->getValue().isStrictlyPositive()) continue;
     // UndefAllowed=false: a possibly-undef addend yields the full range.
     ConstantRange DR = LVI.getConstantRange(D, Add, false);
@@ -500,7 +500,7 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
             Mul->hasNoUnsignedWrap() || LI.getLoopFor(Mul->getParent()) != L ||
             !DT.dominates(Mul->getParent(), Latch)) continue;
         Value *A = BFP_Strip(Mul->getOperand(0)), *B = BFP_Strip(Mul->getOperand(1));
-        auto *Counter = dyn_cast<PHINode>(A == &Product ? B : (B == &Product ? A : nullptr));
+        auto *Counter = dyn_cast_if_present<PHINode>(A == &Product ? B : (B == &Product ? A : nullptr));
         if (!Counter || Counter == &Product || Counter->getParent() != L->getHeader() ||
             Counter->getNumIncomingValues() != 2) continue;
         auto *C0 = dyn_cast<ConstantInt>(Counter->getIncomingValueForBlock(Pre));
