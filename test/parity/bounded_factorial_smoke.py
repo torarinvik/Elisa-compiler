@@ -82,8 +82,31 @@ int main(int argc,char **argv){using namespace llvm;LLVMContext C;SMDiagnostic E
             'big-factor': h.replace('i64 %x, i64 26', 'i64 %x, i64 100000000'),
             'addend-unbounded': h.replace('%d_bad = icmp ugt i64 %d, 26', '%d_bad = icmp eq i64 %d, -1'),
             'huge-start': h.replace('[0,%pre], [%xn', '[1000000000000000000,%pre], [%xn'),
-            'variable-factor': h.replace('i64 %x, i64 26', 'i64 %x, i64 %d'),
         }.items():
             if not cm(apply('horner-' + name, text)): raise RuntimeError(name + ': unproved Horner check removed')
+        # General interval simulation: mutually dependent values with a reset.
+        g = (ROOT / 'test/parity/bounded_interval_fixture.ll').read_text().replace('aarch64-unknown-linux-gnu', host)
+        if cm(apply('interval', g)): raise RuntimeError('bounded interval loop still checked')
+        for name, text in {
+            'too-many-iterations': g.replace('ugt i64 %n, 15', 'ugt i64 %n, 200'),
+            'no-iteration-bound': g.replace('%bad = icmp ugt i64 %n, 15', '%bad = icmp eq i64 %n, -7'),
+            'big-sample': g.replace('ugt i64 %d, 8', 'ugt i64 %d, 4611686018427387904'),
+            'unchecked-sample': g.replace('%d_bad = icmp ugt i64 %d, 8', '%d_bad = icmp eq i64 %d, -1'),
+            'squared-growth': g.replace('i64 %t, i64 3)', 'i64 %t, i64 %t)').replace('[%t,%cmp]', '[%qv,%cmp]').replace('[0,%reset]', '[%qv,%reset]').replace('%s = phi i64 [0,%pre]', '%s = phi i64 [2,%pre]'),
+        }.items():
+            if not cm(apply('interval-' + name, text)): raise RuntimeError(name + ': unproved interval check removed')
+        # Linked behavior: optimized and original agree, and real overflow still traps.
+        orig, opt = work / 'orig.ll', work / 'opt.ll'
+        orig.write_text(g); opt.write_text(apply('interval2', g))
+        check = work / 'g.c'
+        check.write_text('#include <stdint.h>\n#include <stdio.h>\nextern int64_t interval(const int64_t*,int64_t);'
+            'int main(void){int64_t v[15];uint64_t s=88172645463325252ULL,h=0;for(int r=0;r<20000;r++){int n=(s>>7)%16;'
+            'for(int i=0;i<15;i++){s^=s<<13;s^=s>>7;s^=s<<17;v[i]=(int64_t)(s%10);}h=h*31+(uint64_t)interval(v,n);}'
+            'printf("%llu\\n",(unsigned long long)h);return 0;}')
+        outs = []
+        for label, ir in (('orig', orig), ('opt', opt)):
+            run([bindir / 'clang', '-O1', '-Wno-override-module', ir, check, '-o', work / label])
+            outs.append(run([work / label]).stdout)
+        if outs[0] != outs[1]: raise RuntimeError(f'interval results differ: {outs}')
     print(f'bounded factorial: ok ({len(controls)} controls)')
 main()

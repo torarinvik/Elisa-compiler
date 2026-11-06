@@ -3,6 +3,8 @@
 // The product sequence is then fully determined, so simulate it exactly: range
 // multiplication cannot prove this shape, since 20^20 overflows while 20! fits.
 #include "llvm_bounded_product.cpp"
+#include <llvm/Analysis/LoopIterator.h>
+#include <optional>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/SmallPtrSet.h>
@@ -185,6 +187,176 @@ static void BFP_CollectHorner(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LoopI
     }
   }
 }
+// General bounded-loop proof. A header runs at most N times, so evaluate every
+// integer value once per iteration over signed intervals held in 128 bits. Each
+// iteration's header values come only from the previous latch, so resets need
+// no widening. Anything unmodeled is the full range of its type, and each read
+// is narrowed by LVI at its use, which also supplies guard facts. A checked call
+// loses its proof if any iteration's interval can leave its type.
+struct BFP_Interval {
+  APInt Lo, Hi;
+};
+static BFP_Interval BFP_Full(unsigned W) {
+  return {APInt::getSignedMinValue(W).sext(128), APInt::getSignedMaxValue(W).sext(128)};
+}
+static bool BFP_Fits(const BFP_Interval &R, unsigned W) {
+  return R.Lo.isSignedIntN(W) && R.Hi.isSignedIntN(W);
+}
+static BFP_Interval BFP_Corners(const BFP_Interval &A, const BFP_Interval &B) {
+  APInt V[4] = {A.Lo * B.Lo, A.Lo * B.Hi, A.Hi * B.Lo, A.Hi * B.Hi};
+  BFP_Interval R{V[0], V[0]};
+  for (const APInt &X : V) {
+    R.Lo = APIntOps::smin(R.Lo, X);
+    R.Hi = APIntOps::smax(R.Hi, X);
+  }
+  return R;
+}
+static void BFP_CollectIntervals(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LoopInfo &LI,
+                                 LazyValueInfo &LVI, SmallVectorImpl<IntrinsicInst *> &Out) {
+  unsigned Size = 0;
+  SmallVector<IntrinsicInst *, 8> Calls;
+  auto Mdk = L->getHeader()->getContext().getMDKindID("elisa.checkedmul.slow");
+  for (BasicBlock *BB : L->blocks())
+    for (Instruction &I : *BB) {
+      ++Size;
+      auto *C = dyn_cast<IntrinsicInst>(&I);
+      if (!C) continue;
+      auto ID = C->getIntrinsicID();
+      if (ID != Intrinsic::sadd_with_overflow && ID != Intrinsic::ssub_with_overflow &&
+          ID != Intrinsic::smul_with_overflow) continue;
+      SmallVector<std::pair<unsigned, MDNode *>, 2> Metadata;
+      C->getAllMetadataOtherThanDebugLoc(Metadata);
+      bool Plain = !C->hasOperandBundles() && !C->isConvergent();
+      for (auto &MD : Metadata) Plain &= MD.first == Mdk;
+      if (Plain) Calls.push_back(C);
+    }
+  if (Calls.empty() || Size > 512) return;
+  uint64_t Iterations = BFP_IterationBound(L, Pre, Latch, LVI);
+  if (!Iterations) return;
+  LoopBlocksRPO Order(L);
+  Order.perform(&LI);
+  DenseMap<Value *, BFP_Interval> Env, Next;
+  DenseMap<std::pair<Value *, Instruction *>, std::optional<ConstantRange>> Facts;
+  auto Read = [&](Value *V, Instruction *Ctx) -> BFP_Interval {
+    unsigned W = V->getType()->getIntegerBitWidth();
+    if (W > 64) return BFP_Full(64);
+    if (auto *C = dyn_cast<ConstantInt>(V)) {
+      APInt X = C->getValue().sext(128);
+      return {X, X};
+    }
+    BFP_Interval R = BFP_Full(W);
+    if (auto It = Env.find(V); It != Env.end()) R = It->second;
+    auto &Fact = Facts[{V, Ctx}];
+    if (!Fact) Fact = LVI.getConstantRange(V, Ctx, false); // Possibly-undef values read as full.
+    if (Fact->isEmptySet() || Fact->isFullSet()) return R;
+    APInt Lo = APIntOps::smax(R.Lo, Fact->getSignedMin().sext(128));
+    APInt Hi = APIntOps::smin(R.Hi, Fact->getSignedMax().sext(128));
+    if (Lo.sgt(Hi)) return {Fact->getSignedMin().sext(128), Fact->getSignedMax().sext(128)};
+    return {Lo, Hi};
+  };
+  auto Eval = [&](Instruction &I) -> BFP_Interval {
+    unsigned W = I.getType()->getIntegerBitWidth();
+    BFP_Interval Full = BFP_Full(W), R = Full;
+    auto Op = [&](unsigned N) { return Read(I.getOperand(N), &I); };
+    if (auto *B = dyn_cast<BinaryOperator>(&I)) {
+      BFP_Interval X = Op(0), Y = Op(1);
+      bool Nonneg = !X.Lo.isNegative() && !Y.Lo.isNegative();
+      bool ConstY = Y.Lo == Y.Hi;
+      switch (B->getOpcode()) {
+      case Instruction::Add: R = {X.Lo + Y.Lo, X.Hi + Y.Hi}; break;
+      case Instruction::Sub: R = {X.Lo - Y.Hi, X.Hi - Y.Lo}; break;
+      case Instruction::Mul: R = BFP_Corners(X, Y); break;
+      case Instruction::Shl:
+        if (!Y.Lo.isNegative() && Y.Hi.slt(W)) {
+          APInt ScaleLo = APInt(128, 1) << Y.Lo.getZExtValue(), ScaleHi = APInt(128, 1) << Y.Hi.getZExtValue();
+          R = BFP_Corners(X, {ScaleLo, ScaleHi});
+        }
+        break;
+      case Instruction::LShr:
+      case Instruction::AShr:
+        if (Nonneg && Y.Hi.slt(W)) R = {X.Lo.ashr(Y.Hi.getZExtValue()), X.Hi.ashr(Y.Lo.getZExtValue())};
+        break;
+      case Instruction::UDiv:
+        if (Nonneg && ConstY && !Y.Lo.isZero()) R = {X.Lo.sdiv(Y.Lo), X.Hi.sdiv(Y.Lo)};
+        break;
+      case Instruction::SDiv:
+        if (Nonneg && ConstY && !Y.Lo.isZero()) R = {X.Lo.sdiv(Y.Lo), X.Hi.sdiv(Y.Lo)};
+        break;
+      case Instruction::URem:
+        if (Nonneg && ConstY && !Y.Lo.isZero()) R = {APInt(128, 0), APIntOps::smin(X.Hi, Y.Lo - 1)};
+        break;
+      case Instruction::And:
+        if (!Y.Lo.isNegative()) R = {APInt(128, 0), X.Lo.isNegative() ? Y.Hi : APIntOps::smin(X.Hi, Y.Hi)};
+        else if (!X.Lo.isNegative()) R = {APInt(128, 0), X.Hi};
+        break;
+      default: break;
+      }
+    } else if (auto *C = dyn_cast<CastInst>(&I)) {
+      if (!C->getSrcTy()->isIntegerTy() || C->getSrcTy()->getIntegerBitWidth() > 64) return Full;
+      BFP_Interval X = Op(0);
+      unsigned SW = C->getSrcTy()->getIntegerBitWidth();
+      if (isa<SExtInst>(C)) R = X;
+      else if (isa<ZExtInst>(C))
+        R = !X.Lo.isNegative() ? X : BFP_Interval{APInt(128, 0), APInt::getMaxValue(SW).zext(128)};
+      else if (isa<TruncInst>(C)) R = X;
+    } else if (isa<FreezeInst>(I)) {
+      R = Op(0);
+    } else if (auto *S = dyn_cast<SelectInst>(&I)) {
+      BFP_Interval X = Read(S->getTrueValue(), &I), Y = Read(S->getFalseValue(), &I);
+      R = {APIntOps::smin(X.Lo, Y.Lo), APIntOps::smax(X.Hi, Y.Hi)};
+    } else if (auto *E = dyn_cast<ExtractValueInst>(&I)) {
+      if (E->getNumIndices() == 1 && *E->idx_begin() == 0)
+        if (auto It = Env.find(E->getAggregateOperand()); It != Env.end()) R = It->second;
+    } else if (auto *P = dyn_cast<PHINode>(&I)) {
+      for (unsigned N = 0; N < P->getNumIncomingValues(); ++N) {
+        BFP_Interval X = Read(P->getIncomingValue(N), P->getIncomingBlock(N)->getTerminator());
+        R = N ? BFP_Interval{APIntOps::smin(R.Lo, X.Lo), APIntOps::smax(R.Hi, X.Hi)} : X;
+      }
+    }
+    return BFP_Fits(R, W) ? R : Full;
+  };
+  for (PHINode &P : L->getHeader()->phis())
+    if (P.getType()->isIntegerTy() && P.getType()->getIntegerBitWidth() <= 64)
+      Env[&P] = Read(P.getIncomingValueForBlock(Pre), Pre->getTerminator());
+  SmallPtrSet<IntrinsicInst *, 8> Bad;
+  for (uint64_t K = 0; K < Iterations; ++K) {
+    for (BasicBlock *BB : Order) {
+      for (Instruction &I : *BB) {
+        if (BB == L->getHeader() && isa<PHINode>(I)) continue;
+        if (auto *C = dyn_cast<IntrinsicInst>(&I)) {
+          auto ID = C->getIntrinsicID();
+          if (ID == Intrinsic::sadd_with_overflow || ID == Intrinsic::ssub_with_overflow ||
+              ID == Intrinsic::smul_with_overflow) {
+            unsigned W = C->getArgOperand(0)->getType()->getIntegerBitWidth();
+            BFP_Interval X = Read(C->getArgOperand(0), C), Y = Read(C->getArgOperand(1), C), R = BFP_Full(W);
+            if (W <= 64) {
+              R = ID == Intrinsic::sadd_with_overflow   ? BFP_Interval{X.Lo + Y.Lo, X.Hi + Y.Hi}
+                  : ID == Intrinsic::ssub_with_overflow ? BFP_Interval{X.Lo - Y.Hi, X.Hi - Y.Lo}
+                                                        : BFP_Corners(X, Y);
+              if (!BFP_Fits(R, W)) {
+                Bad.insert(C);
+                R = BFP_Full(W); // Past a kept check the value still fits its type.
+              }
+            } else {
+              Bad.insert(C);
+            }
+            Env[C] = R;
+            continue;
+          }
+        }
+        if (I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 64)
+          Env[&I] = Eval(I);
+      }
+    }
+    Next.clear();
+    for (PHINode &P : L->getHeader()->phis())
+      if (P.getType()->isIntegerTy() && P.getType()->getIntegerBitWidth() <= 64)
+        Next[&P] = Read(P.getIncomingValueForBlock(Latch), Latch->getTerminator());
+    for (auto &Entry : Next) Env[Entry.first] = Entry.second;
+  }
+  for (IntrinsicInst *C : Calls)
+    if (!Bad.contains(C)) Out.push_back(C);
+}
 }
 extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
   if (!Ref) return 0;
@@ -206,6 +378,7 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
     for (Instruction &I : instructions(F))
       if (auto *C = dyn_cast<IntrinsicInst>(&I))
         HasCheckedMul |= C->getIntrinsicID() == Intrinsic::smul_with_overflow ||
+                         C->getIntrinsicID() == Intrinsic::ssub_with_overflow ||
                          C->getIntrinsicID() == Intrinsic::sadd_with_overflow;
     if (!HasCheckedMul) continue;
     auto &LI = FAM.getResult<LoopAnalysis>(F);
@@ -219,6 +392,7 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
       if (!Pre || !Latch || !L->getSubLoops().empty()) continue;
       BFP_CollectDivisionSums(L, Pre, Latch, LI, LVI, ProvenSums);
       BFP_CollectHorner(L, Pre, Latch, LI, LVI, ProvenSums);
+      BFP_CollectIntervals(L, Pre, Latch, LI, LVI, ProvenSums);
       for (PHINode &Product : L->getHeader()->phis()) {
         if (!Product.getType()->isIntegerTy(64) || Product.getNumIncomingValues() != 2) continue;
         auto *P0 = dyn_cast<ConstantInt>(Product.getIncomingValueForBlock(Pre));
@@ -263,6 +437,7 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
       }
     }
     for (auto &[Mul, C] : Proven) {
+      if (!SeenSums.insert(C).second) continue;
       Mul->setHasNoSignedWrap(true);
       IRBuilder<> B(C);
       Value *Pair = B.CreateInsertValue(PoisonValue::get(C->getType()), Mul, 0);
@@ -274,9 +449,10 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
     for (IntrinsicInst *C : ProvenSums) {
       if (!SeenSums.insert(C).second) continue;
       IRBuilder<> B(C);
-      Value *Sum = C->getIntrinsicID() == Intrinsic::smul_with_overflow
-                       ? B.CreateNSWMul(C->getArgOperand(0), C->getArgOperand(1))
-                       : B.CreateNSWAdd(C->getArgOperand(0), C->getArgOperand(1));
+      Value *X = C->getArgOperand(0), *Y = C->getArgOperand(1);
+      Value *Sum = C->getIntrinsicID() == Intrinsic::smul_with_overflow   ? B.CreateNSWMul(X, Y)
+                   : C->getIntrinsicID() == Intrinsic::ssub_with_overflow ? B.CreateNSWSub(X, Y)
+                                                                          : B.CreateNSWAdd(X, Y);
       Value *Pair = B.CreateInsertValue(PoisonValue::get(C->getType()), Sum, 0);
       Pair = B.CreateInsertValue(Pair, B.getFalse(), 1);
       C->replaceAllUsesWith(Pair);
