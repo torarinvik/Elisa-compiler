@@ -44,8 +44,12 @@ class ParallelGateRegression(unittest.TestCase):
         runtime = (ROOT / 'src/semantic/semantic_parallel.elisa').read_text()
         self.assertEqual(audit.parallel_runtime_serial_guard_errors(runtime), [])
         pipeline = (ROOT / 'src/semantic/semantic_api/full_pipeline.elisa').read_text()
-        self.assertRegex(pipeline, r'par_pass_run\(file, flags, table, shared_pool, loop_view, 80, 5\)')
-        self.assertTrue(any(i in UNSAFE for i in range(80, 85)))
+        calls, errors = audit.par_run_calls(pipeline.splitlines())
+        self.assertEqual(errors, [])
+        self.assertTrue(any(call["start"] == 80 and call["count"] == 1 for call in calls))
+        for call in calls:
+            if call["count"] > 1:
+                self.assertFalse(set(range(call["start"], call["start"] + call["count"])) & UNSAFE)
 
 
 if __name__ == '__main__':

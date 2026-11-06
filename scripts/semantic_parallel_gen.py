@@ -423,6 +423,18 @@ def normalized_par_run_line(line, match):
             + match.group(4) + ", " + match.group(5) + ")" + (match.group(6) or ""))
 
 
+def split_parallel_range(first, count, safe_ids):
+    """Keep unsafe passes serial while batching consecutive audited passes in order."""
+    end = first + count
+    while first < end:
+        stop = first + 1
+        if first in safe_ids:
+            while stop < end and stop in safe_ids:
+                stop += 1
+        yield first, stop - first
+        first = stop
+
+
 def parse_parallel_dispatch(source):
     """Return dispatcher arms as (id, pass name, args, condition), plus structural errors."""
     lines = source.splitlines()
@@ -2816,16 +2828,25 @@ def emit(info):
     # The checked-in API is already generated. Keep --write idempotent on that form too:
     # refresh its call and flag shapes, but retain the audited pass dispatcher below.
     if has_generated_runs:
+        dispatch, errors = parse_parallel_dispatch(open(PASSES, encoding="utf-8").read())
+        if errors:
+            raise ValueError("; ".join(errors))
+        safe_ids = {record["id"] for record in dispatch if append_only(info, record["name"])[0]}
         out = list(lines)
         for call in generated_calls:
-            out[call["line"]] = normalized_par_run_line(out[call["line"]], call["match"])
+            match = call["match"]
+            out[call["line"]] = "\n".join(
+                match.group(1) + "table <- par_pass_run(file, flags, table, shared_pool, loop_view, "
+                + str(first) + ", " + str(count) + ")" + (match.group(6) or "")
+                for first, count in split_parallel_range(call["start"], call["count"], safe_ids)
+            )
         initializer = "flags: ParPassFlags = ParPassFlags{%s}" % ", ".join("%s: %s" % (flag, flag) for flag in flags)
         for i, line in enumerate(out):
             if start <= i < end and re.match(r"\s*flags: ParPassFlags\s*=\s*ParPassFlags\{", line):
                 indent = line[:len(line) - len(line.lstrip())]
                 out[i] = indent + initializer
         out = [line for i, line in enumerate(out) if not (start <= i < end and re.match(r"\s*\w+:\s*mutable darray\[ParPassScratch\[", line))]
-        return out, flags, [], []
+        return "\n".join(out).split("\n"), flags, [], []
     out = list(lines)
     calls = []
     pass_id = 0

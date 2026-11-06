@@ -139,6 +139,16 @@ lookalike = sharedness
         self.assertEqual(audit.parallel_safety_gate_errors(gate, {1, 4, 9}), [])
         self.assertTrue(audit.parallel_safety_gate_errors(gate, {1, 4, 8}))
 
+    def test_split_batches_preserves_unsafe_boundaries_and_order(self):
+        safe = {0, 1, 3, 4, 5, 7}
+        batches = list(audit.split_parallel_range(0, 9, safe))
+        self.assertEqual(batches, [(0, 2), (2, 1), (3, 3), (6, 1), (7, 1), (8, 1)])
+        self.assertEqual([i for first, count in batches for i in range(first, first + count)], list(range(9)))
+        for first, count in batches:
+            self.assertTrue(count == 1 or all(i in safe for i in range(first, first + count)))
+            self.assertEqual(list(audit.split_parallel_range(first, count, safe)), [(first, count)])
+        self.assertEqual(list(audit.split_parallel_range(3, 0, safe)), [])
+
     def test_parallel_gate_compacts_ranges_without_admitting_gaps(self):
         ids = {0, 1, 2, 4, 6, 7, 8}
         gate = audit.parallel_safety_gate_source(ids)
