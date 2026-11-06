@@ -234,6 +234,8 @@ bare_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_own
 call_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_call_owner"))
 private_import_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_private_import_owner"))
 public_imported_value = compact(function_section(consumer_text, "pma_has_public_imported_function_value"))
+wildcard_index_build = compact(function_section(consumer_text, "pma_build_wildcard_import_index"))
+wildcard_visibility = compact(function_section(consumer_text, "pma_visible_wildcard_import"))
 private_import_visibility = compact(function_section(consumer_text, "pma_private_imported_module_member_visible"))
 public_import_visibility = compact(function_section(consumer_text, "pma_public_imported_module_member_visible"))
 imported_member_visibility = compact(function_section(consumer_text, "pma_imported_module_member_visible"))
@@ -380,12 +382,18 @@ if "pma_public_imported_module_member_visible(index,annotations,current_module,o
         "pma_is_private(index,owner,segment)",
         "notpma_within_module(current_module,owner)")):
     raise SystemExit("public import alternatives must be visible in scope and outside every private module path")
+
+if 'index.wildcard_rows.push(row)ifannotations[row].name=="__binding_wildcard_import"' not in wildcard_index_build or not all(fragment in wildcard_visibility for fragment in (
+        'forrowinindex.wildcard_rows:',
+        'annotation:Ast::EnumAnnotation=annotations[row]',
+        'annotation.owner!=ownerornotpma_import_scope_visible(current_module,annotation.module)')):
+    raise SystemExit("wildcard row projection must preserve exact annotations and lexical visibility")
+
 if not all(fragment in private_import_visibility for fragment in (
-        'annotation.name=="__binding_wildcard_import"',
+        'pma_visible_wildcard_import(index,annotations,current_module,owner,false)',
         "pma_selective_import_target_status(annotations,current_module,owner,member)",
         "target.foundand(nottarget.knownortarget.first)")) or not all(fragment in public_import_visibility for fragment in (
-        'annotation.name=="__binding_wildcard_import"',
-        "pma_import_row_branch_uncertain(annotations,annotation.owner,annotation.name,annotation.module,annotation.line,annotation.offset)",
+        'pma_visible_wildcard_import(index,annotations,current_module,owner,true)',
         "target.foundandtarget.knownandtarget.first")) or not all(fragment in selective_import_status for fragment in (
         "member_annotation.offset",
         "member_annotation.module",
@@ -515,8 +523,8 @@ if "pma_import_annotation_branch_selection_indexed(annotation,annotations,annota
     raise SystemExit("non-indexed PMA callers must retain their complete annotation view")
 if not all(fragment in selective_import_status for fragment in (
         'pma_import_row_branch_uncertain(annotations,"__from_member",member_annotation.name,member_annotation.module,member_annotation.line,member_annotation.offset)',
-        'known_order<-false')) or not all(fragment in public_import_visibility for fragment in (
-        'pma_import_row_branch_uncertain(annotations,annotation.owner,annotation.name,annotation.module,annotation.line,annotation.offset)')):
+        'known_order<-false')) or not all(fragment in wildcard_visibility for fragment in (
+        'notrequire_definiteornotpma_import_row_branch_uncertain(annotations,annotation.owner,annotation.name,annotation.module,annotation.line,annotation.offset)')):
     raise SystemExit("uncertain selective or wildcard imports must not establish a definite public winner")
 if not all(fragment in active_import_annotations for fragment in (
         'annotation.owner=="__from_member"',
