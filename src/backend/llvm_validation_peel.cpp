@@ -697,7 +697,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_checked_mul.cpp"
 #include "llvm_bounded_unswitch.cpp"
 #include "llvm_shared_reciprocal.cpp"
-#include "llvm_bounded_product.cpp"
+#include "llvm_bounded_factorial.cpp"
 #include "llvm_sqrt_proof.cpp"
 #include "llvm_bounded_sum.cpp"
 #include "llvm_index_bounds.cpp"
@@ -769,6 +769,13 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (boundedDivisionLoops) {
     auto options = LLVMCreatePassBuilderOptions();
     auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg)", target, options);
+    LLVMDisposePassBuilderOptions(options);
+    if (error) { LLVMConsumeError(error); return 2; }
+    status = 1;
+  }
+  if (elisacoreBoundedFactorials(module)) {
+    auto options = LLVMCreatePassBuilderOptions();
+    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg,loop-simplify,lcssa,indvars,loop-vectorize,instcombine,simplifycfg)", target, options);
     LLVMDisposePassBuilderOptions(options);
     if (error) { LLVMConsumeError(error); return 2; }
     status = 1;
