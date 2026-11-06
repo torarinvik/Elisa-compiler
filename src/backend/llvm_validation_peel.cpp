@@ -698,6 +698,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_bounded_unswitch.cpp"
 #include "llvm_shared_reciprocal.cpp"
 #include "llvm_bounded_factorial.cpp"
+#include "llvm_array_copy_elision.cpp"
 #include "llvm_sqrt_proof.cpp"
 #include "llvm_bounded_sum.cpp"
 #include "llvm_index_bounds.cpp"
@@ -738,6 +739,7 @@ static bool shouldRevisitNestedVectorLoops(Module &M) {
 
 extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
                                               LLVMTargetMachineRef target) {
+  elisacoreElideArrayRoundTrips(module);
   unsigned scans = elisacorePredicatePrivateBitUpdates(module);
   scans += elisacoreInlineSmallRecursion(module);
   scans += elisacoreUnrollNestedScans(module);
