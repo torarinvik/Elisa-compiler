@@ -160,11 +160,42 @@ static unsigned unrollGuardedReductions(Module &M) {
 static unsigned unrollGuardedReductions(Module &) { return 0; }
 #endif
 
+// Revisit only small modules in which both array-coverage and short-reduction
+// rewrites fired. The bounded second O3 run exposes cleanup opportunities
+// created after the original pipeline; large modules keep their compile budget.
+static void revisitCoveredArrays(Module &M, bool unrolled) {
+  auto *marker = M.getNamedMetadata("elisa.covered-array-revisit");
+  if (!marker) return;
+  marker->eraseFromParent();
+  if (!unrolled) return;
+  unsigned count = 0, functions = 0;
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    if (++functions > 32 || F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
+        F.getSubprogram() || F.hasFnAttribute(Attribute::SanitizeAddress) ||
+        F.hasFnAttribute(Attribute::SanitizeMemory) ||
+        F.hasFnAttribute(Attribute::SanitizeThread) ||
+        F.hasFnAttribute(Attribute::SanitizeHWAddress)) return;
+    count += F.getInstructionCount();
+    if (count > 5000) return;
+  }
+  PassBuilder PB;
+  LoopAnalysisManager LAM; FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM; ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM); PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM); PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  auto MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+  MPM.run(M, MAM);
+}
+
 extern "C" unsigned elisacoreExpandSmallZeroFills(LLVMModuleRef ref) {
   if (!ref) return 0;
   Module &M = *unwrap(ref);
+  unsigned reductions = 0;
   if (M.getTargetTriple().getArch() == Triple::aarch64 && !M.getNamedMetadata("llvm.dbg.cu"))
-    unrollGuardedReductions(M);
+    reductions = unrollGuardedReductions(M);
+  revisitCoveredArrays(M, reductions != 0);
   if (M.getTargetTriple().getArch() != Triple::aarch64 || !M.getDataLayout().isLittleEndian() || M.getNamedValue("__elisacore_smallzero_fill")) return 0;
   // Inline medium, aligned fixed-size fills on Apple AArch64. LLVM otherwise
   // lowers these to a library call. Keep the size bounded to control code growth.
