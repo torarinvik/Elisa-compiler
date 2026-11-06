@@ -8,7 +8,7 @@ def section(name):
     start=text.index('        def '+name+'(')
     end=re.search(r'\n        (?:def |#)',text[start+1:])
     return text[start:start+1+end.start()]+'\n'
-start=text.index('        struct CHVScalarCalls:')
+start=text.index('        struct CHVScalarFields:')
 end=text.index('        def chv_flow_latest(',start)
 helpers=text[start:end]+''.join(section(name) for name in ('chv_flow_latest','chv_flow_clone','chv_flow_has_lmut_rebind_claim','chv_flow_bind'))
 mutable_fields=re.findall(r'^            (\w+): mutable darray\[',text[start:end],re.M)
@@ -27,7 +27,7 @@ module Semantic:
     public:
 '''+helpers+'''
         def exercise() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            parent: mutable CHVViewFlow = CHVViewFlow{rebind_claims: [Ast::EnumAnnotation{owner: "__lmut_rebind_claim", name: "x", line: 7}], reference_holders: ["Holder"], type_alias_names: ["Alias"], type_alias_targets: [42], scalar_type_mask: 32767, scalar_calls: CHVScalarCalls{names: ["count_value"], shadow_names: ["local"]}}
+            parent: mutable CHVViewFlow = CHVViewFlow{rebind_claims: [Ast::EnumAnnotation{owner: "__lmut_rebind_claim", name: "x", line: 7}], reference_holders: ["Holder"], type_alias_names: ["Alias"], type_alias_targets: [42], scalar_type_mask: 32767, scalar_calls: CHVScalarCalls{names: ["count_value"], shadow_names: ["local"], fields: CHVScalarFields{owners: ["Packet"], names: ["value"]}}}
             chv_flow_bind(&parent, "x", true, false, true)
             parent.shape_shadow_names.push("shadow")
             parent.last_value_may_be_owned_view <- true
@@ -43,6 +43,8 @@ module Semantic:
             if branch.scalar_type_mask != parent.scalar_type_mask or sibling.scalar_type_mask != 32767: return 9
             if branch.scalar_calls.names[0] != "count_value" or branch.scalar_calls.shadow_names[0] != "local": return 90
             if (&branch.scalar_calls.names[0]).cast[uintptr] != (&parent.scalar_calls.names[0]).cast[uintptr]: return 91
+            if branch.scalar_calls.fields.owners[0] != "Packet" or branch.scalar_calls.fields.names[0] != "value": return 93
+            if (&branch.scalar_calls.fields.owners[0]).cast[uintptr] != (&parent.scalar_calls.fields.owners[0]).cast[uintptr]: return 94
             branch.scalar_calls <- CHVScalarCalls{}
             if parent.scalar_calls.names.count != 1 or sibling.scalar_calls.names.count != 1: return 92
             branch.owned[0] <- false
