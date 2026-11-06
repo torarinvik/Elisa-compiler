@@ -59,5 +59,18 @@ int main(int argc,char **argv){using namespace llvm;LLVMContext C;SMDiagnostic E
         for label, ir in (('base', work / 'safe.ll'), ('candidate', cand)):
             run([bindir / 'clang', '-O2', '-Wno-override-module', ir, harness, '-o', work / label])
             run([work / label])
+        # Division accumulators: both addend forms prove; unproved variants keep the check.
+        sums = {name: (ROOT / 'test/parity/bounded_division_sum_fixture.ll').read_text().replace('aarch64-unknown-linux-gnu', host).replace('ADDEND', add) for name, add in (('q', 'q'), ('rem', 'm'))}
+        ch = lambda t: any('call ' in l and 'sadd.with.overflow' in l for l in t.splitlines())
+        for name, text in sums.items():
+            if ch(apply('sum-' + name, text)): raise RuntimeError(name + ': division sum still checked')
+        q = sums['q']
+        for name, text in {
+            'huge-start': q.replace('[0,%pre], [%sn', '[9223372036854775000,%pre], [%sn'),
+            'no-input-bound': q.replace('%bad = icmp ugt i64 %n, 1000000000', '%bad = icmp eq i64 %n, -1'),
+            'other-addend': q.replace('i64 %s, i64 %q)', 'i64 %s, i64 %n)'),
+            'divide-by-one': q.replace('udiv i64 %r, 5', 'udiv i64 %r, 1'),
+        }.items():
+            if not ch(apply('sum-' + name, text)): raise RuntimeError(name + ': unproved sum check removed')
     print(f'bounded factorial: ok ({len(controls)} controls)')
 main()

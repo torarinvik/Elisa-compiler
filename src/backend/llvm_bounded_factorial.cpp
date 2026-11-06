@@ -50,6 +50,53 @@ static Value *BFP_UpperLimit(Loop *L, BasicBlock *Latch, Value *Step) {
   bool UpperExit = P == ICmpInst::ICMP_SGT || P == ICmpInst::ICMP_SGE;
   return (StayOnTrue && UpperStay) || (ExitOnTrue && UpperExit) ? Limit : nullptr;
 }
+// Accumulators over a repeatedly divided value: sum += r / C or sum += r % C,
+// with r = r / C on each pass. For r0 <= M the k-th r is at most M / C^k, and
+// once r is zero every later addend is zero, so the worst-case total is finite
+// whatever the loop's exit condition. Addends are nonnegative, so only the
+// upper end can overflow.
+static void BFP_CollectDivisionSums(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LoopInfo &LI,
+                                    LazyValueInfo &LVI, SmallVectorImpl<IntrinsicInst *> &Out) {
+  for (PHINode &R : L->getHeader()->phis()) {
+    if (!R.getType()->isIntegerTy(64) || R.getNumIncomingValues() != 2) continue;
+    auto *Div = dyn_cast<BinaryOperator>(R.getIncomingValueForBlock(Latch));
+    if (!Div || Div->getOpcode() != Instruction::UDiv || Div->isExact() ||
+        Div->getOperand(0) != &R) continue;
+    auto *C = dyn_cast<ConstantInt>(Div->getOperand(1));
+    if (!C || C->getValue().ult(2)) continue;
+    Value *Initial = R.getIncomingValueForBlock(Pre);
+    // UndefAllowed=false: a possibly-undef start yields the full range.
+    ConstantRange IR = LVI.getConstantRangeOnEdge(Initial, Pre, L->getHeader(), Pre->getTerminator());
+    if (IR.isEmptySet() || IR.isFullSet() || !IR.getUnsignedMax().isNonNegative()) continue;
+    for (PHINode &Sum : L->getHeader()->phis()) {
+      if (&Sum == &R || !Sum.getType()->isIntegerTy(64) || Sum.getNumIncomingValues() != 2) continue;
+      auto *S0 = dyn_cast<ConstantInt>(Sum.getIncomingValueForBlock(Pre));
+      auto *E = dyn_cast<ExtractValueInst>(Sum.getIncomingValueForBlock(Latch));
+      auto *Call = E ? dyn_cast<IntrinsicInst>(E->getAggregateOperand()) : nullptr;
+      if (!S0 || !Call || E->getNumIndices() != 1 || *E->idx_begin() != 0 ||
+          Call->getIntrinsicID() != Intrinsic::sadd_with_overflow || Call->hasOperandBundles() ||
+          Call->isConvergent() || Call->hasMetadataOtherThanDebugLoc() ||
+          LI.getLoopFor(Call->getParent()) != L) continue;
+      Value *X = BFP_Strip(Call->getArgOperand(0)), *Y = BFP_Strip(Call->getArgOperand(1));
+      Value *Addend = X == &Sum ? Y : (Y == &Sum ? X : nullptr);
+      auto *A = dyn_cast_or_null<BinaryOperator>(Addend);
+      if (!A) continue;
+      bool Quotient = A == Div;
+      bool Remainder = A->getOpcode() == Instruction::URem && A->getOperand(0) == &R &&
+                       A->getOperand(1) == C;
+      if (!Quotient && !Remainder) continue;
+      APInt Total = S0->getValue().sext(128), Rest = IR.getUnsignedMax().zext(128);
+      APInt Divisor = C->getValue().zext(128);
+      while (!Rest.isZero()) {
+        APInt Next = Rest.udiv(Divisor);
+        if (Quotient) Total += Next;
+        else Total += Rest.ult(Divisor) ? Rest : Divisor - 1;
+        Rest = Next;
+      }
+      if (Total.isSignedIntN(64)) Out.push_back(Call);
+    }
+  }
+}
 }
 extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
   if (!Ref) return 0;
@@ -70,15 +117,18 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
     bool HasCheckedMul = false;
     for (Instruction &I : instructions(F))
       if (auto *C = dyn_cast<IntrinsicInst>(&I))
-        HasCheckedMul |= C->getIntrinsicID() == Intrinsic::smul_with_overflow;
+        HasCheckedMul |= C->getIntrinsicID() == Intrinsic::smul_with_overflow ||
+                         C->getIntrinsicID() == Intrinsic::sadd_with_overflow;
     if (!HasCheckedMul) continue;
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
     SmallVector<std::pair<BinaryOperator *, IntrinsicInst *>, 4> Proven;
+    SmallVector<IntrinsicInst *, 4> ProvenSums;
     for (Loop *L : LI.getLoopsInPreorder()) {
       BasicBlock *Pre = L->getLoopPredecessor(), *Latch = L->getLoopLatch();
       if (!Pre || !Latch || !L->getSubLoops().empty()) continue;
+      BFP_CollectDivisionSums(L, Pre, Latch, LI, LVI, ProvenSums);
       for (PHINode &Product : L->getHeader()->phis()) {
         if (!Product.getType()->isIntegerTy(64) || Product.getNumIncomingValues() != 2) continue;
         auto *P0 = dyn_cast<ConstantInt>(Product.getIncomingValueForBlock(Pre));
@@ -131,7 +181,16 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
       C->eraseFromParent();
       ++Changed;
     }
-    if (!Proven.empty()) FAM.invalidate(F, PreservedAnalyses::none());
+    for (IntrinsicInst *C : ProvenSums) {
+      IRBuilder<> B(C);
+      Value *Sum = B.CreateNSWAdd(C->getArgOperand(0), C->getArgOperand(1));
+      Value *Pair = B.CreateInsertValue(PoisonValue::get(C->getType()), Sum, 0);
+      Pair = B.CreateInsertValue(Pair, B.getFalse(), 1);
+      C->replaceAllUsesWith(Pair);
+      C->eraseFromParent();
+      ++Changed;
+    }
+    if (!Proven.empty() || !ProvenSums.empty()) FAM.invalidate(F, PreservedAnalyses::none());
   }
   return Changed;
 }
