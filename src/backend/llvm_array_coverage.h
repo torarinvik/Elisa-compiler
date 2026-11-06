@@ -104,15 +104,45 @@ static BasicBlock *normalExit(Loop *L) {
     }
   return normal;
 }
-static bool writerCovers(Instruction *Writer, std::map<Loop *, Value *> &used,
-                         LoopInfo &LI, DominatorTree &DT, BasicBlock *&Exit) {
+// Within an enclosing loop, a dominance check alone can be satisfied by a
+// previous iteration. Reject a reader reachable from the parent header without
+// entering this iteration's writer preheader. Bound the graph walk for compile
+// time; exhaustion declines the rewrite.
+static bool readerNeedsPreheader(Loop *Parent, BasicBlock *Pre,
+                                 BasicBlock *Read) {
+  if (Read == Pre || !Parent->contains(Read) || !Parent->contains(Pre))
+    return false;
+  SmallPtrSet<BasicBlock *, 32> Seen;
+  SmallVector<BasicBlock *, 32> Work;
+  Work.push_back(Parent->getHeader());
+  while (!Work.empty()) {
+    BasicBlock *B = Work.pop_back_val();
+    if (B == Pre || !Parent->contains(B) || Seen.count(B))
+      continue;
+    if (Seen.size() >= 512)
+      return false;
+    Seen.insert(B);
+    if (B == Read)
+      return false;
+    for (BasicBlock *Next : successors(B)) {
+      if (Work.size() >= 2048)
+        return false;
+      Work.push_back(Next);
+    }
+  }
+  return true;
+}
+
+static bool writerCovers(Instruction *Writer, Instruction *Read,
+                         std::map<Loop *, Value *> &used, LoopInfo &LI,
+                         DominatorTree &DT, BasicBlock *&Exit) {
   Loop *Inner = LI.getLoopFor(Writer->getParent());
   if (!Inner || !used.count(Inner) ||
       !DT.dominates(Writer->getParent(), Inner->getLoopLatch()))
     return false;
   Loop *child = nullptr;
   unsigned seen = 0;
-  for (Loop *L = Inner; L; L = L->getParentLoop()) {
+  for (Loop *L = Inner; L && used.count(L); L = L->getParentLoop()) {
     if (!used.count(L) || !L->isLoopSimplifyForm() || !normalExit(L))
       return false;
     seen++;
@@ -120,7 +150,13 @@ static bool writerCovers(Instruction *Writer, std::map<Loop *, Value *> &used,
       return false;
     child = L;
   }
-  if (seen != used.size() || !child || LI.getLoopFor(child->getLoopPreheader()))
+  if (seen != used.size() || !child)
+    return false;
+  Loop *Parent = child->getParentLoop();
+  if (Parent && !readerNeedsPreheader(Parent, child->getLoopPreheader(),
+                                      Read->getParent()))
+    return false;
+  if (!Parent && LI.getLoopFor(child->getLoopPreheader()))
     return false;
   for (auto [L, Bound] : used)
     if (!child->isLoopInvariant(Bound))
@@ -168,7 +204,7 @@ static bool prove(AllocaInst *A, MemSetInst *Init, LoopInfo &LI,
       std::map<Loop *, Value *> used;
       BasicBlock *exit = nullptr;
       if (!ri || !sameIndex(wi, ri, R, LI, DT, used) ||
-          !writerCovers(W, used, LI, DT, exit) ||
+          !writerCovers(W, R, used, LI, DT, exit) ||
           !DT.dominates(exit, R->getParent())) {
         all = false;
         break;
@@ -262,7 +298,7 @@ static unsigned prepareCoveredArrayInitializers(Module &M,
       auto *V = dyn_cast<ConstantInt>(S->getValue());
       auto *N = dyn_cast<ConstantInt>(S->getLength());
       if (!A || !T || !T->getElementType()->isDoubleTy() ||
-          !A->isStaticAlloca() || T->getNumElements() < 128 ||
+          !A->isStaticAlloca() || T->getNumElements() < 16 ||
           T->getNumElements() > 8192 || !V || !V->isZero() || !N ||
           N->getValue().getActiveBits() > 64 ||
           N->getZExtValue() != M.getDataLayout().getTypeAllocSize(T) ||
