@@ -29,6 +29,10 @@ DEFAULT_SELF_HOST_GEN2_MAX_RSS_KB=8388608
 DEFAULT_SELF_HOST_GEN2_POLL_SECONDS=0.05
 SELF_HOST_GEN2_MAX_RSS_KB="${ELISA_SELF_HOST_GEN2_MAX_RSS_KB:-$DEFAULT_SELF_HOST_GEN2_MAX_RSS_KB}"
 SELF_HOST_GEN2_POLL_SECONDS="${ELISA_SELF_HOST_GEN2_POLL_SECONDS:-$DEFAULT_SELF_HOST_GEN2_POLL_SECONDS}"
+# The nested driver guard must honor this gate's configured budget. Otherwise the
+# wrapper silently applies its standalone 4 GiB default before the 8 GiB gate can
+# observe the compiler. An explicitly configured inner limit still takes precedence.
+export ELISA_STAGE1_MAX_RSS_KB="${ELISA_STAGE1_MAX_RSS_KB:-$SELF_HOST_GEN2_MAX_RSS_KB}"
 
 # Fork-free RSS polls on Linux (see the file).
 source "$ROOT/scripts/process_rss.sh"
