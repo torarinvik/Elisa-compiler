@@ -747,7 +747,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (scans) {
     auto options = LLVMCreatePassBuilderOptions();
     auto error = LLVMRunPasses(module,
-      "function(early-cse,instcombine<max-iterations=8>,loop-simplify,lcssa,loop(indvars),gvn,instcombine<max-iterations=8>,simplifycfg)", target, options);
+      "function(early-cse,instcombine<max-iterations=8;no-verify-fixpoint>,loop-simplify,lcssa,loop(indvars),gvn,instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg)", target, options);
     LLVMDisposePassBuilderOptions(options);
     if (error) { LLVMConsumeError(error); return 2; }
   }
@@ -755,7 +755,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #if defined(__APPLE__) && defined(__aarch64__)
   auto options = LLVMCreatePassBuilderOptions();
   auto error = LLVMRunPasses(module,
-      "function(early-cse,instcombine<max-iterations=8>,loop-simplify,lcssa,loop(indvars),gvn,instcombine<max-iterations=8>,simplifycfg)",
+      "function(early-cse,instcombine<max-iterations=8;no-verify-fixpoint>,loop-simplify,lcssa,loop(indvars),gvn,instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg)",
       target, options);
   LLVMDisposePassBuilderOptions(options);
   if (error) {
@@ -770,14 +770,14 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned boundedDivisionLoops = elisacoreUnrollBoundedDivisionLoops(module);
   if (boundedDivisionLoops) {
     auto options = LLVMCreatePassBuilderOptions();
-    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg)", target, options);
+    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine<no-verify-fixpoint>,simplifycfg)", target, options);
     LLVMDisposePassBuilderOptions(options);
     if (error) { LLVMConsumeError(error); return 2; }
     status = 1;
   }
   if (elisacoreBoundedFactorials(module)) {
     auto options = LLVMCreatePassBuilderOptions();
-    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine,simplifycfg,loop-simplify,lcssa,indvars,loop-vectorize,instcombine,simplifycfg)", target, options);
+    auto error = LLVMRunPasses(module, "function(correlated-propagation,instcombine<no-verify-fixpoint>,simplifycfg,loop-simplify,lcssa,indvars,loop-vectorize,instcombine<no-verify-fixpoint>,simplifycfg)", target, options);
     LLVMDisposePassBuilderOptions(options);
     if (error) { LLVMConsumeError(error); return 2; }
     status = 1;
@@ -788,9 +788,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     // ordering is qualified; retain Linux's measured scalar ordering.
     const auto &triple = unwrap(module)->getTargetTriple();
     const char *cleanup = triple.isOSDarwin() && triple.getArch() == Triple::aarch64
-        ? "function(correlated-propagation,instcombine,simplifycfg,"
-          "loop-simplify,lcssa,loop-vectorize,instcombine,simplifycfg)"
-        : "function(correlated-propagation,instcombine,simplifycfg)";
+        ? "function(correlated-propagation,instcombine<no-verify-fixpoint>,simplifycfg,"
+          "loop-simplify,lcssa,loop-vectorize,instcombine<no-verify-fixpoint>,simplifycfg)"
+        : "function(correlated-propagation,instcombine<no-verify-fixpoint>,simplifycfg)";
     auto options = LLVMCreatePassBuilderOptions();
     auto error = LLVMRunPasses(module, cleanup, target, options);
     LLVMDisposePassBuilderOptions(options);
@@ -835,7 +835,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (guarded) {
     auto opts = LLVMCreatePassBuilderOptions();
     auto err = LLVMRunPasses(module,
-      "function(instcombine,simplifycfg,loop-simplify,lcssa,loop(indvars),instcombine,simplifycfg)", target, opts);
+      "function(instcombine<no-verify-fixpoint>,simplifycfg,loop-simplify,lcssa,loop(indvars),instcombine<no-verify-fixpoint>,simplifycfg)", target, opts);
     LLVMDisposePassBuilderOptions(opts);
     if (err) { LLVMConsumeError(err); return 2; }
     status = 1;
@@ -845,7 +845,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (orderedVector) status = 1;
   if (elisacoreSpecializeValidationEpilogues(module)) {
     auto opts = LLVMCreatePassBuilderOptions();
-    auto err = LLVMRunPasses(module, "function(instcombine,simplifycfg)", target, opts);
+    auto err = LLVMRunPasses(module, "function(instcombine<no-verify-fixpoint>,simplifycfg)", target, opts);
     LLVMDisposePassBuilderOptions(opts);
     if (err) { LLVMConsumeError(err); return 2; }
     status = 1;
