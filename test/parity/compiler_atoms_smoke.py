@@ -62,6 +62,10 @@ with tempfile.TemporaryDirectory(prefix="elisa-compiler-atoms-") as work:
         if atom == "backend":
             libdir = run([LLVM_CONFIG, "--libdir"]).strip()
             flags += [f"-L{libdir}", f"-Wl,-rpath,{libdir}"] + run([LLVM_CONFIG, "--libs"]).split()
-        run(["clang", *flags, "-o", str(binary), str(obj), str(hooks)])
+        # Linux O0 objects can keep unused runtime functions in the same text
+        # section as the probe. Supply the standalone host's optional callbacks
+        # and ABI-correct va_list helpers, just as the Stage1 seed does.
+        runtime_fallbacks = [str(ROOT / "scripts/pymodule_runtime_fallback.c")] if sys.platform.startswith("linux") else []
+        run(["clang", *flags, "-o", str(binary), str(obj), str(hooks), *runtime_fallbacks])
         run([str(binary)])
         print(f"compiler {atom} atoms: ok ({time.perf_counter() - started:.2f}s)")

@@ -45,10 +45,17 @@ void elisa_native_callback_context_free(void *ctx) {
     (void)ctx;
 }
 #define ELISA_WEAK
+/* These exports implement Elisa's pointer-based varargs ABI, not the C builtin
+ * signatures. Keep their linker names while avoiding builtin C identifiers. */
+#define ELISA_SYMBOL_STRING_INNER(value) #value
+#define ELISA_SYMBOL_STRING(value) ELISA_SYMBOL_STRING_INNER(value)
+#define ELISA_RUNTIME_EXPORT(name) __asm__(ELISA_SYMBOL_STRING(__USER_LABEL_PREFIX__) name)
+ELISA_WEAK void *elisa_fallback_va_copy(void *source) ELISA_RUNTIME_EXPORT("va_copy");
+ELISA_WEAK void elisa_fallback_va_end(void *argument) ELISA_RUNTIME_EXPORT("va_end");
 #if (defined(__x86_64__) && !defined(_WIN32)) || (defined(__aarch64__) && !defined(__APPLE__) && !defined(_WIN32))
 #define ELISA_VA_LIST_BY_REF 1
 #endif
-ELISA_WEAK void *va_copy(void *source) {
+ELISA_WEAK void *elisa_fallback_va_copy(void *source) {
 #ifdef ELISA_VA_LIST_BY_REF
   __builtin_va_list *copy = (__builtin_va_list *)malloc(sizeof(__builtin_va_list));
   if (copy == NULL) abort();
@@ -58,7 +65,7 @@ ELISA_WEAK void *va_copy(void *source) {
   return source;
 #endif
 }
-ELISA_WEAK void va_end(void *argument) {
+ELISA_WEAK void elisa_fallback_va_end(void *argument) {
 #ifdef ELISA_VA_LIST_BY_REF
   if (argument != NULL) { __builtin_va_end(*(__builtin_va_list *)argument); free(argument); }
 #else
