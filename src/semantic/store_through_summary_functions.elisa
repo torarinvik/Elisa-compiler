@@ -150,6 +150,148 @@ extend Semantic:
                             pass
 
         # The rows one function adds under SUMMARY; true when any row is new.
+        # ADDRESS RETENTION. The classes above ask whether anything reachable from a parameter
+        # may reach a writable one. These walks ask the narrower question for `&local`: may the
+        # reference ITSELF be kept? Reading through it (`x.f <- p.g`, `for e in p`) cannot
+        # leave a pointer to the caller's frame behind.
+        def sts_address_bare_root(expression: Ast::Expr) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Ident(name, _):
+                        return name
+                    Expr.Paren(inner, _):
+                        return sts_address_bare_root(inner)
+                    Expr.Move(inner, _):
+                        return sts_address_bare_root(inner)
+                    Expr.Unary(TokenKind.Ampersand, operand, _):
+                        return bam_place_root(operand)
+                    _:
+                        return ""
+
+        def sts_address_visit(expression: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, marked: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, _):
+                        callee_name: mutable sview = ""
+                        match callee:
+                            Expr.Ident(direct_name, direct_position):
+                                callee_name <- direct_name if not has_unreadable_binder and not borrow_reference_site_is_local(reference_sites, function_owner, direct_position, table)
+                            Expr.Field(receiver, _, _):
+                                sts_collect_names(receiver, marked)
+                            _:
+                                callee_name <- sts_generic_direct_callee_name(callee, has_unreadable_binder, function_owner, reference_sites, table)
+                        named: bool = any argument_name in argument_names where argument_name != ""
+                        known: bool = callee_name != "" and not named and sts_is_declared(summary, callee_name)
+                        position: mutable usize = 0
+                        for argument in arguments |position, marked, reference_sites, callee_name, known|:
+                            sts_address_visit(argument, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                            root: sview = sts_address_bare_root(argument)
+                            if root != "" and (not known or sts_retains_address(summary, callee_name, position)):
+                                marked.push(root)
+                            position <- position + 1
+                    Expr.Field(object, _, _):
+                        sts_address_visit(object, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                    Expr.Index(object, index, _):
+                        sts_address_visit(object, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                        sts_address_visit(index, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                    Expr.Binary(left, _, right, _):
+                        sts_address_visit(left, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                        sts_address_visit(right, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                    Expr.Unary(_, operand, _):
+                        sts_address_visit(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                    Expr.Paren(inner, _):
+                        sts_address_visit(inner, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                    Expr.Ident(_, _):
+                        pass
+                    _:
+                        # Aggregates, lambdas and block values may keep anything they mention.
+                        sts_collect_names(expression, marked)
+
+        def sts_address_stored(expression: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, marked: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                root: sview = sts_address_bare_root(expression)
+                marked.push(root) if root != ""
+                sts_address_visit(expression, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                # A returned value may alias any reference the call was given.
+                if expression is Expr.Call(_, arguments, _, _):
+                    for argument in arguments |marked|:
+                        call_root: sview = sts_address_bare_root(argument)
+                        marked.push(call_root) if call_root != ""
+
+        def sts_address_statements(statements: darray[Ast::Stmt], parameters: darray[Ast::ParamDecl]&, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, marked: mutable darray[sview]&, alias_names: mutable darray[sview]&, alias_roots: mutable darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                for statement in statements |marked, alias_names, alias_roots, reference_sites|:
+                    match statement:
+                        Stmt.VarDecl(declared_name, _, declared_value, _):
+                            sts_address_visit(declared_value, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                            alias_root: sview = sts_address_bare_root(declared_value)
+                            if alias_root != "":
+                                alias_names.push(declared_name)
+                                alias_roots.push(alias_root)
+                        Stmt.Assign(assign_target, assign_operator, assign_value, _):
+                            sts_address_visit(assign_target, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                            threaded: bool = sts_void_threading_call(assign_target, assign_operator, assign_value, has_unreadable_binder, function_owner, reference_sites, table) or sts_same_target_lmut_rebind(assign_target, assign_operator, assign_value, has_unreadable_binder, function_owner, reference_sites, table)
+                            local_target: mutable bool = false
+                            if assign_target is Expr.Ident(target_name, _):
+                                local_target <- not (any parameter in parameters where parameter.name == target_name)
+                            if threaded or local_target:
+                                sts_address_visit(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                                value_root: sview = sts_address_bare_root(assign_value)
+                                if local_target and value_root != "":
+                                    alias_names.push(ident_name_of(assign_target))
+                                    alias_roots.push(value_root)
+                            else:
+                                sts_address_stored(assign_value, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                        Stmt.Expr(statement_value, _):
+                            sts_address_visit(statement_value, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                        Stmt.Return(returned, _):
+                            if returned is returned_value:
+                                sts_address_stored(returned_value, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                        Stmt.If(condition, then_body, else_body, _):
+                            sts_address_visit(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                            sts_address_statements(then_body, parameters, summary, has_unreadable_binder, function_owner, reference_sites, table, marked, alias_names, alias_roots)
+                            sts_address_statements(else_body, parameters, summary, has_unreadable_binder, function_owner, reference_sites, table, marked, alias_names, alias_roots)
+                        Stmt.While(condition, loop_body, _):
+                            sts_address_visit(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                            sts_address_statements(loop_body, parameters, summary, has_unreadable_binder, function_owner, reference_sites, table, marked, alias_names, alias_roots)
+                        Stmt.For(_, _, iterable, loop_body, _):
+                            sts_address_visit(iterable, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                            sts_address_statements(loop_body, parameters, summary, has_unreadable_binder, function_owner, reference_sites, table, marked, alias_names, alias_roots)
+                        Stmt.Block(body: block_body, _):
+                            sts_address_statements(block_body, parameters, summary, has_unreadable_binder, function_owner, reference_sites, table, marked, alias_names, alias_roots)
+                        Stmt.Match(scrutinee, arms, _):
+                            sts_address_visit(scrutinee, summary, has_unreadable_binder, function_owner, reference_sites, table, marked)
+                            for arm in arms |marked, alias_names, alias_roots, reference_sites|:
+                                sts_address_statements(arm.body, parameters, summary, has_unreadable_binder, function_owner, reference_sites, table, marked, alias_names, alias_roots)
+                        Stmt.Contract(_, _, _):
+                            pass
+                        _:
+                            sts_collect_statement_names([statement], marked)
+
+        def sts_summarise_addresses(function_name: sview, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt], has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, summary: mutable StoreThroughSummary&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                marked: mutable darray[sview] = []
+                alias_names: mutable darray[sview] = []
+                alias_roots: mutable darray[sview] = []
+                sts_address_statements(body, parameters, summary, has_unreadable_binder, function_owner, reference_sites, table, marked, alias_names, alias_roots)
+                grew: mutable bool = true
+                while grew |grew, marked, alias_names, alias_roots|:
+                    grew <- false
+                    for alias_index in 0..<alias_names.count |grew, marked, alias_names, alias_roots|:
+                        alias_marked: bool = any name in marked where name == alias_names[alias_index]
+                        root_marked: bool = any name in marked where name == alias_roots[alias_index]
+                        if alias_marked and not root_marked:
+                            marked.push(alias_roots[alias_index])
+                            grew <- true
+                added: mutable bool = false
+                position: mutable usize = 0
+                for parameter in parameters |position, added, marked, summary|:
+                    if (any name in marked where name == parameter.name) and not sts_retains_address(summary, function_name, position):
+                        summary.address_rows <- summary.address_rows.put(sts_address_key(function_name, position), true)
+                        added <- true
+                    position <- position + 1
+                return added
+
         def sts_summarise_function(function_name: sview @source, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt], has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: mutable SymbolTable&, summary: mutable StoreThroughSummary&) -> bool:
             can Memory.Allocate, Abort.Panic, Global{Read,Write}:
                 classes: mutable StoreThroughClasses = sts_classes_empty()
@@ -171,6 +313,7 @@ extend Semantic:
                                 added <- true
                             source <- source + 1
                     target <- target + 1
+                added <- true if sts_summarise_addresses(function_name, parameters, body, has_unreadable_binder, function_owner, reference_sites, table, summary)
                 return added
 
     public:
