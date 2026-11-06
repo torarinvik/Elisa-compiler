@@ -6,6 +6,8 @@ root=Path(__file__).resolve().parents[1]
 s=(root/'src/semantic/check_destroyed_region.elisa').read_text()
 a=s.index('        struct DestroyedRegionNameIndex:');b=s.index('        # Legacy spelling query',a)
 helpers=s[a:b]
+c=s.index('        def region_binding_id_at(');d=s.index('\n\n        # Arena handles',c)
+helpers=s[c:d]+'\n'+helpers
 source='include "'+str(root/'elisacore_std/collections.elisa')+'"\n'+'''module Ast:
     public:
         struct LocalRegionAnnotation:
@@ -14,6 +16,7 @@ source='include "'+str(root/'elisacore_std/collections.elisa')+'"\n'+'''module A
             line: u32 = 0
             owner_offset: u32 = 0
             end_offset: u32 = 0
+            end_line: u32 = 0
             type_expression: bool = false
 module Semantic:
     public:
@@ -22,7 +25,6 @@ module Semantic:
         # Force collisions to check that the index is never identity evidence.
         def name_hash(name: sview) -> u64 = 1
         def local_type_cannot_carry_region(value: bool) -> bool = value
-        def region_binding_id_at(annotations: darray[Ast::LocalRegionAnnotation]&, region: sview, function_line: u32, use_line: u32, use_offset: u32, known: bool) -> u32 = use_offset + 1
         def region_annotation_window_start(annotations: darray[Ast::LocalRegionAnnotation]&, line: u32) -> usize = 0
         def region_annotation_window_end(annotations: darray[Ast::LocalRegionAnnotation]&, line: u32) -> usize = annotations.count
         def region_annotation_offset_window_end(annotations: darray[Ast::LocalRegionAnnotation]&, offset: u32) -> usize = annotations.count
@@ -31,6 +33,8 @@ module Semantic:
             rows: mutable darray[Ast::LocalRegionAnnotation] = []
             for i in 0..<16:
                 rows.push(Ast::LocalRegionAnnotation{name: "x" if i % 2 == 0 else "y", region: "r" if i % 3 != 0 else "", line: (i % 5).u32(), owner_offset: (i * 4).u32(), end_offset: (i * 4 + 9).u32() if i % 3 != 0 else 0, type_expression: i % 4 == 0})
+            for i in 0..<6:
+                rows.push(Ast::LocalRegionAnnotation{name: "__region_param" if i % 3 == 0 else ("__region_local" if i % 3 == 1 else "__region_arena_local"), region: "r" if i % 2 == 0 else "q", line: (i % 4).u32(), end_line: (i + 2).u32(), owner_offset: (i * 3).u32(), end_offset: (i * 3 + 20).u32() if i % 2 == 0 else 0})
             index: mutable DestroyedRegionNameIndex = DestroyedRegionNameIndex{}
             destroyed_build_region_name_index(rows, &index) can Global{Read,Write}
             names: darray[sview] = ["x", "y", "missing"]
@@ -42,6 +46,9 @@ module Semantic:
                             after: mutable darray[u32] = [99]
                             function_regions_of_name(rows, name, 1, line.u32(), &before, offset.u32(), mode == 1) can Global{Read,Write}
                             destroyed_indexed_function_regions_of_name(&index, rows, name, 1, line.u32(), &after, offset.u32(), mode == 1) can Global{Read,Write}
+                            old_binding: u32 = region_binding_id_at(rows, "r", 1, line.u32(), offset.u32(), mode == 1) can Global{Read,Write}
+                            new_binding: u32 = destroyed_indexed_region_binding_id_at(&index, rows, "r", 1, line.u32(), offset.u32(), mode == 1) can Global{Read,Write}
+                            if old_binding != new_binding: return 5
                             if before.count != after.count: return 1
                             for i in 0..<before.count:
                                 if before[i] != after[i]: return 2
@@ -81,4 +88,4 @@ void elisa_profile_allocation_event_v1(uint32_t k,uintptr_t p,size_t s,uintptr_t
 """)
  subprocess.run(['clang',str(p/'test.o'),str(p/'hooks.c'),'-o',str(p/'test')],check=True,timeout=28)
  subprocess.run([str(p/'test')],check=True,timeout=28)
- print('PASS 3150 indexed/scan comparisons with collisions, shadowing, expiry, scalar and empty regions')
+ print('PASS 3150 name-query comparisons and 2940 binder-query comparisons with collisions, shadowing, expiry, scalar and empty regions')
