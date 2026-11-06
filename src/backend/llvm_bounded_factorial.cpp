@@ -4,6 +4,8 @@
 // multiplication cannot prove this shape, since 20^20 overflows while 20! fits.
 #include "llvm_bounded_product.cpp"
 #include <llvm/IR/InstIterator.h>
+#include <llvm/ADT/APInt.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #if LLVM_VERSION_MAJOR >= 23
 namespace {
 constexpr unsigned BFP_MaxIterations = 64;
@@ -97,6 +99,92 @@ static void BFP_CollectDivisionSums(Loop *L, BasicBlock *Pre, BasicBlock *Latch,
     }
   }
 }
+// The largest iteration count of a unit-step counter from a constant start,
+// bounded by a limit whose preheader range is known. Zero when unproved.
+static uint64_t BFP_IterationBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LazyValueInfo &LVI) {
+  auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
+  auto *Cmp = Br ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
+  if (!Cmp) return 0;
+  for (PHINode &I : L->getHeader()->phis()) {
+    if (!I.getType()->isIntegerTy(64) || I.getNumIncomingValues() != 2) continue;
+    auto *S = dyn_cast<ConstantInt>(I.getIncomingValueForBlock(Pre));
+    Value *Step = I.getIncomingValueForBlock(Latch);
+    if (!S || !BFP_IsUnitStep(Step, &I)) continue;
+    Value *Limit = BFP_UpperLimit(L, Latch, Step);
+    bool Equality = false;
+    if (!Limit) {
+      // Equality exits bound a unit counter only when the limit starts above it.
+      Value *Other = Cmp->getOperand(0) == Step ? Cmp->getOperand(1)
+                   : Cmp->getOperand(1) == Step ? Cmp->getOperand(0) : nullptr;
+      bool Exit = (Cmp->getPredicate() == ICmpInst::ICMP_EQ && !L->contains(Br->getSuccessor(0)) &&
+                   Br->getSuccessor(1) == L->getHeader()) ||
+                  (Cmp->getPredicate() == ICmpInst::ICMP_NE && !L->contains(Br->getSuccessor(1)) &&
+                   Br->getSuccessor(0) == L->getHeader());
+      if (!Other || !Exit || !L->isLoopInvariant(Other)) continue;
+      Limit = Other;
+      Equality = true;
+    }
+    ConstantRange R = LVI.getConstantRangeOnEdge(Limit, Pre, L->getHeader(), Pre->getTerminator());
+    if (R.isEmptySet() || R.isFullSet()) continue;
+    if (Equality && !R.getSignedMin().sgt(S->getValue())) continue;
+    APInt Last = R.getSignedMax();
+    if (Last.slt(S->getValue())) Last = S->getValue();
+    if (!S->getValue().sge(-1024) || !Last.sle(1024)) continue;
+    uint64_t Count = Last.getSExtValue() - S->getSExtValue() + 1;
+    if (Count <= BFP_MaxIterations) return Count;
+  }
+  return 0;
+}
+// Horner recurrences: x = x * K + d, with constant start and K, d in a range
+// known at its use, and a bounded loop. Simulate the interval of x exactly.
+static void BFP_CollectHorner(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LoopInfo &LI,
+                              LazyValueInfo &LVI, SmallVectorImpl<IntrinsicInst *> &Out) {
+  auto Checked = [&](Value *V, Intrinsic::ID ID) -> IntrinsicInst * {
+    auto *E = dyn_cast<ExtractValueInst>(V);
+    auto *C = E ? dyn_cast<IntrinsicInst>(E->getAggregateOperand()) : nullptr;
+    if (!C || E->getNumIndices() != 1 || *E->idx_begin() != 0 || C->getIntrinsicID() != ID ||
+        C->hasOperandBundles() || C->isConvergent() || C->hasMetadataOtherThanDebugLoc() ||
+        LI.getLoopFor(C->getParent()) != L) return nullptr;
+    return C;
+  };
+  uint64_t Iterations = 0;
+  for (PHINode &X : L->getHeader()->phis()) {
+    if (!X.getType()->isIntegerTy(64) || X.getNumIncomingValues() != 2) continue;
+    auto *X0 = dyn_cast<ConstantInt>(X.getIncomingValueForBlock(Pre));
+    IntrinsicInst *Add = Checked(X.getIncomingValueForBlock(Latch), Intrinsic::sadd_with_overflow);
+    if (!X0 || !Add) continue;
+    IntrinsicInst *Mul = nullptr;
+    Value *D = nullptr;
+    for (unsigned I = 0; I < 2 && !Mul; ++I)
+      if ((Mul = Checked(Add->getArgOperand(I), Intrinsic::smul_with_overflow)))
+        D = Add->getArgOperand(1 - I);
+    if (!Mul) continue;
+    Value *A = Mul->getArgOperand(0), *B = Mul->getArgOperand(1);
+    auto *K = dyn_cast<ConstantInt>(A == &X ? B : (B == &X ? A : nullptr));
+    if (!K || !K->getValue().isStrictlyPositive()) continue;
+    // UndefAllowed=false: a possibly-undef addend yields the full range.
+    ConstantRange DR = LVI.getConstantRange(D, Add, false);
+    if (DR.isEmptySet() || DR.isFullSet()) continue;
+    if (!Iterations) Iterations = BFP_IterationBound(L, Pre, Latch, LVI);
+    if (!Iterations) return;
+    APInt Lo = X0->getValue().sext(128), Hi = Lo, Factor = K->getValue().sext(128);
+    APInt DMin = DR.getSignedMin().sext(128), DMax = DR.getSignedMax().sext(128);
+    bool Safe = true;
+    // Factor > 0 keeps interval endpoints ordered. Widening with the previous
+    // interval also covers runs that stop after fewer iterations.
+    for (uint64_t I = 0; I < Iterations && Safe; ++I) {
+      APInt L1 = Lo * Factor, H1 = Hi * Factor;
+      APInt L2 = L1 + DMin, H2 = H1 + DMax;
+      Safe = L1.isSignedIntN(64) && H1.isSignedIntN(64) && L2.isSignedIntN(64) && H2.isSignedIntN(64);
+      Lo = APIntOps::smin(Lo, L2);
+      Hi = APIntOps::smax(Hi, H2);
+    }
+    if (Safe) {
+      Out.push_back(Mul);
+      Out.push_back(Add);
+    }
+  }
+}
 }
 extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
   if (!Ref) return 0;
@@ -125,10 +213,12 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
     auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
     SmallVector<std::pair<BinaryOperator *, IntrinsicInst *>, 4> Proven;
     SmallVector<IntrinsicInst *, 4> ProvenSums;
+    SmallPtrSet<IntrinsicInst *, 8> SeenSums;
     for (Loop *L : LI.getLoopsInPreorder()) {
       BasicBlock *Pre = L->getLoopPredecessor(), *Latch = L->getLoopLatch();
       if (!Pre || !Latch || !L->getSubLoops().empty()) continue;
       BFP_CollectDivisionSums(L, Pre, Latch, LI, LVI, ProvenSums);
+      BFP_CollectHorner(L, Pre, Latch, LI, LVI, ProvenSums);
       for (PHINode &Product : L->getHeader()->phis()) {
         if (!Product.getType()->isIntegerTy(64) || Product.getNumIncomingValues() != 2) continue;
         auto *P0 = dyn_cast<ConstantInt>(Product.getIncomingValueForBlock(Pre));
@@ -182,8 +272,11 @@ extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
       ++Changed;
     }
     for (IntrinsicInst *C : ProvenSums) {
+      if (!SeenSums.insert(C).second) continue;
       IRBuilder<> B(C);
-      Value *Sum = B.CreateNSWAdd(C->getArgOperand(0), C->getArgOperand(1));
+      Value *Sum = C->getIntrinsicID() == Intrinsic::smul_with_overflow
+                       ? B.CreateNSWMul(C->getArgOperand(0), C->getArgOperand(1))
+                       : B.CreateNSWAdd(C->getArgOperand(0), C->getArgOperand(1));
       Value *Pair = B.CreateInsertValue(PoisonValue::get(C->getType()), Sum, 0);
       Pair = B.CreateInsertValue(Pair, B.getFalse(), 1);
       C->replaceAllUsesWith(Pair);

@@ -72,5 +72,18 @@ int main(int argc,char **argv){using namespace llvm;LLVMContext C;SMDiagnostic E
             'divide-by-one': q.replace('udiv i64 %r, 5', 'udiv i64 %r, 1'),
         }.items():
             if not ch(apply('sum-' + name, text)): raise RuntimeError(name + ': unproved sum check removed')
+        h = (ROOT / 'test/parity/bounded_horner_fixture.ll').read_text().replace('aarch64-unknown-linux-gnu', host)
+        cm = lambda t: any('call ' in l and 'with.overflow' in l for l in t.splitlines())
+        if cm(apply('horner', h)): raise RuntimeError('bounded Horner recurrence still checked')
+        for name, text in {
+            'count-too-big': h.replace('ugt i64 %n, 12', 'ugt i64 %n, 64'),
+            'count-unbounded': h.replace('%bad = icmp ugt i64 %n, 12', '%bad = icmp eq i64 %n, -7'),
+            'count-may-be-zero': h.replace('icmp ult i64 %n, 1', 'icmp ult i64 %n, 0'),
+            'big-factor': h.replace('i64 %x, i64 26', 'i64 %x, i64 100000000'),
+            'addend-unbounded': h.replace('%d_bad = icmp ugt i64 %d, 26', '%d_bad = icmp eq i64 %d, -1'),
+            'huge-start': h.replace('[0,%pre], [%xn', '[1000000000000000000,%pre], [%xn'),
+            'variable-factor': h.replace('i64 %x, i64 26', 'i64 %x, i64 %d'),
+        }.items():
+            if not cm(apply('horner-' + name, text)): raise RuntimeError(name + ': unproved Horner check removed')
     print(f'bounded factorial: ok ({len(controls)} controls)')
 main()
