@@ -108,5 +108,15 @@ int main(int argc,char **argv){using namespace llvm;LLVMContext C;SMDiagnostic E
             run([bindir / 'clang', '-O1', '-Wno-override-module', ir, check, '-o', work / label])
             outs.append(run([work / label]).stdout)
         if outs[0] != outs[1]: raise RuntimeError(f'interval results differ: {outs}')
+        # Down-counters: 33!! fits i64 but 34!! does not.
+        dn = (ROOT / 'test/parity/bounded_down_fixture.ll').read_text().replace('aarch64-unknown-linux-gnu', host)
+        if cm(apply('down', dn)): raise RuntimeError('33!! down-counter still checked')
+        for name, text in {
+            'bound-34': dn.replace('ugt i64 %n, 33', 'ugt i64 %n, 34'),
+            'no-bound': dn.replace('%bad = icmp ugt i64 %n, 33', '%bad = icmp eq i64 %n, -9'),
+            'upward': dn.replace('add i64 %f, -2', 'add i64 %f, 2'),
+            'slower-step': dn.replace('add i64 %f, -2', 'add i64 %f, -1'),
+        }.items():
+            if not cm(apply('down-' + name, text)): raise RuntimeError(name + ': unproved down check removed')
     print(f'bounded factorial: ok ({len(controls)} controls)')
 main()

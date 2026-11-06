@@ -4,6 +4,7 @@
 // multiplication cannot prove this shape, since 20^20 overflows while 20! fits.
 #include "llvm_bounded_product.cpp"
 #include <llvm/Analysis/LoopIterator.h>
+#include <algorithm>
 #include <optional>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/ADT/APInt.h>
@@ -103,10 +104,70 @@ static void BFP_CollectDivisionSums(Loop *L, BasicBlock *Pre, BasicBlock *Latch,
 }
 // The largest iteration count of a unit-step counter from a constant start,
 // bounded by a limit whose preheader range is known. Zero when unproved.
+// Down-counters: x = x - K with a start range and a constant lower exit test.
+static uint64_t BFP_DownBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch, CondBrInst *Br,
+                              ICmpInst *Cmp, LazyValueInfo &LVI) {
+  auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+  Value *Tested = Cmp->getOperand(0);
+  ICmpInst::Predicate P = Cmp->getPredicate();
+  if (!C) {
+    C = dyn_cast<ConstantInt>(Cmp->getOperand(0));
+    Tested = Cmp->getOperand(1);
+    P = ICmpInst::getSwappedPredicate(P);
+  }
+  if (!C || !C->getType()->isIntegerTy(64)) return 0;
+  if (Br->getSuccessor(1) == L->getHeader() && !L->contains(Br->getSuccessor(0)))
+    P = ICmpInst::getInversePredicate(P);
+  else if (Br->getSuccessor(0) != L->getHeader() || L->contains(Br->getSuccessor(1)))
+    return 0;
+  // Stay while Tested > Floor.
+  if (P != ICmpInst::ICMP_SGT && P != ICmpInst::ICMP_SGE) return 0;
+  APInt Floor = C->getValue().sext(128) - (P == ICmpInst::ICMP_SGE ? 1 : 0);
+  for (PHINode &X : L->getHeader()->phis()) {
+    if (!X.getType()->isIntegerTy(64) || X.getNumIncomingValues() != 2) continue;
+    Value *Step = X.getIncomingValueForBlock(Latch);
+    if (Tested != &X && Tested != Step) continue;
+    Value *Base = nullptr, *Amount = nullptr;
+    bool Subtract = false;
+    if (auto *Add = dyn_cast<BinaryOperator>(Step)) {
+      if (Add->getOpcode() != Instruction::Add && Add->getOpcode() != Instruction::Sub) continue;
+      Base = Add->getOperand(0);
+      Amount = Add->getOperand(1);
+      Subtract = Add->getOpcode() == Instruction::Sub;
+    } else if (auto *E = dyn_cast<ExtractValueInst>(Step)) {
+      auto *Call = dyn_cast<IntrinsicInst>(E->getAggregateOperand());
+      if (!Call || E->getNumIndices() != 1 || *E->idx_begin() != 0) continue;
+      if (Call->getIntrinsicID() != Intrinsic::sadd_with_overflow &&
+          Call->getIntrinsicID() != Intrinsic::ssub_with_overflow) continue;
+      Base = Call->getArgOperand(0);
+      Amount = Call->getArgOperand(1);
+      Subtract = Call->getIntrinsicID() == Intrinsic::ssub_with_overflow;
+    } else {
+      continue;
+    }
+    auto *Inc = dyn_cast<ConstantInt>(Amount);
+    if (Base != &X || !Inc) continue;
+    APInt K = Subtract ? Inc->getValue().sext(128) : -Inc->getValue().sext(128);
+    if (!K.isStrictlyPositive()) continue;
+    ConstantRange R = LVI.getConstantRangeOnEdge(X.getIncomingValueForBlock(Pre), Pre,
+                                                 L->getHeader(), Pre->getTerminator());
+    if (R.isEmptySet() || R.isFullSet()) continue;
+    // The first decrement must not wrap, or a low start could re-enter high.
+    APInt Lo = R.getSignedMin().sext(128), Hi = R.getSignedMax().sext(128);
+    if (!(Lo - K).isSignedIntN(64) || Hi.sgt(1 << 20)) continue;
+    if (Hi.sle(Floor)) return 1;
+    APInt Gap = Hi - Floor;
+    uint64_t Steps = (Gap + K - 1).sdiv(K).getZExtValue(); // Smallest j with Hi - K*j <= Floor.
+    uint64_t Count = Tested == &X ? Steps + 1 : std::max<uint64_t>(Steps, 1);
+    if (Count <= BFP_MaxIterations) return Count;
+  }
+  return 0;
+}
 static uint64_t BFP_IterationBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LazyValueInfo &LVI) {
   auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
   auto *Cmp = Br ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
   if (!Cmp) return 0;
+  if (uint64_t Down = BFP_DownBound(L, Pre, Latch, Br, Cmp, LVI)) return Down;
   for (PHINode &I : L->getHeader()->phis()) {
     if (!I.getType()->isIntegerTy(64) || I.getNumIncomingValues() != 2) continue;
     auto *S = dyn_cast<ConstantInt>(I.getIncomingValueForBlock(Pre));
@@ -352,6 +413,44 @@ static void BFP_CollectIntervals(Loop *L, BasicBlock *Pre, BasicBlock *Latch, Lo
     for (PHINode &P : L->getHeader()->phis())
       if (P.getType()->isIntegerTy() && P.getType()->getIntegerBitWidth() <= 64)
         Next[&P] = Read(P.getIncomingValueForBlock(Latch), Latch->getTerminator());
+    // The backedge runs only if the latch test held, so a tested value and a
+    // constant offset of it inherit that signed limit on the next iteration.
+    if (auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator()))
+      if (auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition())) {
+        auto *Bound = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+        Value *Tested = Cmp->getOperand(0);
+        ICmpInst::Predicate Pred = Cmp->getPredicate();
+        if (Br->getSuccessor(1) == L->getHeader() && Br->getSuccessor(0) != L->getHeader())
+          Pred = ICmpInst::getInversePredicate(Pred);
+        bool Stays = Br->getSuccessor(0) == L->getHeader() || Br->getSuccessor(1) == L->getHeader();
+        if (Bound && Stays && Bound->getBitWidth() <= 64 && ICmpInst::isSigned(Pred)) {
+          APInt C = Bound->getValue().sext(128);
+          bool Lower = Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE;
+          APInt Limit = Pred == ICmpInst::ICMP_SGT ? C + 1 : Pred == ICmpInst::ICMP_SLT ? C - 1 : C;
+          for (PHINode &P : L->getHeader()->phis()) {
+            auto It = Next.find(&P);
+            if (It == Next.end()) continue;
+            Value *In = P.getIncomingValueForBlock(Latch);
+            APInt Offset(128, 0);
+            bool Related = In == Tested;
+            if (auto *Add = dyn_cast<BinaryOperator>(In);
+                !Related && Add && Add->getOpcode() == Instruction::Add && Add->getOperand(0) == Tested)
+              if (auto *K = dyn_cast<ConstantInt>(Add->getOperand(1))) {
+                // Only a non-wrapping offset preserves order; the value interval shows that.
+                BFP_Interval T = Read(Tested, Latch->getTerminator());
+                APInt Off = K->getValue().sext(128);
+                if ((T.Lo + Off).isSignedIntN(K->getBitWidth()) && (T.Hi + Off).isSignedIntN(K->getBitWidth())) {
+                  Offset = Off;
+                  Related = true;
+                }
+              }
+            if (!Related) continue;
+            APInt Moved = Limit + Offset;
+            if (Lower && It->second.Lo.slt(Moved) && Moved.sle(It->second.Hi)) It->second.Lo = Moved;
+            if (!Lower && It->second.Hi.sgt(Moved) && Moved.sge(It->second.Lo)) It->second.Hi = Moved;
+          }
+        }
+      }
     for (auto &Entry : Next) Env[Entry.first] = Entry.second;
   }
   for (IntrinsicInst *C : Calls)
