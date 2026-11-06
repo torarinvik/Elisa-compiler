@@ -27,7 +27,7 @@ module Semantic:
     public:
 '''+helpers+'''
         def exercise() -> i64 can[Memory.Allocate, Abort.Panic, Unsafe.PointerCast]:
-            parent: mutable CHVViewFlow = CHVViewFlow{rebind_claims: [Ast::EnumAnnotation{owner: "__lmut_rebind_claim", name: "x", line: 7}], reference_holders: ["Holder"], type_alias_names: ["Alias"], type_alias_targets: [42]}
+            parent: mutable CHVViewFlow = CHVViewFlow{rebind_claims: [Ast::EnumAnnotation{owner: "__lmut_rebind_claim", name: "x", line: 7}], reference_holders: ["Holder"], type_alias_names: ["Alias"], type_alias_targets: [42], scalar_type_mask: 32767}
             chv_flow_bind(&parent, "x", true, false, true)
             parent.shape_shadow_names.push("shadow")
             parent.last_value_may_be_owned_view <- true
@@ -40,6 +40,7 @@ module Semantic:
             if (&branch.reference_holders[0]).cast[uintptr] != (&parent.reference_holders[0]).cast[uintptr]: return 4
             if (&branch.type_alias_names[0]).cast[uintptr] != (&parent.type_alias_names[0]).cast[uintptr]: return 5
             if (&branch.type_alias_targets[0]).cast[uintptr] != (&parent.type_alias_targets[0]).cast[uintptr]: return 6
+            if branch.scalar_type_mask != parent.scalar_type_mask or sibling.scalar_type_mask != 32767: return 9
             branch.owned[0] <- false
             branch.may_alias_reference[0] <- false
             branch.names[0] <- "branch"
