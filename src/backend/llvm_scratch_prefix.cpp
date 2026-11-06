@@ -161,6 +161,7 @@ static bool canonicalizeTrustedMemset(CallInst *CI, AllocaInst *A,
   return true;
 }
 
+#include "llvm_array_coverage.h"
 #include "llvm_covered_prefix.cpp"
 #include "llvm_stack_prefix.cpp"
 #include "llvm_compact_shift_loop.cpp"
@@ -179,7 +180,9 @@ extern "C" unsigned elisacoreElideScratchPrefixInitializers(LLVMModuleRef Ref) {
   PB.registerFunctionAnalyses(FAM);
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-  unsigned Removed = prepareCoveredPrefixZeros(M, FAM, PB), Analyses = 0;
+  unsigned Removed = prepareCoveredArrayInitializers(M, FAM, PB);
+  Removed += prepareCoveredPrefixZeros(M, FAM, PB);
+  unsigned Analyses = 0;
   markCompactShiftLoops(M);
   if ((M.getTargetTriple().isMacOSX() || M.getTargetTriple().isOSLinux()) &&
       M.getTargetTriple().getArch() == Triple::aarch64)
