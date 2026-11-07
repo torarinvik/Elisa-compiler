@@ -881,6 +881,10 @@ echo "-- region_returned_stored_borrow --"
 run_case region_returned_stored_borrow pos "$REPO_ROOT/test/repro/region_returned_stored_borrow.pos.elisa" "cannot be returned with a region-less type"
 run_case region_returned_stored_borrow neg "$REPO_ROOT/test/repro/region_returned_stored_borrow.neg.elisa" "cannot be returned with a region-less type"
 
+echo "-- while_tail_fallthrough --"
+run_case while_true_tail_no_exit neg "$FIXTURES/while_true_tail_missing_return.neg.elisa" "may fall through without returning a value"
+run_case while_true_tail_can_break pos "$FIXTURES/while_true_tail_can_break.pos.elisa" "may fall through without returning a value"
+
 echo "-- view_return_escape --"
 region_return_msg="value backed by a short-lived region escapes via return; the region ends at scope exit"
 for escape_shape in darray binding tail tuple struct_field; do
