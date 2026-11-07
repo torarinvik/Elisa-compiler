@@ -85,39 +85,16 @@ expected_scan = '''
 def method_unproven(method_names: darray[sview]&, method_refined: darray[bool]&, method: sview) -> bool:
     ensure result == method_unproven_from(method_names, method_refined, method, method_names.count)
     found: mutable bool = false
-    index: mutable usize = 0
-    assert index <= method_names.count
-    assert method_unproven_from(method_names, method_refined, method, method_names.count) == (found or method_unproven_from(method_names, method_refined, method, method_names.count - index))
-    while index < method_names.count |found, index, method_names, method_refined, method|:
-        invariant index <= method_names.count
-        invariant method_unproven_from(method_names, method_refined, method, method_names.count) == (found or method_unproven_from(method_names, method_refined, method, method_names.count - index))
-        remaining: usize = method_names.count - index
+    remaining: mutable usize = method_names.count
+    while remaining > 0 |found, remaining, method_names, method_refined, method|:
+        invariant remaining <= method_names.count
+        invariant method_unproven_from(method_names, method_refined, method, method_names.count) == (found or method_unproven_from(method_names, method_refined, method, remaining))
+        index: usize = method_names.count - remaining
         refined: bool = index < method_refined.count and method_refined[index]
         current_unproven: bool = method_names[index] == method and not refined
-        next_index: usize = index + 1
-        assert next_index <= method_names.count
-        next_remaining: usize = method_names.count - next_index
-        assert next_remaining == remaining - 1
-        assert method_unproven_from(method_names, method_refined, method, remaining) == (
-            current_unproven or method_unproven_from(method_names, method_refined, method, next_remaining)
-        )
-        next_found: bool = found or current_unproven
-        assert method_unproven_from(method_names, method_refined, method, method_names.count) == (
-            next_found or method_unproven_from(method_names, method_refined, method, next_remaining)
-        )
-        found <- next_found
-        assert method_unproven_from(method_names, method_refined, method, method_names.count) == (
-            found or method_unproven_from(method_names, method_refined, method, method_names.count - next_index)
-        )
-        index <- next_index
-        assert index == next_index
-        assert index <= method_names.count
-        assert method_unproven_from(method_names, method_refined, method, method_names.count) == (
-            found or method_unproven_from(method_names, method_refined, method, method_names.count - index)
-        )
-    assert index == method_names.count
+        found <- found or current_unproven
+        remaining <- remaining - 1
     assert method_unproven_from(method_names, method_refined, method, 0) == false
-    assert method_unproven_from(method_names, method_refined, method, method_names.count) == found
     return found
 '''
 if compact(function_section(source_text, "method_unproven_from")) != compact(expected_model):
