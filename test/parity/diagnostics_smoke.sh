@@ -1199,6 +1199,7 @@ for acr_name in xs made t ps; do
 done
 run_case affine_container_return neg "$acr_neg" "must be moved explicitly before return"
 run_case affine_container_return neg "$acr_neg" "must be consumed before scope exit"
+run_case affine_container_return neg "$acr_neg" "value backed by a short-lived region escapes via return"
 
 echo "-- affine_bulk_copy --"
 abc_pos="$FIXTURES/affine_bulk_copy.pos.elisa"
