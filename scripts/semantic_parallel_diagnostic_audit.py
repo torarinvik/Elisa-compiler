@@ -55,11 +55,6 @@ def diagnostic_payload_base_type(type_expression: str) -> str:
     return re.sub(r"\s+@[A-Za-z_]\w*$", "", value)
 
 
-def diagnostic_payload_region(type_expression: str) -> str:
-    match = re.search(r"\s+(@[A-Za-z_]\w*)$", type_expression.strip())
-    return match.group(1) if match else ""
-
-
 def function_section(source: str, name: str) -> str:
     """Extract one source function without relying on an adjacent comment heading."""
     lines = source.splitlines()
@@ -85,7 +80,7 @@ def main() -> None:
     field_types = {name: diagnostic_payload_base_type(kind) for name, kind in fields.items()}
     assert all(kind in {"sview", "u32", "Ast::Pos", "DiagnosticKind"} for kind in field_types.values()), "new Diagnostic payload type requires ownership review"
     texts = [name for name, kind in field_types.items() if kind == "sview"]
-    export_texts = [name for name in texts if diagnostic_payload_region(fields[name]) != "@source"]
+    source_texts = [name for name in texts if fields[name].strip().endswith(" @source")]
     parent = runner.split("        def par_pass_parent_diagnostic", 1)[1].split("        def par_pass_worker", 1)[0]
     worker = runner.split("        def par_pass_worker", 1)[1].split("        # True when", 1)[0]
     copies = re.findall(r"table <- par_pass_parent_text\(source\.(\w+), table\)", parent)
@@ -118,17 +113,18 @@ def main() -> None:
     )
     api = api_path.read_text()
     exported = function_section(api, "diagnostic_export")
-    export_copies = re.findall(r"(\w+): diagnostic_output_text\(source\.(\w+), text_buffers\)", exported)
-    assert len(export_copies) == len(export_texts), "export text copies changed"
-    assert dict(export_copies) == {name: name for name in export_texts}, "export text mapping changed"
     literal = diagnostic_literal(exported)
     assignments = re.findall(r"^\s*(\w+): ([^\n]+?)(?:,)?$", literal, re.M)
     assert len(assignments) == len(fields), "export Diagnostic field coverage changed"
     values = dict(assignments)
     assert set(values) == set(fields), "export Diagnostic fields changed"
     for name in fields:
-        expected = (f"diagnostic_output_text(source.{name}, text_buffers)"
-                    if name in export_texts else f"source.{name}")
+        if name in source_texts:
+            expected = f"diagnostic_output_source_text(source.{name}, source_text_buffers)"
+        elif name in texts:
+            expected = f"diagnostic_output_text(source.{name}, text_buffers)"
+        else:
+            expected = f"source.{name}"
         assert normalized_expression(values[name]) == expected, f"export: incorrect copy of {name}"
     print(f"parallel Diagnostic ownership audit: {len(fields)} fields, {len(texts)} text payloads covered")
 

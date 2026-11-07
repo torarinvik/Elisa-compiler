@@ -1,0 +1,457 @@
+# Function-local scratch for a container that provably stays in its function.
+#
+# A function with a hidden caller-arena slot allocates its locals from that caller arena,
+# because an aggregate may be adopted into a caller-owned table after construction. That is
+# the right default, but a helper called once per statement with a local `seen` dict then
+# leaves every dict in the caller's arena until the caller returns. Stage0's region inference
+# frees such locals on return (`__auto_N`).
+#
+# This is a syntactic proof, and it fails closed: a local qualifies only when every mention of
+# its name is a known non-retaining use. Elements must not own region storage, so reading one
+# out cannot carry scratch memory away. Anything unmodeled keeps the caller's arena.
+#
+# A local passed by reference is safe when no other parameter can hold its type. Otherwise the
+# callee's body must pass the same proof for that parameter. A recursive call is assumed safe
+# while its own proof is running; a failure anywhere rejects the whole local and discards those
+# assumptions, so only a proof that completed is kept.
+extend Backend:
+    private:
+        def local_scratch_mutator(method: sview) -> bool:
+            return when method:
+                "push" | "put" | "extend" | "reserve" | "clear" | "remove" | "set" -> true
+                _ -> false
+
+        def local_scratch_reader(method: sview) -> bool:
+            return when method:
+                "get" | "contains" | "has" | "pop" -> true
+                _ -> false
+
+        def local_scratch_is_name(expression: Expr, name: sview) -> bool:
+            if expression is Expr.Ident(identifier, pos):
+                return identifier == name
+            return false
+
+        # `T` may contain a value of type `target`, directly or through references and fields.
+        # Unmodeled shapes answer yes.
+        def local_scratch_type_can_hold(candidate: ValueType, target: ValueType, visited: mutable darray[u32]&, structs: mutable StructTable&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if depth > 24 or value_type_identity_equal(candidate, target)
+            return false if loop_scratch_scalar_type(candidate)
+            return match candidate.kind:
+                TypeKind.Void | TypeKind.CStr | TypeKind.SView | TypeKind.Arena | TypeKind.PackedStore | TypeKind.ConstUsize: false
+                # A packed constructor copies a container's backing into its store, so a node
+                # never aliases the header of the local it was built from.
+                TypeKind.PackedEnum: false
+                TypeKind.PayloadEnum: local_scratch_enum_can_hold(candidate, target, visited, structs, depth)
+                TypeKind.Ref: local_scratch_type_can_hold(ref_target_of(candidate, structs), target, visited, structs, depth + 1)
+                TypeKind.DArray: local_scratch_type_can_hold(darray_element_of(candidate, structs), target, visited, structs, depth + 1)
+                TypeKind.Array: local_scratch_type_can_hold(array_element_of(candidate, structs), target, visited, structs, depth + 1)
+                TypeKind.Optional: local_scratch_type_can_hold(optional_payload_of(candidate, structs), target, visited, structs, depth + 1)
+                TypeKind.Struct: local_scratch_struct_can_hold(candidate, target, visited, structs, depth)
+                _: true
+
+        def local_scratch_struct_can_hold(candidate: ValueType, target: ValueType, visited: mutable darray[u32]&, structs: mutable StructTable&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for seen in visited |candidate|:
+                return false if seen == candidate.bits
+            visited.push(candidate.bits)
+            slot: usize = candidate.bits.usize()
+            return true if slot >= structs.records.names.count
+            start: usize = structs.records.field_start[slot]
+            span: usize = structs.records.field_count[slot]
+            for offset in 0..<span |target, visited, structs, start, depth|:
+                field: ValueType = copied_type(structs.records.field_types[start + offset])
+                return true if local_scratch_type_can_hold(field, target, visited, structs, depth + 1)
+            return false
+
+        def local_scratch_enum_can_hold(candidate: ValueType, target: ValueType, visited: mutable darray[u32]&, structs: mutable StructTable&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            enum_slot: usize = candidate.bits.usize()
+            return true if enum_slot >= structs.payload_enums.penum_variant_start.count
+            variant_start: usize = structs.payload_enums.penum_variant_start[enum_slot]
+            variant_span: usize = structs.payload_enums.penum_variant_count[enum_slot]
+            for variant_offset in 0..<variant_span |target, visited, structs, variant_start, depth|:
+                field_start: usize = structs.payload_enums.penum_field_type_start[variant_start + variant_offset]
+                field_span: usize = structs.payload_enums.penum_field_type_count[variant_start + variant_offset]
+                for field_offset in 0..<field_span |target, visited, structs, field_start, depth|:
+                    field: ValueType = copied_type(structs.payload_enums.penum_field_types[field_start + field_offset])
+                    return true if local_scratch_type_can_hold(field, target, visited, structs, depth + 1)
+            return false
+
+        # The callee receives the local by reference at `position`. It returns only a scalar, so
+        # nothing comes back through the result, and no other parameter can hold this type, so
+        # the callee has nowhere to store it. Every same-named row must qualify, because
+        # overload selection is not available here.
+        def local_scratch_call_position_safe(callee_name: sview, position: usize, argument_count: usize, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            row: mutable i64 = first_function_named(fns, callee_name)
+            return false if row < 0
+            while row >= 0 |row, callee_name, position, argument_count, local_type, shadows, fns, structs|:
+                index: usize = row.usize()
+                return false if:
+                    position >= fns.param_count[index] or argument_count > fns.param_count[index]
+                    fns.is_error[index] or fns.is_variadic[index]
+                    index < fns.is_extern.count and fns.is_extern[index]
+                    not loop_scratch_scalar_type(fns.returns[index]) and fns.returns[index].kind != TypeKind.Void
+                    region_parameter_count(fns.lines[index], fns.offsets[index], structs) != 0
+                start: usize = fns.param_start[index]
+                borrowed: ValueType = copied_type(fns.param_types[start + position])
+                return false if borrowed.kind != TypeKind.Ref or not value_type_identity_equal(ref_target_of(borrowed, structs), local_type)
+                other_can_hold: mutable bool = false
+                for other in 0..<fns.param_count[index] |other_can_hold, position, local_type, fns, structs, start|:
+                    continue if other == position
+                    visited: mutable darray[u32] = []
+                    other_can_hold <- true if local_scratch_type_can_hold(copied_type(fns.param_types[start + other]), local_type, visited, structs, 0)
+                return false if other_can_hold and not local_scratch_callee_proof(index, position, local_type, shadows, fns, structs)
+                row <- next_function_named(fns, callee_name, row)
+            return true
+
+        # The callee's body keeps its parameter at `position` to itself.
+        def local_scratch_callee_proof(row: usize, position: usize, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            key: u64 = (row.u64() * 65536.u64()) + position.u64()
+            if structs.memory.local_scratch_proofs.get(key) is known:
+                return known == 1.u8() if known != 0.u8()
+            return false if row >= structs.memory.local_scratch_bodies.count or not structs.memory.local_scratch_bodies[row].known
+            parameter_name: sview = fns.param_names[fns.param_start[row] + position]
+            body: darray[Stmt] = structs.memory.local_scratch_bodies[row].body
+            callee_shadows: mutable darray[sview] = []
+            callee_candidates: mutable darray[sview] = []
+            callee_candidate_types: mutable darray[ValueType] = []
+            local_scratch_collect_declarations(body, callee_shadows, callee_candidates, callee_candidate_types, structs)
+            for parameter_index in 0..<fns.param_count[row] |callee_shadows, fns, row|:
+                callee_shadows.push(fns.param_names[fns.param_start[row] + parameter_index])
+            occurrences: mutable usize = 0
+            for callee_shadow in callee_shadows |occurrences, parameter_name|:
+                occurrences <- occurrences + 1 if callee_shadow == parameter_name
+            return false if occurrences != 1
+            callee_shadows.extend(shadows)
+            structs.memory.local_scratch_proofs <- structs.memory.local_scratch_proofs.put(key, 1.u8())
+            structs.memory.local_scratch_tentative.push(key)
+            proven: bool = local_scratch_statements(body, parameter_name, local_type, callee_shadows, fns, structs)
+            structs.memory.local_scratch_proofs <- structs.memory.local_scratch_proofs.put(key, 2.u8()) if not proven
+            return proven
+
+        # Assumptions made for a local that was then rejected must not outlive it.
+        def local_scratch_finish_proof(proven: bool, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if not proven:
+                for tentative in structs.memory.local_scratch_tentative |structs|:
+                    if structs.memory.local_scratch_proofs.get(tentative) is state:
+                        structs.memory.local_scratch_proofs <- structs.memory.local_scratch_proofs.put(tentative, 0.u8()) if state == 1.u8()
+            structs.memory.local_scratch_tentative <- []
+
+        def register_local_scratch_bodies(declarations: darray[Decl]&, fns: FnTable&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            while structs.memory.local_scratch_bodies.count < fns.names.count |structs|:
+                structs.memory.local_scratch_bodies.push(LocalScratchBody{body: [], known: false, seen: false})
+            for declaration in declarations |fns, structs|:
+                if declaration is Decl.Scoped(nested, pos):
+                    register_local_scratch_bodies(nested, fns, structs)
+                elif declaration is Decl.Module(module_name, module_nested, module_pos):
+                    register_local_scratch_bodies(module_nested, fns, structs)
+                elif declaration is Decl.Func(name, params, result, body, effects, decorators, func_pos):
+                    declared_offset: u32 = function_offset_of(declaration)
+                    row: mutable i64 = first_function_named(fns, name)
+                    while row >= 0 |row, name, func_pos, declared_offset, body, fns, structs|:
+                        index: usize = row.usize()
+                        if fns.lines[index] == func_pos.line and fns.offsets[index] == declared_offset:
+                            # Two declarations at one position cannot be told apart.
+                            structs.memory.local_scratch_bodies[index].known <- not structs.memory.local_scratch_bodies[index].seen
+                            structs.memory.local_scratch_bodies[index].seen <- true
+                            structs.memory.local_scratch_bodies[index].body <- body
+                        row <- next_function_named(fns, name, row)
+
+        def local_scratch_borrowed_argument(argument: Expr, name: sview) -> bool:
+            return true if local_scratch_is_name(argument, name)
+            if argument is Expr.Unary(operator, operand, pos):
+                return operator == TokenKind.Ampersand and local_scratch_is_name(operand, name)
+            return false
+
+        def local_scratch_expressions(expressions: darray[Expr]&, name: sview, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for expression in expressions |name, local_type, shadows, fns, structs|:
+                return false if not local_scratch_expression(expression, name, local_type, shadows, fns, structs)
+            return true
+
+        def local_scratch_call(callee: Expr, arguments: darray[Expr]&, labels: darray[sview]&, name: sview, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if callee is Expr.Field(object, method, field_pos):
+                if local_scratch_is_name(object, name):
+                    return false if not local_scratch_reader(method)
+                    return local_scratch_expressions(arguments, name, local_type, shadows, fns, structs)
+                return false if not local_scratch_expression(object, name, local_type, shadows, fns, structs)
+                return local_scratch_expressions(arguments, name, local_type, shadows, fns, structs)
+            target: mutable sview = ""
+            if callee is Expr.Ident(callee_name, callee_pos):
+                target <- callee_name
+            elif callee is Expr.Scope(head, scoped_name, scoped_pos):
+                target <- scoped_name
+            for position in 0..<arguments.count |arguments, labels, target, name, local_type, shadows, fns, structs|:
+                if local_scratch_borrowed_argument(arguments[position], name):
+                    return false if target == "" or labels.count > 0 and labels[position] != ""
+                    for shadow in shadows |target|:
+                        return false if shadow == target
+                    return false if not local_scratch_call_position_safe(target, position, arguments.count, local_type, shadows, fns, structs)
+                else:
+                    return false if not local_scratch_expression(arguments[position], name, local_type, shadows, fns, structs)
+            return local_scratch_expression(callee, name, local_type, shadows, fns, structs)
+
+        def local_scratch_arms(arms: darray[MatchArm]&, name: sview, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for arm in arms |name, local_type, shadows, fns, structs|:
+                return false if:
+                    not local_scratch_expression(arm.guard, name, local_type, shadows, fns, structs)
+                    not local_scratch_statements(arm.body, name, local_type, shadows, fns, structs)
+            return true
+
+        def local_scratch_expression(expression: Expr, name: sview, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            match expression:
+                Expr.Invalid:
+                    return true
+                Expr.Absent:
+                    return true
+                Expr.IntLit(value, pos):
+                    return true
+                Expr.FloatLit(text, pos):
+                    return true
+                Expr.StringLit(text, pos):
+                    return true
+                Expr.CharLit(text, pos):
+                    return true
+                Expr.BoolLit(value, pos):
+                    return true
+                Expr.ShorthandMember(parts, pos):
+                    return true
+                Expr.Ident(identifier, pos):
+                    return identifier != name
+                Expr.Scope(base, scoped, pos):
+                    return local_scratch_expression(base, name, local_type, shadows, fns, structs)
+                Expr.Field(object, field, pos):
+                    return field == "count" or field == "capacity" if local_scratch_is_name(object, name)
+                    return local_scratch_expression(object, name, local_type, shadows, fns, structs)
+                Expr.Index(object, index, pos):
+                    return false if not local_scratch_is_name(object, name) and not local_scratch_expression(object, name, local_type, shadows, fns, structs)
+                    return local_scratch_expression(index, name, local_type, shadows, fns, structs)
+                Expr.Unary(operator, operand, pos):
+                    if operator == TokenKind.Ampersand:
+                        root: sview = growth_root_name(operand)
+                        return false if root == name
+                    return local_scratch_expression(operand, name, local_type, shadows, fns, structs)
+                Expr.Binary(left, operator, right, pos):
+                    return local_scratch_expression(left, name, local_type, shadows, fns, structs) and local_scratch_expression(right, name, local_type, shadows, fns, structs)
+                Expr.Paren(inner, pos):
+                    return local_scratch_expression(inner, name, local_type, shadows, fns, structs)
+                Expr.Move(moved, pos):
+                    return not local_scratch_is_name(moved, name) and local_scratch_expression(moved, name, local_type, shadows, fns, structs)
+                Expr.Slice(object, low, high, pos):
+                    return false if growth_root_name(object) == name
+                    return false if not local_scratch_expression(object, name, local_type, shadows, fns, structs)
+                    return local_scratch_expression(low, name, local_type, shadows, fns, structs) and local_scratch_expression(high, name, local_type, shadows, fns, structs)
+                Expr.IndexN(object, arguments, pos):
+                    return false if growth_root_name(object) == name
+                    return false if not local_scratch_expression(object, name, local_type, shadows, fns, structs)
+                    return local_scratch_expressions(arguments, name, local_type, shadows, fns, structs)
+                Expr.DictLit(entries, pos):
+                    for entry in entries |name, local_type, shadows, fns, structs|:
+                        return false if not local_scratch_expression(entry.key, name, local_type, shadows, fns, structs)
+                        return false if not local_scratch_expression(entry.value, name, local_type, shadows, fns, structs)
+                    return true
+                Expr.RecordUpdate(base, fields, pos):
+                    return false if not local_scratch_expression(base, name, local_type, shadows, fns, structs)
+                    for field in fields |name, local_type, shadows, fns, structs|:
+                        return false if not local_scratch_expression(field.value, name, local_type, shadows, fns, structs)
+                    return true
+                Expr.Catch(guarded, arms, pos):
+                    return false if not local_scratch_expression(guarded, name, local_type, shadows, fns, structs)
+                    return local_scratch_arms(arms, name, local_type, shadows, fns, structs)
+                Expr.GetElse(guarded, recovery, pos):
+                    return false if not local_scratch_expression(guarded, name, local_type, shadows, fns, structs)
+                    return local_scratch_statements(recovery, name, local_type, shadows, fns, structs)
+                Expr.Refinement(base, predicate, pos):
+                    return local_scratch_expression(base, name, local_type, shadows, fns, structs) and local_scratch_expression(predicate, name, local_type, shadows, fns, structs)
+                Expr.Comprehension(variable, iterable, condition, body, pos, query_scope_id):
+                    return false if variable == name or local_scratch_is_name(iterable, name)
+                    return false if not local_scratch_expression(iterable, name, local_type, shadows, fns, structs)
+                    return local_scratch_expression(condition, name, local_type, shadows, fns, structs) and local_scratch_expression(body, name, local_type, shadows, fns, structs)
+                Expr.If(condition, then_value, else_value, pos):
+                    return false if not local_scratch_expression(condition, name, local_type, shadows, fns, structs)
+                    return local_scratch_expression(then_value, name, local_type, shadows, fns, structs) and local_scratch_expression(else_value, name, local_type, shadows, fns, structs)
+                Expr.Call(callee, arguments, labels, pos):
+                    return local_scratch_call(callee, arguments, labels, name, local_type, shadows, fns, structs)
+                Expr.Array(elements, pos):
+                    return local_scratch_expressions(elements, name, local_type, shadows, fns, structs)
+                Expr.Tuple(elements, pos):
+                    return local_scratch_expressions(elements, name, local_type, shadows, fns, structs)
+                Expr.SetLit(elements, pos):
+                    return local_scratch_expressions(elements, name, local_type, shadows, fns, structs)
+                Expr.Construct(type_expression, fields, pos):
+                    for field in fields |name, local_type, shadows, fns, structs|:
+                        return false if not local_scratch_expression(field.value, name, local_type, shadows, fns, structs)
+                    return true
+                Expr.Match(scrutinee, arms, pos):
+                    return false if not local_scratch_expression(scrutinee, name, local_type, shadows, fns, structs)
+                    return local_scratch_arms(arms, name, local_type, shadows, fns, structs)
+                Expr.Block(statements, value, captures, pos):
+                    return false if not local_scratch_statements(statements, name, local_type, shadows, fns, structs)
+                    return local_scratch_expression(value, name, local_type, shadows, fns, structs)
+                _:
+                    return false
+
+        # The value a `name <- …` rebind may carry: an empty literal, or a mutator on itself.
+        def local_scratch_rebind_value(value: Expr, name: sview, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if local_scratch_empty_literal(value)
+            if value is Expr.Call(callee, arguments, labels, pos):
+                if callee is Expr.Field(object, method, field_pos):
+                    if local_scratch_is_name(object, name) and local_scratch_mutator(method):
+                        return local_scratch_expressions(arguments, name, local_type, shadows, fns, structs)
+            return false
+
+        def local_scratch_empty_literal(value: Expr) -> bool:
+            if value is Expr.Array(elements, pos):
+                return elements.count == 0
+            if value is Expr.DictLit(entries, dict_pos):
+                return entries.count == 0
+            if value is Expr.SetLit(set_elements, set_pos):
+                return set_elements.count == 0
+            return false
+
+        def local_scratch_block_kind(kind: sview) -> bool:
+            return when kind:
+                "can" | "trusted" | "scope" | "label" | "region" | "in" | "let" | "expect" | "assert_by" | "static_assert" -> true
+                _ -> false
+
+        def local_scratch_statements(body: darray[Stmt]&, name: sview, local_type: ValueType, shadows: darray[sview]&, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for statement in body |name, local_type, shadows, fns, structs|:
+                match statement:
+                    Stmt.Expr(expression, pos):
+                        mutator_use: mutable bool = false
+                        if expression is Expr.Call(callee, arguments, labels, call_pos):
+                            if callee is Expr.Field(object, method, field_pos):
+                                if local_scratch_is_name(object, name) and local_scratch_mutator(method):
+                                    mutator_use <- true
+                                    return false if not local_scratch_expressions(arguments, name, local_type, shadows, fns, structs)
+                        return false if not mutator_use and not local_scratch_expression(expression, name, local_type, shadows, fns, structs)
+                    Stmt.Block(kind, clause, binding, nested, pos):
+                        return false if:
+                            not local_scratch_block_kind(kind) or binding == name
+                            not local_scratch_statements(nested, name, local_type, shadows, fns, structs)
+                    Stmt.VarDecl(declared, type_expression, value, pos):
+                        if declared == name:
+                            return false if not local_scratch_empty_literal(value)
+                        else:
+                            return false if not local_scratch_expression(value, name, local_type, shadows, fns, structs)
+                    Stmt.Assign(target, operator, value, pos):
+                        if local_scratch_is_name(target, name):
+                            return false if not local_scratch_rebind_value(value, name, local_type, shadows, fns, structs)
+                        else:
+                            return false if:
+                                not local_scratch_expression(target, name, local_type, shadows, fns, structs)
+                                not local_scratch_expression(value, name, local_type, shadows, fns, structs)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        return false if:
+                            not local_scratch_expression(condition, name, local_type, shadows, fns, structs)
+                            not local_scratch_statements(then_body, name, local_type, shadows, fns, structs)
+                            not local_scratch_statements(else_body, name, local_type, shadows, fns, structs)
+                    Stmt.While(condition, nested, pos):
+                        return false if:
+                            not local_scratch_expression(condition, name, local_type, shadows, fns, structs)
+                            not local_scratch_statements(nested, name, local_type, shadows, fns, structs)
+                    Stmt.For(bind, variables, iterable, nested, pos):
+                        if local_scratch_is_name(iterable, name):
+                            return false if bind != ""
+                        else:
+                            return false if not local_scratch_expression(iterable, name, local_type, shadows, fns, structs)
+                        for variable in variables |name|:
+                            return false if variable == name
+                        return false if not local_scratch_statements(nested, name, local_type, shadows, fns, structs)
+                    Stmt.Return(value, pos):
+                        if value is returned:
+                            return false if not local_scratch_expression(returned, name, local_type, shadows, fns, structs)
+                    Stmt.Contract(kind, expression, pos):
+                        return false if not local_scratch_expression(expression, name, local_type, shadows, fns, structs)
+                    Stmt.Break(label, pos):
+                        pass
+                    Stmt.Continue(label, pos):
+                        pass
+                    Stmt.Match(scrutinee, arms, pos):
+                        return false if:
+                            not local_scratch_expression(scrutinee, name, local_type, shadows, fns, structs)
+                            not local_scratch_arms(arms, name, local_type, shadows, fns, structs)
+                    _:
+                        return false
+            return true
+
+        # A container annotation whose element types own no region storage.
+        def local_scratch_container_type(type_expression: Expr, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            shape: mutable Expr = type_expression
+            if type_expression is Expr.Unary(operator, inner, pos):
+                return false if operator != TokenKind.Mutable
+                shape <- inner
+            if shape is Expr.Index(head, element, index_pos):
+                if head is Expr.Ident(container, head_pos):
+                    return false if container != "darray"
+                    return local_scratch_element_type(element, structs)
+                return false
+            if shape is Expr.IndexN(head, elements, index_pos):
+                if head is Expr.Ident(container, head_pos):
+                    return false if container != "dict"
+                    for element in elements |structs|:
+                        return false if not local_scratch_element_type(element, structs)
+                    return true
+            return false
+
+        def local_scratch_element_type(element: Expr, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            element_type: ValueType = annotation_value_type(element, structs)
+            return loop_scratch_scalar_type(element_type)
+
+        def local_scratch_collect_block(expression: Expr, shadows: mutable darray[sview]&, candidates: mutable darray[sview]&, candidate_types: mutable darray[ValueType]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if expression is Expr.Block(statements, value, captures, pos):
+                local_scratch_collect_declarations(statements, shadows, candidates, candidate_types, structs)
+                local_scratch_collect_block(value, shadows, candidates, candidate_types, structs)
+
+        def local_scratch_collect_declarations(body: darray[Stmt]&, shadows: mutable darray[sview]&, candidates: mutable darray[sview]&, candidate_types: mutable darray[ValueType]&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for statement in body |shadows, candidates, candidate_types, structs|:
+                match statement:
+                    Stmt.VarDecl(declared, type_expression, value, pos):
+                        shadows.push(declared)
+                        pinned: mutable bool = false
+                        for pinned_line in structs.regions.local_region_lines |pos, pinned|:
+                            pinned <- true if pinned_line == pos.line
+                        if not pinned and local_scratch_empty_literal(value) and local_scratch_container_type(type_expression, structs):
+                            candidates.push(declared)
+                            candidate_types.push(annotation_value_type(type_expression, structs))
+                        local_scratch_collect_block(value, shadows, candidates, candidate_types, structs)
+                    # A loop with a capture header, and a value block, sit inside an expression.
+                    Stmt.Expr(expression, pos):
+                        local_scratch_collect_block(expression, shadows, candidates, candidate_types, structs)
+                    Stmt.Assign(target, operator, assigned, pos):
+                        local_scratch_collect_block(assigned, shadows, candidates, candidate_types, structs)
+                    Stmt.Match(scrutinee, arms, pos):
+                        for arm in arms |shadows, candidates, candidate_types, structs|:
+                            local_scratch_collect_declarations(arm.body, shadows, candidates, candidate_types, structs)
+                    Stmt.Block(kind, clause, binding, nested, pos):
+                        local_scratch_collect_declarations(nested, shadows, candidates, candidate_types, structs)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        local_scratch_collect_declarations(then_body, shadows, candidates, candidate_types, structs)
+                        local_scratch_collect_declarations(else_body, shadows, candidates, candidate_types, structs)
+                    Stmt.While(condition, nested, pos):
+                        local_scratch_collect_declarations(nested, shadows, candidates, candidate_types, structs)
+                    Stmt.For(bind, variables, iterable, nested, pos):
+                        local_scratch_collect_declarations(nested, shadows, candidates, candidate_types, structs)
+                    _:
+                        pass
+
+        # The names in `body` that qualify. A name declared twice, or shared with a parameter,
+        # is left out: the proof is by name.
+        def local_scratch_names_of(body: darray[Stmt]&, params: darray[ParamDecl]&, fns: FnTable&, structs: mutable StructTable&, generics: GenericTable&) -> darray[sview] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            shadows: mutable darray[sview] = []
+            candidates: mutable darray[sview] = []
+            candidate_types: mutable darray[ValueType] = []
+            local_scratch_collect_declarations(body, shadows, candidates, candidate_types, structs)
+            qualified: mutable darray[sview] = []
+            return qualified if candidates.count == 0
+            for parameter in params |shadows|:
+                shadows.push(parameter.name)
+            # A call to a generic name may bind to a template that the function table lacks.
+            for generic_name in generics.names |shadows|:
+                shadows.push(generic_name)
+            for index in 0..<candidates.count |candidates, candidate_types, shadows, qualified, body, fns, structs|:
+                occurrences: mutable usize = 0
+                for shadow in shadows |candidates, index, occurrences|:
+                    occurrences <- occurrences + 1 if shadow == candidates[index]
+                continue if occurrences != 1
+                proven: bool = local_scratch_statements(body, candidates[index], candidate_types[index], shadows, fns, structs)
+                local_scratch_finish_proof(proven, structs)
+                qualified.push(candidates[index]) if proven
+            return qualified

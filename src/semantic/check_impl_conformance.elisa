@@ -40,14 +40,15 @@ extend Semantic:
             module: sview @source
             module_known: bool
             path_comparable: bool
-            subset_restricted: bool
-            # Fresh checker buffer; only the spelling views point into source storage.
-            subset_variants: darray[sview @source] @source
+            subset_restricted: mutable bool
+            # Rows of the checker's annotation table, not views, so this buffer never holds a
+            # reference. It stays in the caller's table and off the shared source arena, which
+            # worker threads must not grow.
+            subset_rows: mutable darray[u32] = []
 
         struct ImcErrorSubset:
             restricted: bool
-            # Fresh checker buffer; the variant spellings themselves are source-backed.
-            variants: darray[sview @source] @source
+            variant_rows: darray[u32]
 
         def imc_build_index(annotations: darray[Ast::EnumAnnotation]&, owner_index: mutable ImcIndex&) -> void:
             can Memory.Allocate, Abort.Panic:
@@ -213,27 +214,26 @@ extend Semantic:
                     return true if expected.path_comparable and path_comparable and expected.path != "" and path != "" and not expected.module_known and not module_known and catch_module_path_matches(expected.path, path)
                 return false
 
-        def imc_protocol_error_subset(annotations: darray[Ast::EnumAnnotation]&, family: Ast::EnumAnnotation) -> ImcErrorSubset:
+        # Fills the protocol's restricted variants straight into the family row, so the buffer
+        # lives in the caller's table. Answers whether the family is restricted at all.
+        def imc_protocol_fill_error_subset(annotations: darray[Ast::EnumAnnotation]&, family: Ast::EnumAnnotation, target: mutable ImcErrorFamily&) -> bool:
             can Memory.Allocate, Abort.Panic:
                 restricted: mutable bool = false
-                variants: mutable darray[sview @source] @source = []
-                for annotation in annotations |restricted, variants, family|:
+                for row in 0..<annotations.count |restricted, annotations, target, family|:
+                    annotation: Ast::EnumAnnotation = annotations[row]
                     same_occurrence: bool = annotation.module == family.module and annotation.offset == family.offset and annotation.occurrence_offset == family.occurrence_offset
                     if annotation.owner == "__protocol_error_variant_family" and annotation.line == 3900000146 and annotation.name == family.name and same_occurrence:
                         restricted <- true
                     if annotation.owner == family.name and annotation.line == 3900000147 and same_occurrence:
-                        already_present: mutable bool = false
-                        for prior in variants |already_present, annotation|:
-                            already_present <- true if prior == annotation.name
-                        variants.push(annotation.name) if not already_present
-                return ImcErrorSubset{restricted: restricted, variants: variants}
+                        target.subset_rows.push(row.u32()) if not imc_rows_contain(annotations, target.subset_rows, annotation.name)
+                return restricted
 
         def imc_impl_error_subset(annotations: darray[Ast::EnumAnnotation]&, family_index: usize, family: Ast::EnumAnnotation) -> ImcErrorSubset:
             can Memory.Allocate, Abort.Panic:
                 restricted: mutable bool = false
-                variants: mutable darray[sview @source] @source = []
+                variant_rows: mutable darray[u32] = []
                 row_index: mutable usize = family_index + 2.usize()
-                while row_index < annotations.count |row_index, annotations, family, restricted, variants|:
+                while row_index < annotations.count |row_index, annotations, family, restricted, variant_rows|:
                     annotation: Ast::EnumAnnotation = annotations[row_index]
                     break if annotation.owner == "__error_set_family" and annotation.line == family.line and annotation.offset == family.offset and annotation.identity_id == family.identity_id
                     same_occurrence: bool = annotation.line == family.line and annotation.offset == family.offset and annotation.identity_id == family.identity_id and annotation.occurrence_offset == family.occurrence_offset
@@ -242,9 +242,15 @@ extend Semantic:
                         if row_index + 1.usize() < annotations.count:
                             allow: Ast::EnumAnnotation = annotations[row_index + 1.usize()]
                             if allow.owner == "__error_variant_allow" and allow.line == annotation.line and allow.offset == annotation.offset and allow.identity_id == annotation.identity_id and allow.occurrence_offset == annotation.occurrence_offset:
-                                variants.push(allow.name) if not imc_error_subset_contains(variants, allow.name)
+                                variant_rows.push((row_index + 1.usize()).u32()) if not imc_rows_contain(annotations, variant_rows, allow.name)
                     row_index <- row_index + 1.usize()
-                return ImcErrorSubset{restricted: restricted, variants: variants}
+                return ImcErrorSubset{restricted: restricted, variant_rows: variant_rows}
+
+        def imc_rows_contain(annotations: darray[Ast::EnumAnnotation]&, rows: darray[u32]&, wanted: sview) -> bool:
+            can Abort.Panic:
+                for row in rows |annotations, wanted|:
+                    return true if annotations[row.usize()].name == wanted
+                return false
 
         def imc_error_subset_contains(variants: darray[sview]&, wanted: sview) -> bool:
             can Abort.Panic:
@@ -259,12 +265,12 @@ extend Semantic:
         # Repeated references to one family form a union of their allowed variants. The
         # implementation's declared subset must fit inside that union; an unrestricted
         # protocol family admits any implementation subset.
-        def imc_error_family_subset_matches(allowed: darray[ImcErrorFamily]&, family: sview, path: sview, module_known: bool, module: sview, path_comparable: bool, implementation: ImcErrorSubset) -> bool:
+        def imc_error_family_subset_matches(annotations: darray[Ast::EnumAnnotation]&, allowed: darray[ImcErrorFamily]&, family: sview, path: sview, module_known: bool, module: sview, path_comparable: bool, implementation: ImcErrorSubset) -> bool:
             can Memory.Allocate, Abort.Panic:
                 return false if not imc_error_family_matches(allowed, family, path, module_known, module, path_comparable)
                 expected_variants: mutable darray[sview] = []
                 unrestricted: mutable bool = false
-                for expected in allowed |expected_variants, unrestricted, family, path, module_known, module, path_comparable|:
+                for expected in allowed |annotations, expected_variants, unrestricted, family, path, module_known, module, path_comparable|:
                     continue if expected.family != family
                     same_module: bool = expected.module_known and module_known and expected.module == module
                     same_unresolved_path: bool = expected.path_comparable and path_comparable and expected.path != "" and path != "" and not expected.module_known and not module_known and catch_module_path_matches(expected.path, path)
@@ -272,12 +278,13 @@ extend Semantic:
                     if not expected.subset_restricted:
                         unrestricted <- true
                     else:
-                        for variant in expected.subset_variants |expected_variants, expected|:
+                        for row in expected.subset_rows |annotations, expected_variants|:
+                            variant: sview = annotations[row.usize()].name
                             expected_variants.push(variant) if not imc_error_subset_contains(expected_variants, variant)
                 return true if unrestricted
                 return false if not implementation.restricted
-                for variant in implementation.variants:
-                    return false if not imc_error_subset_contains(expected_variants, variant)
+                for row in implementation.variant_rows |annotations, expected_variants|:
+                    return false if not imc_error_subset_contains(expected_variants, annotations[row.usize()].name)
                 return true
 
         # Find the nearest protocol declaration for method in this protocol's
@@ -311,8 +318,9 @@ extend Semantic:
                             path <- next.name if next.owner == "__protocol_error_family_path" and next.line == 3900000067 and next.module == error_annotation.module and next.offset == error_annotation.offset and next.identity_id == error_annotation.identity_id and next.occurrence_offset == error_annotation.occurrence_offset
                         protocol_module: (known: bool, module: sview @source) = (true, declaration.module)
                         family_module: (known: bool, path_comparable: bool, module: sview @source) = imc_resolve_error_family_module(annotations, declaration.line, declaration.offset, declaration.identity_id, error_annotation.name, path, protocol_module, table)
-                        subset: ImcErrorSubset = imc_protocol_error_subset(annotations, error_annotation)
-                        out.push(ImcErrorFamily{family: error_annotation.name, path: path, module: family_module.module, module_known: family_module.known, path_comparable: family_module.path_comparable, subset_restricted: subset.restricted, subset_variants: subset.variants})
+                        out.push(ImcErrorFamily{family: error_annotation.name, path: path, module: family_module.module, module_known: family_module.known, path_comparable: family_module.path_comparable, subset_restricted: false})
+                        family_slot: usize = out.count - 1.usize()
+                        out[family_slot].subset_restricted <- imc_protocol_fill_error_subset(annotations, error_annotation, &out[family_slot])
                 return if imc_bool_value(found_method)
                 parent: sview = imc_indexed_value(annotations, owner_index, protocol, 3900000013)
                 imc_protocol_method_errors(annotations, owner_index, parent, method, origin_scope, protocol_names, protocol_scopes, context, table, visited_names, visited_scopes, found_method, out) if parent != ""
@@ -332,8 +340,8 @@ extend Semantic:
                     match declaration:
                         Decl.Func(name, params, return_type, func_body, effects, decorators, func_line):
                             allowed: mutable darray[ImcErrorFamily] = []
-                            empty_subset_variants: mutable darray[sview @source] @source = []
-                            empty_subset: ImcErrorSubset = ImcErrorSubset{restricted: false, variants: empty_subset_variants}
+                            empty_subset_rows: mutable darray[u32] = []
+                            empty_subset: ImcErrorSubset = ImcErrorSubset{restricted: false, variant_rows: empty_subset_rows}
                             identity_id: u32 = imc_function_identity(annotations, name, func_line)
                             return_occurrence: (found: bool, offset: u32) = imc_function_error_occurrence(annotations, name, func_line, identity_id)
                             function_module: (known: bool, module: sview @source) = imc_function_module(annotations, func_line, identity_id)
@@ -351,7 +359,7 @@ extend Semantic:
                                 # stage0 anchors this at the offending METHOD, not at the
                                 # `impl` header; nothing pinned the line before, so it sat on
                                 # the header and every impl reported the same location.
-                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ImplErrorExtra, name: annotation.name, pos: func_line, line: func_line.line, expected: name, actual: interface}) if impl_family and not imc_error_family_subset_matches(allowed, annotation.name, path, family_module.known, family_module.module, family_module.path_comparable, subset)
+                                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ImplErrorExtra, name: annotation.name, pos: func_line, line: func_line.line, expected: name, actual: interface}) if impl_family and not imc_error_family_subset_matches(annotations, allowed, annotation.name, path, family_module.known, family_module.module, family_module.path_comparable, subset)
                         _:
                             pass
 
