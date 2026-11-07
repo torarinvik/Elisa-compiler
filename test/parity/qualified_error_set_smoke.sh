@@ -33,7 +33,7 @@ checked=0
 
 # Line-tagged so a rule that reports the RIGHT count on the WRONG line still mismatches.
 check_case() {
-    local name="$1" source="$2"
+    local name="$1" source="$2" stage0_physical_line="${3:-}" logical_line="${4:-}"
     checked=$((checked + 1))
     printf '%s' "$source" > "$WORK/$name.elisa"
     local s0 s1
@@ -41,10 +41,13 @@ check_case() {
         | grep -E 'cannot propagate |is no longer supported|not declared in the protocol' \
         | sed -E -e 's#^.*:([0-9]+):[0-9]+[^:]*: (cannot propagate|error\[Set).*#\2 \1#' \
                  -e 's#^[^:]*:([0-9]+):[0-9]+[^ ]* impl method .*not declared in the protocol.*#implerror \1#' | sort)"
-    s1="$("$REPO_ROOT/build/parse_report" < "$WORK/$name.elisa" \
+    s1="$("$RPT" < "$WORK/$name.elisa" \
         | grep -E 'cannot propagate |is no longer supported|not declared in the protocol' \
         | sed -E -e 's#^  L([0-9]+) (cannot propagate|error\[Set).*#\2 \1#' \
                  -e 's#^  L([0-9]+) impl method .*not declared in the protocol.*#implerror \1#' | sort)"
+    if [[ -n "$stage0_physical_line" ]]; then
+        s0="$(sed -E "s/^implerror $stage0_physical_line$/implerror $logical_line/" <<< "$s0")"
+    fi
     if [ "$s0" != "$s1" ]; then
         failed=$((failed + 1))
         printf 'qualified-error-set mismatch: %s\n  stage0: %s\n  stage1: %s\n' \
@@ -60,7 +63,7 @@ check_stage1_raise_mismatch() {
     checked=$((checked + 1))
     printf '%s' "$source" > "$WORK/$name.elisa"
     local report
-    report="$("$REPO_ROOT/build/parse_report" < "$WORK/$name.elisa")"
+    report="$("$RPT" < "$WORK/$name.elisa")"
     if ! printf '%s\n' "$report" | grep -Eq "^[[:space:]]*L${expected_line} raise cannot propagate tag "; then
         failed=$((failed + 1))
         printf 'qualified-error-set missing raise mismatch: %s (expected line %s)\n' \
@@ -73,7 +76,7 @@ check_stage1_impl_subset_extra() {
     checked=$((checked + 1))
     printf '%s' "$source" > "$WORK/$name.elisa"
     local report
-    report="$("$REPO_ROOT/build/parse_report" < "$WORK/$name.elisa")"
+    report="$("$RPT" < "$WORK/$name.elisa")"
     if ! printf '%s\n' "$report" | grep -Eq "^[[:space:]]*L${expected_line} impl method" \
         || ! printf '%s\n' "$report" | grep -Fq 'raises error `Fault` not declared in the protocol'; then
         failed=$((failed + 1))
@@ -117,10 +120,14 @@ if ! grep -q 'impl method "push" for interface "FirstProtocol" raises error `Sec
 fi
 
 offset_zero_impl_fixture="$REPO_ROOT/test/repro/impl_error_set_offset_identity.elisa"
-check_case impl_error_set_offset_identity "$(cat "$offset_zero_impl_fixture")"
+# Stage0 prints the physical line for this standalone file. The reporter uses
+# the directive's logical line, which also belongs to the offset-zero function.
+offset_zero_physical_line="$(awk '/^#line 1 / { print NR + 1; exit }' "$offset_zero_impl_fixture")"
+check_case impl_error_set_offset_identity "$(cat "$offset_zero_impl_fixture")" "$offset_zero_physical_line" 1
 offset_zero_impl_report="$("$RPT" < "$offset_zero_impl_fixture")"
-offset_zero_impl_count="$(grep -c 'impl method "push" for interface "Sink" raises error `Extra` not declared in the protocol' <<< "$offset_zero_impl_report" || true)"
-if [[ "$offset_zero_impl_count" != "1" ]]; then
+offset_zero_impl_message='impl method "push" for interface "Sink" raises error `Extra` not declared in the protocol'
+offset_zero_impl_count="$(grep -Fc "$offset_zero_impl_message" <<< "$offset_zero_impl_report" || true)"
+if [[ "$offset_zero_impl_count" != "1" ]] || ! grep -Fq "  L1 $offset_zero_impl_message" <<< "$offset_zero_impl_report"; then
     failed=$((failed + 1))
     printf 'qualified-error-set expected one extra-family diagnostic on the same-#line impl method\n' >&2
 fi

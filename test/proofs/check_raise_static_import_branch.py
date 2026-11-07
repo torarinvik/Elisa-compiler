@@ -35,7 +35,9 @@ import_parser_source = IMPORT_PARSER_SOURCE.read_text()
 entrypoint = function_source(source, "check_raise_without_error_set")
 if "pma_active_import_annotations(file, table)" not in entrypoint:
     raise SystemExit("raise error-family lookup must receive branch-filtered import annotations")
-if 'check_raise_without_error_set_decls(file.top_decls, annotations, file, "", table)' not in entrypoint:
+if not all(fragment in entrypoint for fragment in (
+        'return_markers.push(annotation) if annotation.name == "__error_return"',
+        'check_raise_without_error_set_decls(file.top_decls, annotations, return_markers, file, "", table)')):
     raise SystemExit("raise checker must pass the filtered annotation view to its declaration walk")
 
 fixture = FIXTURE.read_text()
@@ -83,7 +85,7 @@ if 'name: "__error_return", line: token.line, offset: token.start' not in parser
         'parser.error_set_func_names <- parser.error_set_func_names.push(parser.signature_error_set_name) if parser.signature_has_error_set' not in parser_source or \
         'error_set_func_offsets: parser.error_set_func_offsets' not in (ROOT / "src/parser/parser_types_entry.elisa").read_text():
     raise SystemExit("raise declaration and both error-set metadata paths must retain the parser token offset")
-if "raise_function_declares_error_set(file, annotations, name, line)" not in declarations:
+if "raise_function_declares_error_set(file, return_markers, name, line)" not in declarations:
     raise SystemExit("raise declaration walk must pass the file sidecar used by its exact-offset compatibility path")
 if not all(fragment in inactive_scope for fragment in (
         "pma_static_if_row_for_position(file, position)",
