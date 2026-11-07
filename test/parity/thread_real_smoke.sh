@@ -135,7 +135,7 @@ extern pthread_mutex_destroy(mutex: mutable PthreadMutexT&) -> int can[Memory.Re
 @c_opaque(pthread.h, pthread_mutex_t)
 extern PthreadMutexT
 def main() -> i64 can[Memory.Allocate, Memory.Release, Sync.Lock, Sync.Unlock, Unsafe.PointerCast]:
-    m: mutable PthreadMutexT = zeroed
+    m: mutable PthreadMutexT = zeroed can Unsafe.PointerCast
     _ = pthread_mutex_init(&m, null)
     counter: mutable i64 = 0
     for i in 0..<42:
@@ -165,12 +165,12 @@ def worker(arg: void&?) -> void&? can[Sync.Lock, Sync.Unlock, Unsafe.PointerCast
             _ = pthread_mutex_unlock((&s.lock).cast[void&] can Unsafe.PointerCast)
     return null
 def main() -> i64 can[Memory.Allocate, Thread.Spawn, Thread.Join, Sync.Lock, Sync.Unlock, Unsafe.PointerCast]:
-    s: mutable Shared = zeroed
+    s: mutable Shared = zeroed can Unsafe.PointerCast
     _ = pthread_mutex_init(&s.lock, null)
     handles: mutable uintptr[4] = zeroed
     entry: void& = worker.cast[void&] can Unsafe.PointerCast
     for t in 0..<4:
-        _ = pthread_create(&handles[t], null, entry, (&s).cast[void&?] can Unsafe.PointerCast)
+        _ = pthread_create(&handles[t], null, entry, (&s).cast[void&?] can Unsafe.PointerCast) can Global.Read
     for t in 0..<4:
         _ = pthread_join(handles[t], null)
     return s.counter + 42 - 4000' 42 8
@@ -206,12 +206,12 @@ def worker(arg: void&?) -> void&? can[Sync.Lock, Sync.Unlock, Sync.Notify, Unsaf
         _ = pthread_mutex_unlock(lk)
     return null
 def main() -> i64 can[Memory.Allocate, Thread.Spawn, Thread.Join, Sync.Lock, Sync.Unlock, Sync.Wait, Unsafe.PointerCast]:
-    s: mutable Sync = zeroed
+    s: mutable Sync = zeroed can Unsafe.PointerCast
     _ = pthread_mutex_init(&s.lock, null)
     _ = pthread_cond_init(&s.cond, null)
     handle: mutable uintptr = 0.uintptr()
     entry: void& = worker.cast[void&] can Unsafe.PointerCast
-    _ = pthread_create(&handle, null, entry, (&s).cast[void&?] can Unsafe.PointerCast)
+    _ = pthread_create(&handle, null, entry, (&s).cast[void&?] can Unsafe.PointerCast) can Global.Read
     lk: void& = (&s.lock).cast[void&] can Unsafe.PointerCast
     cv: void& = (&s.cond).cast[void&] can Unsafe.PointerCast
     _ = pthread_mutex_lock(lk)

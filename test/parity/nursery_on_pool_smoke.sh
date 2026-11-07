@@ -8,38 +8,12 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-nursery-on-pool.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-cat >"$WORK/shared-pool.elisa" <<'ELISA'
-struct ThreadPool:
-    handle: void&?
+# Task-group lowering requires the trusted runtime definitions.
+for unit in elisacore_runtime_concurrency elisacore_runtime_prelude collections elisacore_runtime_strings; do
+    printf 'include "%s/elisacore_std/%s.elisa"\n' "$ROOT" "$unit"
+done >"$WORK/shared-pool.elisa"
 
-struct TaskGroup:
-    handle: void&?
-    cleanup: void&?
-
-struct Task[T, S]:
-    handle: usize
-    state: void&?
-
-def pool_new(threads: usize) -> ThreadPool:
-    return ThreadPool{handle: null}
-
-def pool_shutdown(pool: ThreadPool&) -> void:
-    return
-
-def task_group_new() -> TaskGroup:
-    return TaskGroup{handle: null, cleanup: null}
-
-def task_group_wait_all(group: TaskGroup&) -> void:
-    return
-
-def pool_submit1[A, R](pool: ThreadPool&, fn: fn(A) -> R, arg: A) -> Task[R, i64]:
-    task: Task[R, i64] = zeroed
-    return move task
-
-def task_group_add[R](group: TaskGroup&, task: Task[R, i64]) -> void:
-    _ = move task
-    return
-
+cat >>"$WORK/shared-pool.elisa" <<'ELISA'
 def bump(value: i64) -> i64:
     return value + 1
 
