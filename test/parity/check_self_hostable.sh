@@ -119,10 +119,15 @@ sed -nE 's/^def (alloc_perm\(.*\)( -> .*)?):$/extern \1/p' \
 	"$REPO_ROOT/elisacore_std/elisacore_runtime_prelude.elisa" >> "$RUNTIME_STRINGS_IFACE"
 # Runtime functions used by semantic_parallel are declared from their source.
 sed -nE '/^extern memcmp\(/p' "$REPO_ROOT/elisacore_std/elisacore_runtime_prelude.elisa" >> "$RUNTIME_STRINGS_IFACE"
-sed -nE 's/^[[:space:]]*def (perf_cores\(\) -> i64):$/extern \1/p' \
+sed -nE 's/^[[:space:]]*def ((perf_cores|pool_new|pool_shutdown)\(.*\)( -> .*)?):$/extern \1/p' \
     "$REPO_ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" | sort -u >> "$RUNTIME_STRINGS_IFACE"
+sed -nE 's/^def (sview_basename\(.*\) -> sview):$/extern \1/p' \
+    "$REPO_ROOT/elisacore_std/elisacore_runtime_string_path_views.elisa" >> "$RUNTIME_STRINGS_IFACE"
 FRONTEND_FILES=()
-for f in "$REPO_ROOT"/src/lexer/*.elisa "$REPO_ROOT"/src/parser/*.elisa "$REPO_ROOT"/src/semantic/*.elisa \
+while IFS= read -r f; do
+    FRONTEND_FILES+=("$f")
+done < <(find "$REPO_ROOT/src/lexer" "$REPO_ROOT/src/parser" "$REPO_ROOT/src/semantic" -type f -name '*.elisa' -print | LC_ALL=C sort)
+for f in "$REPO_ROOT"/src/backend/codegen_const_checked_arithmetic.elisa \
          "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai \
          "$RUNTIME_STRINGS_IFACE"; do
 	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
