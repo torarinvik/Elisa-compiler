@@ -28,7 +28,10 @@ bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
 [ -x "$BIN" ] || { echo "cli_includes_smoke FAIL: no stage1 binary at $BIN" >&2; exit 1; }
 [ -x "$ELISACORE_BIN" ] || { echo "cli_includes_smoke FAIL: no elisac at $ELISACORE_BIN" >&2; exit 1; }
 
-WORK="$(mktemp -d)"
+# Use a physical path so diagnostic comparisons also work when TMPDIR contains
+# a symlink, as it does under /var on macOS.
+tmp_root="$(cd -P -- "${TMPDIR:-/tmp}" && pwd)" || exit $?
+WORK="$(mktemp -d "$tmp_root/elisa-includes.XXXXXX")" || exit $?
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
