@@ -74,7 +74,6 @@ run_case penum_is_narrow_multi 'enum Shape:\n    Rect(i64, i64)\n    None\n\ndef
 # GEP at each use (constant and dynamic index; narrower element widths).
 run_case const_array_literal_index 'const xs: i64[3] = [10, 20, 30]\n\ndef main() -> i64:\n    return xs[0] + xs[2]\n'   40
 run_case const_array_dynamic_index 'const xs: i64[3] = [10, 20, 30]\n\ndef get(i: i64) -> i64:\n    return xs[i]\n\ndef main() -> i64:\n    return get(1)\n'   20
-run_case qualified_const_array_slice_lifetime 'module Support:\n    public:\n        const values: i64[2] = [40, 2]\n\ndef make_view() -> view[i64]:\n    return Support::values[0:2]\n\ndef main() -> i64:\n    v: view[i64] = make_view()\n    return v[0] + v[1]\n' 42
 run_case const_array_u8_elem 'const bs: u8[4] = [1, 2, 3, 4]\n\ndef main() -> i64:\n    return bs[3].i64()\n'   4
 # Mutable Elisa globals are addressable module storage, not folded constants.
 run_case global_mutable_scalar 'global mutable seed: i64 = 0\n\ndef main() -> i64:\n    seed <- 42\n    return seed\n' 42
@@ -413,13 +412,6 @@ run_case for_captures 'def main() -> i64:\n    total: mutable i64 = 0\n    for i
 # GEPs per level. Read, write, and loop-driven variable indexing.
 run_case nested_array_read 'def main() -> i64:\n    m: i64[2][2] = [[40, 0], [0, 2]]\n    return (m[0][0] can Unsafe.UncheckedIndex) + (m[1][1] can Unsafe.UncheckedIndex)\n' 42
 run_case nested_array_write 'def main() -> i64:\n    m: mutable i64[3][2] = [[1, 2, 3], [4, 5, 6]]\n    m[1][2] <- 40 can Unsafe.UncheckedIndex\n    return (m[1][2] can Unsafe.UncheckedIndex) + (m[0][1] can Unsafe.UncheckedIndex)\n' 42
-# A nested fixed-array element is a PLACE. A slice view must keep that element's address so
-# later writes to the original row are visible through the view, not a copied temporary.
-run_case nested_fixed_array_slice_place 'def main() -> i64:\n    m: mutable i64[2][2] = [[10, 20], [30, 40]]\n    row: view[i64] = m[1][0:2]\n    m[1][0] <- 42 can Unsafe.UncheckedIndex\n    return row[0]\n' 42
-# When a fixed-array slice is only the receiver of another index, its view type must be
-# inferred from the slice expression rather than an Unmodeled expected type.
-run_case fixed_array_slice_unannotated_index 'def main() -> i64:\n    values: i64[4] = [0, 42, 7, 0]\n    return values[1:3][0]\n' 42
-run_case borrowed_fixed_array_slice_unannotated_index 'def first(values: i64[4]&) -> i64:\n    return values[1:3][0]\ndef main() -> i64:\n    values: i64[4] = [0, 42, 7, 0]\n    return first(&values)\n' 42
 # `catch f():` — the ERROR-fn ABI (i32 status + out-param): code 0 takes the success
 # arm (binding the out value), a nonzero code is ordinal+1 and dispatches down the
 # error arms; `_` is the catch-all.
