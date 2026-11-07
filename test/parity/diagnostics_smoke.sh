@@ -911,6 +911,9 @@ require_region_control() {
 }
 require_region_control region_param_container_return_inferred_new "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" '`new[auto]` is deprecated'
 require_region_control region_param_container_return_inferred_new "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" 'variable "values" expects darray, got reference'
+inferred_region_store='value in region "<inferred>" is stored into longer-lived region "r"'
+require_region_control region_param_container_return_auto_move "$FIXTURES/region_param_container_return_auto_move.pos.elisa" "$inferred_region_store"
+run_case region_param_container_return_same_region_store neg "$FIXTURES/region_param_container_return.neg.elisa" "$inferred_region_store"
 
 # Semicolon-separated multistatements are not legal Elisa. Pin that parser rejection instead of
 # treating equal source-line numbers as evidence that the unsafe reassignment is supported syntax.
