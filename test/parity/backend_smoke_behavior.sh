@@ -49,6 +49,25 @@ run_fixture_case() {
 
 run_fixture_case local_field_view_caller_arena test/fixtures/diagnostics/local_field_view_bound_return.pos.elisa 65
 
+# Both direct and bound returns must keep the factory's arena through a chain.
+run_case forwarded_field_view_caller_arena 'def outer() -> sview:
+    result: sview = inner()
+    return result
+
+def inner() -> sview:
+    return mk()
+
+struct BytesHolder:
+    data: mutable darray[u8]
+
+def mk() -> sview:
+    holder: mutable BytesHolder = BytesHolder{data: [65.u8()]}
+    return holder.data.as_sview()
+
+def main() -> i64:
+    return outer()[0].i64()
+' 65
+
 # The inactive alias must leave the real Bytes module visible to native calls.
 run_case inactive_static_module_alias "$(cat "$ROOT/test/fixtures/diagnostics/static_string_binding_inactive_alias.pos.elisa")"'
 def main() -> i64:
