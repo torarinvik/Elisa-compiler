@@ -91,6 +91,29 @@ cases = [
     ("returned global alias keeps its origin at the caller", "global mutable hot: i64 = 0\ndef leak() -> mutable i64&:\n    can Global{Read,Write}:\n        return &hot\ndef write_leaked() -> void:\n    reference: mutable i64& = leak() can Global{Read,Write}\n    reference <- 3\n", {"Global.Write"}),
     ("argument pass-through call keeps the argument's global origin", "global mutable hot: i64 = 0\ndef pass_through(value: mutable i64&) -> mutable i64&:\n    return value\ndef write_passed() -> void:\n    reference: mutable i64& = (pass_through(&hot) can Global{Read,Write})\n    reference <- 4\n", {"Global.Write"}),
     ("argument pass-through call keeps a local origin local", "def pass_through(value: mutable i64&) -> mutable i64&:\n    return value\ndef write_local() -> i64:\n    seed: mutable i64 = 0\n    reference: mutable i64& = pass_through(&seed)\n    reference <- 4\n    return seed\n", set()),
+    (
+        "replacing a local reference field does not write its old referent",
+        """struct Box:
+    value: mutable i64&
+global stable: i64 = 2
+def replace() -> Box:
+    box: mutable Box = Box{value: &stable}
+    box.value <- &stable
+    return box
+""",
+        set(),
+    ),
+    (
+        "replacing a global reference field still requires Global.Write",
+        """struct Box:
+    value: mutable i64&
+global stable: i64 = 2
+global slot: Box = Box{value: &stable}
+def replace() -> void:
+    slot.value <- &stable
+""",
+        {"Global.Write"},
+    ),
     ("mutable record field read grant", "struct GrantRecord:\n    value: mutable i64\nglobal mutable record: GrantRecord = GrantRecord{value: 0}\ndef read_record() -> i64:\n    can Global.Read:\n        return record.value\n", set()),
     ("mutable record field write grant", "struct GrantRecord:\n    value: mutable i64\nglobal mutable record: GrantRecord = GrantRecord{value: 0}\ndef write_record() -> void:\n    can Global.Write:\n        record.value <- 1\n", set()),
     ("mutable record field read missing grant", "struct GrantRecord:\n    value: mutable i64\nglobal mutable record: GrantRecord = GrantRecord{value: 0}\ndef read_record() -> i64:\n    return record.value\n", {"Global.Read"}),
