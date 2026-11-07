@@ -23,7 +23,7 @@ suffers more from contention than stage1 does: measured 36.5 idle, 25.9 with fou
 compiles), so a busy machine can only MASK a regression here, never invent one. That is the
 direction a gate check should fail in.
 """
-import os, pathlib, re, resource, subprocess, sys, tempfile
+import os, pathlib, resource, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(os.environ["REPO_ROOT"])
 BIN = pathlib.Path(os.environ.get("ELISA_STAGE1_BIN", ROOT / "bin" / "elisac-stage1"))
@@ -31,30 +31,16 @@ BASELINE = ROOT / "test" / "fixtures" / "compile_cpu.baseline"
 REFERENCE_C = ROOT / "test" / "fixtures" / "compile_cpu_reference.c"
 LIMIT = float(os.environ.get("COMPILE_CPU_LIMIT", "1.5"))
 
-include_re = re.compile(r'^[ \t]*(?:#\s*)?include[ \t]+"([^"]+)"[ \t]*$')
-
-def flatten(path, seen, out):
-    ap = path.resolve()
-    if ap in seen:
-        return
-    seen.add(ap)
-    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
-        m = include_re.match(line.rstrip("\n"))
-        if m:
-            flatten(path.parent / m.group(1), seen, out)
-        else:
-            out.append(line)
-
 def child_cpu():
     r = resource.getrusage(resource.RUSAGE_CHILDREN)
     return r.ru_utime + r.ru_stime
 
 def main():
-    out = []
-    flatten(ROOT / "src" / "driver" / "elisac.elisa", set(), out)
-    source = "".join(out)
     work = tempfile.mkdtemp()
-    payload = (os.path.join(work, "out.o") + "\n" + source).encode()
+    # Compile the actual source file so the compiler can attribute trusted
+    # runtime declarations to their defining include files.
+    source = ROOT / "src" / "driver" / "elisac.elisa"
+    command = [str(BIN), "-o", os.path.join(work, "out.o"), str(source)]
     # The yardstick, measured in this same run and on this same machine state.
     reference = None
     for _ in range(2):
@@ -74,11 +60,12 @@ def main():
     best = None
     for _ in range(2):
         before = child_cpu()
-        r = subprocess.run([str(BIN)], input=payload, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=900)
+        r = subprocess.run(command, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True, errors="replace", timeout=900)
         used = child_cpu() - before
         if r.returncode != 0:
             print(f"compile_cpu FAILED: stage1 exited {r.returncode} on its own source")
+            print("\n".join(r.stderr.splitlines()[-20:]), file=sys.stderr)
             return 1
         best = used if best is None else min(best, used)
     measured = best / reference
