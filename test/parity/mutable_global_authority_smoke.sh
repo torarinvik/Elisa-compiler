@@ -1331,5 +1331,9 @@ def main() -> i64:
     callback = factory()
     return 0
 CASE
+if ! ELISA_PARSE_REPORT="$RPT" python3 "$REPO_ROOT/test/proofs/check_global_authority_field_chain.py"; then
+    failed=$((failed+1))
+fi
+cases=$((cases+1))
 [ "$failed" -eq 0 ] || exit 1
 echo "mutable global authority smoke OK: $cases cases" >&2
