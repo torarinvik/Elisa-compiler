@@ -303,7 +303,6 @@ NAMES=(
     static_string_binding_declaration
     static_string_binding_ternary
     static_string_binding_inactive_alias
-    container_literal_block_tail
     discarded_loop_value
     # --- rule R (2026-09-22): the TYPE's `mutable` is the write capability ---
     ref_rebind_value
@@ -565,7 +564,6 @@ EXPECTS=(
     "variable \"t\" expects sview, got static u8&"
     "ternary branches are incompatible: static u8& and sview"
     "argument 1 to \"inspect\" expects sview, got static u8&"
-    "darray literal has no region to allocate in"
     "accumulator loop result \`valid\` is discarded; make the loop the final expression of its block"
     # --- rule R (2026-09-22) ---
     "cannot assign int to i64&"

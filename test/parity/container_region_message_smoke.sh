@@ -46,33 +46,21 @@ nested_out=$(cat "$work/lit_nested.elisa" | "$RPT")
 nested_count=$(grep -c "darray literal has no region to allocate in" <<< "$nested_out" || true)
 [ "$nested_count" -eq 2 ] || fail "nested conditional calls lost container-region diagnostics: $nested_out"
 
-# 2c. INFERENCE-BY-DEFAULT is an INVISIBLE suppressor of this entire family, and it is the
-# reason a rule here cannot be measured on one-line probe bodies. stage0's parser wraps a
-# function body in one synthesized lazy `region __auto_N:` when a region-less container local
-# is initialized by an ALLOCATING LITERAL (maybeWrapFunctionBodyInAutoRegion ->
-# isRegionlessContainerType && isAllocatingLiteral), and inside that wrap `currentAllocExpr`
-# is non-nil for the body's WHOLE extent -- so nothing in this family fires anywhere in the
-# function. An explicit `region NAME(...):` block does the same for its body.
-#
-# Both compilers are asserted on each shape, so neither can drift alone. Getting this wrong in
-# either direction is expensive: too narrow and the rule flags ordinary allocating functions
-# (it once flagged three sites in this compiler's own backend that stage0 accepts, and
-# self-hosting stopped building); too broad and the family goes silent everywhere.
+# 2c. A typed destination supplies the region to both arms. Check this even
+# without another allocating local or an enclosing explicit region.
 printf 'def p_alone(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    xs: darray[i64] = [1, 2] if c else [3, 4]\n    return xs.count.i64()\n' > "$work/wrap_none.elisa"
 printf 'def p_wrapped(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    acc: mutable darray[i64] = []\n    xs: darray[i64] = [1, 2] if c else [3, 4]\n    return xs.count.i64() + acc.count.i64()\n' > "$work/wrap_literal_local.elisa"
 printf 'def p_scalar_call(v: i64) -> i64:\n    return v + 1\n\ndef p_still_flagged(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    n: i64 = p_scalar_call(1)\n    xs: darray[i64] = [1, 2] if c else [3, 4]\n    return xs.count.i64() + n\n' > "$work/wrap_scalar_call.elisa"
 printf 'def p_region_block(c: bool) -> i64 can[Memory.Allocate, Abort.Panic]:\n    region scratch(4096):\n        xs: darray[i64] = [1, 2] if c else [3, 4]\n        return xs.count.i64()\n    return 0\n' > "$work/wrap_region_block.elisa"
 
 # file                  expected "darray literal has no region" count
-for row in "wrap_none 2" "wrap_literal_local 0" "wrap_scalar_call 2" "wrap_region_block 0"; do
-  set -- $row
-  wrap_name="$1"; wrap_want="$2"
+for wrap_name in wrap_none wrap_literal_local wrap_scalar_call wrap_region_block; do
   s0_out=$( cd "$work" && "$ELISACORE_BIN" -emit llvm -o /dev/null "$wrap_name.elisa" 2>&1 )
   s0_got=$(grep -c "darray literal has no region to allocate in" <<< "$s0_out" || true)
   s1_out=$(cat "$work/$wrap_name.elisa" | "$RPT")
   s1_got=$(grep -c "darray literal has no region to allocate in" <<< "$s1_out" || true)
-  [ "$s0_got" -eq "$wrap_want" ] || fail "$wrap_name: stage0 reported $s0_got container-region diagnostics, expected $wrap_want (the ORACLE moved -- re-measure before touching stage1): $s0_out"
-  [ "$s1_got" -eq "$wrap_want" ] || fail "$wrap_name: stage1 reported $s1_got container-region diagnostics, stage0 reports $wrap_want: $s1_out"
+  [ "$s0_got" -eq 0 ] || fail "$wrap_name: stage0 reported container-region diagnostics: $s0_out"
+  [ "$s1_got" -eq 0 ] || fail "$wrap_name: stage1 reported container-region diagnostics: $s1_out"
 done
 
 # 3. Every destination that DOES supply a region must still compile.
@@ -82,6 +70,14 @@ printf 'struct S:\n    xs: darray[i64]\n\ndef main() -> i64 can[Memory.Allocate,
 for ok in ok_local ok_return ok_field; do
   ( cd "$work" && "$ELISACORE_BIN" -emit llvm -o /dev/null "$ok.elisa" >/dev/null 2>&1 ) \
     || fail "$ok no longer compiles; the region check is rejecting a valid destination"
+done
+
+# Verify actual native emission for block tails, including the original controls.
+stage1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
+for variant in pos neg; do
+  fixture="$REPO_ROOT/test/fixtures/diagnostics/container_literal_block_tail.$variant.elisa"
+  "$ELISACORE_BIN" -emit obj -o "$work/block-s0.o" "$fixture" || fail "stage0 could not lower block tails ($variant)"
+  "$stage1" -emit obj -o "$work/block-s1.o" "$fixture" || fail "stage1 could not lower block tails ($variant)"
 done
 
 # 4. No user-facing "in <arena>: scope" text survives anywhere in stage0's sources, and stage1's
