@@ -47,6 +47,8 @@ run_fixture_case() {
     run_case "$name" "$src" "$want"
 }
 
+run_fixture_case local_field_view_caller_arena test/fixtures/diagnostics/local_field_view_bound_return.pos.elisa 65
+
 # The inactive alias must leave the real Bytes module visible to native calls.
 run_case inactive_static_module_alias "$(cat "$ROOT/test/fixtures/diagnostics/static_string_binding_inactive_alias.pos.elisa")"'
 def main() -> i64:
