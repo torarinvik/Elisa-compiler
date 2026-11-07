@@ -175,6 +175,10 @@ stage1_ir_case module_triple 'def main() -> i64:\n    return 42\n' "^target trip
 # rather than decline the enclosing function or GEP through the header itself. This
 # is the backend regression behind `peek(&xs[0])` in the affine projection fixture.
 stage1_ir_case view_element_address 'struct Handle:\n    v: i64\n\ndef peek(h: Handle&) -> i64:\n    return h.v\n\ndef element_read(xs: view[Handle]) -> i64:\n    return peek(&xs[0])\n\ndef main() -> i64:\n    return 0\n' 'view\.elem\.ptr'
+# A returned view over a constant fixed-array global must point to the global storage,
+# not a stack alloca made while evaluating the array value.
+stage1_ir_case const_fixed_array_slice_global_storage 'const values: i64[2] = [40, 2]\n\ndef make_view() -> view[i64]:\n    return values[0:2]\n\ndef main() -> i64:\n    v: view[i64] = make_view()\n    return v[0] + v[1]\n' 'getelementptr.*@values'
+stage1_ir_case qualified_const_fixed_array_slice_global_storage 'module Support:\n    public:\n        const values: i64[2] = [40, 2]\n\ndef make_view() -> view[i64]:\n    return Support::values[0:2]\n\ndef main() -> i64:\n    v: view[i64] = make_view()\n    return v[0] + v[1]\n' 'getelementptr.*@values'
 stage1_ir_absent_case store_not_underaligned 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[0] can Unsafe.UncheckedIndex) + 42\n' 'store i64 %comp.var.value, ptr %comp.var, align 4'
 
 # The `-Wperf` autovec MARKER on a comprehension's latch branch. It rides in the IR so it
