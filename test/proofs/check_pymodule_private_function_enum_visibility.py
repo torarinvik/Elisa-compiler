@@ -25,7 +25,7 @@ for marker in ("__private_enum_type", "__private_module_decl"):
     if marker not in parser:
         raise SystemExit(f"parser must preserve declaration-kind visibility marker {marker}")
 
-alias_targets = ALIAS_TARGETS.read_text(encoding="utf-8")
+alias_targets = ALIAS_TARGETS.read_text(encoding="utf-8") + ALIAS_TARGETS.with_name("enum_import_resolution.elisa").read_text(encoding="utf-8")
 visibility = compact_function(alias_targets, "pymodule_default_imported_enum_is_visible")
 if not all(marker in visibility for marker in ("__private_enum_type", "__private_module_decl")):
     raise SystemExit("import visibility must use declaration-kind markers, not generic private-member rows")

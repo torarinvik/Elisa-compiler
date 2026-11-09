@@ -20,7 +20,7 @@ def compact_function(source: str, name: str) -> str:
     return "".join("".join(line.split()) for line in code)
 
 
-source = DEFAULTS.read_text(encoding="utf-8")
+source = DEFAULTS.read_text(encoding="utf-8") + DEFAULTS.with_name("enum_import_resolution.elisa").read_text(encoding="utf-8")
 imports = compact_function(source, "pymodule_default_visible_enum_import")
 priority_loop = imports.find("forimport_priorityin0..<2")
 wildcard_tier = imports.find('ifimport_priority==0:')
@@ -191,7 +191,7 @@ if not all(fragment in same_leaf_alias for fragment in (
 same_leaf_smoke = (ROOT / "test/parity/pymodule_selective_enum_defaults_smoke.sh").read_text(encoding="utf-8")
 if '"default": "57"' not in same_leaf_smoke or "alias_wins(value: int = 57)" not in same_leaf_smoke:
     raise SystemExit("same-leaf alias smoke must assert the alias target's distinct enum value")
-qualifier_resolution = compact_function(DEFAULTS.read_text(encoding="utf-8"), "pymodule_default_enum_qualifier_matches_owner")
+qualifier_resolution = compact_function(DEFAULTS.read_text(encoding="utf-8") + DEFAULTS.with_name("enum_import_resolution.elisa").read_text(encoding="utf-8"), "pymodule_default_enum_qualifier_matches_owner")
 lexical_enum_check = qualifier_resolution.find("iflexical_enum_path_foundandpymodule_default_module_path_declares_enum")
 alias_target_check = qualifier_resolution.find("target_match.resolvedandtarget_match.contains_enum")
 if not (

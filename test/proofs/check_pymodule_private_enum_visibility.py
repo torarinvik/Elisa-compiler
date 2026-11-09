@@ -46,8 +46,8 @@ def compact_function(source: str, name: str) -> str:
 
 
 defaults = DEFAULTS.read_text(encoding="utf-8")
-alias_targets = ALIAS_TARGETS.read_text(encoding="utf-8")
-parser = PARSER.read_text(encoding="utf-8")
+alias_targets = ALIAS_TARGETS.read_text(encoding="utf-8") + ALIAS_TARGETS.with_name("enum_import_resolution.elisa").read_text(encoding="utf-8")
+parser = PARSER.read_text(encoding="utf-8") + PARSER.with_name("parser_decl_imports.elisa").read_text(encoding="utf-8")
 parser_types = PARSER_TYPES.read_text(encoding="utf-8")
 parser_aggregate = PARSER_AGGREGATE.read_text(encoding="utf-8")
 parser_dispatch = PARSER_DISPATCH.read_text(encoding="utf-8")

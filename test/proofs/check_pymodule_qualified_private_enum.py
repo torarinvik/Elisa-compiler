@@ -19,7 +19,7 @@ def compact_function(source: str, name: str) -> str:
     return "".join("".join(line.split()) for line in lines[start:end] if not line.lstrip().startswith("#"))
 
 
-source = SOURCE.read_text(encoding="utf-8")
+source = SOURCE.read_text(encoding="utf-8") + SOURCE.with_name("enum_import_resolution.elisa").read_text(encoding="utf-8")
 resolver = compact_function(source, "pymodule_default_enum_value")
 qualified = resolver.find("ifenum_qualifierisqualifier:")
 visibility = resolver.find("pymodule_default_imported_enum_is_visible", qualified)
