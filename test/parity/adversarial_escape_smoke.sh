@@ -83,4 +83,9 @@ for f in "$DIR"/*.elisa; do
             if [ $accepted -ne 1 ]; then echo "FAIL $name: rejected (rc=$rc)"; grep -v 'warning:' "$TMP/log" | head -3; fail=1; fi ;;
     esac
 done
+for optimization in 0 2; do
+    "$BIN" -emit exe "-O$optimization" "$DIR/fuzz_esc_return_struct_field_view.pos.elisa" -o "$TMP/ambient-view" >"$TMP/log" 2>&1 \
+        && "$TMP/ambient-view" >>"$TMP/log" 2>&1 \
+        || { echo "FAIL ambient byte-view runtime at O$optimization"; tail -5 "$TMP/log"; fail=1; }
+done
 [ $fail -eq 0 ] && echo "adversarial-escape OK ($n cases)" || exit 1
