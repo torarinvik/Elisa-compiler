@@ -700,7 +700,7 @@ if "SemanticGlobalAuthorityOrigin::constructor_origin(origin,false)" not in orig
 constructor_coverage = compact(function_section(authority_text, "ga_construct_omits_reference_field"))
 for fragment in (
     "returntrueifowner>=state.struct_names.count",
-    "returntrueifstate.field_scopes[field_index]!=state.module_scope",
+    "continueifstate.field_owners[field_index]!=state.struct_names[owner]orstate.field_scopes[field_index]!=state.struct_scopes[owner]",
     'returntrueifinitializer.name==""andnotinitializer.is_copy_base',
     "found<-trueifinitializer.name==state.field_names[field_index]",
     "returntrueifnotfound",
