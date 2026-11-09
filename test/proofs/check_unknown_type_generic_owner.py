@@ -1,5 +1,6 @@
 """Bind unknown-type and protocol generic exemptions to declaration owners."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -24,8 +25,8 @@ def function_source(source: str, name: str) -> str:
 unknown = UNKNOWN_SOURCE.read_text()
 structs = STRUCT_SOURCE.read_text()
 fixture = FIXTURE.read_text()
-smoke = SMOKE.read_text()
-gate = GATE.read_text()
+smoke = read_parity_smoke_source(SMOKE)
+gate = read_parity_smoke_source(GATE)
 
 owner_lookup = function_source(unknown, "unknown_type_is_generic")
 if not all(fragment in owner_lookup for fragment in (

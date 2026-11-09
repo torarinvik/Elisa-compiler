@@ -1,5 +1,6 @@
 """Bind strict-unsafe generic suppression to the exact function declaration."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -19,7 +20,7 @@ def function_source(source: str, name: str) -> str:
 
 
 source = SOURCE.read_text()
-smoke = SMOKE.read_text()
+smoke = read_parity_smoke_source(SMOKE)
 generic_context = function_source(source, "strict_unsafe_function_is_generic")
 declaration_walk = function_source(source, "strict_unsafe_decls")
 

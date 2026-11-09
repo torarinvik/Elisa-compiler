@@ -1,5 +1,6 @@
 """Bind thread-shareability generic classification to exact declaration offsets."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -25,7 +26,7 @@ def function_source(source: str, name: str) -> str:
 thread = THREAD.read_text()
 reference_types = REFERENCE_TYPES.read_text() + REFERENCE_TYPES.with_name("payloads.elisa").read_text()
 walk = WALK.read_text()
-smoke = SMOKE.read_text()
+smoke = read_parity_smoke_source(SMOKE)
 positive = POS.read_text()
 negative = NEG.read_text()
 

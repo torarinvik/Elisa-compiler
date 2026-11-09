@@ -1,5 +1,6 @@
 """Extern signature contracts must stay bound to their declaration offset."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -36,7 +37,7 @@ pipeline = source("src/semantic/semantic_api/full_pipeline.elisa")
 unsafe_report = source("src/driver/elisac_emit_unsafe_externs.elisa")
 backend_ensure = source("src/backend/codegen_extern_ensure.elisa")
 backend_side_tables = source("src/backend/codegen_struct_table_side_tables.elisa")
-gate = source("test/parity/diagnostics_smoke.sh")
+gate = read_parity_smoke_source(ROOT / "test/parity/diagnostics_smoke.sh")
 
 capture = function_text(parser_signature, "capture_extern_header_contracts")
 if "extern_offset: u32" not in capture or "drain_signature_contracts(extern_line, extern_offset)" not in capture:

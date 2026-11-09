@@ -1,5 +1,6 @@
 """Field default type/kind metadata must belong to the exact field token."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -7,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PARSER = (ROOT / "src/parser/parser_types_struct.elisa").read_text()
 CHECKER = (ROOT / "src/semantic/check_field_default_type.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/field_default_type_owner_line_zero.elisa").read_text()
-SMOKE = (ROOT / "test/parity/diagnostics_smoke.sh").read_text()
+SMOKE = read_parity_smoke_source(ROOT / "test/parity/diagnostics_smoke.sh")
 TYPE_HEAD_FIXTURE = (ROOT / "test/repro/field_default_type_mutable_parens.elisa").read_text()
 TYPE_HEAD_SMOKE = (ROOT / "test/parity/field_default_type_head_smoke.sh").read_text()
 AST_TESTS = (ROOT / "test/parity/parser_ast_decls.elisa").read_text()

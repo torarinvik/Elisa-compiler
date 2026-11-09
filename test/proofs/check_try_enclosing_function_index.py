@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source, parity_smoke_inputs
 import re
 import subprocess
 
@@ -211,7 +212,7 @@ zero_offset_enclosing_fixture = ZERO_OFFSET_ENCLOSING_FIXTURE.read_text()
 line_zero_nonerror_fixture = LINE_ZERO_NONERROR_FIXTURE.read_text()
 first_class_ambiguous_family_fixture = FIRST_CLASS_AMBIGUOUS_FAMILY_FIXTURE.read_text()
 first_class_inactive_duplicate_family_fixture = FIRST_CLASS_INACTIVE_DUPLICATE_FAMILY_FIXTURE.read_text()
-try_smoke = TRY_SMOKE.read_text()
+try_smoke = read_parity_smoke_source(TRY_SMOKE)
 private_overload_fixture = PRIVATE_OVERLOAD_FIXTURE.read_text()
 private_overload_smoke = PRIVATE_OVERLOAD_SMOKE.read_text()
 
@@ -1688,7 +1689,7 @@ inputs = list(dict.fromkeys([
     PARSER_CATCH_SOURCE,
     *PARSER_NOMINAL_SOURCES,
     ZERO_OFFSET_ENCLOSING_FIXTURE,
-    TRY_SMOKE,
+    HERE / "parity_smoke_source.py", *parity_smoke_inputs(TRY_SMOKE),
     ROOT / "test/atoms/try_fallback_source.elisa",
     ROOT / "test/repro/try_overload_private_same_named_module_types.elisa",
     ROOT / "test/parity/try_overload_private_same_named_module_types_smoke.sh",

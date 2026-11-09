@@ -1,5 +1,6 @@
 """Bind unbound generic operator checks to exact function declaration identity."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -19,7 +20,7 @@ def function_source(source: str, name: str) -> str:
 
 
 source = SOURCE.read_text()
-smoke = SMOKE.read_text()
+smoke = read_parity_smoke_source(SMOKE)
 sole_param = function_source(source, "gonb_sole_param_name")
 bound_check = function_source(source, "gonb_param_has_any_bound")
 walker = function_source(source, "gonb_walk_declarations")

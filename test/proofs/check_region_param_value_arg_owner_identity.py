@@ -1,5 +1,6 @@
 """Bind region-parameter value-argument checks to exact caller and callee owners."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -21,7 +22,7 @@ def function_source(source: str, name: str) -> str:
 
 
 checker = CHECKER.read_text()
-smoke = SMOKE.read_text()
+smoke = read_parity_smoke_source(SMOKE)
 positive = POS.read_text()
 negative = NEG.read_text()
 

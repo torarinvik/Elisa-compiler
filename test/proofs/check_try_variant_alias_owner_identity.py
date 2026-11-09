@@ -1,5 +1,6 @@
 """Variant alias bindings in try analysis must belong to the exact is-target expression."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -7,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PARSER = (ROOT / "src/parser/parser_expr_binary.elisa").read_text()
 CONSUMER = (ROOT / "src/semantic/check_try_fallible/block_sources.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/try_variant_alias_owner_line_zero.elisa").read_text()
-SMOKE = (ROOT / "test/parity/try_fallible_smoke.sh").read_text()
+SMOKE = read_parity_smoke_source(ROOT / "test/parity/try_fallible_smoke.sh")
 
 
 def function_source(source: str, name: str) -> str:

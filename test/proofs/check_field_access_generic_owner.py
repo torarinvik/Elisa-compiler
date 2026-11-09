@@ -1,5 +1,6 @@
 """Bind unbounded generic field checks to exact declaration owners."""
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source
 import re
 
 
@@ -22,8 +23,8 @@ def function_source(source: str, name: str) -> str:
 
 source = SOURCE.read_text()
 fixture = FIXTURE.read_text()
-smoke = SMOKE.read_text()
-gate = GATE.read_text()
+smoke = read_parity_smoke_source(SMOKE)
+gate = read_parity_smoke_source(GATE)
 
 generic_lookup = function_source(source, "fatp_unbounded_type_params")
 if not all(fragment in generic_lookup for fragment in (

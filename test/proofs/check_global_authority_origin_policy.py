@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from parity_smoke_source import read_parity_smoke_source, parity_smoke_inputs
 import re
 import subprocess
 
@@ -294,7 +295,7 @@ if not all(fragment in alias_index_builder for fragment in (
 text_module = compact(function_section(authority_text, "ga_text_module"))
 if "ga_module_alias_resolve(path,lexical_scope,state,0,true,before_offset)" not in text_module:
     raise SystemExit("GlobalAuthority text module lookup drops its source offset")
-global_authority_smoke = GLOBAL_AUTHORITY_SMOKE.read_text()
+global_authority_smoke = read_parity_smoke_source(GLOBAL_AUTHORITY_SMOKE)
 if 'run_case alias_target_concrete_before_alias ' not in global_authority_smoke or \
         "using Other as A" not in global_authority_smoke or \
         "using A::Foo as F" not in global_authority_smoke or \
@@ -944,6 +945,7 @@ stage1_provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
+    HERE / "parity_smoke_source.py", *parity_smoke_inputs(GLOBAL_AUTHORITY_SMOKE),
     POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_LATE_CONFLICT_FIXTURE, ALIAS_CONFLICT_FIXTURE, STATIC_BRANCH_ALIAS_FIXTURE, ACTIVE_STATIC_ALIAS_FIXTURE, SAME_TARGET_ALIAS_FIXTURE, ALIAS_SMOKE,
     ALIAS_CONFLICT_CHECKER, ALIAS_CONFLICT_DIAGNOSTICS, DIAGNOSTIC_KINDS,
     *source_include_closure([DIAGNOSTIC_KINDS]),
