@@ -19,6 +19,13 @@ for part in \
   platform.sh \
   elisac_stage1.sh \
   stage1_object_cache.py \
+  stage1_object_cache_files.py \
+  stage1_object_cache_merger.py \
+  stage1_shard_cache.py \
+  stage1_shard_batch.py \
+  stage1_shard_serialization.py \
+  stage1_artifact_fingerprint.py \
+  stage1_toolchain_fingerprint.py \
   process_rss.sh \
   assert_stage0_fresh.sh \
   assert_stage1_fresh.sh \
