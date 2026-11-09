@@ -27,7 +27,7 @@ postfix_end = parser_postfix.find("\n\n", postfix_start)
 if "Ast::Expr.Field(active," not in parser_postfix[postfix_start:postfix_end] or \
         "Ast::pos_of_token(token)" not in parser_postfix[postfix_start:postfix_end]:
     raise SystemExit("field callee positions must originate from the dot token")
-if "parser.new_region_use_position(region_new_allocated, Ast::pos_of_token(token))" not in parser or \
+if "new_region_use_position(region_new_allocated, Ast::pos_of_token(token))" not in parser or \
         'name: "__region_use", line: region_use_position.line, offset: region_use_position.offset' not in parser:
     raise SystemExit("parser must record successful constructor selectors at the computed exact position")
 if "region_use_offsets: mutable darray[u32] = []" not in structs:
