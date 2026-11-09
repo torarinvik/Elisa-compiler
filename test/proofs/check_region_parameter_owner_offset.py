@@ -89,9 +89,10 @@ if "function_offset: mutable u32 = 0" not in runtime or \
         "caller_region_parameter_start: mutable i64 = -1" not in runtime or \
         "caller_region_parameter_start: runtime.caller_region_parameter_start" not in runtime_copy or \
         "function_parameter_region_count(fns, function_region_row).i64()" not in body or \
-        "value_type_returns_caller_region(return_value_type, structs) and not params_manage_arena(params, structs)" not in body:
+        "signature_returns_caller_region(return_value_type, function_offset_of(declaration), structs) and not params_manage_arena(params, structs)" not in body or \
+        "return value_type_returns_caller_region(value_type, structs) or signature_returns_ambient_view(value_type, offset, structs)" not in regions:
     raise SystemExit("runtime copies must carry the explicit-region suffix base after hidden parameter and return slots")
-if "region_parameter_index(runtime.function_line, runtime.function_offset, region_new_name, runtime.caller_region_parameter_start, structs)" not in new_expr or \
+if "explicit_region_call_arena(region_new_name, local_scope, runtime, structs, m, ctx, builder)" not in new_expr or \
         "region_parameter_index(runtime.function_line, runtime.function_offset, block_clause[0], runtime.caller_region_parameter_start, structs)" not in in_block or \
         "region_parameter_index(runtime.function_line, runtime.function_offset, pinned_region, runtime.caller_region_parameter_start, structs)" not in var_decl or \
         "pinned_arena <- runtime.caller_arenas[pinned_parameter_index.usize()]" not in var_decl:
