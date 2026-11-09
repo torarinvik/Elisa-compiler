@@ -1,0 +1,233 @@
+extend Semantic:
+    private:
+        # `&count` / `lmut count` of a caller local or parameter: a stack reference handed to
+        # another thread (stage0: "stack mutable i64&"). A task joined later may still race the
+        # owner's frame, and a pool may outlive it, so such a borrow is never shareable.
+        def thread_payload_borrows_local(payload: Ast::Expr, names: darray[sview @source]&, flags: darray[bool]&) -> bool:
+            can Abort.Panic:
+                match payload:
+                    Expr.Ident(name, _):
+                        return thread_flag_for_name(names, flags, name)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return thread_payload_borrows_local(inner, names, flags)
+                    Expr.Unary(operator, operand, _):
+                        if operator == TokenKind.Ampersand or operator == TokenKind.Lmut:
+                            return (affine_root(operand) != "" and any name in names where name == affine_root(operand)) or thread_payload_borrows_local(operand, names, flags)
+                        # `!x` is Elisa's volatile read and preserves x's value type. Other
+                        # unary operators produce a value; do not mistake their source
+                        # operand's borrow for a borrow in the result.
+                        return thread_payload_borrows_local(operand, names, flags) if operator == TokenKind.Bang
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements:
+                            return true if thread_payload_borrows_local(element, names, flags)
+                        return false
+                    # A call's result is independent of the provenance of each argument
+                    # unless its declared result type says otherwise. The result-type walk
+                    # below handles direct calls and fails closed for unresolved callees.
+                    Expr.Call(_, _, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
+                        return false
+                    Expr.Field(object, _, _) | Expr.Index(object, _, _):
+                        return thread_payload_borrows_local(object, names, flags)
+                    Expr.IndexN(object, indices, _):
+                        return true if thread_payload_borrows_local(object, names, flags)
+                        for index in indices:
+                            return true if thread_payload_borrows_local(index, names, flags)
+                        return false
+                    Expr.Construct(_, fields, _):
+                        for field in fields:
+                            return true if thread_payload_borrows_local(field.value, names, flags)
+                        return false
+                    Expr.RecordUpdate(base, fields, _):
+                        return true if thread_payload_borrows_local(base, names, flags)
+                        for field in fields:
+                            return true if thread_payload_borrows_local(field.value, names, flags)
+                        return false
+                    _:
+                        return false
+
+        def thread_expression_type_contains_nonstatic_reference(expression: Ast::Expr, callbacks: mutable ThreadCallbackIndex&, table: SymbolTable&) -> bool can[Abort.Panic, Memory.Allocate]:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match expression:
+                    Expr.Construct(type_expression, fields, _):
+                        # The literal's declared type is what crosses the boundary (stage0
+                        # checks the argument's type); each field value converts to its field
+                        # type, so the field expressions add nothing.
+                        module_scope: sview = table.current_module
+                        return thread_type_may_contain_nonstatic_reference(type_expression, table, callbacks, module_scope)
+                    Expr.RecordUpdate(base, fields, _):
+                        return true if thread_expression_type_contains_nonstatic_reference(base, callbacks, table)
+                        for field in fields:
+                            return true if thread_expression_type_contains_nonstatic_reference(field.value, callbacks, table)
+                        return false
+                    Expr.Array(elements, _) | Expr.Tuple(elements, _):
+                        for element in elements:
+                            return true if thread_expression_type_contains_nonstatic_reference(element, callbacks, table)
+                        return false
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        return thread_expression_type_contains_nonstatic_reference(inner, callbacks, table)
+                    Expr.Call(Expr.Ident(name, _), _, _, _):
+                        # Return provenance comes from the declaration AST because TypeId
+                        # interning erases `static`. Generic and region-parameterized results
+                        # retain their source qualifiers; unresolved overloads combine all
+                        # same-named candidates conservatively.
+                        module_scope: sview = table.current_module
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
+                    Expr.Call(Expr.Scope(module_expression, name, _), _, _, _):
+                        module_scope: mutable sview = ""
+                        can Global{Read,Write}:
+                            module_scope <- thread_scope_module_name(module_expression, callbacks, table)
+                        return true if module_scope == ""
+                        return thread_function_result_may_reference(callbacks, name, module_scope, table)
+                    Expr.Call(_, _, _, _) | Expr.StaticEffectCall(_, _, _, _, _, _):
+                        # Method, indirect, and effect calls lack a resolved return row here.
+                        # Keep them shareability-safe until result provenance is available.
+                        return true
+                    _:
+                        return false
+
+
+        def thread_join_source(expression: Ast::Expr, names: darray[sview @source]&, callbacks: ThreadCallbackIndex&, is_view: bool) -> usize:
+            can Abort.Panic:
+                name: sview = ident_name_of(expression)
+                return names.count if name == ""
+                slot: mutable usize = names.count
+                while slot > 0 |slot|:
+                    slot <- slot - 1.usize()
+                    if names[slot] == name:
+                        for source in callbacks.join_sources:
+                            return source.backing_slot if source.slot == slot and source.is_view == is_view and source.backing_slot < names.count
+                        return names.count
+                return names.count
+
+        def thread_join_byte_array(type_expression: Ast::Expr) -> bool:
+            match type_expression:
+                Expr.Index(Expr.Ident(name, _), Expr.Ident(element, _), _):
+                    return name == "darray" and element == "u8"
+                Expr.Unary(operator, inner, _) if operator == TokenKind.Mutable:
+                    return thread_join_byte_array(inner)
+                Expr.Paren(inner, _):
+                    return thread_join_byte_array(inner)
+                _:
+                    return false
+
+        # Record only direct owned byte-array literals and immutable sview bindings
+        # whose initializer is the byte array's built-in view or an already proven view.
+        def thread_note_join_source(type_expression: Ast::Expr, value: Ast::Expr, binding_mutable: bool, names: darray[sview @source]&, callbacks: mutable ThreadCallbackIndex&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                if (value is Expr.Array(_, _)) and thread_join_byte_array(type_expression):
+                    callbacks.join_sources.push(ThreadJoinSource{slot: names.count, backing_slot: names.count, is_view: false})
+                    return
+                return if binding_mutable or ident_name_of(type_expression) != "sview"
+                backing: mutable usize = names.count
+                match value:
+                    Expr.Call(Expr.Field(receiver, method, _), arguments, _, _) if method == "as_sview" and arguments.count == 0:
+                        backing <- thread_join_source(receiver, names, callbacks, false)
+                    _:
+                        backing <- thread_join_source(value, names, callbacks, true)
+                callbacks.join_sources.push(ThreadJoinSource{slot: names.count, backing_slot: backing, is_view: true}) if backing < names.count
+
+        def thread_invalidate_join_source(target: Ast::Expr, names: darray[sview @source]&, callbacks: mutable ThreadCallbackIndex&) -> void:
+            can Abort.Panic:
+                return if callbacks.join_sources.count == 0
+                if target is Expr.Array(targets, _):
+                    for element in targets |callbacks|:
+                        thread_invalidate_join_source(element, names, callbacks)
+                    return
+                name: sview = ident_name_of(target)
+                return if name == ""
+                slot: mutable usize = names.count
+                while slot > 0 |slot, callbacks|:
+                    slot <- slot - 1.usize()
+                    if names[slot] == name:
+                        for index in 0..<callbacks.join_sources.count |callbacks, slot|:
+                            if callbacks.join_sources[index].slot == slot or callbacks.join_sources[index].backing_slot == slot:
+                                callbacks.join_sources[index] <- ThreadJoinSource{slot: callbacks.join_sources[index].slot, backing_slot: 0.usize() - 1.usize(), is_view: false}
+                        return
+
+        def thread_joined_view(payload: Ast::Expr, names: darray[sview @source]&, callbacks: ThreadCallbackIndex&) -> bool:
+            can Abort.Panic:
+                return false if not callbacks.join_active
+                backing: usize = thread_join_source(payload, names, callbacks, true)
+                return backing < names.count and backing < callbacks.join_floor
+
+
+        def report_thread_payload(call_name: sview @source, payload: Ast::Expr, line: u32, names: darray[sview @source]&, flags: darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                payload_name: sview = affine_root(payload)
+                parameter_index: usize = thread_function_param_index(callbacks, payload_name)
+                callbacks.generic_deferred <- true if parameter_index < callbacks.function_param_deferred.count and callbacks.function_param_deferred[parameter_index]
+                should_report: mutable bool = payload_name != "" and thread_flag_for_name(names, flags, payload_name)
+                if not should_report:
+                    should_report <- thread_payload_borrows_local(payload, names, flags)
+                if not should_report:
+                    should_report <- match payload:
+                        Expr.Call(Expr.Ident(call_name_inner, _), call_arguments, _, _): thread_call_may_reference(call_name_inner, Ast::Expr.Absent, call_arguments, names, flags, callbacks, table)
+                        Expr.Call(Expr.Field(receiver, method, _), call_arguments, _, _): thread_call_may_reference(method, receiver, call_arguments, names, flags, callbacks, table)
+                        _: thread_expression_type_contains_nonstatic_reference(payload, callbacks, table)
+                if should_report:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ThreadArgumentNotShareable, name: call_name, line: line, expected: "", actual: "reference"})
+
+
+        def thread_function_param_index(callbacks: ThreadCallbackIndex&, name: sview) -> usize:
+            can Abort.Panic:
+                return callbacks.function_params.count if name == ""
+                for index in 0..<callbacks.function_params.count |name, callbacks|:
+                    return index if callbacks.function_params[index] == name
+                return callbacks.function_params.count
+
+        def thread_derived_index(callbacks: ThreadCallbackIndex&, name: sview) -> usize:
+            can Abort.Panic:
+                return callbacks.derived_names.count if name == ""
+                for index in 0..<callbacks.derived_names.count |name, callbacks|:
+                    return index if callbacks.derived_names[index] == name
+                return callbacks.derived_names.count
+
+        def thread_register_derived_boundary(callbacks: mutable ThreadCallbackIndex&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if callbacks.function_name == "" or thread_derived_index(callbacks, callbacks.function_name) < callbacks.derived_names.count
+                callbacks.derived_names.push(callbacks.function_name)
+                callbacks.derived_param_starts.push(callbacks.derived_param_is_fn.count)
+                callbacks.derived_param_counts.push(callbacks.function_param_is_fn.count)
+                for is_fn in callbacks.function_param_is_fn |callbacks|:
+                    callbacks.derived_param_is_fn.push(is_fn)
+
+        # Whether a parameter annotation is an fn type (`fn(...) -> T`; in type position
+        # it may also parse through the lambda word).
+        def thread_type_is_fn(type_expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match type_expression:
+                    Expr.Binary(signature, operator, _, _):
+                        return operator == TokenKind.Arrow and thread_type_is_fn(signature)
+                    Expr.Call(callee: callee, _):
+                        return ident_name_of(callee) == "fn"
+                    Expr.Lambda(_, _, _):
+                        return true
+                    Expr.Paren(inner, _):
+                        return thread_type_is_fn(inner)
+                    _:
+                        return false
+
+        def check_thread_boundary_call(callee: Ast::Expr, arguments: darray[Ast::Expr]&, line: u32, names: darray[sview @source]&, flags: darray[bool]&, callbacks: mutable ThreadCallbackIndex&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                call_name: sview = match callee:
+                    Expr.Ident(name, call_line): name
+                    _: ""
+                callbacks.generic_deferred <- false
+                if call_name != "spawn1" and call_name != "pool_submit1" and call_name != "spawn_daemon":
+                    derived_index: usize = thread_derived_index(callbacks, call_name)
+                    return if derived_index >= callbacks.derived_names.count
+                    start: usize = callbacks.derived_param_starts[derived_index]
+                    for argument_index in 0..<arguments.count |table|:
+                        if argument_index < callbacks.derived_param_counts[derived_index] and callbacks.derived_param_is_fn[start + argument_index]:
+                            table <- report_thread_callback_result(call_name, arguments[argument_index], line, callbacks, table)
+                        else:
+                            table <- report_thread_payload(call_name, arguments[argument_index], line, names, flags, callbacks, table)
+                    thread_register_derived_boundary(callbacks) if callbacks.generic_deferred
+                    return
+                callback_index: usize = 0 if call_name == "spawn1" or call_name == "spawn_daemon" else 1
+                if callback_index < arguments.count:
+                    table <- report_thread_callback_result(call_name, arguments[callback_index], line, callbacks, table)
+                if arguments.count > 0:
+                    table <- report_thread_payload(call_name, arguments[arguments.count - 1], line, names, flags, callbacks, table)
+                thread_register_derived_boundary(callbacks) if callbacks.generic_deferred

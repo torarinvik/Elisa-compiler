@@ -23,7 +23,7 @@ def function_source(source: str, name: str) -> str:
 
 
 thread = THREAD.read_text()
-reference_types = REFERENCE_TYPES.read_text()
+reference_types = REFERENCE_TYPES.read_text() + REFERENCE_TYPES.with_name("payloads.elisa").read_text()
 walk = WALK.read_text()
 smoke = SMOKE.read_text()
 positive = POS.read_text()
