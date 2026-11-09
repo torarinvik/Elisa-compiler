@@ -38,7 +38,7 @@ def function_source(path: Path, name: str) -> str:
     return match.group(0)
 
 
-resolver = function_source(TRY, "try_error_family_ref_for_annotation")
+resolver = function_source(TRY.with_name("check_try_error_family.elisa"), "try_error_family_ref_for_annotation")
 if "table: mutable SymbolTable&" not in resolver:
     raise SystemExit("canonical Try family resolution must retain its mutable SymbolTable contract")
 

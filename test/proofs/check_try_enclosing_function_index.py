@@ -22,6 +22,8 @@ BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).reso
 MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE_FILES = [
     ROOT / "src/semantic/check_try_fallible.elisa",
+    ROOT / "src/semantic/check_try_callable_lookup.elisa",
+    ROOT / "src/semantic/check_try_error_family.elisa",
     ROOT / "src/semantic/check_try_fallible/using_aliases.elisa",
     ROOT / "src/semantic/check_try_fallible/callable_errors.elisa",
     ROOT / "src/semantic/check_try_fallible/callable_rows.elisa",

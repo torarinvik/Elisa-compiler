@@ -382,7 +382,7 @@ def require_static_call_context_identity() -> None:
     statement_walker = compact(function_section(source, "static_call_check_statements"))
     walker = compact(function_section(source, "check_static_call_context_walk"))
     entrypoint = compact(function_section(source, "check_static_call_context"))
-    module_ancestor = compact(function_section(TRY_FALLIBLE.read_text(), "try_noncall_module_is_ancestor"))
+    module_ancestor = compact(function_section(TRY_FALLIBLE.with_name("check_try_error_family.elisa").read_text(), "try_noncall_module_is_ancestor"))
     if not all(fragment in declaration_match for fragment in (
             'annotation.owner!="__static_fn"',
             "annotation.name==function_name",

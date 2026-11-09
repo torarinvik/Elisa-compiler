@@ -65,7 +65,7 @@ if not (cycle_guard in fallback and push in fallback and pop in fallback):
 
 for import_path in (
     function_source("esh_import_path_matches"),
-    function_source("try_error_set_import_path_matches", TRY),
+    function_source("try_error_set_import_path_matches", TRY.with_name("check_try_callable_lookup.elisa")),
 ):
     if "catch_module_qualifier_alias_target(" in import_path or \
             "catch_module_path_matches_relative(import_module, raw_module, declaration_module)" not in import_path:
