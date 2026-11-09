@@ -26,6 +26,7 @@ HOLDER_PARTS = [
     HOLDER_SOURCE,
     ROOT / "src/semantic/check_call_holder_view_store/type_references.elisa",
     ROOT / "src/semantic/check_call_holder_view_store/alias_expressions.elisa",
+    ROOT / "src/semantic/check_call_holder_view_store/alias_calls.elisa",
     ROOT / "src/semantic/check_call_holder_view_store/flow_binders.elisa",
     ROOT / "src/semantic/check_call_holder_view_store/walk.elisa",
 ]
