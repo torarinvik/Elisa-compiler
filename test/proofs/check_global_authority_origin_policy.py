@@ -641,8 +641,9 @@ if "origin:usize=ga_update_reference_origin(target,value,state)" not in rebind_b
     raise SystemExit("reference rebinds must retain their new origin and charge writes to exact global roots")
 rebind_origin = compact(function_section(authority_text, "ga_update_reference_origin"))
 if "source_origin:usize=ga_reference_rebind_origin(value,state,0)" not in rebind_origin or \
-        "state.local_global_origins[local_index]<-GLOBAL_AUTHORITY_UNKNOWN_ALIAS" not in rebind_origin or \
-        "returnstate.local_global_origins[local_index]" not in rebind_origin:
+        "state.local_global_origins[local_index]<-ga_join_origins(state,previous_origin,source_origin)" not in rebind_origin or \
+        "returnstate.local_global_origins[local_index]" not in rebind_origin or \
+        "returnGLOBAL_AUTHORITY_UNKNOWN_ALIASifleft==GLOBAL_AUTHORITY_UNKNOWN_ALIASorright==GLOBAL_AUTHORITY_UNKNOWN_ALIAS" not in compact(function_section(authority_text, "ga_join_origins")):
     raise SystemExit("reference rebinds must preserve unresolved aliases for conservative checks at later access")
 write_place_body = compact(function_section(authority_text, "ga_write_place_inner"))
 if "ifga_expression_is_reference(expression,state,0):table<-ga_access(expression,true,state,table)canGlobal{Read,Write}" not in write_place_body:
