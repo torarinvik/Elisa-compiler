@@ -1,5 +1,6 @@
 """Render proofs derived from the generated Unicode classifier."""
 
+import re
 from typing import Optional
 
 SCALAR_MAX = "0x10FFFF"
@@ -48,16 +49,24 @@ def render_bounds_parts(table: dict) -> dict[str, str]:
     blocks = render_bounds(table).strip().split("\n\n")
     files = {}
     current = []
+
+    def add_file(group: list[str]) -> None:
+        content = "\n\n".join(group) + "\n"
+        names = re.findall(r"(?m)^def (unicode_[a-z0-9_]+?)(?:_page)?_intervals_are_valid_and_ordered\(", content)
+        if not names:
+            raise ValueError("generated Unicode bounds have no theorem names")
+        files[f"lexer_bounds_{names[0]}_through_{names[-1]}.elisa"] = content
+
     for block in blocks:
         candidate = "\n\n".join(current + [block]) + "\n"
         if len(candidate.splitlines()) > 590 and current:
-            files[f"lexer_unicode_range_bounds_part_{len(files) + 1:02}.elisa"] = "\n\n".join(current) + "\n"
+            add_file(current)
             current = []
         current.append(block)
         if len(("\n\n".join(current) + "\n").splitlines()) > 600:
             raise ValueError("one generated Unicode proof exceeds 600 lines")
     if current:
-        files[f"lexer_unicode_range_bounds_part_{len(files) + 1:02}.elisa"] = "\n\n".join(current) + "\n"
+        add_file(current)
     return files
 
 

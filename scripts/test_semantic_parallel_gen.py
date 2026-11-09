@@ -2,9 +2,10 @@
 """Focused soundness and precision checks for the semantic parallel audit."""
 import unittest
 
-from semantic_parallel_audit_cases_01 import SemanticParallelAuditPart1
-from semantic_parallel_audit_cases_02 import SemanticParallelAuditPart2
-from semantic_parallel_audit_cases_03 import SemanticParallelAuditPart3
+from semantic_parallel_audit_borrow_tests import SemanticParallelBorrowTests
+from semantic_parallel_audit_flow_tests import SemanticParallelFlowTests
+from semantic_parallel_audit_dispatch_tests import SemanticParallelDispatchTests
+from semantic_parallel_audit_calls_tests import SemanticParallelCallsTests
 
 
 if __name__ == "__main__":
