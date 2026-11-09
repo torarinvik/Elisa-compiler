@@ -78,6 +78,7 @@ def read_semantic_declaration_source(path: Path) -> str:
     text = path.read_text()
     prefixes = {
         "semantic_types_symbol_table.elisa": "symbol_table_",
+        "full_pipeline.elisa": "pipeline_",
         "compiler_semantic.elisa": "compiler_semantic_cases_",
     }
     prefix = prefixes.get(path.name)
@@ -85,7 +86,10 @@ def read_semantic_declaration_source(path: Path) -> str:
         return text
     def expand(match):
         name = match.group(1)
-        return (path.parent / name).read_text() if name.startswith(prefix) else match.group(0)
+        if not name.startswith(prefix):
+            return match.group(0)
+        fragment = (path.parent / name).read_text()
+        return fragment.rstrip("\n") if path.name == "full_pipeline.elisa" else fragment
     return re.sub(r'^include "\./([^"/]+)"[ \t]*$', expand, text, flags=re.MULTILINE)
 
 

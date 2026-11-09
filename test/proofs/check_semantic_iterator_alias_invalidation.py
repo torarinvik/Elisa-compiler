@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 argument_parser = argparse.ArgumentParser()
@@ -352,7 +352,7 @@ if compact("Expr.Ident(_, _):ident_name_of(stripped)") not in alias_binding:
     raise SystemExit("bare reference-value copies are no longer included in the conservative alias set")
 if 'include "./check_mutate_while_iterating.elisa"' not in SEMANTIC_ROOT.read_text():
     raise SystemExit("semantic root no longer includes the iterator invalidation pass")
-if compact(SEMANTIC_API.read_text()).count("table<-check_mutate_while_iterating(loop_view,table)") != 1:
+if compact(read_semantic_declaration_source(SEMANTIC_API)).count("table<-check_mutate_while_iterating(loop_view,table)") != 1:
     raise SystemExit("semantic pipeline must execute iterator invalidation exactly once")
 
 source_closure = source_include_closure([POSITIVE, NEGATIVE])
@@ -374,7 +374,7 @@ manifest = BIN.with_name(BIN.name + ".manifest.json")
 inputs = list(dict.fromkeys([
     BIN, manifest, manifest.with_name(manifest.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", MODULE, CHECKER,
+    Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([SEMANTIC_API]), MODULE, CHECKER,
     SEMANTIC_ROOT, SEMANTIC_API, POSITIVE, NEGATIVE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}

@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,7 +56,7 @@ def declarations(source: str) -> set[str]:
 
 policy_text = POLICY.read_text()
 resolver_text = RESOLVER.read_text()
-semantic_api_full_pipeline_text = SEMANTIC_API_FULL_PIPELINE.read_text()
+semantic_api_full_pipeline_text = read_semantic_declaration_source(SEMANTIC_API_FULL_PIPELINE)
 semantic_api_table_setup_text = SEMANTIC_API_TABLE_SETUP.read_text()
 semantic_api_diagnostics_text = SEMANTIC_API_DIAGNOSTICS.read_text()
 positive_text = POSITIVE.read_text()
@@ -192,7 +192,7 @@ provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1, provenance, Path(__file__),
-    HERE / "proof_product_gate.py", POLICY, RESOLVER,
+    HERE / "proof_product_gate.py", *source_include_closure([SEMANTIC_API_FULL_PIPELINE]), POLICY, RESOLVER,
     SEMANTIC_API_FULL_PIPELINE, SEMANTIC_API_TABLE_SETUP, SEMANTIC_API_DIAGNOSTICS,
     *sorted(SEMANTIC_DIR.rglob("*.elisa")),
     POSITIVE, NEGATIVE, *source_closure,

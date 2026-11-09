@@ -25,7 +25,7 @@ def append_only(_services, info, name):
 def pipeline_statements(_services):
     """(line index, indent, pass name, args, cond) for each `table <- pass(...)` statement in
     check_full_into_pipeline, plus the function's parameter names."""
-    lines = open(_services['API'], encoding="utf-8").read().split("\n")
+    lines = _services['read_pipeline_source'](_services['API'], annotated=True).split("\n")
     start = next(i for i, l in enumerate(lines) if re.match(r"\s*def " + _services['PIPELINE'] + r"(?:\[[^\]]*\])?\(", l))
     params = [p.split(":")[0].strip() for p in _services['DEF_RE'].match(lines[start]).group(3).split(",")]
     indent = len(lines[start]) - len(lines[start].lstrip())

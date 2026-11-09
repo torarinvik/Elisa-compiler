@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -120,7 +120,7 @@ if 'include "./check_law_subject.elisa"' not in SEMANTIC_ROOT.read_text():
 parallel = compact(PARALLEL_PASSES.read_text())
 if f"ifpass_id=={LAW_SUBJECT_PASS_ID}:table<-check_law_subject(loop_view,table)" not in parallel:
     raise SystemExit("parallel semantic dispatcher no longer calls the law-subject pass at its assigned id")
-pipeline = compact(SEMANTIC_API.read_text())
+pipeline = compact(read_semantic_declaration_source(SEMANTIC_API))
 if f"par_pass_run(file,flags,table,shared_pool,loop_view,{LAW_SUBJECT_BATCH_START},{LAW_SUBJECT_BATCH_SIZE})" not in pipeline:
     raise SystemExit("semantic pipeline no longer schedules the law-subject pass")
 expected_message = 'DiagnosticKind.LawNeedsSubject: buffer.extend(f"law \\"{diagnostic.name}\\" needs a subject: give it at least one value parameter (conventionally `self`)")'
@@ -181,7 +181,7 @@ stage1_product = Path(product["compiler"]["product"]["path"]).resolve(strict=Tru
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
-    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
+    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([SEMANTIC_API]),
     PARSER, PARSER_HEADER, SEMANTIC_PASS, SEMANTIC_ROOT, PARALLEL_PASSES,
     SEMANTIC_API, DIAGNOSTIC_MESSAGE, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),

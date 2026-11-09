@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve(strict=True)
@@ -135,7 +135,7 @@ if 'include "./check_law_subject_type.elisa"' not in SEMANTIC.read_text():
 parallel = compact(PARALLEL_PASSES.read_text())
 if f"pass_id=={PASS_ID}:table<-check_law_subject_type(loop_view,table)" not in parallel:
     raise SystemExit("parallel semantic dispatcher no longer calls the subject-type pass")
-pipeline = compact(SEMANTIC_API.read_text())
+pipeline = compact(read_semantic_declaration_source(SEMANTIC_API))
 if f"par_pass_run(file,flags,table,shared_pool,loop_view,{BATCH_START},{BATCH_SIZE})" not in pipeline:
     raise SystemExit("semantic pipeline no longer schedules the subject-type pass")
 
@@ -194,7 +194,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", PARSER, SOURCE, SEMANTIC,
+    Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([SEMANTIC_API]), PARSER, SOURCE, SEMANTIC,
     PARALLEL_PASSES, SEMANTIC_API, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
 ]))

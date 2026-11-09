@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 ROOT = Path(__file__).resolve().parents[2]
 PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).resolve()
@@ -89,7 +89,7 @@ if 'include "./check_modulo_by_zero.elisa"' not in SEMANTIC.read_text():
 parallel = compact(PARALLEL_PASSES.read_text())
 if "ifpass_id==39:table<-check_modulo_by_zero(loop_view.top_decls,table)" not in parallel:
     raise SystemExit("parallel semantic dispatch no longer calls modulo-by-zero at pass id 39")
-if "par_pass_run(file,flags,table,shared_pool,loop_view,35,8)" not in compact(SEMANTIC_API.read_text()):
+if "par_pass_run(file,flags,table,shared_pool,loop_view,35,8)" not in compact(read_semantic_declaration_source(SEMANTIC_API)):
     raise SystemExit("semantic pipeline no longer schedules the modulo-by-zero pass")
 
 mutations = (
@@ -272,7 +272,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", DIVISION_CHECKER, SOURCE,
+    Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([SEMANTIC_API]), DIVISION_CHECKER, SOURCE,
     SEMANTIC, SEMANTIC_API, PARALLEL_PASSES, AST_NODES, AST_SIDE_TABLES, EFFECT_TYPE_SHAPE, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
 ]))

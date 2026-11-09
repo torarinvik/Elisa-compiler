@@ -8,7 +8,7 @@ import sys
 
 def generated_parallel_errors(_services, info):
     """Validate generated pipeline ranges against the dispatcher's ordered pass IDs."""
-    api = open(_services['API'], encoding="utf-8").read()
+    api = _services['read_pipeline_source'](_services['API'])
     passes = open(_services['PASSES'], encoding="utf-8").read()
     parallel = open(os.path.join(_services['SRC'], "semantic", "semantic_parallel.elisa"), encoding="utf-8").read()
     errors = []

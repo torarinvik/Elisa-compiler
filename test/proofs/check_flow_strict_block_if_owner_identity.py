@@ -15,7 +15,7 @@ types = read("src/semantic/semantic_types_symbol_table.elisa")
 table_setup = read("src/semantic/semantic_api/table_setup.elisa")
 diagnostics = read("src/semantic/semantic_api/diagnostic_output.elisa")
 checker = read("src/semantic/check_flow_shapes_strict.elisa")
-pipeline = read("src/semantic/semantic_api/full_pipeline.elisa")
+pipeline = read_semantic_declaration_source(ROOT / "src/semantic/semantic_api/full_pipeline.elisa")
 fixture = read("test/repro/flow_strict_block_if_owner_line_zero.elisa")
 smoke = read("test/parity/flow_strict_block_if_owner_line_zero_smoke.sh")
 

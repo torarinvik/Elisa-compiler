@@ -10,7 +10,7 @@ from parity_smoke_source import read_parity_smoke_source, parity_smoke_inputs
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 parser = argparse.ArgumentParser()
@@ -203,7 +203,7 @@ def constant_definitions(source: str) -> dict[str, tuple[str, str]]:
 
 source_text = "\n".join(path.read_text() for path in SOURCE_FILES)
 semantic_text = SEMANTIC.read_text()
-pipeline_text = "\n".join(path.read_text() for path in PIPELINE_FILES)
+pipeline_text = "\n".join(read_semantic_declaration_source(path) for path in PIPELINE_FILES)
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 qualified_leaf_fixture = QUALIFIED_LEAF_FIXTURE.read_text()
@@ -1681,7 +1681,7 @@ inputs = list(dict.fromkeys([
     HERE / "proof_product_gate.py",
     *SOURCE_FILES,
     SEMANTIC,
-    *PIPELINE_FILES,
+    *PIPELINE_FILES, *source_include_closure([PIPELINE_FILES[-1]]),
     PARSER_ARGUMENT_SOURCE,
     PARSER_FUNCTION_SOURCE,
     PARSER_DECLARATION_SOURCE,

@@ -1,5 +1,6 @@
 """Extern signature contracts must stay bound to their declaration offset."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 from parity_smoke_source import read_parity_smoke_source
 import re
 
@@ -33,7 +34,7 @@ extern_contract = source("src/semantic/check_extern_contract.elisa")
 extern_resource = source("src/semantic/check_extern_resource.elisa")
 extern_bounds = source("src/semantic/check_extern_bounds.elisa")
 extern_header_probe = source("src/parser/parser_extern_header_probes.elisa")
-pipeline = source("src/semantic/semantic_api/full_pipeline.elisa")
+pipeline = read_semantic_declaration_source(ROOT / "src/semantic/semantic_api/full_pipeline.elisa")
 unsafe_report = source("src/driver/elisac_emit_unsafe_externs.elisa")
 backend_ensure = source("src/backend/codegen_extern_ensure.elisa")
 backend_side_tables = source("src/backend/codegen_struct_table_side_tables.elisa")

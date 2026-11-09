@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 argument_parser = argparse.ArgumentParser()
 argument_parser.add_argument("--source-only", action="store_true")
@@ -34,7 +34,7 @@ if not __debug__:
 source = SORTED.read_text()
 origin_builder = ORIGIN_BUILDER.read_text()
 semantic = SEMANTIC.read_text()
-pipeline = PIPELINE.read_text()
+pipeline = read_semantic_declaration_source(PIPELINE)
 consumer = CONSUMER.read_text()
 sorted_consumer = SORTED_CONSUMER.read_text()
 positive = POSITIVE.read_text()
@@ -210,7 +210,7 @@ inputs = [
     stage1_product,
     stage1_provenance,
     Path(__file__),
-    HERE / "proof_product_gate.py",
+    HERE / "proof_product_gate.py", *source_include_closure([PIPELINE]),
     POSITIVE,
     NEGATIVE,
     SORTED,

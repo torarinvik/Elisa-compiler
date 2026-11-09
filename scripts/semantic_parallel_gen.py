@@ -41,6 +41,8 @@ import os
 import re
 import sys
 
+from semantic_pipeline_source import read_pipeline_source, write_pipeline_source
+
 # Shared services preserve one audit configuration across the responsibility modules.
 import semantic_parallel_source_scan
 import semantic_parallel_syntax_walk
@@ -520,7 +522,7 @@ def main(argv):
         except ValueError as error:
             print("semantic_parallel_gen: refusing --write: " + str(error))
             return 1
-        open(API, "w", encoding="utf-8").write("\n".join(flat))
+        write_pipeline_source(API, "\n".join(flat))
         generated_counts = [int(m.group(5)) for line in flat for m in [PAR_RUN_RE.search(line)] if m]
         if calls or not generated_counts:
             max_batch = max((len(run) for run in runs), default=1)

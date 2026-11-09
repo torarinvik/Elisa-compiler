@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 
 
@@ -46,7 +47,7 @@ body_walk = function_source(source, "check_unknown_types_in_body")
 declaration_walk = function_source(source, "check_unknown_type_name_in")
 entrypoint = function_source(source, "check_unknown_type_name")
 alias_entrypoint = function_source(source, "check_alias_target_type")
-pipeline = PIPELINE.read_text()
+pipeline = read_semantic_declaration_source(PIPELINE)
 parser_dispatch = PARSER_DISPATCH.read_text()
 parser_law = PARSER_LAW.read_text()
 parser_types = PARSER_TYPES.read_text()

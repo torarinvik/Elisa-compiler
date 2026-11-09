@@ -317,7 +317,7 @@ inputs = list(dict.fromkeys([
     stage1_product,
     stage1_provenance,
     Path(__file__),
-    HERE / "proof_product_gate.py",
+    HERE / "proof_product_gate.py", *source_include_closure([FULL_PIPELINE]),
     HERE / "static_if_source_inspection.py", HERE / "static_if_fixture_checks.py", HERE / "static_if_backend_checks.py",
     BRANCH_TAGS,
     PARSER_FACADE,

@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -213,7 +213,7 @@ if ('include "./parser_types_signature.elisa"' not in parser_root_text or
 dispatch_text = DISPATCH.read_text()
 if not direct_child(dispatch_text, f"if pass_id == {PASS_ID}:", "table <- check_fulfills_whole_function(loop_view, table)"):
     raise SystemExit("parallel semantic dispatch no longer invokes the whole-function fulfills check")
-if f"par_pass_run(file, flags, table, shared_pool, loop_view, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in PIPELINE.read_text():
+if f"par_pass_run(file, flags, table, shared_pool, loop_view, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in read_semantic_declaration_source(PIPELINE):
     raise SystemExit("semantic pipeline no longer schedules the pass containing the whole-function fulfills check")
 
 expected_positive = {
@@ -283,7 +283,7 @@ stage1_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=Tr
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
-    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
+    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([PIPELINE]),
     PARSER, PARSER_SUPPORT, PARSER_ROOT, PASS, SEMANTIC, DISPATCH, PIPELINE, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
 ]))

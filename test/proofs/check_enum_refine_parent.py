@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -152,7 +152,7 @@ if 'include "./check_enum_refine_parent.elisa"' not in SEMANTIC.read_text():
 dispatch_text = DISPATCH.read_text()
 if not direct_child(dispatch_text, f"if pass_id == {PASS_ID}:", "table <- check_enum_refine_parent(loop_view, table)"):
     raise SystemExit("parallel semantic dispatcher no longer invokes the enum-refinement check")
-if f"par_pass_run(file, flags, table, shared_pool, loop_view, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in PIPELINE.read_text():
+if f"par_pass_run(file, flags, table, shared_pool, loop_view, {PASS_BATCH_START}, {PASS_BATCH_SIZE})" not in read_semantic_declaration_source(PIPELINE):
     raise SystemExit("semantic pipeline no longer schedules the enum-refinement pass batch")
 
 expected_positive = {
@@ -199,7 +199,7 @@ stage1_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=Tr
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
-    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
+    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([PIPELINE]),
     PARSER, PARSER_ROOT, PASS, SEMANTIC, DISPATCH, PIPELINE, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
 ]))

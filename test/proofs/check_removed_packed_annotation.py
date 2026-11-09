@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -133,7 +133,7 @@ if 'include "./check_removed_packed_annotation.elisa"' not in SEMANTIC_LATE_CHEC
 parallel = compact(PARALLEL_PASSES.read_text())
 if f"ifpass_id=={REMOVED_PACKED_PASS_ID}:table<-check_removed_packed_annotation(loop_view,table)" not in parallel:
     raise SystemExit("parallel semantic dispatch no longer calls the proved removed packed-annotation pass")
-pipeline = compact(SEMANTIC_API.read_text())
+pipeline = compact(read_semantic_declaration_source(SEMANTIC_API))
 if f"par_pass_run(file,flags,table,shared_pool,loop_view,{REMOVED_PACKED_BATCH_START},{REMOVED_PACKED_BATCH_SIZE})" not in pipeline:
     raise SystemExit("semantic pipeline no longer schedules the removed packed-annotation pass")
 
@@ -183,7 +183,7 @@ stage1_product = Path(product["compiler"]["product"]["path"]).resolve(strict=Tru
 stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
-    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
+    stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([SEMANTIC_API]),
     SOURCE, SEMANTIC, SEMANTIC_LATE_CHECKS, PARALLEL_PASSES, SEMANTIC_API, POSITIVE, NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE]),
 ]))

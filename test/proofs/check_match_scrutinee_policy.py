@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -72,7 +72,7 @@ consumer_text = CONSUMER.read_text()
 semantic_text = SEMANTIC.read_text()
 semantic_api_text = SEMANTIC_API.read_text()
 semantic_late_checks_text = SEMANTIC_LATE_CHECKS.read_text()
-semantic_pipeline_text = SEMANTIC_PIPELINE.read_text()
+semantic_pipeline_text = read_semantic_declaration_source(SEMANTIC_PIPELINE)
 semantic_diagnostics_text = SEMANTIC_DIAGNOSTICS.read_text()
 driver_text = DRIVER.read_text()
 driver_probes_text = DRIVER_PROBES.read_text()
@@ -274,7 +274,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1_product, stage1_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", POLICY, CONSUMER,
+    Path(__file__), HERE / "proof_product_gate.py", *source_include_closure([SEMANTIC_PIPELINE]), POLICY, CONSUMER,
     SEMANTIC, SEMANTIC_API, SEMANTIC_LATE_CHECKS, SEMANTIC_PIPELINE,
     SEMANTIC_DIAGNOSTICS, DRIVER, DRIVER_PROBES, INCREMENTAL_GATE,
     POSITIVE, NEGATIVE, *source_closure,

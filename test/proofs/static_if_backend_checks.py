@@ -1,4 +1,5 @@
 """Check static if backend checks."""
+from proof_product_gate import read_semantic_declaration_source
 from static_if_source_inspection import compact, direct_children, function_section, source_code
 
 
@@ -107,7 +108,7 @@ def require_backend_position_identity(*, BACKEND_ID_FIXTURE, CODEGEN_DECL_HOISTI
     condition_check = compact(function_section(STATIC_IF_CONDITION.read_text(), "check_static_if_condition"))
     condition_owner_walk = compact(function_section(STATIC_IF_CONDITION.read_text(), "static_if_mark_statement_owners"))
     function_owner_walk = compact(function_section(STATIC_IF_CONDITION.read_text(), "static_if_collect_function_owners"))
-    pipeline = compact(FULL_PIPELINE.read_text())
+    pipeline = compact(read_semantic_declaration_source(FULL_PIPELINE))
     ast_condition = compact(function_section(DRIVER_AST_DECL.read_text(), "emit_ast_static_condition"))
     selected_offsets = compact(function_section(SELECTOR.read_text(), "static_if_offsets_for_rows"))
     if not all(fragment in selected_offsets for fragment in (

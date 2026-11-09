@@ -43,7 +43,7 @@ class ParallelGateRegression(unittest.TestCase):
     def test_runtime_checks_whole_batch_before_worker_submission(self):
         runtime = (ROOT / 'src/semantic/semantic_parallel.elisa').read_text()
         self.assertEqual(audit.parallel_runtime_serial_guard_errors(runtime), [])
-        pipeline = (ROOT / 'src/semantic/semantic_api/full_pipeline.elisa').read_text()
+        pipeline = audit.read_pipeline_source(ROOT / 'src/semantic/semantic_api/full_pipeline.elisa')
         calls, errors = audit.par_run_calls(pipeline.splitlines())
         self.assertEqual(errors, [])
         self.assertTrue(any(call["start"] == 80 and call["count"] == 1 for call in calls))
