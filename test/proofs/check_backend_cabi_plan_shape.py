@@ -42,7 +42,7 @@ for path, expected in ((POSITIVE, POSITIVE_HASHES), (NEGATIVE, NEGATIVE_HASHES))
             raise SystemExit(f"{name} proof changed since source binding")
 if not NEGATIVE.read_text().startswith('include "./backend_cabi_plan_shape.elisa"'):
     raise SystemExit("false controls must import the C ABI shape model")
-body = compact(section(SOURCE.read_text(), "emit_direct_call_indexed"))
+body = compact(section(SOURCE.read_text() + SOURCE.with_name("codegen_call_indexed_result.elisa").read_text() + SOURCE.with_name("codegen_call_indexed_helpers.elisa").read_text(), "emit_direct_call_indexed"))
 if 'include "./codegen_call_direct.elisa"' not in CALL_FACADE.read_text():
     raise SystemExit("direct-call implementation is no longer included by the production call facade")
 ordered = (

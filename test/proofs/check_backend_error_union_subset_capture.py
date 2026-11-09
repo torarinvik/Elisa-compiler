@@ -2,7 +2,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CALL = (ROOT / "src/backend/codegen_call_direct.elisa").read_text()
+CALL = (ROOT / "src/backend/codegen_call_direct.elisa").read_text() + (ROOT / "src/backend/codegen_call_indexed_result.elisa").read_text() + (ROOT / "src/backend/codegen_call_indexed_helpers.elisa").read_text()
 FIXTURE = (ROOT / "test/fixtures/effects/error_union_subset_capture_cleanup.elisa").read_text()
 SMOKE = (ROOT / "test/parity/error_union_subset_capture_smoke.sh").read_text()
 

@@ -4,7 +4,7 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-CALL = (ROOT / "src/backend/codegen_call_direct.elisa").read_text()
+CALL = (ROOT / "src/backend/codegen_call_direct.elisa").read_text() + (ROOT / "src/backend/codegen_call_indexed_result.elisa").read_text() + (ROOT / "src/backend/codegen_call_indexed_helpers.elisa").read_text()
 GOOD = (ROOT / "test/fixtures/backend/extern_fallible_ensure_good.elisa").read_text()
 BAD = (ROOT / "test/fixtures/backend/extern_fallible_ensure_bad.elisa").read_text()
 FAIL = (ROOT / "test/fixtures/backend/extern_fallible_ensure_unwritten_failure.elisa").read_text()
