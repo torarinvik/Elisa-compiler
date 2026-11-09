@@ -27,7 +27,7 @@ core = CORE.read_text()
 core_init = CORE_INIT.read_text()
 deferred = DEFERRED.read_text()
 rewrite = REWRITE.read_text()
-specialization = SPECIALIZATION.read_text()
+specialization = SPECIALIZATION.read_text() + SPECIALIZATION.with_name("parser_effect_clones.elisa").read_text()
 fixture = FIXTURE.read_text()
 smoke = SMOKE.read_text()
 

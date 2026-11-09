@@ -11,7 +11,7 @@ PARSER_HANDLER = (ROOT / "src/parser/parser_decl_handler.elisa").read_text(encod
 PARSER_CORE = (ROOT / "src/parser/parser_core.elisa").read_text(encoding="utf-8")
 PARSER_CTOR = (ROOT / "src/parser/parser_core_member_tables.elisa").read_text(encoding="utf-8")
 PARSER_ENTRY = (ROOT / "src/parser/parser_types_entry.elisa").read_text(encoding="utf-8")
-PARSER_SPECIALIZATION = (ROOT / "src/parser/parser_effect_specialization.elisa").read_text(encoding="utf-8")
+PARSER_SPECIALIZATION = (ROOT / "src/parser/parser_effect_specialization.elisa").read_text(encoding="utf-8") + (ROOT / "src/parser/parser_effect_clones.elisa").read_text(encoding="utf-8")
 SEMANTIC_REF = (ROOT / "src/semantic/check_effect_declarations.elisa").read_text(encoding="utf-8")
 SEMANTIC_INDEX = (ROOT / "src/semantic/check_abstract_effects.elisa").read_text(encoding="utf-8")
 SMOKE = (ROOT / "test/parity/effect_handler_stage1_smoke.sh").read_text(encoding="utf-8")
