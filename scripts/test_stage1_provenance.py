@@ -12,6 +12,7 @@ import tempfile
 from unittest.mock import patch
 
 import stage1_provenance
+import stage1_artifact_fingerprint
 
 
 # Duplicate search directories preserve first-match lookup, including when the
@@ -260,7 +261,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert str(Path(original["external_linker"]["link_command"][0]).resolve()) == str(linker.resolve())
         assert "-o" in original["external_linker"]["link_command"]
         assert [item["path"] for item in original["link_libraries"]] == [str(custom_library.resolve())]
-        with patch.object(stage1_provenance, "sha256_file", side_effect=AssertionError("unchanged artifact was rehashed")):
+        with patch.object(stage1_artifact_fingerprint, "sha256_file", side_effect=AssertionError("unchanged artifact was rehashed")):
             unchanged = stage1_provenance.llvm_toolchain_fingerprint(original)
         assert unchanged == original
         cxx = bindir / "clang++"
