@@ -13,7 +13,7 @@ def compact(text: str) -> str:
     return "".join(line.split("#", 1)[0] for line in text.splitlines()).replace(" ", "").replace("\t", "").replace("\n", "")
 
 
-parser = compact(PARSER.read_text())
+parser = compact(PARSER.read_text() + PARSER.with_name("parser_expr_lambda.elisa").read_text())
 consumer = compact(CONSUMER.read_text())
 fixture = FIXTURE.read_text()
 smoke = SMOKE.read_text()

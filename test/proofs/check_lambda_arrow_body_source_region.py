@@ -16,7 +16,7 @@ def compact(text: str) -> str:
 
 
 cursor = compact(CURSOR.read_text())
-expr = compact(EXPR.read_text())
+expr = compact(EXPR.read_text() + EXPR.with_name("parser_expr_lambda.elisa").read_text())
 smoke = SMOKE.read_text()
 cli_smoke = CLI_SMOKE.read_text()
 gate = GATE.read_text()
