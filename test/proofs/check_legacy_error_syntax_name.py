@@ -47,7 +47,12 @@ helper_text = HELPER.read_text()
 proof_text = POSITIVE.read_text()
 if compact(marker_map) not in compact(function_section(helper_text, "diagnostic_name")):
     raise SystemExit("production diagnostic-name helper no longer matches the closed marker map")
-if compact(marker_map) not in compact(function_section(proof_text, "source_marker_map_matches_spec")):
+proof_contract = (
+    'ensure when marker: "__legacy_error_wildcard" -> result == ("wildcard") '
+    '"__legacy_error_pipe" -> result == ("pipe") '
+    '"__legacy_error_open" -> result == ("open") _ -> result == ("")'
+)
+if compact(proof_contract) not in compact(function_section(proof_text, "source_marker_map_matches_spec")):
     raise SystemExit("proof contract no longer states the exact parser-marker map")
 if compact("return " + marker_map) not in compact(function_section(helper_text, "diagnostic_name")):
     raise SystemExit("production marker-map implementation differs from its contract")
