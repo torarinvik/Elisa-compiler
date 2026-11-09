@@ -1,5 +1,6 @@
 """Bind view-return generic classification to the declaring function offset."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 
 
@@ -24,7 +25,7 @@ def function_source(source: str, name: str) -> str:
 source = SOURCE.read_text()
 parser = PARSER_FUNCTIONS.read_text()
 smoke = SMOKE.read_text()
-atom = ATOM.read_text()
+atom = read_semantic_declaration_source(ATOM)
 atom_smoke = ATOM_SMOKE.read_text()
 
 if "declaration_pos: Ast::Pos = Ast::decl_pos(declaration)" not in parser or \
