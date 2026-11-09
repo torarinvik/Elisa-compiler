@@ -121,7 +121,8 @@ sed -nE 's/^def (alloc_perm\(.*\)( -> .*)?):$/extern \1/p' \
 # Runtime functions used by semantic_parallel are declared from their source.
 sed -nE '/^extern memcmp\(/p' "$REPO_ROOT/elisacore_std/elisacore_runtime_prelude.elisa" >> "$RUNTIME_STRINGS_IFACE"
 sed -nE 's/^[[:space:]]*def ((perf_cores|pool_new|pool_shutdown)\(.*\)( -> .*)?):$/extern \1/p' \
-    "$REPO_ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" | sort -u >> "$RUNTIME_STRINGS_IFACE"
+    "$REPO_ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" \
+    "$REPO_ROOT/elisacore_std/elisacore_concurrency_pool.elisa" | sort -u >> "$RUNTIME_STRINGS_IFACE"
 sed -nE 's/^def (sview_basename\(.*\) -> sview):$/extern \1/p' \
     "$REPO_ROOT/elisacore_std/elisacore_runtime_string_path_views.elisa" >> "$RUNTIME_STRINGS_IFACE"
 FRONTEND_FILES=()

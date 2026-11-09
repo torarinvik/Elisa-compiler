@@ -80,6 +80,8 @@ is_runtime_std() {
         elisacore_json_parse.elisa|elisacore_json_values.elisa|elisacore_parse_float.elisa|\
         elisacore_parse_float_algorithms.elisa|elisacore_regex.elisa|elisacore_regex_automaton.elisa|\
         elisacore_regex_search.elisa|elisacore_runtime_string_views.elisa|debug_referee.elisa|deque.elisa|\
+        elisacore_concurrency_threads.elisa|elisacore_concurrency_pool.elisa|\
+        elisacore_concurrency_tasks.elisa|elisacore_concurrency_await.elisa|\
         elisacore_runtime.elisa|elisacore_runtime_concurrency.elisa|elisacore_runtime_prelude.elisa|\
         elisacore_runtime_strings.elisa|elisacore_runtime_system_bridge.elisa|heap.elisa|names.elisa|\
         native_runtime_support.elisa|runtime.elisa|stores.elisa|stores_core.elisa|\
