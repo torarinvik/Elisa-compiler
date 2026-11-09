@@ -230,7 +230,7 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 if [[ "${1:-}" != "--one" ]]; then
     # Build output may contain entire stale compiler snapshots, including compiler
     # sources. They are not corpus inputs and must not be rebuilt as test programs.
-    find "${CORPUS_DIRS[@]}" -path "$ELISA_CORE/compiler/build" -prune -o -name '*.elisa' -print0 2>/dev/null \
+    find "${CORPUS_DIRS[@]}" \( -path "$ELISA_CORE/build" -o -path "$ELISA_CORE/compiler/build" \) -prune -o -name '*.elisa' -print0 2>/dev/null \
       | xargs -0 grep -l '^def main' 2>/dev/null \
       | grep -v '/repro/' \
       | grep -v '\.xfail\.elisa$' \
