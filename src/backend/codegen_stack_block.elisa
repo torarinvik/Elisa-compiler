@@ -1,0 +1,585 @@
+# Frame-block backing for small, provably bounded numeric darrays (stage0 parity:
+# compiler/src/semantic/analyzer_region_stack_block.go + backend/llvm_region_stack_block.go).
+#
+# A function-local `darray[scalar]` whose element count has a PROVEN bound gets its own arena
+# whose storage is a block in the function's frame (arena_init_stack_block, owner tag 3) instead
+# of a reservation from the function's auto region. The arena runs reserve_commit once the block
+# is installed, so overflow would panic; the bound must therefore cover every byte the arena
+# receives, and eligibility is narrow (fails closed):
+#   * the element type is numeric or bool, the declaration is unique, not inside a loop;
+#   * the initializer is `[]`, a list literal, or `[v for _ in 0..<K]` with K a constant, an
+#     expression of literals/parameters/`+`/`*`/integer conversions (evaluated at the
+#     declaration, block installed only when it fits), or a local/parameter whose constant upper
+#     bound is proven by dominating early-exit guards (and a non-negative lower bound before an
+#     unsigned conversion);
+#   * `name.resize(n)` with a guard-proven constant bound on n (it SETS the count, so it adds
+#     its bound once);
+#   * every other mention is `name[i]`, `.count`/`.len`, or a `for x in name` source.
+# A runtime bound that does not fit leaves the arena an ordinary lazy chained arena (today's
+# behavior); the arena is freed with the function's other regions either way (arena_free skips
+# the frame block itself).
+extend Backend:
+    private:
+        struct StackBlockPlan:
+            name: sview
+            element: ValueType
+            # >= 0: constant element bound (exactly sized block, installed unconditionally).
+            # -1: the comprehension end, evaluated at the declaration.
+            bound: i64
+
+        struct StackBlockScan:
+            ok: mutable bool = true
+            decls: mutable i64 = 0
+            in_loop_decl: mutable bool = false
+            init_const: mutable i64 = -1
+            init_runtime: mutable bool = false
+            resize_total: mutable i64 = 0
+
+        def stack_block_int_conversion(name: sview) -> bool:
+            return when name:
+                "int" | "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "uintptr" -> true
+                _ -> false
+
+        def stack_block_wide_unsigned(name: sview) -> bool:
+            return when name:
+                "u64" | "usize" | "uintptr" -> true
+                _ -> false
+
+        def stack_block_wide_signed(name: sview) -> bool:
+            return when name:
+                "int" | "i64" | "isize" -> true
+                _ -> false
+
+        def stack_block_cap(value: i64) -> i64:
+            return 1073741824 if value > 1073741824
+            return value
+
+        # ---- assignment / declaration census -------------------------------------------
+
+        def stack_block_assigned(body: darray[Stmt]&, name: sview) -> bool can[Abort.Panic]:
+            for statement in body |name|:
+                match statement:
+                    Stmt.Assign(target, operator, value, pos):
+                        return true if local_scratch_is_name(target, name)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        return true if stack_block_assigned(then_body, name) or stack_block_assigned(else_body, name)
+                    Stmt.While(condition, nested, pos):
+                        return true if stack_block_assigned(nested, name)
+                    Stmt.For(bind, variables, iterable, nested, pos):
+                        return true if stack_block_assigned(nested, name)
+                    Stmt.Block(kind, clause, binding, nested, pos):
+                        return true if stack_block_assigned(nested, name)
+                    Stmt.Match(scrutinee, arms, pos):
+                        for arm in arms |name|:
+                            return true if stack_block_assigned(arm.body, name)
+                    _:
+                        pass
+            return false
+
+        def stack_block_decl_count(body: darray[Stmt]&, name: sview) -> i64 can[Abort.Panic]:
+            total: mutable i64 = 0
+            for statement in body |name, total|:
+                match statement:
+                    Stmt.VarDecl(declared, type_expression, value, pos):
+                        total <- total + 1 if declared == name
+                    Stmt.If(condition, then_body, else_body, pos):
+                        total <- total + stack_block_decl_count(then_body, name) + stack_block_decl_count(else_body, name)
+                    Stmt.While(condition, nested, pos):
+                        total <- total + stack_block_decl_count(nested, name)
+                    Stmt.For(bind, variables, iterable, nested, pos):
+                        for variable in variables |name, total|:
+                            total <- total + 1 if variable == name
+                        total <- total + stack_block_decl_count(nested, name)
+                    Stmt.Block(kind, clause, binding, nested, pos):
+                        total <- total + 1 if binding == name
+                        total <- total + stack_block_decl_count(nested, name)
+                    Stmt.Match(scrutinee, arms, pos):
+                        # A pattern may bind the name: fail closed.
+                        total <- total + 2
+                    _:
+                        pass
+            return total
+
+        def stack_block_param_index(params: darray[ParamDecl]&, name: sview) -> i64:
+            for index in 0..<params.count |params, name|:
+                return index.i64() if params[index].name == name
+            return -1
+
+        # A name whose value is fixed for the whole body: one binding (parameter or a single
+        # declaration), never reassigned.
+        def stack_block_stable_name(name: sview, body: darray[Stmt]&, params: darray[ParamDecl]&) -> bool can[Abort.Panic]:
+            decls: i64 = stack_block_decl_count(body, name)
+            is_param: bool = stack_block_param_index(params, name) >= 0
+            return false if is_param and decls != 0
+            return false if not is_param and decls != 1
+            return not stack_block_assigned(body, name)
+
+        # ---- range facts from dominating statements -------------------------------------
+
+        def stack_block_guard_exits(then_body: darray[Stmt]&, else_body: darray[Stmt]&) -> bool:
+            return false if else_body.count != 0 or then_body.count == 0
+            last: Stmt = then_body[then_body.count - 1]
+            if last is Stmt.Return(returned, pos):
+                return true
+            return false
+
+        def stack_block_int_literal(expression: Expr) -> i64:
+            if expression is Expr.IntLit(value, pos):
+                return value
+            if expression is Expr.Paren(inner, paren_pos):
+                return stack_block_int_literal(inner)
+            return -1
+
+        # Upper bound `name` is known NOT to exceed when the disjunct is false (guard exits).
+        def stack_block_disjunct_upper(condition: Expr, name: sview) -> i64 can[Abort.Panic]:
+            if condition is Expr.Binary(left, operator, right, pos):
+                if operator == TokenKind.Or:
+                    a: i64 = stack_block_disjunct_upper(left, name)
+                    b: i64 = stack_block_disjunct_upper(right, name)
+                    return b if a < 0
+                    return a if b < 0
+                    return a if a < b
+                    return b
+                if local_scratch_is_name(left, name):
+                    c: i64 = stack_block_int_literal(right)
+                    return c if operator == TokenKind.Gt and c >= 0
+                    return c - 1 if operator == TokenKind.GtEq and c >= 1
+                if local_scratch_is_name(right, name):
+                    c: i64 = stack_block_int_literal(left)
+                    return c if operator == TokenKind.Lt and c >= 0
+                    return c - 1 if operator == TokenKind.LtEq and c >= 1
+            return -1
+
+        # Lower bound `name` is known to reach when the disjunct is false.
+        def stack_block_disjunct_lower(condition: Expr, name: sview) -> i64 can[Abort.Panic]:
+            if condition is Expr.Binary(left, operator, right, pos):
+                if operator == TokenKind.Or:
+                    a: i64 = stack_block_disjunct_lower(left, name)
+                    b: i64 = stack_block_disjunct_lower(right, name)
+                    return a if a > b
+                    return b
+                if local_scratch_is_name(left, name):
+                    c: i64 = stack_block_int_literal(right)
+                    return c if operator == TokenKind.Lt and c >= 0
+                    return c + 1 if operator == TokenKind.LtEq and c >= 0
+                if local_scratch_is_name(right, name):
+                    c: i64 = stack_block_int_literal(left)
+                    return c if operator == TokenKind.Gt and c >= 0
+                    return c + 1 if operator == TokenKind.GtEq and c >= 0
+            return -1
+
+        def stack_block_type_unsigned(type_expression: Expr, structs: mutable StructTable&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return annotation_value_type(type_expression, structs).kind == TypeKind.Unsigned
+
+        def stack_block_upper(name: sview, doms: darray[Stmt]&, body: darray[Stmt]&, params: darray[ParamDecl]&, structs: mutable StructTable&, depth: i64) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return -1 if depth > 6 or not stack_block_stable_name(name, body, params)
+            best: mutable i64 = -1
+            for dom in doms |name, best, body, params, structs, depth|:
+                candidate: mutable i64 = -1
+                match dom:
+                    Stmt.If(condition, then_body, else_body, pos):
+                        candidate <- stack_block_disjunct_upper(condition, name) if stack_block_guard_exits(then_body, else_body)
+                    Stmt.VarDecl(declared, type_expression, value, pos):
+                        candidate <- stack_block_upper_expr(value, doms, body, params, structs, depth + 1) if declared == name
+                    _:
+                        pass
+                best <- candidate if candidate >= 0 and (best < 0 or candidate < best)
+            return best
+
+        def stack_block_lower(name: sview, doms: darray[Stmt]&, body: darray[Stmt]&, params: darray[ParamDecl]&, structs: mutable StructTable&, depth: i64) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return -1 if depth > 6 or not stack_block_stable_name(name, body, params)
+            best: mutable i64 = -1
+            param_index: i64 = stack_block_param_index(params, name)
+            if param_index >= 0:
+                best <- 0 if stack_block_type_unsigned(params[param_index.usize()].type_expression, structs)
+            for dom in doms |name, best, body, params, structs, depth|:
+                candidate: mutable i64 = -1
+                match dom:
+                    Stmt.If(condition, then_body, else_body, pos):
+                        candidate <- stack_block_disjunct_lower(condition, name) if stack_block_guard_exits(then_body, else_body)
+                    Stmt.VarDecl(declared, type_expression, value, pos):
+                        if declared == name:
+                            candidate <- 0 if stack_block_type_unsigned(type_expression, structs)
+                            from_value: i64 = stack_block_lower_expr(value, doms, body, params, structs, depth + 1)
+                            candidate <- from_value if from_value > candidate
+                    _:
+                        pass
+                best <- candidate if candidate > best
+            return best
+
+        def stack_block_upper_expr(expression: Expr, doms: darray[Stmt]&, body: darray[Stmt]&, params: darray[ParamDecl]&, structs: mutable StructTable&, depth: i64) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return -1 if depth > 6
+            match expression:
+                Expr.IntLit(value, pos):
+                    return value
+                Expr.Paren(inner, pos):
+                    return stack_block_upper_expr(inner, doms, body, params, structs, depth + 1)
+                Expr.Ident(identifier, pos):
+                    return stack_block_upper(identifier, doms, body, params, structs, depth + 1)
+                Expr.Binary(left, operator, right, pos):
+                    return -1 if operator != TokenKind.Plus
+                    a: i64 = stack_block_upper_expr(left, doms, body, params, structs, depth + 1)
+                    b: i64 = stack_block_upper_expr(right, doms, body, params, structs, depth + 1)
+                    return -1 if a < 0 or b < 0
+                    return stack_block_cap(a) + stack_block_cap(b)
+                Expr.Call(callee, arguments, labels, pos):
+                    return -1 if arguments.count != 0
+                    if callee is Expr.Field(object, conversion, field_pos):
+                        # A wrapping conversion of a possibly negative value is unbounded.
+                        if stack_block_wide_unsigned(conversion):
+                            return -1 if stack_block_lower_expr(object, doms, body, params, structs, depth + 1) < 0
+                            return stack_block_upper_expr(object, doms, body, params, structs, depth + 1)
+                        if stack_block_wide_signed(conversion):
+                            return stack_block_upper_expr(object, doms, body, params, structs, depth + 1)
+                    return -1
+                _:
+                    return -1
+
+        def stack_block_lower_expr(expression: Expr, doms: darray[Stmt]&, body: darray[Stmt]&, params: darray[ParamDecl]&, structs: mutable StructTable&, depth: i64) -> i64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return -1 if depth > 6
+            match expression:
+                Expr.IntLit(value, pos):
+                    return value
+                Expr.Paren(inner, pos):
+                    return stack_block_lower_expr(inner, doms, body, params, structs, depth + 1)
+                Expr.Ident(identifier, pos):
+                    return stack_block_lower(identifier, doms, body, params, structs, depth + 1)
+                Expr.Call(callee, arguments, labels, pos):
+                    return -1 if arguments.count != 0
+                    if callee is Expr.Field(object, conversion, field_pos):
+                        return 0 if stack_block_wide_unsigned(conversion)
+                        if stack_block_wide_signed(conversion):
+                            return stack_block_lower_expr(object, doms, body, params, structs, depth + 1)
+                    return -1
+                _:
+                    return -1
+
+        # ---- the bound expression shapes evaluated at the declaration -------------------
+
+        def stack_block_evaluable(expression: Expr, body: darray[Stmt]&, params: darray[ParamDecl]&) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.IntLit(value, pos):
+                    return value >= 0
+                Expr.Paren(inner, pos):
+                    return stack_block_evaluable(inner, body, params)
+                Expr.Ident(identifier, pos):
+                    return stack_block_param_index(params, identifier) >= 0 and stack_block_stable_name(identifier, body, params)
+                Expr.Binary(left, operator, right, pos):
+                    return false if operator != TokenKind.Plus and operator != TokenKind.Star
+                    return stack_block_evaluable(left, body, params) and stack_block_evaluable(right, body, params)
+                Expr.Call(callee, arguments, labels, pos):
+                    return false if arguments.count != 0
+                    if callee is Expr.Field(object, conversion, field_pos):
+                        return stack_block_int_conversion(conversion) and stack_block_evaluable(object, body, params)
+                    return false
+                _:
+                    return false
+
+        def stack_block_const(expression: Expr) -> i64:
+            match expression:
+                Expr.IntLit(value, pos):
+                    return value
+                Expr.Paren(inner, pos):
+                    return stack_block_const(inner)
+                Expr.Binary(left, operator, right, pos):
+                    a: i64 = stack_block_const(left)
+                    b: i64 = stack_block_const(right)
+                    return -1 if a < 0 or b < 0 or a > 1073741824 or b > 1073741824
+                    return a + b if operator == TokenKind.Plus
+                    return a * b if operator == TokenKind.Star
+                    return -1
+                _:
+                    return -1
+
+        # ---- the mention scan ------------------------------------------------------------
+
+        def stack_block_exprs(expressions: darray[Expr]&, name: sview) -> bool can[Abort.Panic]:
+            for expression in expressions |name|:
+                return false if not stack_block_expr(expression, name)
+            return true
+
+        # True when every mention of `name` inside `expression` is an allowed read.
+        def stack_block_expr(expression: Expr, name: sview) -> bool can[Abort.Panic]:
+            match expression:
+                Expr.Invalid:
+                    return true
+                Expr.Absent:
+                    return true
+                Expr.IntLit(value, pos):
+                    return true
+                Expr.FloatLit(text, pos):
+                    return true
+                Expr.StringLit(text, pos):
+                    return true
+                Expr.CharLit(text, pos):
+                    return true
+                Expr.BoolLit(value, pos):
+                    return true
+                Expr.Ident(identifier, pos):
+                    return identifier != name
+                Expr.Field(object, field, pos):
+                    return field == "count" or field == "len" if local_scratch_is_name(object, name)
+                    return stack_block_expr(object, name)
+                Expr.Index(object, index, pos):
+                    return false if not local_scratch_is_name(object, name) and not stack_block_expr(object, name)
+                    return stack_block_expr(index, name)
+                Expr.Unary(operator, operand, pos):
+                    return stack_block_expr(operand, name)
+                Expr.Binary(left, operator, right, pos):
+                    return stack_block_expr(left, name) and stack_block_expr(right, name)
+                Expr.Paren(inner, pos):
+                    return stack_block_expr(inner, name)
+                Expr.If(condition, then_value, else_value, pos):
+                    return stack_block_expr(condition, name) and stack_block_expr(then_value, name) and stack_block_expr(else_value, name)
+                Expr.Call(callee, arguments, labels, pos):
+                    if callee is Expr.Field(object, method, field_pos):
+                        return false if local_scratch_is_name(object, name)
+                    return stack_block_expr(callee, name) and stack_block_exprs(arguments, name)
+                Expr.Array(elements, pos):
+                    return stack_block_exprs(elements, name)
+                Expr.Tuple(elements, pos):
+                    return stack_block_exprs(elements, name)
+                Expr.Comprehension(variable, iterable, condition, comprehension_body, pos, query_scope_id):
+                    return false if variable == name or local_scratch_is_name(iterable, name)
+                    return stack_block_expr(iterable, name) and stack_block_expr(condition, name) and stack_block_expr(comprehension_body, name)
+                _:
+                    return false
+
+        def stack_block_block_kind(kind: sview) -> bool:
+            return when kind:
+                "can" | "trusted" | "scope" | "label" | "let" | "expect" | "assert_by" | "static_assert" -> true
+                _ -> false
+
+        def stack_block_init(value: Expr, name: sview, doms: darray[Stmt]&, body: darray[Stmt]&, params: darray[ParamDecl]&, scan: mutable StackBlockScan&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if value is Expr.Array(elements, pos):
+                scan.ok <- false if not stack_block_exprs(elements, name)
+                scan.init_const <- elements.count.i64()
+                return
+            if value is Expr.Comprehension(variable, iterable, condition, comprehension_body, comprehension_pos, query_scope_id):
+                scan.ok <- false if not stack_block_expr(value, name)
+                if iterable is Expr.Binary(low, operator, high, range_pos):
+                    if operator == TokenKind.RangeLt and stack_block_int_literal(low) == 0:
+                        folded: i64 = stack_block_const(high)
+                        if folded >= 0:
+                            scan.init_const <- folded
+                            return
+                        if stack_block_evaluable(high, body, params):
+                            scan.init_runtime <- true
+                            return
+                        proven: i64 = stack_block_upper_expr(high, doms, body, params, structs, 0)
+                        if proven >= 0:
+                            scan.init_const <- proven
+                            return
+            scan.ok <- false
+
+        def stack_block_statements(statements: darray[Stmt]&, name: sview, doms: mutable darray[Stmt]&, in_loop: bool, body: darray[Stmt]&, params: darray[ParamDecl]&, scan: mutable StackBlockScan&, structs: mutable StructTable&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            mark: usize = doms.count
+            for statement in statements |name, doms, in_loop, body, params, scan, structs|:
+                return if not scan.ok
+                match statement:
+                    Stmt.Expr(expression, pos):
+                        handled: mutable bool = false
+                        if expression is Expr.Call(callee, arguments, labels, call_pos):
+                            if callee is Expr.Field(object, method, field_pos):
+                                if local_scratch_is_name(object, name):
+                                    handled <- true
+                                    if method == "resize" and arguments.count == 1 and stack_block_expr(arguments[0], name):
+                                        hi: i64 = stack_block_upper_expr(arguments[0], doms, body, params, structs, 0)
+                                        if hi < 0 or hi > 1048576:
+                                            scan.ok <- false
+                                        else:
+                                            scan.resize_total <- scan.resize_total + hi
+                                    else:
+                                        scan.ok <- false
+                        scan.ok <- false if not handled and not stack_block_expr(expression, name)
+                    Stmt.VarDecl(declared, type_expression, value, pos):
+                        if declared == name:
+                            scan.decls <- scan.decls + 1
+                            scan.in_loop_decl <- true if in_loop
+                            stack_block_init(value, name, doms, body, params, scan, structs)
+                        else:
+                            scan.ok <- false if not stack_block_expr(value, name)
+                    Stmt.Assign(target, operator, value, pos):
+                        if target is Expr.Index(object, index, index_pos):
+                            if local_scratch_is_name(object, name):
+                                scan.ok <- false if not stack_block_expr(index, name)
+                            else:
+                                scan.ok <- false if not stack_block_expr(target, name)
+                        else:
+                            scan.ok <- false if not stack_block_expr(target, name)
+                        scan.ok <- false if not stack_block_expr(value, name)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        scan.ok <- false if not stack_block_expr(condition, name)
+                        stack_block_statements(then_body, name, doms, in_loop, body, params, scan, structs)
+                        stack_block_statements(else_body, name, doms, in_loop, body, params, scan, structs)
+                    Stmt.While(condition, nested, pos):
+                        scan.ok <- false if not stack_block_expr(condition, name)
+                        stack_block_statements(nested, name, doms, true, body, params, scan, structs)
+                    Stmt.For(bind, variables, iterable, nested, pos):
+                        if local_scratch_is_name(iterable, name):
+                            scan.ok <- false if bind != ""
+                        else:
+                            scan.ok <- false if not stack_block_expr(iterable, name)
+                        for variable in variables |name, scan|:
+                            scan.ok <- false if variable == name
+                        stack_block_statements(nested, name, doms, true, body, params, scan, structs)
+                    Stmt.Return(value, pos):
+                        if value is returned:
+                            scan.ok <- false if not stack_block_expr(returned, name)
+                    Stmt.Contract(kind, expression, pos):
+                        scan.ok <- false if not stack_block_expr(expression, name)
+                    Stmt.Break(label, pos):
+                        pass
+                    Stmt.Continue(label, pos):
+                        pass
+                    Stmt.Block(kind, clause, binding, nested, pos):
+                        if not stack_block_block_kind(kind) or binding == name:
+                            scan.ok <- false
+                        else:
+                            stack_block_statements(nested, name, doms, in_loop, body, params, scan, structs)
+                    _:
+                        scan.ok <- false
+                doms.push(statement)
+            doms.truncate(mark)
+
+        def stack_block_collect(statements: darray[Stmt]&, names: mutable darray[sview]&, types: mutable darray[Expr]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for statement in statements |names, types|:
+                match statement:
+                    Stmt.VarDecl(declared, type_expression, value, pos):
+                        names.push(declared)
+                        types.push(type_expression)
+                    Stmt.If(condition, then_body, else_body, pos):
+                        stack_block_collect(then_body, names, types)
+                        stack_block_collect(else_body, names, types)
+                    Stmt.Block(kind, clause, binding, nested, pos):
+                        stack_block_collect(nested, names, types)
+                    _:
+                        pass
+
+        # The element type of a `darray[scalar]` annotation, or Void.
+        def stack_block_element(type_expression: Expr, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            none: ValueType = ValueType{kind: TypeKind.Void, bits: 0}
+            shape: mutable Expr = type_expression
+            if type_expression is Expr.Unary(operator, inner, pos):
+                return none if operator != TokenKind.Mutable
+                shape <- inner
+            if shape is Expr.Index(head, element, index_pos):
+                if head is Expr.Ident(container, head_pos):
+                    return none if container != "darray"
+                    element_type: ValueType = annotation_value_type(element, structs)
+                    return element_type if loop_scratch_scalar_type(element_type)
+            return none
+
+        def stack_block_plans(body: darray[Stmt]&, params: darray[ParamDecl]&, structs: mutable StructTable&) -> darray[StackBlockPlan] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            plans: mutable darray[StackBlockPlan] = []
+            names: mutable darray[sview] = []
+            types: mutable darray[Expr] = []
+            stack_block_collect(body, names, types)
+            for index in 0..<names.count |names, types, plans, body, params, structs|:
+                name: sview = names[index]
+                element: ValueType = stack_block_element(types[index], structs)
+                continue if element.kind == TypeKind.Void
+                continue if stack_block_param_index(params, name) >= 0
+                scan: mutable StackBlockScan = StackBlockScan{}
+                doms: mutable darray[Stmt] = []
+                stack_block_statements(body, name, doms, false, body, params, scan, structs)
+                continue if not scan.ok or scan.decls != 1 or scan.in_loop_decl
+                continue if stack_block_decl_count(body, name) != 1 or stack_block_assigned(body, name)
+                if scan.init_runtime:
+                    continue if scan.resize_total != 0
+                    plans.push(StackBlockPlan{name: name, element: element, bound: -1})
+                else:
+                    continue if scan.init_const < 0
+                    plans.push(StackBlockPlan{name: name, element: element, bound: stack_block_cap(scan.init_const) + scan.resize_total})
+            return plans
+
+        # ---- codegen ----------------------------------------------------------------------
+
+        # Payload slots covering the worst footprint of a growable bounded by n elements
+        # (capacity <= max(8, 2n), plus slack), or 0 when it would exceed 64 KiB.
+        def stack_block_const_payload_slots(n: i64, element_bytes: u64) -> u64:
+            bytes_per: u64 = 1 if element_bytes == 0 else element_bytes
+            return 0 if n < 0 or n > 16777216
+            bytes: u64 = (2 * n.u64() + 16) * bytes_per
+            slots: u64 = (bytes + 7) / 8 + 2
+            return 0 if (slots + 16) * 8 > 65536
+            return slots
+
+        # Largest runtime bound whose worst footprint fits the default 1024-slot block.
+        def stack_block_max_elems(element_bytes: u64) -> i64:
+            bytes_per: u64 = 1 if element_bytes == 0 else element_bytes
+            usable: u64 = 1022 * 8
+            return 0 if usable / bytes_per <= 16
+            return ((usable / bytes_per - 16) / 2).i64()
+
+        # Called where the function's auto region is created: one arena + frame block per plan.
+        def stack_block_prepare(body: darray[Stmt]&, params: darray[ParamDecl]&, local_runtime: mutable Runtime&, structs: mutable StructTable&, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            plans: darray[StackBlockPlan] = stack_block_plans(body, params, structs)
+            for plan in plans |local_runtime, structs, ctx, builder|:
+                element_bytes: u64 = LLVMABISizeOfType(structs.target.target_data, llvm_type_of(plan.element, structs, ctx))
+                payload: mutable u64 = 0
+                limit: mutable i64 = -1
+                if plan.bound >= 0:
+                    payload <- stack_block_const_payload_slots(plan.bound, element_bytes)
+                else:
+                    limit <- stack_block_max_elems(element_bytes)
+                    payload <- 1024 if limit > 0
+                continue if payload == 0
+                arena_type: LLVMTypeRef = arena_llvm_type(ctx, structs.target.target_pointer_bits)
+                arena_slot: LLVMValueRef = build_entry_alloca(builder, arena_type, "stack.block.region")
+                _ = LLVMBuildStore(builder, LLVMConstNull(arena_type), arena_slot)
+                block: LLVMValueRef = build_entry_alloca(builder, LLVMArrayType(LLVMInt64TypeInContext(ctx), (payload + 16).u32()), "stack.block")
+                LLVMSetAlignment(block, 16)
+                local_runtime.stack_block_names.push(plan.name)
+                local_runtime.stack_block_arenas.push(arena_slot)
+                local_runtime.stack_block_blocks.push(block)
+                local_runtime.stack_block_payloads.push(payload)
+                local_runtime.stack_block_limits.push(limit)
+
+        def stack_block_index(runtime: Runtime&, name: sview) -> i64:
+            for index in 0..<runtime.stack_block_names.count |runtime, name|:
+                return index.i64() if runtime.stack_block_names[index] == name
+            return -1
+
+        # At the declaration: install the frame block (conditionally for a runtime bound).
+        def emit_stack_block_install(index: usize, value: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arena: LLVMValueRef = runtime.stack_block_arenas[index]
+            limit: i64 = runtime.stack_block_limits[index]
+            continue_block: mutable LLVMBasicBlockRef? = null
+            if limit >= 0:
+                bound_expression: mutable Expr = Expr.Absent
+                if value is Expr.Comprehension(variable, iterable, condition, comprehension_body, comprehension_pos, query_scope_id):
+                    if iterable is Expr.Binary(low, operator, high, range_pos):
+                        bound_expression <- high
+                usize_type: ValueType = ValueType{kind: TypeKind.Unsigned, bits: 64}
+                bound_value: mutable LLVMValueRef? = null
+                if bound_expression is Expr.Absent:
+                    return
+                bound_value <- emit_expression_coerced(bound_expression, usize_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                if bound_value is measured:
+                    function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder))
+                    install_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "stack.block.init")
+                    after_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "stack.block.cont")
+                    # icmp ule
+                    fits: LLVMValueRef = LLVMBuildICmp(builder, 37, measured, LLVMConstInt(LLVMTypeOf(measured), limit.u64(), 0), "stack.block.fits")
+                    _ = LLVMBuildCondBr(builder, fits, install_block, after_block)
+                    LLVMPositionBuilderAtEnd(builder, install_block)
+                    continue_block <- after_block
+                else:
+                    return
+            size_type: LLVMTypeRef = runtime_size_llvm_type(ctx, structs.target.target_pointer_bits)
+            arena_type: LLVMTypeRef = arena_llvm_type(ctx, structs.target.target_pointer_bits)
+            strategy_pointer: LLVMValueRef = LLVMBuildStructGEP2(builder, arena_type, arena, 3, "stack.block.strategy")
+            # ARENA_STRATEGY_RESERVE_COMMIT: bump inside the tagged block, never chain.
+            _ = LLVMBuildStore(builder, LLVMConstInt(size_type, 2, 0), strategy_pointer)
+            pointer_type: LLVMTypeRef = LLVMPointerTypeInContext(ctx, 0)
+            init_params: mutable darray[LLVMTypeRef] = [pointer_type, pointer_type, size_type]
+            init_params_pointer: void& = (&init_params[0]).cast[void&] can Unsafe.PointerCast
+            init_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(ctx), init_params_pointer, 3, 0)
+            init_fn: LLVMValueRef = declare_or_get_named(m, "arena_init_stack_block", init_type)
+            init_args: mutable darray[LLVMValueRef] = [arena, runtime.stack_block_blocks[index], LLVMConstInt(size_type, runtime.stack_block_payloads[index], 0)]
+            init_args_pointer: void& = (&init_args[0]).cast[void&] can Unsafe.PointerCast
+            _ = LLVMBuildCall2(builder, init_type, init_fn, init_args_pointer, 3, "")
+            if continue_block is after:
+                _ = LLVMBuildBr(builder, after)
+                LLVMPositionBuilderAtEnd(builder, after)
