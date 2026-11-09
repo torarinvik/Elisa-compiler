@@ -1,5 +1,6 @@
 from __future__ import annotations
 from stage1_object_cache_test_support import *
+import stage1_object_cache_merger
 
 
 class ObjectCacheIdentityTests(CacheTestFixture):
@@ -48,7 +49,7 @@ class ObjectCacheIdentityTests(CacheTestFixture):
         read_record = cache.native_merger_record
         environment = {"ELISA_STAGE1_JOBS": "2", "PATH": "/usr/bin"}
         with patch.object(cache.shutil, "which", return_value="/usr/bin/ld"), \
-                patch.object(cache, "native_merger_record", side_effect=lambda _: read_record(native)):
+                patch.object(stage1_object_cache_merger, "native_merger_record", side_effect=lambda _: read_record(native)):
             first = cache.object_merger_key(environment, "linux")
             before = native.stat()
             with native.open("ab") as output:
@@ -68,7 +69,7 @@ class ObjectCacheIdentityTests(CacheTestFixture):
             return {"selected": path, "sha256": hashlib.sha256(contents[path].encode()).hexdigest()}
         with patch.object(cache.shutil, "which", return_value="/usr/bin/ld"), \
                 patch.object(cache.os.path, "realpath", side_effect=lambda path: path), \
-                patch.object(cache, "native_merger_record", side_effect=record), \
+                patch.object(stage1_object_cache_merger, "native_merger_record", side_effect=record), \
                 patch.object(cache.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"/selected/ld\n")):
             original = cache.object_merger_key(environment, "darwin")
             for path in contents:

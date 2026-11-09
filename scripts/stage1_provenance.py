@@ -23,6 +23,8 @@ BUILD_RECIPES = (
     "scripts/platform.sh",
     "scripts/elisac_stage1.sh",
     "scripts/stage1_object_cache.py",
+    "scripts/stage1_object_cache_files.py",
+    "scripts/stage1_object_cache_merger.py",
     "scripts/elisac_stage1_seed.sh",
     "scripts/stage0_provenance.py",
     "scripts/assert_stage0_fresh.sh",

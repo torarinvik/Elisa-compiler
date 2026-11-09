@@ -1,5 +1,6 @@
 from __future__ import annotations
 from stage1_object_cache_test_support import *
+import stage1_object_cache_files
 
 
 class ObjectCacheRestoreTests(CacheTestFixture):
@@ -154,7 +155,8 @@ class ObjectCacheRestoreTests(CacheTestFixture):
         staged = self.output.parent / "staged.o"
         staged.write_bytes(b"staging sentinel")
         before = self.output.read_bytes()
-        with patch.object(cache, "descriptor_provenance", side_effect=["01", "02"]):
+        with patch.object(stage1_object_cache_files, "descriptor_provenance", side_effect=["01", "02"]) as provenance, \
+             patch.object(cache, "descriptor_provenance", side_effect=provenance):
             self.assertFalse(cache.restore(self.entry, staged, "key", destination=self.output))
         self.assertEqual(staged.read_bytes(), b"staging sentinel")
         self.assertEqual(self.output.read_bytes(), before)
@@ -187,7 +189,7 @@ class ObjectCacheRestoreTests(CacheTestFixture):
     def test_output_state_declines_present_or_unverifiable_acl(self):
         for acl_state in (True, None):
             with self.subTest(acl_state=acl_state), patch.object(
-                cache, "descriptor_has_extended_acl", return_value=acl_state
+                stage1_object_cache_files, "descriptor_has_extended_acl", return_value=acl_state
             ):
                 self.assertIsNone(cache.compiler_output_state(self.output))
 

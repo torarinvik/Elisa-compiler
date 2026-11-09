@@ -32,7 +32,7 @@ class CacheTestFixture(unittest.TestCase):
         (root / "elisacore_std" / "runtime.elisa").write_text("# fixture\n")
         (root / "scripts").mkdir()
         scripts = Path(__file__).resolve().parent
-        for name in ("elisac_stage1.sh", "stage1_object_cache.py", "platform.sh"):
+        for name in ("elisac_stage1.sh", "stage1_object_cache.py", "stage1_object_cache_files.py", "stage1_object_cache_merger.py", "platform.sh"):
             shutil.copyfile(scripts / name, root / "scripts" / name)
         return root
 
