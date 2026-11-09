@@ -29,7 +29,7 @@ def function_source(source: str, name: str) -> str:
 
 source = SOURCE.read_text()
 imports = IMPORTS.read_text()
-visibility_source = IMPORT_VISIBILITY.read_text()
+visibility_source = IMPORT_VISIBILITY.read_text() + IMPORT_VISIBILITY.with_name("semantic_import_candidate_visibility.elisa").read_text()
 precedence = function_source(source, "binding_module_alias_precedes")
 global_precedence = function_source(visibility_source, "semantic_possible_import_alias_precedes")
 branch_marker_at = function_source(visibility_source, "semantic_possible_import_alias_branch_marker_at")

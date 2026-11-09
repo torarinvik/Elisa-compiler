@@ -7,7 +7,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[2]
 SEMANTIC = (ROOT / "src/semantic/check_uninitialized_zeroed.elisa").read_text()
-IMPORTS = (ROOT / "src/semantic/semantic_import_visibility.elisa").read_text()
+IMPORTS = (ROOT / "src/semantic/semantic_import_visibility.elisa").read_text() + (ROOT / "src/semantic/semantic_import_candidate_visibility.elisa").read_text()
 TYPE_ALIASES = (ROOT / "src/semantic/check_uninitialized_zeroed/type_aliases.elisa").read_text()
 CALLEE_OWNER = (ROOT / "src/semantic/check_zeroed_value_positions.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/zeroed_inactive_module_alias.elisa").read_text()

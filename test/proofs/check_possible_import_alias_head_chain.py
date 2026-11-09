@@ -6,7 +6,7 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
-IMPORTS = (ROOT / "src/semantic/semantic_import_visibility.elisa").read_text()
+IMPORTS = (ROOT / "src/semantic/semantic_import_visibility.elisa").read_text() + (ROOT / "src/semantic/semantic_import_candidate_visibility.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/zeroed_possible_alias_head_chain.elisa").read_text()
 SMOKE = (ROOT / "test/parity/zeroed_reference_safety_smoke.sh").read_text()
 

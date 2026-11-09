@@ -59,7 +59,7 @@ def declarations(source: str) -> set[str]:
 
 policy_text = POLICY.read_text()
 consumer_text = CONSUMER.read_text()
-import_visibility_text = IMPORT_VISIBILITY.read_text()
+import_visibility_text = IMPORT_VISIBILITY.read_text() + IMPORT_VISIBILITY.with_name("semantic_import_candidate_visibility.elisa").read_text()
 semantic_text = SEMANTIC.read_text()
 resolver_text = RESOLVER.read_text()
 binding_resolver_text = BINDING_RESOLVER.read_text()
