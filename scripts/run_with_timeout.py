@@ -24,7 +24,7 @@ def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: float = 1.
     process_group = process.pid
     try:
         os.killpg(process_group, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     try:
         process.wait(timeout=grace_seconds)
@@ -33,7 +33,7 @@ def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: float = 1.
     if _group_exists(process_group):
         try:
             os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     try:
         process.wait(timeout=grace_seconds)
