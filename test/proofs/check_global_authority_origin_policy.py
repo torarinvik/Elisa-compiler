@@ -946,6 +946,7 @@ inputs = [
     stage1, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
     POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_LATE_CONFLICT_FIXTURE, ALIAS_CONFLICT_FIXTURE, STATIC_BRANCH_ALIAS_FIXTURE, ACTIVE_STATIC_ALIAS_FIXTURE, SAME_TARGET_ALIAS_FIXTURE, ALIAS_SMOKE,
     ALIAS_CONFLICT_CHECKER, ALIAS_CONFLICT_DIAGNOSTICS, DIAGNOSTIC_KINDS,
+    *source_include_closure([DIAGNOSTIC_KINDS]),
     ROOT / "test/atoms/authority_coverage.elisa", POSITIVE, NEGATIVE, *source_closure,
 ]
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
