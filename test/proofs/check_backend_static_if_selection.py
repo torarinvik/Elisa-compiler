@@ -724,9 +724,9 @@ def require_backend_position_identity() -> None:
     function_owner_walk = compact(function_section(STATIC_IF_CONDITION.read_text(), "static_if_collect_function_owners"))
     pipeline = compact(FULL_PIPELINE.read_text())
     ast_condition = compact(function_section(DRIVER_AST_DECL.read_text(), "emit_ast_static_condition"))
-    selected_offsets = compact(function_section(SELECTOR.read_text(), "selected_static_if_offsets"))
+    selected_offsets = compact(function_section(SELECTOR.read_text(), "static_if_offsets_for_rows"))
     if not all(fragment in selected_offsets for fragment in (
-            "selected_static_if_rows(file,structs)",
+            "forrowintaken_rows",
             "row.usize()>=file.static_if_offsets.count",
             "taken_offsets.push(file.static_if_offsets[row.usize()])")) or not all(fragment in selector for fragment in (
             "flatten_static_branches[@r](decls:darray[Decl]&,branch_offsets:darray[u32]&,taken_offsets:darray[u32]&",
@@ -737,7 +737,8 @@ def require_backend_position_identity() -> None:
         raise SystemExit("backend declaration flattening must select static branches by exact source offsets")
     if not all(fragment in module for fragment in (
             "static_branch_offsets:darray[u32]=file.static_if_offsets",
-            "selected_static_if_offsets(file,structs)",
+            "round_rows:darray[u32]=selected_static_if_rows(file,structs)",
+            "round_taken_offsets:darray[u32]=static_if_offsets_for_rows(file,selected_rows)",
             "flatten_static_branches(file.top_decls,static_branch_offsets,round_taken_offsets,round_top)",
             "structs.annotations.static_branch_offsets<-file.static_if_offsets",
             "structs.annotations.static_taken_offsets<-structs.annotations.static_taken_offsets.push(file.static_if_offsets[selected_row.usize()])")) or not all(fragment in backend_annotations for fragment in (
