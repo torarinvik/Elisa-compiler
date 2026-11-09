@@ -1,0 +1,545 @@
+# Affine-use flow analysis.
+extend Semantic:
+    private:
+        # TypeIds do not store a nominal declaration module. Qualify each nominal head
+        # while expanding an alias so matching retains the defining owner even when the
+        # requester has a same-spelled local type or no direct import of that type.
+        def affine_call_type_id_qualify_nominal_owners(type_id: u32, definition_module: sview @source, generic_owner: Ast::Pos, depth: u32, table: mutable SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return 0 if type_id == 0 or depth > 64
+                kind: SemTypeKind = interned_kind(type_id, table)
+                if kind == SemTypeKind.Region:
+                    region_row: usize = type_id.usize() - 1.usize()
+                    return 0 if region_row >= table.type_row_region_ids.count or table.type_row_region_ids[region_row] == 0
+                    return type_id
+                type_name: mutable sview = interned_name(type_id, table)
+                return type_id if kind == SemTypeKind.Named and function_generic_param_named(table, generic_owner.line, generic_owner.offset, type_name)
+                if kind == SemTypeKind.Named or (kind == SemTypeKind.Container and type_name != "array" and type_name != "darray" and type_name != "dict" and type_name != "set" and type_name != "view"):
+                    definition_identity: (found: bool, module: sview @source, owner: sview @source) = affine_call_nominal_identity(type_name, definition_module, table)
+                    return 0 if not definition_identity.found
+                    if affine_call_type_path_is_bare(type_name):
+                        if definition_identity.module == "":
+                            qualified_bytes: mutable darray[u8] = [58, 58]
+                            for byte_position in 0..<type_name.len |qualified_bytes, type_name|:
+                                qualified_bytes.push(type_name[byte_position])
+                            type_name <- intern_joined_text(qualified_bytes, table)
+                        else:
+                            type_name <- affine_call_module_path_join(definition_identity.module, type_name, table)
+                element_ids: mutable darray[u32] = []
+                for element_position in 0..<interned_elem_count(type_id, table) |type_id, definition_module, generic_owner, depth, table, element_ids|:
+                    qualified_element: u32 = affine_call_type_id_qualify_nominal_owners(interned_elem(type_id, element_position.u32(), table), definition_module, generic_owner, depth + 1, table)
+                    return 0 if qualified_element == 0
+                    element_ids.push(qualified_element)
+                return intern_type(kind, type_name, element_ids, table)
+
+        def affine_call_type_alias_application_id(alias_row: u32, arguments: darray[Ast::Expr]&, module: sview @source, use_pos: Ast::Pos, generic_owner: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, depth: u32, table: mutable SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return 0 if depth > 64 or alias_row == AFFINE_TYPE_ALIAS_ROW_AMBIGUOUS
+                return 0 if alias_row.usize() >= table.type_alias_declarations.count or alias_row.usize() >= table.type_alias_module.count
+                alias_declaration: TypeAliasDeclaration = table.type_alias_declarations[alias_row.usize()]
+                return 0 if alias_declaration.module_owner != table.type_alias_module[alias_row.usize()]
+                alias_formals: (known: bool, names: darray[sview @source]) = affine_call_alias_formal_names(table.type_alias_name[alias_row.usize()], alias_declaration.pos, annotations)
+                return 0 if not alias_formals.known or alias_formals.names.count != arguments.count
+                alias_actuals: mutable darray[u32] = []
+                for argument in arguments |alias_actuals, module, use_pos, generic_owner, annotations, depth, alias_formals, alias_declaration, table|:
+                    argument_id: mutable u32 = affine_call_type_expression_type_id(argument, module, use_pos, generic_owner, annotations, depth + 1, table)
+                    argument_id <- annotation_generic_argument_type_id(argument, table) if argument_id == 0
+                    return 0 if argument_id == 0
+                    canonical_argument: mutable u32 = affine_call_canonical_actual_type_id(argument_id, module, use_pos, generic_owner, annotations, depth + 1, table)
+                    return 0 if canonical_argument == 0
+                    canonical_argument <- affine_call_type_id_qualify_nominal_owners(canonical_argument, module, generic_owner, depth + 1, table) if alias_declaration.module_owner != module
+                    return 0 if canonical_argument == 0
+                    alias_actuals.push(canonical_argument)
+                no_generic_owner: Ast::Pos = Ast::Pos{line: 4294967295, column: 0, offset: 4294967295, end_line: 4294967295, end_column: 0, end_offset: 4294967295}
+                target_id: mutable u32 = affine_call_alias_target_type_id(alias_declaration.target, alias_declaration.module_owner, alias_declaration.pos, alias_formals.names, annotations, depth + 1, table)
+                return 0 if target_id == 0
+                canonical_target: u32 = affine_call_canonical_actual_type_id_with_alias_substitution(target_id, alias_declaration.module_owner, alias_declaration.pos, no_generic_owner, annotations, alias_formals.names, alias_actuals, depth + 1, AFFINE_STATE_FAMILY_NONE, table)
+                return 0 if canonical_target == 0
+                return affine_call_type_id_qualify_nominal_owners(canonical_target, alias_declaration.module_owner, generic_owner, depth + 1, table) if alias_declaration.module_owner != module
+                return canonical_target
+
+        # `annotation_type_id` does not represent a qualified AST path. Recover a
+        # concrete TypeId from its alias declaration (or a directly qualified nominal
+        # owner) so affine overload selection can compare identities instead of dropping
+        # the local's module information into a bare leaf spelling.
+        def affine_call_type_expression_type_id(type_expression: Ast::Expr, module: sview @source, use_pos: Ast::Pos, generic_owner: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, depth: u32, table: mutable SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return 0 if depth > 64
+                match type_expression:
+                    Expr.Ident(generic_name, _) if function_generic_param_named(table, generic_owner.line, generic_owner.offset, generic_name):
+                        generic_id: u32 = annotation_type_id(type_expression, table)
+                        return generic_id if generic_id != 0
+                        return annotation_generic_argument_type_id(type_expression, table)
+                    _:
+                        pass
+                match type_expression:
+                    Expr.Paren(inner, _):
+                        return affine_call_type_expression_type_id(inner, module, use_pos, generic_owner, annotations, depth + 1, table)
+                    Expr.Refinement(base, _, _):
+                        return affine_call_type_expression_type_id(base, module, use_pos, generic_owner, annotations, depth + 1, table)
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Mutable or operator == TokenKind.Lmut or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail:
+                        return affine_call_type_expression_type_id(inner, module, use_pos, generic_owner, annotations, depth + 1, table)
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Question or operator == TokenKind.Ampersand:
+                        inner_id: u32 = affine_call_type_expression_type_id(inner, module, use_pos, generic_owner, annotations, depth + 1, table)
+                        return 0 if inner_id == 0
+                        return intern_type_one(SemTypeKind.Optional, "optional", inner_id, table) if operator == TokenKind.Question
+                        return intern_type_one(SemTypeKind.Ref, "ref", inner_id, table)
+                    Expr.Tuple(elements, _):
+                        element_handles: mutable darray[Ast::Expr] = []
+                        element_handles.extend(elements)
+                        element_ids: mutable darray[u32] = []
+                        for element in element_handles |element_ids, module, use_pos, generic_owner, annotations, depth, table|:
+                            element_id: u32 = affine_call_type_expression_type_id(element, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            return 0 if element_id == 0
+                            element_ids.push(element_id)
+                        return intern_type(SemTypeKind.Tuple, "tuple", element_ids, table)
+                    Expr.Index(indexed_head, index_argument, _):
+                        if literal_kind_of(index_argument) == "int":
+                            element_id: u32 = affine_call_type_expression_type_id(indexed_head, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            return 0 if element_id == 0
+                            return intern_type_one(SemTypeKind.Container, "array", element_id, table)
+                        type_id: u32 = annotation_type_id(type_expression, table) if not affine_call_type_expression_has_scope(type_expression) else 0
+                        if type_id == 0:
+                            head_path: sview = affine_call_type_path(indexed_head, table)
+                            if head_path != "":
+                                alias_row: u32 = affine_call_type_alias_row_at(head_path, module, use_pos, annotations, table)
+                                if alias_row != SYMBOL_INDEX_ROW_NONE:
+                                    alias_arguments: darray[Ast::Expr] = [index_argument]
+                                    return affine_call_type_alias_application_id(alias_row, alias_arguments, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            head_id: u32 = affine_call_type_expression_type_id(indexed_head, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            argument_id: mutable u32 = affine_call_type_expression_type_id(index_argument, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            argument_id <- annotation_generic_argument_type_id(index_argument, table) if argument_id == 0
+                            return 0 if head_id == 0 or argument_id == 0
+                            arguments: mutable darray[u32] = [argument_id]
+                            return intern_type(SemTypeKind.Container, interned_name(head_id, table), arguments, table)
+                        head_type_id: u32 = annotation_type_id(indexed_head, table)
+                        head_kind: SemTypeKind = interned_kind(head_type_id, table)
+                        if interned_name(type_id, table) == "array" and head_type_id != 0 and head_kind != SemTypeKind.Named and head_kind != SemTypeKind.Unknown:
+                            element_id: u32 = affine_call_type_expression_type_id(indexed_head, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            return 0 if element_id == 0
+                            return intern_type_one(SemTypeKind.Container, "array", element_id, table)
+                        element_count: usize = interned_elem_count(type_id, table)
+                        return type_id if element_count == 0
+                        return 0 if element_count != 1
+                        argument_id: mutable u32 = affine_call_type_expression_type_id(index_argument, module, use_pos, generic_owner, annotations, depth + 1, table)
+                        argument_id <- annotation_generic_argument_type_id(index_argument, table) if argument_id == 0
+                        return 0 if argument_id == 0
+                        arguments: mutable darray[u32] = [argument_id]
+                        return intern_type(interned_kind(type_id, table), interned_name(type_id, table), arguments, table)
+                    Expr.IndexN(indexed_head, index_arguments, _):
+                        argument_handles: mutable darray[Ast::Expr] = []
+                        argument_handles.extend(index_arguments)
+                        type_id: u32 = annotation_type_id(type_expression, table) if not affine_call_type_expression_has_scope(type_expression) else 0
+                        if type_id == 0:
+                            head_path: sview = affine_call_type_path(indexed_head, table)
+                            if head_path != "":
+                                alias_row: u32 = affine_call_type_alias_row_at(head_path, module, use_pos, annotations, table)
+                                if alias_row != SYMBOL_INDEX_ROW_NONE:
+                                    return affine_call_type_alias_application_id(alias_row, argument_handles, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            head_id: u32 = affine_call_type_expression_type_id(indexed_head, module, use_pos, generic_owner, annotations, depth + 1, table)
+                            return 0 if head_id == 0
+                            arguments: mutable darray[u32] = []
+                            for argument_index in 0..<argument_handles.count |arguments, argument_handles, module, use_pos, generic_owner, annotations, depth, table|:
+                                argument_id: mutable u32 = affine_call_type_expression_type_id(argument_handles[argument_index], module, use_pos, generic_owner, annotations, depth + 1, table)
+                                argument_id <- annotation_generic_argument_type_id(argument_handles[argument_index], table) if argument_id == 0
+                                return 0 if argument_id == 0
+                                arguments.push(argument_id)
+                            return intern_type(SemTypeKind.Container, interned_name(head_id, table), arguments, table)
+                        element_count: usize = interned_elem_count(type_id, table)
+                        return type_id if element_count == 0
+                        return 0 if argument_handles.count < element_count
+                        arguments: mutable darray[u32] = []
+                        for argument_index in 0..<element_count |arguments, argument_handles, module, use_pos, generic_owner, annotations, depth, table|:
+                            argument_id: mutable u32 = affine_call_type_expression_type_id(argument_handles[argument_index], module, use_pos, generic_owner, annotations, depth + 1, table)
+                            argument_id <- annotation_generic_argument_type_id(argument_handles[argument_index], table) if argument_id == 0
+                            return 0 if argument_id == 0
+                            arguments.push(argument_id)
+                        return intern_type(interned_kind(type_id, table), interned_name(type_id, table), arguments, table)
+                    _:
+                        pass
+                type_id: u32 = annotation_type_id(type_expression, table) if not affine_call_type_expression_has_scope(type_expression) else 0
+                return type_id if type_id != 0
+                type_path: sview = affine_call_type_path(type_expression, table)
+                return 0 if type_path == ""
+                alias_row: u32 = affine_call_type_alias_row_at(type_path, module, use_pos, annotations, table)
+                return 0 if alias_row == AFFINE_TYPE_ALIAS_ROW_AMBIGUOUS
+                if alias_row != SYMBOL_INDEX_ROW_NONE:
+                    return 0 if alias_row.usize() >= table.type_alias_declarations.count or alias_row.usize() >= table.type_alias_module.count
+                    alias_declaration: TypeAliasDeclaration = table.type_alias_declarations[alias_row.usize()]
+                    return 0 if alias_declaration.module_owner != table.type_alias_module[alias_row.usize()]
+                    alias_formals: (known: bool, names: darray[sview @source]) = affine_call_alias_formal_names(table.type_alias_name[alias_row.usize()], alias_declaration.pos, annotations)
+                    return 0 if not alias_formals.known or alias_formals.names.count > 0
+                    no_generic_owner: Ast::Pos = Ast::Pos{line: 4294967295, column: 0, offset: 4294967295, end_line: 4294967295, end_column: 0, end_offset: 4294967295}
+                    target_id: mutable u32 = affine_call_alias_target_type_id(alias_declaration.target, alias_declaration.module_owner, alias_declaration.pos, alias_formals.names, annotations, depth + 1, table)
+                    return 0 if target_id == 0
+                    empty_alias_actuals: darray[u32] = []
+                    canonical_target: u32 = affine_call_canonical_actual_type_id_with_alias_substitution(target_id, alias_declaration.module_owner, alias_declaration.pos, no_generic_owner, annotations, alias_formals.names, empty_alias_actuals, depth + 1, AFFINE_STATE_FAMILY_NONE, table)
+                    return 0 if canonical_target == 0
+                    return affine_call_type_id_qualify_nominal_owners(canonical_target, alias_declaration.module_owner, generic_owner, depth + 1, table)
+                path_separator: mutable usize = type_path.len
+                scan: mutable usize = 0
+                while scan + 1.usize() < type_path.len |scan, path_separator, type_path|:
+                    if type_path[scan] == 58 and type_path[scan + 1.usize()] == 58:
+                        path_separator <- scan
+                    scan <- scan + 1.usize()
+                identity: mutable (found: bool, module: sview @source, owner: sview @source) = (false, "", "")
+                if path_separator < type_path.len:
+                    path_module: sview = string_view_slice(type_path, 0, path_separator.i64())
+                    type_name: sview = string_view_slice(type_path, (path_separator + 2.usize()).i64(), type_path.len.i64())
+                    requester: Ast::EnumAnnotation = Ast::EnumAnnotation{owner: "", name: "", line: use_pos.line, module: module, offset: use_pos.offset, pos: use_pos}
+                    module_scope: mutable sview = module
+                    while module_scope != "" |module_scope, identity, path_module, type_name, table|:
+                        candidate_module: sview = affine_call_module_path_join(module_scope, path_module, table)
+                        identity <- affine_call_nominal_identity_in_module(type_name, candidate_module, table)
+                        break if identity.found
+                        module_scope <- try_noncall_module_parent(module_scope)
+                    if not identity.found:
+                        first_separator: mutable usize = path_module.len
+                        first_scan: mutable usize = 0
+                        while first_scan + 1.usize() < path_module.len |first_scan, first_separator, path_module|:
+                            if path_module[first_scan] == 58 and path_module[first_scan + 1.usize()] == 58:
+                                first_separator <- first_scan
+                                break
+                            first_scan <- first_scan + 1.usize()
+                        first_component: sview = string_view_slice(path_module, 0, first_separator.i64())
+                        alias_row: u32 = binding_module_alias_row_before(first_component, requester, table)
+                        return 0 if alias_row == BINDING_MODULE_ALIAS_ROW_AMBIGUOUS
+                        if alias_row != SYMBOL_INDEX_ROW_NONE:
+                            canonical_module: sview = binding_nominal_alias_target_owner(path_module, requester, table)
+                            return 0 if canonical_module == ""
+                            identity <- affine_call_nominal_identity_in_module(type_name, canonical_module, table)
+                        identity <- affine_call_nominal_identity_in_module(type_name, path_module, table) if not identity.found
+                else:
+                    identity <- affine_call_nominal_identity(type_path, module, table)
+                return 0 if not identity.found
+                qualified_name: sview = affine_call_nominal_type_name(identity.module, identity.owner, table)
+                no_elements: darray[u32] = []
+                return intern_type(SemTypeKind.Named, qualified_name, no_elements, table)
+
+        # Build a generic alias target before substituting its formals. The ordinary
+        # annotation converter cannot represent a formal such as `Elem` inside
+        # `darray[Elem]`; keeping it as a symbolic Named leaf lets the canonicalizer
+        # replace it with the already-resolved actual TypeId.
+        def affine_call_alias_target_type_id(type_expression: Ast::Expr, module: sview @source, alias_pos: Ast::Pos, alias_formals: darray[sview @source]&, annotations: darray[Ast::EnumAnnotation]&, depth: u32, table: mutable SymbolTable&) -> u32:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return 0 if depth > 64
+                no_generic_owner: Ast::Pos = Ast::Pos{line: 4294967295, column: 0, offset: 4294967295, end_line: 4294967295, end_column: 0, end_offset: 4294967295}
+                match type_expression:
+                    Expr.Ident(type_name, _):
+                        for formal_name in alias_formals |type_name, table|:
+                            if formal_name == type_name:
+                                no_elements: darray[u32] = []
+                                return intern_type(SemTypeKind.Named, type_name, no_elements, table)
+                        return affine_call_type_expression_type_id(type_expression, module, alias_pos, no_generic_owner, annotations, depth + 1, table)
+                    Expr.Paren(inner, _) | Expr.Refinement(inner, _, _):
+                        return affine_call_alias_target_type_id(inner, module, alias_pos, alias_formals, annotations, depth + 1, table)
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Mutable or operator == TokenKind.Lmut or operator == TokenKind.Static or operator == TokenKind.Heap or operator == TokenKind.Stack or operator == TokenKind.Tail:
+                        return affine_call_alias_target_type_id(inner, module, alias_pos, alias_formals, annotations, depth + 1, table)
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Question or operator == TokenKind.Ampersand:
+                        inner_id: u32 = affine_call_alias_target_type_id(inner, module, alias_pos, alias_formals, annotations, depth + 1, table)
+                        return 0 if inner_id == 0
+                        return intern_type_one(SemTypeKind.Optional, "optional", inner_id, table) if operator == TokenKind.Question
+                        return intern_type_one(SemTypeKind.Ref, "ref", inner_id, table)
+                    Expr.Tuple(elements, _):
+                        element_handles: mutable darray[Ast::Expr] = []
+                        element_handles.extend(elements)
+                        element_ids: mutable darray[u32] = []
+                        for element in element_handles |element_ids, module, alias_pos, alias_formals, annotations, depth, table|:
+                            element_id: u32 = affine_call_alias_target_type_id(element, module, alias_pos, alias_formals, annotations, depth + 1, table)
+                            return 0 if element_id == 0
+                            element_ids.push(element_id)
+                        return intern_type(SemTypeKind.Tuple, "tuple", element_ids, table)
+                    Expr.Index(indexed_head, index_argument, _):
+                        if literal_kind_of(index_argument) == "int":
+                            element_id: u32 = affine_call_alias_target_type_id(indexed_head, module, alias_pos, alias_formals, annotations, depth + 1, table)
+                            return 0 if element_id == 0
+                            return intern_type_one(SemTypeKind.Container, "array", element_id, table)
+                        head_path: sview = affine_call_type_path(indexed_head, table)
+                        return affine_call_type_expression_type_id(type_expression, module, alias_pos, no_generic_owner, annotations, depth + 1, table) if head_path == ""
+                        scalar_head: InferType = type_of_name(head_path)
+                        if scalar_head.kind != SemTypeKind.Unknown and scalar_head.kind != SemTypeKind.Named:
+                            return annotation_type_id(type_expression, table)
+                        argument_id: mutable u32 = affine_call_alias_target_type_id(index_argument, module, alias_pos, alias_formals, annotations, depth + 1, table)
+                        argument_id <- annotation_generic_argument_type_id(index_argument, table) if argument_id == 0
+                        return 0 if argument_id == 0
+                        arguments: darray[u32] = [argument_id]
+                        return intern_type(SemTypeKind.Container, head_path, arguments, table)
+                    Expr.IndexN(indexed_head, index_arguments, _):
+                        head_path: sview = affine_call_type_path(indexed_head, table)
+                        return affine_call_type_expression_type_id(type_expression, module, alias_pos, no_generic_owner, annotations, depth + 1, table) if head_path == ""
+                        argument_handles: mutable darray[Ast::Expr] = []
+                        argument_handles.extend(index_arguments)
+                        argument_count: usize = argument_handles.count
+                        type_argument_count: usize = 1 if head_path == "darray" and argument_count == 2 else argument_count
+                        arguments: mutable darray[u32] = []
+                        for argument_index in 0..<type_argument_count |arguments, argument_handles, module, alias_pos, alias_formals, annotations, depth, table|:
+                            argument_id: mutable u32 = affine_call_alias_target_type_id(argument_handles[argument_index], module, alias_pos, alias_formals, annotations, depth + 1, table)
+                            argument_id <- annotation_generic_argument_type_id(argument_handles[argument_index], table) if argument_id == 0
+                            return 0 if argument_id == 0
+                            arguments.push(argument_id)
+                        return intern_type(SemTypeKind.Container, head_path, arguments, table)
+                    _:
+                        pass
+                type_id: u32 = annotation_type_id(type_expression, table)
+                return type_id if type_id != 0
+                return affine_call_type_expression_type_id(type_expression, module, alias_pos, no_generic_owner, annotations, depth + 1, table)
+
+        def affine_call_type_pattern_may_match(initial_formal_id: u32, initial_actual_id: u32, declaration_module: sview @source, declaration_line: Ast::Pos, current_module: sview @source, caller_line: Ast::Pos, call_pos: Ast::Pos, generic_names: mutable darray[sview @source]&, generic_actuals: mutable darray[u32]&, region_formals: mutable darray[u32]&, region_actuals: mutable darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, depth: u32, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                formal_id: mutable u32 = initial_formal_id
+                actual_id: mutable u32 = initial_actual_id
+                if formal_id == 0:
+                    return false if type_id_contains_function_generic(actual_id, caller_line.line, caller_line.offset, table)
+                    return true
+                return false if depth > 64
+                original_formal_kind: SemTypeKind = interned_kind(formal_id, table)
+                if original_formal_kind == SemTypeKind.Named and function_generic_param_named(table, declaration_line.line, declaration_line.offset, interned_name(formal_id, table)):
+                    generic_canonical_actual: u32 = affine_call_canonical_actual_type_id(actual_id, current_module, call_pos, caller_line, annotations, 0, table)
+                    return false if generic_canonical_actual == 0
+                    generic_actual_kind: SemTypeKind = interned_kind(generic_canonical_actual, table)
+                    return false if generic_actual_kind == SemTypeKind.Unknown or generic_actual_kind == SemTypeKind.Region
+                    return false if not affine_call_type_id_has_unique_nominal_names_for_generic_owner(generic_canonical_actual, current_module, caller_line, 0, table)
+                    generic_name: sview = interned_name(formal_id, table)
+                    return false if generic_names.count != generic_actuals.count
+                    for generic_index in 0..<generic_names.count |generic_name, generic_names, generic_actuals, generic_canonical_actual, current_module, caller_line, table|:
+                        if generic_names[generic_index] == generic_name:
+                            return affine_call_type_ids_equal_as_generic_actuals(generic_actuals[generic_index], generic_canonical_actual, current_module, caller_line, 0, table)
+                    generic_names.push(generic_name)
+                    generic_actuals.push(generic_canonical_actual)
+                    return true
+                canonical_formal: u32 = affine_call_canonical_actual_type_id(formal_id, declaration_module, declaration_line, declaration_line, annotations, 0, table)
+                if canonical_formal == 0:
+                    return false if original_formal_kind == SemTypeKind.Region or type_id_contains_region(formal_id, table)
+                    return false if original_formal_kind != SemTypeKind.Unknown and type_id_contains_function_generic(actual_id, caller_line.line, caller_line.offset, table)
+                    return true
+                formal_id <- canonical_formal
+                formal_kind: SemTypeKind = interned_kind(formal_id, table)
+                actual_has_caller_generic: bool = type_id_contains_function_generic(actual_id, caller_line.line, caller_line.offset, table)
+                canonical_argument_id: u32 = affine_call_canonical_actual_type_id(actual_id, current_module, call_pos, caller_line, annotations, 0, table)
+                if canonical_argument_id == 0:
+                    return false if actual_has_caller_generic
+                    return false if type_id_contains_region(formal_id, table)
+                    return true
+                if formal_kind == SemTypeKind.Region:
+                    actual_id <- canonical_argument_id
+                    region_actual_kind: SemTypeKind = interned_kind(actual_id, table)
+                    return false if region_actual_kind != SemTypeKind.Region
+                    return false if region_formals.count != region_actuals.count
+                    for region_index in 0..<region_formals.count |region_formals, region_actuals, formal_id, actual_id|:
+                        if region_formals[region_index] == formal_id:
+                            return region_actuals[region_index] == actual_id
+                    region_formals.push(formal_id)
+                    region_actuals.push(actual_id)
+                    return true
+                actual_id <- canonical_argument_id
+                actual_kind: SemTypeKind = interned_kind(actual_id, table)
+                if actual_kind == SemTypeKind.Named and function_generic_param_named(table, caller_line.line, caller_line.offset, interned_name(actual_id, table)):
+                    return false
+                return true if formal_kind == SemTypeKind.Unknown or actual_kind == SemTypeKind.Unknown
+                return false if actual_kind == SemTypeKind.Region
+                return true if affine_call_type_id_is_alias(formal_id, declaration_module, table) or affine_call_type_id_is_alias(actual_id, current_module, table)
+                if formal_kind == SemTypeKind.Ref or actual_kind == SemTypeKind.Ref:
+                    if formal_kind == SemTypeKind.Ref:
+                        return true if interned_elem_count(formal_id, table) != 1
+                        if actual_kind == SemTypeKind.Ref:
+                            return true if interned_elem_count(actual_id, table) != 1
+                            return affine_call_type_pattern_may_match(interned_elem(formal_id, 0, table), interned_elem(actual_id, 0, table), declaration_module, declaration_line, current_module, caller_line, call_pos, generic_names, generic_actuals, region_formals, region_actuals, annotations, depth + 1, table)
+                        return affine_call_type_pattern_may_match(interned_elem(formal_id, 0, table), actual_id, declaration_module, declaration_line, current_module, caller_line, call_pos, generic_names, generic_actuals, region_formals, region_actuals, annotations, depth + 1, table)
+                    return false
+                formal_structured: bool = formal_kind == SemTypeKind.Named or formal_kind == SemTypeKind.Container or formal_kind == SemTypeKind.Tuple or formal_kind == SemTypeKind.Optional
+                actual_structured: bool = actual_kind == SemTypeKind.Named or actual_kind == SemTypeKind.Container or actual_kind == SemTypeKind.Tuple or actual_kind == SemTypeKind.Optional
+                return true if not formal_structured and not actual_structured and depth == 0
+                return false if formal_structured != actual_structured
+                if not formal_structured and not actual_structured:
+                    return false if formal_kind != actual_kind
+                    formal_scalar_name: sview = interned_name(formal_id, table)
+                    actual_scalar_name: sview = interned_name(actual_id, table)
+                    return true if formal_scalar_name == actual_scalar_name
+                    return true if formal_kind == SemTypeKind.Int and actual_scalar_name == "int"
+                    return true if formal_kind == SemTypeKind.Float and actual_scalar_name == "float"
+                    return false
+                return false if formal_kind != actual_kind
+                formal_name: sview = interned_name(formal_id, table)
+                actual_name: sview = interned_name(actual_id, table)
+                if formal_kind == SemTypeKind.Named:
+                    formal_identity: (found: bool, module: sview @source, owner: sview @source) = affine_call_nominal_identity(formal_name, declaration_module, table)
+                    actual_identity: (found: bool, module: sview @source, owner: sview @source) = affine_call_nominal_identity(actual_name, current_module, table)
+                    return true if not formal_identity.found or not actual_identity.found
+                    return false if formal_identity.module != actual_identity.module or formal_identity.owner != actual_identity.owner
+                if formal_kind == SemTypeKind.Container:
+                    formal_builtin: bool = formal_name == "array" or formal_name == "darray" or formal_name == "dict" or formal_name == "set" or formal_name == "view"
+                    actual_builtin: bool = actual_name == "array" or actual_name == "darray" or actual_name == "dict" or actual_name == "set" or actual_name == "view"
+                    if formal_builtin or actual_builtin:
+                        return false if formal_name != actual_name
+                    else:
+                        formal_identity: (found: bool, module: sview @source, owner: sview @source) = affine_call_nominal_identity(formal_name, declaration_module, table)
+                        actual_identity: (found: bool, module: sview @source, owner: sview @source) = affine_call_nominal_identity(actual_name, current_module, table)
+                        return true if not formal_identity.found or not actual_identity.found
+                        return false if formal_identity.module != actual_identity.module or formal_identity.owner != actual_identity.owner
+                return false if interned_elem_count(formal_id, table) != interned_elem_count(actual_id, table)
+                for element_position in 0..<interned_elem_count(formal_id, table) |formal_id, actual_id, declaration_module, declaration_line, current_module, caller_line, call_pos, generic_names, generic_actuals, region_formals, region_actuals, annotations, depth, table|:
+                    return false if not affine_call_type_pattern_may_match(interned_elem(formal_id, element_position.u32(), table), interned_elem(actual_id, element_position.u32(), table), declaration_module, declaration_line, current_module, caller_line, call_pos, generic_names, generic_actuals, region_formals, region_actuals, annotations, depth + 1, table)
+                return true
+
+        # Generic-callee bindings may contain caller-owned generic leaves. Treat those leaves
+        # as symbolic identities, while requiring every concrete nominal leaf to remain
+        # owner-unique. This prevents a same-spelled local nominal from standing in for T.
+        def affine_call_type_id_has_unique_nominal_names_for_generic_owner(type_id: u32, module: sview @source, generic_owner: Ast::Pos, depth: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if type_id == 0 or depth > 64
+                kind: SemTypeKind = interned_kind(type_id, table)
+                type_name: sview = interned_name(type_id, table)
+                if kind == SemTypeKind.Named and function_generic_param_named(table, generic_owner.line, generic_owner.offset, type_name):
+                    return true
+                nominal_head: bool = kind == SemTypeKind.Named or (kind == SemTypeKind.Container and type_name != "array" and type_name != "darray" and type_name != "dict" and type_name != "set" and type_name != "view")
+                if nominal_head:
+                    if affine_call_type_path_is_bare(type_name):
+                        return affine_call_unique_nominal_owner(type_name, table) or (kind == SemTypeKind.Named and affine_call_unique_enum_variant_name(type_name, table))
+                    return affine_call_nominal_identity(type_name, module, table).found
+                for element_position in 0..<interned_elem_count(type_id, table) |type_id, module, generic_owner, depth, table|:
+                    return false if not affine_call_type_id_has_unique_nominal_names_for_generic_owner(interned_elem(type_id, element_position.u32(), table), module, generic_owner, depth + 1, table)
+                return true
+
+
+        def affine_call_type_ids_equal_as_generic_actuals(left_id: u32, right_id: u32, module: sview @source, generic_owner: Ast::Pos, depth: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                return false if left_id == 0 or right_id == 0 or depth > 64
+                left_kind: SemTypeKind = interned_kind(left_id, table)
+                right_kind: SemTypeKind = interned_kind(right_id, table)
+                left_name: sview = interned_name(left_id, table)
+                right_name: sview = interned_name(right_id, table)
+                left_generic: bool = left_kind == SemTypeKind.Named and function_generic_param_named(table, generic_owner.line, generic_owner.offset, left_name)
+                right_generic: bool = right_kind == SemTypeKind.Named and function_generic_param_named(table, generic_owner.line, generic_owner.offset, right_name)
+                if left_generic or right_generic:
+                    return left_generic and right_generic and left_name == right_name
+                return false if left_kind != right_kind or left_name != right_name or interned_elem_count(left_id, table) != interned_elem_count(right_id, table)
+                for element_position in 0..<interned_elem_count(left_id, table) |left_id, right_id, module, generic_owner, depth, table|:
+                    return false if not affine_call_type_ids_equal_as_generic_actuals(interned_elem(left_id, element_position.u32(), table), interned_elem(right_id, element_position.u32(), table), module, generic_owner, depth + 1, table)
+                return true
+
+        def affine_call_structured_argument_may_match(argument: Ast::Expr, parameter_type: Ast::Expr, declaration_module: sview @source, declaration_line: Ast::Pos, current_module: sview @source, caller_line: Ast::Pos, call_pos: Ast::Pos, generic_names: mutable darray[sview @source]&, generic_actuals: mutable darray[u32]&, region_formals: mutable darray[u32]&, region_actuals: mutable darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, local_names: darray[sview]&, local_types: darray[sview @source]&, local_type_ids: darray[u32]&, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                formal_id: mutable u32 = annotation_type_id(parameter_type, table)
+                if affine_call_type_expression_has_scope(parameter_type):
+                    formal_id <- affine_call_type_expression_type_id(parameter_type, declaration_module, declaration_line, declaration_line, annotations, 0, table)
+                    return false if formal_id == 0
+                    canonical_formal: u32 = affine_call_canonical_actual_type_id(formal_id, declaration_module, declaration_line, declaration_line, annotations, 0, table)
+                    return false if canonical_formal == 0
+                    formal_id <- canonical_formal
+                actual_id: u32 = affine_call_argument_type_id(argument, current_module, caller_line, annotations, local_names, local_types, local_type_ids, table)
+                return false if formal_id == 0 and type_id_contains_function_generic(actual_id, caller_line.line, caller_line.offset, table)
+                return true if formal_id == 0
+                return affine_call_type_pattern_may_match(formal_id, actual_id, declaration_module, declaration_line, current_module, caller_line, call_pos, generic_names, generic_actuals, region_formals, region_actuals, annotations, 0, table)
+
+        def affine_call_argument_is_exact(argument: Ast::Expr, parameter_type: Ast::Expr, declaration_module: sview @source, declaration_line: Ast::Pos, current_module: sview @source, caller_line: Ast::Pos, call_pos: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, local_names: darray[sview]&, local_types: darray[sview @source]&, local_type_ids: darray[u32]&, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                expected_path: sview = affine_call_type_path(parameter_type, table)
+                if expected_path != "":
+                    return false if function_generic_param_named(table, declaration_line.line, declaration_line.offset, expected_path)
+                    expected_name: sview = affine_call_resolve_type_alias(expected_path, declaration_module, declaration_line, annotations, table)
+                    expected: InferType = type_of_name(expected_name)
+                    literal_kind: sview = literal_kind_of(argument)
+                    if literal_kind != "":
+                        return expected.kind == SemTypeKind.Int if literal_kind == "int"
+                        return expected.kind == SemTypeKind.Float if literal_kind == "float"
+                        return expected.kind == SemTypeKind.String if literal_kind == "string"
+                        return expected.kind == SemTypeKind.Char if literal_kind == "char"
+                        return expected.kind == SemTypeKind.Bool if literal_kind == "bool"
+                formal_id: u32 = affine_call_type_expression_type_id(parameter_type, declaration_module, declaration_line, declaration_line, annotations, 0, table)
+                actual_id: u32 = affine_call_argument_type_id(argument, current_module, caller_line, annotations, local_names, local_types, local_type_ids, table)
+                return false if formal_id == 0 or actual_id == 0
+                return false if not affine_call_type_id_is_concrete(formal_id, table) or not affine_call_type_id_is_concrete(actual_id, table)
+                return false if type_id_contains_function_generic(formal_id, declaration_line.line, declaration_line.offset, table) or type_id_contains_function_generic(actual_id, caller_line.line, caller_line.offset, table) or type_id_contains_region(formal_id, table) or type_id_contains_region(actual_id, table)
+                canonical_formal: u32 = affine_call_canonical_actual_type_id(formal_id, declaration_module, declaration_line, declaration_line, annotations, 0, table)
+                canonical_actual: u32 = affine_call_canonical_actual_type_id(actual_id, current_module, call_pos, caller_line, annotations, 0, table)
+                return false if canonical_formal == 0 or canonical_actual == 0
+                return false if type_id_contains_region(canonical_formal, table) or type_id_contains_region(canonical_actual, table)
+                return affine_call_type_ids_are_exact(canonical_formal, canonical_actual, declaration_module, declaration_line, current_module, caller_line, AFFINE_STATE_FAMILY_NONE, 0, table)
+
+        def affine_call_argument_is_exact_name(argument: Ast::Expr, expected_name: sview @source, declaration_module: sview @source, declaration_line: Ast::Pos, current_module: sview @source, caller_line: Ast::Pos, annotations: darray[Ast::EnumAnnotation]&, local_names: darray[sview]&, local_types: darray[sview @source]&, local_type_ids: darray[u32]&, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic:
+                return false if expected_name == "" or function_generic_param_named(table, declaration_line.line, declaration_line.offset, expected_name)
+                resolved_name: sview = affine_call_resolve_type_alias(expected_name, declaration_module, declaration_line, annotations, table)
+                expected: InferType = type_of_name(resolved_name)
+                return false if expected.kind == SemTypeKind.Unknown
+                literal_kind: sview = literal_kind_of(argument)
+                return expected.kind == SemTypeKind.Int if literal_kind == "int"
+                return expected.kind == SemTypeKind.Float if literal_kind == "float"
+                return expected.kind == SemTypeKind.String if literal_kind == "string"
+                return expected.kind == SemTypeKind.Char if literal_kind == "char"
+                return expected.kind == SemTypeKind.Bool if literal_kind == "bool"
+                actual: InferType = affine_call_argument_infer_type(argument, current_module, caller_line, annotations, local_names, local_types, local_type_ids, table)
+                return false if actual.kind != expected.kind
+                if expected.kind == SemTypeKind.Named:
+                    return actual.name == expected.name if not affine_call_type_path_is_bare(resolved_name)
+                    formal_identity: (found: bool, module: sview @source, owner: sview @source) = affine_call_nominal_identity(expected.name, declaration_module, table)
+                    actual_identity: (found: bool, module: sview @source, owner: sview @source) = affine_call_nominal_identity(actual.name, current_module, table)
+                    return formal_identity.found and actual_identity.found and formal_identity.module == actual_identity.module and formal_identity.owner == actual_identity.owner
+                return true if expected.kind == SemTypeKind.Bool or expected.kind == SemTypeKind.Char
+                return actual.name != "" and actual.name == expected.name
+
+        def affine_call_argument_can_match(argument: Ast::Expr, parameter_type: Ast::Expr, declaration_module: sview @source, declaration_line: Ast::Pos, current_module: sview @source, caller_line: Ast::Pos, call_pos: Ast::Pos, generic_names: mutable darray[sview @source]&, generic_actuals: mutable darray[u32]&, region_formals: mutable darray[u32]&, region_actuals: mutable darray[u32]&, annotations: darray[Ast::EnumAnnotation]&, local_names: darray[sview]&, local_types: darray[sview @source]&, local_type_ids: darray[u32]&, table: mutable SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return false if not affine_call_structured_argument_may_match(argument, parameter_type, declaration_module, declaration_line, current_module, caller_line, call_pos, generic_names, generic_actuals, region_formals, region_actuals, annotations, local_names, local_types, local_type_ids, table)
+                return affine_call_argument_can_match_name(argument, affine_call_type_path(parameter_type, table), declaration_module, declaration_line, current_module, caller_line, annotations, local_names, local_types, local_type_ids, table)
+
+        # Reserve the sentinel for bindings with no usable scoped type. A structural
+        # annotation whose initializer is coarse-Unknown keeps an empty flat spelling so
+        # affine_call_argument_infer_type can still read its live Container/Optional TypeId.
+        def affine_call_local_type(type_expression: Ast::Expr, value: Ast::Expr, names: darray[sview]&, types: darray[sview @source]&, local_type_ids: darray[u32]&, current_module: sview @source, annotations: darray[Ast::EnumAnnotation]&, function_line: Ast::Pos, declaration_pos: Ast::Pos, table: mutable SymbolTable&) -> sview @source:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                declared_name: sview = affine_call_type_path(type_expression, table)
+                if declared_name != "":
+                    return "__firm_scope_binder__" if affine_call_type_path_is_bare(declared_name) and function_generic_param_named(table, function_line.line, function_line.offset, declared_name)
+                    return affine_call_resolve_type_alias(declared_name, current_module, declaration_pos, annotations, table)
+                inferred: InferType = affine_call_argument_infer_type(value, current_module, function_line, annotations, names, types, local_type_ids, table)
+                if inferred.kind == SemTypeKind.Unknown:
+                    scoped_type_id: mutable u32 = annotation_type_id(type_expression, table) if type_expression is not Expr.Absent else 0
+                    scoped_type_id <- 0 if type_id_contains_function_generic(scoped_type_id, function_line.line, function_line.offset, table)
+                    return "" if scoped_type_id != 0
+                    return "__firm_scope_binder__"
+                return stage0_value_spelling(inferred)
+
+        # Match-arm binders shadow the enclosing local even when their payload type is not
+        # available to this affine walk. Keep the type unknown rather than selecting an
+        # overload from an outer same-named local.
+        def affine_call_add_unknown_pattern_binders(pattern: Ast::Pattern, names: mutable darray[sview @source]&, local_types: mutable darray[sview @source]&, local_type_ids: mutable darray[u32]&, flags: mutable darray[bool]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pattern_names: mutable darray[sview @source] = []
+                gather_arm_pattern(pattern, pattern_names)
+                for pattern_name in pattern_names |names, local_types, local_type_ids, flags|:
+                    names.push(pattern_name)
+                    local_types.push("__firm_scope_binder__")
+                    local_type_ids.push(0)
+                    flags.push(false)
+
+        # A bare Named TypeId does not retain the declaring module of a call's return type.
+        # Track call-rooted projections so they can use only globally unambiguous nominal
+        # owners and fields rather than borrowing a same-spelled caller-module declaration.
+        def affine_call_projection_has_call(expression: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match expression:
+                    Expr.Call(_, _, _, _):
+                        return true
+                    Expr.Paren(inner, _) | Expr.Move(inner, _) | Expr.Refinement(inner, _, _):
+                        return affine_call_projection_has_call(inner)
+                    Expr.Unary(operator, inner, _) if operator == TokenKind.Ampersand or operator == TokenKind.Mutable or operator == TokenKind.Lmut:
+                        return affine_call_projection_has_call(inner)
+                    Expr.Field(object, _, _) | Expr.Index(object, _, _) | Expr.IndexN(object, _, _) | Expr.Slice(object, _, _, _):
+                        return affine_call_projection_has_call(object)
+                    Expr.GetElse(guarded, _, _):
+                        return affine_call_projection_has_call(guarded)
+                    _:
+                        return false
+
+        def affine_call_unique_nominal_owner(owner: sview @source, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                module_owner: mutable sview = ""
+                found: mutable bool = false
+                for symbol in table.symbols |module_owner, found, owner, table|:
+                    type_symbol: bool = symbol.kind == SymbolKind.Struct or symbol.kind == SymbolKind.Enum or symbol.kind == SymbolKind.Alias or (symbol.kind == SymbolKind.Extern and symbol.opaque_extern_type)
+                    continue if symbol.name != owner or not type_symbol
+                    return false if found and module_owner != symbol.module_owner
+                    module_owner <- symbol.module_owner
+                    found <- true
+                return found

@@ -4,7 +4,10 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
-FLOW = (ROOT / "src/semantic/check_affine_use_linear_flow.elisa").read_text()
+FLOW = "\n".join((ROOT / "src/semantic" / name).read_text() for name in (
+    "check_affine_use_linear_flow.elisa", "check_affine_call_type_ids.elisa",
+    "check_affine_call_resolution.elisa", "check_affine_flow_entry.elisa",
+))
 WALK = (ROOT / "src/semantic/check_affine_use_linear.elisa").read_text()
 PARSER = (ROOT / "src/parser/parser_decl_typestate.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/affine_typestate_postcondition_overload_owner.elisa").read_text()
