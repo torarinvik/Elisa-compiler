@@ -64,7 +64,7 @@ if "reachable <- false if is_catch_match and scrutinee_aborts and arm_index == 0
     raise SystemExit("loop break search counts the success arm of an aborting statement Catch")
 
 body_flow = function_source(
-    ROOT / "src/semantic/region_escape_provenance/body_flow.elisa",
+    ROOT / "src/semantic/region_escape_provenance/element_flow.elisa",
     "region_escape_body_apply_statements_with_elements_flow",
 )
 if "region_escape_catch_marker_matches(match_line, catch_context)" not in body_flow:
@@ -97,7 +97,7 @@ if effective_value.count("region_escape_value_arms_region_with_elements(") < 2:
     raise SystemExit("effective value-region Match/Catch fallback omits arm reachability or taint flow")
 
 value_arms_flow = function_source(
-    ROOT / "src/semantic/region_escape_provenance/body_flow.elisa",
+    ROOT / "src/semantic/region_escape_provenance/element_flow.elisa",
     "region_escape_value_arms_region_with_elements",
 )
 if not re.search(r"region_escape_record_collection_element_mutation\(arm\.guard,[^\n]*, line, catch_context\)", value_arms_flow):
@@ -117,6 +117,7 @@ region_escape_sources = [
     ROOT / "src/semantic/region_escape_assignments.elisa",
     ROOT / "src/semantic/region_escape_provenance.elisa",
     ROOT / "src/semantic/region_escape_provenance/body_flow.elisa",
+    ROOT / "src/semantic/region_escape_provenance/element_flow.elisa",
     ROOT / "src/semantic/region_escape_provenance/catchable_raises.elisa",
     ROOT / "src/semantic/region_escape_provenance/loop_control.elisa",
     ROOT / "src/semantic/region_escape_provenance/stored_regions.elisa",
@@ -174,7 +175,7 @@ loop_atom = (ROOT / "test/atoms/region_loop_tail.elisa").read_text()
 if "return 21 if aborting_match_value.found" not in loop_atom:
     raise SystemExit("loop tail atom is missing the aborting-Match break reachability control")
 
-body_flow_path = ROOT / "src/semantic/region_escape_provenance/body_flow.elisa"
+body_flow_path = ROOT / "src/semantic/region_escape_provenance/element_flow.elisa"
 body_flow = function_source(body_flow_path, "region_escape_body_apply_statements_with_elements_flow")
 if not re.search(r"region_escape_comprehension_element_region\(value,[^\n]*statement_line\.line, catch_context\)", body_flow):
     raise SystemExit("RegionEscape variable-declaration element lookup drops catch context")
