@@ -112,7 +112,7 @@ if not all(fragment in param_import_entrypoint for fragment in (
         "errorset_collect_candidates(file.top_decls, annotations, names, params, modules, file, table)",
         "errorset_walk_decls(file.top_decls, names, params, modules, annotations, \"\", file, table)")):
     raise SystemExit("ErrorSet parameter inference must use branch-filtered imports for candidate lookup and call walking")
-parser_import_source = PARSER_IMPORTS.read_text()
+parser_import_source = PARSER_IMPORTS.read_text() + PARSER_IMPORTS.with_name("parser_decl_imports.elisa").read_text()
 if not all(fragment in param_import_order for fragment in (
         "annotation.pos.end_offset > annotation.pos.offset",
         "call_offset_present",

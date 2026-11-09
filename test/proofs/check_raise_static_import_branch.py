@@ -31,7 +31,7 @@ def function_source(source: str, name: str) -> str:
 source = SOURCE.read_text()
 lambda_source = LAMBDA_SOURCE.read_text()
 parser_source = PARSER_SOURCE.read_text()
-import_parser_source = IMPORT_PARSER_SOURCE.read_text()
+import_parser_source = IMPORT_PARSER_SOURCE.read_text() + IMPORT_PARSER_SOURCE.with_name("parser_decl_imports.elisa").read_text()
 entrypoint = function_source(source, "check_raise_without_error_set")
 if "pma_active_import_annotations(file, table)" not in entrypoint:
     raise SystemExit("raise error-family lookup must receive branch-filtered import annotations")

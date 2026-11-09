@@ -107,7 +107,7 @@ if not all(fragment in alias_registration for fragment in (
         "returnleft_offset<right_offsetor(left_offset==right_offsetandleft_index<right_index)")):
     raise SystemExit("direct aliases must keep Core's registration priority over static-branch aliases")
 alias_static_branch = compact(function_section(authority_text, "ga_module_alias_is_static_branch"))
-parser_decl_module = (ROOT / "src/parser/parser_decl_module.elisa").read_text()
+parser_decl_module = (ROOT / "src/parser/parser_decl_module.elisa").read_text() + (ROOT / "src/parser/parser_decl_imports.elisa").read_text()
 alias_static_branch_parser = compact(function_section(parser_decl_module, "record_static_if_branch_rows"))
 static_branch_marker_parser = compact(function_section(parser_decl_module, "record_static_if_branch_markers"))
 using_alias_parser = compact(function_section(parser_decl_module, "using_alias"))
