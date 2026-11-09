@@ -177,7 +177,7 @@ def require_static_if_row_alignment() -> None:
         if any(position < 0 for position in positions) or positions != sorted(positions):
             raise SystemExit(f"{function_name} must append all six static-if row columns in lockstep")
         if any(section.count(fragment) != 1 for fragment in fragments):
-        raise SystemExit(f"{function_name} must append each static-if row column exactly once")
+            raise SystemExit(f"{function_name} must append each static-if row column exactly once")
     parser_core = compact(PARSER_CORE.read_text())
     constructor = compact(PARSER_CORE_MEMBER_TABLES.read_text())
     for column in columns:
