@@ -27,7 +27,7 @@ def function_source(source: str, name: str) -> str:
     return compact(match.group(0))
 
 
-pattern_source = PATTERN.read_text()
+pattern_source = PATTERN.read_text() + PATTERN.with_name("catch_family_reachability.elisa").read_text()
 catch_source = CATCH.read_text() + CATCH.with_name("check_catch_path_resolution.elisa").read_text() + CATCH.with_name("check_catch_exhaustive_checks.elisa").read_text()
 pattern_lookup = function_source(pattern_source, "progress_catch_module_path_matches_scoped")
 catch_lookup = function_source(catch_source, "catch_module_alias_target")
