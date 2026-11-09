@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -98,7 +98,7 @@ prefix_positions = [prefix_body.find(step) for step in prefix_steps]
 if any(position < 0 for position in prefix_positions) or prefix_positions != sorted(prefix_positions):
     raise SystemExit("explicit-allocator prefix comparison no longer checks each byte in order")
 
-runtime_text = RUNTIME_STRINGS.read_text()
+runtime_text = read_runtime_split_source(RUNTIME_STRINGS)
 if {"sview_len", "sview_at"} & set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", runtime_text)):
     raise SystemExit("legacy sview length/index wrappers remain in the runtime")
 index_body = compact(function_section(runtime_text, "string_view_index"))

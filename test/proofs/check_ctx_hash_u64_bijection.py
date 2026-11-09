@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,7 +56,7 @@ def declarations(source: str) -> set[str]:
     return set(re.findall(r"(?m)^[ \t]*def ([A-Za-z_][A-Za-z0-9_]*)\(", source))
 
 
-collections_text = COLLECTIONS.read_text()
+collections_text = read_runtime_split_source(COLLECTIONS)
 hash_body = compact(function_section(collections_text, "ctx_hash_u64"))
 if compact("ensure ctx_unhash_u64(result) == value") not in hash_body:
     raise SystemExit("ctx_hash_u64 lost its production left-inverse postcondition")

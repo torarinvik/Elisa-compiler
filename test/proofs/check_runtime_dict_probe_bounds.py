@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,7 +53,7 @@ def declarations(source: str) -> set[str]:
     return set(re.findall(r"(?m)^[ \t]*def ([A-Za-z_][A-Za-z0-9_]*)\(", source))
 
 
-source = COLLECTIONS.read_text()
+source = read_runtime_split_source(COLLECTIONS)
 contracts = {
     "arena_dict_find_index": (
         "ensure (m.capacity == 0 or m.items == null) implies (result.index == 0 and not result.found)",

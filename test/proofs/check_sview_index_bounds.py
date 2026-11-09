@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product
+from proof_product_gate import require_current_product, read_runtime_split_source
 
 
 from source_guard_compat import expand_return_if_blocks
@@ -62,7 +62,7 @@ inline = compact(function_body(INDEX_HELPERS.read_text(), "emit_inline_sview_ind
 index_emitter = compact(function_body(index_source, "emit_expression_index_read"))
 short_circuit = compact(function_body(SHORT_CIRCUIT.read_text(), "emit_short_circuit"))
 binary_tail = compact(BINARY_TAIL.read_text())
-runtime_index = compact(function_body(RUNTIME_STRINGS.read_text(), "string_view_index"))
+runtime_index = compact(function_body(read_runtime_split_source(RUNTIME_STRINGS), "string_view_index"))
 field_emitter = compact(function_body(FIELD_READ.read_text(), "emit_expression_field_read"))
 place_type = compact(function_body(TYPE_PLACE.read_text(), "expression_type_of_place"))
 infer_source = compact(function_body(INFER.read_text(), "infer_expression_type"))

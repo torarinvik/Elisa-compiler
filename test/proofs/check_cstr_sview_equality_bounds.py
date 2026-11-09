@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 from source_guard_compat import expand_return_if_blocks
@@ -50,7 +50,7 @@ def declarations(source: str) -> set[str]:
     return set(re.findall(r"(?m)^[ \t]*def ([A-Za-z_][A-Za-z0-9_]*)\(", source))
 
 
-collections_text = COLLECTIONS.read_text()
+collections_text = read_runtime_split_source(COLLECTIONS)
 if compact("extern ctx_cstr_eq_sview(text: cstr, expected_length: i64, view: sview) -> bool") not in compact(COLLECTIONS_INTERFACE.read_text()):
     raise SystemExit("collection interface no longer carries the explicit expected C-string extent")
 compare = compact(function_section(collections_text, "ctx_cstr_eq_sview"))

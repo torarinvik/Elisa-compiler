@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -314,7 +314,7 @@ if 'LLVMInt32TypeInContext(ctx)returniftarget_bits==32' not in runtime_size_type
 view_llvm_type = compact(function_section(LLVM_TYPES.read_text(), "llvm_type_of"))
 if 'view_fields:mutabledarray[LLVMTypeRef]=[LLVMPointerTypeInContext(ctx,0),runtime_size_llvm_type(ctx,structs.target.target_pointer_bits)]' not in view_llvm_type:
     raise SystemExit("DynArrayView length field no longer follows the target usize width")
-if 'structDynArrayView:data:mutablevoid&?len:mutableusize' not in compact(COLLECTIONS.read_text()):
+if 'structDynArrayView:data:mutablevoid&?len:mutableusize' not in compact(read_runtime_split_source(COLLECTIONS)):
     raise SystemExit("the source DynArrayView length field is no longer usize")
 view_fallback = compact(function_section(STRUCT_REG.read_text(), "synthesize_view_struct"))
 if 'structs.records.field_types.push(ValueType{kind:TypeKind.Unsigned,bits:structs.target.target_pointer_bits})' not in view_fallback or \

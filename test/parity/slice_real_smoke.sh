@@ -47,10 +47,18 @@ slice_case() {
     local src="$BUILD/slicereal_$name.elisa" ll="$BUILD/slicereal_$name.ll" obj="$BUILD/slicereal_$name.o" exe="$BUILD/slicereal_$name"
     python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" "$STD/elisacore_runtime_slice.elisa" > "$src" <<PY
 import sys, re
+from pathlib import Path
 out = []
+def append_source(path):
+    path = Path(path)
+    for line in path.read_text().splitlines(keepends=True):
+        match = re.match(r'^include "\./((?:arena_|collections_)[^"/]+)"', line)
+        if match:
+            append_source(path.parent / match.group(1))
+        elif not line.startswith("include"):
+            out.append(line)
 for path in sys.argv[1:]:
-    for line in open(path):
-        if not line.startswith('include'): out.append(line)
+    append_source(path)
 lines = ''.join(out).split('\n'); res = []; skip = False
 for ln in lines:
     if re.match(r'def (ctx_hash_u64|ctx_hash_cstr)\b', ln): skip = True; continue

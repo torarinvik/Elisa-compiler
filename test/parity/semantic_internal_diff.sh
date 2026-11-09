@@ -71,7 +71,15 @@ is_runtime_std() {
         */elisacore_std|elisacore_std) return 0 ;;
     esac
     case "$(basename -- "$path")" in
-        allocator.elisa|arena.elisa|collections.elisa|debug_referee.elisa|deque.elisa|\
+        allocator.elisa|arena.elisa|arena_alloc_realloc.elisa|arena_collection_stacks.elisa|\
+        arena_defaults_and_pointers.elisa|arena_format.elisa|arena_lifecycle.elisa|\
+        arena_region_blocks.elisa|arena_region_cache.elisa|collections.elisa|\
+        collections_array_algorithms.elisa|collections_dict.elisa|collections_hashing.elisa|\
+        collections_index_map.elisa|collections_inline_vec_flags.elisa|collections_set.elisa|\
+        elisacore_json.elisa|elisacore_json_handles.elisa|elisacore_json_lex.elisa|\
+        elisacore_json_parse.elisa|elisacore_json_values.elisa|elisacore_parse_float.elisa|\
+        elisacore_parse_float_algorithms.elisa|elisacore_regex.elisa|elisacore_regex_automaton.elisa|\
+        elisacore_regex_search.elisa|elisacore_runtime_string_views.elisa|debug_referee.elisa|deque.elisa|\
         elisacore_runtime.elisa|elisacore_runtime_concurrency.elisa|elisacore_runtime_prelude.elisa|\
         elisacore_runtime_strings.elisa|elisacore_runtime_system_bridge.elisa|heap.elisa|names.elisa|\
         native_runtime_support.elisa|runtime.elisa|stores.elisa|stores_core.elisa|\

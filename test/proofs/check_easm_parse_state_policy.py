@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 from source_guard_compat import expand_return_if_blocks
@@ -58,7 +58,7 @@ env_text = ENV.read_text()
 model_text = MODEL.read_text()
 policy_text = POLICY.read_text()
 parser_text = PARSER_SOURCE.read_text()
-runtime_strings_text = RUNTIME_STRINGS.read_text()
+runtime_strings_text = read_runtime_split_source(RUNTIME_STRINGS)
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 

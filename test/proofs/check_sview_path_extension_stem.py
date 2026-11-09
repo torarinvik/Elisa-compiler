@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,7 +52,7 @@ def declarations(source: str) -> set[str]:
     return set(re.findall(r"(?m)^[ \t]*def ([A-Za-z_][A-Za-z0-9_]*)\(", source))
 
 
-runtime_text = RUNTIME.read_text()
+runtime_text = read_runtime_split_source(RUNTIME)
 extension = compact(function_section(runtime_text, "extension"))
 stem = compact(function_section(runtime_text, "stem"))
 valid = "p.len >= 0 and p.len.usize().i64() == p.len"

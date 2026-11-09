@@ -56,6 +56,22 @@ def _stage1_input_digest(root: Path, paths: tuple[str, ...]) -> str:
     return digest.hexdigest()
 
 
+def read_runtime_split_source(path: Path) -> str:
+    """Read a runtime file with its responsibility-split fragments in source order."""
+    prefixes = {
+        "collections.elisa": "collections_",
+        "elisacore_runtime_strings.elisa": "elisacore_runtime_string_views.",
+    }
+    prefix = prefixes.get(path.name)
+    text = path.read_text()
+    if prefix is None:
+        return text
+    def expand(match):
+        name = match.group(1)
+        return (path.parent / name).read_text() if name.startswith(prefix) else match.group(0)
+    return re.sub(r'^include "\./([^"/]+)"[ \t]*$', expand, text, flags=re.MULTILINE)
+
+
 def source_include_closure(roots: list[Path]) -> list[Path]:
     """Return every source file reachable through literal Elisa include directives."""
     pending = list(roots)

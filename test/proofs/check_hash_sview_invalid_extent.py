@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -58,10 +58,10 @@ def declarations(source: str) -> set[str]:
     return set(re.findall(r"(?m)^[ \t]*def ([A-Za-z_][A-Za-z0-9_]*)\(", source))
 
 
-runtime_text = RUNTIME.read_text()
-hash_text = HASH_RUNTIME.read_text()
+runtime_text = read_runtime_split_source(RUNTIME)
+hash_text = HASH_read_runtime_split_source(RUNTIME)
 spec_text = FNV_SPEC.read_text()
-collections_text = COLLECTIONS.read_text()
+collections_text = read_runtime_split_source(COLLECTIONS)
 hash_body = compact(function_section(hash_text, "hash_sview"))
 contract = (
     f"ensure (value.len <= 0 or value.len.usize().i64() != value.len) "

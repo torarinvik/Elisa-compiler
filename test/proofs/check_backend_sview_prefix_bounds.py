@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -137,7 +137,7 @@ def function_section(source: str, name: str) -> str:
 
 
 def declarations(path: Path) -> set[str]:
-    return set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", path.read_text()))
+    return set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", read_runtime_split_source(path)))
 
 
 def operational_shape(function: str) -> tuple[str, ...]:
@@ -165,7 +165,7 @@ def sview_matches_prefix(path: sview, candidate: sview, start: i64, end: i64) ->
 if compact_code(function_section(source_text, "sview_matches_prefix")) != compact_code(expected_prefix):
     raise SystemExit("production prefix comparator lost its view-length, slice, or per-byte bounds guards")
 
-runtime_text = RUNTIME_STRINGS.read_text()
+runtime_text = read_runtime_split_source(RUNTIME_STRINGS)
 if {"sview_len", "sview_at"} & declarations(RUNTIME_STRINGS):
     raise SystemExit("legacy sview length/index wrappers remain in the runtime")
 expected_string_view_index = """

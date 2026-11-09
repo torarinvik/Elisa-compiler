@@ -110,7 +110,8 @@ clang "${link_flags[@]}"
 # per top-level `def` of the real file, so their bodies are not counted.
 RUNTIME_STRINGS_IFACE="$WORK/runtime_strings.elisai"
 sed -nE 's/^def ([A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\(.*\)( -> .*)?):$/extern \1/p' \
-	"$REPO_ROOT/elisacore_std/elisacore_runtime_strings.elisa" > "$RUNTIME_STRINGS_IFACE"
+	"$REPO_ROOT/elisacore_std/elisacore_runtime_strings.elisa" \
+    "$REPO_ROOT/elisacore_std/elisacore_runtime_string_views.elisa" > "$RUNTIME_STRINGS_IFACE"
 # The parser keeps synthesized names alive with the runtime prelude's `alloc_perm`
 # (parser_stmt_machine.elisa). Declare only the prelude entry points the frontend calls,
 # generated from their real definitions: the rest of the prelude names runtime-internal

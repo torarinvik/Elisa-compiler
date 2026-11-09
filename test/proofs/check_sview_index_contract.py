@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 from source_guard_compat import expand_return_if_blocks
@@ -60,7 +60,7 @@ def declarations(source: str) -> set[str]:
     return set(re.findall(r"(?m)^[ \t]*def ([A-Za-z_][A-Za-z0-9_]*)\(", source))
 
 
-runtime_text = RUNTIME_STRINGS.read_text()
+runtime_text = read_runtime_split_source(RUNTIME_STRINGS)
 positive_text = POSITIVE.read_text()
 negative_text = NEGATIVE.read_text()
 request_valid = compact(function_section(runtime_text, "string_view_index_request_valid"))

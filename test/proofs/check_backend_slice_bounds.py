@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -215,7 +215,7 @@ if "size_type:LLVMTypeRef=darray_size_type(ctx,structs.target.target_pointer_bit
 view_layout = compact(function_section(LLVM_TYPES.read_text(), "llvm_type_of"))
 if "view_fields:mutabledarray[LLVMTypeRef]=[LLVMPointerTypeInContext(ctx,0),runtime_size_llvm_type(ctx,structs.target.target_pointer_bits)]" not in view_layout:
     raise SystemExit("slice view source count must use target usize")
-if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(COLLECTIONS.read_text()):
+if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(read_runtime_split_source(COLLECTIONS)):
     raise SystemExit("slice view source declaration must retain usize length")
 if "array_extents:mutabledarray[u32]=[]" not in compact(STRUCT_TABLE.read_text() + STRUCT_TABLE.with_name("codegen_enum_tables.elisa").read_text()):
     raise SystemExit("fixed-array slice extents must remain representable in the recorded u32 domain")

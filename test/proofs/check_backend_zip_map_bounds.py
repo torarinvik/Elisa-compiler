@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from proof_product_gate import require_current_product, source_include_closure
+from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--source-only", action="store_true", help="check source and theorem bindings without proof-product replay")
@@ -134,7 +134,7 @@ if "returnLLVMInt32TypeInContext(ctx)iftarget_bits==32" not in runtime_size or \
 view_type = compact(function_section(LLVM_TYPES.read_text(), "llvm_type_of"))
 if "view_fields:mutabledarray[LLVMTypeRef]=[LLVMPointerTypeInContext(ctx,0),runtime_size_llvm_type(ctx,structs.target.target_pointer_bits)]" not in view_type:
     raise SystemExit("DynArrayView count field must have the target usize width")
-if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(COLLECTIONS.read_text()):
+if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(read_runtime_split_source(COLLECTIONS)):
     raise SystemExit("source DynArrayView length must remain usize")
 
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:
