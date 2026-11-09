@@ -1,20 +1,24 @@
 """Bind store-through theorem routes to their source walkers."""
 from __future__ import annotations
 
-from store_walk_edges_1 import (
+from store_walk_collection_edges import (
     EXPRESSION_EDGES,
     STATEMENT_COLLECTOR_EDGES,
     EXPRESSION_UNIFIER_EDGES,
+)
+from store_walk_holder_traversal_edges import (
     HOLDER_WALK_STATEMENT_EDGES,
     FOR_ITERATOR_VIEW_TAINT_EDGES,
     FOR_ITERATOR_REF_ALIAS_EDGES,
     ITERABLE_BINDING_FACTS_ALIAS_EDGES,
     HOLDER_WALK_EXPRESSION_EDGES,
+)
+from store_walk_view_flow_edges import (
     BINARY_AND_RIGHT_WALK_EDGE,
     BINARY_RIGHT_VIEW_EDGES,
     BINARY_OPERATOR_FALLBACK_EDGES,
 )
-from store_walk_edges_2 import (
+from store_walk_view_flow_edges import (
     BINARY_NON_RUNTIME_TARGET_EDGES,
     CONSTRUCT_VIEW_TAINT_EDGES,
     RECORD_UPDATE_VIEW_TAINT_EDGES,

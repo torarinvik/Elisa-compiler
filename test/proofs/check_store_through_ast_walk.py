@@ -36,11 +36,13 @@ from store_walk_inspection import (
     validate_exact_boolean_theorem,
     validate_exact_boolean_theorem_source_routes,
 )
-from store_walk_edges_1 import (
+from store_walk_collection_edges import (
     EXPRESSION_EDGES,
     STATEMENT_COLLECTOR_EDGES,
     STATEMENT_UNIFIER_EDGES,
     EXPRESSION_UNIFIER_EDGES,
+)
+from store_walk_holder_traversal_edges import (
     HOLDER_SCAN_STATEMENT_EDGES,
     HOLDER_SCAN_EXPRESSION_EDGES,
     HOLDER_WALK_STATEMENT_EDGES,
@@ -52,11 +54,13 @@ from store_walk_edges_1 import (
     CATCH_PATTERN_BINDING_EDGES,
     EXPRESSION_BINDING_FACTS_OR_EDGES,
     PARALLEL_ASSIGNMENT_FLOW_EDGES,
+)
+from store_walk_view_flow_edges import (
     BINARY_AND_RIGHT_WALK_EDGE,
     BINARY_RIGHT_VIEW_EDGES,
     BINARY_OPERATOR_FALLBACK_EDGES,
 )
-from store_walk_edges_2 import (
+from store_walk_view_flow_edges import (
     BINARY_NON_RUNTIME_TARGET_EDGES,
     CONSTRUCT_VIEW_TAINT_EDGES,
     RECORD_UPDATE_VIEW_TAINT_EDGES,
@@ -517,7 +521,7 @@ source_closure = source_include_closure([POSITIVE, NEGATIVE])
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST_CHECKSUM, PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
-    *(HERE / name for name in ("store_walk_inspection.py", "store_walk_edges_1.py", "store_walk_edges_2.py", "store_walk_theorem_routes.py", "store_walk_theorem_checks.py")),
+    *(HERE / name for name in ("store_walk_inspection.py", "store_walk_collection_edges.py", "store_walk_holder_traversal_edges.py", "store_walk_view_flow_edges.py", "store_walk_theorem_routes.py", "store_walk_theorem_checks.py")),
     SEMANTIC_ROOT, *SUMMARY_PARTS, *HOLDER_PARTS,
     AST_NODES, AST_SIDE_TABLES, EFFECT_SHAPE, POSITIVE, NEGATIVE, *source_closure,
 ]))

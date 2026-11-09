@@ -1,4 +1,4 @@
-"""Unsafe capability scope regression cases, group 1."""
+"""Unsafe grant regression cases for alias and effect."""
 
 CASES = {
     "alias unrelated grant": (
@@ -301,29 +301,5 @@ CASES = {
         "def bad() -> i64:\n    can Unsafe.MutableGlobal:\n        return hot\n"
         "def main() -> i64:\n    return 0\n",
         "accesses a global mutable binding without Global.Read",
-    ),
-    "pointer arithmetic unrelated grant": (
-        "# strict\n"
-        "def bad(pointer: u8&, offset: usize) -> i64:\n"
-        "    can Unsafe.PointerCast:\n        pointer + offset\n"
-        "    return 0\n"
-        "def main() -> i64:\n    return 0\n",
-        "pointer arithmetic requires",
-    ),
-    "pointer arithmetic exact grant": (
-        "# strict\n"
-        "def bad(pointer: u8&, offset: usize) -> i64:\n"
-        "    can Unsafe.PointerArithmetic:\n        pointer + offset\n"
-        "    return 0\n"
-        "def main() -> i64:\n    return 0\n",
-        None,
-    ),
-    "pointer arithmetic through local ref alias": (
-        "# strict\n"
-        "def bad(pointer: u8&, offset: usize) -> u8&:\n"
-        "    alias: u8& = pointer\n"
-        "    return alias + offset\n"
-        "def main() -> i64:\n    return 0\n",
-        "pointer arithmetic requires",
     ),
 }

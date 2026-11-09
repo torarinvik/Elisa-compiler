@@ -1,5 +1,23 @@
-"""Source edges for store-through traversal proofs."""
+"""Traversal edges for view flow edges."""
 
+
+BINARY_AND_RIGHT_WALK_EDGE = (
+    "if binary_operator == TokenKind.And:",
+    "table <- chv_walk_expression(right, in_region, ref_params, binders, owned, view_names, view_values, right_flow, summary, table)",
+)
+
+BINARY_RIGHT_VIEW_EDGES = (
+    ("if binary_operator == TokenKind.And:", "right_may_be_owned_view <- right_flow.last_value_may_be_owned_view"),
+    ("if binary_operator != TokenKind.And:", "right_may_be_owned_view <- flow.last_value_may_be_owned_view"),
+)
+
+BINARY_OPERATOR_FALLBACK_EDGES = (
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
+    ("Expr.Binary(left, binary_operator, right, _):", "if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
+    ("if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:", "table <- chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+)
 
 BINARY_NON_RUNTIME_TARGET_EDGES = (
     ("can Abort.Panic:", "return operator == TokenKind.Is or operator == TokenKind.As"),

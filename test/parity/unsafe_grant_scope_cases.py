@@ -1,6 +1,7 @@
-from unsafe_grant_cases_1 import CASES as CASES_1
-from unsafe_grant_cases_2 import CASES as CASES_2
-from unsafe_grant_cases_3 import CASES as CASES_3
+from unsafe_grant_alias_and_effect_cases import CASES as UNSAFE_GRANT_ALIAS_AND_EFFECT_CASES
+from unsafe_grant_pointer_expression_cases import CASES as UNSAFE_GRANT_POINTER_EXPRESSION_CASES
+from unsafe_grant_pointer_pattern_cases import CASES as UNSAFE_GRANT_POINTER_PATTERN_CASES
+from unsafe_grant_cast_and_extern_cases import CASES as UNSAFE_GRANT_CAST_AND_EXTERN_CASES
 
 import pathlib
 import subprocess
@@ -10,7 +11,7 @@ import tempfile
 stage1 = sys.argv[1]
 repo = pathlib.Path(sys.argv[2])
 
-cases = {**CASES_1, **CASES_2, **CASES_3}
+cases = {**UNSAFE_GRANT_ALIAS_AND_EFFECT_CASES, **UNSAFE_GRANT_POINTER_EXPRESSION_CASES, **UNSAFE_GRANT_POINTER_PATTERN_CASES, **UNSAFE_GRANT_CAST_AND_EXTERN_CASES}
 
 # Qualified duplicate leaf names must retain module identity in strict-unsafe effect
 # lookup. Test both declaration orders, and check both that the pure sibling stays
