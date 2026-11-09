@@ -20,7 +20,7 @@ def function_text(text: str, name: str) -> str:
     return match.group(0)
 
 
-annotations = source("src/backend/codegen_struct_table.elisa")
+annotations = source("src/backend/codegen_struct_table.elisa") + source("src/backend/codegen_enum_tables.elisa")
 producer = source("src/backend/codegen_module.elisa") + source("src/backend/codegen_module_emit.elisa")
 consumer = source("src/backend/codegen_generic_inference/trusted_runtime_calls.elisa")
 smoke = source("test/parity/submit_store_capture_smoke.sh")

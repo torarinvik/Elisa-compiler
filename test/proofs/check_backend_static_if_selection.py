@@ -714,7 +714,7 @@ def require_backend_position_identity() -> None:
     selector = compact(SELECTOR.read_text())
     module = compact(function_section(CODEGEN_MODULE.read_text() + CODEGEN_MODULE.with_name("codegen_module_emit.elisa").read_text(), "select_module_declarations"))
     statement_backend = compact(CODEGEN_STMT.read_text())
-    backend_annotations = compact(CODEGEN_TABLE.read_text())
+    backend_annotations = compact(CODEGEN_TABLE.read_text() + CODEGEN_TABLE.with_name("codegen_enum_tables.elisa").read_text())
     unsafe = compact(DRIVER_UNSAFE.read_text())
     unsafe_segments = compact(DRIVER_UNSAFE_SEGMENTS.read_text())
     impl_registration = compact(function_section(CODEGEN_DECL_HOISTING.read_text(), "record_impl_member_lines"))

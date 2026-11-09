@@ -217,7 +217,7 @@ if "view_fields:mutabledarray[LLVMTypeRef]=[LLVMPointerTypeInContext(ctx,0),runt
     raise SystemExit("slice view source count must use target usize")
 if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(COLLECTIONS.read_text()):
     raise SystemExit("slice view source declaration must retain usize length")
-if "array_extents:mutabledarray[u32]=[]" not in compact(STRUCT_TABLE.read_text()):
+if "array_extents:mutabledarray[u32]=[]" not in compact(STRUCT_TABLE.read_text() + STRUCT_TABLE.with_name("codegen_enum_tables.elisa").read_text()):
     raise SystemExit("fixed-array slice extents must remain representable in the recorded u32 domain")
 
 cstr_dispatch = (

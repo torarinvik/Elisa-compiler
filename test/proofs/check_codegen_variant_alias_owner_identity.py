@@ -9,7 +9,7 @@ def source(path: str) -> str:
     return (ROOT / path).read_text()
 
 
-structs = source("src/backend/codegen_struct_table.elisa")
+structs = source("src/backend/codegen_struct_table.elisa") + source("src/backend/codegen_enum_tables.elisa")
 producer = source("src/backend/codegen_module.elisa") + source("src/backend/codegen_module_emit.elisa")
 lookup = source("src/backend/codegen_env.elisa")
 branching = source("src/backend/codegen_stmt_branching.elisa")

@@ -3,7 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PARSER = (ROOT / "src/parser/parser_expr_query.elisa").read_text()
-TABLE = (ROOT / "src/backend/codegen_struct_table.elisa").read_text()
+TABLE = (ROOT / "src/backend/codegen_struct_table.elisa").read_text() + (ROOT / "src/backend/codegen_enum_tables.elisa").read_text()
 ENV = (ROOT / "src/backend/codegen_env.elisa").read_text()
 QUERIES = (ROOT / "src/backend/codegen_env_source_queries.elisa").read_text()
 VARDECL = (ROOT / "src/backend/codegen_stmt_vardecl_emit.elisa").read_text()

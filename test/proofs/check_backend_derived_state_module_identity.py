@@ -11,7 +11,7 @@ def read(path: str) -> str:
 
 ast = read("src/parser/ast_side_tables.elisa")
 parser = read("src/parser/parser_types_struct.elisa")
-table = read("src/backend/codegen_struct_table.elisa")
+table = read("src/backend/codegen_struct_table.elisa") + read("src/backend/codegen_enum_tables.elisa")
 collector = read("src/backend/codegen_module.elisa") + read("src/backend/codegen_module_emit.elisa")
 lookup_source = read("src/backend/codegen_env.elisa")
 runtime_consumer = read("src/backend/codegen_expr_optional_binary.elisa")
