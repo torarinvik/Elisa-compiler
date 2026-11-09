@@ -104,17 +104,24 @@ def toolchain_content_view(value):
     return value
 
 
+def selected_seed_bootstrap():
+    """Resolve the optional oracle cache the same way as Stage0 freshness checks."""
+    explicit = (os.environ.get("ELISA_STAGE1_SEED_BOOTSTRAP_BIN")
+                or os.environ.get("ELISA_STAGE1_SEED_STAGE0_BIN")
+                or os.environ.get("BOOTSTRAP_BIN") or os.environ.get("STAGE0_BIN"))
+    if explicit:
+        return explicit
+    oracle = os.environ.get("ELISACORE_BIN")
+    if oracle and Path(oracle).name == "s0cache":
+        return os.environ.get("ELISA_S0_REAL") or oracle
+    return oracle
+
+
 def seed_configuration_fingerprint(previous=None, exact=False):
     previous = previous if isinstance(previous, dict) else {}
     previous_bootstrap = previous.get("bootstrap_compiler")
     previous_runtime = previous.get("bootstrap_runtime_object")
-    bootstrap_path = (
-        os.environ.get("ELISA_STAGE1_SEED_BOOTSTRAP_BIN")
-        or os.environ.get("ELISA_STAGE1_SEED_STAGE0_BIN")
-        or os.environ.get("BOOTSTRAP_BIN")
-        or os.environ.get("STAGE0_BIN")
-        or os.environ.get("ELISACORE_BIN")
-    )
+    bootstrap_path = selected_seed_bootstrap()
     rebuilding = bool(bootstrap_path)
     if rebuilding:
         bootstrap_path = Path(bootstrap_path).expanduser().resolve()

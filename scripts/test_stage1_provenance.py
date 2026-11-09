@@ -33,6 +33,14 @@ for count in range(5):
 assert stage1_provenance.normalize_linker_probe_argv(["ld", "-L/first", "-L/second"]) != stage1_provenance.normalize_linker_probe_argv(["ld", "-L/second", "-L/first"])
 
 
+# An oracle cache wrapper is not the compiler that produced the Stage1 seed.
+with patch.dict(os.environ, {"ELISACORE_BIN": "/tools/s0cache", "ELISA_S0_REAL": "/core/elisac"}, clear=True):
+    assert stage1_provenance.selected_seed_bootstrap() == "/core/elisac"
+    with patch.dict(os.environ, {"ELISA_STAGE1_SEED_BOOTSTRAP_BIN": "/other/elisac"}):
+        assert stage1_provenance.selected_seed_bootstrap() == "/other/elisac"
+with patch.dict(os.environ, {"ELISACORE_BIN": "/tools/s0cache"}, clear=True):
+    assert stage1_provenance.selected_seed_bootstrap() == "/tools/s0cache"
+
 original_revision = stage1_provenance.source_revision
 original_toolchain_fingerprint = stage1_provenance.llvm_toolchain_fingerprint
 stage1_provenance.source_revision = lambda _root: "test-revision"
