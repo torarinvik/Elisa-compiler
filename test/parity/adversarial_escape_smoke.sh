@@ -84,7 +84,7 @@ for f in "$DIR"/*.elisa; do
     esac
 done
 for optimization in 0 2; do
-    "$BIN" -emit exe "-O$optimization" "$DIR/fuzz_esc_return_struct_field_view.pos.elisa" -o "$TMP/ambient-view" >"$TMP/log" 2>&1 \
+    "$BIN" -emit exe "-O$optimization" "$DIR/fuzz_esc_return_struct_field_view_caller_arena.pos.elisa" -o "$TMP/ambient-view" >"$TMP/log" 2>&1 \
         && "$TMP/ambient-view" >>"$TMP/log" 2>&1 \
         || { echo "FAIL ambient byte-view runtime at O$optimization"; tail -5 "$TMP/log"; fail=1; }
 done
