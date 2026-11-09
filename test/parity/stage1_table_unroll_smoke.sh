@@ -13,7 +13,8 @@ run bash "$ROOT/scripts/build_runtime_object.sh"
 T=$(mktemp -d "${TMPDIR:-/tmp}/stage1-table-unroll.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/test/parity"
-cp "$ROOT/test/parity/stage1_table_unroll_fixture.ll" "$ROOT/test/parity/stage1_table_unroll_noop_fixture.ll" "$ROOT/test/parity/stage1_table_unroll_attempts_fixture.ll" "$ROOT/test/parity/stage1_table_unroll_graph_budget_fixture.ll" "$T/test/parity/"
+cp "$ROOT/test/parity/stage1_table_unroll_noop_fixture.ll" "$ROOT/test/parity/stage1_table_unroll_attempts_fixture.ll" "$T/test/parity/"
+run python3 "$ROOT/test/parity/stage1_table_unroll_fixture_gen.py" "$T/test/parity"
 cd "$T"
 run python3 "$ROOT/test/parity/stage1_table_unroll_clean_fixture.py"
 run "$STAGE1" -O0 -emit obj -o "$T/probe.o" "$ROOT/test/parity/stage1_table_unroll_probe.elisa"
