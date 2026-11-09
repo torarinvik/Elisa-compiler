@@ -37,7 +37,7 @@ for path, expected in ((POSITIVE, POSITIVE_HASHES), (NEGATIVE, NEGATIVE_HASHES))
             raise SystemExit(f"{name} proof changed since source binding")
 if not NEGATIVE.read_text().startswith('include "./backend_caller_region_slots.elisa"'):
     raise SystemExit("false control must include the positive region-slot policy")
-body = compact(section(SOURCE.read_text() + SOURCE.with_name("codegen_call_indexed_result.elisa").read_text() + SOURCE.with_name("codegen_call_indexed_helpers.elisa").read_text(), "emit_direct_call_indexed"))
+body = compact(section(SOURCE.read_text() + SOURCE.with_name("codegen_call_indexed_result.elisa").read_text() + SOURCE.with_name("codegen_call_indexed_helpers.elisa").read_text(), "emit_direct_call_indexed_result"))
 if 'include "./codegen_call_direct.elisa"' not in CALL_FACADE.read_text():
     raise SystemExit("direct-call implementation is no longer included by the production call facade")
 ordered = (
@@ -55,7 +55,7 @@ if args.source_only:
 product = require_current_product(BIN, PROVER)
 if product.get("compile_mode") != "strict":
     raise SystemExit("caller-region slot proof requires strict Elisa-Proof build")
-inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", SOURCE, CALL_FACADE, POSITIVE, NEGATIVE, *source_include_closure([POSITIVE, NEGATIVE])]))
+inputs = list(dict.fromkeys([BIN, BIN.with_name(BIN.name + ".manifest.json"), BIN.with_name(BIN.name + ".manifest.json.sha256"), PROVER / "ELISA_COMPILER_REV", Path(__file__), HERE / "proof_product_gate.py", SOURCE, CALL_FACADE, POSITIVE, NEGATIVE, *source_include_closure([SOURCE, POSITIVE, NEGATIVE])]))
 before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 def run(path: Path):
     result = subprocess.run([str(BIN), "--json", str(path)], capture_output=True, text=True, timeout=60)
