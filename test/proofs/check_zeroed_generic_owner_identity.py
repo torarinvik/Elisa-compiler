@@ -43,7 +43,7 @@ def function_source(source: str, name: str) -> str:
     return match.group(0)
 
 
-semantic = SEMANTIC.read_text()
+semantic = SEMANTIC.read_text() + SEMANTIC.with_name("check_zeroed_alias_paths.elisa").read_text()
 type_aliases = TYPE_ALIASES.read_text()
 zeroed = ZEROED.read_text()
 zeroed_walk = ZEROED_WALK.read_text()
