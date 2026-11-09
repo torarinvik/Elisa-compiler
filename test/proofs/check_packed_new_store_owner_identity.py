@@ -12,7 +12,7 @@ def source(path: str) -> str:
 parser = source("src/parser/parser_expr.elisa")
 parser_postfix = source("src/parser/parser_expr_postfix.elisa")
 structs = source("src/backend/codegen_struct_table.elisa") + source("src/backend/codegen_enum_tables.elisa")
-backend_env = source("src/backend/codegen_env.elisa")
+backend_env = source("src/backend/codegen_env.elisa") + source("src/backend/codegen_env_signatures.elisa")
 call_store = source("src/backend/codegen_call_store.elisa")
 fixture = source("test/repro/packed_new_store_owner_line_zero.pos.elisa")
 
