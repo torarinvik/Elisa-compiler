@@ -9,7 +9,7 @@ values passed indirectly may need an explicit reference in the probe to be retai
 """
 from pathlib import Path
 import re,sys
-root=Path(sys.argv[1]).resolve(); harness=Path(sys.argv[2]).read_text();out=Path(sys.argv[3]);seen=set()
+root=Path(sys.argv[1]).resolve(); harness_path=Path(sys.argv[2]).resolve();out=Path(sys.argv[3]);seen=set()
 def expand(path):
  path=path.resolve()
  if path in seen:return ''
@@ -20,7 +20,7 @@ def expand(path):
   m=re.match(r'^include "([^"]+)"',line)
   parts.append(expand(path.parent/m[1]) if m else line)
  return ''.join(parts)+'\n'
-s=expand(root);lines=s.splitlines(keepends=True);base=[];funcs=[];i=0;contexts=[];mandatory=set()
+s=expand(root);harness=expand(harness_path);lines=s.splitlines(keepends=True);base=[];funcs=[];i=0;contexts=[];mandatory=set()
 while i<len(lines):
  line=lines[i]
  if line.strip() and not line.lstrip().startswith('#'):
