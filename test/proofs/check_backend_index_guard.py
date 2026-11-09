@@ -10,6 +10,7 @@ import shutil
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure, read_runtime_split_source
+from backend_index_guard_source import compact, declarations, function_section, require_ordered
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,37 +42,6 @@ LLVM_CONFIG = shutil.which(os.environ.get("LLVM_CONFIG", "llvm-config"))
 
 if not __debug__:
     raise SystemExit("run without Python -O")
-
-
-def compact(text: str) -> str:
-    return "".join("".join(line.split("#", 1)[0].split()) for line in text.splitlines())
-
-
-def function_section(source: str, name: str) -> str:
-    matches = list(re.finditer(rf"(?m)^([ \t]*)def {re.escape(name)}(?:\[[^\]\n]*\])?\(", source))
-    if len(matches) != 1:
-        raise SystemExit(f"expected exactly one function named {name}")
-    match = matches[0]
-    indent = match.group(1)
-    following = re.search(rf"(?m)^{re.escape(indent)}def [A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]*\])?\(", source[match.end():])
-    end = match.end() + following.start() if following else len(source)
-    return source[match.start():end]
-
-
-def declarations(path: Path) -> set[str]:
-    return set(re.findall(r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\(", path.read_text()))
-
-
-def require_ordered(source: str, steps: tuple[str, ...], label: str) -> None:
-    positions: list[int] = []
-    cursor = 0
-    for step in steps:
-        position = source.find(step, cursor)
-        positions.append(position)
-        if position >= 0:
-            cursor = position + len(step)
-    if any(position < 0 for position in positions):
-        raise SystemExit(f"{label} changed its proved operation order: {positions}")
 
 
 def llvm_integer_predicates() -> dict[str, int]:
@@ -550,7 +520,7 @@ llvm_header = Path(subprocess.run([LLVM_CONFIG, "--includedir"], check=True,
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", compiler_product, compiler_provenance,
-    Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE,
+    Path(__file__), HERE / "proof_product_gate.py", HERE / "backend_index_guard_source.py", POSITIVE, NEGATIVE,
     CHUNKS_POSITIVE, CHUNKS_NEGATIVE,
     *source_include_closure([POSITIVE, NEGATIVE, CHUNKS_POSITIVE, CHUNKS_NEGATIVE]),
     GUARDS, CONVERT, INDEX_READ, ASSIGN, STRUCT_REG, CALL_NAMED, INTERNED_TYPES,
