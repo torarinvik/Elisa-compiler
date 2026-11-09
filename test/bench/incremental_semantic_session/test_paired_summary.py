@@ -12,10 +12,17 @@ from paired import (
     paired_counter_measurements,
     paired_timing_summary,
     timing_arm_kinds,
+    report_fields,
+    timing_rows,
 )
 
 
 class PairedTimingSummaryTest(unittest.TestCase):
+    def test_parses_session_report_and_timing_rows(self) -> None:
+        report = ["incremental-ga-cache: hit=2 miss=1", "stage1-timing: parse wall_ms=1.5 cpu_ms=1.2"]
+        self.assertEqual(report_fields(report), {"hit": "2", "miss": "1"})
+        self.assertEqual(timing_rows(report), [{"phase": "parse", "wall_ms": 1.5, "cpu_ms": 1.2}])
+
     def test_memory_gauges_can_decrease_without_counter_failure(self) -> None:
         before = {"physical_footprint_bytes": 120, "lifetime_max_physical_footprint_bytes": 180}
         after = {"physical_footprint_bytes": 100, "lifetime_max_physical_footprint_bytes": 190}
