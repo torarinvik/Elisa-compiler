@@ -557,10 +557,10 @@ def require_static_call_context_identity() -> None:
             'static function "parse" can only be called from a static context',
             'static function "ancestor_helper" can only be called from a static context',
             'static function "branch_pick" can only be called from a static context',
-            'branch_static_count="$(grep-Fc',
-            '[["$branch_static_count"-eq1]]',
-            'unknown_branch_static_count="$(grep-Fc',
-            '[["$unknown_branch_static_count"-eq1]]',
+            'branch_static_count="$(grep -Fc',
+            '[[ "$branch_static_count" -eq 1 ]]',
+            'unknown_branch_static_count="$(grep -Fc',
+            '[[ "$unknown_branch_static_count" -eq 1 ]]',
             'static function "shadowed_helper" can only be called from a static context',
             'ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown',
             'static function "compile_only" can only be called from a static context',
@@ -576,7 +576,7 @@ def require_static_call_context_identity() -> None:
     selected_runtime = compact(function_section(fixture, "selected_runtime_caller"))
     bare_static = compact(function_section(fixture, "bare_static_compile_time_caller"))
     if not all(fragment in selected_runtime for fragment in (
-            "static if true:", "static else:", "branch_static()")) or selected_runtime.count("branch_static()") != 2 or not all(fragment in bare_static for fragment in (
+            "staticiftrue:", "staticelse:", "branch_static()")) or selected_runtime.count("branch_static()") != 2 or not all(fragment in bare_static for fragment in (
             "static:", "branch_static()")):
         raise SystemExit("static-call regression must pair a selected and inactive static-if statement call with a bare-static compile-time control")
     lexical_fixture = LEXICAL_MODULE_FIXTURE.read_text()
