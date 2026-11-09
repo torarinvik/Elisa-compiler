@@ -258,7 +258,7 @@ def require_static_runtime_block_identity() -> None:
             "annotation.line==position.line",
             "annotation.offset==position.offset")) or \
             not all(fragment in collector for fragment in (
-            "srs_static_function_at(file,current_module,function_name,position)",
+            "srs_static_function_at(static_markers,current_module,function_name,position)",
             "modules<-modules.push(current_module)",
             "srs_static_if_branch_selection(file,scoped_position,current_module,table)",
             "continueifbranch.foundandbranch.knownandnotbranch.active")) or \
@@ -280,7 +280,7 @@ def require_static_runtime_block_identity() -> None:
             "notbranch.knownorbranch.active",
             "srs_walk_static(body,file,current_module,names,modules,lines,offsets,is_static,table)")) or \
             "continueifbranch.foundandbranch.knownandnotbranch.active" not in checker or \
-            "srs_collect_functions(file.top_decls,\"\",file,table,function_names,function_modules,function_lines,function_offsets,function_is_static)" not in entrypoint:
+            "srs_collect_functions(file.top_decls,\"\",file,static_markers,table,function_names,function_modules,function_lines,function_offsets,function_is_static)" not in entrypoint:
         raise SystemExit("static-runtime analysis must use lexical function identity and prune proven-inactive nested static-if arms")
     fixture = STATIC_RUNTIME_FIXTURE.read_text()
     nested_fixture = STATIC_RUNTIME_NESTED_FIXTURE.read_text()
