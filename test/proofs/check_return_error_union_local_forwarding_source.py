@@ -3,7 +3,7 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
 return_source = (root / "src/backend/codegen_stmt_return_vardecl_emit.elisa").read_text()
-try_source = (root / "src/backend/codegen_try_lowering.elisa").read_text()
+try_source = (root / "src/backend/codegen_try_lowering.elisa").read_text() + (root / "src/backend/codegen_try_fallback.elisa").read_text()
 parameter_control = (root / "test/fixtures/backend/return_error_union_local_forwarding.elisa").read_text()
 subset_control = (root / "test/fixtures/backend/return_error_union_local_source_forwarding.elisa").read_text()
 minimal_fixture = (root / "test/fixtures/backend/return_error_union_local_forwarding_minimal.elisa").read_text()
