@@ -1,5 +1,6 @@
 """Bind lexical region IDs to their exact owner offsets, including #line 0."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 
 
@@ -56,7 +57,7 @@ destroyed_sources = [
     DESTROYED_VIEWS.read_text(),
     DESTROYED_LAMBDAS.read_text(),
 ]
-symbol_table = SYMBOL_TABLE.read_text()
+symbol_table = read_semantic_declaration_source(SYMBOL_TABLE)
 parser_function = PARSER_FUNCTION.read_text()
 parser_blocks = PARSER_BLOCKS.read_text()
 parser_cursor = PARSER_CURSOR.read_text()

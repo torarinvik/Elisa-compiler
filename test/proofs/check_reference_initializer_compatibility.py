@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 import subprocess
 
@@ -254,7 +255,7 @@ expected_table_fields = {
     "typestate_struct_names": "mutabledarray[sview@source]",
 }
 for field, expected in expected_table_fields.items():
-    if struct_fields(SYMBOL_TABLE_SOURCE.read_text(), "SymbolTable").get(field) != expected or \
+    if struct_fields(read_semantic_declaration_source(SYMBOL_TABLE_SOURCE), "SymbolTable").get(field) != expected or \
             struct_fields(proof_projection, "SymbolTable").get(field) != expected:
         raise SystemExit(f"SymbolTable.{field} proof projection differs from production")
 if enum_variants(actual_semantic_types, "SymbolKind") != enum_variants(proof_projection, "SymbolKind"):
@@ -409,6 +410,7 @@ inputs = list(dict.fromkeys([
     BIN, MANIFEST, manifest_checksum, PROVER / "ELISA_COMPILER_REV", compiler_executable,
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
     POLICY, UNIQUE_POLICY, INITIALIZERS, SEMANTIC_TYPES, SYMBOL_TABLE_SOURCE, POSITIVE, NEGATIVE, *closure,
+    *source_include_closure([SYMBOL_TABLE_SOURCE]),
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

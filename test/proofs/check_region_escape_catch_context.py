@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 
 
@@ -19,7 +20,7 @@ def function_source(path: Path, name: str) -> str:
     return match.group(0)
 
 
-types = (ROOT / "src/semantic/semantic_types_symbol_table.elisa").read_text()
+types = read_semantic_declaration_source(ROOT / "src/semantic/semantic_types_symbol_table.elisa")
 if "struct RegionEscapeCatchContext:" not in types:
     raise SystemExit("RegionEscape catch context type is missing")
 if "markers: darray[Ast::EnumAnnotation]" not in types or "lexical_module: sview @source" not in types:

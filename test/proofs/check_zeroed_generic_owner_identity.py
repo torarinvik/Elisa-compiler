@@ -1,5 +1,6 @@
 """Bind zeroed generic lookups to exact declaration offsets, including logical line zero."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 
 
@@ -47,7 +48,7 @@ semantic = SEMANTIC.read_text() + SEMANTIC.with_name("check_zeroed_alias_paths.e
 type_aliases = TYPE_ALIASES.read_text()
 zeroed = ZEROED.read_text()
 zeroed_walk = ZEROED_WALK.read_text()
-symbol_table = SYMBOL_TABLE.read_text()
+symbol_table = read_semantic_declaration_source(SYMBOL_TABLE)
 table_constructor = TABLE_CONSTRUCTOR.read_text()
 table_setup = TABLE_SETUP.read_text()
 diagnostic_output = DIAGNOSTIC_OUTPUT.read_text()

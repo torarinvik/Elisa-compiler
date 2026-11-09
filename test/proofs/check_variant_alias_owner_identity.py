@@ -1,12 +1,13 @@
 """Variant-alias bindings must belong to the exact `is` RHS field."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def read(path: str) -> str:
-    return (ROOT / path).read_text()
+    return read_semantic_declaration_source(ROOT / path)
 
 
 parser = read("src/parser/parser_expr_binary.elisa")

@@ -1,5 +1,6 @@
 """Bind generic interface-bound consumers to exact declaration offsets."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 
 
@@ -28,7 +29,7 @@ def function_source(source: str, name: str) -> str:
 
 
 semantic = SEMANTIC.read_text()
-symbol_table = SYMBOL_TABLE.read_text()
+symbol_table = read_semantic_declaration_source(SYMBOL_TABLE)
 table_constructor = TABLE_CONSTRUCTOR.read_text()
 table_setup = TABLE_SETUP.read_text()
 diagnostic_output = DIAGNOSTIC_OUTPUT.read_text()

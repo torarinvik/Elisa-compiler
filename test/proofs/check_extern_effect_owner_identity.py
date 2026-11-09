@@ -1,5 +1,6 @@
 """Extern capability rows must retain both declaration and module identity."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 
 
@@ -7,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def source(path: str) -> str:
-    return (ROOT / path).read_text()
+    return read_semantic_declaration_source(ROOT / path)
 
 
 def function_text(text: str, name: str) -> str:

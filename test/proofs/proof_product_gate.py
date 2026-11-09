@@ -72,6 +72,17 @@ def read_runtime_split_source(path: Path) -> str:
     return re.sub(r'^include "\./([^"/]+)"[ \t]*$', expand, text, flags=re.MULTILINE)
 
 
+def read_semantic_declaration_source(path: Path) -> str:
+    """Read the SymbolTable declaration with its field fragments expanded."""
+    text = path.read_text()
+    if path.name != "semantic_types_symbol_table.elisa":
+        return text
+    def expand(match):
+        name = match.group(1)
+        return (path.parent / name).read_text() if name.startswith("symbol_table_") else match.group(0)
+    return re.sub(r'^include "\./([^"/]+)"[ \t]*$', expand, text, flags=re.MULTILINE)
+
+
 def source_include_closure(roots: list[Path]) -> list[Path]:
     """Return every source file reachable through literal Elisa include directives."""
     pending = list(roots)

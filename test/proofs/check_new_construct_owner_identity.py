@@ -1,12 +1,13 @@
 """`new` markers must join to their exact AST target, not the erased keyword."""
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def source(path: str) -> str:
-    return (ROOT / path).read_text()
+    return read_semantic_declaration_source(ROOT / path)
 
 
 def compact(text: str) -> str:

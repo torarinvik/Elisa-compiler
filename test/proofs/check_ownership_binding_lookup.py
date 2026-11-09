@@ -4,6 +4,7 @@ import json
 import os
 import argparse
 from pathlib import Path
+from proof_product_gate import read_semantic_declaration_source
 import re
 import subprocess
 
@@ -44,7 +45,7 @@ if not ARGS.source_only:
 
 
 def struct_fields(path: Path, name: str) -> dict[str, str]:
-    lines = path.read_text().splitlines()
+    lines = read_semantic_declaration_source(path).splitlines()
     declaration = re.compile(rf"^( *)struct {re.escape(name)}:\s*$")
     for index, line in enumerate(lines):
         match = declaration.match(line)
@@ -240,7 +241,7 @@ SOURCES = [Path(__file__), HERE / "proof_product_gate.py", POSITIVE, NEGATIVE, T
            ROOT / "src/semantic/ownership_binding_flow.elisa"]
 compiler_product = Path(manifest["compiler"]["product"]["path"]).resolve(strict=True)
 stage1_provenance = Path(str(compiler_product) + ".provenance.json")
-INPUTS = [*source_include_closure([POSITIVE, NEGATIVE]), BIN, MANIFEST, MANIFEST_CHECKSUM, (PROVER / "ELISA_COMPILER_REV").resolve(strict=True),
+INPUTS = [*source_include_closure([POSITIVE, NEGATIVE, TABLE_SOURCE]), BIN, MANIFEST, MANIFEST_CHECKSUM, (PROVER / "ELISA_COMPILER_REV").resolve(strict=True),
           Path(manifest["compiler"]["executable"]["path"]).resolve(strict=True), compiler_product,
           Path(manifest["runtime"]["path"]).resolve(strict=True),
           Path(manifest["profile_hooks"]["path"]).resolve(strict=True),
