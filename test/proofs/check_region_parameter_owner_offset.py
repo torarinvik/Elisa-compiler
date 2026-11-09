@@ -12,7 +12,7 @@ def read(path: str) -> str:
 ast = read("src/parser/ast_side_tables.elisa")
 parser = read("src/parser/parser_types_function.elisa")
 table = read("src/backend/codegen_struct_table_side_tables.elisa")
-collector = read("src/backend/codegen_module.elisa")
+collector = read("src/backend/codegen_module.elisa") + read("src/backend/codegen_module_emit.elisa")
 regions = read("src/backend/codegen_abi_regions.elisa")
 region_facts = read("src/backend/codegen_region_forwarding/dependencies.elisa")
 runtime = read("src/backend/codegen_runtime_types.elisa")

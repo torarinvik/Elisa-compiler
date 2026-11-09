@@ -67,7 +67,7 @@ def declarations(path: Path) -> set[str]:
 
 attrs = ATTRS.read_text()
 wrappers = WRAPPERS.read_text()
-module = MODULE.read_text()
+module = MODULE.read_text() + MODULE.with_name("codegen_module_emit.elisa").read_text()
 llvm_c = LLVM_C.read_text()
 remove_one = compact(section(attrs, "remove_noalias_parameter_attributes"))
 for shape in (

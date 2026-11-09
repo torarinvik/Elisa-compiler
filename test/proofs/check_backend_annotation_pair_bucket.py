@@ -212,7 +212,7 @@ clear_old_buckets = next(i for i, (_, line) in enumerate(builder_shape)
 if overflow_check > clear_old_buckets:
     raise SystemExit("oversized fallback must preserve the previous touched-bucket list")
 
-module_text = MODULE_SOURCE.read_text()
+module_text = MODULE_SOURCE.read_text() + MODULE_SOURCE.with_name("codegen_module_emit.elisa").read_text()
 module_lines = function_section(module_text, "emit_module_core").splitlines()
 expected_module_entry = compact_code("""
     can Global.Write:

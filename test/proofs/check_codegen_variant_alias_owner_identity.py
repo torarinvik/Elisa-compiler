@@ -10,7 +10,7 @@ def source(path: str) -> str:
 
 
 structs = source("src/backend/codegen_struct_table.elisa")
-producer = source("src/backend/codegen_module.elisa")
+producer = source("src/backend/codegen_module.elisa") + source("src/backend/codegen_module_emit.elisa")
 lookup = source("src/backend/codegen_env.elisa")
 branching = source("src/backend/codegen_stmt_branching.elisa")
 fixture = source("test/repro/try_variant_alias_owner_line_zero.elisa")

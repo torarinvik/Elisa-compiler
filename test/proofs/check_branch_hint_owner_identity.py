@@ -10,7 +10,7 @@ def source(path: str) -> str:
 
 
 parser = source("src/parser/parser_stmt_control_flow.elisa")
-backend_module = source("src/backend/codegen_module.elisa")
+backend_module = source("src/backend/codegen_module.elisa") + source("src/backend/codegen_module_emit.elisa")
 backend_structs = source("src/backend/codegen_struct_table.elisa")
 backend_attrs = source("src/backend/codegen_attrs.elisa")
 backend_branching = source("src/backend/codegen_stmt_branching.elisa")

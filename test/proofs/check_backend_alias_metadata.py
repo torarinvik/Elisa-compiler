@@ -21,7 +21,7 @@ def function_section(source: str, name: str) -> str:
 
 metadata = METADATA.read_text()
 convert = CONVERT.read_text()
-module = MODULE.read_text()
+module = MODULE.read_text() + MODULE.with_name("codegen_module_emit.elisa").read_text()
 for forbidden in ("darray_element_and_header_scopes", "tag_darray_header_access",
                   '"elisa.darray.aa"', '"hdr"', '"elt"'):
     if forbidden in metadata or forbidden in convert:

@@ -20,7 +20,7 @@ def function_text(text: str, name: str) -> str:
 
 
 ensure = ENSURE.read_text()
-module = MODULE.read_text()
+module = MODULE.read_text() + MODULE.with_name("codegen_module_emit.elisa").read_text()
 static_if = STATIC_IF.read_text()
 
 collector = function_text(ensure, "collect_extern_ensures")

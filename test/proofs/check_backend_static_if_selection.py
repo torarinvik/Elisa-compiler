@@ -331,9 +331,9 @@ def require_static_runtime_block_identity() -> None:
 
 def require_static_function_filter_identity() -> None:
     parser = compact(function_section(PARSER_DECL.read_text(), "parse_static"))
-    backend_source = compact(CODEGEN_MODULE.read_text())
-    declaration_match = compact(function_section(CODEGEN_MODULE.read_text(), "declaration_is_static_function"))
-    recursive_filter = compact(function_section(CODEGEN_MODULE.read_text(), "declaration_without_static_functions"))
+    backend_source = compact(CODEGEN_MODULE.read_text() + CODEGEN_MODULE.with_name("codegen_module_emit.elisa").read_text())
+    declaration_match = compact(function_section(CODEGEN_MODULE.read_text() + CODEGEN_MODULE.with_name("codegen_module_emit.elisa").read_text(), "declaration_is_static_function"))
+    recursive_filter = compact(function_section(CODEGEN_MODULE.read_text() + CODEGEN_MODULE.with_name("codegen_module_emit.elisa").read_text(), "declaration_without_static_functions"))
     if not all(fragment in parser for fragment in (
             'owner:"__static_fn"',
             "line:static_fn_pos.line",
@@ -712,7 +712,7 @@ def require_selector_layout() -> None:
 
 def require_backend_position_identity() -> None:
     selector = compact(SELECTOR.read_text())
-    module = compact(function_section(CODEGEN_MODULE.read_text(), "select_module_declarations"))
+    module = compact(function_section(CODEGEN_MODULE.read_text() + CODEGEN_MODULE.with_name("codegen_module_emit.elisa").read_text(), "select_module_declarations"))
     statement_backend = compact(CODEGEN_STMT.read_text())
     backend_annotations = compact(CODEGEN_TABLE.read_text())
     unsafe = compact(DRIVER_UNSAFE.read_text())

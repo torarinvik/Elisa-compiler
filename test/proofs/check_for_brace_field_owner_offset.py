@@ -11,7 +11,7 @@ def read(path: str) -> str:
 
 parser = read("src/parser/parser_stmt_for.elisa")
 side_tables = read("src/backend/codegen_struct_table_side_tables.elisa")
-collector = read("src/backend/codegen_module.elisa")
+collector = read("src/backend/codegen_module.elisa") + read("src/backend/codegen_module_emit.elisa")
 lookup_source = read("src/backend/codegen_env.elisa")
 consumer = read("src/backend/codegen_stmt_for_shapes_iterable.elisa")
 fixture = read("test/repro/for_brace_field_owner_offset.elisa")

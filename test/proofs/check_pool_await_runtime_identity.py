@@ -21,7 +21,7 @@ def function_text(text: str, name: str) -> str:
 
 
 annotations = source("src/backend/codegen_struct_table.elisa")
-producer = source("src/backend/codegen_module.elisa")
+producer = source("src/backend/codegen_module.elisa") + source("src/backend/codegen_module_emit.elisa")
 consumer = source("src/backend/codegen_generic_inference/trusted_runtime_calls.elisa")
 smoke = source("test/parity/submit_store_capture_smoke.sh")
 control = source("test/parity/submit_store_capture_control.elisa")
