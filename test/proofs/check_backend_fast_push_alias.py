@@ -90,11 +90,11 @@ self_loop = compact(function(prereserve_source, "prereserve_self_loop_rebind"))
 for required in (
     "Stmt.Assign(Expr.Ident(target,_),operator,Expr.Block(block_statements,Expr.Ident(yielded,_),captures,_),_)",
     "target!=nameoroperator!=TokenKind.LArroworyielded!=name",
-    "captures.count==0orcaptures.count>PRERESERVE_MAX_SCOPE_NAMESorblock_statements.count!=1",
+    "captures.count==0orcaptures.count>LoopPrereserveLimits::MAX_SCOPE_NAMESorblock_statements.count!=1",
     "capture_name==name",
     "receiver_captures!=1.usize()",
     "notloop_scratch_scalar_type(lookup_type(local_scope,capture_name))",
-    "Stmt.For(bind,_,_,_,_):returnbind==\"\"",
+    "Stmt.For(bind:bind,_):returnbind==\"\"",
 ):
     if required not in self_loop:
         raise SystemExit(f"captured-loop freshness proof lost a required guard: {required}")
@@ -141,8 +141,8 @@ fact_update = emit_statements.find("update_prereserve_unaliased_facts(statement,
 if min(statement_count_capture, prepare_position, statement_emission, fact_update) < 0 or not (statement_count_capture < prepare_position < statement_emission < fact_update):
     raise SystemExit("backing facts must update after each emitted statement using its pre-emission local count")
 
-calls_source = (BACKEND / "codegen_stmt_expr_calls.elisa").read_text()
-statement_calls = compact(function(calls_source, "emit_statement_expr_calls"))
+calls_source = (BACKEND / "codegen_stmt_call_expression.elisa").read_text()
+statement_calls = compact(function(calls_source, "emit_statement_call_expression"))
 for required in (
     "push_type:ValueType=darray_type_behind_expr(push_object,local_scope,structs)",
     "ifpush_type.kind==TypeKind.DArrayandpush_method==\"reserve\"andpush_arguments.count==1:",
@@ -151,9 +151,9 @@ for required in (
     if required not in statement_calls:
         raise SystemExit(f"preserved reserve must stay on the builtin DArray lowering path: {required}")
 
-type_place_source = (BACKEND / "codegen_expression_type_place.elisa").read_text()
+type_place_source = (BACKEND / "codegen_expression_type_place_of.elisa").read_text()
 type_place = compact(function(type_place_source, "expression_type_of_place"))
-if "unmodeled_type()returnifobject_type.kind!=TypeKind.Struct" not in type_place:
+if "returnunmodeled_type()ifobject_type.kind!=TypeKind.Struct" not in type_place:
     raise SystemExit("DArray method-shaped fields must not become an arbitrary callable that shadows builtin reserve")
 callable_check = statement_calls.find("statement_callee_callable")
 darray_dispatch = statement_calls.find("push_type:ValueType=darray_type_behind_expr(push_object,local_scope,structs)")
@@ -188,15 +188,15 @@ for expected in fixture_steps:
     fixture_cursor = fixture_position + len(expected)
 
 # Bind the fixture's capacity assumption to the literal emitter. Empty literals
-# are null headers; every non-empty literal reserves the fixed 256-element seed.
+# are null headers; ordinary non-empty literals reserve at least eight elements.
 aggregates = (BACKEND / "codegen_expr_aggregates.elisa").read_text()
 array_literal = compact(function(aggregates, "emit_expression_aggregate_literals"))
 if "ifarray_elements.count==0:returnLLVMConstNull(darray_llvm_type(structs,ctx))" not in array_literal:
     raise SystemExit("empty DArray literals must remain zero-capacity in the alias witness model")
-if "literal_initial_capacity:LLVMValueRef=LLVMConstInt(LLVMInt64TypeInContext(ctx),256,0)" not in array_literal:
-    raise SystemExit("non-empty DArray literals must retain their observable initial capacity of 256")
+if "literal_capacity<-8ifliteral_capacity<8" not in array_literal or "literal_capacity<-0ifliteral_has_spread" not in array_literal:
+    raise SystemExit("DArray literals must retain their observable capacity and spread growth policy")
 if "emit_darray_reserve(temporary,expected,literal_initial_capacity" not in array_literal:
-    raise SystemExit("non-empty DArray literals must reserve their 256-element initial capacity")
+    raise SystemExit("ordinary non-empty DArray literals must reserve their initial capacity")
 
 benchmark = (ROOT / "test/bench/codegen_perf/darray_count_sum.elisa").read_text()
 benchmark_tokens = (
@@ -212,11 +212,11 @@ for token in benchmark_tokens:
         raise SystemExit(f"runtime fill benchmark no longer keeps the unique-header setup sequence: {token}")
     benchmark_cursor = benchmark_position + len(token)
 
-# Abstract shallow-copy control: with N=4, C=256, and K=304, ordinary pushes
+# Abstract shallow-copy control: with N=4, C=8, and K=304, ordinary pushes
 # first write into shared spare slots, while eager reserve detaches before the
 # first write. The source checks bind C to the literal emitter; this model does
 # not execute Elisa or prove arena allocation behavior.
-n, capacity, required = 4, 256, 304
+n, capacity, required = 4, 8, 304
 assert n < capacity < required
 ordinary_alias = [10, 11, 12, 13, 99] + [0] * (capacity - 5)
 ordinary_receiver = ordinary_alias
