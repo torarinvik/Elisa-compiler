@@ -211,6 +211,7 @@ if [[ "${1:-}" == "--exec-one" ]]; then
 fi
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+. "$REPO_ROOT/scripts/platform.sh"
 export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
 bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1_BIN" || exit $?
@@ -737,9 +738,23 @@ done
 
 # Dispatch. Each worker re-enters this script in --exec-one mode and writes its own result
 # file, so no two workers share state or interleave output.
-python3 - "$resultdir" "$REPO_ROOT" "$GATE_JOBS" <<'PYEOF'
+# macOS system Python can add LIBRARY_PATH and SDKROOT while starting up. Preserve
+# the caller's actual values so workers see the same linker environment as the
+# freshness check above, even when ELISA_TOOL_PYTHON resolves to system Python.
+export ELISA_GATE_DISPATCH_LIBRARY_PATH_SET="${LIBRARY_PATH+x}"
+export ELISA_GATE_DISPATCH_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}"
+export ELISA_GATE_DISPATCH_SDKROOT_SET="${SDKROOT+x}"
+export ELISA_GATE_DISPATCH_SDKROOT_VALUE="${SDKROOT-}"
+"$ELISA_TOOL_PYTHON" - "$resultdir" "$REPO_ROOT" "$GATE_JOBS" <<'PYEOF'
 import os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
+for name in ("LIBRARY_PATH", "SDKROOT"):
+    present = os.environ.pop(f"ELISA_GATE_DISPATCH_{name}_SET")
+    value = os.environ.pop(f"ELISA_GATE_DISPATCH_{name}_VALUE")
+    if present:
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
 rd, root, jobs = sys.argv[1], sys.argv[2], int(sys.argv[3])
 blob = open(os.path.join(rd, "cmdlist"), "rb").read()
 records = [r for r in blob.split(b"\0\0") if r.strip(b"\0")]
@@ -759,6 +774,8 @@ with ThreadPoolExecutor(max_workers=jobs) as ex:
     for f in futures:
         f.result()
 PYEOF
+unset ELISA_GATE_DISPATCH_LIBRARY_PATH_SET ELISA_GATE_DISPATCH_LIBRARY_PATH_VALUE
+unset ELISA_GATE_DISPATCH_SDKROOT_SET ELISA_GATE_DISPATCH_SDKROOT_VALUE
 
 # Aggregate. Results are per-file, so nothing raced to produce this.
 for f in "$resultdir"/*.result; do

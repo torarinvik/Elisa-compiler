@@ -227,13 +227,15 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 # the same directory with its own ratchet, so an xfail landed here as an unexplained
 # MISMATCH: two harnesses over one corpus, disagreeing about what a known gap means. A
 # documented divergence is a filed bug, not a regression.
-find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
-  | xargs -0 grep -l '^def main' 2>/dev/null \
-  | grep -v '/repro/' \
-  | grep -v '\.xfail\.elisa$' \
-  | grep -v '\.neg\.elisa$' \
-  | tr '\n' '\0' | xargs -0 grep -L 'corpus: deliberate-decline' 2>/dev/null \
-  | sort > "$WORK/programs.txt"
+if [[ "${1:-}" != "--one" ]]; then
+    find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
+      | xargs -0 grep -l '^def main' 2>/dev/null \
+      | grep -v '/repro/' \
+      | grep -v '\.xfail\.elisa$' \
+      | grep -v '\.neg\.elisa$' \
+      | tr '\n' '\0' | xargs -0 grep -L 'corpus: deliberate-decline' 2>/dev/null \
+      | sort > "$WORK/programs.txt"
+fi
 
 # ---- one program (worker mode). Prints exactly one line: KIND<TAB>name<TAB>detail
 one_program() {

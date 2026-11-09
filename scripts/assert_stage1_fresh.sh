@@ -35,6 +35,14 @@ esac
 # by builds before checking it; many parity scripts invoke this guard without sourcing the
 # shared platform setup themselves.
 . "$ROOT/scripts/platform.sh"
+# The seed records the resolved clang in its seed_configuration. Resolve it exactly as
+# elisac_stage1.sh does, or a check run with a bootstrap compiler in the environment
+# (ELISACORE_BIN, which the parity gate always exports) reports every product stale.
+if [[ -z "${ELISA_CLANG:-}" ]]; then
+  _fresh_clang="${ELISA_LLVM_BIN_DIR:-$(dirname -- "${LLVM_CONFIG:-}")}/clang"
+  [[ -x "$_fresh_clang" ]] || _fresh_clang="$(command -v clang || true)"
+  [[ -x "$_fresh_clang" ]] && export ELISA_CLANG="$_fresh_clang"
+fi
 
 if ! command -v "$ELISA_TOOL_PYTHON" >/dev/null 2>&1; then
   echo "cannot verify stage1 source provenance: $ELISA_TOOL_PYTHON is unavailable" >&2

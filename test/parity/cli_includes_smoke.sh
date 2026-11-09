@@ -99,12 +99,13 @@ done
 # no pre-flattening. Asserts a non-trivial object rather than just rc=0, because an empty
 # object would also exit 0.
 total=$((total + 1))
-if ( cd "$ROOT" && RUN "$BIN" -o "$WORK/self.o" src/driver/elisac.elisa >/dev/null 2>&1 ) \
+if ( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$BIN" -o "$WORK/self.o" src/driver/elisac.elisa >/dev/null 2>&1 ) \
    && [ -s "$WORK/self.o" ] \
    && [ "$(wc -c < "$WORK/self.o")" -gt 1000000 ]; then
     ok
 else
     fail "self_compile: the CLI could not compile src/driver/elisac.elisa unaided"
+    exit 1
 fi
 
 # --- 5. The driver's flattening and the wrapper's agree, BYTE FOR BYTE ---------------------
@@ -115,8 +116,8 @@ fi
 # compiler's own sources). This is the check that has to hold before the wrapper's flattening
 # can be deleted, so it is asserted rather than left as a footnote.
 total=$((total + 1))
-( cd "$ROOT" && RUN "$BIN" -o "$WORK/flat_cli.o" src/driver/elisac.elisa >/dev/null 2>&1 )
-( cd "$ROOT" && RUN bash scripts/elisac_stage1.sh -o "$WORK/flat_wrap.o" src/driver/elisac.elisa >/dev/null 2>&1 )
+( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$BIN" -o "$WORK/flat_cli.o" src/driver/elisac.elisa >/dev/null 2>&1 ) || exit 1
+( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" bash scripts/elisac_stage1.sh -o "$WORK/flat_wrap.o" src/driver/elisac.elisa >/dev/null 2>&1 ) || exit 1
 if [ -s "$WORK/flat_cli.o" ] && [ -s "$WORK/flat_wrap.o" ] && cmp -s "$WORK/flat_cli.o" "$WORK/flat_wrap.o"; then
     pass=$((pass + 1))
 else

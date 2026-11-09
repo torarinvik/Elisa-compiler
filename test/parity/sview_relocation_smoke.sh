@@ -89,18 +89,8 @@ for optimization in 0 2; do
     for closure_control in "$CLOSURE_GOOD" "$CLOSURE_PARAM_SHADOW_GOOD" "$CLOSURE_SCALAR_GOOD" "$CLOSURE_LOCAL_SHADOW_GOOD"; do
         closure_output="$WORK/closure-control-$(basename "$closure_control").O$optimization.ll"
         closure_log="$closure_output.log"
-        if [[ "$closure_control" == "$CLOSURE_LOCAL_SHADOW_GOOD" ]]; then
-            if ! "$STAGE1" -emit llvm "-O$optimization" -o "$closure_output" "$closure_control" >"$closure_log" 2>&1; then
-                rg -Fq 'backend could not produce a linkable unit' "$closure_log" \
-                    || fail "Stage1 rejected the body-local shadow control before backend lowering at O$optimization: $(tail -n 8 "$closure_log")"
-                rg -Fq 'storage dependency facts were invalidated' "$closure_log" \
-                    && fail "Stage1 confused a body-local view with the outer captured view at O$optimization"
-                [[ ! -e "$closure_output" ]] || fail "Stage1 emitted LLVM after declining the body-local shadow control at O$optimization"
-            fi
-        else
-            "$STAGE1" -emit llvm "-O$optimization" -o "$closure_output" "$closure_control" >"$closure_log" 2>&1 \
-                || fail "Stage1 rejected a closure whose captured storage is live or parameter-shadowed at O$optimization: $(tail -n 8 "$closure_log")"
-        fi
+        "$STAGE1" -emit llvm "-O$optimization" -o "$closure_output" "$closure_control" >"$closure_log" 2>&1 \
+            || fail "Stage1 rejected a closure whose captured storage is live or shadowed at O$optimization: $(tail -n 8 "$closure_log")"
     done
 done
 

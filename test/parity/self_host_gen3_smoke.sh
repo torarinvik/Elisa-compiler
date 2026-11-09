@@ -89,7 +89,7 @@ DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=600
 # bound and passed every stage), so 600 s reported a healthy bootstrap as "closure BROKE".
 if [[ "$(uname -s)" == "Linux" ]]; then DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS=3600; fi
 DEFAULT_SELF_HOST_PROBE_POLL_SECONDS=0.05
-SELF_HOST_PROBE_TIMEOUT_SECONDS="${SELF_HOST_PROBE_TIMEOUT_SECONDS:-$DEFAULT_SELF_HOST_PROBE_TIMEOUT_SECONDS}"
+SELF_HOST_PROBE_TIMEOUT_SECONDS=30
 SELF_HOST_PROBE_POLL_SECONDS="${SELF_HOST_PROBE_POLL_SECONDS:-$DEFAULT_SELF_HOST_PROBE_POLL_SECONDS}"
 
 fail() { echo "self_host_gen3_smoke FAIL: $1" >&2; exit 1; }
@@ -148,7 +148,7 @@ run_guarded_request() {
 if [ -n "$(find "$ROOT/src" -name '*.elisa' -newer "$BIN" -print -quit 2>/dev/null)" ]; then
     fail "seed $BIN is OLDER than src/*.elisa — rebuild it (scripts/elisac_stage1.sh --seed) or this check reports on stale code"
 fi
-bash "$ROOT/scripts/self_host_gen2.sh" "$GEN2_DIR" >"$WORK/gen2.log" 2>&1 \
+bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" bash "$ROOT/scripts/self_host_gen2.sh" "$GEN2_DIR" >"$WORK/gen2.log" 2>&1 \
   || fail "self_host_gen2.sh did not produce a working gen2 (see $WORK/gen2.log)"
 [ -x "$GEN2" ] || fail "no gen2 binary at $GEN2"
 
@@ -213,7 +213,7 @@ PY
 
 { printf '%s\n' "$WORK/gen3.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen3.request"
 rc=0
-run_guarded_request "$GEN2" "$WORK/gen3.request" "$WORK/gen3.log" || rc=$?
+bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$GEN2" <"$WORK/gen3.request" >"$WORK/gen3.log" 2>&1 || rc=$?
 
 [ "$rc" -eq "$BASELINE_GEN3_RC" ] \
   || fail "stage B exit $rc, baseline $BASELINE_GEN3_RC — bootstrap closure BROKE. Re-diagnose (lldb bt on the gen3 input); do not just re-baseline."
@@ -242,7 +242,7 @@ clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/elisac-stage1-gen3" "
 
 { printf '%s\n' "$WORK/gen4.o"; cat "$WORK/flat.elisa"; } >"$WORK/gen4.request"
 rc4=0
-run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/gen4.request" "$WORK/gen4.log" || rc4=$?
+bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$WORK/elisac-stage1-gen3" <"$WORK/gen4.request" >"$WORK/gen4.log" 2>&1 || rc4=$?
 [ "$rc4" -eq 0 ] || fail "gen3 could not compile the compiler (exit $rc4) — gen2 and gen3 disagree"
 # A mismatch here has TWO very different causes and the old message named only one.
 # Either gen2 and gen3 genuinely disagree (a miscompile -- what this gate exists to
@@ -254,9 +254,9 @@ run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/gen4.request" "$WORK/gen4.
 if ! cmp -s "$WORK/gen3.o" "$WORK/gen4.o"; then
     echo "self_host_gen3_smoke: gen3.o != gen4.o; re-running both generations to see which one is unstable" >&2
     { printf '%s\n' "$WORK/gen3.again.o"; cat "$WORK/flat.elisa"; } >"$WORK/again.request"
-    run_guarded_request "$GEN2" "$WORK/again.request" "$WORK/gen3.again.log" || true
+    bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$GEN2" <"$WORK/again.request" >"$WORK/gen3.again.log" 2>&1 || fail "gen3 repeat failed; investigate before retrying"
     { printf '%s\n' "$WORK/gen4.again.o"; cat "$WORK/flat.elisa"; } >"$WORK/again4.request"
-    run_guarded_request "$WORK/elisac-stage1-gen3" "$WORK/again4.request" "$WORK/gen4.again.log" || true
+    bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$WORK/elisac-stage1-gen3" <"$WORK/again4.request" >"$WORK/gen4.again.log" 2>&1 || fail "gen4 repeat failed; investigate before retrying"
     describe() { if [ -s "$1" ]; then printf '%s bytes' "$(wc -c <"$1" | tr -d ' ')"; else printf 'MISSING'; fi; }
     echo "  gen2 -> gen3.o        $(describe "$WORK/gen3.o")" >&2
     echo "  gen2 -> gen3.again.o  $(describe "$WORK/gen3.again.o")   (differs from gen3.o => gen2 is not reproducible)" >&2

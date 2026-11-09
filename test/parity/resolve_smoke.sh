@@ -326,8 +326,8 @@ int main(int argc, char **argv) {
 }
 EOF
 
-"$ELISACORE_BIN" -emit header -o "$WORK/resolve_smoke.h" "$FIX" >/dev/null
-"$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/resolve_smoke.o" "$FIX" >/dev/null
+ELISACORE_ANALYSIS_BOOTSTRAP=0 "$ELISACORE_BIN" -emit header -o "$WORK/resolve_smoke.h" "$FIX" >/dev/null
+ELISACORE_ANALYSIS_BOOTSTRAP=0 "$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/resolve_smoke.o" "$FIX" >/dev/null
 
 source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
 elisa_native_optional_hook_objects "$WORK" "$REPO_ROOT"

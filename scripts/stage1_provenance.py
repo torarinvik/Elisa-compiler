@@ -107,6 +107,10 @@ def valid_sha256(value):
 def bootstrap_compiler_kind(path):
     """Identify the bootstrap implementation from artifact provenance, not its filename."""
     path = Path(path).expanduser().resolve()
+    # ELISACORE_BIN may be the oracle memo (tools/s0cache), which only wraps the real stage0
+    # binary named by ELISA_S0_REAL (the same mapping assert_stage0_fresh.sh applies).
+    if path.name == "s0cache" and os.environ.get("ELISA_S0_REAL"):
+        path = Path(os.environ["ELISA_S0_REAL"]).expanduser().resolve()
     explicit = os.environ.get("ELISA_STAGE1_SEED_BOOTSTRAP_KIND")
     if explicit:
         if explicit not in ("stage0", "stage1"):
