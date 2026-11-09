@@ -228,7 +228,9 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 # MISMATCH: two harnesses over one corpus, disagreeing about what a known gap means. A
 # documented divergence is a filed bug, not a regression.
 if [[ "${1:-}" != "--one" ]]; then
-    find "${CORPUS_DIRS[@]}" -name '*.elisa' -print0 2>/dev/null \
+    # Build output may contain entire stale compiler snapshots, including compiler
+    # sources. They are not corpus inputs and must not be rebuilt as test programs.
+    find "${CORPUS_DIRS[@]}" -path "$ELISA_CORE/compiler/build" -prune -o -name '*.elisa' -print0 2>/dev/null \
       | xargs -0 grep -l '^def main' 2>/dev/null \
       | grep -v '/repro/' \
       | grep -v '\.xfail\.elisa$' \
