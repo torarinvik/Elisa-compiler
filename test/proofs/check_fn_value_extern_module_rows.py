@@ -20,7 +20,7 @@ def function_text(text: str, name: str) -> str:
     return match.group(0)
 
 
-rows = source("src/semantic/check_fn_value_effect_row.elisa")
+rows = source("src/semantic/check_fn_value_effect_row.elisa") + "\n" + source("src/semantic/check_fn_value_effect_row_calls.elisa")
 signatures = source("src/semantic/check_fn_value_effect_row_signatures.elisa")
 fixture = source("test/repro/fn_value_extern_rows_module_identity.elisa")
 
