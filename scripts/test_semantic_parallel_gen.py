@@ -2,6 +2,8 @@
 """Focused soundness and precision checks for the semantic parallel audit."""
 import unittest
 
+from semantic_parallel_audit_test_support import TABLE_FIELD_TYPES, definition
+
 from semantic_parallel_audit_borrow_tests import SemanticParallelBorrowTests
 from semantic_parallel_audit_flow_tests import SemanticParallelFlowTests
 from semantic_parallel_audit_dispatch_tests import SemanticParallelDispatchTests
