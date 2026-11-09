@@ -24,6 +24,7 @@ SUMMARY_PARTS = [SUMMARY, ROOT / "src/semantic/store_through_summary_functions.e
 HOLDER_SOURCE = ROOT / "src/semantic/check_call_holder_view_store.elisa"
 HOLDER_PARTS = [
     HOLDER_SOURCE,
+    ROOT / "src/semantic/check_call_holder_view_store/local_scans.elisa",
     ROOT / "src/semantic/check_call_holder_view_store/type_references.elisa",
     ROOT / "src/semantic/check_call_holder_view_store/alias_expressions.elisa",
     ROOT / "src/semantic/check_call_holder_view_store/alias_calls.elisa",
