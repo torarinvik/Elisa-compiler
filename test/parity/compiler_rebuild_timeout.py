@@ -36,7 +36,13 @@ def sample_rebuild():
             descendants = updated
         candidates = [pid for pid in descendants if "elisac" in os.path.basename(processes.get(pid, (0, ""))[1])]
         if candidates:
-            subprocess.run(["/usr/bin/sample", str(candidates[-1]), "1", "10", "-file", profile],
+            # Prefer the oldest compiler process, not an arbitrary short-lived worker.
+            # Set iteration order is unspecified, and sampling an exiting worker can
+            # produce an empty call graph exactly when the rebuild times out.
+            candidate_set = set(candidates)
+            roots = [pid for pid in candidates if processes[pid][0] not in candidate_set]
+            target = min(roots or candidates)
+            subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-file", profile],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4, check=False)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
