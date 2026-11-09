@@ -23,6 +23,7 @@ MANIFEST = BIN.with_name(BIN.name + ".manifest.json")
 SOURCE_FILES = [
     ROOT / "src/semantic/check_try_fallible.elisa",
     ROOT / "src/semantic/check_try_fallible/using_aliases.elisa",
+    ROOT / "src/semantic/check_try_fallible/callable_errors.elisa",
     ROOT / "src/semantic/check_try_fallible/callable_rows.elisa",
     ROOT / "src/semantic/check_try_fallible/direct_raises.elisa",
     ROOT / "src/semantic/check_try_fallible/noncall_scan.elisa",

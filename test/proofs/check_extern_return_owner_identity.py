@@ -14,7 +14,7 @@ WRAPPER_CHECKER = "\n".join((ROOT / "src/semantic" / name).read_text() for name 
     "check_errorset_wrapper_coverage.elisa",
 ))
 BORROW_AFTER_MOVE = (ROOT / "src/semantic/check_borrow_after_move/store_ref_links.elisa").read_text()
-TRY_CHECKER = (ROOT / "src/semantic/check_try_fallible/using_aliases.elisa").read_text()
+TRY_CHECKER = (ROOT / "src/semantic/check_try_fallible/using_aliases.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_errors.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/extern_return_owner_line_zero.elisa").read_text()
 SMOKE = (ROOT / "test/parity/function_annotation_smoke.sh").read_text()
 

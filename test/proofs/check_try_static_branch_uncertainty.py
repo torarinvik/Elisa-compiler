@@ -6,7 +6,7 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 CALLABLE_ROWS = (ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text()
 FALLBACK = (ROOT / "src/semantic/check_try_fallible/fallback_casts.elisa").read_text()
-USING_ALIASES = (ROOT / "src/semantic/check_try_fallible/using_aliases.elisa").read_text()
+USING_ALIASES = (ROOT / "src/semantic/check_try_fallible/using_aliases.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_errors.elisa").read_text()
 TRY_CHECK = (ROOT / "src/semantic/check_try_fallible.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/try_unresolved_static_function_family.elisa").read_text()
 SMOKE = (ROOT / "test/parity/try_unresolved_static_function_family_smoke.sh").read_text()
