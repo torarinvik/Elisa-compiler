@@ -1,0 +1,116 @@
+# Direct effect source collection and incremental reuse.
+extend Semantic:
+    private:
+        # The effect ref of the first `signal` statement (recursing through blocks), or "".
+        def body_first_signal_ref(statements: darray[Ast::Stmt]) -> sview:
+            can Memory.Allocate, Abort.Panic:
+                for statement in statements:
+                    match statement:
+                        Stmt.Block(kind, clause, binding, body, line):
+                            return clause[0] if kind == "signal" and clause.count > 0
+                            nested: sview = body_first_signal_ref(body)
+                            return nested if nested != ""
+                        Stmt.If(condition, then_body, else_body, line):
+                            then_ref: sview = body_first_signal_ref(then_body)
+                            return then_ref if then_ref != ""
+                            return body_first_signal_ref(else_body)
+                        Stmt.While(condition, body, line):
+                            return body_first_signal_ref(body)
+                        Stmt.For(bind, variables, iterable, body, line):
+                            return body_first_signal_ref(body)
+                        _:
+                            pass
+                return sview("", 0, 0)
+
+
+        # Preserve the call node's full source span when an effect warning is emitted. The
+        # surrounding statement line is still used as a fallback for non-call expressions.
+        def called_function_position(expression: Ast::Expr, fallback_line: u32) -> Ast::Pos:
+            match expression:
+                Expr.Call(callee, arguments, argument_names, call_line):
+                    return call_line
+                _:
+                    return Ast::pos_at_line(fallback_line)
+
+        # Index current-source function anchors once so the recursive declaration walk
+        # can find its exact body record without comparing every function to every
+        # snapshot row. Duplicate offsets are marked with functions.count and fail closed.
+        def incremental_effect_source_anchor_index[@snapshot_storage, @snapshot_borrow](snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: mutable dict[u64, usize]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if snapshot.functions.count != snapshot.current_anchors.count
+                missing: usize = snapshot.functions.count + 1
+                for index in 0..<snapshot.functions.count |offsets, snapshot, index, missing|:
+                    offset: u64 = snapshot.current_anchors[index].definition_offset.u64()
+                    previous: usize = row if offsets.get(offset) is row else missing
+                    if previous == missing:
+                        offsets <- offsets.put(offset, index) can Global{Read,Write}
+                    else:
+                        offsets <- offsets.put(offset, snapshot.functions.count) can Global{Read,Write}
+
+
+        # Current facts are freshly collected from this AST. A record is usable by
+        # body-only passes only when its exact definition anchor has one supported
+        # record whose complete fact span is well formed.
+        def incremental_current_body_record_index[@snapshot_storage, @snapshot_borrow](at: Ast::Pos, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: dict[u64, usize]&) -> usize:
+            can Abort.Panic:
+                count: usize = snapshot.functions.count
+                return count if snapshot.functions.count != snapshot.current_anchors.count
+                owner: usize = row if offsets.get(at.offset.u64()) is row else count
+                return count if owner >= count
+                return count if snapshot.current_anchors[owner].definition_offset != at.offset
+                record: IncrementalFunctionFactRecord = snapshot.functions[owner]
+                return count if not record.cacheable
+                return count if record.direct_fact_start > snapshot.direct_facts.count
+                return count if record.direct_fact_count > snapshot.direct_facts.count - record.direct_fact_start
+                return owner
+
+
+        def incremental_current_body_has_zero_direct_facts[@snapshot_storage, @snapshot_borrow](at: Ast::Pos, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: dict[u64, usize]&) -> bool:
+            can Abort.Panic:
+                owner: usize = incremental_current_body_record_index(at, snapshot, offsets)
+                return owner < snapshot.functions.count and snapshot.functions[owner].direct_fact_count == 0
+
+
+        def collect_effect_sources[@snapshot_storage, @snapshot_borrow](declarations: darray[Ast::Decl], current_module: sview @source, table: lmut SymbolTable, snapshot: IncrementalSemanticSnapshot[snapshot_storage]& @snapshot_borrow, offsets: dict[u64, usize]&, effect_source_bodies_skipped: mutable u64&, use_snapshot_facts: bool) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |table, effect_source_bodies_skipped| -> table:
+                    match declaration:
+                        Decl.Func(name, parameters, return_type, body, effects, decorators, at):
+                            if use_snapshot_facts and incremental_current_body_has_zero_direct_facts(at, snapshot, offsets):
+                                effect_source_bodies_skipped <- effect_source_bodies_skipped + 1
+                            else:
+                                bound_names: mutable darray[sview] = []
+                                for parameter in parameters:
+                                    bound_names.push(parameter.name)
+                                table <- register_block_grant_gaps(name, body, [], false, current_module, bound_names, table) can Global{Read,Write}
+                                # A `can Unsafe.X:` GRANT block propagates the assumption
+                                # upward: the function surfaces Unsafe.X and its callers need
+                                # the grant (a `trusted` block is the firewall and does not).
+                                table <- register_unsafe_can_grants(name, current_module, body, table) can Global{Read,Write}
+                                rebind body_facts: (has_panic: bool, effect_refs: darray[sview]), table = body_statement_effect_facts(body, false, current_module, bound_names, table)
+                                signal_ref: sview = body_first_signal_ref(body)
+                                source_refs: mutable darray[sview] = []
+                                source_refs.push("Abort.Panic") if body_facts.has_panic
+                                for effect_ref in body_facts.effect_refs |source_refs|:
+                                    source_refs.push(effect_ref) if not (any known in source_refs where known == effect_ref)
+                                source_refs.push(signal_ref) if signal_ref != "" and not (any known in source_refs where known == signal_ref)
+                                for source_ref in source_refs |table, name, current_module|:
+                                    table.function_effect_source_owner <- table.function_effect_source_owner.push(name)
+                                    table.function_effect_source_module <- table.function_effect_source_module.push(current_module)
+                                    table.function_effect_source_ref <- table.function_effect_source_ref.push(source_ref)
+                            table <- index_effect_source_rows(table) can Global{Read,Write}
+                        Decl.Module(name, body, line):
+                            rebind nested_module: sview @source, table = extern_join_module_scope(current_module, name, table)
+                            table <- collect_effect_sources(body, nested_module, table, snapshot, offsets, effect_source_bodies_skipped, false) can Global{Read,Write}
+                        Decl.Scoped(body, line):
+                            table <- collect_effect_sources(body, current_module, table, snapshot, offsets, effect_source_bodies_skipped, false) can Global{Read,Write}
+                        _:
+                            pass
+
+
+        # The `__extern_effect_ref` recorded for the extern at (`line`, `offset`), or "" when none.
+        # Matched by declaration position, not array adjacency: other extern side-table annotations
+        # (`__extern_segment_owner`, `__extern_return_shape`) can be pushed between the
+        # `__extern_effect` marker and its ref, so a next-index probe misses the ref and
+        # falls back to the "Permission" placeholder (a spurious ungranted-call fire). The
+        # declaration offset also keeps a same-`#line` sibling from donating its effect.

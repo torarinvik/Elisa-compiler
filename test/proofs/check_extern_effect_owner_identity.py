@@ -12,7 +12,7 @@ def source(path: str) -> str:
 
 def function_text(text: str, name: str) -> str:
     match = re.search(
-        rf"(?ms)^        def {re.escape(name)}\(.*?(?=^        def |^    public:|\Z)",
+        rf"(?ms)^        def {re.escape(name)}(?:\[[^\]\n]*\])?\(.*?(?=^        def |^    public:|\Z)",
         text,
     )
     if match is None:
@@ -23,7 +23,9 @@ def function_text(text: str, name: str) -> str:
 parser = source("src/parser/parser_export_surface.elisa")
 parser_probes = source("src/parser/parser_extern_header_probes.elisa")
 parser_modules = source("src/parser/parser_decl_module.elisa")
-checker = source("src/semantic/check_ungranted_panic.elisa")
+checker = (source("src/semantic/check_ungranted_panic.elisa") + "\n"
+           + source("src/semantic/effect_source_collection.elisa") + "\n"
+           + source("src/semantic/extern_effect_index.elisa"))
 symbols = source("src/semantic/symbols.elisa")
 abstract_effects = source("src/semantic/check_abstract_effects.elisa")
 effect_refs = source("src/semantic/resolve_types_effect_refs.elisa")
