@@ -7,7 +7,12 @@ ROOT = Path(__file__).resolve().parents[2]
 PARSER = (ROOT / "src/parser/parser_export_surface.elisa").read_text()
 RETURN_TEXT = (ROOT / "src/parser/parser_extern_return_text.elisa").read_text()
 BORROW_CHECKER = (ROOT / "src/semantic/check_unknown_function_annotation.elisa").read_text()
-WRAPPER_CHECKER = (ROOT / "src/semantic/check_errorset_wrapper_return.elisa").read_text()
+WRAPPER_CHECKER = "\n".join((ROOT / "src/semantic" / name).read_text() for name in (
+    "check_errorset_wrapper_return.elisa",
+    "check_errorset_wrapper_visibility.elisa",
+    "check_errorset_wrapper_callable.elisa",
+    "check_errorset_wrapper_coverage.elisa",
+))
 BORROW_AFTER_MOVE = (ROOT / "src/semantic/check_borrow_after_move/store_ref_links.elisa").read_text()
 TRY_CHECKER = (ROOT / "src/semantic/check_try_fallible/using_aliases.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/extern_return_owner_line_zero.elisa").read_text()

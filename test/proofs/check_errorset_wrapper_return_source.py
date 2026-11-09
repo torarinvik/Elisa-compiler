@@ -20,6 +20,15 @@ VISIBILITY_ATOM = ROOT / "test/atoms/errorset_wrapper_return_visibility.elisa"
 
 def function_source(path: Path, name: str) -> str:
     source = path.read_text()
+    if path == EWR:
+        source += "\n" + "\n".join(
+            (ROOT / "src/semantic" / filename).read_text()
+            for filename in (
+                "check_errorset_wrapper_visibility.elisa",
+                "check_errorset_wrapper_callable.elisa",
+                "check_errorset_wrapper_coverage.elisa",
+            )
+        )
     match = re.search(
         rf"(?ms)^        def {re.escape(name)}\(.*?(?=^        def |\Z)",
         source,
