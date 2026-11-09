@@ -26,6 +26,7 @@ SOURCE_FILES = [
     ROOT / "src/semantic/check_try_fallible/callable_rows.elisa",
     ROOT / "src/semantic/check_try_fallible/direct_raises.elisa",
     ROOT / "src/semantic/check_try_fallible/noncall_scan.elisa",
+    ROOT / "src/semantic/check_try_fallible/noncall_checks.elisa",
     ROOT / "src/semantic/check_try_fallible/block_sources.elisa",
     ROOT / "src/semantic/check_try_fallible/fallback_casts.elisa",
 ]
