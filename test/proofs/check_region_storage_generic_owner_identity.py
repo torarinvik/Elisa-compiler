@@ -21,7 +21,7 @@ def function_source(source: str, name: str) -> str:
 
 
 storage = STORAGE.read_text()
-region = REGION.read_text()
+region = REGION.read_text() + REGION.with_name("check_local_region_allocations.elisa").read_text() + REGION.with_name("check_local_region_dependencies.elisa").read_text()
 fixture = FIXTURE.read_text()
 smoke = SMOKE.read_text()
 

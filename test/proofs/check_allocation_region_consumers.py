@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-LOCAL = (ROOT / "src/semantic/check_local_region_annotation.elisa").read_text()
+LOCAL = (ROOT / "src/semantic/check_local_region_annotation.elisa").read_text() + (ROOT / "src/semantic/check_local_region_allocations.elisa").read_text() + (ROOT / "src/semantic/check_local_region_dependencies.elisa").read_text()
 LOCAL_ENTRY = (ROOT / "src/semantic/check_local_region_annotation_entry.elisa").read_text()
 TRANSFER = (ROOT / "src/semantic/check_thread_transfer_provenance.elisa").read_text()
 PACKED = (ROOT / "src/semantic/check_packed_move_store.elisa").read_text()

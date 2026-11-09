@@ -41,7 +41,7 @@ def function_source(source: str, name: str) -> str:
 
 api = API.read_text()
 type_table = TYPE_TABLE.read_text()
-local_region = LOCAL_REGION.read_text()
+local_region = LOCAL_REGION.read_text() + LOCAL_REGION.with_name("check_local_region_allocations.elisa").read_text() + LOCAL_REGION.with_name("check_local_region_dependencies.elisa").read_text()
 local_region_entry = LOCAL_REGION_ENTRY.read_text()
 loop_roots = LOOP_ROOTS.read_text()
 generic_calls = GENERIC_CALLS.read_text()
