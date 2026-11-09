@@ -37,7 +37,7 @@ def function_source(source: str, name: str) -> str:
 
 source = SOURCE.read_text() + SOURCE.with_name("check_error_union_call_sites.elisa").read_text()
 catch_source = CATCH_SOURCE.read_text() + CATCH_SOURCE.with_name("check_catch_path_resolution.elisa").read_text() + CATCH_SOURCE.with_name("check_catch_exhaustive_checks.elisa").read_text()
-pma_source = PMA_SOURCE.read_text()
+pma_source = PMA_SOURCE.read_text() + PMA_SOURCE.with_name("check_private_import_visibility.elisa").read_text() + PMA_SOURCE.with_name("check_private_member_walk.elisa").read_text()
 branch_guard = function_source(source, "error_union_static_scope_is_inactive")
 import_lookup = function_source(source, "error_imported_module")
 callable_walk = function_source(source, "error_union_visible_callable_module")

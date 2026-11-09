@@ -96,7 +96,7 @@ def declarations(source: str) -> set[str]:
 
 
 source_text = SOURCE.read_text()
-consumer_text = CONSUMER.read_text()
+consumer_text = CONSUMER.read_text() + CONSUMER.with_name("check_private_import_visibility.elisa").read_text() + CONSUMER.with_name("check_private_member_walk.elisa").read_text()
 semantic_text = SEMANTIC.read_text()
 table_setup_text = TABLE_SETUP.read_text()
 diagnostic_output_text = DIAGNOSTIC_OUTPUT.read_text()
@@ -111,7 +111,7 @@ check_named_type_mismatch_text = CHECK_NAMED_TYPE_MISMATCH.read_text()
 check_construct_field_type_text = CHECK_CONSTRUCT_FIELD_TYPE.read_text()
 check_readonly_ref_text = CHECK_READONLY_REF.read_text()
 check_private_fields_types_text = CHECK_PRIVATE_FIELDS_TYPES.read_text()
-parser_text = PARSER.read_text()
+parser_text = PARSER.read_text() + PARSER.with_name("parser_decl_imports.elisa").read_text()
 parser_using_alias = compact(function_section(parser_text, "using_alias"))
 parser_consume_using_target = compact(function_section(parser_text, "consume_using_target"))
 parser_const_text = (ROOT / "src/parser/parser_types_aggregate.elisa").read_text()
