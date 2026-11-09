@@ -136,7 +136,7 @@ if any(position < 0 for position in positions) or positions != sorted(positions)
     raise SystemExit("optional wrapping no longer applies the proved null-tag rule before storing its payload")
 if wrap.count("LLVMBuildStore(builder,value,value_pointer)") != 1:
     raise SystemExit("optional wrapping must store the payload exactly once after selecting its tag")
-if compact("NE: i32 = 33") not in compact(LLVM_C.read_text()):
+if compact("NE: i32 = 33") not in compact(LLVM_C.read_text() + LLVM_C.with_name("llvm_c_calls_emit.elisa").read_text()):
     raise SystemExit("LLVMIntPredicate::NE no longer binds to LLVM-C's not-equal predicate")
 if wrap.count("LLVMIntPredicate::NE") != 1 or optional_tag.count("LLVMIntPredicate::NE") != 1:
     raise SystemExit("optional null checks must use the named LLVM not-equal predicate")

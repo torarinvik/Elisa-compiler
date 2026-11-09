@@ -124,7 +124,7 @@ slice_predicates = {
 for name, expected in slice_predicates.items():
     if predicates.get(name) != expected:
         raise SystemExit(f"LLVM predicate {name} changed from the proved value {expected}")
-llvm_bindings = compact(LLVM_C.read_text())
+llvm_bindings = compact(LLVM_C.read_text() + LLVM_C.with_name("llvm_c_calls_emit.elisa").read_text())
 for name, expected in {key.removeprefix("LLVMInt"): value for key, value in slice_predicates.items()}.items():
     if f"{name}:i32={expected}" not in llvm_bindings:
         raise SystemExit(f"LLVM C binding {name} no longer matches LLVMIntPredicate::{name}")

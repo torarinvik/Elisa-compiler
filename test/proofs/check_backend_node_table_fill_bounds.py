@@ -183,7 +183,7 @@ require_ordered(target_size_conversion, (
     "returnvalue",
 ), "node_table_fill result view usize conversion")
 
-llvm_bindings = compact(LLVM_C.read_text())
+llvm_bindings = compact(LLVM_C.read_text() + LLVM_C.with_name("llvm_c_calls_emit.elisa").read_text())
 if "NE:i32=33" not in llvm_bindings or "UGT:i32=34" not in llvm_bindings:
     raise SystemExit("node_table_fill comparison IDs no longer match their LLVMIntPredicate bindings")
 target_pointer_bits = compact(function_section(VALUE_TYPE.read_text(), "target_pointer_bits"))

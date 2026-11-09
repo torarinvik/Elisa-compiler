@@ -101,7 +101,7 @@ if "view_fields:mutabledarray[LLVMTypeRef]=[LLVMPointerTypeInContext(ctx,0),runt
     raise SystemExit("DynArrayView field 1 must be target-sized usize")
 if "structDynArrayView:data:mutablevoid&?len:mutableusize" not in compact(COLLECTIONS.read_text()):
     raise SystemExit("source DynArrayView length must remain usize")
-if "ULT:i32=36" not in compact(LLVM_C.read_text()):
+if "ULT:i32=36" not in compact(LLVM_C.read_text() + LLVM_C.with_name("llvm_c_calls_emit.elisa").read_text()):
     raise SystemExit("reduce_sum loop bound must use LLVM's unsigned-less-than predicate")
 
 if declarations(POSITIVE) != POSITIVE_NAMES or declarations(NEGATIVE) != NEGATIVE_NAMES:

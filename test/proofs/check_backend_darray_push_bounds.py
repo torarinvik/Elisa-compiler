@@ -83,7 +83,7 @@ def ordered(source: str, name: str, steps: tuple[str, ...]) -> None:
 container = CONTAINER.read_text() + CONTAINER_GROWTH.read_text()
 prereserve = PRERESERVE.read_text()
 size_types = SIZE_TYPES.read_text()
-llvm_c = compact(LLVM_C.read_text())
+llvm_c = compact(LLVM_C.read_text() + LLVM_C.with_name("llvm_c_calls_emit.elisa").read_text())
 maximum = re.search(r"(?m)^\s*const DARRAY_U32_MAX: u64 = (\d+)\s*$", container)
 if maximum is None or int(maximum.group(1)) != 4294967295:
     raise SystemExit("push capacity model lost the target usize32 maximum")

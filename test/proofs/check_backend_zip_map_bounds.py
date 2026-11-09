@@ -125,7 +125,7 @@ if any(position < 0 for position in guard_positions) or guard_positions != sorte
 normalizer = compact(function_section(INTERNED_TYPES.read_text(), "darray_size_value_i64"))
 if "returnLLVMBuildZExt(builder,value,size_type,name)ifLLVMGetIntTypeWidth(source_type)<64elsevalue" not in normalizer:
     raise SystemExit("zip_map view counts must be zero-extended before unsigned comparison")
-if "UGE:i32=35" not in compact(LLVM_C.read_text()):
+if "UGE:i32=35" not in compact(LLVM_C.read_text() + LLVM_C.with_name("llvm_c_calls_emit.elisa").read_text()):
     raise SystemExit("zip_map count guard must bind UGE to LLVMIntPredicate's unsigned-greater-or-equal value")
 runtime_size = compact(function_section(RUNTIME_DECL.read_text(), "runtime_size_llvm_type"))
 if "returnLLVMInt32TypeInContext(ctx)iftarget_bits==32" not in runtime_size or \

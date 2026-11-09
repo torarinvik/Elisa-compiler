@@ -89,7 +89,7 @@ required_inline = (
 )
 if not all(fragment in inline for fragment in required_inline):
     raise SystemExit("inline StringView indexing no longer guards and zero-extends the byte load")
-llvm_predicates = compact(LLVM_BINDINGS.read_text())
+llvm_predicates = compact(LLVM_BINDINGS.read_text() + LLVM_BINDINGS.with_name("llvm_c_calls_emit.elisa").read_text())
 predicate_values = {
     "EQ": 32,
     "NE": 33,

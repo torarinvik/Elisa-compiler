@@ -103,7 +103,7 @@ if declarations(NEGATIVE) != negative_names or \
 predicates = llvm_integer_predicates()
 if predicates.get("LLVMIntULT") != 36 or predicates.get("LLVMIntSGE") != 39:
     raise SystemExit("LLVM unsigned-less-than or signed-greater-equal predicate changed")
-binding_text = compact(LLVM_BINDINGS.read_text())
+binding_text = compact(LLVM_BINDINGS.read_text() + LLVM_BINDINGS.with_name("llvm_c_calls_emit.elisa").read_text())
 if "ULT:i32=36" not in binding_text or "SGE:i32=39" not in binding_text:
     raise SystemExit("Elisa LLVMIntPredicate bindings no longer match LLVM")
 
