@@ -73,7 +73,7 @@ if "region_escape_provenance_expression_terminates_with_metadata(scrutinee, catc
     raise SystemExit("element body-flow termination drops nested catch metadata")
 
 summary = function_source(
-    ROOT / "src/semantic/region_escape_provenance.elisa",
+    ROOT / "src/semantic/region_escape_statement_summary.elisa",
     "region_escape_provenance_catchable_raise_statement_summary",
 )
 if "region_escape_catch_marker_matches(match_line, catch_context)" not in summary:
@@ -116,6 +116,7 @@ region_escape_sources = [
     ROOT / "src/semantic/check_region_escape/walk_recovery.elisa",
     ROOT / "src/semantic/region_escape_assignments.elisa",
     ROOT / "src/semantic/region_escape_provenance.elisa",
+    ROOT / "src/semantic/region_escape_statement_summary.elisa",
     ROOT / "src/semantic/region_escape_provenance/body_flow.elisa",
     ROOT / "src/semantic/region_escape_provenance/element_flow.elisa",
     ROOT / "src/semantic/region_escape_provenance/catchable_raises.elisa",
