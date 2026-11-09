@@ -245,67 +245,67 @@ def check_global_authority_source(
 
     policy_body = compact(function_section(policy_text, "pattern_binding_origin"))
     expected_policy = compact("""
-    def pattern_binding_origin(contains_reference: bool, source_origin: usize) -> usize:
-        ensure result == (
-            NO_ORIGIN if not contains_reference else
-            (source_origin if source_origin != NO_ORIGIN else UNKNOWN_ALIAS)
-        )
-        return NO_ORIGIN if not contains_reference
-        return source_origin if source_origin != NO_ORIGIN
-        return UNKNOWN_ALIAS
-    """)
+def pattern_binding_origin(contains_reference: bool, source_origin: usize) -> usize:
+    ensure result == (
+        NO_ORIGIN if not contains_reference else
+        (source_origin if source_origin != NO_ORIGIN else UNKNOWN_ALIAS)
+    )
+    return NO_ORIGIN if not contains_reference
+    return source_origin if source_origin != NO_ORIGIN
+    return UNKNOWN_ALIAS
+""")
     if policy_body != expected_policy:
         raise SystemExit("production binder-origin policy changed from its exact origin-preservation rule")
     join_body = compact(function_section(policy_text, "join_reference_origins"))
     expected_join = compact("""
-    def join_reference_origins(left: usize, right: usize) -> usize:
-        ensure result == (
-            right if left == NO_ORIGIN else
-            (left if right == NO_ORIGIN else
-                (left if left == right else UNKNOWN_ALIAS))
-        )
-        return right if left == NO_ORIGIN
-        return left if:
-            right == NO_ORIGIN
-            left == right
-        return UNKNOWN_ALIAS
-    """)
+def join_reference_origins(left: usize, right: usize) -> usize:
+    ensure result == (
+        right if left == NO_ORIGIN else
+        (left if right == NO_ORIGIN else
+            (left if left == right else UNKNOWN_ALIAS))
+    )
+    return right if left == NO_ORIGIN
+    return left if:
+        right == NO_ORIGIN
+        left == right
+    return UNKNOWN_ALIAS
+""")
     if join_body != expected_join:
         raise SystemExit("production reference-origin join changed from its exact conservative lattice rule")
     opaque_body = compact(function_section(policy_text, "opaque_expression_origin"))
     expected_opaque = compact("""
-    def opaque_expression_origin(type_known: bool, contains_reference: bool) -> usize:
-        ensure result == (UNKNOWN_ALIAS if not type_known or contains_reference else NO_ORIGIN)
-        return UNKNOWN_ALIAS if:
-            not type_known
-            contains_reference
-        return NO_ORIGIN
-    """)
+def opaque_expression_origin(type_known: bool, contains_reference: bool) -> usize:
+    ensure result == (UNKNOWN_ALIAS if not type_known or contains_reference else NO_ORIGIN)
+    return UNKNOWN_ALIAS if:
+        not type_known
+        contains_reference
+    return NO_ORIGIN
+""")
     if opaque_body != expected_opaque:
         raise SystemExit("opaque-expression origin policy must preserve unknown or reference-bearing values")
     constructor_body = compact(function_section(policy_text, "constructor_origin"))
     expected_constructor = compact("""
-    def constructor_origin(summary: usize, reference_fields_complete: bool) -> usize:
-        ensure result == (summary if reference_fields_complete else UNKNOWN_ALIAS)
-        return summary if reference_fields_complete
-        return UNKNOWN_ALIAS
-    """)
+def constructor_origin(summary: usize, reference_fields_complete: bool) -> usize:
+    ensure result == (summary if reference_fields_complete else UNKNOWN_ALIAS)
+    return summary if reference_fields_complete
+    return UNKNOWN_ALIAS
+""")
     if constructor_body != expected_constructor:
         raise SystemExit("incomplete reference-bearing constructors must discard partial origin summaries")
     permission_body = compact(function_section(policy_text, "unknown_alias_permission"))
     expected_permission = compact('''
-    def unknown_alias_permission(write: bool) -> sview:
-        ensure result == ("Global.Write" if write else "Global.Read")
-        return "Global.Write" if write else "Global.Read"
-    ''')
+def unknown_alias_permission(write: bool) -> sview:
+    ensure result == ("Global.Write" if write else "Global.Read")
+    return "Global.Write" if write else "Global.Read"
+''')
     if permission_body != expected_permission:
         raise SystemExit("production unknown-alias permission mapping changed from its exact read/write rule")
     conservative_origin_body = compact(function_section(policy_text, "requires_unknown_alias_permission"))
     expected_conservative_origin = compact('''
-    def requires_unknown_alias_permission(origin: usize) -> bool:
-        ensure result == (origin == NO_ORIGIN or origin == UNKNOWN_ALIAS)
-        return origin == NO_ORIGIN or origin == UNKNOWN_ALIAS
-    ''')
+def requires_unknown_alias_permission(origin: usize) -> bool:
+    ensure result == (origin == NO_ORIGIN or origin == UNKNOWN_ALIAS)
+    return origin == NO_ORIGIN or origin == UNKNOWN_ALIAS
+''')
     if conservative_origin_body != expected_conservative_origin:
         raise SystemExit("missing and unknown origins must use the exact fail-closed access classification")
 
@@ -397,10 +397,10 @@ def check_global_authority_source(
             raise SystemExit("direct borrows of local storage must preserve the encoded local-root identity")
     local_origin = compact(function_section(authority_text, "ga_local_origin"))
     local_origin_guard = compact("""
-    return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if:
-        identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS or state.globals.count >= GLOBAL_AUTHORITY_LOCAL_ALIAS
-        identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS - state.globals.count
-    """)
+return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if:
+    identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS or state.globals.count >= GLOBAL_AUTHORITY_LOCAL_ALIAS
+    identity >= GLOBAL_AUTHORITY_LOCAL_ALIAS - state.globals.count
+""")
     if "identity:usize=state.local_origin_ids[local_index]" not in local_origin or \
             local_origin_guard not in local_origin or \
             "returnstate.globals.count+identity" not in local_origin:
