@@ -51,7 +51,7 @@ def declarations(source: str) -> set[str]:
 
 
 collections_text = read_runtime_split_source(COLLECTIONS)
-if compact("extern ctx_cstr_eq_sview(text: cstr, expected_length: i64, view: sview) -> bool") not in compact(COLLECTIONS_INTERFACE.read_text()):
+if compact("extern ctx_cstr_eq_sview(text: cstr, expected_length: i64, view: sview) -> bool") not in compact(read_runtime_split_source(COLLECTIONS_INTERFACE)):
     raise SystemExit("collection interface no longer carries the explicit expected C-string extent")
 compare = compact(function_section(collections_text, "ctx_cstr_eq_sview"))
 contracts = (
@@ -142,7 +142,7 @@ provenance = Path(str(stage1) + ".provenance.json").resolve(strict=True)
 inputs = list(dict.fromkeys([
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"),
     PROVER / "ELISA_COMPILER_REV", stage1, provenance, Path(__file__),
-    HERE / "proof_product_gate.py", COLLECTIONS, COLLECTIONS_INTERFACE, POSITIVE, NEGATIVE, *source_closure,
+    HERE / "proof_product_gate.py", COLLECTIONS, *source_include_closure([COLLECTIONS_INTERFACE]), POSITIVE, NEGATIVE, *source_closure,
 ]))
 hashes_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
 

@@ -60,6 +60,7 @@ def read_runtime_split_source(path: Path) -> str:
     """Read a runtime file with its responsibility-split fragments in source order."""
     prefixes = {
         "collections.elisa": "collections_",
+        "collections.elisai": "collections_interface_",
         "elisacore_runtime_strings.elisa": "elisacore_runtime_string_views.",
     }
     prefix = prefixes.get(path.name)
