@@ -1419,6 +1419,7 @@ statement_catch_marker = compact_inline(function_section(source_text, "try_nonca
 if 'marker.owner == "__catch_match" and marker.name == "__catch_match" and marker.line == position.line and marker.offset == position.offset and marker.module == lexical_module' not in statement_catch_marker:
     raise SystemExit("Try catchability must match statement Catch markers by exact source position and lexical module")
 fallback_atom_text = (ROOT / "test/atoms/try_fallback_source.elisa").read_text()
+fallback_atom_text += (ROOT / "test/atoms/try_fallback_noncall_cases.elisa").read_text()
 for helper_name, expected_count in (
         ("try_noncall_expression_directly_raises(", 3),
         ("try_noncall_block_directly_raises(", 4)):
