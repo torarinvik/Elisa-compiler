@@ -289,7 +289,7 @@ for name, expected in expected_module.items():
     if compact(function_section(module_text, name)) != compact(expected):
         raise SystemExit(f"production alias resolver no longer matches its proved model: {name}")
 
-checker_text = CHECKER.read_text()
+checker_text = CHECKER.read_text() + CHECKER.with_name("check_iterator_mutation_walk.elisa").read_text()
 checker_compact = compact(checker_text)
 if checker_text.count('include "./iterator_alias_resolution.elisa"') != 1:
     raise SystemExit("iterator invalidation must include the proof-refined alias resolver exactly once")
