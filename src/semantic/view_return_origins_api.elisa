@@ -1,0 +1,124 @@
+extend Semantic:
+    public:
+        def view_return_origin_rows(file: Ast::File&) -> darray[sview @source]:
+            can Memory.Allocate, Abort.Panic:
+                rows: mutable darray[sview @source] = []
+                view_enums: mutable darray[sview @source] = []
+                vro_view_enums(file.top_decls, view_enums)
+                mut_rows: mutable darray[sview @source] = []
+                vro_collect_mutable_rows(file.top_decls, mut_rows)
+                mutables: darray[sview @source] = vro_sort_rows(mut_rows)
+                # Iterate to a fixpoint so a helper returning another helper's view (`return
+                # at(b)`) is summarised through it. A call to a not-yet-known (or recursive)
+                # helper stays "unknown" -- callers keep the conservative path.
+                prior_index: mutable VroPriorIndex = VroPriorIndex{}
+                vro_collect(file.top_decls, file.generic_param_lines, file.generic_param_owner_offsets, file.generic_param_names, view_enums, rows, prior_index, true, mutables, rows) can Global{Read,Write}
+                for round in 0..<8 |rows, view_enums, file, prior_index|:
+                    next: mutable darray[sview @source] = []
+                    # This round reads the completed previous summary and writes only
+                    # to next. Sorting a copy lets each call search by key while
+                    # preserving the original row order within that key.
+                    prior: darray[sview @source] = vro_sort_rows(rows)
+                    vro_collect(file.top_decls, file.generic_param_lines, file.generic_param_owner_offsets, file.generic_param_names, view_enums, prior, prior_index, false, mutables, next) can Global{Read,Write}
+                    same: mutable bool = next.count == rows.count
+                    if same:
+                        for index in 0..<next.count |same, next, rows|:
+                            same <- false if next[index] != rows[index]
+                    rows <- next
+                    break if same
+                return rows
+
+        # A summarised call's status, resolving `recv.m(args)` (receiver form, arity args+1)
+        # before the static form `T.m(args)`.
+        def vro_call_status(callee: Ast::Expr, argument_count: usize, rows: darray[sview @source]&) -> u8:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Ident(name, _):
+                        return vro_status(rows, name, argument_count)
+                    Expr.Field(_, method, _):
+                        receiver_status: u8 = vro_status(rows, method, argument_count + 1)
+                        return receiver_status if receiver_status != 0
+                        return vro_status(rows, method, argument_count)
+                    _:
+                        return 0
+
+        # The argument expressions a traceable summarised call's result carries (CARRIED true:
+        # "carry" rows) or borrows the storage of (CARRIED false: "into" rows). Empty when the
+        # call is not summarised or is unknown; "thread" rows are left to the storage checker.
+        def vro_origin_arguments(callee: Ast::Expr, arguments: darray[Ast::Expr]&, rows: darray[sview @source]&, carried: bool) -> darray[Ast::Expr]:
+            can Memory.Allocate, Abort.Panic:
+                out: mutable darray[Ast::Expr] = []
+                name: mutable sview @source = ""
+                receiver: mutable Ast::Expr? = null
+                shift: mutable usize = 0
+                match callee:
+                    Expr.Ident(callee_name, _):
+                        name <- callee_name
+                    Expr.Field(object, method, _):
+                        name <- method
+                        if vro_status(rows, method, arguments.count + 1) != 0:
+                            receiver <- object
+                            shift <- 1
+                    _:
+                        pass
+                arity: usize = arguments.count + shift
+                return out if vro_status(rows, name, arity) != 1
+                arity_tag: sview @source = vro_tag(arity)
+                wanted: sview @source = "carry" if carried else "into"
+                row: mutable usize = vro_scan_start(rows, name, arity_tag)
+                while vro_scan_live(rows, row, name, arity_tag) |row, out|:
+                    if rows[row] == name and rows[row + 1] == arity_tag and rows[row + 3] == wanted:
+                        position: mutable usize = 16
+                        for candidate in 0..<16 |position|:
+                            position <- candidate if vro_tag(candidate) == rows[row + 2]
+                        if position < arity:
+                            if shift == 1 and position == 0:
+                                if receiver is object:
+                                    out.push(object)
+                            else:
+                                out.push(arguments[position - shift])
+                    row <- row + vro_row()
+                return out
+
+        # The field each vro_origin_arguments entry goes through ("" for the whole argument),
+        # in the same order.
+        def vro_origin_fields(callee: Ast::Expr, arguments: darray[Ast::Expr]&, rows: darray[sview @source]&, carried: bool) -> darray[sview @source]:
+            can Memory.Allocate, Abort.Panic:
+                out: mutable darray[sview @source] = []
+                name: mutable sview @source = ""
+                shift: mutable usize = 0
+                match callee:
+                    Expr.Ident(callee_name, _):
+                        name <- callee_name
+                    Expr.Field(object, method, _):
+                        name <- method
+                        if vro_status(rows, method, arguments.count + 1) != 0:
+                            shift <- 1
+                    _:
+                        pass
+                arity: usize = arguments.count + shift
+                return out if vro_status(rows, name, arity) != 1
+                arity_tag: sview @source = vro_tag(arity)
+                wanted: sview @source = "carry" if carried else "into"
+                row: mutable usize = vro_scan_start(rows, name, arity_tag)
+                while vro_scan_live(rows, row, name, arity_tag) |row, out|:
+                    if rows[row] == name and rows[row + 1] == arity_tag and rows[row + 3] == wanted:
+                        position: mutable usize = 16
+                        for candidate in 0..<16 |position|:
+                            position <- candidate if vro_tag(candidate) == rows[row + 2]
+                        if position < arity:
+                            out.push(rows[row + 4])
+                    row <- row + vro_row()
+                return out
+
+        # Strip parentheses and `&` / `lmut` borrows: `&buf` names `buf`.
+        def vro_strip_borrow(expression: Ast::Expr) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Paren(inner, _):
+                        return vro_strip_borrow(inner)
+                    Expr.Unary(operator, operand, _):
+                        return expression if operator != TokenKind.Ampersand and operator != TokenKind.Lmut
+                        return vro_strip_borrow(operand)
+                    _:
+                        return expression
