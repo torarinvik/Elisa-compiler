@@ -59,6 +59,7 @@ def token_kind_variants(source: str) -> list[str]:
 
 source_text = ARITHMETIC.read_text()
 semantic_text = SEMANTIC.read_text()
+semantic_text = semantic_text.replace('include "./semantic_contract_checks.elisa"', SEMANTIC.with_name("semantic_contract_checks.elisa").read_text())
 legacy_text = SOURCE.read_text()
 maximum = compact(function_section(source_text, "linear_i64_max"))
 minimum = compact(function_section(source_text, "linear_i64_min"))
