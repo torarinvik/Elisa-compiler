@@ -80,7 +80,7 @@ def ghost_declarations(path: Path) -> set[str]:
     return set(re.findall(r"(?m)^\s*ghost def ([A-Za-z_][A-Za-z0-9_]*)\(", path.read_text()))
 
 
-production_text = ERROR_UNIONS.read_text()
+production_text = ERROR_UNIONS.read_text() + ERROR_UNIONS.with_name("codegen_error_union_registration.elisa").read_text()
 expected_production = """
 def error_family_precedes(left: sview, right: sview) -> bool:
     left_length: usize = left.len

@@ -37,7 +37,7 @@ def section(text: str, name: str) -> str:
     return text[match.start():end]
 
 
-source = compact(section(SOURCE.read_text(), "error_union_variant_allowed"))
+source = compact(section(SOURCE.read_text() + SOURCE.with_name("codegen_error_union_registration.elisa").read_text(), "error_union_variant_allowed"))
 production_fragments = (
     'deferror_union_variant_allowed(file:Ast::File&,family_row_index:usize,variant:sview)->boolcan[Abort.Panic]:',
     'returntrueiffamily_row_index>=file.enum_annotations.count',
@@ -53,7 +53,7 @@ production_fragments = (
 if not all(fragment in source for fragment in production_fragments):
     raise SystemExit("error-union variant admission no longer binds the proved policy to one family occurrence")
 
-registration = compact(section(SOURCE.read_text(), "register_error_union_row"))
+registration = compact(section(SOURCE.read_text() + SOURCE.with_name("codegen_error_union_registration.elisa").read_text(), "register_error_union_row"))
 registration_fragments = (
     'occurrence_offset:u32',
     'annotation.occurrence_offset!=occurrence_offset',
@@ -61,7 +61,7 @@ registration_fragments = (
 if not all(fragment in registration for fragment in registration_fragments):
     raise SystemExit("error-union ABI registration no longer filters family rows by error-set occurrence")
 
-composite_registration = compact(section(SOURCE.read_text(), "register_composite_error_unions"))
+composite_registration = compact(section(SOURCE.read_text() + SOURCE.with_name("codegen_error_union_registration.elisa").read_text(), "register_composite_error_unions"))
 if 'key_annotation.occurrence_offset,structs' not in composite_registration:
     raise SystemExit("composite error-union keys no longer pass their occurrence to ABI registration")
 
