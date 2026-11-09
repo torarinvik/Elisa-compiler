@@ -23,7 +23,7 @@ def function_source(source: str, name: str) -> str:
     return match.group(0)
 
 
-source = SOURCE.read_text()
+source = SOURCE.read_text() + SOURCE.with_name("check_catch_path_resolution.elisa").read_text() + SOURCE.with_name("check_catch_exhaustive_checks.elisa").read_text()
 alias_lookup = function_source(source, "catch_module_alias_target")
 qualifier_lookup = function_source(source, "catch_module_qualifier_alias_target")
 alias_order = function_source(source, "catch_module_alias_order")

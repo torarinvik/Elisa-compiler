@@ -36,7 +36,7 @@ def function_source(source: str, name: str) -> str:
 
 
 source = SOURCE.read_text()
-catch_source = CATCH_SOURCE.read_text()
+catch_source = CATCH_SOURCE.read_text() + CATCH_SOURCE.with_name("check_catch_path_resolution.elisa").read_text() + CATCH_SOURCE.with_name("check_catch_exhaustive_checks.elisa").read_text()
 pma_source = PMA_SOURCE.read_text()
 branch_guard = function_source(source, "error_union_static_scope_is_inactive")
 import_lookup = function_source(source, "error_imported_module")

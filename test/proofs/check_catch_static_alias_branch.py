@@ -7,7 +7,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "src/semantic/check_catch_exhaustive.elisa"
-PROOF = SOURCE.read_text()
+PROOF = SOURCE.read_text() + SOURCE.with_name("check_catch_path_resolution.elisa").read_text() + SOURCE.with_name("check_catch_exhaustive_checks.elisa").read_text()
 EXTERN_ENUM_SOURCE = (ROOT / "src/parser/parser_extern_enum.elisa").read_text()
 DECL_NAME_SOURCE = (ROOT / "src/parser/parser_decl.elisa").read_text()
 ENUM_PARSER_SOURCE = (ROOT / "src/parser/parser_types_aggregate.elisa").read_text()
@@ -194,7 +194,7 @@ if not all(fragment in alias_unknown_marker for fragment in (
 if not all(fragment in catch_declaration_lookup for fragment in (
     "alias_target.uncertain",
     'return (false, callee, 0, 0, 0, 0) if alias_target.uncertain',
-    "catch_module_alias_path_matches_ancestor(alias_target.module, alias_target.scope, alias_target.suffixes, candidate_module)')) or not all(fragment in catch_alias_ancestor for fragment in (
+    "catch_module_alias_path_matches_ancestor(alias_target.module, alias_target.scope, alias_target.suffixes, candidate_module)")) or not all(fragment in catch_alias_ancestor for fragment in (
     "catch_module_alias_path_matches(alias_module, scope, suffixes, candidate_module)",
     "scope <- catch_module_parent_path(scope)",
     'break if scope == ""')) or not all(fragment in catch_family_lookup for fragment in (
