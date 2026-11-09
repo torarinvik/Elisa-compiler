@@ -4,7 +4,7 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CALLABLE_ROWS = (ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text()
+CALLABLE_ROWS = ((ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_arguments.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_overloads.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_noncall_expressions.elisa").read_text())
 NONCALL = (ROOT / "src/semantic/check_try_fallible/noncall_scan.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/noncall_checks.elisa").read_text()
 FALLBACK = (ROOT / "src/semantic/check_try_fallible/fallback_casts.elisa").read_text()
 PARSER_DISPATCH = (ROOT / "src/parser/parser_decl_dispatch.elisa").read_text()

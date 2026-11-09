@@ -193,8 +193,8 @@ if "typestate_call_widening_owner_line_zero.elisa" not in SMOKE or \
         'before "call_move_operand" returns' not in SMOKE or \
         'before "call_region_operand" returns' not in SMOKE or \
         "call_offset_present" not in SOURCE or \
-        "alias.offset >= before_offset" not in Path(ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text() or \
-        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, before_offset, table)" not in Path(ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text():
+        "alias.offset >= before_offset" not in Path((ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_arguments.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_overloads.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_noncall_expressions.elisa").read_text()) or \
+        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, before_offset, table)" not in Path((ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_arguments.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_overloads.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_noncall_expressions.elisa").read_text()):
     raise SystemExit("smoke must cover local, qualified, imported, arity, and ambiguous-shape owner selection")
 
 if 'for smoke in "$REPO_ROOT"/test/parity/*_smoke.sh' not in RUN_ALL or \
