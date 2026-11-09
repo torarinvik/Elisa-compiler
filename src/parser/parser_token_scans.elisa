@@ -1,0 +1,163 @@
+extend Parser:
+    public:
+        # Read scalar token fields through a reference to the backing array instead of
+        # repeatedly materializing the 20-byte Token value in a full-file machine. The
+        # stage1 backend lowers a direct `tokens[index]` value expression to a stack
+        # temporary; inside a million-token scan that temporary was not reclaimed per
+        # iteration and the self-hosted gen3 binary exhausted its native stack.
+        def scan_token_ref(parser: Parser&, index: usize) -> Token&:
+            trusted [Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+                first: Token& = &parser.tokens[0.usize()]
+                return (first.cast[u8&] + index * size_of(Token)).cast[Token&]
+
+        def scan_token_kind(parser: Parser&, index: usize) -> TokenKind:
+            token: Token& = parser.scan_token_ref(index)
+            return token.kind
+
+        def scan_token_line(parser: Parser&, index: usize) -> u32:
+            token: Token& = parser.scan_token_ref(index)
+            return token.line
+
+        def scan_token_pos(parser: Parser&, index: usize) -> Ast::Pos:
+            token: Token& = parser.scan_token_ref(index)
+            return Ast::pos_of_token(token)
+
+        def scan_token_text(parser: Parser&, index: usize) -> sview:
+            token: Token& = parser.scan_token_ref(index)
+            return Lexer::text_or_empty(token, parser.source, parser.source_length)
+
+        # These two post-parse checks are independent token-local recognizers. Share the
+        # full token walk while preserving source order in their separate output columns.
+        def scan_token_metadata(parser: lmut Parser) -> void:
+            can Memory.Allocate, Abort.Panic:
+                machine over parser.tokens for index in 0..<parser.tokens.count:
+                    state Scan
+                    start Scan
+
+                    Scan, _ if index + 2 >= parser.tokens.count:
+                        -> Scan
+
+                    Scan, _:
+                        is_allocation: bool = (parser.scan_token_kind(index) == TokenKind.New or (parser.scan_token_kind(index) == TokenKind.Ident and parser.scan_token_text(index) == "new")) and parser.scan_token_kind(index + 1) == TokenKind.LBracket and parser.scan_token_kind(index + 2) == TokenKind.Ident
+                        if is_allocation:
+                            parser.allocation_region_names <- parser.allocation_region_names.push(parser.scan_token_text(index + 2))
+                            parser.allocation_region_lines <- parser.allocation_region_lines.push(parser.scan_token_line(index))
+                            parser.allocation_region_offsets <- parser.allocation_region_offsets.push(parser.scan_token_pos(index).offset)
+                        is_invalid_console: bool = index > 0 and parser.scan_token_kind(index - 1) == TokenKind.Ident and parser.scan_token_text(index - 1) == "can" and parser.scan_token_kind(index) == TokenKind.Ident and parser.scan_token_text(index) == "Console" and parser.scan_token_kind(index + 1) == TokenKind.Dot and parser.scan_token_kind(index + 2) == TokenKind.Ident and parser.scan_token_text(index + 2) != "Format" and parser.scan_token_text(index + 2) != "Write"
+                        if is_invalid_console:
+                            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__invalid_console", name: parser.scan_token_text(index + 2), line: parser.scan_token_line(index), pos: parser.scan_token_pos(index)})
+                        -> Scan
+
+
+        # Permission-row parameters stand for a complete permission value. Unlike a
+        # concrete permission family (`Console.Write`), they cannot be qualified with a
+        # member (`P.Write`). Preserve this source-level distinction for semantic
+        # diagnostics; the compact type AST intentionally erases generic-parameter kinds.
+        def permission_param_on_line(names: darray[sview]&, lines: darray[u32]&, name: sview, line: u32) -> bool:
+            can Abort.Panic:
+                machine over names for index in 0..<names.count:
+                    state Scan
+                    start Scan
+
+                    Scan, _ if names[index] == name and lines[index] == line:
+                        return true
+
+                    Scan, _:
+                        -> Scan
+                return false
+
+
+        def scan_permission_param_members(parser: lmut Parser) -> void:
+            can Memory.Allocate, Abort.Panic:
+                permission_params: mutable darray[sview] = []
+                permission_param_lines: mutable darray[u32] = []
+                machine over parser.tokens for index in 0..<parser.tokens.count:
+                    state Scan
+                    start Scan
+
+                    Scan, _ if index + 1 >= parser.tokens.count:
+                        -> Scan
+
+                    Scan, _ if parser.scan_token_kind(index) == TokenKind.Ident and parser.scan_token_text(index) == "permission" and parser.scan_token_kind(index + 1) == TokenKind.Ident:
+                        permission_params.push(parser.scan_token_text(index + 1))
+                        permission_param_lines.push(parser.scan_token_line(index + 1))
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__permission_param_decl", name: parser.scan_token_text(index + 1), line: parser.scan_token_line(index + 1), offset: parser.scan_token_pos(index + 1).offset})
+                        -> Scan
+
+                    Scan, _:
+                        -> Scan
+
+                machine over parser.tokens for index in 0..<parser.tokens.count:
+                    state Scan
+                    start Scan
+
+                    Scan, _ if index + 2 >= parser.tokens.count:
+                        -> Scan
+
+                    Scan, _ if parser.scan_token_kind(index) == TokenKind.Ident and parser.scan_token_kind(index + 1) == TokenKind.Dot and parser.scan_token_kind(index + 2) == TokenKind.Ident and permission_param_on_line(permission_params, permission_param_lines, parser.scan_token_text(index), parser.scan_token_line(index)):
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "__permission_param_member", name: parser.scan_token_text(index), line: parser.scan_token_line(index)})
+                        -> Scan
+
+                    Scan, _:
+                        -> Scan
+
+        # The last segment of a `::` path starting at `token_index`. `scan_token_kind` is
+        # raw pointer arithmetic, so every step bounds-checks before it reads.
+        def legacy_wildcard_path_end(parser: Parser&, token_index: usize, depth: u32) -> usize:
+            return token_index if depth > 8 or token_index + 2 >= parser.tokens.count
+            qualified: bool = parser.scan_token_kind(token_index + 1) == TokenKind.Scope and parser.scan_token_kind(token_index + 2) == TokenKind.Ident
+            return token_index if not qualified
+            return parser.legacy_wildcard_path_end(token_index + 2, depth + 1)
+
+        # `error[Mod::Set.*]`: the removed wildcard sits after the whole PATH, not after the
+        # first segment, so a qualified spelling slipped past the deprecation scan and
+        # stage1 accepted silently what stage0 rejects.
+        def legacy_error_wildcard_at(parser: Parser&, token_index: usize) -> bool:
+            return false if:
+                token_index + 5 >= parser.tokens.count
+                parser.scan_token_kind(token_index) != TokenKind.Error or parser.scan_token_kind(token_index + 1) != TokenKind.LBracket or parser.scan_token_kind(token_index + 2) != TokenKind.Ident
+            path_end: usize = parser.legacy_wildcard_path_end(token_index + 2, 0)
+            return false if path_end + 3 >= parser.tokens.count
+            return parser.scan_token_kind(path_end + 1) == TokenKind.Dot and parser.scan_token_kind(path_end + 2) == TokenKind.Star and parser.scan_token_kind(path_end + 3) == TokenKind.RBracket
+
+        # `->` opens a return type, but a signature CLAUSE closes it. A `|` that follows one is a
+        # typestate set (`ensures job => Ready | Failed`) or a predicate -- never the dropped
+        # `T | ErrorSet` return form, which can only appear between the arrow and the first clause.
+        def scan_closes_return_type(parser: Parser&, index: usize) -> bool:
+            return false if parser.scan_token_kind(index) != TokenKind.Ident
+            text: sview = parser.scan_token_text(index)
+            return when text:
+                "can" | "ensures" | "requires" | "decreases" | "where" -> true
+                _ -> false
+
+        def scan_legacy_error_syntax(parser: lmut Parser) -> void:
+            can Memory.Allocate, Abort.Panic:
+                machine over parser.enum_annotations for token_index in 0..<parser.tokens.count:
+                    state Scan(saw_arrow: bool)
+                    start Scan(false)
+
+                    Scan(_), _ if parser.scan_token_kind(token_index) == TokenKind.Newline:
+                        -> Scan(false)
+
+                    Scan(_), _ if parser.scan_token_kind(token_index) == TokenKind.Arrow:
+                        -> Scan(true)
+
+                    Scan(_), _ if parser.scan_closes_return_type(token_index):
+                        -> Scan(false)
+
+                    Scan(saw_arrow), _ if parser.legacy_error_wildcard_at(token_index):
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "", name: "__legacy_error_wildcard", line: parser.scan_token_line(token_index)})
+                        -> Scan(saw_arrow)
+
+                    Scan(true), _ if parser.scan_token_kind(token_index) == TokenKind.Pipe:
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "", name: "__legacy_error_pipe", line: parser.scan_token_line(token_index)})
+                        -> Scan(true)
+
+                    # `error[Set, ...]`: a Comma directly followed by `...` inside the set is
+                    # the dropped open-suffix form (deprecated: a bare set name means the family).
+                    Scan(true), _ if parser.scan_token_kind(token_index) == TokenKind.Comma and token_index + 1 < parser.tokens.count and parser.scan_token_kind(token_index + 1) == TokenKind.Ellipsis:
+                        parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: "", name: "__legacy_error_open", line: parser.scan_token_line(token_index)})
+                        -> Scan(true)
+
+                    Scan(saw_arrow), _:
+                        -> Scan(saw_arrow)

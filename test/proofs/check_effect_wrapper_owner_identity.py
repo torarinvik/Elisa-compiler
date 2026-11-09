@@ -22,7 +22,7 @@ def function_text(text: str, name: str) -> str:
 
 params = source("src/parser/parser_func_params.elisa")
 function_parser = source("src/parser/parser_types_function.elisa")
-permission_scan = source("src/parser/parser_types_entry.elisa")
+permission_scan = source("src/parser/parser_types_entry.elisa") + source("src/parser/parser_token_scans.elisa")
 grants = source("src/semantic/check_ungranted_panic_grants.elisa")
 coverage = source("src/semantic/check_ungranted_panic_coverage.elisa")
 fixture = source("test/repro/effect_wrapper_same_line_zero_identity.elisa")

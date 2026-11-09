@@ -54,7 +54,7 @@ if compact("return " + marker_map) not in compact(function_section(helper_text, 
 
 semantic_text = SEMANTIC.read_text()
 check_text = CHECK.read_text()
-parser_text = PARSER.read_text()
+parser_text = PARSER.read_text() + PARSER.with_name("parser_token_scans.elisa").read_text()
 if 'include "./legacy_error_syntax_name.elisa"' not in semantic_text:
     raise SystemExit("semantic root no longer imports the proved marker-name helper")
 if 'include "./check_legacy_error_syntax.elisa"' not in semantic_text:
