@@ -32,6 +32,14 @@ if [[ "$(uname -s)" == Darwin && -z "${DEVELOPER_DIR:-}" && -d /Library/Develope
 fi
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--seed" && "${ELISA_STAGE1_SEED_TIMEOUT_WRAPPED:-0}" != "1" ]]; then
+  # setup_local_compilers.sh supplies this marker so aggregate RSS/footprint
+  # accounting includes every child in its bounded process group. Direct
+  # developer-script invocations get the same 30-second wall cap.
+  export ELISA_STAGE1_SEED_TIMEOUT_WRAPPED=1
+  exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 30 -- \
+    "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 # `ELISA_STAGE1_BIN` is a product override, but callers commonly obtain it from
 # `command -v elisac-stage1`, which is the installed host wrapper rather than the
