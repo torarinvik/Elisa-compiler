@@ -57,7 +57,7 @@ if "region_escape_catch_marker_matches(line, catch_context)" not in statement_te
 if "region_escape_provenance_match_arms_terminate_with_metadata(scrutinee, arms, catch_context)" not in statement_termination:
     raise SystemExit("ordinary Match termination drops nested RegionEscape catch context")
 
-break_search = function_source(catchable, "region_escape_provenance_statement_has_break_for_loop")
+break_search = function_source(catchable.with_name("loop_control.elisa"), "region_escape_provenance_statement_has_break_for_loop")
 if "scrutinee_aborts and (not is_catch_match or not scrutinee_may_raise)" not in break_search:
     raise SystemExit("loop break search treats arms after an aborting Match scrutinee as reachable")
 if "reachable <- false if is_catch_match and scrutinee_aborts and arm_index == 0" not in break_search:
@@ -118,6 +118,7 @@ region_escape_sources = [
     ROOT / "src/semantic/region_escape_provenance.elisa",
     ROOT / "src/semantic/region_escape_provenance/body_flow.elisa",
     ROOT / "src/semantic/region_escape_provenance/catchable_raises.elisa",
+    ROOT / "src/semantic/region_escape_provenance/loop_control.elisa",
     ROOT / "src/semantic/region_escape_provenance/stored_regions.elisa",
     ROOT / "src/semantic/region_escape_stores.elisa",
 ]
