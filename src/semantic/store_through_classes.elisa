@@ -1,0 +1,270 @@
+extend Semantic:
+    private:
+        struct StoreThroughClasses:
+            # NameSet keeps insertion order and a hash index; parents uses the same
+            # zero-based name rows with 1-based parent labels.
+            names: mutable NameSet
+            parents: mutable darray[usize]
+            ranks: mutable darray[u8]
+            # Reference parameters whose fields hold no references: a read through one
+            # copies data and cannot retain the address of the object passed in.
+            copy_safe: mutable darray[sview] = []
+            # By-value locals with no reference fields: even a bare use is only a copy.
+            copy_values: mutable darray[sview] = []
+
+        def sts_classes_empty() -> StoreThroughClasses:
+            can Memory.Allocate, Abort.Panic:
+                return StoreThroughClasses{names: empty_name_set(), parents: [], ranks: []}
+
+        # The class of NAME (registering it as its own class). Classes are a union-find
+        # forest: parents[row] is the 1-based row of the parent, a root points at itself.
+        # Callers only ever compare two classes for equality, so the partition -- which
+        # does not depend on the order of the unions -- is the whole answer; relabelling
+        # every row per union made each function quadratic in the names it mentions. The
+        # hash-backed NameSet avoids a linear name search for larger functions, while
+        # union-by-rank bounds tree
+        # height before path compression.
+        def sts_class_of(classes: mutable StoreThroughClasses&, name: sview) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                row: mutable i64 = -1
+                if classes.names.slots.count == 0:
+                    candidate: mutable usize = 0
+                    while candidate < classes.names.names.count |candidate, classes|:
+                        if classes.names.names[candidate] == name:
+                            row <- candidate.i64()
+                            break
+                        candidate <- candidate + 1
+                else:
+                    row <- name_set_index(classes.names, name)
+                return sts_class_root(classes, row.usize() + 1) if row >= 0
+                label: usize = classes.parents.count + 1
+                if classes.names.slots.count == 0 and classes.names.names.count < STS_CLASS_HASH_THRESHOLD:
+                    classes.names.names.push(name)
+                else:
+                    name_set_grow(&classes.names) if classes.names.slots.count == 0
+                    name_set_add(&classes.names, name)
+                classes.parents.push(label)
+                classes.ranks.push(0)
+                return label
+
+        def sts_class_root(classes: mutable StoreThroughClasses&, label: usize) -> usize:
+            can Memory.Allocate, Abort.Panic:
+                root: mutable usize = label
+                while classes.parents[root - 1] != root |root, classes|:
+                    root <- classes.parents[root - 1]
+                # Path compression.
+                walk: mutable usize = label
+                while classes.parents[walk - 1] != root |walk, classes, root|:
+                    parent: usize = classes.parents[walk - 1]
+                    classes.parents[walk - 1] <- root
+                    walk <- parent
+                return root
+
+        def sts_unify(classes: mutable StoreThroughClasses&, first: sview, second: sview) -> void:
+            can Memory.Allocate, Abort.Panic:
+                kept: usize = sts_class_of(classes, first)
+                merged: usize = sts_class_of(classes, second)
+                return if kept == merged
+                kept_rank: u8 = classes.ranks[kept - 1]
+                merged_rank: u8 = classes.ranks[merged - 1]
+                if kept_rank < merged_rank:
+                    classes.parents[kept - 1] <- merged
+                elif kept_rank > merged_rank:
+                    classes.parents[merged - 1] <- kept
+                else:
+                    classes.parents[merged - 1] <- kept
+                    classes.ranks[kept - 1] <- kept_rank + 1
+
+        def sts_unify_all(classes: mutable StoreThroughClasses&, mentioned: darray[sview]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                return if mentioned.count < 2
+                for other in mentioned |classes|:
+                    sts_unify(classes, mentioned[0], other)
+
+        # A generic direct call is represented as an Index/IndexN callee in the AST.
+        # Resolve it only when the head names one unique function and is not shadowed
+        # by a local binding; runtime indexing and ambiguous function values stay on
+        # the conservative unknown-call path.
+        def sts_generic_direct_callee_name(callee: Ast::Expr, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> sview:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match callee:
+                    Expr.Index(Expr.Ident(name, position), _, _) | Expr.IndexN(Expr.Ident(name, position), _, _):
+                        return "" if has_unreadable_binder or name == "" or direct_function_count(table, name) != 1
+                        return "" if borrow_reference_site_is_local(reference_sites, function_owner, position, table)
+                        return name
+                    Expr.Index(Expr.Scope(_, name, position), _, _) | Expr.IndexN(Expr.Scope(_, name, position), _, _):
+                        return "" if has_unreadable_binder or name == "" or direct_function_count(table, name) != 1
+                        return "" if borrow_reference_site_is_local(reference_sites, function_owner, position, table)
+                        return name
+                    _:
+                        return ""
+
+        # Apply the known callee's target/source rows to the corresponding actuals.
+        def sts_unify_call_pairs(callee_name: sview, arguments: darray[Ast::Expr], summary: StoreThroughSummary&, classes: mutable StoreThroughClasses&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                pair_row: mutable u32 = sts_pair_first(summary, callee_name)
+                while pair_row != STS_NO_ROW |pair_row, classes|:
+                    row: usize = pair_row.usize()
+                    if summary.pair_function[row] == callee_name and summary.pair_target[row] < arguments.count and summary.pair_source[row] < arguments.count:
+                        pair_names: mutable darray[sview] = []
+                        sts_collect_names(arguments[summary.pair_target[row]], pair_names)
+                        sts_collect_names_except(arguments[summary.pair_source[row]], pair_names, classes.copy_safe, classes.copy_values)
+                        sts_unify_all(classes, pair_names)
+                    pair_row <- sts_pair_after(summary, pair_row)
+
+        # Calls anywhere inside EXPRESSION: a summarised callee unifies its stored argument
+        # pairs, a method call or any other call unifies everything it was handed.
+        def sts_unify_calls(expression: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, classes: mutable StoreThroughClasses&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match expression:
+                    Expr.Call(callee, arguments, argument_names, _):
+                        sts_unify_calls(callee, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        for argument in arguments |classes, reference_sites|:
+                            sts_unify_calls(argument, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        match callee:
+                            Expr.Ident(callee_name, callee_position):
+                                shadowed: bool = borrow_reference_site_is_local(reference_sites, function_owner, callee_position, table) or has_unreadable_binder
+                                if sts_is_declared(summary, callee_name) and not shadowed and not (any argument_name in argument_names where argument_name != ""):
+                                    pair_row: mutable u32 = sts_pair_first(summary, callee_name)
+                                    while pair_row != STS_NO_ROW |pair_row, classes|:
+                                        row: usize = pair_row.usize()
+                                        if summary.pair_function[row] == callee_name and summary.pair_target[row] < arguments.count and summary.pair_source[row] < arguments.count:
+                                            pair_names: mutable darray[sview] = []
+                                            sts_collect_names(arguments[summary.pair_target[row]], pair_names)
+                                            sts_collect_names_except(arguments[summary.pair_source[row]], pair_names, classes.copy_safe, classes.copy_values)
+                                            sts_unify_all(classes, pair_names)
+                                        pair_row <- sts_pair_after(summary, pair_row)
+                                    return
+                            Expr.Index(Expr.Ident(generic_name, generic_position), _, _) | Expr.IndexN(Expr.Ident(generic_name, generic_position), _, _):
+                                if not (any argument_name in argument_names where argument_name != ""):
+                                    generic_callee: sview = sts_generic_direct_callee_name(callee, has_unreadable_binder, function_owner, reference_sites, table)
+                                    if generic_callee != "" and sts_is_declared(summary, generic_callee):
+                                        sts_unify_call_pairs(generic_callee, arguments, summary, classes)
+                                        return
+                            _:
+                                pass
+                        call_names: mutable darray[sview] = []
+                        match callee:
+                            Expr.Ident(callee_name, callee_position):
+                                call_names.push(callee_name) if borrow_reference_site_is_local(reference_sites, function_owner, callee_position, table) or has_unreadable_binder
+                            Expr.Field(receiver, _, _):
+                                sts_collect_names(receiver, call_names)
+                            _:
+                                pass
+                        for argument in arguments |call_names, classes|:
+                            sts_collect_names_except(argument, call_names, classes.copy_safe, classes.copy_values)
+                        sts_unify_all(classes, call_names)
+                    Expr.Field(object, _, _):
+                        sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.Index(object, index, _):
+                        sts_unify_calls(object, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(index, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.Binary(left, _, right, _):
+                        sts_unify_calls(left, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(right, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.Unary(_, operand, _):
+                        sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.Move(operand, _):
+                        sts_unify_calls(operand, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.Paren(inner, _):
+                        sts_unify_calls(inner, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.If(condition, then_value, else_value, _):
+                        sts_unify_calls(condition, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(then_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        sts_unify_calls(else_value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    _:
+                        # Anything this walk does not open (a lambda, a block or match value)
+                        # may store anything it mentions anywhere.
+                        hidden_names: mutable darray[sview] = []
+                        sts_collect_names(expression, hidden_names)
+                        sts_unify_all(classes, hidden_names)
+
+        # Returning a constructed aggregate does not store its fields through any writable
+        # parameter. Walk field expressions for calls with real store effects, but do not
+        # alias unrelated values merely because they are packaged into the same result.
+        # This matters for backend carrier structs such as PropagatingTryCall, whose fields
+        # include independent LLVM handles and compiler-state views.
+        def sts_unify_return_calls(expression: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&, classes: mutable StoreThroughClasses&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                match expression:
+                    Expr.Construct(_, fields, _):
+                        for field in fields |classes, reference_sites|:
+                            sts_unify_return_calls(field.value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.RecordUpdate(base, fields, _):
+                        sts_unify_return_calls(base, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                        for field in fields |classes, reference_sites|:
+                            sts_unify_return_calls(field.value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    Expr.Paren(inner, _) | Expr.Move(inner, _):
+                        sts_unify_return_calls(inner, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+                    _:
+                        sts_unify_calls(expression, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+
+        # LLVM-C opaque handles are host compiler objects, not Elisa references. Keep
+        # this whitelist exact: arbitrary extern/nominal types remain unknown and retain
+        # the conservative initializer alias union. Structural wrappers are safe only
+        # when every contained element is one of these handles.
+        def sts_type_is_llvm_handle(type_id: u32, table: SymbolTable&) -> bool:
+            can Abort.Panic:
+                kind: SemTypeKind = interned_kind(type_id, table)
+                if kind == SemTypeKind.Named:
+                    name: sview = interned_name(type_id, table)
+                    return name == "LLVMContextRef" or name == "LLVMModuleRef" or name == "LLVMTypeRef" or name == "LLVMValueRef" or name == "LLVMBuilderRef" or name == "LLVMBasicBlockRef" or name == "LLVMTargetRef" or name == "LLVMTargetMachineRef" or name == "LLVMMemoryBufferRef" or name == "LLVMDiagnosticInfoRef"
+                return false if:
+                    kind != SemTypeKind.Optional and kind != SemTypeKind.Tuple and kind != SemTypeKind.Container
+                    interned_elem_count(type_id, table) == 0
+                for position in 0 ..< interned_elem_count(type_id, table) |table|:
+                    return false if not sts_type_is_llvm_handle(interned_elem(type_id, position, table), table)
+                return true
+
+        def sts_unify_bound(name: sview, declared_type: Ast::Expr, value: Ast::Expr, summary: StoreThroughSummary&, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: mutable SymbolTable&, classes: mutable StoreThroughClasses&) -> void:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                declared_type_id: u32 = annotation_type_id(declared_type, table) can Global{Read,Write}
+                bound_type_is_reference_free: mutable bool = false
+                can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                    bound_type_is_reference_free <- bam_type_is_proven_reference_free_cached(declared_type_id, reference_sites, table) if declared_type_id != 0
+                # A by-value copy with no reference fields cannot hold the address of the object
+                # it was read from. Its views point at bytes, which the view checks track.
+                if declared_type_id != 0 and not type_marker_present_here(declared_type, TokenKind.Ampersand):
+                    bound_visited: mutable dict[u32, bool] = {}
+                    if bam_type_has_no_direct_reference(declared_type_id, bound_visited, reference_sites, table):
+                        bound_type_is_reference_free <- true
+                        classes.copy_safe.push(name)
+                        classes.copy_values.push(name)
+                # A value whose declared type is proven not to contain references cannot
+                # carry a borrow from the initializer into this binding. Keep the broad
+                # alias union for unknown/inferred or reference-bearing types, and always
+                # walk calls so their store-through effects still reach the summary.
+                bound_type_id: u32 = declared_type_id
+                bound_type_is_host_handle: bool = sts_type_is_llvm_handle(bound_type_id, table)
+                if not bound_type_is_reference_free and not bound_type_is_host_handle:
+                    bound_names: mutable darray[sview] = []
+                    bound_names.push(name) if name != ""
+                    sts_collect_names_except(value, bound_names, classes.copy_safe, classes.copy_values)
+                    sts_unify_all(classes, bound_names)
+                sts_unify_calls(value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)
+
+        def sts_lmut_parameter_at(table: SymbolTable&, callee: sview, position: u32) -> bool:
+            can Abort.Panic:
+                index: mutable usize = 0
+                while index < table.lmut_param_owner.count:
+                    return true if table.lmut_param_owner[index] == callee and table.lmut_param_pos[index] == position
+                    index <- index + 1
+                return false
+
+        # A plain assignment from a uniquely resolved local/parameter identifier of a
+        # proven reference-free type cannot carry reference contents into its target. Keep
+        # this optimization deliberately syntactic: calls, operators, unknown bindings, and
+        # every compound assignment retain the conservative alias union. Call traversal is
+        # still performed by the caller for both sides of the assignment.
+        def sts_assignment_rhs_is_reference_free(value: Ast::Expr, operator: TokenKind, has_unreadable_binder: bool, function_owner: DeclId, reference_sites: mutable BorrowReferenceSites&, table: SymbolTable&) -> bool:
+            can Memory.Allocate, Abort.Panic, Global{Read,Write}:
+                return false if operator != TokenKind.LArrow or has_unreadable_binder
+                match value:
+                    Expr.Ident(_, position):
+                        binding: (known: bool, binding_id: BindingId) = borrow_reference_site_binding(reference_sites, function_owner, position, table)
+                        return false if not binding.known
+                        type_id: u32 = bam_binding_declared_type_id(binding.binding_id, reference_sites, table)
+                        return false if type_id == 0
+                        return bam_type_is_proven_reference_free_cached(type_id, reference_sites, table)
+                    _:
+                        return false

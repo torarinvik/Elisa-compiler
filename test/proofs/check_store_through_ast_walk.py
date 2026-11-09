@@ -20,7 +20,7 @@ PROVER = Path(os.environ.get("ELISA_PROOF_ROOT", ROOT.parent / "elisa-proof")).r
 HERE = Path(__file__).resolve().parent
 BIN = Path(os.environ.get("ELISA_PROOF_BIN", PROVER / "build/elisa-proof")).resolve(strict=not args.source_only)
 SUMMARY = ROOT / "src/semantic/store_through_summary.elisa"
-SUMMARY_PARTS = [SUMMARY, ROOT / "src/semantic/store_through_summary_functions.elisa"]
+SUMMARY_PARTS = [SUMMARY, ROOT / "src/semantic/store_through_classes.elisa", ROOT / "src/semantic/store_through_summary_functions.elisa"]
 HOLDER_SOURCE = ROOT / "src/semantic/check_call_holder_view_store.elisa"
 HOLDER_PARTS = [
     HOLDER_SOURCE,
