@@ -8,6 +8,7 @@ import re
 import subprocess
 
 from proof_product_gate import require_current_product, source_include_closure
+from easm_call_liveness_source import compact, proof_body, return_expression, source_body
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,30 +69,6 @@ FALSE_CLAIMS = {
 
 if not __debug__:
     raise SystemExit("run without Python -O")
-
-
-def compact(value: str) -> str:
-    return " ".join(value.split())
-
-
-def source_body(source: str, signature: str) -> str:
-    if signature not in source:
-        raise SystemExit(f"missing production function: {signature}")
-    return source.split(signature, 1)[1].split("\n        def ", 1)[0]
-
-
-def proof_body(source: str, name: str) -> str:
-    signature = f"def {name}("
-    if signature not in source:
-        raise SystemExit(f"missing proof function: {name}")
-    return source.split(signature, 1)[1].split("\ndef ", 1)[0].split(":\n", 1)[1]
-
-
-def return_expression(source: str, name: str) -> str:
-    body = proof_body(source, name)
-    if "return " not in body:
-        raise SystemExit(f"proof function has no return expression: {name}")
-    return compact(body.split("return ", 1)[1])
 
 
 mask_source = MASKS.read_text()
@@ -542,6 +519,7 @@ stage1_provenance = Path(str(stage1_product) + ".provenance.json").resolve(stric
 inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1_product, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
+    HERE / "easm_call_liveness_source.py",
     POSITIVE, NEGATIVE, MASKS, MODEL, PROVENANCE,
 ]
 inputs.extend(source_include_closure([POSITIVE, NEGATIVE]))
