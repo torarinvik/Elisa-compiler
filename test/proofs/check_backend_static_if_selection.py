@@ -669,9 +669,9 @@ def require_selector_layout() -> None:
         raise SystemExit("static-if action match is missing")
     action_indent = len(lines[action_index]) - len(lines[action_index].lstrip(" \t"))
     expected_arms = [
-        "StaticIfPolicy::Action::Skip:",
-        "StaticIfPolicy::Action::SelectFallback:",
-        "StaticIfPolicy::Action::EvaluateCondition:",
+        "StaticIfPolicy::Action.Skip:",
+        "StaticIfPolicy::Action.SelectFallback:",
+        "StaticIfPolicy::Action.EvaluateCondition:",
     ]
     if direct_children(lines, action_index, action_indent) != expected_arms:
         raise SystemExit("static-if action match must handle skip, fallback, and condition evaluation explicitly")
