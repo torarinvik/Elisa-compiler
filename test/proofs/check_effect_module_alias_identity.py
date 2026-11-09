@@ -13,7 +13,7 @@ PARSER_CTOR = (ROOT / "src/parser/parser_core_member_tables.elisa").read_text(en
 PARSER_ENTRY = (ROOT / "src/parser/parser_types_entry.elisa").read_text(encoding="utf-8")
 PARSER_SPECIALIZATION = (ROOT / "src/parser/parser_effect_specialization.elisa").read_text(encoding="utf-8") + (ROOT / "src/parser/parser_effect_clones.elisa").read_text(encoding="utf-8")
 SEMANTIC_REF = (ROOT / "src/semantic/check_effect_declarations.elisa").read_text(encoding="utf-8")
-SEMANTIC_INDEX = (ROOT / "src/semantic/check_abstract_effects.elisa").read_text(encoding="utf-8")
+SEMANTIC_INDEX = (ROOT / "src/semantic/check_abstract_effects.elisa").read_text(encoding="utf-8") + (ROOT / "src/semantic/check_abstract_effect_resolution.elisa").read_text(encoding="utf-8")
 SMOKE = (ROOT / "test/parity/effect_handler_stage1_smoke.sh").read_text(encoding="utf-8")
 FIXTURE = (ROOT / "test/fixtures/effects/chained_module_alias_effect_identity.elisa").read_text(encoding="utf-8")
 

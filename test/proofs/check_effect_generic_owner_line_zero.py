@@ -112,7 +112,7 @@ for source, fragments, label in (
             raise SystemExit(f"{label} must preserve exact source declaration offsets: {fragment}")
 backend = (ROOT / "src/backend/codegen_template_registry.elisa").read_text()
 semantic_handlers = (ROOT / "src/semantic/check_effect_handlers.elisa").read_text()
-semantic_effects = (ROOT / "src/semantic/check_abstract_effects.elisa").read_text()
+semantic_effects = (ROOT / "src/semantic/check_abstract_effects.elisa").read_text() + (ROOT / "src/semantic/check_abstract_effect_resolution.elisa").read_text()
 backend_template = function_source(backend, "declaration_is_effect_template")
 semantic_template = function_source(semantic_handlers, "ae_effect_template_declared")
 if not all(fragment in backend_template for fragment in (

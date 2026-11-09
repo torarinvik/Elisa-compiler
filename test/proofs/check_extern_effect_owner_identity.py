@@ -27,7 +27,7 @@ checker = (source("src/semantic/check_ungranted_panic.elisa") + "\n"
            + source("src/semantic/effect_source_collection.elisa") + "\n"
            + source("src/semantic/extern_effect_index.elisa"))
 symbols = source("src/semantic/symbols.elisa")
-abstract_effects = source("src/semantic/check_abstract_effects.elisa")
+abstract_effects = source("src/semantic/check_abstract_effects.elisa") + source("src/semantic/check_abstract_effect_resolution.elisa")
 effect_refs = source("src/semantic/resolve_types_effect_refs.elisa")
 resolve_types = source("src/semantic/resolve_types.elisa")
 grant_checker = source("src/semantic/check_ungranted_panic_grants.elisa")

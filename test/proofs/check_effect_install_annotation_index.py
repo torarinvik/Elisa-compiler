@@ -19,7 +19,7 @@ def function_source(source: str, name: str) -> str:
     return match.group(0)
 
 
-semantic = SEMANTIC.read_text()
+semantic = SEMANTIC.read_text() + SEMANTIC.with_name("check_abstract_effect_resolution.elisa").read_text()
 operation = OPERATION_HEADS.read_text()
 smoke = SMOKE.read_text()
 

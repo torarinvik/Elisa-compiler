@@ -31,7 +31,7 @@ def function_source(source: str, name: str) -> str:
 parser = PARSER.read_text()
 handler_rewrite = HANDLER_REWRITE.read_text() + HANDLER_REWRITE.with_name("parser_effect_handler_expression.elisa").read_text()
 heads = HEADS.read_text()
-semantic = SEMANTIC.read_text()
+semantic = SEMANTIC.read_text() + SEMANTIC.with_name("check_abstract_effect_resolution.elisa").read_text()
 signatures = SIGNATURES.read_text()
 signature_fixture = SIGNATURE_FIXTURE.read_text()
 missing_call = MISSING_CALL.read_text()
