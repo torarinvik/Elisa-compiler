@@ -16,6 +16,17 @@ clang -c "$ROOT/test/parity/profile_hooks.c" -o "$WORK/profile_hooks.o"
 real_std_pass=0
 real_std_total=0
 
+real_std_collections_setup() {
+    cat > "$WORK/ctx_streq.c" <<'C'
+#include <string.h>
+_Bool ctx_streq(const char *left, const char *right) {
+    return strcmp(left, right) == 0;
+}
+C
+    clang -c "$WORK/ctx_streq.c" -o "$WORK/ctx_streq.o"
+    link_inputs=("$WORK/profile_hooks.o" "$WORK/ctx_streq.o")
+}
+
 real_std_runtime_case() {
     local include="$1" name="$2" body="$3" expected="$4"
     shift 4

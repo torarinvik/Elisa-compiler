@@ -1,87 +1,11 @@
 #!/usr/bin/env bash
-. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
-# Stage1 darray `.reserve(n)` smoke: `reserve` ensures capacity >= n without changing count
-# or storing an element (emit_darray_reserve), so unlike `resize` (scalar-only, push-fills
-# zeros) it works for ANY element type — including a darray of structs. reserve returns
-# `mutable darray&` for chaining, so it is DISCARDED via `_ =` rather than a bare statement,
-# and needs an explicit `in <arena>:` scope (stage0-enforced). This gate exercises it on a
-# plain scalar darray, a struct-field darray, and a darray-of-structs (the IndexMap ctor
-# shape: `map.entries.reserve(cap)`), asserting the reserved buffer round-trips real values.
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
-RUN() { elisa_run_timeout 15 "$@"; }
-set -u
+# Compile and execute each real stdlib case through both compiler drivers.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/real_std_runtime_cases.sh"
+real_std_collections_setup
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
-bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
-STD="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/runtime/elisacore_std"
-
-[ -x "$ELISACORE_BIN" ] || { echo "reserve_real_smoke FAIL: no elisac" >&2; exit 1; }
-[ -x "$LLVM_CONFIG" ] || { echo "reserve_real_smoke FAIL: no llvm-config" >&2; exit 1; }
-[ -f "$STD/arena.elisa" ] || { echo "reserve_real_smoke FAIL: no arena std at $STD" >&2; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "reserve_real_smoke SKIP: no python3"; exit 0; }
-
-LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$("$LLVM_CONFIG" --bindir)/llc"
-BUILD="$ROOT/build"; mkdir -p "$BUILD"
-EMIT="$BUILD/emit_native"
-
-# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
-ELISA_EMIT_NATIVE="$EMIT" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1
-[ -x "$EMIT" ] || { echo "reserve_real_smoke FAILED: no emit_native"; exit 1; }
-RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
-if [ ! -f "$RUNTIME_OBJ" ]; then
-    mkdir -p "$BUILD/runtime"
-    printf 'def main() -> i64:\n    d: mutable darray[u8] = []\n    d.push(1)\n    return 0\n' > "$BUILD/runtime/probe.elisa"
-    ( cd "$BUILD/runtime" && "$ELISACORE_BIN" -emit c-archive -o probe.a probe.elisa 2>/dev/null && ar x probe.a elisacore_runtime.o 2>/dev/null )
-fi
-[ -f "$RUNTIME_OBJ" ] || { echo "reserve_real_smoke FAILED: no elisacore_runtime.o"; exit 1; }
-
-pass=0; total=0
 reserve_case() {
-    local name="$1" body="$2" want="$3"; total=$((total + 1))
-    local src="$BUILD/reservereal_$name.elisa" ll="$BUILD/reservereal_$name.ll" obj="$BUILD/reservereal_$name.o" exe="$BUILD/reservereal_$name"
-    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
-import sys, re
-from pathlib import Path
-out = []
-def append_source(path):
-    path = Path(path)
-    for line in path.read_text().splitlines(keepends=True):
-        match = re.match(r'^include "\./((?:arena_|collections_)[^"/]+)"', line)
-        if match:
-            append_source(path.parent / match.group(1))
-        elif not line.startswith("include"):
-            out.append(line)
-for path in sys.argv[1:]:
-    append_source(path)
-lines = ''.join(out).split('\n'); res = []; skip = False
-for ln in lines:
-    if re.match(r'def (ctx_hash_u64|ctx_hash_cstr)\b', ln): skip = True; continue
-    if skip:
-        if ln and not ln[0].isspace(): skip = False
-        else: continue
-    res.append(ln)
-print('extern ctx_hash_cstr(s: cstr) -> u64')
-print('extern ctx_hash_u64(value: u64) -> u64')
-print('\n'.join(res))
-print('''$body''')
-PY
-    if ! "$ELISACORE_BIN" -emit llvm -o /dev/null "$src" 2>"$BUILD/reservereal_$name.s0log"; then
-        echo "  FAIL $name: FIXTURE INVALID -- stage0 rejects the reserve program:"
-        grep -v warning "$BUILD/reservereal_$name.s0log" | head -3 | sed 's/^/      /'
-        return; fi
-    if ! "$EMIT" < "$src" > "$ll" 2>/dev/null || head -1 "$ll" | grep -q UNSUPPORTED; then
-        echo "  FAIL $name: stage1 declined the reserve program"; return; fi
-    if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
-        echo "  FAIL $name: llc rejected the emitted IR"; return; fi
-    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
-        echo "  FAIL $name: link failed (an instantiation body declined?)"; return; fi
-    RUN "$exe"; local got=$?
-    if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT"; return; fi
-    if [ "$got" -ne "$want" ]; then echo "  FAIL $name: exit $got, want $want"; return; fi
-    pass=$((pass + 1))
+    real_std_runtime_case "collections.elisa" "$@" "${link_inputs[@]}"
 }
 
 # reserve on a plain scalar darray: reserve ahead, then push+read through the reserved buffer.
@@ -127,8 +51,4 @@ reserve_case noshrink 'def main() -> i64 can[Memory.Allocate, Abort.Panic]:
         _ = xs.reserve(4.usize())
     return xs[0] + xs[1]' 42
 
-if [ "$pass" -eq "$total" ]; then
-    echo "reserve_real_smoke OK: $pass/$total darray reserve programs compile+run correctly"
-else
-    echo "reserve_real_smoke FAILED: $pass/$total"; exit 1
-fi
+real_std_runtime_summary "reserve_real_smoke"

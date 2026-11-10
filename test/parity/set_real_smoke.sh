@@ -2,14 +2,7 @@
 # Compile and execute each real stdlib case through both compiler drivers.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/real_std_runtime_cases.sh"
-cat > "$WORK/ctx_streq.c" <<'C'
-#include <string.h>
-_Bool ctx_streq(const char *left, const char *right) {
-    return strcmp(left, right) == 0;
-}
-C
-clang -c "$WORK/ctx_streq.c" -o "$WORK/ctx_streq.o"
-link_inputs=("$WORK/profile_hooks.o" "$WORK/ctx_streq.o")
+real_std_collections_setup
 
 set_case() {
     real_std_runtime_case "collections.elisa" "$@" "${link_inputs[@]}"
