@@ -185,6 +185,13 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     if (error) { LLVMConsumeError(error); return 2; }
     status = 1;
   }
+  if (elisacoreUnrollLaggedRecurrences(module)) {
+    auto options = LLVMCreatePassBuilderOptions();
+    auto error = LLVMRunPasses(module, "function(instcombine<no-verify-fixpoint>,simplifycfg)", target, options);
+    LLVMDisposePassBuilderOptions(options);
+    if (error) { LLVMConsumeError(error); return 2; }
+    status = 1;
+  }
   if (elisacoreBoundedProducts(module)) {
     // Revisit reductions made vectorizable by the product proof. The first
     // O3 vectorizer saw their checked-arithmetic side exits. The Darwin/ARM64

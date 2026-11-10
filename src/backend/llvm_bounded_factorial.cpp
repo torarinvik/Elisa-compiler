@@ -12,6 +12,8 @@
 #if LLVM_VERSION_MAJOR >= 23
 namespace {
 constexpr unsigned BFP_MaxIterations = 64;
+constexpr unsigned BFP_MaxIntervalIterations = 192;
+constexpr unsigned BFP_MaxIntervalWork = 512 * BFP_MaxIterations;
 static Value *BFP_Strip(Value *V) {
   auto *F = dyn_cast<FreezeInst>(V);
   return F ? F->getOperand(0) : V;
@@ -106,7 +108,7 @@ static void BFP_CollectDivisionSums(Loop *L, BasicBlock *Pre, BasicBlock *Latch,
 // bounded by a limit whose preheader range is known. Zero when unproved.
 // Down-counters: x = x - K with a start range and a constant lower exit test.
 static uint64_t BFP_DownBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch, CondBrInst *Br,
-                              ICmpInst *Cmp, LazyValueInfo &LVI) {
+                              ICmpInst *Cmp, LazyValueInfo &LVI, unsigned MaxIterations) {
   auto *C = dyn_cast<ConstantInt>(Cmp->getOperand(1));
   Value *Tested = Cmp->getOperand(0);
   ICmpInst::Predicate P = Cmp->getPredicate();
@@ -159,15 +161,17 @@ static uint64_t BFP_DownBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch, CondB
     APInt Gap = Hi - Floor;
     uint64_t Steps = (Gap + K - 1).sdiv(K).getZExtValue(); // Smallest j with Hi - K*j <= Floor.
     uint64_t Count = Tested == &X ? Steps + 1 : std::max<uint64_t>(Steps, 1);
-    if (Count <= BFP_MaxIterations) return Count;
+    if (Count <= MaxIterations) return Count;
   }
   return 0;
 }
-static uint64_t BFP_IterationBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch, LazyValueInfo &LVI) {
+static uint64_t BFP_IterationBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch,
+                                   LazyValueInfo &LVI, unsigned MaxIterations = BFP_MaxIterations,
+                                   BinaryOperator **ProvenUnitStep = nullptr) {
   auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
   auto *Cmp = Br ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
   if (!Cmp) return 0;
-  if (uint64_t Down = BFP_DownBound(L, Pre, Latch, Br, Cmp, LVI)) return Down;
+  if (uint64_t Down = BFP_DownBound(L, Pre, Latch, Br, Cmp, LVI, MaxIterations)) return Down;
   for (PHINode &I : L->getHeader()->phis()) {
     if (!I.getType()->isIntegerTy(64) || I.getNumIncomingValues() != 2) continue;
     auto *S = dyn_cast<ConstantInt>(I.getIncomingValueForBlock(Pre));
@@ -194,7 +198,12 @@ static uint64_t BFP_IterationBound(Loop *L, BasicBlock *Pre, BasicBlock *Latch, 
     if (Last.slt(S->getValue())) Last = S->getValue();
     if (!S->getValue().sge(-1024) || !Last.sle(1024)) continue;
     uint64_t Count = Last.getSExtValue() - S->getSExtValue() + 1;
-    if (Count <= BFP_MaxIterations) return Count;
+    if (Count <= MaxIterations) {
+      // The first counter and each counter admitted by the backedge test are
+      // in [-1024, 1024], so the increment itself cannot overflow.
+      if (ProvenUnitStep) *ProvenUnitStep = dyn_cast<BinaryOperator>(Step);
+      return Count;
+    }
   }
   return 0;
 }
@@ -292,8 +301,12 @@ static void BFP_CollectIntervals(Loop *L, BasicBlock *Pre, BasicBlock *Latch, Lo
       if (Plain) Calls.push_back(C);
     }
   if (Calls.empty() || Size > 512) return;
-  uint64_t Iterations = BFP_IterationBound(L, Pre, Latch, LVI);
-  if (!Iterations) return;
+  BinaryOperator *ProvenUnitStep = nullptr;
+  uint64_t Iterations = BFP_IterationBound(L, Pre, Latch, LVI, BFP_MaxIntervalIterations,
+                                            &ProvenUnitStep);
+  // Larger trip bounds are useful for small recurrence bodies. Keep the
+  // previous per-loop work ceiling regardless of the proven trip count.
+  if (!Iterations || Size * Iterations > BFP_MaxIntervalWork) return;
   LoopBlocksRPO Order(L);
   Order.perform(&LI);
   DenseMap<Value *, BFP_Interval> Env, Next;
@@ -453,8 +466,11 @@ static void BFP_CollectIntervals(Loop *L, BasicBlock *Pre, BasicBlock *Latch, Lo
       }
     for (auto &Entry : Next) Env[Entry.first] = Entry.second;
   }
+  unsigned Before = Out.size();
   for (IntrinsicInst *C : Calls)
     if (!Bad.contains(C)) Out.push_back(C);
+  if (ProvenUnitStep && Out.size() != Before)
+    ProvenUnitStep->setHasNoSignedWrap(true);
 }
 }
 extern "C" unsigned elisacoreBoundedFactorials(LLVMModuleRef Ref) {
