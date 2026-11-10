@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -454,6 +456,7 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
 #include "llvm_shift_bit_reverse.cpp"
 #include "llvm_power_position.cpp"
 #include "llvm_edge_division_reuse.cpp"
+#include "llvm_factored_unsigned_division.cpp"
 
 #else
 extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef) { return 0; }
