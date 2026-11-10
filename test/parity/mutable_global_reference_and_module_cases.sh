@@ -179,6 +179,18 @@ module Box:
 def main() -> i64:
     return Box::hot
 CASE
+run_case cast_function_addresses_do_not_alias_globals clean <<'CASE'
+module Workers:
+    public:
+        def work(arg: mutable void&?) -> mutable void&?:
+            return arg
+using Workers::work
+def main() -> i64:
+    can Unsafe.PointerCast:
+        direct: void& = work.cast[void&]
+        qualified: void&? = Workers::work.cast[void&?]
+        return 1 if direct == qualified and qualified != null else 0
+CASE
 run_case imported_read 'accesses a global mutable binding without Global.Read' <<'CASE'
 module Box:
     public:
