@@ -26,6 +26,9 @@ def function_source(source: str, name: str) -> str:
 
 
 call_span = function_source(LOCAL, "allocation_regions_in_call_span")
+fill_call_spans = function_source(LOCAL, "allocation_fill_call_source_spans")
+lookup_call_span = function_source(LOCAL, "allocation_call_source_span")
+indexed_interval = function_source(LOCAL, "allocation_regions_in_indexed_interval")
 expression = function_source(LOCAL, "allocation_regions_in_expression")
 expression_end = function_source(LOCAL, "allocation_expression_end_offset")
 local_dependencies = function_source(LOCAL, "walk_local_region_dependencies")
@@ -39,19 +42,24 @@ packed_check = function_source(PACKED, "check_frozen_packed_allocation")
 destroyed_walk = function_source(DESTROYED, "walk_destroyed_region_statements")
 destroyed_lambda_body = function_source(DESTROYED, "destroyed_validate_lambda_body")
 
-for fragment in (
-    'annotation.owner == "__call_source_span" and annotation.offset == call_pos.offset',
-    "allocation_offset >= span.offset and allocation_offset < span.end_offset",
-    "allocation_region_is_inline_effect_row(regions, offsets, row_index)",
+for fragment, source in (
+    ('annotation.owner == "__call_source_span"', fill_call_spans),
+    ("call_spans.heads.put(annotation.offset", fill_call_spans),
+    ("call_spans.heads.get(offset)", lookup_call_span),
+    ("allocation_call_source_span(call_spans, call_pos.offset, call_pos)", call_span),
+    ("allocation_regions_in_indexed_interval(span.offset, span.end_offset", call_span),
+    ("offsets[call_spans.offset_order[middle]] < start_offset", indexed_interval),
+    ("offsets[call_spans.offset_order[position]] < end_offset", indexed_interval),
+    ("name != SYMBOL_INDEX_ROW_NONE", indexed_interval),
 ):
-    if fragment not in call_span:
+    if fragment not in source:
         raise SystemExit(f"call allocation lookup is missing exact-span filtering: {fragment}")
 
 if "allocation_regions_in_call_span(call_pos" not in expression or "Ast::expr_pos(expression)" not in expression:
     raise SystemExit("allocation traversal must use the call's recorded source span")
 if "Expr.Lambda(_, _, _):\n                        pass" not in expression or "Expr.Lambda(_, _, _):\n                        pass" not in expression_end:
     raise SystemExit("allocation source walks must leave deferred lambda bodies to their own statement analysis")
-if "walk_destroyed_region_statements(lambda_body, scoped_annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans" not in destroyed_lambda_body:
+if "walk_destroyed_region_statements(scoped_region_index, lambda_body, scoped_annotations, allocation_regions, allocation_lines, allocation_offsets, call_spans" not in destroyed_lambda_body:
     raise SystemExit("destroyed-region lambda validation must analyze deferred statements with their own source offsets")
 if "allocation_region_at(allocation_regions, allocation_lines" in local_dependencies or "allocation_region_at(allocation_regions, allocation_lines" in local_assignments:
     raise SystemExit("local-region consumers still join allocations by logical line")
@@ -65,12 +73,12 @@ if "allocation_source_interval_has_region(statement_start, statement_end" not in
     raise SystemExit("local-region binding taint must retain allocation rows hidden by struct-literal lowering")
 if "Expr.Construct(type_expression, fields, _) | Expr.RecordUpdate(type_expression, fields, _)" not in expression_end or "allocation_expression_end_offset(field.value, call_spans)" not in expression_end:
     raise SystemExit("initializer end calculation must include hidden allocations in record fields")
-if "region_expression_recorded_allocations(return_value, line.offset, return_end_offset" not in local_assignments or "for temporary_region in return_allocations" not in local_assignments or "allocation_regions_in_source_interval(statement_start, statement_end" not in recorded_allocations:
+if "region_expression_recorded_allocations(return_value, line.offset, return_end_offset" not in local_assignments or "for temporary_region in return_allocations" not in local_assignments or "allocation_regions_in_indexed_interval(statement_start, statement_end" not in recorded_allocations:
     raise SystemExit("return escape checks must consider every allocation in the bounded return interval")
 if "allocation_region_offsets" not in LOCAL_ENTRY or "file.enum_annotations" not in LOCAL_ENTRY:
     raise SystemExit("local-region entry must pass both the offset column and call-span annotations")
 
-if "allocation_regions_in_expression(value, allocation_names, allocation_lines, allocation_offsets, call_spans, out)" not in thread_allocations or "allocation_regions_in_source_interval(statement_start, statement_end" not in thread_allocations:
+if "allocation_regions_in_expression(value, allocation_names, allocation_lines, allocation_offsets, call_spans, out)" not in thread_allocations or "allocation_regions_in_indexed_interval(statement_start, statement_end" not in thread_allocations:
     raise SystemExit("thread transfer must query allocation offsets from the value expression")
 if "allocation_expression_end_offset(value, call_spans)" not in thread_walk or "transfer_allocation_regions(value, line.offset, value_end_offset, allocation_names, allocation_lines, allocation_offsets, call_spans, allocations)" not in thread_walk:
     raise SystemExit("thread transfer declarations must use source-aware allocation lookup")
@@ -88,7 +96,7 @@ if "allocation_offsets" not in PACKED or "file.enum_annotations" not in PACKED:
 
 if "region_expression_recorded_allocations(value, line.offset, allocation_expression_end_offset(value, call_spans), allocation_regions, allocation_lines, allocation_offsets, call_spans, recorded_regions)" not in destroyed_walk:
     raise SystemExit("destroyed-region lambda dependencies still join allocations by logical line")
-if "file.allocation_region_offsets, file.enum_annotations" not in DESTROYED:
+if "allocation_fill_call_source_spans(file.enum_annotations, file.allocation_region_names, file.allocation_region_offsets, call_spans)" not in DESTROYED or "file.allocation_region_offsets, call_spans" not in DESTROYED:
     raise SystemExit("destroyed-region traversal must thread allocation offsets and call-span annotations")
 
 if "check_allocation_region_consumers.py" not in SMOKE or "allocation_region_offset_line0.elisa" not in SMOKE or "allocation_region_struct_field_escape.elisa" not in SMOKE:

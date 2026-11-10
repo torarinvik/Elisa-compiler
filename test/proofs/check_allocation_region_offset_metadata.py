@@ -7,6 +7,7 @@ PARSER = (ROOT / "src/parser/parser_core.elisa").read_text()
 PARSER_INIT = (ROOT / "src/parser/parser_core_member_tables.elisa").read_text()
 AST = (ROOT / "src/parser/parser_tokens.elisa").read_text()
 PARSE_FILE = (ROOT / "src/parser/parser_types_entry.elisa").read_text()
+TOKEN_SCANS = (ROOT / "src/parser/parser_token_scans.elisa").read_text()
 EFFECTS = (ROOT / "src/parser/parser_core_blocks_effects.elisa").read_text()
 LOOP_VIEW = (ROOT / "src/semantic/semantic_loop_view.elisa").read_text()
 PROBE = (ROOT / "test/repro/cpu_optional_goal_allocation_probe.elisa").read_text()
@@ -30,6 +31,7 @@ parser = compact(PARSER)
 parser_init = compact(PARSER_INIT)
 ast = compact(AST)
 parse_file = compact(PARSE_FILE)
+token_scans = compact(TOKEN_SCANS)
 effects = compact(EFFECTS)
 loop_view = compact(LOOP_VIEW)
 probe = compact(PROBE)
@@ -57,7 +59,7 @@ for fragment, text in (
     if fragment not in text:
         raise SystemExit(f"allocation offset metadata is missing from a parser/file boundary: {fragment}")
 
-if not appears_in_order(parse_file,
+if not appears_in_order(token_scans,
     "parser.allocation_region_names<-parser.allocation_region_names.push(parser.scan_token_text(index+2))",
     "parser.allocation_region_lines<-parser.allocation_region_lines.push(parser.scan_token_line(index))",
     "parser.allocation_region_offsets<-parser.allocation_region_offsets.push(parser.scan_token_pos(index).offset)",
@@ -68,7 +70,7 @@ new_row_appends = (
     "parser.allocation_region_lines<-parser.allocation_region_lines.push(parser.scan_token_line(index))",
     "parser.allocation_region_offsets<-parser.allocation_region_offsets.push(parser.scan_token_pos(index).offset)",
 )
-if any(parse_file.count(fragment) != 1 for fragment in new_row_appends):
+if any(token_scans.count(fragment) != 1 for fragment in new_row_appends):
     raise SystemExit("every new[region] row must append exactly one name, line, and offset")
 
 if not appears_in_order(effects,
