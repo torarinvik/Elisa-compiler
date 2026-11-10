@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -40,13 +41,26 @@ def run_check(result_dir: Path, name: str, check: Path, env: dict[str, str]) -> 
 
 
 def main() -> None:
-    env = os.environ.copy()
-    for name in ("ELISA_GATE_TOOLCHAIN_HASH", "ELISA_GATE_NO_CACHE", "ELISA_GATE_LOG_DIR"):
-        env.pop(name, None)
-    env.update(ELISA_GATE_TREE_HASH="fixed-test-tree", ELISA_GATE_BINS_HASH="fixed-test-binaries")
-
     with tempfile.TemporaryDirectory(prefix="elisa-gate-cache-smoke-") as temporary:
         temp = Path(temporary)
+        # Fingerprint only the tools this synthetic check can use. Hashing the
+        # full developer toolchain for each case competes with live gate jobs.
+        tools = temp / "bin"
+        tools.mkdir()
+        commands = ["bash", "dirname", "mkdir", "nice", "rm", "sed", "tail", "tr"]
+        if sys.platform == "darwin":
+            commands.append("otool")
+        for command in commands:
+            executable = shutil.which(command)
+            if executable is None:
+                raise RuntimeError(f"missing gate cache smoke tool: {command}")
+            (tools / command).symlink_to(Path(executable).resolve())
+        (tools / "python3").symlink_to(Path(sys.executable).resolve())
+        env = {
+            "PATH": str(tools),
+            "ELISA_GATE_TREE_HASH": "fixed-test-tree",
+            "ELISA_GATE_BINS_HASH": "fixed-test-binaries",
+        }
         result_dir = temp / "results"
         result_dir.mkdir()
         check = temp / "check.sh"

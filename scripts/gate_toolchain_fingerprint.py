@@ -83,26 +83,28 @@ class Fingerprint:
         otool = shutil.which("otool")
         if not otool:
             raise OSError("otool is unavailable; cannot fingerprint Mach-O dependencies")
-        deps = subprocess.run(
-            [otool, "-L", resolved], capture_output=True, text=True, timeout=5,
-            check=False,
-        )
         load_commands = subprocess.run(
             [otool, "-l", resolved], capture_output=True, text=True, timeout=5,
             check=False,
         )
-        if deps.returncode or load_commands.returncode:
+        if load_commands.returncode:
             raise OSError(f"otool could not inspect {resolved}")
 
         rpaths: list[str] = []
-        lines = load_commands.stdout.splitlines()
-        for index, line in enumerate(lines):
-            if line.strip() == "cmd LC_RPATH":
-                for candidate in lines[index + 1:index + 5]:
-                    fields = candidate.strip().split()
-                    if len(fields) >= 2 and fields[0] == "path":
-                        rpaths.append(fields[1])
-                        break
+        dependencies: list[str] = []
+        dependency_commands = {
+            "LC_LOAD_DYLIB", "LC_LOAD_WEAK_DYLIB", "LC_REEXPORT_DYLIB",
+            "LC_LAZY_LOAD_DYLIB", "LC_LOAD_UPWARD_DYLIB",
+        }
+        command = ""
+        for line in load_commands.stdout.splitlines():
+            field, _, value = line.strip().partition(" ")
+            if field == "cmd":
+                command = value
+            elif field == "path" and command == "LC_RPATH":
+                rpaths.append(value.rsplit(" (offset ", 1)[0])
+            elif field == "name" and command in dependency_commands:
+                dependencies.append(value.rsplit(" (offset ", 1)[0])
 
         def expand_loader_tokens(value: str) -> str:
             return value.replace("@loader_path", os.path.dirname(resolved))
@@ -125,10 +127,7 @@ class Fingerprint:
                         return candidate
             return None
 
-        for line in deps.stdout.splitlines()[1:]:
-            entry = line.strip().split(" (", 1)[0]
-            if not entry:
-                continue
+        for entry in dependencies:
             self.add_text("dependency:" + entry)
             dependency = resolve_dependency(entry)
             if dependency is None:
