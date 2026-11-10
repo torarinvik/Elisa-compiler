@@ -5,11 +5,20 @@
 # Requires a seed product binary (scripts/elisac_stage1.sh --seed).
 # Compiles src/driver/elisac.elisa with the stage1 product and links gen2.
 set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED:-0}" != "1" ]]; then
+  export ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED=1
+  ELISA_TIMEOUT_LIBRARY_PATH_SET="${LIBRARY_PATH+x}" \
+  ELISA_TIMEOUT_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
+  ELISA_TIMEOUT_SDKROOT_SET="${SDKROOT+x}" \
+  ELISA_TIMEOUT_SDKROOT_VALUE="${SDKROOT-}" \
+    exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 5 -- \
+    "$BASH" "${BASH_SOURCE[0]}" "$@"
+fi
 # Host predicates for products built by a compiler invoked DIRECTLY here (not through the
 # wrapper, which exports the same two flags): see register_target_consts.
 if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
 if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${1:-$ROOT/build/self_host_gen2}"
 mkdir -p "$OUT_DIR"
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"

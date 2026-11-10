@@ -24,4 +24,13 @@ with tempfile.TemporaryDirectory(prefix="self-host-budget-") as work:
                              cwd=root, env=env, capture_output=True, text=True, timeout=10)
         if run.returncode != 17 or not result.exists() or result.read_text() != expected:
             raise SystemExit(f"budget propagation failed: {settings}\n{run.stdout}{run.stderr}")
-print("PASS default, custom outer budget, and explicit inner override")
+
+    fake.write_text("#!/bin/bash\nexec /bin/sleep 60\n")
+    env.pop("ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED", None)
+    run = subprocess.run(
+        ["bash", str(root / "scripts/self_host_gen2.sh"), str(work / "deadline")],
+        cwd=root, env=env, capture_output=True, text=True, timeout=8,
+    )
+    if run.returncode != 124 or "deadline exceeded (5s)" not in run.stderr:
+        raise SystemExit(f"direct self-host deadline failed\n{run.stdout}{run.stderr}")
+print("PASS nested memory budgets and the direct five-second deadline")

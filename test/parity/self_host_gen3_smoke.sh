@@ -148,7 +148,8 @@ run_guarded_request() {
 if [ -n "$(find "$ROOT/src" -name '*.elisa' -newer "$BIN" -print -quit 2>/dev/null)" ]; then
     fail "seed $BIN is OLDER than src/*.elisa — rebuild it (scripts/elisac_stage1.sh --seed) or this check reports on stale code"
 fi
-bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" bash "$ROOT/scripts/self_host_gen2.sh" "$GEN2_DIR" >"$WORK/gen2.log" 2>&1 \
+ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED=1 \
+  bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" bash "$ROOT/scripts/self_host_gen2.sh" "$GEN2_DIR" >"$WORK/gen2.log" 2>&1 \
   || fail "self_host_gen2.sh did not produce a working gen2 (see $WORK/gen2.log)"
 [ -x "$GEN2" ] || fail "no gen2 binary at $GEN2"
 
