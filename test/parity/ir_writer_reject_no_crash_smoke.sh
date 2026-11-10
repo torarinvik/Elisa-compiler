@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# A partial parser source currently contains an integer AST shape that the v2 IR
-# writer cannot faithfully encode. It must refuse by name, never bounds-trap while
-# constructing the diagnostic bundle.
+# The unsigned maximum becomes a negative decoded integer in the compact AST.
+# The writer must refuse by name without indexing into an empty encoding.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -12,14 +11,22 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 [[ -x "$STAGE1" ]] || { echo "IR writer rejection smoke FAIL: stage1 unavailable" >&2; exit 1; }
 
+cat >"$WORK/unsigned_max.elisa" <<'ELISA'
+def unsigned_max() -> u64:
+    return 18446744073709551615u64
+ELISA
+
+# A refused report clears an earlier output rather than leaving stale data behind.
+printf 'stale bundle' >"$WORK/unsigned_max.elisair"
 set +e
-"$STAGE1" -emit ir -O0 -o "$WORK/parser-core.elisair" "$ROOT/src/parser/parser_core.elisa" >"$WORK/log" 2>&1
+"$STAGE1" -emit ir -O0 -o "$WORK/unsigned_max.elisair" "$WORK/unsigned_max.elisa" >"$WORK/log" 2>&1
 status=$?
 set -e
 
 [[ "$status" -ne 0 ]] || { echo "IR writer rejection smoke FAIL: unsupported input was accepted"; exit 1; }
 [[ "$status" -lt 128 ]] || { echo "IR writer rejection smoke FAIL: compiler terminated by signal (status $status)"; exit 1; }
-rg -q -- "-emit ir cannot represent this construct yet:" "$WORK/log" || {
+[[ ! -s "$WORK/unsigned_max.elisair" ]] || { echo "IR writer rejection smoke FAIL: output contains stale or partial data"; exit 1; }
+rg -qF -- "-emit ir cannot represent this construct yet: integer literal outside the IR writer's decimal domain" "$WORK/log" || {
     echo "IR writer rejection smoke FAIL: expected refusal was not diagnosed"
     sed 's/^/    /' "$WORK/log" | head -10
     exit 1
