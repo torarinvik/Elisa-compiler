@@ -260,6 +260,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #if LLVM_VERSION_MAJOR >= 23
   finalSimplifications += elisacoreFoldRangeAndLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldScalarLoopIdioms(*unwrap(module));
+  finalSimplifications += elisacoreFoldShiftXorLoops(*unwrap(module));
 #endif
   if (finalSimplifications) {
     auto opts = LLVMCreatePassBuilderOptions();

@@ -22,6 +22,7 @@
 #include <llvm/IR/Dominators.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Transforms/Utils/LoopUtils.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/UnrollLoop.h>
 #include <llvm/Support/CBindingWrapping.h>
 
@@ -457,6 +458,7 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
 #include "llvm_power_position.cpp"
 #include "llvm_range_and.cpp"
 #include "llvm_scalar_loop_idioms.cpp"
+#include "llvm_shift_xor.cpp"
 #include "llvm_edge_division_reuse.cpp"
 #include "llvm_factored_unsigned_division.cpp"
 #include "llvm_remainder_recurrence.cpp"
