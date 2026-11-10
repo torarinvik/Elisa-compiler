@@ -452,6 +452,7 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
 
 #include "llvm_shift_parity.cpp"
 #include "llvm_shift_bit_reverse.cpp"
+#include "llvm_power_position.cpp"
 
 #else
 extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef) { return 0; }
