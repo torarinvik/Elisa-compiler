@@ -23,7 +23,8 @@ cat > "$POSITIVE_FIXTURE" <<'EOF'
 global mutable answer: i64 = 42
 
 def main() -> i64:
-    return answer
+    can Global.Read:
+        return answer
 EOF
 
 OPTIONAL_AGGREGATE_FIXTURE="$WORK/valid_optional_aggregate_global.elisa"
@@ -35,7 +36,8 @@ struct MaybeRefBox:
 global mutable state: MaybeRefBox = MaybeRefBox{slot: null, value: 42}
 
 def main() -> i64:
-    return state.value
+    can Global.Read:
+        return state.value
 EOF
 
 OPTIONAL_GLOBAL_FIXTURE="$WORK/valid_optional_global.elisa"
@@ -43,9 +45,10 @@ cat > "$OPTIONAL_GLOBAL_FIXTURE" <<'EOF'
 global mutable active: mutable i64&? = null
 
 def main() -> i64:
-    if active is found:
-        return 0
-    return 42
+    can Global.Read:
+        if active is found:
+            return 0
+        return 42
 EOF
 
 ARRAY_GLOBAL_FIXTURE="$WORK/valid_array_global.elisa"
@@ -53,7 +56,8 @@ cat > "$ARRAY_GLOBAL_FIXTURE" <<'EOF'
 global mutable values: i64[2] = [20, 22]
 
 def main() -> i64:
-    return values[0] + values[1]
+    can Global.Read:
+        return values[0] + values[1]
 EOF
 
 CSTR_GLOBAL_FIXTURE="$WORK/valid_cstr_global.elisa"
@@ -63,7 +67,8 @@ extern strlen(text: cstr) -> usize
 global mutable greeting: cstr = "hello"
 
 def main() -> i64:
-    return 42 if strlen(greeting) == 5 else 0
+    can Global.Read:
+        return 42 if strlen(greeting) == 5 else 0
 EOF
 
 run_reject_case() {
