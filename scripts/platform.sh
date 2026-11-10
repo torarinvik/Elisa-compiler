@@ -56,7 +56,17 @@ if [[ -z "${LLVM_CONFIG:-}" ]]; then
             echo "Homebrew is required to select the newest LLVM on macOS; set LLVM_CONFIG explicitly to override" >&2
             return 2
         fi
-        _ep_llvm_prefix="$("$_ep_brew" --prefix llvm 2>/dev/null || true)"
+        # The standard Homebrew installations maintain this symlink on upgrades.
+        # Use it directly to avoid booting Ruby on every compiler invocation.
+        case "$_ep_brew" in
+            /opt/homebrew/bin/brew|/usr/local/bin/brew)
+                _ep_llvm_prefix="${_ep_brew%/bin/brew}/opt/llvm"
+                ;;
+            *) _ep_llvm_prefix="" ;;
+        esac
+        if [[ -z "$_ep_llvm_prefix" || ! -x "$_ep_llvm_prefix/bin/llvm-config" ]]; then
+            _ep_llvm_prefix="$("$_ep_brew" --prefix llvm 2>/dev/null || true)"
+        fi
         if [[ ! -x "$_ep_llvm_prefix/bin/llvm-config" ]]; then
             echo "Homebrew LLVM is not installed; install it or set LLVM_CONFIG explicitly" >&2
             return 2
