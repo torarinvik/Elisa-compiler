@@ -5,42 +5,18 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
-[ -x "$ELISACORE_BIN" ] || { echo "backend_header_smoke FAIL: no elisac" >&2; exit 1; }
-[ -x "$LLVM_CONFIG" ] || { echo "backend_header_smoke FAIL: no llvm-config" >&2; exit 1; }
+STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
+[[ -x "$ELISACORE_BIN" && -x "$STAGE1" ]] || { echo "backend_header_smoke FAIL: missing compiler" >&2; exit 1; }
 
-BUILD="$ROOT/build/header_smoke"
-mkdir -p "$BUILD"
-LIBDIR="$($LLVM_CONFIG --libdir)"
-FALLBACK_OBJ="$BUILD/runtime_fallback.o"
-clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
-PROFILE_OBJ="$BUILD/profile_hooks.o"
-clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
-
-"$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/driver.o" "$ROOT/test/breadth/emit_header.elisa" \
-    >"$BUILD/build.log" 2>&1
-
-# The normal runtime object deliberately does not provide the compiler-generated overload
-# name for this tiny host driver. Supply that one Console bridge locally; the generated
-# header itself is still checked by real C and C++ frontends below.
-clang -x c -c -o "$BUILD/puts_shim.o" - <<'EOF'
-#include <stdio.h>
-int elisa_header_puts(const char *s) __asm__("___ovl__puts__cstr__puts");
-int elisa_header_puts(const char *s) { return puts(s); }
-EOF
-# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
-# Without them this link fails outright on _elisa_profile_* (the arena calls
-# the profiler ABI unconditionally), which is what kept this gate red.
-source "$ROOT/test/parity/native_optional_hook_objects.sh"
-elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/emit_header" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$BUILD/puts_shim.o" \
-    -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 
 # The structs are `layout(c)`: stage0 REFUSES to export a type that is not
 # C-ABI-compatible ("export type X must name a concrete C-ABI-compatible struct"), so a
 # plain `struct` here made the source one stage0 would reject — and the oracle below could
 # not run at all.
-cat > "$BUILD/input.elisa" <<'ELISA'
+cat > "$WORK/input.elisa" <<'ELISA'
 struct Inner layout(c):
     value: i64
 struct Pair layout(c):
@@ -74,38 +50,23 @@ export fn add(a: i64, b: i64) -> i64 = internal
 def main() -> i64:
     return 0
 ELISA
-"$BUILD/emit_header" < "$BUILD/input.elisa" > "$BUILD/generated.h"
-
-# ORACLE, not a hand-written assertion list. The greps this replaced had drifted from the
-# generator twice over — they demanded `PublicNode* next;` where both compilers now write
-# `PublicNode *next;` (C binds the star to the declarator), and `intptr_t` where an `i64`
-# must render `int64_t`. A frozen expectation cannot notice that stage0 moved; comparing
-# against stage0 directly cannot miss it.
-#
-# Only the include GUARD is normalized away: stage0 derives it from the source filename
-# while this host driver hardcodes ELISA_GENERATED_H, which is a property of the driver,
-# not of the generator under test.
-"$ELISACORE_BIN" -emit header -o "$BUILD/stage0.h" "$BUILD/input.elisa" >/dev/null 2>&1
-# Also drop a trailing blank line: this host driver publishes the header with `puts`,
-# which appends a newline of its own. That is the DRIVER's, not the generator's — the CLI
-# `-emit header` output is byte-identical to stage0 without it.
-normalize() { sed -E 's/(ifndef|define|endif.*) [A-Z0-9_]+_H/\1 GUARD_H/' "$1" | sed -e '$ { /^$/d; }'; }
-if ! diff <(normalize "$BUILD/stage0.h") <(normalize "$BUILD/generated.h") > "$BUILD/header.diff"; then
-    echo "backend header smoke FAILED: generator disagrees with stage0"
-    head -20 "$BUILD/header.diff"
+"$ELISACORE_BIN" -emit header -o "$WORK/stage0.h" "$WORK/input.elisa"
+"$STAGE1" -emit header -o "$WORK/generated.h" "$WORK/input.elisa"
+if ! diff -u "$WORK/stage0.h" "$WORK/generated.h"; then
+    echo "backend header smoke FAILED: Stage1 disagrees with Stage0" >&2
     exit 1
 fi
 
 # A floor of structural checks, so a generator that emitted nothing could not pass by
 # matching an equally empty oracle.
-grep -q 'struct Public' "$BUILD/generated.h"
-grep -q 'struct Inner' "$BUILD/generated.h"
-grep -q 'struct PublicOuter' "$BUILD/generated.h"
-grep -q 'Inner inner;' "$BUILD/generated.h"
-grep -q 'struct PublicNode' "$BUILD/generated.h"
-grep -q 'PublicNode \*next;' "$BUILD/generated.h"
-grep -q 'void (\*callback)(void \*arg0, int32_t arg1);' "$BUILD/generated.h"
-grep -q 'int64_t add(' "$BUILD/generated.h"
-cc -x c -fsyntax-only "$BUILD/generated.h"
-c++ -x c++ -fsyntax-only "$BUILD/generated.h"
+grep -q 'struct Public' "$WORK/generated.h"
+grep -q 'struct Inner' "$WORK/generated.h"
+grep -q 'struct PublicOuter' "$WORK/generated.h"
+grep -q 'Inner inner;' "$WORK/generated.h"
+grep -q 'struct PublicNode' "$WORK/generated.h"
+grep -q 'PublicNode \*next;' "$WORK/generated.h"
+grep -q 'void (\*callback)(void \*arg0, int32_t arg1);' "$WORK/generated.h"
+grep -q 'int64_t add(' "$WORK/generated.h"
+cc -x c -fsyntax-only "$WORK/generated.h"
+c++ -x c++ -fsyntax-only "$WORK/generated.h"
 echo "backend header smoke OK (byte-identical to stage0)"
