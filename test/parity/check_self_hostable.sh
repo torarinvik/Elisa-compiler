@@ -11,7 +11,7 @@
 # exercises the stage1 frontend's OWN self-hosted resolver (Semantic::unresolved_table
 # in src/semantic/), which only knows names from a small hardcoded builtin whitelist
 # (seed_builtins, src/semantic/symbols.elisa) plus whatever is declared inside
-# src/lexer/*.elisa, src/parser/*.elisa, src/semantic/*.elisa (see FRONTEND_FILES
+# the source closure of src/semantic/semantic.elisa (see the expansion
 # below — deliberately NOT including elisacore_std). A check file that calls a
 # runtime/stdlib-only helper without redeclaring it inside that glob passes
 # parse_report + the breadth sweep but is invisible to this resolver, and used to
@@ -125,29 +125,21 @@ sed -nE 's/^[[:space:]]*def ((perf_cores|pool_new|pool_shutdown)\(.*\)( -> .*)?)
     "$REPO_ROOT/elisacore_std/elisacore_concurrency_pool.elisa" | sort -u >> "$RUNTIME_STRINGS_IFACE"
 sed -nE 's/^def (sview_basename\(.*\) -> sview):$/extern \1/p' \
     "$REPO_ROOT/elisacore_std/elisacore_runtime_string_path_views.elisa" >> "$RUNTIME_STRINGS_IFACE"
-FRONTEND_FILES=()
-while IFS= read -r f; do
-    FRONTEND_FILES+=("$f")
-done < <(find "$REPO_ROOT/src/lexer" "$REPO_ROOT/src/parser" "$REPO_ROOT/src/semantic" -type f -name '*.elisa' -print | LC_ALL=C sort)
-for f in "$REPO_ROOT"/src/backend/codegen_const_checked_arithmetic.elisa \
-         "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai \
-         "$RUNTIME_STRINGS_IFACE"; do
-	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
-done
-if [[ ${#FRONTEND_FILES[@]} -eq 0 ]]; then
-	echo "error: no frontend files found under src/{lexer,parser,semantic}" >&2
-	exit 2
-fi
-
+# Preserve include order and keep indented fragments with their declarations.
+frontend="$WORK/frontend.elisa"
+line_map="$WORK/frontend.json"
+python3 "$REPO_ROOT/scripts/expand_source_probe.py" "$REPO_ROOT/src/semantic/semantic.elisa" "$frontend" "$line_map"
+frontend_files="$(python3 -c 'import json, sys; print(len({row["source"] for row in json.load(sys.stdin)}))' < "$line_map")"
 names_out="$WORK/names.txt"
-unresolved="$("$WORK/run" "${FRONTEND_FILES[@]}" 2>"$names_out")"
+unresolved="$("$WORK/run" "$frontend" "$REPO_ROOT/elisacore_std/debug_referee.elisa" \
+    "$REPO_ROOT/elisacore_std/collections.elisai" "$RUNTIME_STRINGS_IFACE" 2>"$names_out")"
 
 RESOLVE_SELF_MAX="${RESOLVE_SELF_MAX:-0}"
 if [[ "$unresolved" -gt "$RESOLVE_SELF_MAX" ]]; then
-	echo "check_self_hostable FAILED: $unresolved unresolved (> RESOLVE_SELF_MAX=$RESOLVE_SELF_MAX) across ${#FRONTEND_FILES[@]} frontend files" >&2
+	echo "check_self_hostable FAILED: $unresolved unresolved (> RESOLVE_SELF_MAX=$RESOLVE_SELF_MAX) across $frontend_files frontend files" >&2
 	echo "unresolved identifiers:" >&2
 	sort -u "$names_out" >&2
 	exit 1
 fi
 
-echo "check_self_hostable OK: $unresolved unresolved (<= RESOLVE_SELF_MAX=$RESOLVE_SELF_MAX) across ${#FRONTEND_FILES[@]} frontend files" >&2
+echo "check_self_hostable OK: $unresolved unresolved (<= RESOLVE_SELF_MAX=$RESOLVE_SELF_MAX) across $frontend_files frontend files" >&2
