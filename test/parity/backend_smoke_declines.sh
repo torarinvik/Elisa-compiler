@@ -30,9 +30,10 @@ stripped_case() {
     if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
         pass=$((pass + 1)); return   # invalid IR rejected loudly: fine
     fi
-    local -a stripped_link_flags=()
-    if [ "$ELISA_HOST_OS" = Linux ]; then stripped_link_flags=(-no-pie); fi
-    if clang -o "$exe" "$obj" "$RUNTIME_OBJ" "${stripped_link_flags[@]}" 2>/dev/null; then
+    # Bash 3.2 with nounset treats an empty array as unbound.
+    set --
+    if [ "$ELISA_HOST_OS" = Linux ]; then set -- -no-pie; fi
+    if clang -o "$exe" "$obj" "$RUNTIME_OBJ" "$@" 2>/dev/null; then
         echo "  FAIL stripped_$name: linked a binary despite the unmodeled helper"; return
     fi
     pass=$((pass + 1))
