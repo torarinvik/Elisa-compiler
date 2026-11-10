@@ -450,6 +450,8 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
   return Changed;
 }
 
+#include "llvm_shift_parity.cpp"
+
 #else
 extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef) { return 0; }
 extern "C" unsigned elisacoreUnrollBoundedDivisionLoops(LLVMModuleRef) { return 0; }

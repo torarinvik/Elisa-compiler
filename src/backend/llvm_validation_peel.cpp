@@ -253,7 +253,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned orderedVector = elisacoreOptimizeOrderedConversions(module, target);
   if (orderedVector == 2) return 2;
   if (orderedVector) status = 1;
-  if (elisacoreSpecializeValidationEpilogues(module)) {
+  unsigned finalSimplifications = elisacoreSpecializeValidationEpilogues(module);
+  finalSimplifications += elisacoreFoldShiftParityLoops(*unwrap(module));
+  if (finalSimplifications) {
     auto opts = LLVMCreatePassBuilderOptions();
     auto err = LLVMRunPasses(module, "function(instcombine<no-verify-fixpoint>,simplifycfg)", target, opts);
     LLVMDisposePassBuilderOptions(opts);
