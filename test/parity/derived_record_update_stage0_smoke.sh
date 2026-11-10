@@ -17,8 +17,10 @@ cleanup() {
 }
 trap cleanup EXIT
 elisa_run_timeout 30 "$STAGE0" -emit llvm -o "$WORK/positive.ll" "$ROOT/test/repro/derived_record_update_codegen_probe.elisa" || { status=$?; echo "positive LLVM build failed: $status" >&2; exit "$status"; }
-rg -q '^%Player__Alive = type \{ i64, i64 \}$' "$WORK/positive.ll"
-rg -q '^%Player__Dead = type \{ i64, i64 \}$' "$WORK/positive.ll"
+# Specializations use hashed names. Both states must still have distinct,
+# tag-free layouts containing only the two declared fields.
+layout_count="$(rg -c '^%"Player\$generic_v1\$[0-9a-f]+" = type \{ i64, i64 \}$' "$WORK/positive.ll" || true)"
+[[ "$layout_count" == 2 ]] || { echo "expected two tag-free Player layouts, got ${layout_count:-0}" >&2; exit 1; }
 for optimization in 0 2; do
     elisa_run_timeout 30 "$STAGE0" -emit c-archive "-O$optimization" -o "$WORK/positive.a" "$ROOT/test/repro/derived_record_update_codegen_probe.elisa" || { status=$?; echo "O$optimization build failed: $status" >&2; exit "$status"; }
     elisa_run_timeout 30 "${ELISA_CLANG:-clang}" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/positive" "$WORK/positive.a"
