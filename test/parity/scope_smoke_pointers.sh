@@ -291,17 +291,19 @@ global mutable tape: i64[CAP] = zeroed
 
 
 def put(index: usize, value: i64) -> void:
-    tape[index] <- value
+    can Global.Write:
+        tape[index] <- value
 
 
 def get(index: usize) -> i64:
-    return tape[index]
+    return tape[index] can Global.Read
 
 
 def main() -> i64:
-    put(0.usize(), 7)
-    put((CAP - 1.usize()), 35)
-    return get(0.usize()) + get((CAP - 1.usize()))
+    can Global{Read,Write}:
+        put(0.usize(), 7)
+        put((CAP - 1.usize()), 35)
+        return get(0.usize()) + get((CAP - 1.usize()))
 EOF
 )" 42
 
