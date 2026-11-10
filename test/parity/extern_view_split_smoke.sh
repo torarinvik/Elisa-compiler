@@ -17,7 +17,7 @@ ROOT="$ROOT" python3 - "$STAGE0" "$STAGE1" "$WORK" <<'PY'
 from pathlib import Path
 import os, re, subprocess, sys
 stage0, stage1, work = sys.argv[1:]
-work = Path(work); root = Path(os.environ['ROOT'])
+work = Path(work).resolve(); root = Path(os.environ['ROOT'])
 source = root / 'test/differential/cases/extern_view_split.elisa'
 declares = []
 for stage, compiler in enumerate((stage0, stage1)):
