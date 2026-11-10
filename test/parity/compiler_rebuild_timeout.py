@@ -15,7 +15,10 @@ for name in ("LIBRARY_PATH", "SDKROOT"):
         os.environ.pop(name, None)
 
 profile_enabled = os.environ.pop("ELISA_REBUILD_PROFILE", "") == "1"
-child = subprocess.Popen(sys.argv[1:], start_new_session=True)
+child = subprocess.Popen(
+    sys.argv[1:], start_new_session=True,
+    env={**os.environ, "ELISA_REBUILD_SUPERVISED": "1"},
+)
 profile = f"/tmp/elisa-rebuild-profile-{child.pid}.txt"
 
 def sample_rebuild():
@@ -55,6 +58,8 @@ def sample_rebuild():
                     workers.append((1, pid))
                 elif command in {"cgo", "link"}:
                     workers.append((2, pid))
+                elif command == "go":
+                    workers.append((3, pid))
             if not workers:
                 return
             _, target = min(workers)
