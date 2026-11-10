@@ -99,13 +99,14 @@ done
 # no pre-flattening. Asserts a non-trivial object rather than just rc=0, because an empty
 # object would also exit 0.
 total=$((total + 1))
-if ( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$BIN" -o "$WORK/self.o" src/driver/elisac.elisa >/dev/null 2>&1 ) \
+if ( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$BIN" -o "$WORK/self.o" src/driver/elisac.elisa >"$WORK/self.log" 2>&1 ) \
    && [ -s "$WORK/self.o" ] \
    && [ "$(wc -c < "$WORK/self.o")" -gt 1000000 ]; then
     ok
 else
     fail "self_compile: the CLI could not compile src/driver/elisac.elisa unaided"
-    exit 1
+    cat "$WORK/self.log" >&2
+    rm -f "$WORK/self.o"
 fi
 
 # --- 5. The driver's flattening and the wrapper's agree, BYTE FOR BYTE ---------------------
@@ -116,13 +117,16 @@ fi
 # compiler's own sources). This is the check that has to hold before the wrapper's flattening
 # can be deleted, so it is asserted rather than left as a footnote.
 total=$((total + 1))
-( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" "$BIN" -o "$WORK/flat_cli.o" src/driver/elisac.elisa >/dev/null 2>&1 ) || exit 1
-( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" bash scripts/elisac_stage1.sh -o "$WORK/flat_wrap.o" src/driver/elisac.elisa >/dev/null 2>&1 ) || exit 1
-if [ -s "$WORK/flat_cli.o" ] && [ -s "$WORK/flat_wrap.o" ] && cmp -s "$WORK/flat_cli.o" "$WORK/flat_wrap.o"; then
-    pass=$((pass + 1))
+if [ ! -s "$WORK/self.o" ]; then
+    fail "flattening_agrees: direct CLI compile did not produce an object to compare"
+elif ! ( cd "$ROOT" && bash "$ROOT/test/parity/compiler_rebuild_timeout.sh" bash scripts/elisac_stage1.sh -o "$WORK/flat_wrap.o" src/driver/elisac.elisa >"$WORK/flat_wrap.log" 2>&1 ); then
+    fail "flattening_agrees: wrapper compile failed"
+    cat "$WORK/flat_wrap.log" >&2
+elif cmp -s "$WORK/self.o" "$WORK/flat_wrap.o"; then
+    ok
 else
     echo "  FAIL flattening_agrees: driver-flattened and wrapper-flattened objects differ"
-    echo "    $(wc -c < "$WORK/flat_cli.o" 2>/dev/null) vs $(wc -c < "$WORK/flat_wrap.o" 2>/dev/null) bytes; differing symbols: $(diff <(nm "$WORK/flat_wrap.o" 2>/dev/null | awk '{print $2,$3}' | sort) <(nm "$WORK/flat_cli.o" 2>/dev/null | awk '{print $2,$3}' | sort) | grep -c '^[<>]')"
+    echo "    $(wc -c < "$WORK/self.o") vs $(wc -c < "$WORK/flat_wrap.o" 2>/dev/null) bytes; differing symbols: $(diff <(nm "$WORK/flat_wrap.o" 2>/dev/null | awk '{print $2,$3}' | sort) <(nm "$WORK/self.o" 2>/dev/null | awk '{print $2,$3}' | sort) | grep -c '^[<>]')"
 fi
 
 # --- 6. Diagnostics name the ORIGINAL file and line ----------------------------------------

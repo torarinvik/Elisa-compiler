@@ -9,7 +9,8 @@ STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
-WORK="$(mktemp -d)"
+tmp_root="$(cd -P -- "${TMPDIR:-/tmp}" && pwd)"
+WORK="$(mktemp -d "$tmp_root/elisa-extern-resource.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 clang -c "$ROOT/test/parity/profile_hooks.c" -o "$WORK/hooks.o"
 ROOT="$ROOT" python3 - "$STAGE0" "$STAGE1" "$WORK" <<'PY'
