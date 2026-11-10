@@ -48,6 +48,21 @@ grep -q 'try requires a fallible expression' <<< "$typed_local_chained_numeric"
 local_numeric_binary_alias=$(printf 'def bad() -> i64:\n    x: i64 = 1\n    return try x + 1 else 0\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$local_numeric_binary_alias"
 
+noncall_fallback_controls=$(cat <<'ELISA' | "$RPT"
+enum Failure:
+    Broken
+
+def recover(value: i64 error[Failure]) -> i64:
+    return try value else 0
+
+static if false:
+    def inactive(value: i64) -> i64:
+        return try value + 1 else 0
+ELISA
+)
+grep -Fxq 'P 0' <<< "$noncall_fallback_controls"
+grep -Fxq 'D 0' <<< "$noncall_fallback_controls"
+
 nonfallible_int_binary=$(printf 'def bad(value: int) -> int:\n    return try value + 1\n' | "$RPT")
 grep -q 'try requires a fallible expression' <<< "$nonfallible_int_binary"
 
