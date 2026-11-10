@@ -16,7 +16,7 @@ ROOT="$ROOT" python3 - "$STAGE0" "$STAGE1" "$WORK" <<'PY'
 from pathlib import Path
 import subprocess, sys
 stage0, stage1, work = sys.argv[1:]
-work = Path(work)
+work = Path(work).resolve()
 branches = ('module Outer:\n    public:\n        static if ELISA_TARGET_OS_LINUX:\n            module Inner:\n                public:\n                    const V: i64 = 1\n        static elif ELISA_TARGET_OS_WINDOWS:\n            module Inner:\n                public:\n                    const V: i64 = 3\n        static else:\n            module Inner:\n                public:\n                    const V: i64 = 2\n\ndef main() -> i64:\n    return 0\n')
 same_branch = ('module Outer:\n    public:\n        static if ELISA_TARGET_OS_POSIX:\n            module Inner:\n                public:\n                    const V: i64 = 1\n            module Inner:\n                public:\n                    const W: i64 = 1\n\ndef main() -> i64:\n    return 0\n')
 def compile(compiler, source):
