@@ -240,7 +240,8 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     status = 1;
   }
   unsigned guarded = foldGuardedIncrements(*unwrap(module));
-  guarded += foldGuardedCounters(*unwrap(module));
+  SmallVector<Function *, 8> boundedCounterFunctions;
+  guarded += foldGuardedCounters(*unwrap(module), boundedCounterFunctions);
   guarded += foldNonnegativeRemainders(*unwrap(module));
   if (guarded) {
     auto opts = LLVMCreatePassBuilderOptions();
@@ -249,6 +250,15 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     LLVMDisposePassBuilderOptions(opts);
     if (err) { LLVMConsumeError(err); return 2; }
     status = 1;
+  }
+  // Removing checked-counter exits can expose reductions to the vectorizer.
+  for (Function *F : boundedCounterFunctions) {
+    auto opts = LLVMCreatePassBuilderOptions();
+    auto err = LLVMRunPassesOnFunction(wrap(F),
+        "loop-simplify,lcssa,loop-vectorize,instcombine<no-verify-fixpoint>,simplifycfg",
+        target, opts);
+    LLVMDisposePassBuilderOptions(opts);
+    if (err) { LLVMConsumeError(err); return 2; }
   }
   unsigned orderedVector = elisacoreOptimizeOrderedConversions(module, target);
   if (orderedVector == 2) return 2;
