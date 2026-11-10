@@ -24,7 +24,10 @@ STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE_ROOT/compiler/bin/elisac}"
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0_BIN" || exit $?
 [ -f "$ROOT/build/runtime/elisacore_runtime.o" ] || { echo "adversarial_differential FAIL: no runtime object" >&2; exit 1; }
 
-out="$(REPO_ROOT="$ROOT" python3 "$ROOT/test/breadth/adversarial_differential.py" 2>&1)"
+out="$(REPO_ROOT="$ROOT" \
+    ELISA_ADV_LIBRARY_PATH_SET="${LIBRARY_PATH+x}" ELISA_ADV_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
+    ELISA_ADV_SDKROOT_SET="${SDKROOT+x}" ELISA_ADV_SDKROOT_VALUE="${SDKROOT-}" \
+    "${ELISA_TOOL_PYTHON:-python3}" "$ROOT/test/breadth/adversarial_differential.py" 2>&1)"
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "$out" >&2

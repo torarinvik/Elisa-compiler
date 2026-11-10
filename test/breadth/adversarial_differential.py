@@ -35,6 +35,16 @@ close here. Prefer the parity smokes for them.
 import os
 import sys
 
+# macOS system Python can inject these before the harness starts. Preserve the
+# shell's toolchain environment so compiler provenance checks see the same inputs.
+for name in ("LIBRARY_PATH", "SDKROOT"):
+    present = os.environ.pop(f"ELISA_ADV_{name}_SET", None)
+    value = os.environ.pop(f"ELISA_ADV_{name}_VALUE", "")
+    if present == "x":
+        os.environ[name] = value
+    elif present == "":
+        os.environ.pop(name, None)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from adversarial_harness import main
