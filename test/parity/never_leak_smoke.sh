@@ -81,7 +81,7 @@ expect_text() {
     local wanted="$1"; shift
     check "$@" "$FIXTURES/illegal.elisa"
     [[ "$status" -eq 0 ]] || fail "$* exited $status: $output"
-    text="${output//"$FIXTURES/"/}"
+    text="${output//$FIXTURES\//}"
     [[ "$text" == "$(cat "$FIXTURES/$wanted")" ]] || fail "$* output differs from $wanted:
 $(diff "$FIXTURES/$wanted" <(printf '%s\n' "$text") || true)"
 }
@@ -99,7 +99,7 @@ warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-gentle.txt")"
 for flag in -Wnever-leak -Wnever-leak=strict; do
     check "$flag" "$FIXTURES/illegal_stage1.elisa"
     [[ "$status" -eq 0 ]] || fail "illegal_stage1.elisa ($flag) exited $status: $output"
-    text="${output//"$FIXTURES/"/}"
+    text="${output//$FIXTURES\//}"
     [[ "$text" == "$(cat "$FIXTURES/expected-stage1.txt")" ]] || fail "illegal_stage1.elisa ($flag) output differs from expected-stage1.txt:
 $(diff "$FIXTURES/expected-stage1.txt" <(printf '%s\n' "$text") || true)"
     check "$flag" "$FIXTURES/fixed_stage1.elisa"
