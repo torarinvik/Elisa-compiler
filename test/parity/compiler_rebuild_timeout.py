@@ -43,8 +43,16 @@ def sample_rebuild():
             candidate_set = set(candidates)
             roots = [pid for pid in candidates if processes[pid][0] not in candidate_set]
             target = min(roots or candidates)
-            subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-file", profile],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4, check=False)
+        else:
+            # Stage0 is built by Go. Sample the tool doing the work, not the
+            # go command waiting for its worker to finish.
+            workers = [pid for pid in descendants
+                       if os.path.basename(processes.get(pid, (0, ""))[1]) in {"compile", "cgo", "link"}]
+            if not workers:
+                return
+            target = min(workers)
+        subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-file", profile],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4, check=False)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
 
