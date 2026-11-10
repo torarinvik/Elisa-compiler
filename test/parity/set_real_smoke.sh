@@ -1,105 +1,18 @@
 #!/usr/bin/env bash
-. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
-# Stage1 REAL-STD set smoke: compile the ACTUAL elisacore_std set path (open-addressing
-# hash set, arena_set_add_or_panic / arena_set_contains) through the stage1 backend and
-# assert the program's real BEHAVIOR (exit code). End-to-end proof that `set` — literal
-# construction `{a, b, …}` and membership `x in s` — works, not just that it compiles.
-#
-# Like dict_real_smoke, the std source is CONCATENATED (arena + deque + collections) with
-# `include` lines stripped and the two ctx_hash_* DEFINITIONS dropped (elisacore_runtime.o
-# already provides them) + re-declared extern.
-#
-# ASYMMETRY vs dict: `DynSet`/`SetBucket` are stage0 BACKEND BUILTINS (not declared in std
-# source), whereas `DynDict`/`DictBucket` ARE in collections.elisa. So stage1's backend has
-# no layout for them from the std alone. The fixture therefore prepends a source struct
-# PRELUDE declaring DynSet/SetBucket — but ONLY for stage1: stage0 already has them builtin,
-# so feeding stage0 the prelude would redeclare them. stage0 validates the un-preluded
-# source; stage1's emitter gets the preluded one.
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
-RUN() { elisa_run_timeout 15 "$@"; }
-set -u
+# Compile and execute each real stdlib case through both compiler drivers.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/real_std_runtime_cases.sh"
+cat > "$WORK/ctx_streq.c" <<'C'
+#include <string.h>
+_Bool ctx_streq(const char *left, const char *right) {
+    return strcmp(left, right) == 0;
+}
+C
+clang -c "$WORK/ctx_streq.c" -o "$WORK/ctx_streq.o"
+link_inputs=("$WORK/profile_hooks.o" "$WORK/ctx_streq.o")
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
-bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
-STD="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/runtime/elisacore_std"
-
-[ -x "$ELISACORE_BIN" ] || { echo "set_real_smoke FAIL: no elisac" >&2; exit 1; }
-[ -x "$LLVM_CONFIG" ] || { echo "set_real_smoke FAIL: no llvm-config" >&2; exit 1; }
-[ -f "$STD/collections.elisa" ] || { echo "set_real_smoke FAIL: no collections.elisa at $STD" >&2; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "set_real_smoke SKIP: no python3"; exit 0; }
-
-LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$("$LLVM_CONFIG" --bindir)/llc"
-BUILD="$ROOT/build"; mkdir -p "$BUILD"
-EMIT="$BUILD/emit_native"
-
-# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
-ELISA_EMIT_NATIVE="$EMIT" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1
-[ -x "$EMIT" ] || { echo "set_real_smoke FAILED: no emit_native"; exit 1; }
-RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
-if [ ! -f "$RUNTIME_OBJ" ]; then
-    mkdir -p "$BUILD/runtime"
-    printf 'def main() -> i64:\n    d: mutable darray[u8] = []\n    d.push(1)\n    return 0\n' > "$BUILD/runtime/probe.elisa"
-    ( cd "$BUILD/runtime" && "$ELISACORE_BIN" -emit c-archive -o probe.a probe.elisa 2>/dev/null && ar x probe.a elisacore_runtime.o 2>/dev/null )
-fi
-[ -f "$RUNTIME_OBJ" ] || { echo "set_real_smoke FAILED: no elisacore_runtime.o"; exit 1; }
-
-# The stage1-only DynSet/SetBucket layout prelude (matches the stage0 builtin layout).
-PRELUDE='struct SetBucket[T]:
-    key: mutable T
-    state: mutable u8
-
-struct DynSet[T]:
-    items: mutable SetBucket[T]&?
-    count: mutable usize
-    used: mutable usize
-    capacity: mutable usize
-    arena: mutable Arena&?
-'
-
-pass=0; total=0
-# set_case <name> <main-body> <want-exit>
 set_case() {
-    local name="$1" body="$2" want="$3"; total=$((total + 1))
-    local src="$BUILD/setreal_$name.elisa" s1="$BUILD/setreal_${name}_s1.elisa"
-    local ll="$BUILD/setreal_$name.ll" obj="$BUILD/setreal_$name.o" exe="$BUILD/setreal_$name"
-    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" > "$src" <<PY
-import sys, re
-out = []
-for path in sys.argv[1:]:
-    for line in open(path):
-        if not line.startswith('include'): out.append(line)
-lines = ''.join(out).split('\n'); res = []; skip = False
-for ln in lines:
-    if re.match(r'def (ctx_hash_u64|ctx_hash_cstr)\b', ln): skip = True; continue
-    if skip:
-        if ln and not ln[0].isspace(): skip = False
-        else: continue
-    res.append(ln)
-print('extern ctx_hash_cstr(s: cstr) -> u64')
-print('extern ctx_hash_u64(value: u64) -> u64')
-print('\n'.join(res))
-print('''$body''')
-PY
-    # stage0 validates the un-preluded source (DynSet/SetBucket are its builtins).
-    if ! "$ELISACORE_BIN" -emit llvm -o /dev/null "$src" 2>"$BUILD/setreal_$name.s0log"; then
-        echo "  FAIL $name: FIXTURE INVALID -- stage0 rejects the set program:"
-        grep -v warning "$BUILD/setreal_$name.s0log" | head -3 | sed 's/^/      /'
-        return; fi
-    # stage1 gets the DynSet/SetBucket layout prelude prepended (backend has no builtin).
-    printf '%s\n' "$PRELUDE" > "$s1"; cat "$src" >> "$s1"
-    if ! "$EMIT" < "$s1" > "$ll" 2>/dev/null || head -1 "$ll" | grep -q UNSUPPORTED; then
-        echo "  FAIL $name: stage1 declined the real-std set program"; return; fi
-    if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
-        echo "  FAIL $name: llc rejected the emitted IR"; return; fi
-    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
-        echo "  FAIL $name: link failed"; return; fi
-    RUN "$exe"; local got=$?
-    if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT"; return; fi
-    if [ "$got" -ne "$want" ]; then echo "  FAIL $name: exit $got, want $want"; return; fi
-    pass=$((pass + 1))
+    real_std_runtime_case "collections.elisa" "$@" "${link_inputs[@]}"
 }
 
 # Literal build + membership hit: {1,2,3}, probe for 2 -> present.
@@ -147,8 +60,4 @@ set_case comprehension_over_darray 'def main() -> i64:
     s: mutable set[i64] = {x * 2 for x in xs}
     return 42 if (10 in s) and not (3 in s) else 7' 42
 
-if [ "$pass" -eq "$total" ]; then
-    echo "set_real_smoke OK: $pass/$total real-std collections.elisa set programs compile+run correctly"
-else
-    echo "set_real_smoke FAILED: $pass/$total"; exit 1
-fi
+real_std_runtime_summary "set_real_smoke"

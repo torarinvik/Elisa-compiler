@@ -1,90 +1,13 @@
 #!/usr/bin/env bash
-. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
-# Stage1 REAL-STD Slice smoke: compile the ACTUAL elisacore_std Slice[T] API (the
-# borrowed, disjoint-partitionable view — elisacore_runtime_slice.elisa) through the stage1
-# backend and assert its real BEHAVIOR (exit code). Slice is the first advanced container to
-# run end-to-end via UFCS-to-generic (`s.len()`, `s.get(i)`, `s.split(n, k)`) after
-# slot-aware generic overload resolution + darray-param inference + ref-to-scalar indexing +
-# address-of a darray-ref element all landed.
-#
-# Slice is declared in std source (no builtin asymmetry), so no prelude is needed — unlike
-# set. The std is concatenated (arena + deque + collections + slice) with `include` lines
-# stripped and the two ctx_hash_* definitions dropped (the runtime object provides them).
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/run_timeout.sh"
-RUN() { elisa_run_timeout 15 "$@"; }
-set -u
+# Compile and execute each real stdlib case through both compiler drivers.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/real_std_runtime_cases.sh"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+[[ -f "$RUNTIME_OBJ" ]] || { echo "slice_real_smoke FAIL: missing runtime at $RUNTIME_OBJ" >&2; exit 1; }
+link_inputs=("$WORK/profile_hooks.o" "$RUNTIME_OBJ")
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
-bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
-STD="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/runtime/elisacore_std"
-
-[ -x "$ELISACORE_BIN" ] || { echo "slice_real_smoke FAIL: no elisac" >&2; exit 1; }
-[ -x "$LLVM_CONFIG" ] || { echo "slice_real_smoke FAIL: no llvm-config" >&2; exit 1; }
-[ -f "$STD/elisacore_runtime_slice.elisa" ] || { echo "slice_real_smoke FAIL: no slice std at $STD" >&2; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "slice_real_smoke SKIP: no python3"; exit 0; }
-
-LIBDIR="$("$LLVM_CONFIG" --libdir)"
-LLC="$("$LLVM_CONFIG" --bindir)/llc"
-BUILD="$ROOT/build"; mkdir -p "$BUILD"
-EMIT="$BUILD/emit_native"
-
-# Shared, race-free builder (see build_emit_native.sh); run_all primes it once.
-ELISA_EMIT_NATIVE="$EMIT" REPO_ROOT="$ROOT" bash "$ROOT/test/parity/build_emit_native.sh" >/dev/null 2>&1
-[ -x "$EMIT" ] || { echo "slice_real_smoke FAILED: no emit_native"; exit 1; }
-RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
-if [ ! -f "$RUNTIME_OBJ" ]; then
-    mkdir -p "$BUILD/runtime"
-    printf 'def main() -> i64:\n    d: mutable darray[u8] = []\n    d.push(1)\n    return 0\n' > "$BUILD/runtime/probe.elisa"
-    ( cd "$BUILD/runtime" && "$ELISACORE_BIN" -emit c-archive -o probe.a probe.elisa 2>/dev/null && ar x probe.a elisacore_runtime.o 2>/dev/null )
-fi
-[ -f "$RUNTIME_OBJ" ] || { echo "slice_real_smoke FAILED: no elisacore_runtime.o"; exit 1; }
-
-pass=0; total=0
 slice_case() {
-    local name="$1" body="$2" want="$3"; total=$((total + 1))
-    local src="$BUILD/slicereal_$name.elisa" ll="$BUILD/slicereal_$name.ll" obj="$BUILD/slicereal_$name.o" exe="$BUILD/slicereal_$name"
-    python3 - "$STD/profiler_hooks.elisa" "$STD/arena.elisa" "$STD/deque.elisa" "$STD/collections.elisa" "$STD/elisacore_runtime_slice.elisa" > "$src" <<PY
-import sys, re
-from pathlib import Path
-out = []
-def append_source(path):
-    path = Path(path)
-    for line in path.read_text().splitlines(keepends=True):
-        match = re.match(r'^include "\./((?:arena_|collections_)[^"/]+)"', line)
-        if match:
-            append_source(path.parent / match.group(1))
-        elif not line.startswith("include"):
-            out.append(line)
-for path in sys.argv[1:]:
-    append_source(path)
-lines = ''.join(out).split('\n'); res = []; skip = False
-for ln in lines:
-    if re.match(r'def (ctx_hash_u64|ctx_hash_cstr)\b', ln): skip = True; continue
-    if skip:
-        if ln and not ln[0].isspace(): skip = False
-        else: continue
-    res.append(ln)
-print('extern ctx_hash_cstr(s: cstr) -> u64')
-print('extern ctx_hash_u64(value: u64) -> u64')
-print('\n'.join(res))
-print('''$body''')
-PY
-    if ! "$ELISACORE_BIN" -emit llvm -o /dev/null "$src" 2>"$BUILD/slicereal_$name.s0log"; then
-        echo "  FAIL $name: FIXTURE INVALID -- stage0 rejects the slice program:"
-        grep -v warning "$BUILD/slicereal_$name.s0log" | head -3 | sed 's/^/      /'
-        return; fi
-    if ! "$EMIT" < "$src" > "$ll" 2>/dev/null || head -1 "$ll" | grep -q UNSUPPORTED; then
-        echo "  FAIL $name: stage1 declined the real-std slice program"; return; fi
-    if ! "$LLC" -filetype=obj "$ll" -o "$obj" 2>/dev/null; then
-        echo "  FAIL $name: llc rejected the emitted IR"; return; fi
-    if ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$exe" "$obj" "$RUNTIME_OBJ" 2>/dev/null; then
-        echo "  FAIL $name: link failed (an instantiation body declined?)"; return; fi
-    RUN "$exe"; local got=$?
-    if [ "$got" -eq 124 ]; then echo "  FAIL $name: TIMED OUT"; return; fi
-    if [ "$got" -ne "$want" ]; then echo "  FAIL $name: exit $got, want $want"; return; fi
-    pass=$((pass + 1))
+    real_std_runtime_case "elisacore_runtime_slice.elisa" "$@" "${link_inputs[@]}"
 }
 
 # slice(&da) borrows the darray; len() reports the count via a UFCS generic method.
@@ -117,8 +40,4 @@ slice_case set_unchecked 'def main() -> i64:
     s.set_unchecked(2.usize(), 42)
     return s.get(2.usize())' 42
 
-if [ "$pass" -eq "$total" ]; then
-    echo "slice_real_smoke OK: $pass/$total real-std Slice[T] programs compile+run correctly"
-else
-    echo "slice_real_smoke FAILED: $pass/$total"; exit 1
-fi
+real_std_runtime_summary "slice_real_smoke"
