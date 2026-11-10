@@ -266,6 +266,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   }
   if (elisacoreCompactEvenRanges(module)) status = 1;
   if (elisacoreBiasValidationReturns(module)) status = 1;
+  if (elisacoreReuseEdgeDivisions(*unwrap(module))) status = 1;
   return status;
 }
 
