@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 STAGE0_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
-STAGE1_BIN="${ELISA_STAGE1_BIN:-$(command -v elisac-stage1 || true)}"
+STAGE1_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 
 # The installer puts a host-facing shell wrapper on PATH. Passing that wrapper back
@@ -26,6 +26,8 @@ if [[ ! -f "$RUNTIME_OBJ" ]]; then
     echo "profiler runtime smoke FAIL: runtime object unavailable" >&2
     exit 1
 fi
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0_BIN"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1_BIN"
 command -v clang >/dev/null 2>&1 || {
     echo "profiler runtime smoke SKIP: clang unavailable"
     exit 0
@@ -61,7 +63,7 @@ clang -std=c11 -O2 -Wall -Wextra -Werror -c \
 
 # This focused probe includes the vendored arena implementation so both compiler
 # stages exercise the same exact source and the collector can filter by arena ID.
-# Use c-archive for stage1 here to avoid linking a second copy of the runtime object.
+# The Stage1 object already contains the arena implementation used by the probe.
 "$STAGE0_BIN" -emit c-archive -O2 \
     -o "$BUILD/stage0_arena_free.a" "$ROOT/test/parity/profiler_arena_free_smoke.elisa" \
     >"$BUILD/stage0_arena_free.log" 2>&1
@@ -69,11 +71,11 @@ clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/stage0_arena_free" \
     "$FREE_COLLECTOR_OBJ" "$BUILD/stage0_arena_free.a"
 "$BUILD/stage0_arena_free"
 
-"$STAGE1_BIN" -emit c-archive -O2 \
-    -o "$BUILD/stage1_arena_free.a" "$ROOT/test/parity/profiler_arena_free_smoke.elisa" \
+"$STAGE1_BIN" -emit obj -O2 \
+    -o "$BUILD/stage1_arena_free.o" "$ROOT/test/parity/profiler_arena_free_smoke.elisa" \
     >"$BUILD/stage1_arena_free.log" 2>&1
 clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/stage1_arena_free" \
-    "$FREE_COLLECTOR_OBJ" "$BUILD/stage1_arena_free.a"
+    "$FREE_COLLECTOR_OBJ" "$BUILD/stage1_arena_free.o"
 "$BUILD/stage1_arena_free"
 
 echo "profiler runtime smoke passed under stage0 and stage1"
