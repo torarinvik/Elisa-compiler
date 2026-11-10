@@ -1,100 +1,25 @@
 #!/usr/bin/env bash
-# Loop semantic checks smoke test for stage1.
-#
-# Tests the stage1 semantic layer's checks for:
-# 1. Non-iterable for loop sources (NonIterableLoop)
-# 2. Non-bool while conditions (NonBoolCondition with while loops)
-#
-# Builds loop_smoke.elisa (which includes the semantic layer), links it with a C driver,
-# and validates the counts of each diagnostic kind.
-#
+# Exercise the shipped Stage1 driver's semantic diagnostics for loops.
 set -euo pipefail
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 
-source "$REPO_ROOT/test/parity/resolve_elisac.sh"
-
-command -v clang >/dev/null 2>&1 || { echo "error: missing clang" >&2; exit 2; }
-
-FIX="$REPO_ROOT/test/parity/loop_smoke.elisa"
-[[ -f "$FIX" ]] || { echo "error: missing loop smoke fixture: $FIX" >&2; exit 2; }
-
+FIX="$ROOT/test/parity/loop_smoke.elisa"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+trap 'rm -rf "$WORK"' EXIT
 
-cat > "$WORK/driver.c" <<'EOF'
-#include "loop_smoke.h"
-#include <stdint.h>
-#include <stdio.h>
+status=0
+"$STAGE1" -emit check "$FIX" >"$WORK/output" 2>&1 || status=$?
+non_iterable="$(grep -c 'for loop iterable must be an iterable type' "$WORK/output" || true)"
+non_bool="$(grep -c 'while condition must be bool' "$WORK/output" || true)"
+diagnostics="$(grep -c '^.*loop_smoke\.elisa:[0-9]' "$WORK/output" || true)"
 
-int main(void) {
-    /* Test code with expected diagnostics:
-       - 4 NonIterableLoop (for x in n, for item in f, for flag in b, for f in flag)
-       - 2 NonBoolCondition while (while n, while x)
-    */
-    const char *src =
-        "def invalid_loop_int() -> void:\n"
-        "    n: int = 42\n"
-        "    for x in n:\n"
-        "        pass\n"
-        "\n"
-        "def invalid_loop_float() -> void:\n"
-        "    f: f32 = 3.14\n"
-        "    for item in f:\n"
-        "        pass\n"
-        "\n"
-        "def invalid_loop_bool() -> void:\n"
-        "    b: bool = true\n"
-        "    for flag in b:\n"
-        "        pass\n"
-        "\n"
-        "def invalid_while_int() -> void:\n"
-        "    n: int = 5\n"
-        "    while n:\n"
-        "        n <- n - 1\n"
-        "\n"
-        "def invalid_while_float() -> void:\n"
-        "    x: f32 = 1.0\n"
-        "    while x:\n"
-        "        x <- x - 0.1\n"
-        "\n"
-        "def loop_combination() -> void:\n"
-        "    a: darray[int] = []\n"
-        "    for v in a:\n"
-        "        pass\n"
-        "    flag: bool = false\n"
-        "    for f in flag:\n"
-        "        pass\n";
-    size_t n = 0; while (src[n]) n++;
-    uint64_t non_iter = 0, non_bool = 0;
-    loop_probe_export((uint8_t *)src, n, &non_iter, &non_bool);
-    printf("%llu %llu\n", (unsigned long long)non_iter, (unsigned long long)non_bool);
-    return 0;
-}
-EOF
-
-"$ELISACORE_BIN" -emit header -o "$WORK/loop_smoke.h" "$FIX" >/dev/null
-"$ELISACORE_BIN" -emit obj -permissive -O2 -o "$WORK/loop_smoke.o" "$FIX" >/dev/null
-
-# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. These
-# links use -undefined,dynamic_lookup, which turns a missing one into a NULL
-# ADDRESS instead of a link error -- so the program built fine and then died with
-# SIGSEGV on the arena's first profiler call. Same cause 0b220f1a fixed for
-# resolve_smoke and check_self_hostable.
-source "$REPO_ROOT/test/parity/native_optional_hook_objects.sh"
-elisa_native_optional_hook_objects "$WORK" "$REPO_ROOT"
-link_flags=(-O2 -I "$WORK" "$WORK/driver.c" "$WORK/loop_smoke.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" -o "$WORK/run")
-[[ "$(uname -s)" == "Darwin" ]] && link_flags=(-Wl,-undefined,dynamic_lookup "${link_flags[@]}")
-[[ "$(uname -s)" == "Linux" ]] && link_flags=(-no-pie "${link_flags[@]}")
-clang "${link_flags[@]}"
-
-read -r got_non_iter got_non_bool < <("$WORK/run")
-
-# Expected: 4 NonIterableLoop + 2 NonBoolCondition (while)
-if [[ "$got_non_iter" != "4" || "$got_non_bool" != "2" ]]; then
-    echo "loop smoke FAILED: NonIterableLoop=$got_non_iter (want 4), NonBoolCondition=$got_non_bool (want 2)" >&2
+if [[ "$status" != 1 || "$non_iterable" != 4 || "$non_bool" != 2 || "$diagnostics" != 6 ]]; then
+    cat "$WORK/output" >&2
+    echo "loop smoke FAILED with exit $status and $diagnostics diagnostics ($non_iterable non-iterable, $non_bool non-bool)" >&2
     exit 1
 fi
 
-echo "loop smoke OK: NonIterableLoop=$got_non_iter NonBoolCondition=$got_non_bool" >&2
+echo "loop smoke OK: NonIterableLoop=$non_iterable NonBoolCondition=$non_bool" >&2
