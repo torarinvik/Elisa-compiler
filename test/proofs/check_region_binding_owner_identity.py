@@ -124,7 +124,7 @@ if not destroyed_call_arguments or any(
     len(call.split(",")) < 6 or "true" not in call.split(",")[-1] for call in destroyed_call_arguments
 ):
     raise SystemExit("destroyed-region call sites must mark their source offsets as present, including byte zero")
-if "function_regions_of_name(file.local_region_annotations, parameter.name, line.line, line.line, parameter_regions, line.offset, true)" not in destroyed_lambda_declarations:
+if "destroyed_indexed_function_regions_of_name(region_index, file.local_region_annotations, parameter.name, line.line, line.line, parameter_regions, line.offset, true)" not in destroyed_lambda_declarations:
     raise SystemExit("lambda parameter region seeding must query function bindings at the declaration offset, including byte zero")
 scope = function_source(local_region, "local_region_is_in_scope")
 local_annotation_lookup = function_source(local_region, "local_region_annotation_of")
@@ -136,12 +136,15 @@ if "use_offset: u32" not in scope or "annotation.owner_offset > use_offset" not 
 if not all(fragment in local_annotation_lookup for fragment in (
     "before_offset: u32 = 0",
     "before_offset_known: bool = false",
-    "for annotation in annotations |found, found_offset, before_offset, before_offset_known|:",
-    "source_visible: bool = annotation.owner_offset <= before_offset and (before_offset < annotation.end_offset if annotation.end_offset != 0 else annotation.end_line == 0 or before_line <= annotation.end_line)",
-    "line_visible: bool = annotation.line <= before_line and (annotation.end_line == 0 or before_line <= annotation.end_line)",
-    "visible: bool = source_visible if before_offset_known else line_visible",
-    "candidate_offset: u32 = annotation.owner_offset if before_offset_known else annotation.line",
-    "candidate_offset >= found_offset",
+    "query_position: u32 = before_offset if before_offset_known else before_line",
+    "for row in 0..<annotations.count |found, found_offset|:",
+    "candidate_offset: u32 = annotations[row].owner_offset if before_offset_known else annotations[row].line",
+    "continue if candidate_offset > query_position or candidate_offset < found_offset",
+    "end_offset: u32 = annotations[row].end_offset if before_offset_known else 0",
+    "continue if before_offset >= end_offset",
+    "continue if end_line != 0 and before_line > end_line",
+    "continue if annotations[row].name != name",
+    "found_offset <- candidate_offset",
 )):
     raise SystemExit("local value-region lookup must choose the newest annotation active at the exact source offset")
 if not all(fragment in region_escape for fragment in (
@@ -157,7 +160,7 @@ if "local_region_annotation_of(annotations, name, line.line, line.offset, true)"
         region_stores.count("local_region_annotation_of(annotations, receiver, line, use_offset, true)") != 2 or \
         "local_region_name(annotations, growth.receiver, line, use_offset, true)" not in region_stores or \
         "local_region_name(annotations, target_name, line, target_pos.offset, true)" not in region_assignments or \
-        "local_region_name(annotations, name, line.line, line.offset, true)" not in region_recovery:
+        "local_region_annotation_of(annotations, region_key, line.line, line.offset, true)" not in region_recovery:
     raise SystemExit("semantic local-region lookup callers must mark available AST offsets as present, including byte zero")
 if "argument_line.line, argument_line.offset" not in type_table:
     raise SystemExit("generic region selector interning must pass the expression's source offset")
