@@ -10,6 +10,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
 STAGE0="${ELISACORE_BIN:-${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 FIXTURE="$ROOT/test/fixtures/mutable_heap_ref_local_rebind.elisa"
 
@@ -34,8 +35,6 @@ run_case() {
 }
 
 run_case "$STAGE1" stage1 2
-if [[ -x "$STAGE0" ]]; then
-    run_case "$STAGE0" stage0 2
-fi
+run_case "$STAGE0" stage0 2
 
 echo "mutable-ref scope smoke OK: scoped zeroed reference rebind is safe"
