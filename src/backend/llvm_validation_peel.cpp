@@ -257,6 +257,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   finalSimplifications += elisacoreFoldShiftParityLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldShiftBitReverseLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldPowerPosition(*unwrap(module));
+#if LLVM_VERSION_MAJOR >= 23
+  finalSimplifications += elisacoreFoldRangeAndLoops(*unwrap(module));
+#endif
   if (finalSimplifications) {
     auto opts = LLVMCreatePassBuilderOptions();
     auto err = LLVMRunPasses(module, "function(instcombine<no-verify-fixpoint>,simplifycfg)", target, opts);
