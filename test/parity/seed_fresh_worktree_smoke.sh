@@ -17,6 +17,7 @@ printf '%s\n' 'fake llvm library' > "$WORK/lib/libLLVM.dylib"
 # The provenance manifest fingerprints every build helper, including the object cache.
 for part in \
   platform.sh \
+  run_with_timeout.py \
   elisac_stage1.sh \
   stage1_object_cache.py \
   stage1_object_cache_files.py \
