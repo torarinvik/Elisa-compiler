@@ -155,7 +155,7 @@ if not all(fragment in region_escape for fragment in (
 if "local_region_annotation_of(annotations, name, before_line, before_offset, before_offset_known)" not in region_escape:
     raise SystemExit("local region name lookup must preserve explicit byte-zero offset presence")
 if "local_region_annotation_of(annotations, name, line.line, line.offset, true)" not in local_region or \
-        "local_region_annotation_of(annotations, source_name, position.line, position.offset, true)" not in destroyed_sources[0] or \
+        destroyed_sources[0].count("destroyed_indexed_local_region_annotation(region_index, annotations, source_name, position)") != 2 or \
         "local_region_annotation_of(annotations, receiver, line, use_offset, true)" not in region_stores or \
         region_stores.count("local_region_annotation_of(annotations, receiver, line, use_offset, true)") != 2 or \
         "local_region_name(annotations, growth.receiver, line, use_offset, true)" not in region_stores or \
