@@ -457,6 +457,7 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
 #include "llvm_power_position.cpp"
 #include "llvm_edge_division_reuse.cpp"
 #include "llvm_factored_unsigned_division.cpp"
+#include "llvm_remainder_recurrence.cpp"
 
 #else
 extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef) { return 0; }

@@ -268,6 +268,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (elisacoreBiasValidationReturns(module)) status = 1;
   if (elisacoreReuseEdgeDivisions(*unwrap(module))) status = 1;
   if (elisacoreSplitFactoredDivisions(*unwrap(module))) status = 1;
+  if (elisacoreSplitRemainderRecurrences(*unwrap(module))) status = 1;
   return status;
 }
 
