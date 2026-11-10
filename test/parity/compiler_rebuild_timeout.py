@@ -14,6 +14,7 @@ for name in ("LIBRARY_PATH", "SDKROOT"):
     else:
         os.environ.pop(name, None)
 
+profile_enabled = os.environ.pop("ELISA_REBUILD_PROFILE", "") == "1"
 child = subprocess.Popen(sys.argv[1:], start_new_session=True)
 profile = f"/tmp/elisa-rebuild-profile-{child.pid}.txt"
 
@@ -47,9 +48,11 @@ def sample_rebuild():
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
 
-sampler = threading.Timer(2, sample_rebuild)
-sampler.daemon = True
-sampler.start()
+sampler = None
+if profile_enabled:
+    sampler = threading.Timer(2, sample_rebuild)
+    sampler.daemon = True
+    sampler.start()
 
 def terminate(signum, _frame):
     try:
@@ -69,8 +72,12 @@ except subprocess.TimeoutExpired:
     except ProcessLookupError:
         pass
     child.wait()
-    print(f"compiler rebuild exceeded 5 seconds; sample: {profile}", file=sys.stderr)
+    message = "compiler rebuild exceeded 5 seconds"
+    if profile_enabled and os.path.isfile(profile):
+        message += f"; sample: {profile}"
+    print(message, file=sys.stderr)
     raise SystemExit(124)
 finally:
-    sampler.cancel()
+    if sampler is not None:
+        sampler.cancel()
 raise SystemExit(status if status >= 0 else 128 - status)
