@@ -6,9 +6,10 @@
 #include <llvm-c/Error.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 #if LLVM_VERSION_MAJOR >= 23
-// The only rewrites are local to a recurrence whose zero seed, per-update
-// nonnegative step range, and maximum loop iteration count prove that every
-// prefix sum fits the signed type. No source-language assumptions are added.
+// Prove a recurrence's prefix sums from its nonnegative seed and step range
+// and its maximum iteration count. Reuse those bounds for nearby arithmetic.
+#include <cstdint>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Analysis/AssumptionCache.h>
@@ -197,22 +198,22 @@ static ConstantRange rangeAt(Value *V, Instruction *At, LazyValueInfo &LVI, Assu
 }
 
 static bool fitsSignedAccumulation(PHINode *P, Value *Initial, Value *Step,
-                                   Instruction *At, unsigned Updates,
+                                   Instruction *At, uint32_t Updates,
                                    LazyValueInfo &LVI,
                                    AssumptionCache &AC, DominatorTree &DT,
                                    ConstantRange &Out) {
   auto *Ty = dyn_cast<IntegerType>(P->getType());
   auto *Start = dyn_cast<ConstantInt>(Initial);
-  if (!Ty || Ty->getBitWidth() > 128 || Updates > 65536 ||
-      !Start || !Start->isZero() || Step->getType() != P->getType() ||
+  if (!Ty || Ty->getBitWidth() > 128 || !Start || Start->isNegative() ||
+      Step->getType() != P->getType() ||
       !isGuaranteedNotToBeUndefOrPoison(Initial, &AC, At, &DT))
     return false;
   // LVI(false) excludes non-singleton ranges that may include undef. A
   // singleton may still include undef, so require a separate guarantee there.
-  // For the closed zero-seeded recurrence, every concrete step choice is
+  // For the closed recurrence, every concrete step choice is
   // bounded; poison propagates through its adds. It needs no noundef assertion
   // on the cyclic PHI (which ValueTracking cannot generally prove).
-  APInt Seed(Ty->getBitWidth(), 0);
+  const APInt &Seed = Start->getValue();
   ConstantRange SR = LVI.getConstantRange(Step, At, false);
   if (SR.isEmptySet() || SR.isFullSet() || SR.isWrappedSet() ||
       SR.getSignedMin().isNegative() ||
@@ -220,7 +221,7 @@ static bool fitsSignedAccumulation(PHINode *P, Value *Initial, Value *Step,
     return false;
   unsigned W = Ty->getBitWidth(), EW = W + 32;
   APInt MaxStep = SR.getSignedMax().sext(EW);
-  APInt MaxSum = MaxStep * APInt(EW, Updates);
+  APInt MaxSum = Seed.zext(EW) + MaxStep * APInt(EW, Updates);
   if (!MaxSum.isSignedIntN(W))
     return false;
   Out = ConstantRange::getNonEmpty(Seed,
@@ -228,16 +229,16 @@ static bool fitsSignedAccumulation(PHINode *P, Value *Initial, Value *Step,
   return true;
 }
 
-static bool boundedBackedges(Loop *L, ScalarEvolution &SE, unsigned &Updates) {
+static bool boundedBackedges(Loop *L, ScalarEvolution &SE, uint32_t &Updates) {
   const SCEV *S = SE.getConstantMaxBackedgeTakenCount(L);
   auto *C = dyn_cast<SCEVConstant>(S);
-  if (!C || C->getAPInt().getActiveBits() > 16)
+  if (!C || C->getAPInt().getActiveBits() > 32)
     return false;
   uint64_t MaxBackedges = C->getAPInt().getZExtValue();
-  if (MaxBackedges >= 65536)
+  if (MaxBackedges >= UINT32_MAX)
     return false;
-  Updates = static_cast<unsigned>(MaxBackedges + 1);
-  return Updates != 0;
+  Updates = static_cast<uint32_t>(MaxBackedges + 1);
+  return true;
 }
 
 } // namespace
@@ -301,7 +302,7 @@ extern "C" unsigned elisacoreBoundedCheckedSums(LLVMModuleRef Ref) {
         continue;
       BasicBlock *Pre = L->getLoopPredecessor();
       BasicBlock *Latch = L->getLoopLatch();
-      unsigned Updates = 0;
+      uint32_t Updates = 0;
       if (!Pre || !Latch || !boundedBackedges(L, SE, Updates))
         continue;
       for (PHINode &P : L->getHeader()->phis()) {
@@ -337,8 +338,8 @@ extern "C" unsigned elisacoreBoundedCheckedSums(LLVMModuleRef Ref) {
       }
     }
 
-    // Separately prove any checked subtraction from already bounded values.
-    SmallVector<IntrinsicInst *, 4> SafeSubs;
+    // Use the recurrence bounds to prove other checked arithmetic.
+    SmallVector<IntrinsicInst *, 4> SafeChecked;
     SmallVector<BinaryOperator *, 4> SafePlainSubs;
     for (Instruction &I : instructions(F)) {
       if (auto *Sub = dyn_cast<BinaryOperator>(&I)) {
@@ -359,6 +360,21 @@ extern "C" unsigned elisacoreBoundedCheckedSums(LLVMModuleRef Ref) {
         continue;
       }
       auto *Call = dyn_cast<IntrinsicInst>(&I);
+      if (Call && Call->getIntrinsicID() == Intrinsic::sadd_with_overflow &&
+          !Call->hasOperandBundles() && !Call->hasMetadataOtherThanDebugLoc() &&
+          !Call->isConvergent() &&
+          (ProvenRanges.count(Call->getArgOperand(0)) ||
+           ProvenRanges.count(Call->getArgOperand(1))) &&
+          !llvm::any_of(Facts, [Call](const SumFact &Fact) {
+            return Fact.CheckedAdd == Call;
+          })) {
+        auto A = rangeAt(Call->getArgOperand(0), Call, LVI, AC, DT, ProvenRanges);
+        auto B = rangeAt(Call->getArgOperand(1), Call, LVI, AC, DT, ProvenRanges);
+        if (!A.isEmptySet() && !B.isEmptySet() &&
+            A.signedAddMayOverflow(B) == ConstantRange::OverflowResult::NeverOverflows)
+          SafeChecked.push_back(Call);
+        continue;
+      }
       if (!Call || Call->getIntrinsicID() != Intrinsic::ssub_with_overflow ||
           Call->hasOperandBundles() || Call->hasMetadataOtherThanDebugLoc() ||
           Call->isConvergent() || Call->arg_size() != 2 ||
@@ -373,7 +389,7 @@ extern "C" unsigned elisacoreBoundedCheckedSums(LLVMModuleRef Ref) {
       APInt Lo = A.getSignedMin().sext(W + 1) - B.getSignedMax().sext(W + 1);
       APInt Hi = A.getSignedMax().sext(W + 1) - B.getSignedMin().sext(W + 1);
       if (Lo.isSignedIntN(W) && Hi.isSignedIntN(W))
-        SafeSubs.push_back(Call);
+        SafeChecked.push_back(Call);
     }
 
     // Apply only after all ranges were derived from the unmodified function.
@@ -396,12 +412,14 @@ extern "C" unsigned elisacoreBoundedCheckedSums(LLVMModuleRef Ref) {
         ++Changed;
       }
     }
-    for (IntrinsicInst *Call : SafeSubs) {
+    for (IntrinsicInst *Call : SafeChecked) {
       IRBuilder<> B(Call);
-      Value *Diff = B.CreateNSWSub(Call->getArgOperand(0),
-                                   Call->getArgOperand(1));
+      Value *A = Call->getArgOperand(0), *BVal = Call->getArgOperand(1);
+      Value *Result = Call->getIntrinsicID() == Intrinsic::sadd_with_overflow
+                          ? B.CreateNSWAdd(A, BVal)
+                          : B.CreateNSWSub(A, BVal);
       Value *Pair = B.CreateInsertValue(PoisonValue::get(Call->getType()),
-                                        Diff, 0);
+                                        Result, 0);
       Pair = B.CreateInsertValue(Pair, B.getFalse(), 1);
       Call->replaceAllUsesWith(Pair);
       Call->eraseFromParent();
