@@ -105,6 +105,9 @@ STAGE1_BIN="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
 bash "$REPO_ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1_BIN" || exit $?
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$REPO_ROOT/build/runtime/elisacore_runtime.o}"
 export ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ"
+# Gate fixtures are short-lived and often have distinct include roots. Do not
+# leave an automatic retained Stage0 server holding each fixture's analysis.
+export ELISACORE_RETAINED_SERVER="${ELISACORE_RETAINED_SERVER-}"
 
 [[ -x "$STAGE1_BIN" ]] || {
   echo "error: stage1 product missing at $STAGE1_BIN (run scripts/elisac_stage1.sh --seed)" >&2
