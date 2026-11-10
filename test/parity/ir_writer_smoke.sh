@@ -52,4 +52,13 @@ if ELISA_STAGE1_BIN="$STAGE1" \
 fi
 grep -q 'opaque extern signature shape' "$WORK/negative.err"
 
-echo "ir writer smoke OK: callable extern round-trips; lossy optional shape declines"
+# A plain-looking return can still carry structure the writer does not encode.
+printf '%s\n' 'extern probe_ptr() -> i32&' >"$WORK/pointer.elisa"
+if ELISA_STAGE1_BIN="$STAGE1" \
+    bash "$ROOT/scripts/elisac_stage1.sh" -emit ir -o "$WORK/pointer.elisair" "$WORK/pointer.elisa" >/dev/null 2>"$WORK/pointer.err"; then
+    echo "ir writer FAILED: pointer return was emitted as a bare scalar" >&2
+    exit 1
+fi
+grep -q 'extern signature metadata' "$WORK/pointer.err"
+
+echo "ir writer smoke OK: callable extern round-trips; lossy return shapes decline"
