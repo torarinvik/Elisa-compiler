@@ -34,8 +34,9 @@ global mutable canary: u64 = 7
 
 def main() -> i64:
     index: usize = atoi("$1").usize()
-    buf[index] <- 1
-    return 0 if canary == 7 else 9
+    can Global{Read,Write}:
+        buf[index] <- 1
+        return 0 if canary == 7 else 9
 SRC
 }
 probe 7 >"$WORK/inside.elisa"
