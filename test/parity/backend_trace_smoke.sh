@@ -3,41 +3,24 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-ELISACORE_BIN="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
-bash "$ROOT/scripts/assert_stage0_fresh.sh" "$ELISACORE_BIN" || exit $?
-LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
+STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 LLC="${LLC:-$ELISA_LLVM_BIN_DIR/llc}"
-[ -x "$ELISACORE_BIN" ] || { echo "backend_trace_smoke FAIL: no elisac" >&2; exit 1; }
-[ -x "$LLVM_CONFIG" ] || { echo "backend_trace_smoke FAIL: no llvm-config" >&2; exit 1; }
 [ -x "$LLC" ] || { echo "backend_trace_smoke SKIP: no llc"; exit 0; }
 
-BUILD="$ROOT/build/trace_smoke"
-mkdir -p "$BUILD"
-LIBDIR="$($LLVM_CONFIG --libdir)"
-RUNTIME_OBJ="$ROOT/build/runtime/elisacore_runtime.o"
-[ -f "$RUNTIME_OBJ" ] || { echo "backend_trace_smoke FAIL: no runtime object" >&2; exit 1; }
-FALLBACK_OBJ="$BUILD/runtime_fallback.o"
-clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
-PROFILE_OBJ="$BUILD/profile_hooks.o"
-clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
+BUILD="$(mktemp -d)"
+trap 'rm -rf "$BUILD"' EXIT
 
-"$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/driver.o" "$ROOT/test/breadth/emit_trace.elisa" \
-    >"$BUILD/build.log" 2>&1
-clang -x c -c -o "$BUILD/puts_shim.o" - <<'EOF'
-#include <stdio.h>
-int trace_puts(const char *s) __asm__("___ovl__puts__cstr__puts");
-int trace_puts(const char *s) { return puts(s); }
+# Use the shipped driver to exercise the same backend trace path.
+cat >"$BUILD/trace.elisa" <<'EOF'
+def helper(x: i64) -> i64:
+    y: i64 = x + 1
+    return y
+
+def main() -> i64:
+    return helper(41)
 EOF
-# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
-# Without them this link fails outright on _elisa_profile_* (the arena calls
-# the profiler ABI unconditionally), which is what kept this gate red.
-source "$ROOT/test/parity/native_optional_hook_objects.sh"
-elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-clang -o "$BUILD/emit_trace" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$BUILD/puts_shim.o" \
-    -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
-
-src=$'def helper(x: i64) -> i64:\n    y: i64 = x + 1\n    return y\n\ndef main() -> i64:\n    return helper(41)\n'
-printf '%s' "$src" | "$BUILD/emit_trace" > "$BUILD/trace.ll"
+"$STAGE1" -emit llvm -O0 -ftrace -o "$BUILD/trace.ll" "$BUILD/trace.elisa"
 # Trace IDs are the current stable ABI: the legacy declarations remain for host
 # compatibility, while emitted calls use the ID-carrying forms so a trace can be
 # correlated across independently compiled units.
