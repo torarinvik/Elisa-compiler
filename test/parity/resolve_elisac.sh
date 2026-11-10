@@ -27,11 +27,18 @@ else
 	ELISACORE_BIN="${ELISAC_OUT:-$ELISA_CORE/compiler/bin/elisac}"
 	REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 	mkdir -p "$(dirname "$ELISACORE_BIN")"
-	if env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 python3 "$REPO_ROOT/scripts/stage0_provenance.py" check --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN" >/dev/null 2>&1; then
+	if env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 ELISA_CORE="$ELISA_CORE" python3 "$REPO_ROOT/scripts/stage0_provenance.py" check --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN" >/dev/null 2>&1; then
 		echo "Stage0 provenance is current: $ELISACORE_BIN" >&2
 	else
 		echo "building latest elisac from $ELISA_CORE/compiler -> $ELISACORE_BIN" >&2
-		env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 python3 "$REPO_ROOT/scripts/stage0_provenance.py" build --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN" || exit 2
+		_stage0_rebuild=(python3 "$REPO_ROOT/scripts/stage0_provenance.py" build --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN")
+		if [[ "${ELISA_REBUILD_SUPERVISED:-0}" != 1 ]]; then
+			_stage0_rebuild=(bash "$REPO_ROOT/test/parity/compiler_rebuild_timeout.sh" "${_stage0_rebuild[@]}")
+		fi
+		env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 ELISA_CORE="$ELISA_CORE" \
+			ELISA_REBUILD_SUPERVISED="${ELISA_REBUILD_SUPERVISED:-0}" ELISA_REBUILD_PROFILE="${ELISA_REBUILD_PROFILE:-0}" \
+			"${_stage0_rebuild[@]}" || exit 2
+		unset _stage0_rebuild
 	fi
 	export ELISA_STAGE0_SOURCE_ROOT="$ELISA_CORE/compiler"
 fi
