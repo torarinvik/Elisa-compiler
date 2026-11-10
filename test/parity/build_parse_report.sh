@@ -32,7 +32,8 @@ mkdir -p "$(dirname -- "$RPT")"
 # Skip when the binary is newer than every input it is built from.
 if [[ -x "$RPT" ]]; then
   _pr_stale=""
-  for _pr_src in "$REPO_ROOT/test/breadth/parse_report.elisa" "$STAGE1_BIN" "$RUNTIME_OBJ" "$REPO_ROOT/scripts/elisac_stage1.sh"; do
+  for _pr_src in "$REPO_ROOT/test/breadth/parse_report.elisa" "$STAGE1_BIN" "$RUNTIME_OBJ" \
+      "$REPO_ROOT/scripts/elisac_stage1.sh" "${BASH_SOURCE[0]}" "$REPO_ROOT/test/parity/profile_hooks.c"; do
     [[ -e "$_pr_src" && "$_pr_src" -nt "$RPT" ]] && _pr_stale=1
   done
   # The semantic layer it includes is the real input set; any .elisa under src/ counts.
@@ -73,7 +74,8 @@ fi
 
 _pr_link_flags=()
 case "$(uname -s)" in
-  Darwin) _pr_link_flags=(-Wl,-undefined,dynamic_lookup) ;;
+  # The reporter runs the same recursive semantic passes as the compiler.
+  Darwin) _pr_link_flags=(-Wl,-undefined,dynamic_lookup -Wl,-stack_size,0x20000000) ;;
   Linux)  _pr_link_flags=(-no-pie) ;;
 esac
 # The generated frontend may contain the optional allocation/region profiling ABI even when
