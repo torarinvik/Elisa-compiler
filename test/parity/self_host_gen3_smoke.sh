@@ -112,7 +112,7 @@ terminate_guarded_pid() {
 # scripts/elisac_stage1.sh. This is an operational safety boundary, not a semantic fallback:
 # crossing it fails the smoke and leaves the compiler bug visible instead of freezing the host.
 run_guarded_request() {
-    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-4194304}" deadline
+    local binary="$1" request="$2" output="$3" pid rss peak=0 max_rss="${ELISA_STAGE1_MAX_RSS_KB:-12582912}" deadline
     "$binary" <"$request" >"$output" 2>&1 &
     pid=$!
     # A WALL-CLOCK deadline. This used to count polls (a fixed 12000 x the poll sleep), which

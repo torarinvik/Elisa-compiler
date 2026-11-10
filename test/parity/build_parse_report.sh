@@ -53,13 +53,16 @@ _pr_tmp="$RPT.$$"
 _pr_obj="$REPO_ROOT/build/parse_report.$$.o"
 trap 'rm -f "$_pr_tmp" "$_pr_obj"' RETURN 2>/dev/null || true
 
+# The reporter is compiled at -O0: at -O2 its object build alone took ~59 s (LLVM optimize
+# ~24 s, emit ~16 s), over the 30 s single-run cap. Its output is identical at -O0 and -O2
+# on the try/catch/error fixtures, and -O1 was slower (~45 s).
 # The reporter is deliberately a stage1-only product. Differential callers export their
 # stage0 oracle as ELISACORE_BIN (and often ELISA_CORE); do not let those selector variables
 # leak into the self-hosted compiler's environment, where they can change an otherwise local
 # build or accidentally re-enter the seed path. The wrapper derives its own ROOT.
 if ! env -u ELISACORE_BIN -u ELISA_CORE -u REPO_ROOT \
     ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" \
-    bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit obj -O2 -permissive \
+    bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit obj -O0 -permissive \
       -o "$_pr_obj" "$REPO_ROOT/test/breadth/parse_report.elisa" \
       >/dev/null 2>"$REPO_ROOT/build/parse_report.$$.err"; then
   cat "$REPO_ROOT/build/parse_report.$$.err" >&2

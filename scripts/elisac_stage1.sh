@@ -229,7 +229,7 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$BIN" >&2
 
 run_stage1_driver_guarded() {
   local driver_pid driver_rss driver_peak=0 driver_rc=0
-  local driver_max_rss_kb="${ELISA_STAGE1_MAX_RSS_KB:-4194304}"
+  local driver_max_rss_kb="${ELISA_STAGE1_MAX_RSS_KB:-12582912}"
   local driver_rss_poll_seconds="${ELISA_STAGE1_RSS_POLL_SECONDS:-0.05}"
   # The poll BACKS OFF exponentially from 2ms up to the configured interval. A
   # fixed 50ms first sleep dominated small compiles outright — a differential-

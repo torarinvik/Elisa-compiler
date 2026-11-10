@@ -2,11 +2,11 @@
 # Resolve a CURRENT elisac binary for the parity / bench harnesses.
 # Sourced (not executed) — sets $ELISACORE_BIN in the caller's shell.
 #
-# Default behavior: build the compiler from $ELISA_CORE/compiler so we ALWAYS
-# run the latest source rather than a possibly-stale prebuilt binary (the old
-# $ELISA_CORE/bin/elisacore default was a frequent stale-binary trap). The Go
-# build is incremental (~2s when nothing changed), so this is cheap to do every
-# run.
+# Default behavior: use the Stage0 binary when its provenance receipt matches the
+# current source, and rebuild from $ELISA_CORE/compiler only when it does not. A
+# matching receipt means the binary was built from exactly this source with the
+# canonical recipe, so rebuilding would only churn bytes and invalidate any Stage1
+# seed recorded against it.
 #
 # Escape hatch: set ELISACORE_BIN to an explicit path to skip the build and use
 # that binary as-is (e.g. to test against a specific/older compiler). Set
@@ -27,7 +27,11 @@ else
 	ELISACORE_BIN="${ELISAC_OUT:-$ELISA_CORE/compiler/bin/elisac}"
 	REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 	mkdir -p "$(dirname "$ELISACORE_BIN")"
-	echo "building latest elisac from $ELISA_CORE/compiler -> $ELISACORE_BIN" >&2
-	python3 "$REPO_ROOT/scripts/stage0_provenance.py" build --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN" || exit 2
+	if env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 python3 "$REPO_ROOT/scripts/stage0_provenance.py" check --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN" >/dev/null 2>&1; then
+		echo "Stage0 provenance is current: $ELISACORE_BIN" >&2
+	else
+		echo "building latest elisac from $ELISA_CORE/compiler -> $ELISACORE_BIN" >&2
+		env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 python3 "$REPO_ROOT/scripts/stage0_provenance.py" build --root "$ELISA_CORE/compiler" --binary "$ELISACORE_BIN" || exit 2
+	fi
 	export ELISA_STAGE0_SOURCE_ROOT="$ELISA_CORE/compiler"
 fi

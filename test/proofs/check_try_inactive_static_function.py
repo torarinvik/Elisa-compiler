@@ -33,7 +33,7 @@ if not all(fragment in filter_body for fragment in (
     raise SystemExit("Try must mark only functions proven inactive by static-branch selection")
 
 inactive = function_source(CALLABLE_ROWS, "callable_function_declaration_is_static_inactive")
-visible = function_source(CALLABLE_ROWS, "callable_function_declaration_visible")
+visible = function_source(CALLABLE_ROWS, "callable_function_declaration_visible_with")
 active_count = function_source(CALLABLE_ROWS, "callable_active_direct_function_count")
 facts = function_source(CALLABLE_ROWS, "try_noncall_callable_facts_add")
 candidate_set = function_source(CALLABLE_ROWS, "callable_row_in_ufcs_candidate_set_indexed")
