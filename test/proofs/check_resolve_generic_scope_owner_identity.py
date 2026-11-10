@@ -9,7 +9,7 @@ RESOLVE = ROOT / "src/semantic/resolve.elisa"
 
 def function_source(source: str, name: str) -> str:
     match = re.search(
-        rf"(?ms)^        def {re.escape(name)}\(.*?(?=^        def |^    public:|\Z)",
+        rf"(?ms)^        def {re.escape(name)}(?:\[[^\]\n]+\])?\(.*?(?=^        def |^    public:|\Z)",
         source,
     )
     if match is None:

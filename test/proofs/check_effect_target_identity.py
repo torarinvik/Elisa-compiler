@@ -106,7 +106,7 @@ for fragment in (
         raise SystemExit(f"handler validation must use the target effect ID: {fragment}")
 if not all(fragment in semantic_effects for fragment in (
     "target_member: sview = effect_ref_member(target_ref)",
-    "ae_validate_effect_ref(target_ref, handler_line, file.enum_annotations, table)",
+    "ae_validate_effect_ref(target_ref, handler_line, file.enum_annotations, effect_names, table)",
     "not target_validation_reported",
 )):
     raise SystemExit("dotted handler targets must use the shared effect-row diagnostics before the generic unknown-interface fallback")

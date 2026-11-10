@@ -156,12 +156,12 @@ bare_module = function_text(checker, "extern_bare_module_for_call")
 if not all(fragment in bare_module for fragment in (
     "errorset_import_scope(table.definite_import_annotations",
     "requester.line, requester.offset, call_offset_present",
-    "candidate_module != selected",
+    "or symbol.module_owner == selected",
     "selected_direct: mutable bool = false",
     "rank == best_rank and direct and not selected_direct",
     "direct == selected_direct and selected != candidate_module",
     "errorset_import_scope(table.possible_import_annotations, candidate_module, name, caller_module, requester.line, requester.offset, call_offset_present)",
-    "possible_rank > best_rank",
+    "possible_rank > best_rank or (possible_rank == best_rank and not selected_direct)",
 )):
     raise SystemExit("bare extern calls must honor direct-over-import ties and only reject source-visible possible imports that can win")
 
@@ -172,8 +172,8 @@ if not all(fragment in outside_checker for fragment in (
     "extern_bare_module_for_call(callee_name, caller_module, requester, table)",
     "extern_module_owner_is_extern_only",
     "extern_effect_index_refs",
-    "return extern_effect_index_refs(resolved.module, target.name, table)",
-    "return extern_effect_index_refs(selected.module, target.name, table)",
+    "required_effects <- extern_effect_index_refs(resolved.module, callee_name, table)",
+    "required_effects <- extern_effect_index_refs(selected_module.module, callee_name, table)",
     "function_effect_refs(table, callee_name, resolved.module, true)",
     "function_effect_refs(table, callee_name, selected_module.module, true)",
     "function_has_effect(table, callee_name, selected_function_module, true)",
@@ -252,7 +252,8 @@ for statement_shape in (
     "Stmt.While(condition, body, line)",
     "Stmt.For(bind, variables, iterable, body, line)",
     "Stmt.Match(scrutinee, arms, line)",
-    "if operator == TokenKind.Assign:",
+    "register_block_grant_expression_gaps(owner, target, line.line, enclosing_clause, caller_module, visible_names, table)",
+    "register_block_grant_expression_gaps(owner, value, line.line, enclosing_clause, caller_module, visible_names, table)",
 ):
     if statement_shape not in block_gap:
         raise SystemExit(f"block-gap source walk must inspect calls in {statement_shape}")
@@ -264,8 +265,7 @@ if not all(fragment in gap_expression for fragment in (
     "Expr.Match(scrutinee, arms, match_pos)",
     "Expr.Block(block_statements, value, captures, block_pos)",
     "body_block_tail_visible_names(block_statements, visible_names)",
-    "Lambda expressions are deferred bodies",
-)):
+)) or "Expr.Lambda(" in gap_expression:
     raise SystemExit("block-gap expression traversal must find nested calls and leave deferred lambdas to fn-value analysis")
 if "collect_bound_names(body, bound_names)" in function_text(checker, "collect_effect_sources"):
     raise SystemExit("block-gap extern lookup must not use function-wide binder overcollection")
@@ -328,7 +328,7 @@ if "body_assignment_bound_names(target, visible_names) if operator == TokenKind.
 collector_source = function_text(checker, "collect_effect_sources")
 if not all(fragment in collector_source for fragment in (
     "body_statement_effect_facts(body, false, current_module, bound_names, table)",
-    'source_refs.push("Abort.Panic") if body_facts.panic',
+    'source_refs.push("Abort.Panic") if body_facts.has_panic',
     "for effect_ref in body_facts.effect_refs",
     "table.function_effect_source_module <- table.function_effect_source_module.push(current_module)",
     "table.function_effect_source_ref <- table.function_effect_source_ref.push(source_ref)",

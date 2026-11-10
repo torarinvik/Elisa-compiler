@@ -11,7 +11,7 @@ STATIC_IF = ROOT / "src/backend/codegen_static_if.elisa"
 
 def function_text(text: str, name: str) -> str:
     match = re.search(
-        rf"(?ms)^        def {re.escape(name)}\(.*?(?=^        def |^    public:|\Z)",
+        rf"(?ms)^        def {re.escape(name)}(?:\[[^\]\n]+\])?\(.*?(?=^        def |^    public:|\Z)",
         text,
     )
     if match is None:
@@ -42,7 +42,9 @@ if not all(fragment in offset_walk for fragment in (
 
 selection = function_text(module, "select_module_declarations")
 if not all(fragment in selection for fragment in (
-    "selected_static_if_offsets(file, structs)",
+    "round_rows: darray[u32] = selected_static_if_rows(file, structs)",
+    "selected_rows <- round_rows",
+    "round_taken_offsets: darray[u32] = static_if_offsets_for_rows(file, selected_rows)",
     "flatten_static_branches(file.top_decls, static_branch_offsets, round_taken_offsets, round_top)",
 )):
     raise SystemExit("the shared selector must flatten only backend-selected static branches")
