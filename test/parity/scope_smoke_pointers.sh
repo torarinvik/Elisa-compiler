@@ -345,14 +345,15 @@ global mutable stored_entry: Entry = Entry{tag: 7}
 
 
 def peek(bucket: usize) -> i64 can[Abort.Panic]:
-    entry: mutable heap Entry&? = cache[bucket]
-    if entry == null:
-        return 0
-    return entry.tag
+    can Global.Read:
+        entry: mutable heap Entry&? = cache[bucket]
+        if entry == null:
+            return 0
+        return entry.tag
 
 
 def main() -> i64:
-    can Abort.Panic, Unsafe.PointerCast:
+    can Abort.Panic, Unsafe.PointerCast, Global{Read,Write}:
         cache[0] <- (&stored_entry).cast[heap Entry&]
         return peek(0.usize()) * 6 + peek(1.usize()) + peek(3.usize())
 EOF
