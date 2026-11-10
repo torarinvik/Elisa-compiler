@@ -58,15 +58,6 @@ func hashString(hash uint64, value string) uint64 {
 	return hash
 }
 
-func kindCode(kind lexer.TokenKind) uint64 {
-	switch kind {
-	case lexer.TOKEN_RANGE_LE:
-		return 109
-	default:
-		return uint64(kind) + 1
-	}
-}
-
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Fprintln(os.Stderr, "usage: stage0_full_tokens <file>")
@@ -82,13 +73,13 @@ func main() {
 	fullHash := offset
 	for {
 		token := l.NextToken()
-		code := kindCode(token.Kind)
+		code := uint64(token.Kind) + 1
 		kindHash = mix(kindHash, code)
 		fullHash = mix(fullHash, code)
 		fullHash = mix(fullHash, uint64(token.Pos.Line))
 		fullHash = mix(fullHash, uint64(token.Pos.Col))
 		fullHash = hashString(fullHash, token.Text)
-		fullHash = hashString(fullHash, token.Suffix)
+		fullHash = hashString(fullHash, token.Suffix.String())
 		if token.Kind == lexer.TOKEN_EOF {
 			break
 		}
@@ -99,6 +90,8 @@ EOF
 (cd "$ELISA_CORE/compiler" && go build -o "$WORK/stage0_full_tokens" "$WORK/stage0_full_tokens.go")
 
 cat > "$WORK/stage1_lexer_harness.elisa" <<EOF
+# The lexer-only harness has no parser to declare the source region.
+global region source
 include "$FIXTURE"
 
 def stage1_lexer_checksums(source: u8&, source_len: usize, kind_out: mutable u64&, full_out: mutable u64&):
