@@ -156,8 +156,8 @@ if not all(fragment in fixture for fragment in (
         "from SafeProvider import perform",
         "module RootCollision:",
         "module AliasSafeProvider:",
-        "module AliasInstallerA:\n    static if UNKNOWN_ALIAS_TARGET:\n        using AliasSafeProvider as RootCollision",
-        "module AliasInstallerB:\n    static if UNKNOWN_ALIAS_TARGET:\n        using AliasSafeProvider as RootCollision",
+        "module AliasInstallerA:\n    static if ELISA_TARGET_OS_WASI:\n        using AliasSafeProvider as RootCollision",
+        "module AliasInstallerB:\n    static if ELISA_TARGET_OS_WASI:\n        using AliasSafeProvider as RootCollision",
         "def unresolved_alias_does_not_fall_back_to_root_module()",
         "RootCollision::load()",
         "static if false:",
@@ -169,6 +169,7 @@ if not all(fragment in fixture for fragment in (
         "def choose(value: i64) -> i64 error[OverloadBranch::Fault]:",
         "choose(1)")) or not all(fragment in smoke for fragment in (
         "error_union_static_import_branches.elisa",
+        "ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown",
         "error union result must be handled",
         "unresolved module aliases blocking same-name raw-module fallback",
         "unhandled_count", "!= 1")):
