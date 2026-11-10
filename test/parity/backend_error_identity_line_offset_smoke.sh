@@ -9,6 +9,7 @@ LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LLVM_BIN="$(dirname -- "$LLVM_CONFIG")"
 OPT="${ELISA_OPT:-$LLVM_BIN/opt}"
 CLANG="${ELISA_CLANG:-$LLVM_BIN/clang}"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 FIXTURE="$ROOT/test/repro/backend_error_identity_line_offset.elisa"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-error-identity-offset.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -17,6 +18,7 @@ bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 [[ -x "$OPT" ]] || { echo "error identity offset smoke: missing opt: $OPT" >&2; exit 2; }
 [[ -x "$CLANG" ]] || { echo "error identity offset smoke: missing clang: $CLANG" >&2; exit 2; }
+[[ -f "$RUNTIME_OBJ" ]] || { echo "error identity offset smoke: missing runtime: $RUNTIME_OBJ" >&2; exit 2; }
 
 for level in 0 2; do
     for stage in 0 1; do
@@ -30,7 +32,8 @@ for level in 0 2; do
         fi
         "$OPT" -passes=verify -disable-output "$llvm"
         DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}" \
-            "$CLANG" "-O$level" -Wno-override-module -o "$WORK/stage${stage}-O${level}" "$llvm"
+            "$CLANG" "-O$level" -Wno-override-module $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS \
+            -o "$WORK/stage${stage}-O${level}" "$llvm" "$RUNTIME_OBJ" "$ROOT/test/parity/profile_hooks.c"
     done
 
     set +e
