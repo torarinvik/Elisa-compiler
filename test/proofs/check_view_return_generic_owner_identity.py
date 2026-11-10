@@ -5,7 +5,8 @@ import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "src/semantic/view_return_origins.elisa"
+COLLECT = ROOT / "src/semantic/view_return_origins_collect.elisa"
+API = ROOT / "src/semantic/view_return_origins_api.elisa"
 PARSER_FUNCTIONS = ROOT / "src/parser/parser_types_function.elisa"
 SMOKE = ROOT / "test/parity/owned_overload_storage_smoke.sh"
 ATOM = ROOT / "test/atoms/compiler_semantic.elisa"
@@ -22,7 +23,7 @@ def function_source(source: str, name: str) -> str:
     return match.group(0)
 
 
-source = SOURCE.read_text()
+collection = COLLECT.read_text()
 parser = PARSER_FUNCTIONS.read_text()
 smoke = SMOKE.read_text()
 atom = read_semantic_declaration_source(ATOM)
@@ -35,7 +36,7 @@ if "declaration_pos: Ast::Pos = Ast::decl_pos(declaration)" not in parser or \
         "generic_param_owner_offsets <- parser.generic_param_owner_offsets.push(function_offset) if is_generic_name" not in parser:
     raise SystemExit("function generic metadata must retain the same declaration offset stored in the AST")
 
-generic_lookup = function_source(source, "vro_generics_of")
+generic_lookup = function_source(collection, "vro_generics_of")
 if not all(fragment in generic_lookup for fragment in (
     "owner_offset: u32",
     "generic_names.count != generic_lines.count",
@@ -45,15 +46,15 @@ if not all(fragment in generic_lookup for fragment in (
 )):
     raise SystemExit("view-return generic lookup must validate and match the exact owner line and offset")
 
-collector = function_source(source, "vro_collect")
+collector = function_source(collection, "vro_collect")
 if not all(fragment in collector for fragment in (
     "generic_offsets: darray[u32]&",
     "vro_generics_of(pos.line, pos.offset, generic_lines, generic_offsets, generic_names, generics)",
-    "vro_collect(body, generic_lines, generic_offsets, generic_names, view_enums, prior, out)",
+    "vro_collect(body, generic_lines, generic_offsets, generic_names, view_enums, prior, prior_index, update_prior, mutables, out)",
 )):
     raise SystemExit("view-return declaration traversal must preserve owner offsets through nested scopes")
 
-entrypoint = function_source(source, "view_return_origin_rows")
+entrypoint = function_source(API.read_text(), "view_return_origin_rows")
 if entrypoint.count("file.generic_param_owner_offsets") != 2:
     raise SystemExit("both view-return collection passes must receive parser-owned generic offsets")
 if 'python3 "$ROOT/test/proofs/check_view_return_generic_owner_identity.py"' not in smoke:
@@ -61,8 +62,8 @@ if 'python3 "$ROOT/test/proofs/check_view_return_generic_owner_identity.py"' not
 if not all(fragment in atom for fragment in (
     'view_generic_names: darray[sview @source] = ["Widget"]',
     "view_generic_offsets: darray[u32] = [100]",
-    "view_generic_pos: Ast::Pos{line: 0",
-    "view_concrete_pos: Ast::Pos{line: 0",
+    "view_generic_pos: Ast::Pos = Ast::Pos{line: 0",
+    "view_concrete_pos: Ast::Pos = Ast::Pos{line: 0",
     "view_rows: darray[sview @source] = view_return_origin_rows(view_file)",
     'view_rows[0] != "generic"',
 )) or "  semantic " not in atom_smoke or \
