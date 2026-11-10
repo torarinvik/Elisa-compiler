@@ -47,6 +47,130 @@ static bool checkedMulCandidate(IntrinsicInst &C, LoopInfo &LI) {
 }
 
 #if LLVM_VERSION_MAJOR >= 23
+// Recover the range of expressions made from a bounded cursor and constants.
+static ConstantRange checkedMulCursorExpr(Value *V, PHINode *Cursor,
+                                          const ConstantRange &Bounds,
+                                          unsigned Depth = 0) {
+  if (V == Cursor) return Bounds;
+  if (auto *C = dyn_cast<ConstantInt>(V)) return ConstantRange(C->getValue());
+  auto *Op = dyn_cast<BinaryOperator>(V);
+  if (!Op || !Op->getType()->isIntegerTy(64) || Depth >= 4)
+    return ConstantRange::getFull(64);
+  switch (Op->getOpcode()) {
+  case Instruction::Add: case Instruction::Sub:
+  case Instruction::Shl: case Instruction::LShr:
+    return checkedMulCursorExpr(Op->getOperand(0), Cursor, Bounds, Depth + 1)
+        .binaryOp(static_cast<Instruction::BinaryOps>(Op->getOpcode()),
+                  checkedMulCursorExpr(Op->getOperand(1), Cursor, Bounds, Depth + 1));
+  default:
+    return ConstantRange::getFull(64);
+  }
+}
+
+static void replaceCheckedResult(IntrinsicInst &Call, IRBuilder<> &B, Value *Result) {
+  Value *Pair = B.CreateInsertValue(PoisonValue::get(Call.getType()), Result, 0);
+  Call.replaceAllUsesWith(B.CreateInsertValue(Pair, B.getFalse(), 1));
+  Call.eraseFromParent();
+}
+
+static bool foldCursorProductSum(IntrinsicInst &Mul, Loop &L, BasicBlock *Pre,
+                                 BasicBlock *Latch, const APInt &Trips,
+                                 const ConstantRange &Product) {
+  if (Product.getSignedMin().isNegative()) return false;
+  for (PHINode &Accumulator : L.getHeader()->phis()) {
+    if (Accumulator.getNumIncomingValues() != 2 || !Accumulator.getType()->isIntegerTy(64) ||
+        Accumulator.getBasicBlockIndex(Pre) < 0 || Accumulator.getBasicBlockIndex(Latch) < 0)
+      continue;
+    auto *Seed = dyn_cast<ConstantInt>(Accumulator.getIncomingValueForBlock(Pre));
+    auto *Value = dyn_cast<ExtractValueInst>(Accumulator.getIncomingValueForBlock(Latch));
+    auto *Add = Value ? dyn_cast<IntrinsicInst>(Value->getAggregateOperand()) : nullptr;
+    if (!Seed || Seed->isNegative() || !Add || !L.contains(Add) ||
+        Value->getNumIndices() != 1 || *Value->idx_begin() != 0 ||
+        Add->getIntrinsicID() != Intrinsic::sadd_with_overflow || Add->hasOperandBundles() ||
+        Add->isConvergent() || Add->hasMetadataOtherThanDebugLoc())
+      continue;
+    for (unsigned Side : {0u, 1u}) {
+      auto *Term = dyn_cast<ExtractValueInst>(Add->getArgOperand(1 - Side));
+      if (Add->getArgOperand(Side) != &Accumulator || !Term ||
+          Term->getAggregateOperand() != &Mul || Term->getNumIndices() != 1 ||
+          *Term->idx_begin() != 0)
+        continue;
+      APInt Upper = Seed->getValue().zext(128) +
+                    Trips.zext(128) * Product.getSignedMax().zext(128);
+      if (!Upper.isSignedIntN(64)) return false;
+      IRBuilder<> B(Add);
+      B.SetCurrentDebugLocation(Add->getDebugLoc());
+      replaceCheckedResult(*Add, B, B.CreateNSWAdd(Add->getArgOperand(0), Add->getArgOperand(1)));
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool foldCursorCheckedMul(IntrinsicInst &Mul, LoopInfo &LI, DominatorTree &DT,
+                                 bool &FoldedReduction) {
+  Loop *L = LI.getLoopFor(Mul.getParent());
+  BasicBlock *Pre = L->getLoopPredecessor(), *Latch = L->getLoopLatch();
+  if (!Pre || !Latch) return false;
+  auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
+  auto *Cmp = Br ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
+  if (!Cmp || !Cmp->isEquality()) return false;
+  unsigned Continue = Cmp->getPredicate() == ICmpInst::ICMP_EQ ? 1 : 0;
+  if (Br->getSuccessor(Continue) != L->getHeader() ||
+      L->contains(Br->getSuccessor(1 - Continue)))
+    return false;
+
+  for (unsigned Side : {0u, 1u}) {
+    Value *Tested = Cmp->getOperand(Side), *Limit = Cmp->getOperand(1 - Side);
+    auto *Cursor = dyn_cast<PHINode>(Tested);
+    if (!Cursor || !Cursor->getType()->isIntegerTy(64) ||
+        Cursor->getParent() != L->getHeader() || Cursor->getNumIncomingValues() != 2 ||
+        Cursor->getBasicBlockIndex(Pre) < 0 || Cursor->getBasicBlockIndex(Latch) < 0 ||
+        !L->isLoopInvariant(Limit))
+      continue;
+    auto *Start = dyn_cast<ConstantInt>(Cursor->getIncomingValueForBlock(Pre));
+    auto *Next = dyn_cast<BinaryOperator>(Cursor->getIncomingValueForBlock(Latch));
+    if (!Start || Start->isNegative() || !Next || Next->getOpcode() != Instruction::Add ||
+        Next->getOperand(0) != Cursor || !L->contains(Next))
+      continue;
+    auto *One = dyn_cast<ConstantInt>(Next->getOperand(1));
+    if (!One || !One->isOne()) continue;
+
+    Function &F = *Mul.getFunction();
+    AssumptionCache AC(F);
+    LazyValueInfo LVI(&F, &AC);
+    auto End = LVI.getConstantRangeOnEdge(Limit, Pre, L->getHeader(), Pre->getTerminator());
+    if (End.isEmptySet() || End.getSignedMin().slt(Start->getValue()) ||
+        End.getSignedMax().isMaxSignedValue())
+      continue;
+    // The cursor advances by one until equality, so it cannot exceed End
+    // or overflow its step. Use the same limit in the entry test and latch.
+    auto *ArgumentLimit = dyn_cast<Argument>(Limit);
+    if (!ArgumentLimit && !isGuaranteedNotToBeUndefOrPoison(Limit, &AC, Br, &DT))
+      continue;
+    ConstantRange Bounds(Start->getValue(), End.getSignedMax() + 1);
+    auto Left = checkedMulCursorExpr(Mul.getArgOperand(0), Cursor, Bounds);
+    auto Right = checkedMulCursorExpr(Mul.getArgOperand(1), Cursor, Bounds);
+    if (Left.isEmptySet() || Right.isEmptySet()) continue;
+    auto ProductRange = Left.smul_fast(Right);
+    if (ProductRange.isFullSet()) continue;
+    if (ArgumentLimit) {
+      IRBuilder<> Entry(&*F.getEntryBlock().getFirstInsertionPt());
+      Value *Stable = Entry.CreateFreeze(Limit, "checkedmul.limit");
+      Limit->replaceUsesWithIf(Stable, [Stable](Use &U) { return U.getUser() != Stable; });
+    }
+    FoldedReduction |= foldCursorProductSum(Mul, *L, Pre, Latch,
+                                            End.getSignedMax() - Start->getValue() + 1,
+                                            ProductRange);
+    IRBuilder<> B(&Mul);
+    B.SetCurrentDebugLocation(Mul.getDebugLoc());
+    Value *Product = B.CreateNSWMul(Mul.getArgOperand(0), Mul.getArgOperand(1));
+    replaceCheckedResult(Mul, B, Product);
+    return true;
+  }
+  return false;
+}
+
 constexpr uint64_t CheckedSquareMaxRoot = 3037000499; // floor(sqrt(INT64_MAX))
 static bool hasSafeSquareLimit(const ConstantRange &Range) {
   constexpr uint64_t MaxPrevious = CheckedSquareMaxRoot - 1;
@@ -188,6 +312,7 @@ extern "C" unsigned elisacoreFastCheckedMul(LLVMModuleRef ref, LLVMTargetMachine
   bool changed = false;
 #if LLVM_VERSION_MAJOR >= 23
   unsigned InitializerBudget = 6000, InitializerTrials = 0;
+  SmallVector<Function *, 4> VectorizableReductions;
 #endif
   for (Function &F : M) {
     if (F.isDeclaration() || F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
@@ -220,11 +345,14 @@ extern "C" unsigned elisacoreFastCheckedMul(LLVMModuleRef ref, LLVMTargetMachine
     if (work.size() > 32) continue;
     // These proofs change instructions only, leaving the CFG analyses valid.
 #if LLVM_VERSION_MAJOR >= 23
+    bool FoldedReduction = false;
     llvm::erase_if(work, [&](IntrinsicInst *C) {
-      if (!foldBoundedCheckedSquare(*C, LI, DT)) return false;
+      if (!foldCursorCheckedMul(*C, LI, DT, FoldedReduction) && !foldBoundedCheckedSquare(*C, LI, DT))
+        return false;
       changed = true;
       return true;
     });
+    if (FoldedReduction) VectorizableReductions.push_back(&F);
 #endif
     for (auto *C : work) { versionCheckedMul(*C); changed = true; }
     if (!work.empty()) F.addFnAttr("elisa.checkedmul.versioned");
@@ -237,6 +365,12 @@ extern "C" unsigned elisacoreFastCheckedMul(LLVMModuleRef ref, LLVMTargetMachine
   }
 #if LLVM_VERSION_MAJOR >= 23
   auto PowerOptions = LLVMCreatePassBuilderOptions();
+  for (Function *F : VectorizableReductions) {
+    auto Error = LLVMRunPassesOnFunction(wrap(F),
+        "loop-simplify,lcssa,loop-vectorize,instcombine<no-verify-fixpoint>,simplifycfg",
+        target, PowerOptions);
+    if (Error) { LLVMDisposePassBuilderOptions(PowerOptions); LLVMConsumeError(Error); return 2; }
+  }
   for (Function &F : M) {
     if (F.isDeclaration() || F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
         F.getSubprogram() || F.hasPersonalityFn() || F.hasGC() ||
