@@ -372,7 +372,7 @@ done
 echo "resolve smoke OK: loop-capture call initializers resolve without a dangling payload" >&2
 
 # Self-resolve diagnostic: run the resolver over the frontend's OWN source —
-# WHOLE-PROGRAM (all files concatenated into one combined symbol table), so
+# WHOLE-PROGRAM (the frontend include graph expanded into one symbol table), so
 # cross-file and module-qualified references (`Lexer::foo`, `Ast::Node`) resolve.
 # This dogfooding measurement drove the resolver to ~zero (788 per-file -> 5):
 # modeling cross-file modules, struct-literal field labels (labels are selectors,
@@ -406,20 +406,44 @@ sed -nE 's/^[[:space:]]*def ((perf_cores|pool_new|pool_shutdown)\(.*\)( -> .*)?)
     "$REPO_ROOT/elisacore_std/elisacore_concurrency_pool.elisa" | sort -u >> "$RUNTIME_STRINGS_IFACE"
 sed -nE 's/^def (sview_basename\(.*\) -> sview):$/extern \1/p' \
     "$REPO_ROOT/elisacore_std/elisacore_runtime_string_path_views.elisa" >> "$RUNTIME_STRINGS_IFACE"
-FRONTEND_FILES=()
-while IFS= read -r f; do
-    FRONTEND_FILES+=("$f")
-done < <(find "$REPO_ROOT/src/lexer" "$REPO_ROOT/src/parser" "$REPO_ROOT/src/semantic" -type f -name '*.elisa' -print | LC_ALL=C sort)
-for f in "$REPO_ROOT"/src/backend/codegen_const_checked_arithmetic.elisa \
-         "$REPO_ROOT"/elisacore_std/debug_referee.elisa "$REPO_ROOT"/elisacore_std/collections.elisai \
-         "$RUNTIME_STRINGS_IFACE"; do
-	[[ -f "$f" ]] && FRONTEND_FILES+=("$f")
-done
-if [[ ${#FRONTEND_FILES[@]} -gt 0 ]]; then
-	read -r self_unresolved self_files < <("$WORK/run" "${FRONTEND_FILES[@]}")
-	echo "resolve self-resolve: $self_unresolved unresolved across $self_files frontend files (whole-program)" >&2
-	if [[ "$self_unresolved" -gt "${RESOLVE_SELF_MAX:-0}" ]]; then
-		echo "resolve self-resolve FAILED: $self_unresolved > RESOLVE_SELF_MAX=${RESOLVE_SELF_MAX:-0}" >&2
-		exit 1
-	fi
+# Some included files are indented fragments of the surrounding declaration.
+# Expand each include at its source position and visit each file only once.
+frontend="$WORK/frontend.elisa"
+self_files="$(python3 - "$REPO_ROOT/src/semantic/semantic.elisa" "$frontend" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+include = re.compile(r'^[ \t]*(?:#\s*)?include[ \t]+"([^"]+)"[ \t]*$')
+seen = set()
+
+def expand(path, output):
+    path = path.resolve()
+    if path in seen:
+        return
+    seen.add(path)
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            match = include.fullmatch(line.rstrip("\n"))
+            if match:
+                expand(path.parent / match[1], output)
+            else:
+                output.write(line if line.endswith("\n") else line + "\n")
+
+with Path(sys.argv[2]).open("w", encoding="utf-8") as output:
+    expand(Path(sys.argv[1]), output)
+print(len(seen))
+PY
+)" || exit 1
+self_result="$("$WORK/run" "$frontend" "$REPO_ROOT/elisacore_std/debug_referee.elisa" \
+    "$REPO_ROOT/elisacore_std/collections.elisai" "$RUNTIME_STRINGS_IFACE")" || exit 1
+read -r self_unresolved _ <<<"$self_result"
+if ! [[ "$self_unresolved" =~ ^[0-9]+$ ]]; then
+	echo "resolve self-resolve FAILED: invalid probe result: $self_result" >&2
+	exit 1
+fi
+echo "resolve self-resolve: $self_unresolved unresolved across $self_files frontend files (whole-program)" >&2
+if [[ "$self_unresolved" -gt "${RESOLVE_SELF_MAX:-0}" ]]; then
+	echo "resolve self-resolve FAILED: $self_unresolved > RESOLVE_SELF_MAX=${RESOLVE_SELF_MAX:-0}" >&2
+	exit 1
 fi
