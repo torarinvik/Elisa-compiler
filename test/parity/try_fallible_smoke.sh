@@ -151,6 +151,25 @@ grep -q 'cannot propagate CallbackFault from a function returning ReturnFault' <
     exit 1
 }
 
+shadowed_callback_report=$(cat <<'ELISA' | "$RPT"
+error CallbackFault:
+    Bad
+error ReturnFault:
+    Other
+
+def compatible() -> i64 error[ReturnFault]:
+    return 1
+
+def shadowed(callback: fn() -> i64 error[CallbackFault]) -> i64 error[ReturnFault]:
+    if true:
+        callback = compatible
+        return try callback()
+    return 0
+ELISA
+)
+grep -Fxq 'P 0' <<< "$shadowed_callback_report"
+grep -Fxq 'D 0' <<< "$shadowed_callback_report"
+
 composite_source='error Foo:
     FooTag
 error Bar:
