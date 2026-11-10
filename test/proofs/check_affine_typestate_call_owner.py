@@ -304,7 +304,7 @@ if "return local_type_ids[name_index]" not in loop_iterable_type or \
         "can Memory.Allocate, Abort.Panic" not in lookup_qualified_module or \
         "can Memory.Allocate, Abort.Panic" not in qualified_return_type_id or \
         "affine_call_lookup_qualified_module(table, annotations, function_name, qualifier, lexical_module, selected_module)" not in qualified_return_type_id or \
-        "callable_function_declaration_visible(annotations, function_name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)" not in qualified_return_type_id or \
+        "callable_function_declaration_visible(table.visibility_annotations, function_name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)" not in qualified_return_type_id or \
         "symbol.module_owner == selected_module" not in qualified_return_type_id or \
         "symbol_chain_head(table, function_name)" not in qualified_return_type_id or \
         "table.symbol_name_next[cursor.usize()]" not in qualified_return_type_id or \
@@ -315,7 +315,7 @@ if "return local_type_ids[name_index]" not in loop_iterable_type or \
         "type_id_contains_region(selected_return_id" not in qualified_return_type_id or \
         "affine_call_lookup_module(table, annotations, function_name, lexical_module, selected_module)" not in unqualified_return_type_id or \
         "symbol.module_owner == selected_module" not in unqualified_return_type_id or \
-        "callable_function_declaration_visible(annotations, function_name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)" not in unqualified_return_type_id or \
+        "callable_function_declaration_visible(table.visibility_annotations, function_name, symbol.module_owner, symbol.line, symbol.offset, lexical_module)" not in unqualified_return_type_id or \
         "symbol_chain_head(table, function_name)" not in unqualified_return_type_id or \
         "table.symbol_name_next[cursor.usize()]" not in unqualified_return_type_id or \
         "declarations > 1" not in unqualified_return_type_id or \
