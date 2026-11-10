@@ -11,6 +11,9 @@
 # `-emit llvm` is exercised on one fixture: the module must parse as textual IR (llvm-as or
 # clang can consume it) and contain the program's main.
 set -uo pipefail
+# Keep the runtime contract mode constant while varying the LLVM pipeline.
+# The default optimized build erases assertions that -O0 checks.
+export ELISACORE_FORCE_CONTRACTS=1
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
