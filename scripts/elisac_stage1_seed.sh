@@ -123,6 +123,11 @@ seed_build() {
   }
   cleanup_seed_lock() {
     finish_seed_freshness_check || true
+    if [[ -n "${ELISA_SEED_BRIDGE_PID:-}" ]]; then
+      kill "$ELISA_SEED_BRIDGE_PID" 2>/dev/null || true
+      wait "$ELISA_SEED_BRIDGE_PID" 2>/dev/null || true
+      ELISA_SEED_BRIDGE_PID=""
+    fi
     if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
       rm -f "$ELISA_SEED_OUTPUT"
     fi
@@ -274,6 +279,10 @@ seed_build() {
   # above. ELISACORE_PARALLEL_IR=0 restores serial whole-module lowering.
   seed_parallel_ir="${ELISACORE_PARALLEL_IR-1}"
   seed_parallel_opt_import="${ELISACORE_PARALLEL_OPT_IMPORT-100}"
+  # Prepare the independently keyed LLVM bridge while the bootstrap compiler runs.
+  # The result is joined before linking, and cleanup kills it on every early exit.
+  bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$ELISA_SEED_LLVM_BRIDGE" &
+  ELISA_SEED_BRIDGE_PID=$!
   # Stage1 includes its own standard-library copy; authorize only that exact file. The
   # bootstrap loader still requires it to appear in the expanded include set.
   ELISACORE_RETAINED_SPLICED_CODEGEN="$seed_spliced_codegen" \
@@ -391,7 +400,12 @@ seed_build() {
     bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" >"$seed_profile_hook_source"
   fi
   local seed_llvm_bridge="$ELISA_SEED_LLVM_BRIDGE"
-  bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$seed_llvm_bridge"
+  if ! wait "$ELISA_SEED_BRIDGE_PID"; then
+    ELISA_SEED_BRIDGE_PID=""
+    echo "seed: LLVM bridge build failed" >&2
+    exit 2
+  fi
+  ELISA_SEED_BRIDGE_PID=""
   seed_link_objects+=("$seed_llvm_bridge")
   local seed_cxx_lib=-lc++
   [[ "$(uname -s)" == Linux ]] && seed_cxx_lib=-lstdc++
