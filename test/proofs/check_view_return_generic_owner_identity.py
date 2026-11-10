@@ -64,8 +64,10 @@ if not all(fragment in atom for fragment in (
     "view_generic_offsets: darray[u32] = [100]",
     "view_generic_pos: Ast::Pos = Ast::Pos{line: 0",
     "view_concrete_pos: Ast::Pos = Ast::Pos{line: 0",
-    "view_rows: darray[sview @source] = view_return_origin_rows(view_file)",
-    'view_rows[0] != "generic"',
+    "vro_generics_of(view_generic_pos.line, view_generic_pos.offset,",
+    "vro_generics_of(view_concrete_pos.line, view_concrete_pos.offset,",
+    'return 103 if not vro_borrow_return(Ast::Expr.Ident("Widget", view_generic_pos), generic_parameters)',
+    'return 103 if vro_borrow_return(Ast::Expr.Ident("Widget", view_concrete_pos), concrete_parameters)',
 )) or "  semantic " not in atom_smoke or \
         'python3 "$ROOT/test/proofs/check_view_return_generic_owner_identity.py"' not in atom_smoke:
     raise SystemExit("semantic compiler atom must reject a same-line generic-to-concrete return leak")
