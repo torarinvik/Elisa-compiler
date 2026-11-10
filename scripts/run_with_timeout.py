@@ -61,7 +61,11 @@ def run(command: list[str], timeout_seconds: float) -> int:
     try:
         return_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        _terminate_group(process)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
         print(
             f"run_with_timeout: deadline exceeded ({timeout_seconds:g}s); "
             f"terminated owned process group {process.pid}",
