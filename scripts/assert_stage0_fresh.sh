@@ -29,8 +29,9 @@ if [ "${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}" = stage1 ] || [ "$(basename "$BIN")
         exit 2
     fi
     . "$STAGE1_ROOT/scripts/platform.sh"
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "cannot verify Stage1 bootstrap provenance: python3 is unavailable (binary: $BIN)" >&2
+    provenance_python="${ELISA_TOOL_PYTHON:-python3}"
+    if ! command -v "$provenance_python" >/dev/null 2>&1; then
+        echo "cannot verify Stage1 bootstrap provenance: $provenance_python is unavailable (binary: $BIN)" >&2
         exit 2
     fi
     # Check the Stage1 product's recorded bootstrap inputs, not the compiler currently
@@ -42,7 +43,11 @@ if [ "${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}" = stage1 ] || [ "$(basename "$BIN")
         -u BOOTSTRAP_BIN \
         -u STAGE0_BIN \
         -u ELISACORE_BIN \
-        python3 "$STAGE1_PROVENANCE" check "$STAGE1_ROOT" "$BIN" || {
+        ELISA_PROVENANCE_LIBRARY_PATH_SET="${LIBRARY_PATH+x}" \
+        ELISA_PROVENANCE_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
+        ELISA_PROVENANCE_SDKROOT_SET="${SDKROOT+x}" \
+        ELISA_PROVENANCE_SDKROOT_VALUE="${SDKROOT-}" \
+        "$provenance_python" "$STAGE1_PROVENANCE" check "$STAGE1_ROOT" "$BIN" || {
         echo "Stage1 bootstrap product is stale or unverifiable: $BIN" >&2
         exit 2
     }

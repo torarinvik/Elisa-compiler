@@ -8,7 +8,7 @@ STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$ROOT}"
 RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 source "$ROOT/test/parity/run_timeout.sh"
 . "$STAGE1_ROOT/scripts/platform.sh"
-python3 "$STAGE1_ROOT/scripts/stage1_provenance.py" check "$STAGE1_ROOT" "$STAGE1"
+elisa_stage1_provenance check "$STAGE1_ROOT" "$STAGE1"
 bash "$STAGE1_ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 [[ -x "$STAGE1" ]] || { echo "protocol graph transition smoke: missing Stage1: $STAGE1" >&2; exit 2; }
 [[ -f "$RUNTIME" ]] || { echo "protocol graph transition smoke: missing runtime object: $RUNTIME" >&2; exit 2; }

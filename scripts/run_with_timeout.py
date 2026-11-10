@@ -83,6 +83,14 @@ def _terminate_on_signal(process: subprocess.Popen[bytes], signum: int) -> NoRet
 
 
 def main(argv: list[str] | None = None) -> int:
+    for name in ("LIBRARY_PATH", "SDKROOT"):
+        present = os.environ.pop(f"ELISA_TIMEOUT_{name}_SET", None)
+        value = os.environ.pop(f"ELISA_TIMEOUT_{name}_VALUE", "")
+        if present == "x":
+            os.environ[name] = value
+        elif present == "":
+            os.environ.pop(name, None)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("timeout_seconds", type=float)
     parser.add_argument("command", nargs=argparse.REMAINDER)

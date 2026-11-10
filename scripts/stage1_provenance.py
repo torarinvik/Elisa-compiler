@@ -515,6 +515,14 @@ def check(root, binary, exact=False):
 
 
 def main(argv):
+    for name in ("LIBRARY_PATH", "SDKROOT"):
+        present = os.environ.pop(f"ELISA_PROVENANCE_{name}_SET", None)
+        value = os.environ.pop(f"ELISA_PROVENANCE_{name}_VALUE", "")
+        if present == "x":
+            os.environ[name] = value
+        elif present == "":
+            os.environ.pop(name, None)
+
     if len(argv) < 2:
         print("usage: stage1_provenance.py (bootstrap-kind|record|check|check-exact|inputs|write-fingerprint|check-inputs) ...", file=sys.stderr)
         return 2

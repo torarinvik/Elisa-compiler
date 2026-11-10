@@ -37,7 +37,11 @@ if [[ "${1:-}" == "--seed" && "${ELISA_STAGE1_SEED_TIMEOUT_WRAPPED:-0}" != "1" ]
   # accounting includes every child in its bounded process group. Direct
   # developer-script invocations get the same 30-second wall cap.
   export ELISA_STAGE1_SEED_TIMEOUT_WRAPPED=1
-  exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 30 -- \
+  ELISA_TIMEOUT_LIBRARY_PATH_SET="${LIBRARY_PATH+x}" \
+  ELISA_TIMEOUT_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
+  ELISA_TIMEOUT_SDKROOT_SET="${SDKROOT+x}" \
+  ELISA_TIMEOUT_SDKROOT_VALUE="${SDKROOT-}" \
+    exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 30 -- \
     "$BASH" "${BASH_SOURCE[0]}" "$@"
 fi
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
@@ -191,7 +195,7 @@ source "$ROOT/scripts/elisac_stage1_seed.sh"
 if [[ "${1:-}" == "--seed" ]]; then
   export ELISA_STAGE1_SEED_BOOTSTRAP_BIN="$BOOTSTRAP_BIN"
   if [[ -z "${ELISA_STAGE1_SEED_BOOTSTRAP_KIND:-}" ]]; then
-    ELISA_STAGE1_SEED_BOOTSTRAP_KIND="$("$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" bootstrap-kind "$BOOTSTRAP_BIN")"
+    ELISA_STAGE1_SEED_BOOTSTRAP_KIND="$(elisa_stage1_provenance bootstrap-kind "$BOOTSTRAP_BIN")"
   fi
   case "$ELISA_STAGE1_SEED_BOOTSTRAP_KIND" in
     stage0|stage1) ;;
@@ -208,14 +212,14 @@ if [[ "${1:-}" == "--seed" ]]; then
   # anything; the full (content and toolchain) fingerprint is computed beside the
   # build. seed_build joins it and requires both it and the tree after the build to
   # match the anchor, so a write at any point of the build still refuses publication.
-  ELISA_STAGE1_SEED_WRITES="$("$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" write-fingerprint "$ROOT")"
+  ELISA_STAGE1_SEED_WRITES="$(elisa_stage1_provenance write-fingerprint "$ROOT")"
   mkdir -p "$ROOT/build"
   ELISA_SEED_INPUTS_FILE="$ROOT/build/.seed-inputs.$$"
-  "$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
+  elisa_stage1_provenance inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
   ELISA_SEED_INPUTS_PID=$!
   seed_build
   # seed_build's check-inputs proved these build-time inputs unchanged through the build.
-  "$ELISA_TOOL_PYTHON" "$ROOT/scripts/stage1_provenance.py" record-verified "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
+  elisa_stage1_provenance record-verified "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
   exit 0
 fi
 

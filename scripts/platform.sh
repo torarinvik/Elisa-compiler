@@ -153,6 +153,16 @@ export ELISA_TOOL_PYTHON
 export ELISA_NPROC="${ELISA_NPROC:-$( (nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )}"
 fi
 
+# macOS system Python can add linker settings before running the script.
+# Pass their shell values separately, including the distinction between unset and empty.
+elisa_stage1_provenance() {
+    ELISA_PROVENANCE_LIBRARY_PATH_SET="${LIBRARY_PATH+x}" \
+    ELISA_PROVENANCE_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
+    ELISA_PROVENANCE_SDKROOT_SET="${SDKROOT+x}" \
+    ELISA_PROVENANCE_SDKROOT_VALUE="${SDKROOT-}" \
+        "$ELISA_TOOL_PYTHON" "${BASH_SOURCE[0]%/*}/stage1_provenance.py" "$@"
+}
+
 elisa_sha256() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
 }
