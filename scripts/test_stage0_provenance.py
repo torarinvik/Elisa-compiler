@@ -55,6 +55,13 @@ class Stage0ProvenanceTests(unittest.TestCase):
             "arm64": "arm64",
         }.get(platform.machine().lower(), platform.machine().lower())
 
+    def is_guarded_go_build(self, args) -> bool:
+        if Path(args[1]).name != "run_with_timeout.py":
+            return False
+        self.assertEqual(args[0], sys.executable)
+        self.assertEqual(args[2:8], ["5", "--grace-seconds", "0", "--", "go", "build"])
+        return True
+
     def fake_go(self, args, **kwargs):
         if args[1] == "env":
             environment = dict(self.go_environment)
@@ -81,7 +88,7 @@ class Stage0ProvenanceTests(unittest.TestCase):
             return stage0_provenance.subprocess.CompletedProcess(
                 args, 0, stdout="\n".join(json.dumps(package) for package in packages), stderr=""
             )
-        if args[1] == "build":
+        if self.is_guarded_go_build(args):
             output = Path(args[args.index("-o") + 1])
             output.write_bytes(b"fresh fake executable")
             output.chmod(0o755)
@@ -191,7 +198,7 @@ class Stage0ProvenanceTests(unittest.TestCase):
         previous_receipt = receipt.read_bytes()
 
         def failed_build(args, **kwargs):
-            if args[1] == "build":
+            if self.is_guarded_go_build(args):
                 return stage0_provenance.subprocess.CompletedProcess(args, 1, stdout="", stderr="compile failed")
             return self.fake_go(args, **kwargs)
 
@@ -207,7 +214,7 @@ class Stage0ProvenanceTests(unittest.TestCase):
         previous_receipt = receipt.read_bytes()
 
         def no_output_build(args, **kwargs):
-            if args[1] == "build":
+            if self.is_guarded_go_build(args):
                 return stage0_provenance.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
             return self.fake_go(args, **kwargs)
 
@@ -223,7 +230,7 @@ class Stage0ProvenanceTests(unittest.TestCase):
         previous_receipt = receipt.read_bytes()
 
         def mutate_during_build(args, **kwargs):
-            if args[1] == "build":
+            if self.is_guarded_go_build(args):
                 output = Path(args[args.index("-o") + 1])
                 output.write_bytes(b"fresh but raced executable")
                 output.chmod(0o755)
@@ -289,7 +296,7 @@ class Stage0ProvenanceTests(unittest.TestCase):
 
     def test_rejects_wrong_package_or_module_identity(self) -> None:
         def wrong_identity(args, **kwargs):
-            if args[1] in ("env", "list", "build"):
+            if args[1] in ("env", "list") or self.is_guarded_go_build(args):
                 return self.fake_go(args, **kwargs)
             binary = Path(args[-1])
             return stage0_provenance.subprocess.CompletedProcess(
