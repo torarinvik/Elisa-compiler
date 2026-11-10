@@ -44,13 +44,20 @@ def sample_rebuild():
             roots = [pid for pid in candidates if processes[pid][0] not in candidate_set]
             target = min(roots or candidates)
         else:
-            # Stage0 is built by Go. Sample the tool doing the work, not the
-            # go command waiting for its worker to finish.
-            workers = [pid for pid in descendants
-                       if os.path.basename(processes.get(pid, (0, ""))[1]) in {"compile", "cgo", "link"}]
+            # Go builds Stage0 and Clang builds the Stage1 LLVM bridge.
+            # Sample the worker while the driver waits for it.
+            workers = []
+            for pid in descendants:
+                command = os.path.basename(processes.get(pid, (0, ""))[1])
+                if command in {"ld", "ld64.lld", "ld.lld", "dsymutil"}:
+                    workers.append((0, pid))
+                elif command in {"compile", "clang", "clang++"} or command.startswith("clang-"):
+                    workers.append((1, pid))
+                elif command in {"cgo", "link"}:
+                    workers.append((2, pid))
             if not workers:
                 return
-            target = min(workers)
+            _, target = min(workers)
         subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-file", profile],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4, check=False)
     except (OSError, ValueError, subprocess.SubprocessError):
