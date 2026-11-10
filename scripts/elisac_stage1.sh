@@ -218,8 +218,6 @@ if [[ "${1:-}" == "--seed" ]]; then
   elisa_stage1_provenance inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
   ELISA_SEED_INPUTS_PID=$!
   seed_build
-  # seed_build's check-inputs proved these build-time inputs unchanged through the build.
-  elisa_stage1_provenance record-verified "$ROOT" "$BIN" "$ELISA_STAGE1_SEED_INPUTS"
   exit 0
 fi
 

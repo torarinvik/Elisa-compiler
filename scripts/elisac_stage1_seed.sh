@@ -107,6 +107,8 @@ seed_build() {
   seed_profile_hook_source=""
   ELISA_SEED_OUTPUT=""
   ELISA_SEED_OUTPUT_DIR=""
+  ELISA_SEED_RUNTIME_DIR=""
+  ELISA_SEED_RECEIPT_PID=""
   ELISA_SEED_OBJECT="$seed_object"
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
   ELISA_SEED_LLVM_BRIDGE="$ROOT/build/elisac_stage1_llvm_bridge.tmp.$$.o"
@@ -137,7 +139,16 @@ seed_build() {
     if [[ -n "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}" ]]; then
       rm -f "$ELISA_SEED_PROFILE_HOOK_SOURCE"
     fi
+    if [[ -n "$ELISA_SEED_RECEIPT_PID" ]]; then
+      kill "$ELISA_SEED_RECEIPT_PID" 2>/dev/null || true
+      wait "$ELISA_SEED_RECEIPT_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$ELISA_SEED_RUNTIME_DIR" ]]; then
+      rm -f "$ELISA_SEED_RUNTIME_DIR"/runtime.o*
+      rmdir "$ELISA_SEED_RUNTIME_DIR" 2>/dev/null || true
+    fi
     if [[ -n "${ELISA_SEED_OUTPUT_DIR:-}" ]]; then
+      rm -f "$ELISA_SEED_OUTPUT_DIR"/*.provenance.json*
       rmdir "$ELISA_SEED_OUTPUT_DIR" 2>/dev/null || true
     fi
     [[ -z "${ELISA_SEED_LLVM_BRIDGE:-}" ]] || rm -f "$ELISA_SEED_LLVM_BRIDGE"
@@ -422,16 +433,30 @@ seed_build() {
     echo "seed: refusing to publish a product built while its source inputs were changing" >&2
     exit 2
   fi
-  mv -f "$seed_output" "$BIN"
+  # Prepare the receipt and the matching runtime before making the new compiler
+  # visible. A failed or timed-out runtime build leaves the installed set usable.
+  elisa_stage1_provenance record-verified "$ROOT" "$seed_output" "$ELISA_STAGE1_SEED_INPUTS" &
+  ELISA_SEED_RECEIPT_PID=$!
+  local runtime_out="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
+  mkdir -p "$(dirname "$runtime_out")"
+  ELISA_SEED_RUNTIME_DIR="$(mktemp -d "$runtime_out.seed.XXXXXXXX")"
+  local runtime_stage="$ELISA_SEED_RUNTIME_DIR/runtime.o"
+  if [[ -s "$runtime_out" && -f "$runtime_out.inputs.sha256" ]]; then
+    cp -p "$runtime_out" "$runtime_stage"
+    cp -p "$runtime_out.inputs.sha256" "$runtime_stage.inputs.sha256"
+  fi
+  ELISA_STAGE1_BIN="$seed_output" ELISA_RUNTIME_PRODUCT_IDENTITY_PATH="$BIN" \
+    ELISA_RUNTIME_OBJ="$runtime_stage" bash "$ROOT/scripts/build_runtime_object.sh"
+  wait "$ELISA_SEED_RECEIPT_PID"
+  ELISA_SEED_RECEIPT_PID=""
+
   mv -f "$seed_object" "$seed_object_output"
+  mv -f "$runtime_stage" "$runtime_out"
+  mv -f "$runtime_stage.inputs.sha256" "$runtime_out.inputs.sha256"
+  mv -f "$seed_output.provenance.json" "$BIN.provenance.json"
+  mv -f "$seed_output" "$BIN"
   ELISA_SEED_OUTPUT=""
   rm -f "$seed_profile_hook_source"
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
-  echo "seed: wrote $BIN" >&2
-  # The runtime object is built BY the product just written, from the same std it
-  # embeds: one compiler for the program and its runtime. A seed that left the object
-  # behind handed every consumer a pair from two different sources -- it went unrefreshed
-  # for a week that way and nothing noticed until a link failed. Digest-guarded (the
-  # product is one of the inputs), so this is a no-op when the object already matches.
-  ELISA_STAGE1_BIN="$BIN" bash "$ROOT/scripts/build_runtime_object.sh"
+  echo "seed: wrote $BIN and $runtime_out" >&2
 }

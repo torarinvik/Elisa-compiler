@@ -148,6 +148,10 @@ done
 cat > "$out" <<'PRODUCT'
 #!/usr/bin/env bash
 set -uo pipefail
+if [[ "${FAKE_RUNTIME_FAIL:-0}" == 1 ]]; then
+  echo 'injected runtime build failure' >&2
+  exit 9
+fi
 o=""
 n=0
 for a in "$@"; do
@@ -157,6 +161,9 @@ done
 [[ -n "$o" ]] && printf 'fake object\n' > "$o"
 exit 0
 PRODUCT
+if [[ "${FAKE_RUNTIME_FAIL:-0}" == 1 ]]; then
+  echo '# different compiler image' >> "$out"
+fi
 chmod +x "$out"
 STUB
 chmod +x "$WORK/clang"
@@ -179,23 +186,26 @@ chmod +x "$WORK/clang++"
 # straight over build/runtime/elisacore_runtime.o, and the ~27 gates that link against the
 # runtime failed with `ld: unknown file type` for the rest of the run (2026-09-16).
 # Keep this stub seed's lock private; a real Stage1 seed on the host stays serialized.
-FAKE_LLVM_LIBDIR="$WORK/lib" \
-FAKE_LLVM_BINDIR="$WORK" \
-TMPDIR="$WORK/tmp" \
-ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR="$WORK/tmp/elisac-stage1-global-seed.lock" \
-ELISA_RUNTIME_OBJ="$WORK/build/runtime/elisacore_runtime.o" \
-ELISA_PARSE_REPORT="$WORK/build/parse_report" \
-FAKE_CLANG_ARGS="$WORK/clang.args" \
-FAKE_LINKER="$WORK/ld" \
-ELISA_CORE="$WORK/core" \
-ELISACORE_BIN="$WORK/core/compiler/bin/elisac" \
-ELISA_STAGE1_BIN="$WORK/bin/elisac-stage1" \
-LLVM_CONFIG="$WORK/llvm-config" \
-ELISA_CLANG="$WORK/clang" \
-  bash "$WORK/scripts/elisac_stage1.sh" --seed >"$WORK/seed.log" 2>&1 || {
-    cat "$WORK/seed.log" >&2
-    exit 1
-  }
+seed() {
+  FAKE_LLVM_LIBDIR="$WORK/lib" \
+  FAKE_LLVM_BINDIR="$WORK" \
+  TMPDIR="$WORK/tmp" \
+  ELISA_STAGE1_GLOBAL_SEED_LOCK_DIR="$WORK/tmp/elisac-stage1-global-seed.lock" \
+  ELISA_RUNTIME_OBJ="$WORK/build/runtime/elisacore_runtime.o" \
+  ELISA_PARSE_REPORT="$WORK/build/parse_report" \
+  FAKE_CLANG_ARGS="$WORK/clang.args" \
+  FAKE_LINKER="$WORK/ld" \
+  ELISA_CORE="$WORK/core" \
+  ELISACORE_BIN="$WORK/core/compiler/bin/elisac" \
+  ELISA_STAGE1_BIN="$WORK/bin/elisac-stage1" \
+  LLVM_CONFIG="$WORK/llvm-config" \
+  ELISA_CLANG="$WORK/clang" \
+    bash "$WORK/scripts/elisac_stage1.sh" --seed >"$WORK/seed.log" 2>&1
+}
+if ! seed; then
+  cat "$WORK/seed.log" >&2
+  exit 1
+fi
 
 grep -F "seed: building Stage1 product with stage0 bootstrap compiler $WORK/core/compiler/bin/elisac" "$WORK/seed.log" >/dev/null
 
@@ -235,4 +245,19 @@ case "$(uname -s)" in
     exit 2
     ;;
 esac
+# A failure after linking the compiler must preserve the last published set.
+product="$WORK/bin/elisac-stage1"
+runtime="$WORK/build/runtime/elisacore_runtime.o"
+for file in "$product" "$product.provenance.json" "$runtime" "$runtime.inputs.sha256"; do
+  cp "$file" "$file.last-good"
+done
+if FAKE_RUNTIME_FAIL=1 ELISA_RUNTIME_FORCE=1 seed; then
+  echo 'seed unexpectedly accepted an unsuccessful runtime build' >&2
+  exit 1
+fi
+grep -F 'injected runtime build failure' "$WORK/seed.log" >/dev/null
+for file in "$product" "$product.provenance.json" "$runtime" "$runtime.inputs.sha256"; do
+  cmp "$file" "$file.last-good"
+done
+[[ ! -e "$WORK/build/.elisac-stage1-seed.lock" ]]
 echo "seed_fresh_worktree_smoke OK"

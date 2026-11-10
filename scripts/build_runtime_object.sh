@@ -17,6 +17,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/build_runtime_object.sh"
 PRODUCT="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+PRODUCT_IDENTITY_PATH="${ELISA_RUNTIME_PRODUCT_IDENTITY_PATH:-$PRODUCT}"
 OUT="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 RUNTIME_OVERFLOW="${ELISA_RUNTIME_OVERFLOW:-default}"
 # Match the backend's effective FP policy; strict overrides all fast-math
@@ -66,6 +67,8 @@ else
   exit 2
 fi
 runtime_input_digest() {
+  local product_digest
+  product_digest="$(runtime_object_digest "$PRODUCT")" || return
   # Conservatively cover the entire runtime source tree, including interfaces.
   # Content and path hashing detects edited, added, deleted, and backdated
   # includes; the tiny entrypoint's mtime cannot establish runtime freshness.
@@ -73,7 +76,8 @@ runtime_input_digest() {
     find "$ROOT/elisacore_std" -type f \( -name '*.elisa' -o -name '*.elisai' \) \
       -exec "${HASH_COMMAND[@]}" {} + || return
     # The PRODUCT is an input: a reseed changes the compiler that builds the object.
-    "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$PRODUCT" "$ELISA_CLANG_TOOL" || return
+    "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$ELISA_CLANG_TOOL" || return
+    printf 'product %s %s\n' "$product_digest" "$PRODUCT_IDENTITY_PATH"
     # So is the optimisation level: an -O0 and an -O2 object are different products.
     printf 'opt-level %s\n' "$RUNTIME_OPT_LEVEL"
     # And the arithmetic mode, which matters for a checked benchmark profile.
@@ -110,10 +114,23 @@ RUNTIME_TMP="$OUT.runtime.$$.tmp"
 HOOK_SOURCE="$OUT.hooks.$$.c"
 HOOK_OBJECT="$OUT.hooks.$$.o"
 STAMP_TMP="$STAMP.$$.tmp"
+HOOK_PID=""
 cleanup_runtime_build() {
+  if [[ -n "$HOOK_PID" ]]; then
+    kill "$HOOK_PID" 2>/dev/null || true
+    wait "$HOOK_PID" 2>/dev/null || true
+  fi
   rm -f "$TMP" "$RUNTIME_TMP" "$HOOK_SOURCE" "$HOOK_OBJECT" "$STAMP_TMP"
 }
 trap cleanup_runtime_build EXIT
+# Prepare the C hook object independently of the Elisa runtime compilation.
+(
+  # --host-callbacks: the object must link STANDALONE (`clang prog.o elisacore_runtime.o`),
+  # not only through the driver, which adds its own weak callback shims and -dead_strip.
+  bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" --host-callbacks >"$HOOK_SOURCE"
+  "$ELISA_CLANG_TOOL" -fno-builtin -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
+) &
+HOOK_PID=$!
 # The raw product, not the elisac_stage1.sh wrapper: the wrapper refuses a product older
 # than its sources, and this script is the wrapper's own last step of a seed -- the
 # freshness the wrapper would check is the freshness the caller is establishing.
@@ -127,10 +144,8 @@ else
   ELISA_STAGE1_RUNTIME_STD=1 ELISACORE_FORCE_CONTRACTS=1 "$PRODUCT" -emit obj "$RUNTIME_OPT_LEVEL" \
     "-foverflow=$RUNTIME_OVERFLOW" -o "$RUNTIME_TMP" "$SRC"
 fi
-# --host-callbacks: the object must link STANDALONE (`clang prog.o elisacore_runtime.o`),
-# not only through the driver, which adds its own weak callback shims and -dead_strip.
-bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" --host-callbacks >"$HOOK_SOURCE"
-"$ELISA_CLANG_TOOL" -fno-builtin -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
+wait "$HOOK_PID"
+HOOK_PID=""
 "$ELISA_CLANG_TOOL" -r -o "$TMP" "$RUNTIME_TMP" "$HOOK_OBJECT"
 if [[ "$INPUT_DIGEST" != "$(runtime_input_digest)" ]]; then
   echo "runtime inputs changed during build; keeping the previous runtime object" >&2
