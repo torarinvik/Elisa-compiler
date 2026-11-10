@@ -28,7 +28,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 run_isolated() {
-    python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+    # Non-interactive Bash gives background jobs /dev/null unless stdin is explicit.
+    python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" <&0 &
     ACTIVE_PID=$!
     local run_status=0
     wait "$ACTIVE_PID" || run_status=$?

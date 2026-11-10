@@ -1,31 +1,11 @@
 #!/usr/bin/env bash
-# `u8&` RETURNED IN A `cstr` CONTEXT — pointer pass-through, not a deref.
-#
-# codegen_expr_calls.elisa auto-dereferences a call whose declared return is `T&` when the
-# surrounding context is not itself a `T&`. That is right for `v: i64 = get_ref()` and WRONG
-# for a `cstr` context: `cstr` is a pointer and `u8&` IS one. The load produced an `i8`, the
-# return path's type-identity check refused it, and the function declined — which is the shape
-# of every integer/float/char `impl Str for X: def __cast__(self: X) -> cstr: return
-# int_to_string_scratch(self)` in the std. Fourteen of them declined silently in every program
-# that includes the runtime; `print(42)` is the first thing that REFERENCES one (through the
-# generic `print[T: Str]`), and a referenced decline drops the whole module.
-#
-# The same conversion through a LOCAL (`x: cstr = f()`) always passed the pointer through, so
-# the two paths disagreed about one program — that inconsistency is the bug in one line.
-#
-# Two checks, because the fix has to be narrow:
-#   1. the `cstr` return round-trips the actual string (not a byte, not a decline);
-#   2. the emitted IR really passes the pointer through — no `load i8` in the way.
-#
-# `print(42)`, the symptom this gap was found through, needs one more thing on top and is
-# covered by protocol_static_dispatch_smoke.sh.
+# An explicitly converted byte reference must remain a pointer in a cstr return.
+# Check both the native round trip and the IR so a scalar byte load cannot pass.
 set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || { echo "cstr-ref-return FAIL: no runtime object" >&2; exit 1; }
-STD="$ROOT/elisacore_std"
-[ -f "$STD/elisacore_runtime.elisa" ] || { echo "cstr-ref-return FAIL: no vendored elisacore_std" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -44,17 +24,20 @@ build_run() {   # name -> sets $out / $rc
 }
 
 # --- 1. a `u8&`-returning call returned as `cstr` -----------------------------------------
-cat >"$WORK/passthrough.elisa" <<EOF
-include "$STD/elisacore_runtime.elisa"
+cat >"$WORK/passthrough.elisa" <<'EOF'
+extern puts(text: cstr) -> i32
 
-def as_text(v: i64) -> cstr:
-    can Memory.Allocate, Console.Format, Abort.Panic:
-        return int_to_string_scratch(v)
+def text_bytes(text: cstr) -> u8&:
+    trusted Unsafe.PointerCast:
+        return text.cast[u8&]
+
+def as_text(text: cstr) -> cstr:
+    trusted Unsafe.PointerCast:
+        return text_bytes(text).cast[cstr]
 
 def main() -> i64:
-    can Console.Write, Memory.Allocate, Console.Format, Abort.Panic:
-        print(as_text(1234))
-        return 0
+    _ = puts(as_text("1234"))
+    return 0
 EOF
 if build_run passthrough; then
     [ "$out" = "1234" ] || fail "cstr pass-through: printed '$out', want '1234'"
@@ -62,12 +45,7 @@ else
     fail "cstr pass-through: stage1 declined ($(head -1 "$WORK/passthrough.log"))"
 fi
 
-# --- 2. the pass-through is a pass-through, in the IR ------------------------------------
-# The runtime check above cannot tell "returned the pointer" from "loaded a byte that happened
-# to print" — a declined function would also just not print. Read the emitted module: `as_text`
-# must hand back the CALL RESULT, with no `load i8` between. (The deref this narrows is
-# exercised across the whole corpus by opt_pipeline_smoke, which runs every runnable fixture
-# at -O0/-O2/-O3 and compares answers.)
+# The IR must return the pointer produced by the call without loading a byte.
 if bash "$ROOT/scripts/elisac_stage1.sh" -emit llvm -o "$WORK/passthrough.ll" "$WORK/passthrough.elisa" >"$WORK/passthrough.ll.log" 2>&1; then
     body=$(sed -n '/^define[^@]*@as_text/,/^}/p' "$WORK/passthrough.ll")
     [ -n "$body" ] || fail "as_text missing from the emitted module"
@@ -81,4 +59,4 @@ if [ "$failed" -gt 0 ]; then
     echo "cstr-ref-return FAILED: $failed failures"
     exit 1
 fi
-echo "cstr-ref-return OK: a u8&-returning call passes through a cstr context, pointer intact"
+echo "cstr-ref-return OK: an explicitly converted byte reference retains its pointer"

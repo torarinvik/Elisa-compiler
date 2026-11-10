@@ -12,7 +12,7 @@ trap 'rm -rf "$WORK"' EXIT
 clang -c "$ROOT/test/parity/profile_hooks.c" -o "$WORK/hooks.o"
 python3 - "$ROOT" "$STAGE0" "$STAGE1" "$WORK" <<'PY'
 from pathlib import Path
-import re, subprocess, sys
+import os, re, subprocess, sys
 root, stage0, stage1, work = sys.argv[1:]
 work = Path(work)
 for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'tuple_function_tail', 'block_reference_threading', 'block_state_threading', 'with_collection_append'):
