@@ -27,7 +27,10 @@ ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 export ELISA_CORE REPO_ROOT
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d)" || exit 1
+# macOS temporary directories may be spelled with or without /private.
+# Both compilers must receive the physical path for the panic text check.
+WORK="$(cd -- "$WORK" && pwd -P)" || exit 1
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -44,9 +47,15 @@ compare() {
         require_pass=1
         shift
     fi
-    local s0 s1 rc0 rc1
-    s0="$("$ELISACORE_BIN" -emit test "$@" "$src" </dev/null 2>/dev/null)"; rc0=$?
-    s1="$(bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit test "$@" "$src" 2>/dev/null)"; rc1=$?
+    local s0 s1 rc0 rc1 attempt
+    # The compiler-backed fixture can reach Stage0's checkpoint boundary.
+    # Resume that exact invocation, with a fixed limit for genuine failures.
+    for attempt in 1 2 3; do
+        s0="$("$ELISACORE_BIN" -emit test "$@" "$src" </dev/null 2>"$WORK/stage0.stderr")"; rc0=$?
+        [[ "$require_pass" -eq 1 && "$rc0" -eq 75 ]] || break
+        grep -Fq 'analysis checkpoint saved' "$WORK/stage0.stderr" || break
+    done
+    s1="$(bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit test "$@" "$src" 2>"$WORK/stage1.stderr")"; rc1=$?
     if [[ "$require_pass" -eq 1 ]]; then
         local expected_summary='^\[ SUMMARY +\] 1 test\(s\) selected; passed=1 skipped=0 failed=0$'
         if [[ "$rc0" -ne 0 || "$rc1" -ne 0 ]] || ! grep -Eq "$expected_summary" <<<"$s0" || ! grep -Eq "$expected_summary" <<<"$s1"; then
@@ -54,6 +63,7 @@ compare() {
             echo "FAIL: $label must pass exactly one test under both compilers (stage0 rc=$rc0, stage1 rc=$rc1)"
             printf '%s\n' "$s0" | tail -6
             printf '%s\n' "$s1" | tail -6
+            tail -n 6 "$WORK/stage0.stderr" "$WORK/stage1.stderr" >&2
             return
         fi
     fi
