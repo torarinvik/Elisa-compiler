@@ -24,7 +24,10 @@ if grep -qF 'cannot propagate' <<< "$stage0_output"; then
     fail "Stage0 selected the inactive alias provider's ErrorSet: $stage0_output"
 fi
 
-stage1_output="$("$RPT" < "$FIXTURE")"
+stage1_native_output="$(env -u ELISA_STAGE1_TRIPLE -u ELISA_STAGE1_WASM "$RPT" < "$FIXTURE")"
+grep -q '^D 0$' <<< "$stage1_native_output" || fail "Stage1 rejected the native fixture: $stage1_native_output"
+
+stage1_output="$(ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT" < "$FIXTURE")"
 grep -q '^P 0$' <<< "$stage1_output" || fail "Stage1 returned a nonzero process status: $stage1_output"
 if grep -qF 'cannot propagate' <<< "$stage1_output"; then
     fail "Stage1 selected the inactive alias provider's ErrorSet: $stage1_output"
