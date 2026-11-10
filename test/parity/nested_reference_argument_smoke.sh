@@ -6,12 +6,9 @@ FIXTURE="$REPO_ROOT/test/repro/nested_reference_argument.elisa"
 BLOCK_FIXTURE="$REPO_ROOT/test/repro/nested_reference_argument_block.elisa"
 ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 
-stage0="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
-if [[ -z "${ELISACORE_BIN:-}" ]]; then
-    mkdir -p "$(dirname "$stage0")"
-    ( cd "$ELISA_CORE/compiler" && go build -o "$stage0" ./src )
-fi
-stage1="${ELISA_STAGE1_BIN:-$(command -v elisac-stage1 || true)}"
+source "$REPO_ROOT/test/parity/resolve_elisac.sh"
+stage0="$ELISACORE_BIN"
+stage1="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
 [[ -x "$stage1" ]] || { echo "nested reference smoke: missing elisac-stage1" >&2; exit 2; }
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM HUP

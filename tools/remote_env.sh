@@ -34,7 +34,13 @@ export ELISA_LLVM_BIN_DIR="$REMOTE_LLVM_BINDIR" LLC="$REMOTE_LLVM_BINDIR/llc" LL
 # stage0 must be the HOST's build: an rsync that carried the Mac binary once left an arm64
 # Mach-O here (Exec format error). Rebuild when the file is not a native ELF.
 if ! file -b "$ELISACORE_BIN" 2>/dev/null | grep -q ELF; then
-  (cd "$RCORE/compiler" && CGO_CFLAGS="-I$REMOTE_LLVM_INCLUDEDIR" CGO_LDFLAGS="-L$REMOTE_LLVM_LIBDIR -Wl,-rpath,$REMOTE_LLVM_LIBDIR" go build -o bin/elisac ./src) || echo "stage0 rebuild FAILED" >&2
+  if ! (cd "$RCORE/compiler" && \
+    CGO_CFLAGS="-I$REMOTE_LLVM_INCLUDEDIR" \
+    CGO_LDFLAGS="-L$REMOTE_LLVM_LIBDIR -Wl,-rpath,$REMOTE_LLVM_LIBDIR" \
+    bash "$RDIR/test/parity/compiler_rebuild_timeout.sh" go build -o bin/elisac ./src); then
+    echo "stage0 rebuild FAILED; installed oracle retained" >&2
+    return 2
+  fi
 fi
 # z3: the apt package (4.8.12) makes every contract-bearing compile ~25x slower than z3 >= 5
 # (37.6 s vs 1.5 s for one std-including probe). Refuse to time anything against it.

@@ -80,6 +80,11 @@ else
 fi
 SRC="$STAGE0_ROOT/src"
 
+print_stage0_rebuild_command() {
+    printf 'run: python3 %q build --root %q --binary %q\n' \
+        "$STAGE0_ROOT/scripts/stage0_provenance.py" "$STAGE0_ROOT" "$BIN" >&2
+}
+
 # Go-core's normal build recipe disables embedded VCS metadata. When its producer writes
 # a content-bound receipt beside the binary, verify that receipt against both the binary
 # bytes and the source/module inputs. Legacy VCS-stamped products continue through the
@@ -169,7 +174,7 @@ if [ -n "$REPO" ]; then
     fi
     if [ "$BUILT_REVISION" != "$CURRENT_REVISION" ] || [ "$BUILT_MODIFIED" != false ]; then
         echo "stage0 oracle binary has different source provenance: built revision ${BUILT_REVISION:-unknown} (modified=${BUILT_MODIFIED:-unknown}), current revision $CURRENT_REVISION" >&2
-        echo "run: (cd $(dirname "$SRC") && go build -o bin/elisac ./src)" >&2
+        print_stage0_rebuild_command
         echo "set ELISA_ALLOW_STALE_STAGE0=1 only when intentionally testing an older oracle" >&2
         exit 2
     fi
@@ -184,6 +189,6 @@ newer="$(find "$SRC" -name '*.go' -newer "$BIN" -print -quit 2>/dev/null)"
 [ -n "$newer" ] || exit 0
 
 echo "stage0 oracle binary is stale: $newer is newer than $BIN" >&2
-echo "run: (cd $(dirname "$SRC") && go build -o bin/elisac ./src)" >&2
+print_stage0_rebuild_command
 echo "set ELISA_ALLOW_STALE_STAGE0=1 only when intentionally testing an older oracle" >&2
 exit 2

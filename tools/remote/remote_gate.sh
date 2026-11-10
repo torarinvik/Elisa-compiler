@@ -81,6 +81,8 @@ wait $p0; wait $p1
 # bash reads a script lazily, so overwriting a shared copy under a running gate corrupts it
 # (seen: "syntax error near unexpected token fi" in a concurrent run).
 rssh "mkdir -p $R $W/bin && cat > $R/gate_body.sh" < "$HERE/gate_body.sh"
+rssh "cat > $R/compiler_rebuild_timeout.sh" < "$HERE/../../test/parity/compiler_rebuild_timeout.sh"
+rssh "cat > $R/compiler_rebuild_timeout.py" < "$HERE/../../test/parity/compiler_rebuild_timeout.py"
 rssh "cat > $R/host_invalid.txt" < "$HERE/host_invalid.txt"
 rssh "cat > $R/clang_shim && chmod 755 $R/clang_shim && cp $R/clang_shim $W/bin/.clang.$RUN && mv -f $W/bin/.clang.$RUN $W/bin/clang && for n in clang++ cc; do [ -e $W/bin/\$n ] || ln -s clang $W/bin/\$n; done" < "$HERE/clang_shim"
 echo "ship: $(( $(date +%s) - t0 ))s"

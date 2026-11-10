@@ -25,11 +25,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIR="$ROOT/test/repro/param_store_escape"
 ELISA_CORE="${ELISA_CORE:-$ROOT/../../Go projects/Elisa-core}"
 
-stage0="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac}"
-if [[ -z "${ELISACORE_BIN:-}" ]]; then
-    mkdir -p "$(dirname "$stage0")"
-    ( cd "$ELISA_CORE/compiler" && go build -o "$stage0" ./src ) || { echo "param-store-escape FAIL: cannot build stage0" >&2; exit 2; }
-fi
+source "$ROOT/test/parity/resolve_elisac.sh"
+stage0="$ELISACORE_BIN"
 [[ -x "$stage0" ]] || { echo "param-store-escape FAIL: missing stage0 at $stage0" >&2; exit 2; }
 stage1=(bash "$ROOT/scripts/elisac_stage1.sh")
 

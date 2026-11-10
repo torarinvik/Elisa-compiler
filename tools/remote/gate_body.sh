@@ -41,7 +41,7 @@ t=$(stamp)
     mkdir -p "$(dirname "$S0BIN")"
     cd "$S0/compiler" && CGO_CFLAGS="-I$LLVM_INCLUDE_DIR" \
       CGO_LDFLAGS="-L$LLVM_LIB_DIR -Wl,-rpath,$LLVM_LIB_DIR" \
-      go build -o "$S0BIN.part" ./src && mv "$S0BIN.part" "$S0BIN"
+      bash "$RUNDIR/compiler_rebuild_timeout.sh" go build -o "$S0BIN.part" ./src && mv "$S0BIN.part" "$S0BIN"
   fi
 ) 9>"$S0LOCK" > "$RUNDIR/stage0_build.log" 2>&1
 [[ -x "$S0BIN" ]] || { echo "stage0 build FAILED:"; tail -20 "$RUNDIR/stage0_build.log"; finish 2; }

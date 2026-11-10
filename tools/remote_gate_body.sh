@@ -7,10 +7,13 @@ git config --global --get-all safe.directory | grep -qx "$RCORE" || git config -
 # matching the synced tree. remote_env.sh only rebuilds a non-ELF binary.
 # The shared gate-host environment: tools/linux_shim first on PATH unless ELISA_NO_LINUX_SHIM (the suite's
 # Apple-ld link flags), LLVM/clang paths, stack limit and the stage0 oracle cache.
-ELISA_REMOTE_DIR="$RDIR" ELISA_REMOTE_CORE="$RCORE" source "$RDIR/tools/remote_env.sh"
+ELISA_REMOTE_DIR="$RDIR" ELISA_REMOTE_CORE="$RCORE" source "$RDIR/tools/remote_env.sh" || {
+  echo "remote gate: remote compiler environment setup failed" >&2
+  exit 2
+}
 LLVM_INCLUDE_DIR="$("$LLVM_CONFIG" --includedir)"
 LLVM_LIB_DIR="$("$LLVM_CONFIG" --libdir)"
-(cd "$RCORE/compiler" && CGO_CFLAGS="-I$LLVM_INCLUDE_DIR" CGO_LDFLAGS="-L$LLVM_LIB_DIR -Wl,-rpath,$LLVM_LIB_DIR" go build -o bin/elisac ./src)
+(cd "$RCORE/compiler" && CGO_CFLAGS="-I$LLVM_INCLUDE_DIR" CGO_LDFLAGS="-L$LLVM_LIB_DIR -Wl,-rpath,$LLVM_LIB_DIR" bash "$RDIR/test/parity/compiler_rebuild_timeout.sh" go build -o bin/elisac ./src) || { echo "remote gate: Stage0 rebuild failed" >&2; exit 2; }
 mkdir -p bin build/runtime
 [ -f "$ELISA_RUNTIME_OBJ" ] || bash scripts/build_runtime_object.sh
 # The seed guard defaults to 6 GB; Linux stage0 peaks above it, and the gate host has far more.
