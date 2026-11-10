@@ -101,6 +101,8 @@ int main(int argc, char **argv) {
 
   SumFn base_safe_checked = load_fn(base_handle, "safe_checked");
   SumFn cand_safe_checked = load_fn(candidate_handle, "safe_checked");
+  SumFn base_clamped = load_fn(base_handle, "safe_clamped");
+  SumFn cand_clamped = load_fn(candidate_handle, "safe_clamped");
   SumFn base_safe_plain = load_fn(base_handle, "safe_plain");
   SumFn cand_safe_plain = load_fn(candidate_handle, "safe_plain");
   SumFn base_unsafe = load_fn(base_handle, "unsafe_m33");
@@ -130,6 +132,15 @@ int main(int argc, char **argv) {
       b = invoke(base_safe_plain, (uint8_t)n, values);
       c = invoke(cand_safe_plain, (uint8_t)n, values);
       same_outcome("safe_plain", b, c, 0, expected, &checked);
+      int clamped = 0;
+      for (unsigned i = 0; i < n; ++i) {
+        clamped += values[i];
+        if (clamped > (int)i)
+          clamped = (int)i;
+      }
+      b = invoke(base_clamped, (uint8_t)n, values);
+      c = invoke(cand_clamped, (uint8_t)n, values);
+      same_outcome("safe_clamped", b, c, 0, clamped, &checked);
     }
   }
 

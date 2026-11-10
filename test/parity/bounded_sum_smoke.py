@@ -51,8 +51,9 @@ int main(int argc,char **argv){using namespace llvm;if(argc!=2)return 2;
         text = changed.read_text()
         def body(name):
             return text.split('@'+name+'(',1)[1].split('\n}',1)[0]
-        if 'call { i8, i1 } @llvm.sadd.with.overflow' in body('safe_checked'):
-            raise RuntimeError('safe checked sum was not proved')
+        for name in ['safe_checked', 'safe_clamped']:
+            if 'call { i8, i1 } @llvm.sadd.with.overflow' in body(name):
+                raise RuntimeError(name + ': safe checked sum was not proved')
         if 'add nuw nsw i8 %sum, %step' not in body('safe_plain'):
             raise RuntimeError('safe wrapping sum was not proved')
         for name in ['unsafe_m33','nonzero_seed127','header_update_before_exit','header_update_observable_flag']:
@@ -61,6 +62,12 @@ int main(int argc,char **argv){using namespace llvm;if(argc!=2)return 2;
         if run([transform, changed]).stdout.splitlines()[1:] != text.splitlines()[1:]:
             raise RuntimeError('proof is not idempotent')
         original = fixture.read_text()
+        negative_cap = work/'negative-cap.ll'
+        negative_cap.write_text(original.replace(
+            '@llvm.smin.i8(i8 %value, i8 %cap)', '@llvm.smin.i8(i8 %value, i8 -1)'))
+        result = run([transform, negative_cap]).stdout.split('@safe_clamped(', 1)[1]
+        if 'call { i8, i1 } @llvm.sadd.with.overflow' not in result.split('\n}', 1)[0]:
+            raise RuntimeError('negative cap: unproved unsigned bound')
         for label, operand in [('zero-step', '0'), ('undef-step', 'undef')]:
             control=work/(label+'.ll')
             control.write_text(original.replace('i8 %sum, i8 %step)', 'i8 %sum, i8 '+operand+')'))

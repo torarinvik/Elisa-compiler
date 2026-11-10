@@ -4,6 +4,7 @@
 
 declare { i8, i1 } @llvm.sadd.with.overflow.i8(i8, i8) #0
 declare void @llvm.trap() #1
+declare i8 @llvm.smin.i8(i8, i8) #0
 
 define i8 @safe_checked(i8 noundef %n, ptr noundef %data) {
 entry:
@@ -228,6 +229,49 @@ overflow_result:
 
 exit:
   ret i8 %sum.next
+}
+
+; The cap is a second recurrence whose nonnegative range is proved first.
+define i8 @safe_clamped(i8 noundef %n, ptr noundef %data) {
+entry:
+  %valid = icmp ule i8 %n, 8
+  br i1 %valid, label %guard, label %invalid
+
+guard:
+  %empty = icmp eq i8 %n, 0
+  br i1 %empty, label %zero, label %loop
+
+zero:
+  ret i8 0
+
+invalid:
+  ret i8 -1
+
+loop:
+  %index = phi i8 [ 0, %guard ], [ %index.next, %continue ]
+  %cap = phi i8 [ 0, %guard ], [ %cap.next, %continue ]
+  %sum = phi i8 [ 0, %guard ], [ %clamped, %continue ]
+  %address = getelementptr i8, ptr %data, i8 %index
+  %raw = load i8, ptr %address
+  %step = and i8 %raw, 3
+  %pair = call { i8, i1 } @llvm.sadd.with.overflow.i8(i8 %sum, i8 %step)
+  %value = extractvalue { i8, i1 } %pair, 0
+  %overflow = extractvalue { i8, i1 } %pair, 1
+  br i1 %overflow, label %trap, label %continue
+
+continue:
+  %clamped = call i8 @llvm.smin.i8(i8 %value, i8 %cap)
+  %cap.next = add i8 %cap, 1
+  %index.next = add nuw nsw i8 %index, 1
+  %done = icmp eq i8 %index.next, %n
+  br i1 %done, label %exit, label %loop
+
+trap:
+  call void @llvm.trap()
+  unreachable
+
+exit:
+  ret i8 %clamped
 }
 
 attributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }

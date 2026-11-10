@@ -197,6 +197,34 @@ static ConstantRange rangeAt(Value *V, Instruction *At, LazyValueInfo &LVI, Assu
   return R;
 }
 
+// A signed minimum with a nonnegative cap can lower a zero-seeded sum
+// without taking it outside the same nonnegative prefix bounds.
+static bool findClampedUpdate(
+    IntrinsicInst *Min, PHINode *P, Loop *L, Value *&Step,
+    BinaryOperator *&PlainAdd, IntrinsicInst *&CheckedAdd,
+    LazyValueInfo &LVI, AssumptionCache &AC, DominatorTree &DT,
+    const DenseMap<Value *, ConstantRange> &Known) {
+  if (Min->hasOperandBundles() || Min->hasMetadataOtherThanDebugLoc())
+    return false;
+  for (unsigned Index = 0; Index < 2; ++Index) {
+    Value *CandidateStep = nullptr;
+    BinaryOperator *CandidateAdd = nullptr;
+    IntrinsicInst *CandidateChecked = nullptr;
+    if (!findUpdateLeaf(Min->getArgOperand(Index), P, L, CandidateStep,
+                        CandidateAdd, CandidateChecked) ||
+        !CandidateStep)
+      continue;
+    auto Cap = rangeAt(Min->getArgOperand(1 - Index), Min, LVI, AC, DT, Known);
+    if (Cap.isEmptySet() || Cap.getSignedMin().isNegative())
+      continue;
+    Step = CandidateStep;
+    PlainAdd = CandidateAdd;
+    CheckedAdd = CandidateChecked;
+    return true;
+  }
+  return false;
+}
+
 static bool fitsSignedAccumulation(PHINode *P, Value *Initial, Value *Step,
                                    Instruction *At, uint32_t Updates,
                                    LazyValueInfo &LVI,
@@ -314,12 +342,20 @@ extern "C" unsigned elisacoreBoundedCheckedSums(LLVMModuleRef Ref) {
         Value *U = P.getIncomingValue(LIx), *Step = nullptr;
         BinaryOperator *PlainAdd = nullptr;
         IntrinsicInst *CheckedAdd = nullptr;
-        if (!findUpdateLeaf(U, &P, L, Step, PlainAdd, CheckedAdd))
+        Value *Initial = P.getIncomingValue(PI);
+        auto *Min = dyn_cast<IntrinsicInst>(U);
+        auto *Seed = dyn_cast<ConstantInt>(Initial);
+        if (Min && Min->getIntrinsicID() == Intrinsic::smin && Seed &&
+            Seed->isZero()) {
+          if (!findClampedUpdate(Min, &P, L, Step, PlainAdd, CheckedAdd,
+                                 LVI, AC, DT, ProvenRanges))
+            continue;
+        } else if (!findUpdateLeaf(U, &P, L, Step, PlainAdd, CheckedAdd)) {
           continue;
+        }
         Instruction *At = CheckedAdd ? static_cast<Instruction *>(CheckedAdd) : PlainAdd;
         if (!At || !DT.dominates(L->getHeader(), At->getParent()))
           continue;
-        Value *Initial = P.getIncomingValue(PI);
         if (CheckedAdd &&
             !checkedAddHasTrapGuard(CheckedAdd, Latch, L, DT))
           continue;
