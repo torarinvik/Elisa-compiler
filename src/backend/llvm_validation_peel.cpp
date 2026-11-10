@@ -284,6 +284,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (elisacoreReuseEdgeDivisions(*unwrap(module))) status = 1;
   if (elisacoreSplitFactoredDivisions(*unwrap(module))) status = 1;
   if (elisacoreSplitRemainderRecurrences(*unwrap(module))) status = 1;
+#if LLVM_VERSION_MAJOR >= 23
+  if (elisacoreFoldConstantIntegerPaths(*unwrap(module))) status = 1;
+#endif
   return status;
 }
 
