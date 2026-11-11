@@ -109,6 +109,7 @@ extern "C" unsigned elisacoreOptimizeIndexBounds(LLVMModuleRef, LLVMTargetMachin
 #include "llvm_guarded_counter.cpp"
 #include "llvm_nonnegative_remainder.cpp"
 extern "C" unsigned elisacoreFoldBoundedRemainders(LLVMModuleRef);
+extern "C" unsigned elisacoreFoldSignedRangeMasks(LLVMModuleRef);
 #include "llvm_ordered_vector.cpp"
 #include "llvm_special_epilogue.cpp"
 #include "llvm_even_range.cpp"
@@ -312,5 +313,6 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (elisacoreVersionBoundedQuotientSums(*unwrap(module))) status = 1;
 #endif
   if (elisacoreFoldBoundedRemainders(module)) status = 1;
+  if (elisacoreFoldSignedRangeMasks(module)) status = 1;
   return status;
 }

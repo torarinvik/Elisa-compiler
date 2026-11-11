@@ -29,6 +29,6 @@ exit: ret void
 CASES={'nested_vector':(IR,1),'scalar':(IR.replace('load <2 x i64>','load i64'),0),'non_arm':(IR.replace(os.environ.get('ELISA_TEST_TRIPLE','arm64-apple-darwin'),'x86_64-unknown-linux-gnu'),0),'sanitized':(IR.replace('nounwind {','nounwind sanitize_address {'),0),'size_opt':(IR.replace('nounwind {','nounwind optsize {'),0),'five_functions':(IR+'\n'.join('define void @extra%d() { ret void }'%i for i in range(4)),0),'large':(IR.replace('exit: ret void','exit:\n'+''.join(' %%t%d = add i64 %%n, %d\n'%(i,i) for i in range(2001))+' ret void'),0)}
 with tempfile.TemporaryDirectory(prefix='nested-vector-') as tmp:
  d=Path(tmp);(d/'driver.cpp').write_text(DRIVER);bindir=Path(run([CONFIG,'--bindir']).stdout.strip())
- run([bindir/'clang++',*flags('--cxxflags'),'-I'+str(ROOT/'src/backend'),d/'driver.cpp',ROOT/'src/backend/llvm_numeric_passes.cpp',ROOT/'src/backend/llvm_bounded_remainder.cpp',*flags('--ldflags','--libs','--system-libs'),'-Wl,-rpath,'+run([CONFIG,'--libdir']).stdout.strip(),'-o',d/'driver'])
+ run([bindir/'clang++',*flags('--cxxflags'),'-I'+str(ROOT/'src/backend'),d/'driver.cpp',ROOT/'src/backend/llvm_numeric_passes.cpp',ROOT/'src/backend/llvm_bounded_remainder.cpp',ROOT/'src/backend/llvm_signed_range_masks.cpp',*flags('--ldflags','--libs','--system-libs'),'-Wl,-rpath,'+run([CONFIG,'--libdir']).stdout.strip(),'-o',d/'driver'])
  for name,(ir,expected) in CASES.items():
   (d/'test.ll').write_text(ir);actual=int(run([d/'driver',d/'test.ll']).stdout.strip());assert actual==expected,(name,actual);print('PASS',name)

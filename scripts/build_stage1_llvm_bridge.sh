@@ -18,6 +18,7 @@ sources=(
   "$backend/llvm_numeric_passes.cpp"
   "$backend/llvm_masked_split_multiply.cpp"
   "$backend/llvm_bounded_remainder.cpp"
+  "$backend/llvm_signed_range_masks.cpp"
 )
 export LC_ALL=C
 toolchain_inputs="$(
