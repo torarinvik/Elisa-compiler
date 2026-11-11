@@ -172,7 +172,6 @@ seed_build() {
   # an otherwise identical executable miss the runtime's compiler digest.
   seed_profile_hook_source="$ELISA_SEED_OUTPUT_DIR/elisac_stage1_profile_hooks.c"
   ELISA_SEED_PROFILE_HOOK_SOURCE="$seed_profile_hook_source"
-  libdir="$("$LLVM_CONFIG" --libdir)"
   if [[ ! -x "$BOOTSTRAP_BIN" ]]; then
     echo "seed requires an executable bootstrap compiler at ELISACORE_BIN=$BOOTSTRAP_BIN" >&2
     exit 2
@@ -235,7 +234,6 @@ seed_build() {
   # A filename is not compiler provenance: copied products may be renamed.
   # Identify the exact executable without guessing its implementation stage.
   echo "seed: building Stage1 product with $seed_bootstrap_kind bootstrap compiler $BOOTSTRAP_BIN" >&2
-  echo "seed: bootstrap compiler SHA-256 $(elisa_sha256 "$BOOTSTRAP_BIN" | awk '{print $1}')" >&2
   # The compiler itself is a large input. A duplicated seed can consume the whole
   # workstation before either invocation reports an error, so bound one seed by default.
   # The 5.5 GiB freeze came from two worktrees seeding at once; the host-wide global seed lock
@@ -306,6 +304,7 @@ seed_build() {
   ELISACORE_TRUSTED_RUNTIME_SOURCE="$ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" \
     "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
+  echo "seed: bootstrap compiler SHA-256 $(elisa_sha256 "$BOOTSTRAP_BIN" | awk '{print $1}')" >&2
   seed_peak_rss_kb=0
   while kill -0 "$seed_pid" 2>/dev/null; do
     # `kill -0` also succeeds for a zombie on macOS. A completed bootstrap child
@@ -420,6 +419,7 @@ seed_build() {
   seed_link_objects+=("$seed_llvm_bridge")
   local seed_cxx_lib=-lc++
   [[ "$(uname -s)" == Linux ]] && seed_cxx_lib=-lstdc++
+  libdir="$("$LLVM_CONFIG" --libdir)"
   "$ELISA_CLANG_TOOL" -fno-builtin "${seed_link_flags[@]}" -o "$seed_output" "${seed_link_objects[@]}" "$seed_profile_hook_source" -L"$libdir" $ELISA_LLVM_LIBS "$seed_cxx_lib" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$libdir"
   rm -f "$seed_llvm_bridge"
   if [[ -n "$seed_runtime_obj" ]]; then
