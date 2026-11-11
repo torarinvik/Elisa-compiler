@@ -12,15 +12,18 @@ extension="$(sed '/^        def grow(doc:/i\
 extend Tracks:\
     public:
 ' <<< "$qualified")"
-for program in "$qualified" "$extension"; do
+named="$(sed 's/Tracks::read(doc, 0, component)/Tracks::read(component: component, doc: doc, slot: 0)/' <<< "$qualified")"
+for program in "$qualified" "$extension" "$named"; do
     report="$("$RPT" <<< "$program")"
     grep -Fxq 'P 0' <<< "$report"
     grep -Fxq 'D 1' <<< "$report"
     grep -Fq "$expected" <<< "$report"
 done
 
-live="$(sed 's/changed <- changed + grow(doc, cleaned)/changed <- changed + 1/' <<< "$qualified")"
-report="$("$RPT" <<< "$live")"
-grep -Fxq 'P 0' <<< "$report"
-grep -Fxq 'D 0' <<< "$report"
+for program in "$qualified" "$named"; do
+    live="$(sed 's/changed <- changed + grow(doc, cleaned)/changed <- changed + 1/' <<< "$program")"
+    report="$("$RPT" <<< "$live")"
+    grep -Fxq 'P 0' <<< "$report"
+    grep -Fxq 'D 0' <<< "$report"
+done
 printf 'qualified storage view origin smoke OK\n'
