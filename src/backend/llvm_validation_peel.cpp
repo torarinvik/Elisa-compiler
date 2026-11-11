@@ -290,6 +290,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #if LLVM_VERSION_MAJOR >= 23
   if (elisacoreFoldConstantIntegerPaths(*unwrap(module))) status = 1;
   if (elisacoreNarrowBoundedCarries(*unwrap(module))) status = 1;
+  if (elisacoreFoldConditionalDoubling(*unwrap(module))) status = 1;
 #endif
   return status;
 }
