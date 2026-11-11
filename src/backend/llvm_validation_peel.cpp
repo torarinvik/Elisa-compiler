@@ -117,6 +117,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #if LLVM_VERSION_MAJOR >= 23
 #include "llvm_ring_index_bounds.cpp"
 #include "llvm_decimal_digit_count.cpp"
+#include "llvm_halving_runs.cpp"
 #endif
 
 static bool shouldRevisitNestedVectorLoops(Module &M) {
@@ -276,6 +277,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #if LLVM_VERSION_MAJOR >= 23
   finalSimplifications += elisacoreFoldRingIndexBounds(*unwrap(module));
   finalSimplifications += elisacoreFoldDecimalDigitCounts(*unwrap(module));
+  finalSimplifications += elisacoreFoldHalvingRuns(*unwrap(module));
   finalSimplifications += elisacoreFoldRangeAndLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldScalarLoopIdioms(*unwrap(module));
   finalSimplifications += elisacoreFoldMaskedSingleBits(*unwrap(module));
