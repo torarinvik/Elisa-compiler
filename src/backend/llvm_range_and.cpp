@@ -1,26 +1,9 @@
 // Clearing low set bits while upper > lower keeps precisely the common
 // prefix of the unsigned endpoints. The first differing bit identifies
 // the prefix directly, independent of how many bits the loop would clear.
-namespace {
-static ICmpInst *rangeAndContinueTest(CondBrInst &Branch, BasicBlock *Continue,
-                                    Value *Upper, Value *&Lower) {
-  auto *Cmp = dyn_cast<ICmpInst>(Branch.getCondition());
-  if (!Cmp || !Cmp->hasOneUse() || Branch.hasMetadataOtherThanDebugLoc() ||
-      Branch.getSuccessor(0) == Branch.getSuccessor(1)) return nullptr;
-  bool TrueEdge = Branch.getSuccessor(0) == Continue;
-  if (!TrueEdge && Branch.getSuccessor(1) != Continue) return nullptr;
-  auto Pred = TrueEdge ? Cmp->getPredicate() : Cmp->getInversePredicate();
-  if (Pred == ICmpInst::ICMP_ULT && Cmp->getOperand(1) == Upper) {
-    Lower = Cmp->getOperand(0);
-    return Cmp;
-  }
-  if (Pred == ICmpInst::ICMP_UGT && Cmp->getOperand(0) == Upper) {
-    Lower = Cmp->getOperand(1);
-    return Cmp;
-  }
-  return nullptr;
-}
+#include "llvm_unsigned_loop_guard.h"
 
+namespace {
 // When a dominating guard admits only ordered 32-bit endpoints, a 64-bit
 // suffix mask also handles equality. A shift of 32 then clears the entire
 // suffix mask, so the original upper endpoint survives unchanged.

@@ -4,6 +4,7 @@
 // exit checks. Proven recurrence bounds expose invariants only when the
 // initial value is defined and every unsigned division remains defined.
 #include <algorithm>
+#include "llvm_loop_pass_policy.h"
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/InstIterator.h>
@@ -49,19 +50,6 @@ static bool BDU_NoUnrollPolicy(const Loop &L) {
     if (!Tag || Tag->getString().starts_with("llvm.loop.unroll")) return false;
   }
   return true;
-}
-
-static bool BDU_SkipFunction(const Function &F, const Module &M) {
-  if (F.isDeclaration() || F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
-      F.getSubprogram() || M.getNamedMetadata("llvm.dbg.cu")) return true;
-  for (StringRef Flag : {"SanitizeAddress", "SanitizeHWAddress", "SanitizeMemory",
-                         "SanitizeThread", "SanitizeRealtime"})
-    if (M.getModuleFlag(Flag)) return true;
-  for (Attribute::AttrKind Attr : {Attribute::SanitizeAddress, Attribute::SanitizeHWAddress,
-        Attribute::SanitizeMemory, Attribute::SanitizeThread, Attribute::SanitizeMemTag,
-        Attribute::SanitizeRealtime, Attribute::SanitizeRealtimeBlocking})
-    if (F.hasFnAttribute(Attr)) return true;
-  return false;
 }
 
 // Cheap gate before building LoopInfo/SE/DT/LVI for a function. The current
@@ -575,7 +563,6 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
 #include "llvm_shift_bit_reverse.cpp"
 #include "llvm_power_position.cpp"
 #include "llvm_range_and.cpp"
-#include "llvm_scalar_loop_idioms.cpp"
 #include "llvm_masked_single_bit.cpp"
 #include "llvm_conditional_doubling.cpp"
 #include "llvm_shift_xor.cpp"

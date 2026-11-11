@@ -1,3 +1,5 @@
+#include "llvm_scalar_pattern.h"
+
 // Assemble XOR from low bits while both operands are nonzero, then append
 // the remainder of the only operand that can still have nonzero high bits.
 namespace {

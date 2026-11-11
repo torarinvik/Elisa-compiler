@@ -1,20 +1,17 @@
+#include <llvm/Config/llvm-config.h>
+#if LLVM_VERSION_MAJOR >= 23
+#include "llvm_loop_pass_policy.h"
+#include "llvm_unsigned_loop_guard.h"
+#include "llvm_scalar_pattern.h"
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/LazyValueInfo.h>
+#include <llvm/IR/ConstantRange.h>
+#include <llvm/IR/IRBuilder.h>
+
+using namespace llvm;
+
 // Recognize scalar loops whose result can be computed without iteration.
 namespace {
-static BinaryOperator *scalarLoopBinOp(Value *V, unsigned Opcode, BasicBlock &Loop) {
-  auto *Bin = dyn_cast_or_null<BinaryOperator>(V);
-  return Bin && Bin->getOpcode() == Opcode && Bin->getParent() == &Loop ? Bin : nullptr;
-}
-
-static bool scalarLoopPair(BinaryOperator &Bin, Value *X, Value *Y) {
-  return (Bin.getOperand(0) == X && Bin.getOperand(1) == Y) ||
-         (Bin.getOperand(0) == Y && Bin.getOperand(1) == X);
-}
-
-static bool scalarLoopHasConstant(Value *V, uint64_t Expected) {
-  auto *C = dyn_cast<ConstantInt>(V);
-  return C && C->equalsInt(Expected);
-}
-
 static BasicBlock *scalarLoopExit(CondBrInst &Branch, BasicBlock &Loop) {
   if (Branch.hasMetadataOtherThanDebugLoc()) return nullptr;
   if (Branch.getSuccessor(0) == &Loop && Branch.getSuccessor(1) != &Loop)
@@ -229,7 +226,7 @@ static bool foldTrailingZeroLoop(BasicBlock &Loop, CondBrInst &Back, BasicBlock 
 
 } // namespace
 
-static unsigned elisacoreFoldScalarLoopIdioms(Module &M) {
+unsigned elisacoreFoldScalarLoopIdioms(Module &M) {
   if (!M.getTargetTriple().isAArch64()) return 0;
   unsigned Changed = 0;
   for (Function &F : M) {
@@ -253,3 +250,4 @@ static unsigned elisacoreFoldScalarLoopIdioms(Module &M) {
   }
   return Changed;
 }
+#endif

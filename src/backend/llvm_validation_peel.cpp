@@ -37,6 +37,7 @@
 #include <llvm/Transforms/Utils/Local.h>
 
 using namespace llvm;
+unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 #include "llvm_validation_loop_passes.h"
 #include "llvm_validation_bounded_division.h"
 
