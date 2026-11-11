@@ -17,7 +17,11 @@ src="$backend/llvm_validation_peel.cpp"
 export LC_ALL=C
 key="$(
   {
-    elisa_sha256 "$backend"/*.cpp "$backend"/*.h "$cxx"
+    inputs=()
+    for input in "$backend"/*.cpp "$backend"/*.h; do
+      [[ "$input" == "$backend/llvm_masked_split_multiply.cpp" ]] || inputs+=("$input")
+    done
+    elisa_sha256 "${inputs[@]}" "$cxx"
     "$cxx" --version
     printf '%s\n' -O1 -fPIC "${cxxflags[@]}"
   } | elisa_sha256 | awk '{print $1}'
@@ -30,4 +34,18 @@ if [[ ! -s "$cached" ]]; then
   "$cxx" -O1 -fPIC "${cxxflags[@]}" -c "$src" -o "$tmp"
   mv -f "$tmp" "$cached"
 fi
-cp -f "$cached" "$1"
+split_src="$backend/llvm_masked_split_multiply.cpp"
+split_key="$(
+  {
+    elisa_sha256 "$split_src" "$cxx"
+    "$cxx" --version
+    printf '%s\n' -O1 -fPIC "${cxxflags[@]}"
+  } | elisa_sha256 | awk '{print $1}'
+)"
+split_cached="$cache_dir/$split_key.o"
+if [[ ! -s "$split_cached" ]]; then
+  tmp="$split_cached.tmp.$$"
+  "$cxx" -O1 -fPIC "${cxxflags[@]}" -c "$split_src" -o "$tmp"
+  mv -f "$tmp" "$split_cached"
+fi
+"$cxx" -r "$cached" "$split_cached" -o "$1"
