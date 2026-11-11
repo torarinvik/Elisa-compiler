@@ -378,12 +378,14 @@ static unsigned elisacoreReuseEdgeDivisions(Module &M) {
   unsigned Changed = 0;
   for (Function &F : M) {
     if (BDU_SkipFunction(F, M) || F.size() > 128) continue;
+    unsigned FunctionChanges = 0;
     for (BasicBlock &B : F) {
       if (!skipRedundantFactorDivision(B) && !carryFactorQuotient(B) &&
           !reuseUnsignedInductionQuotient(B) && !reuseJoinedQuotient(B) &&
           !reuseEdgeDivision(B)) continue;
       ++Changed;
-      break;
+      // Inlining can leave multiple copies of the same quotient loop.
+      if (++FunctionChanges == 4) break;
     }
   }
   return Changed;
