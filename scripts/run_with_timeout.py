@@ -66,9 +66,17 @@ def run(command: list[str], timeout_seconds: float) -> int:
         except ProcessLookupError:
             pass
         except PermissionError as error:
-            # macOS can reject the group signal as the leader exits. Reap
-            # the child and confirm the group is gone before treating it
-            # as the ordinary deadline race.
+            # macOS can reject the group signal while the leader is exiting,
+            # before waitpid reports it. Try the child directly, then bound
+            # cleanup and check that no process group remains.
+            try:
+                process.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                process.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                pass
             if process.poll() is None or _group_exists(process.pid):
                 print(
                     f"run_with_timeout: cannot terminate owned process group {process.pid}: {error}",

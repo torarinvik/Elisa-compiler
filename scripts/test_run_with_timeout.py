@@ -22,7 +22,7 @@ RUNNER = ROOT / "scripts" / "run_with_timeout.py"
 class RunWithTimeoutTests(unittest.TestCase):
     def test_deadline_race_with_exited_group(self) -> None:
         process = Mock(pid=123)
-        process.wait.side_effect = [subprocess.TimeoutExpired(["compiler"], 5), 75]
+        process.wait.side_effect = [subprocess.TimeoutExpired(["compiler"], 5), 75, 75]
         process.poll.return_value = 75
         with (
             patch.object(run_with_timeout.subprocess, "Popen", return_value=process),
@@ -30,6 +30,7 @@ class RunWithTimeoutTests(unittest.TestCase):
             patch.object(run_with_timeout.os, "killpg", side_effect=[PermissionError(), ProcessLookupError()]),
         ):
             self.assertEqual(run_with_timeout.run(["compiler"], 5), 124)
+        process.kill.assert_called_once()
 
     def test_deadline_reports_permission_denied_for_live_child(self) -> None:
         process = Mock(pid=123)
@@ -41,7 +42,8 @@ class RunWithTimeoutTests(unittest.TestCase):
             patch.object(run_with_timeout.os, "killpg", side_effect=PermissionError()),
         ):
             self.assertEqual(run_with_timeout.run(["compiler"], 5), 125)
-        process.wait.assert_called_once_with(timeout=5)
+        process.kill.assert_called_once()
+        self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list], [5, 0.05])
 
     def test_timeout_terminates_owned_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
