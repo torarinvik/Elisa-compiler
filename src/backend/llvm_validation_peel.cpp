@@ -302,6 +302,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned specialized = elisacoreSpecializeLiteralDivisors(*unwrap(module), target);
   if (specialized == 2) return 2;
   if (specialized) status = 1;
+  unsigned stackViews = elisacoreInlineStackViewHelpers(*unwrap(module), target);
+  if (stackViews == 2) return 2;
+  if (stackViews) status = 1;
 #endif
   return status;
 }
