@@ -31,6 +31,6 @@ with tempfile.TemporaryDirectory(prefix="self-host-budget-") as work:
         ["bash", str(root / "scripts/self_host_gen2.sh"), str(work / "deadline")],
         cwd=root, env=env, capture_output=True, text=True, timeout=8,
     )
-    if run.returncode != 124 or "deadline exceeded (5s)" not in run.stderr:
+    if run.returncode != 124 or "deadline exceeded (3s)" not in run.stderr:
         raise SystemExit(f"direct self-host deadline failed\n{run.stdout}{run.stderr}")
-print("PASS nested memory budgets and the direct five-second deadline")
+print("PASS nested memory budgets and the direct three-second deadline")

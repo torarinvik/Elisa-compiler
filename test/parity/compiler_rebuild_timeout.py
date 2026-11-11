@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a compiler rebuild with a strict 5-second process-group deadline."""
+"""Run a compiler rebuild with a strict 3-second process-group deadline."""
 import os
 import signal
 import subprocess
@@ -70,7 +70,7 @@ def sample_rebuild():
 
 sampler = None
 if profile_enabled:
-    sampler = threading.Timer(2, sample_rebuild)
+    sampler = threading.Timer(1, sample_rebuild)
     sampler.daemon = True
     sampler.start()
 
@@ -85,14 +85,14 @@ def terminate(signum, _frame):
 signal.signal(signal.SIGTERM, terminate)
 signal.signal(signal.SIGINT, terminate)
 try:
-    status = child.wait(timeout=5)
+    status = child.wait(timeout=3)
 except subprocess.TimeoutExpired:
     try:
         os.killpg(child.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     child.wait()
-    message = "compiler rebuild exceeded 5 seconds"
+    message = "compiler rebuild exceeded 3 seconds"
     if profile_enabled and os.path.isfile(profile):
         message += f"; sample: {profile}"
     print(message, file=sys.stderr)

@@ -35,13 +35,13 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" == "--seed" && "${ELISA_STAGE1_SEED_TIMEOUT_WRAPPED:-0}" != "1" ]]; then
   # setup_local_compilers.sh supplies this marker so aggregate RSS/footprint
   # accounting includes every child in its bounded process group. Direct
-  # developer-script invocations get the same 5-second wall cap.
+  # developer-script invocations get the same 3-second wall cap.
   export ELISA_STAGE1_SEED_TIMEOUT_WRAPPED=1
   ELISA_TIMEOUT_LIBRARY_PATH_SET="${LIBRARY_PATH+x}" \
   ELISA_TIMEOUT_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
   ELISA_TIMEOUT_SDKROOT_SET="${SDKROOT+x}" \
   ELISA_TIMEOUT_SDKROOT_VALUE="${SDKROOT-}" \
-    exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 5 -- \
+    exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 3 -- \
     "$BASH" "${BASH_SOURCE[0]}" "$@"
 fi
 BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
