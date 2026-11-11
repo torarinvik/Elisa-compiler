@@ -105,6 +105,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_bounded_factorial.cpp"
 #include "llvm_array_copy_elision.cpp"
 #include "llvm_sqrt_proof.cpp"
+#include "llvm_masked_split_multiply.cpp"
 #include "llvm_bounded_sum.cpp"
 #include "llvm_index_bounds.cpp"
 #include "llvm_validation_layout.cpp"
