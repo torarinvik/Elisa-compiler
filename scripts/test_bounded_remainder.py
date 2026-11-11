@@ -76,6 +76,8 @@ def main():
     libs = shlex.split(run(CONFIG, "--ldflags", "--libs", "--system-libs"))
     cases = [
         ("guarded", IR, 2),
+        ("unsigned", IR.replace("srem", "urem"), 2),
+        ("mixed", IR.replace("%b.rem = srem", "%b.rem = urem"), 2),
         ("unknown sign", IR.replace("icmp ugt", "icmp sgt"), 0),
         ("undefined seed", IR.replace("[ 1, %entry ]", "[ undef, %entry ]"), 0),
         ("negative seed", IR.replace("[ 1, %entry ]", "[ -1, %entry ]"), 0),
@@ -95,7 +97,7 @@ def main():
             count, rewritten = run(executable, fixture).split("\n", 1)
             assert int(count) == expected, (name, count, expected)
             assert ("freeze i64 %value" in rewritten) == bool(expected), name
-            assert rewritten.count("srem i64") == 2 - expected, name
+            assert rewritten.count("srem i64") + rewritten.count("urem i64") == 2 - expected, name
             if name == "wide dividend":
                 assert "%a.rem = srem i64" in rewritten, name
             print("PASS", name)
