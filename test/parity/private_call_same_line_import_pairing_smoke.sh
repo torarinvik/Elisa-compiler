@@ -19,13 +19,17 @@ set +e
 stage0_output="$("$ELISACORE_BIN" -emit semantic "$FIXTURE" 2>&1)"
 stage0_rc=$?
 set -e
-[[ "$stage0_rc" == 0 ]] || fail "Stage0 rejected the first public selective import: $stage0_output"
+[[ "$stage0_rc" -ne 0 ]] || fail "Stage0 accepted conflicting selective imports"
+grep -Fq 'conflicting import: "pick" is already imported as "PublicProvider.pick", cannot also import it as "PrivateProvider.pick"' <<< "$stage0_output" \
+    || fail "Stage0 did not identify the first and second import targets: $stage0_output"
 if grep -qF 'is private to module' <<< "$stage0_output"; then
     fail "Stage0 reported the later private import instead of the first public binding: $stage0_output"
 fi
 
 stage1_output="$("$RPT" < "$FIXTURE")"
 grep -q '^P 0$' <<< "$stage1_output" || fail "Stage1 returned a nonzero process status: $stage1_output"
+grep -Fq 'conflicting import: "pick" is already imported from "PublicProvider", cannot also import it from "PrivateProvider"' <<< "$stage1_output" \
+    || fail "Stage1 did not identify the first and second import targets: $stage1_output"
 if grep -qF 'is private to module' <<< "$stage1_output"; then
     fail "Stage1 paired a selective import with another source at the same #line value: $stage1_output"
 fi
