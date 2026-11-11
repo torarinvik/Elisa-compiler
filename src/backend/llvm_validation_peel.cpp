@@ -52,9 +52,6 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef) { return 0;
 extern "C" unsigned elisacoreCsscAbsoluteRangeChecks(LLVMModuleRef, LLVMTargetMachineRef) { return 0; }
 #endif
 
-// Shared reduction-tail pass, also included in the bridge cache identity.
-#include "llvm_remainder_tail.cpp"
-
 // Keep Apple ARM layout policy identical to Stage0's O3 emitter.
 #include <llvm-c/Support.h>
 #include <llvm-c/Transforms/PassBuilder.h>
@@ -100,13 +97,13 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #endif
 }
 #include "llvm_checked_mul.cpp"
-#include "llvm_bounded_unswitch.cpp"
+extern "C" unsigned elisacoreBoundedLoopUnswitch(LLVMModuleRef);
 #include "llvm_shared_reciprocal.cpp"
 #include "llvm_bounded_factorial.cpp"
-#include "llvm_array_copy_elision.cpp"
-#include "llvm_sqrt_proof.cpp"
-#include "llvm_bounded_sum.cpp"
-#include "llvm_index_bounds.cpp"
+extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);
+extern "C" unsigned elisacoreOptimizeSqrtNonNaN(LLVMModuleRef, LLVMTargetMachineRef);
+extern "C" unsigned elisacoreOptimizeBoundedSums(LLVMModuleRef, LLVMTargetMachineRef);
+extern "C" unsigned elisacoreOptimizeIndexBounds(LLVMModuleRef, LLVMTargetMachineRef);
 #include "llvm_validation_layout.cpp"
 #include "llvm_guarded_increment.cpp"
 #include "llvm_guarded_counter.cpp"
@@ -311,13 +308,3 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #endif
   return status;
 }
-
-// Bounded AArch64 zero-fill expansion shared with Stage0.
-#include "llvm_scratch_prefix.cpp"
-#include "llvm_small_zero.cpp"
-
-#include "llvm_bool_array_pack.cpp"
-
-#include "llvm_short_trip.cpp"
-
-#include "llvm_recursive_inline.cpp"

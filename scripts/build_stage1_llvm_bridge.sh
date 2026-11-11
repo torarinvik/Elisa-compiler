@@ -11,44 +11,88 @@ cxx="${ELISA_LLVM_CXX:-$llvm_bindir/clang++}"
 # llvm-config emits compiler options, not user shell code. Split them as arguments.
 read -r -a cxxflags <<<"$("$LLVM_CONFIG" --cxxflags)"
 backend="$ROOT/src/backend"
-src="$backend/llvm_validation_peel.cpp"
-# Bridge sources include other C++ files from this directory. Key them all so
-# adding an include cannot leave the cached bridge stale after an edit.
+sources=(
+  "$backend/llvm_validation_peel.cpp"
+  "$backend/llvm_memory_and_call_passes.cpp"
+  "$backend/llvm_small_zero.cpp"
+  "$backend/llvm_numeric_passes.cpp"
+  "$backend/llvm_masked_split_multiply.cpp"
+)
 export LC_ALL=C
 toolchain_inputs="$(
   elisa_sha256 "$cxx"
   "$cxx" --version
   printf '%s\n' -O1 -fPIC "${cxxflags[@]}"
 )"
-key="$(
-  {
-    inputs=()
-    for input in "$backend"/*.cpp "$backend"/*.h; do
-      [[ "$input" == "$backend/llvm_masked_split_multiply.cpp" ]] || inputs+=("$input")
-    done
-    elisa_sha256 "${inputs[@]}"
-    printf '%s\n' "$toolchain_inputs"
-  } | elisa_sha256 | awk '{print $1}'
-)"
+# Each unit is keyed by its quoted local includes, including transitive
+# includes. A fill-pass edit can therefore reuse the validation bridge.
+bridge_keys() {
+  "$ELISA_TOOL_PYTHON" - "$toolchain_inputs" "${sources[@]}" <<'PY_KEYS'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+includes = re.compile(rb'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+for source in sys.argv[2:]:
+    digest = hashlib.sha256(sys.argv[1].encode())
+    pending = [Path(source)]
+    seen = set()
+    while pending:
+        path = pending.pop().resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        content = path.read_bytes()
+        digest.update(str(path).encode() + b"\0")
+        digest.update(hashlib.sha256(content).digest())
+        pending.extend(path.parent / name.decode() for name in includes.findall(content))
+    print(digest.hexdigest())
+PY_KEYS
+}
+keys="$(bridge_keys)"
 cache_dir="${ELISA_LLVM_BRIDGE_CACHE_DIR:-$ROOT/build/cache/llvm_bridge}"
-cached="$cache_dir/$key.o"
-if [[ ! -s "$cached" ]]; then
-  mkdir -p "$cache_dir"
-  tmp="$cached.tmp.$$"
-  "$cxx" -O1 -fPIC "${cxxflags[@]}" -c "$src" -o "$tmp"
-  mv -f "$tmp" "$cached"
+mkdir -p "$cache_dir"
+objects=()
+jobs=()
+temporary=()
+destinations=()
+cleanup() {
+  if (( ${#temporary[@]} )); then
+    for tmp in "${temporary[@]}"; do
+      if [[ -e "$tmp" ]]; then unlink "$tmp"; fi
+    done
+  fi
+}
+trap cleanup EXIT
+index=0
+while IFS= read -r key; do
+  source="${sources[$index]}"
+  cached="$cache_dir/$key.o"
+  objects+=("$cached")
+  if [[ ! -s "$cached" ]]; then
+    tmp="$cached.tmp.$$"
+    temporary+=("$tmp")
+    destinations+=("$cached")
+    "$cxx" -O1 -fPIC "${cxxflags[@]}" -c "$source" -o "$tmp" &
+    jobs+=("$!")
+  fi
+  index=$((index + 1))
+done <<<"$keys"
+status=0
+if (( ${#jobs[@]} )); then
+  for job in "${jobs[@]}"; do
+    wait "$job" || status=$?
+  done
 fi
-split_src="$backend/llvm_masked_split_multiply.cpp"
-split_key="$(
-  {
-    elisa_sha256 "$split_src"
-    printf '%s\n' "$toolchain_inputs"
-  } | elisa_sha256 | awk '{print $1}'
-)"
-split_cached="$cache_dir/$split_key.o"
-if [[ ! -s "$split_cached" ]]; then
-  tmp="$split_cached.tmp.$$"
-  "$cxx" -O1 -fPIC "${cxxflags[@]}" -c "$split_src" -o "$tmp"
-  mv -f "$tmp" "$split_cached"
+if (( status )); then exit "$status"; fi
+if (( ${#temporary[@]} )); then
+  if [[ "$(bridge_keys)" != "$keys" ]]; then
+    echo "Stage1 LLVM bridge inputs changed during compilation" >&2
+    exit 1
+  fi
+  for index in "${!temporary[@]}"; do
+    mv -f "${temporary[$index]}" "${destinations[$index]}"
+  done
 fi
-"$cxx" -nostdlib -r "$cached" "$split_cached" -o "$1"
+"$cxx" -nostdlib -r "${objects[@]}" -o "$1"
