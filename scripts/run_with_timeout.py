@@ -65,6 +65,16 @@ def run(command: list[str], timeout_seconds: float) -> int:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError as error:
+            # macOS can reject the group signal as the leader exits. Reap
+            # the child and confirm the group is gone before treating it
+            # as the ordinary deadline race.
+            if process.poll() is None or _group_exists(process.pid):
+                print(
+                    f"run_with_timeout: cannot terminate owned process group {process.pid}: {error}",
+                    file=sys.stderr,
+                )
+                return 125
         process.wait()
         print(
             f"run_with_timeout: deadline exceeded ({timeout_seconds:g}s); "
