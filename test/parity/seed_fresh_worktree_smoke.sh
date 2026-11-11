@@ -40,7 +40,10 @@ for part in \
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
 mkdir -p "$WORK/src/backend"
-printf '%s\n' '// LLVM bridge fixture' > "$WORK/src/backend/llvm_validation_peel.cpp"
+for source in llvm_validation_peel llvm_memory_and_call_passes llvm_small_zero \
+  llvm_numeric_passes llvm_masked_split_multiply llvm_bounded_remainder; do
+  printf '%s\n' '// LLVM bridge fixture' > "$WORK/src/backend/$source.cpp"
+done
 # The seed builds the runtime object after the product (70589584), and that helper
 # reads elisacore_std/native_runtime_support.elisa and fingerprints the whole
 # directory. A clean worktree has one; this fixture stubs it, in keeping with the
@@ -170,6 +173,10 @@ chmod +x "$WORK/clang"
 cat > "$WORK/clang++" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  echo "clang version seed-fresh-worktree-smoke"
+  exit 0
+fi
 out=""; next=0
 for arg in "$@"; do
   if [[ "$next" == 1 ]]; then out="$arg"; next=0; continue; fi
