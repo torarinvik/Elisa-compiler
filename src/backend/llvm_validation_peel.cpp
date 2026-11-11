@@ -299,6 +299,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (elisacoreFoldConstantIntegerPaths(*unwrap(module))) status = 1;
   if (elisacoreNarrowBoundedCarries(*unwrap(module))) status = 1;
   if (elisacoreFoldConditionalDoubling(*unwrap(module))) status = 1;
+  unsigned specialized = elisacoreSpecializeLiteralDivisors(*unwrap(module), target);
+  if (specialized == 2) return 2;
+  if (specialized) status = 1;
 #endif
   return status;
 }
