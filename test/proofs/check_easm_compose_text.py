@@ -179,15 +179,15 @@ required_span_fragments = (
     "if values[cursor] == 44:",
     "assert current < wanted",
     "EasmTextScan::trim_bounds(values[start:cursor])",
-    "assert span_end <= close",
     "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).valid",
-    "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).start == span_start",
-    "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == span_end",
-    "selected_span: ComposeSpan = ComposeSpan{start: span_start, end: span_end, valid: true}",
+    "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).start == selected_span.start",
+    "assert easm_compose_span_reference_from_state(values, base, close, start, cursor, current, wanted).end == selected_span.end",
+    "selected_span: ComposeSpan = easm_compose_span_from_trim_bounds(base, close, start, cursor, bounds)",
     "assert easm_compose_span_matches_reference(selected_span, text, wanted)",
     "return selected_span",
     "if current == wanted:",
     "EasmTextScan::trim_bounds(values[start:value_length])",
+    "selected_span: ComposeSpan = easm_compose_span_from_trim_bounds(base, close, start, value_length, bounds)",
     "assert wanted - current > easm_compose_comma_count_from(values, value_length)",
     "assert not easm_compose_span_reference_from_state(values, base, close, start, value_length, current, wanted).valid",
     "assert easm_compose_span_reference_from_state(values, base, close, start, value_length, current, wanted).start == 0",
@@ -368,7 +368,7 @@ if any(compact(fragment) not in trimmed_span_body for fragment in (
     raise SystemExit("trimmed compose spans no longer derive their bounds from the proved trim specification")
 trim_bounds_span_body = compact(function_section(text_source, "easm_compose_span_from_trim_bounds"))
 if any(compact(fragment) not in trim_bounds_span_body for fragment in (
-    "ghost def easm_compose_span_from_trim_bounds(",
+    "def easm_compose_span_from_trim_bounds(",
     "requires base <= source_end",
     "requires bounds.start <= bounds.end and bounds.end <= cursor - segment_start",
     "requires cursor <= source_end - base",
