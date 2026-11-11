@@ -585,6 +585,7 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
 #include "llvm_constant_paths.cpp"
 #include "llvm_literal_divisor_specialization.cpp"
 #include "llvm_stack_view_inline.cpp"
+#include "llvm_bounded_quotient_sum.cpp"
 #include "llvm_bounded_carry.cpp"
 
 #else
