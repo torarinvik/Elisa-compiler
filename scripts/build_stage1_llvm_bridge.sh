@@ -10,10 +10,18 @@ cxx="${ELISA_LLVM_CXX:-$llvm_bindir/clang++}"
 [[ -x "$cxx" ]] || { echo "LLVM C++ compiler not found: $cxx" >&2; exit 2; }
 # llvm-config emits compiler options, not user shell code. Split them as arguments.
 read -r -a cxxflags <<<"$("$LLVM_CONFIG" --cxxflags)"
-src="$ROOT/src/backend/llvm_validation_peel.cpp"
-# Every seed links the bridge; recompiling it costs ~1 s. Reuse an object keyed
-# on the source, the compiler binary and version, and the exact flags.
-key="$( { elisa_sha256 "$src" "$ROOT/src/backend/llvm_validation_loop_passes.h" "$ROOT/src/backend/llvm_validation_bounded_division.h" "$ROOT/src/backend/llvm_remainder_tail.cpp" "$ROOT/src/backend/llvm_small_zero.cpp" "$ROOT/src/backend/llvm_guarded_divisor.h" "$ROOT/src/backend/llvm_scratch_prefix.cpp" "$ROOT/src/backend/llvm_array_coverage.h" "$ROOT/src/backend/llvm_covered_prefix.cpp" "$ROOT/src/backend/llvm_stack_prefix.cpp" "$ROOT/src/backend/llvm_compact_shift_loop.cpp" "$ROOT/src/backend/llvm_bool_array_pack.cpp" "$ROOT/src/backend/llvm_bounded_division_unroll.cpp" "$ROOT/src/backend/llvm_shift_parity.cpp" "$ROOT/src/backend/llvm_shift_bit_reverse.cpp" "$ROOT/src/backend/llvm_power_position.cpp" "$ROOT/src/backend/llvm_range_and.cpp" "$ROOT/src/backend/llvm_scalar_loop_idioms.cpp" "$ROOT/src/backend/llvm_masked_single_bit.cpp" "$ROOT/src/backend/llvm_conditional_doubling.cpp" "$ROOT/src/backend/llvm_shift_xor.cpp" "$ROOT/src/backend/llvm_edge_division_reuse.cpp" "$ROOT/src/backend/llvm_factored_unsigned_division.cpp" "$ROOT/src/backend/llvm_remainder_recurrence.cpp" "$ROOT/src/backend/llvm_constant_paths.cpp" "$ROOT/src/backend/llvm_bounded_carry.cpp" "$ROOT/src/backend/llvm_bounded_product.cpp" "$ROOT/src/backend/llvm_bounded_factorial.cpp" "$ROOT/src/backend/llvm_array_copy_elision.cpp" "$ROOT/src/backend/llvm_sqrt_proof.cpp" "$ROOT/src/backend/llvm_bounded_sum.cpp" "$ROOT/src/backend/llvm_index_bounds.cpp" "$ROOT/src/backend/llvm_validation_layout.cpp" "$ROOT/src/backend/llvm_guarded_increment.cpp" "$ROOT/src/backend/llvm_guarded_counter.cpp" "$ROOT/src/backend/llvm_nonnegative_remainder.cpp" "$ROOT/src/backend/llvm_ordered_vector.cpp" "$ROOT/src/backend/llvm_special_epilogue.cpp" "$ROOT/src/backend/llvm_even_range.cpp" "$ROOT/src/backend/llvm_selective_scheduler.cpp" "$ROOT/src/backend/llvm_short_trip.cpp" "$ROOT/src/backend/llvm_recursive_inline.cpp" "$ROOT/src/backend/llvm_checked_mul.cpp" "$ROOT/src/backend/llvm_checked_initialization.cpp" "$ROOT/src/backend/llvm_checked_power.cpp" "$ROOT/src/backend/llvm_bounded_unswitch.cpp" "$ROOT/src/backend/llvm_shared_reciprocal.cpp" "$cxx"; "$cxx" --version; printf '%s\n' -O1 -fPIC "${cxxflags[@]}"; } | elisa_sha256 | awk '{print $1}')"
+backend="$ROOT/src/backend"
+src="$backend/llvm_validation_peel.cpp"
+# Bridge sources include other C++ files from this directory. Key them all so
+# adding an include cannot leave the cached bridge stale after an edit.
+export LC_ALL=C
+key="$(
+  {
+    elisa_sha256 "$backend"/*.cpp "$backend"/*.h "$cxx"
+    "$cxx" --version
+    printf '%s\n' -O1 -fPIC "${cxxflags[@]}"
+  } | elisa_sha256 | awk '{print $1}'
+)"
 cache_dir="${ELISA_LLVM_BRIDGE_CACHE_DIR:-$ROOT/build/cache/llvm_bridge}"
 cached="$cache_dir/$key.o"
 if [[ ! -s "$cached" ]]; then

@@ -114,6 +114,9 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_ordered_vector.cpp"
 #include "llvm_special_epilogue.cpp"
 #include "llvm_even_range.cpp"
+#if LLVM_VERSION_MAJOR >= 23
+#include "llvm_ring_index_bounds.cpp"
+#endif
 
 static bool shouldRevisitNestedVectorLoops(Module &M) {
   if (M.getNamedMetadata("llvm.dbg.cu") || !M.getTargetTriple().isAArch64())
@@ -270,6 +273,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   finalSimplifications += elisacoreFoldShiftBitReverseLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldPowerPosition(*unwrap(module));
 #if LLVM_VERSION_MAJOR >= 23
+  finalSimplifications += elisacoreFoldRingIndexBounds(*unwrap(module));
   finalSimplifications += elisacoreFoldRangeAndLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldScalarLoopIdioms(*unwrap(module));
   finalSimplifications += elisacoreFoldMaskedSingleBits(*unwrap(module));
