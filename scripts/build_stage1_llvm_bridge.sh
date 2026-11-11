@@ -53,6 +53,14 @@ PY_KEYS
 keys="$(bridge_keys)"
 cache_dir="${ELISA_LLVM_BRIDGE_CACHE_DIR:-$ROOT/build/cache/llvm_bridge}"
 mkdir -p "$cache_dir"
+# The merged bridge is identical whenever its ordered translation units
+# are identical. Avoid starting a second linker on warm seed runs.
+merged_key="$(printf '%s\n' stage1-llvm-bridge-v1 -nostdlib -r "$keys" | elisa_sha256)"
+merged="$cache_dir/merged-${merged_key%% *}.o"
+if [[ -s "$merged" ]]; then
+  cp "$merged" "$1"
+  exit
+fi
 objects=()
 jobs=()
 temporary=()
@@ -95,4 +103,8 @@ if (( ${#temporary[@]} )); then
     mv -f "${temporary[$index]}" "${destinations[$index]}"
   done
 fi
-"$cxx" -nostdlib -r "${objects[@]}" -o "$1"
+merged_tmp="$(mktemp "$merged.tmp.XXXXXXXX")"
+temporary+=("$merged_tmp")
+"$cxx" -nostdlib -r "${objects[@]}" -o "$merged_tmp"
+mv -f "$merged_tmp" "$merged"
+cp "$merged" "$1"
