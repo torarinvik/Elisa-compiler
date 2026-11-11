@@ -117,9 +117,8 @@ seed_build() {
     if [[ -n "${ELISA_SEED_STAGE0_FRESH_PID:-}" ]]; then
       wait "$ELISA_SEED_STAGE0_FRESH_PID" || status=$?
       ELISA_SEED_STAGE0_FRESH_PID=""
-      cat "$ELISA_SEED_FRESH_OUT"
-      cat "$ELISA_SEED_FRESH_ERR" >&2
-      rm -f "$ELISA_SEED_FRESH_OUT" "$ELISA_SEED_FRESH_ERR"
+      if [[ -s "$ELISA_SEED_FRESH_OUT" ]]; then cat "$ELISA_SEED_FRESH_OUT"; fi
+      if [[ -s "$ELISA_SEED_FRESH_ERR" ]]; then cat "$ELISA_SEED_FRESH_ERR" >&2; fi
     fi
     return "$status"
   }
@@ -130,35 +129,36 @@ seed_build() {
       wait "$ELISA_SEED_BRIDGE_PID" 2>/dev/null || true
       ELISA_SEED_BRIDGE_PID=""
     fi
-    if [[ -n "${ELISA_SEED_OUTPUT:-}" ]]; then
-      rm -f "$ELISA_SEED_OUTPUT"
-    fi
-    if [[ -n "${ELISA_SEED_OBJECT:-}" ]]; then
-      rm -f "$ELISA_SEED_OBJECT"
-    fi
-    if [[ -n "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}" ]]; then
-      rm -f "$ELISA_SEED_PROFILE_HOOK_SOURCE"
-    fi
     if [[ -n "$ELISA_SEED_RECEIPT_PID" ]]; then
       kill "$ELISA_SEED_RECEIPT_PID" 2>/dev/null || true
       wait "$ELISA_SEED_RECEIPT_PID" 2>/dev/null || true
+      ELISA_SEED_RECEIPT_PID=""
     fi
+    if [[ -n "${ELISA_SEED_INPUTS_PID:-}" ]]; then
+      kill "$ELISA_SEED_INPUTS_PID" 2>/dev/null || true
+      wait "$ELISA_SEED_INPUTS_PID" 2>/dev/null || true
+      ELISA_SEED_INPUTS_PID=""
+    fi
+    local file
+    local -a files=("$ELISA_SEED_LOCK_DIR/pid") directories=("$ELISA_SEED_LOCK_DIR")
+    for file in "${ELISA_SEED_OUTPUT:-}" "${ELISA_SEED_OBJECT:-}" "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}" \
+        "${ELISA_SEED_LLVM_BRIDGE:-}" "${ELISA_SEED_INPUTS_FILE:-}" "${ELISA_SEED_FRESH_OUT:-}" "${ELISA_SEED_FRESH_ERR:-}"; do
+      if [[ -n "$file" ]]; then files+=("$file"); fi
+    done
     if [[ -n "$ELISA_SEED_RUNTIME_DIR" ]]; then
-      rm -f "$ELISA_SEED_RUNTIME_DIR"/runtime.o*
-      rmdir "$ELISA_SEED_RUNTIME_DIR" 2>/dev/null || true
+      files+=("$ELISA_SEED_RUNTIME_DIR"/runtime.o*)
+      directories+=("$ELISA_SEED_RUNTIME_DIR")
     fi
     if [[ -n "${ELISA_SEED_OUTPUT_DIR:-}" ]]; then
-      rm -f "$ELISA_SEED_OUTPUT_DIR"/*.provenance.json*
-      rmdir "$ELISA_SEED_OUTPUT_DIR" 2>/dev/null || true
+      files+=("$ELISA_SEED_OUTPUT_DIR"/*.provenance.json*)
+      directories+=("$ELISA_SEED_OUTPUT_DIR")
     fi
-    [[ -z "${ELISA_SEED_LLVM_BRIDGE:-}" ]] || rm -f "$ELISA_SEED_LLVM_BRIDGE"
-    [[ -z "${ELISA_SEED_INPUTS_FILE:-}" ]] || rm -f "$ELISA_SEED_INPUTS_FILE"
-    rm -f "$ELISA_SEED_LOCK_DIR/pid"
-    rmdir "$ELISA_SEED_LOCK_DIR" 2>/dev/null || true
     if [[ -n "${ELISA_SEED_GLOBAL_LOCK_DIR:-}" ]]; then
-      rm -f "$ELISA_SEED_GLOBAL_LOCK_DIR/pid"
-      rmdir "$ELISA_SEED_GLOBAL_LOCK_DIR" 2>/dev/null || true
+      files+=("$ELISA_SEED_GLOBAL_LOCK_DIR/pid")
+      directories+=("$ELISA_SEED_GLOBAL_LOCK_DIR")
     fi
+    rm -f -- "${files[@]}"
+    rmdir -- "${directories[@]}" 2>/dev/null || true
   }
   trap cleanup_seed_lock EXIT INT TERM HUP
   ELISA_SEED_OUTPUT_DIR="$(mktemp -d "${BIN}.tmp.XXXXXXXX")"
