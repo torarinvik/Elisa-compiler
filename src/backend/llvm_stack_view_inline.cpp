@@ -3,6 +3,7 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InstIterator.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/Transforms/PassBuilder.h>
@@ -40,6 +41,40 @@ static bool hasInlineStackViewArguments(CallInst &Call) {
   }
   return Storage.size() >= 2 && HasConstantFlag;
 }
+
+// View aggregates cannot carry pointer parameter attributes. When every call
+// supplies two different stack arrays, expose their allocation separation to AA.
+static bool assumeDisjointStackViews(Function &F) {
+  if (!F.hasLocalLinkage() || F.isVarArg() || F.arg_size() != 3 ||
+      !F.getReturnType()->isVoidTy() || F.getNumUses() < 2 ||
+      F.getNumUses() > 4 || !F.getArg(2)->getType()->isIntegerTy(1) ||
+      F.hasFnAttribute("elisa.disjoint-stack-views") ||
+      BDU_SkipFunction(F, *F.getParent()))
+    return false;
+  for (Use &U : F.uses()) {
+    auto *Call = dyn_cast<CallInst>(U.getUser());
+    if (!Call || &Call->getCalledOperandUse() != &U ||
+        Call->getFunctionType() != F.getFunctionType() ||
+        !hasInlineStackViewArguments(*Call))
+      return false;
+    for (unsigned Index : {0u, 1u}) {
+      auto *Storage = dyn_cast_or_null<AllocaInst>(
+          FindInsertedValue(Call->getArgOperand(Index), {0}));
+      auto *Array = Storage ? dyn_cast<ArrayType>(Storage->getAllocatedType())
+                            : nullptr;
+      auto *Length = dyn_cast_or_null<ConstantInt>(
+          FindInsertedValue(Call->getArgOperand(Index), {1}));
+      if (!Array || !Length || Array->getNumElements() < Length->getZExtValue())
+        return false;
+    }
+  }
+  IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
+  Value *Pointers[] = {B.CreateExtractValue(F.getArg(0), 0),
+                      B.CreateExtractValue(F.getArg(1), 0)};
+  B.CreateAssumption({OperandBundleDef("separate_storage", Pointers)});
+  F.addFnAttr("elisa.disjoint-stack-views");
+  return true;
+}
 } // namespace
 
 static unsigned elisacoreInlineStackViewHelpers(Module &M, LLVMTargetMachineRef Target) {
@@ -74,17 +109,24 @@ static unsigned elisacoreInlineStackViewHelpers(Module &M, LLVMTargetMachineRef 
     InlineFunctionInfo Info;
     if (InlineFunction(*Call, Info).isSuccess()) Callers.insert(Caller);
   }
+  SmallPtrSet<Function *, 4> DisjointViews;
+  for (Function &F : M)
+    if (assumeDisjointStackViews(F)) {
+      if (Callers.insert(&F).second) DisjointViews.insert(&F);
+    }
   if (Callers.empty()) return 0;
   auto Options = LLVMCreatePassBuilderOptions();
-  for (Function *Caller : Callers)
-    if (auto Error = LLVMRunPassesOnFunction(wrap(Caller),
-            "sroa,early-cse,instcombine,simplifycfg,gvn,slp-vectorizer,instcombine,simplifycfg,"
-            "loop-simplify,lcssa,loop-unroll<O3>,sroa,instcombine,simplifycfg,gvn,slp-vectorizer",
-            Target, Options)) {
+  for (Function *Caller : Callers) {
+    const char *Pipeline = DisjointViews.contains(Caller)
+        ? "sroa,instcombine,simplifycfg,gvn,slp-vectorizer,instcombine,simplifycfg"
+        : "sroa,early-cse,instcombine,simplifycfg,gvn,slp-vectorizer,instcombine,simplifycfg,"
+          "loop-simplify,lcssa,loop-unroll<O3>,sroa,instcombine,simplifycfg,gvn,slp-vectorizer";
+    if (auto Error = LLVMRunPassesOnFunction(wrap(Caller), Pipeline, Target, Options)) {
       LLVMConsumeError(Error);
       LLVMDisposePassBuilderOptions(Options);
       return 2;
     }
+  }
   LLVMDisposePassBuilderOptions(Options);
   return 1;
 }

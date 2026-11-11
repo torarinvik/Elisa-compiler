@@ -1,6 +1,8 @@
 // Preserve constant-divisor lowering when a shared helper survives inlining.
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -39,6 +41,7 @@ static unsigned elisacoreSpecializeLiteralDivisors(Module &M, LLVMTargetMachineR
   if (!M.getTargetTriple().isAArch64() || M.size() > 2048) return 0;
   unsigned RemainingGrowth = 1024;
   SmallVector<Function *, 8> Clones;
+  SmallVector<Function *, 8> InlinedCallers;
   for (Function &F : llvm::make_early_inc_range(M)) {
     if (!F.hasLocalLinkage() || F.isVarArg() || F.arg_size() > 8 || F.hasComdat() ||
         F.hasFnAttribute(Attribute::Convergent) || F.hasFnAttribute(Attribute::NoDuplicate) ||
@@ -84,6 +87,31 @@ static unsigned elisacoreSpecializeLiteralDivisors(Module &M, LLVMTargetMachineR
   auto Options = LLVMCreatePassBuilderOptions();
   for (Function *Clone : Clones)
     if (auto Error = LLVMRunPassesOnFunction(wrap(Clone),
+            "instcombine<no-verify-fixpoint>,simplifycfg", Target, Options)) {
+      LLVMConsumeError(Error);
+      LLVMDisposePassBuilderOptions(Options);
+      return 2;
+    }
+  for (Function *Clone : Clones) {
+    // A single caller can absorb the specialized body without duplicating it.
+    // Limit this to loop calls, where each iteration pays the call overhead.
+    if (!Clone->hasOneUse() || Clone->getInstructionCount() > 192) continue;
+    auto *Call = dyn_cast<CallInst>(*Clone->user_begin());
+    if (!Call || Call->hasFnAttr(Attribute::NoInline)) continue;
+    Function *Caller = Call->getFunction();
+    if (BDU_SkipFunction(*Caller, M) || Caller->getInstructionCount() > 512)
+      continue;
+    DominatorTree DT(*Caller);
+    LoopInfo Loops(DT);
+    if (!Loops.getLoopFor(Call->getParent())) continue;
+    InlineFunctionInfo Info;
+    if (!InlineFunction(*Call, Info).isSuccess()) continue;
+    Clone->eraseFromParent();
+    if (!llvm::is_contained(InlinedCallers, Caller))
+      InlinedCallers.push_back(Caller);
+  }
+  for (Function *Caller : InlinedCallers)
+    if (auto Error = LLVMRunPassesOnFunction(wrap(Caller),
             "instcombine<no-verify-fixpoint>,simplifycfg", Target, Options)) {
       LLVMConsumeError(Error);
       LLVMDisposePassBuilderOptions(Options);
