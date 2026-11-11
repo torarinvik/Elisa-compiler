@@ -15,15 +15,19 @@ src="$backend/llvm_validation_peel.cpp"
 # Bridge sources include other C++ files from this directory. Key them all so
 # adding an include cannot leave the cached bridge stale after an edit.
 export LC_ALL=C
+toolchain_inputs="$(
+  elisa_sha256 "$cxx"
+  "$cxx" --version
+  printf '%s\n' -O1 -fPIC "${cxxflags[@]}"
+)"
 key="$(
   {
     inputs=()
     for input in "$backend"/*.cpp "$backend"/*.h; do
       [[ "$input" == "$backend/llvm_masked_split_multiply.cpp" ]] || inputs+=("$input")
     done
-    elisa_sha256 "${inputs[@]}" "$cxx"
-    "$cxx" --version
-    printf '%s\n' -O1 -fPIC "${cxxflags[@]}"
+    elisa_sha256 "${inputs[@]}"
+    printf '%s\n' "$toolchain_inputs"
   } | elisa_sha256 | awk '{print $1}'
 )"
 cache_dir="${ELISA_LLVM_BRIDGE_CACHE_DIR:-$ROOT/build/cache/llvm_bridge}"
@@ -37,9 +41,8 @@ fi
 split_src="$backend/llvm_masked_split_multiply.cpp"
 split_key="$(
   {
-    elisa_sha256 "$split_src" "$cxx"
-    "$cxx" --version
-    printf '%s\n' -O1 -fPIC "${cxxflags[@]}"
+    elisa_sha256 "$split_src"
+    printf '%s\n' "$toolchain_inputs"
   } | elisa_sha256 | awk '{print $1}'
 )"
 split_cached="$cache_dir/$split_key.o"
@@ -48,4 +51,4 @@ if [[ ! -s "$split_cached" ]]; then
   "$cxx" -O1 -fPIC "${cxxflags[@]}" -c "$split_src" -o "$tmp"
   mv -f "$tmp" "$split_cached"
 fi
-"$cxx" -r "$cached" "$split_cached" -o "$1"
+"$cxx" -nostdlib -r "$cached" "$split_cached" -o "$1"
