@@ -116,6 +116,7 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_even_range.cpp"
 #if LLVM_VERSION_MAJOR >= 23
 #include "llvm_ring_index_bounds.cpp"
+#include "llvm_guarded_counter_bounds.cpp"
 #include "llvm_decimal_digit_count.cpp"
 #include "llvm_halving_runs.cpp"
 #endif
@@ -276,6 +277,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   finalSimplifications += elisacoreFoldPowerPosition(*unwrap(module));
 #if LLVM_VERSION_MAJOR >= 23
   finalSimplifications += elisacoreFoldRingIndexBounds(*unwrap(module));
+  finalSimplifications += elisacoreFoldGuardedCounterBounds(*unwrap(module));
   finalSimplifications += elisacoreFoldDecimalDigitCounts(*unwrap(module));
   finalSimplifications += elisacoreFoldHalvingRuns(*unwrap(module));
   finalSimplifications += elisacoreFoldRangeAndLoops(*unwrap(module));
