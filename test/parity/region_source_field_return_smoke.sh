@@ -40,4 +40,32 @@ for line in 12 15 18 21; do
         exit 1
     fi
 done
+
+view_report="$("$RPT" <<'ELISA'
+global region source
+struct SourceBuffer:
+    bytes: darray[u8] @source
+struct Borrowed[@r]:
+    bytes: darray[u8] @r
+
+def view_bytes(bytes: darray[u8], start: usize, count: usize) -> sview:
+    return ""
+def choose_view(first: darray[u8], second: darray[u8]) -> sview:
+    return ""
+
+def good_view[@r](buffer: SourceBuffer& @r) -> sview @source:
+    return view_bytes(buffer.bytes, 0, buffer.bytes.count)
+def bad_view[@r](buffer: SourceBuffer& @r, other: Borrowed[r]& @r) -> sview @source:
+    return choose_view(buffer.bytes, other.bytes)
+ELISA
+)"
+grep -Fxq 'P 0' <<< "$view_report"
+if grep -q '  L13 ' <<< "$view_report"; then
+    printf 'source-backed view rejected:\n%s\n' "$view_report" >&2
+    exit 1
+fi
+if ! grep -q '  L15 .*region' <<< "$view_report"; then
+    printf 'missing lifetime diagnostic for independent view argument:\n%s\n' "$view_report" >&2
+    exit 1
+fi
 printf 'source-backed field return and lifetime controls OK\n'
