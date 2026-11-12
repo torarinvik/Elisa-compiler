@@ -37,7 +37,7 @@ expected_rows='L18'
   printf 'Stage0 reported an unexpected Try diagnostic count:\n%s\n' "$stage0_output" >&2
   exit 1
 }
-grep -q 'cannot propagate Expected from a function returning Other' <<< "$stage0_output" || {
+grep -q 'cannot propagate Provider.Expected from a function returning Consumer.Other' <<< "$stage0_output" || {
   printf 'Stage0 did not resolve AliasExpected through imported Base to Provider.Expected:\n%s\n' "$stage0_output" >&2
   exit 1
 }
