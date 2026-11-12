@@ -114,47 +114,31 @@ extend Semantic:
                         return false
 
 
-        # Local container declarations in a body, including nested blocks.
-        def collect_local_containers(body: darray[Ast::Stmt], container_fns: darray[sview]&, out: mutable darray[sview]&, scalars: mutable darray[sview]&) -> void:
-            can Memory.Allocate, Abort.Panic:
-                for statement in body |out, scalars|:
-                    match statement:
-                        Stmt.VarDecl(name, type_expression, value, line):
-                            is_container_typed: bool = annotation_is_container(type_expression)
-                            # A local INITIALIZED from a locally-created value carries the
-                            # provenance whatever its declared type (`node: Item =
-                            # Item.Row(make_vals(10))`).
-                            initializer_local: bool = value_is_locally_created(value, out, container_fns)
-                            out.push(name) if is_container_typed or initializer_local
-                            scalars.push(name) if annotation_is_scalar_darray(type_expression) and not initializer_local
-                        Stmt.Block(kind, clause, binding, block_body, line):
-                            collect_local_containers(block_body, container_fns, out, scalars)
-                        Stmt.If(condition, then_body, else_body, if_line):
-                            collect_local_containers(then_body, container_fns, out, scalars)
-                            collect_local_containers(else_body, container_fns, out, scalars)
-                        Stmt.While(condition, while_body, while_line):
-                            collect_local_containers(while_body, container_fns, out, scalars)
-                        Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
-                            collect_local_containers(for_body, container_fns, out, scalars)
-                        Stmt.Match(match_scrutinee, match_arms, match_line):
-                            for arm in match_arms |out, scalars|:
-                                collect_local_containers(arm.body, container_fns, out, scalars)
-                        _:
-                            pass
-
-
         def auto_escape_walk(body: darray[Ast::Stmt], caller_params: darray[sview]&, whole_params: darray[sview]&, local_containers: darray[sview]&, scalar_containers: darray[sview]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
-                for statement in body |table| -> table:
+                active_params: mutable darray[sview] = [name for name in caller_params]
+                active_whole: mutable darray[sview] = [name for name in whole_params]
+                active_locals: mutable darray[sview] = [name for name in local_containers]
+                active_scalars: mutable darray[sview] = [name for name in scalar_containers]
+                for statement in body |table, active_params, active_whole, active_locals, active_scalars| -> table:
                     match statement:
                         Stmt.Expr(expression, line):
-                            table <- auto_escape_call(expression, line.line, caller_params, local_containers, scalar_containers, container_fns, table)
+                            table <- auto_escape_call(expression, line.line, active_params, active_locals, active_scalars, container_fns, table)
                         # `_ = dst.put("k", make_item())` — the discarded-result form.
                         Stmt.VarDecl(name, type_expression, value, line):
-                            table <- auto_escape_call(value, line.line, caller_params, local_containers, scalar_containers, container_fns, table)
+                            table <- auto_escape_call(value, line.line, active_params, active_locals, active_scalars, container_fns, table)
+                            initializer_local: bool = value_is_locally_created(value, active_locals, container_fns)
+                            active_locals <- [local_name for local_name in active_locals if local_name != name]
+                            active_scalars <- [local_name for local_name in active_scalars if local_name != name]
+                            external_name: sview = ident_name_of(value)
+                            copied_external: bool = external_name != "" and not initializer_local
+                            active_locals.push(name) if (annotation_is_container(type_expression) and not copied_external) or initializer_local
+                            active_scalars.push(name) if annotation_is_scalar_darray(type_expression) and not initializer_local and not copied_external
+                            active_params <- [param for param in active_params if param != name]
+                            active_whole <- [param for param in active_whole if param != name]
                         # `b.field <- local_container` on a caller-owned struct param.
                         Stmt.Assign(target, operator, value, line):
-                            table <- auto_escape_call(collection_append_call(target, value, line), line.line, caller_params, local_containers, scalar_containers, container_fns, table) if operator == TokenKind.PlusEq
+                            table <- auto_escape_call(collection_append_call(target, value, line), line.line, active_params, active_locals, active_scalars, container_fns, table) if operator == TokenKind.PlusEq
                             # A bare `out <- xs` on a `mutable darray/dict&` param is a write THROUGH
                             # the reference (the whole container header lands in caller storage), so
                             # it escapes like `out.push(xs)`. stage0 flags a bare local or a call
@@ -162,26 +146,54 @@ extend Semantic:
                             # container stays silent (its type carries no region), and plain `=`
                             # is a slot rebind.
                             bare_owner: sview = ident_name_of(target) if operator == TokenKind.LArrow else sview("", 0, 0)
-                            stores_bare: bool = bare_owner != "" and (any bp in whole_params where bp == bare_owner)
-                            escaping: bool = (stores_bare and value_is_directly_local(value, local_containers, container_fns))
+                            stores_bare: bool = bare_owner != "" and (any bp in active_whole where bp == bare_owner)
+                            # An indexed slot of a caller-owned container outlives this
+                            # function just like a field or the whole container header.
+                            indexed_owner: sview = match target:
+                                Expr.Index(object, _, _) | Expr.IndexN(object, _, _): auto_escape_place_root(object)
+                                _: ""
+                            stores_index: bool = operator == TokenKind.LArrow and indexed_owner != "" and (any bp in active_whole where bp == indexed_owner)
+                            escaping: bool = (stores_bare or stores_index) and value_is_directly_local(value, active_locals, container_fns)
                             table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.AutoRegionStoreEscape, name: "", line: line.line, expected: "", actual: ""}) if escaping
                             # `_ = dst.put("k", make_item())` parses as an ASSIGN to `_`, so
                             # the escaping store lives in the assigned VALUE, not the target.
-                            table <- auto_escape_call(value, line.line, caller_params, local_containers, scalar_containers, container_fns, table) if not escaping
+                            table <- auto_escape_call(value, line.line, active_params, active_locals, active_scalars, container_fns, table) if not escaping
+                            if operator == TokenKind.Assign:
+                                binding_name: sview = ident_name_of(target)
+                                assigned_local: bool = value_is_locally_created(value, active_locals, container_fns)
+                                active_locals <- [local_name for local_name in active_locals if local_name != binding_name]
+                                active_scalars <- [local_name for local_name in active_scalars if local_name != binding_name]
+                                active_locals.push(binding_name) if binding_name != "" and assigned_local
+                                active_params <- [param for param in active_params if param != binding_name]
+                                active_whole <- [param for param in active_whole if param != binding_name]
                         Stmt.Block(kind, clause, binding, block_body, block_line):
-                            table <- auto_escape_walk(block_body, caller_params, whole_params, local_containers, scalar_containers, container_fns, table)
+                            block_params: darray[sview] = [param for param in active_params if param != binding]
+                            block_whole: darray[sview] = [param for param in active_whole if param != binding]
+                            block_locals: darray[sview] = [name for name in active_locals if name != binding]
+                            block_scalars: darray[sview] = [name for name in active_scalars if name != binding]
+                            table <- auto_escape_walk(block_body, block_params, block_whole, block_locals, block_scalars, container_fns, table)
                         Stmt.If(condition, then_body, else_body, if_line):
-                            table <- auto_escape_walk(then_body, caller_params, whole_params, local_containers, scalar_containers, container_fns, table)
-                            table <- auto_escape_walk(else_body, caller_params, whole_params, local_containers, scalar_containers, container_fns, table)
+                            table <- auto_escape_walk(then_body, active_params, active_whole, active_locals, active_scalars, container_fns, table)
+                            table <- auto_escape_walk(else_body, active_params, active_whole, active_locals, active_scalars, container_fns, table)
                         Stmt.While(condition, while_body, while_line):
-                            table <- auto_escape_walk(while_body, caller_params, whole_params, local_containers, scalar_containers, container_fns, table)
+                            table <- auto_escape_walk(while_body, active_params, active_whole, active_locals, active_scalars, container_fns, table)
                         # A store in a loop body or a match arm escapes exactly like a
                         # straight-line one (stage0 walks every nested body).
                         Stmt.For(for_bind, for_variables, for_iterable, for_body, for_line):
-                            table <- auto_escape_walk(for_body, caller_params, whole_params, local_containers, scalar_containers, container_fns, table)
+                            loop_params: darray[sview] = [param for param in active_params if not (any variable in for_variables where variable == param)]
+                            loop_whole: darray[sview] = [param for param in active_whole if not (any variable in for_variables where variable == param)]
+                            loop_locals: darray[sview] = [name for name in active_locals if not (any variable in for_variables where variable == name)]
+                            loop_scalars: darray[sview] = [name for name in active_scalars if not (any variable in for_variables where variable == name)]
+                            table <- auto_escape_walk(for_body, loop_params, loop_whole, loop_locals, loop_scalars, container_fns, table)
                         Stmt.Match(match_scrutinee, match_arms, match_line):
                             for arm in match_arms |table| -> table:
-                                table <- auto_escape_walk(arm.body, caller_params, whole_params, local_containers, scalar_containers, container_fns, table)
+                                arm_binders: mutable darray[sview @source] = []
+                                gather_arm_pattern(arm.pattern, arm_binders)
+                                arm_params: darray[sview] = [param for param in active_params if not (any binder in arm_binders where binder == param)]
+                                arm_whole: darray[sview] = [param for param in active_whole if not (any binder in arm_binders where binder == param)]
+                                arm_locals: darray[sview] = [name for name in active_locals if not (any binder in arm_binders where binder == name)]
+                                arm_scalars: darray[sview] = [name for name in active_scalars if not (any binder in arm_binders where binder == name)]
+                                table <- auto_escape_walk(arm.body, arm_params, arm_whole, arm_locals, arm_scalars, container_fns, table)
                         _:
                             pass
 
@@ -291,7 +303,7 @@ extend Semantic:
                         pass
 
 
-        def check_auto_region_escape_walk(declarations: darray[Ast::Decl], container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
+        def check_auto_region_escape_walk(declarations: darray[Ast::Decl], annotations: darray[Ast::LocalRegionAnnotation]&, container_fns: darray[sview]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -310,7 +322,8 @@ extend Semantic:
                             caller_params: mutable darray[sview] = []
                             for parameter in parameters |caller_params, table|:
                                 continue if not param_is_mutable_ref(parameter)
-                                region_tied: bool = any tied_name in table.region_tied_param_names where tied_name == parameter.name
+                                has_region_name: bool = any tied_name in table.region_tied_param_names where tied_name == parameter.name
+                                region_tied: bool = has_region_name and (any annotation in annotations where annotation.line == line.line and annotation.owner_offset == line.offset and annotation.name == parameter.name and annotation.region != "")
                                 caller_params.push(parameter.name) if not region_tied
                             continue if caller_params.count == 0
                             whole_params: mutable darray[sview] = []
@@ -318,17 +331,16 @@ extend Semantic:
                                 whole_params.push(whole_parameter.name) if (any caller_name in caller_params where caller_name == whole_parameter.name) and annotation_is_container(whole_parameter.type_expression)
                             local_containers: mutable darray[sview] = []
                             scalar_containers: mutable darray[sview] = []
-                            collect_local_containers(body, container_fns, local_containers, scalar_containers)
                             table <- auto_escape_walk(body, caller_params, whole_params, local_containers, scalar_containers, container_fns, table)
                         Decl.Module(module_name, module_body, module_line):
-                            table <- check_auto_region_escape_walk(module_body, container_fns, table)
+                            table <- check_auto_region_escape_walk(module_body, annotations, container_fns, table)
                         Decl.Scoped(scoped_body, scoped_line):
-                            table <- check_auto_region_escape_walk(scoped_body, container_fns, table)
+                            table <- check_auto_region_escape_walk(scoped_body, annotations, container_fns, table)
                         _:
                             pass
 
     public:
-        def check_auto_region_escape(declarations: darray[Ast::Decl], table: lmut SymbolTable) -> void:
+        def check_auto_region_escape(file: Ast::File&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 # Only REGION-BACKED enums count as container-returning.
                 # collect_enum_type_names returns EVERY enum, but a plain non-recursive one is
@@ -338,9 +350,9 @@ extend Semantic:
                 # `packed enum` plus the recursive ones record_recursive_enum auto-promotes
                 # into region-backed packed trees.
                 all_enum_names: mutable darray[sview] = []
-                collect_enum_type_names(declarations, all_enum_names)
+                collect_enum_type_names(file.top_decls, all_enum_names)
                 enum_names: mutable darray[sview] = []
                 enum_names.extend([candidate_enum for candidate_enum in all_enum_names if any packed_name in table.packed_enum_names where packed_name == candidate_enum])
                 container_fns: mutable darray[sview] = []
-                collect_container_returning_fns(declarations, enum_names, container_fns)
-                table <- check_auto_region_escape_walk(declarations, container_fns, table)
+                collect_container_returning_fns(file.top_decls, enum_names, container_fns)
+                table <- check_auto_region_escape_walk(file.top_decls, file.local_region_annotations, container_fns, table)
