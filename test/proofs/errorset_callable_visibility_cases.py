@@ -77,10 +77,13 @@ def check_callable_visibility_fixtures(
 
     singleton_fixture = (ROOT / "test/repro/errorset_wrapper_return_lexical_singleton_over_imported_singleton.elisa").read_text()
     singleton_smoke = (ROOT / "test/parity/errorset_wrapper_return_lexical_singleton_over_imported_singleton_smoke.sh").read_text()
+    singleton_lines = [number for number, line in enumerate(singleton_fixture.splitlines(), 1)
+                       if line.strip() == "return choose(value)"]
     if not all(fragment in singleton_fixture for fragment in (
             "def choose(value: i64)",
             "def choose[T](value: T)",
-            "return choose(value)")) or "expected_rows='L19'" not in singleton_smoke:
+            "return choose(value)")) or len(singleton_lines) != 1 or \
+            f"expected_rows='L{singleton_lines[0]}'" not in singleton_smoke:
         raise SystemExit("EWR must retain coverage that a local and imported singleton do not activate cross-module receiver ranking")
 
     cross_module_singleton_smoke = (ROOT / "test/parity/errorset_wrapper_return_cross_module_singleton_specificity_smoke.sh").read_text()
@@ -219,7 +222,7 @@ def check_callable_visibility_fixtures(
             "return collect(..)")) or not all(fragment in variadic_arguments_smoke for fragment in (
             "errorset_wrapper_return_variadic_arguments.elisa",
             "named arguments and explicit bundle applications are not supported for variadic function",
-            "call argument forwarding `..` is not supported for variadic function",
+            r"call argument forwarding `\.\.` is not supported for variadic function",
             "expected_rows=$'L24'")):
         raise SystemExit("EWR variadic coverage must rank the concrete positional candidate above a fixed generic sibling and suppress unsupported named/forwarded shapes")
 
@@ -393,7 +396,7 @@ def check_callable_visibility_fixtures(
             "ewr_module_alias_order(candidate, alias, table)",
             "not ordering.known or ordering.left_precedes",
             "return true")) or not all(fragment in alias_order for fragment in (
-            "return (known: bool, left_precedes: bool)",
+            "-> (known: bool, left_precedes: bool)",
             "return semantic_possible_import_alias_precedes(left, right, table)")) or "ewr_module_is_lexical_ancestor(marker.module, caller_module)" in unknown_alias_barrier:
         raise SystemExit("EWR must check only a possible alias head and retain the barrier only when its target may supply the call")
     for alias_rank_source in (binding_scope, inaccessible_binding_scope, function_source(EWR, "ewr_infallible_callable_scope"), ordinary_binding):

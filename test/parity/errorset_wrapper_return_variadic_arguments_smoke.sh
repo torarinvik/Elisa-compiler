@@ -22,9 +22,9 @@ stage0_output="$("$ELISACORE_BIN" -emit semantic "$FIXTURE" 2>&1)"
 stage0_status=$?
 set -e
 [[ "$stage0_status" -ne 0 ]] || fail "Stage0 accepted the family mismatch and invalid variadic calls"
-grep -Fq 'named arguments and explicit bundle applications are not supported for variadic function "collect"' <<< "$stage0_output" \
+grep -Eq 'named arguments and explicit bundle applications are not supported for variadic function "(VariadicProvider\.)?collect"' <<< "$stage0_output" \
   || fail "Stage0 did not reject named arguments to the selected variadic function: $stage0_output"
-grep -Fq 'call argument forwarding `..` is not supported for variadic function "collect"' <<< "$stage0_output" \
+grep -Eq 'call argument forwarding `\.\.` is not supported for variadic function "(VariadicProvider\.)?collect"' <<< "$stage0_output" \
   || fail "Stage0 did not reject forwarding to the selected variadic function: $stage0_output"
 stage0_rows="$(printf '%s\n' "$stage0_output" \
   | sed -E -n 's#^.*:([0-9]+):[0-9]+[^:]*: return type expects.*$#L\1#p' \

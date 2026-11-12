@@ -80,7 +80,15 @@ if min(wildcard_lookup, wildcard_return, selective_lookup) < 0 or not (
     raise SystemExit("EWR callable lookup must prefer the nearest lexical wildcard before program-wide selective aliases")
 
 callable_lookup = function_source(EWR, "ewr_infallible_callable_scope")
-if "ewr_imported_callable_scope(annotations, name, current_module, caller_module)" not in callable_lookup:
+import_projection = function_source(EWR, "ewr_import_scope_rows")
+wrapper_check = function_source(EWR, "check_errorset_wrapper_return")
+if not all(fragment in import_projection for fragment in (
+        'annotation.name == "__binding_wildcard_import"',
+        'annotation.owner == "__from_member"',
+        'annotation.owner == "__from_src"',
+)) or "table.ewr_import_rows <- ewr_import_scope_rows(lookup_annotations)" not in wrapper_check:
+    raise SystemExit("EWR import projection must retain all callable scope rows from active annotations")
+if "ewr_imported_callable_scope(table.ewr_import_rows, name, current_module, caller_module)" not in callable_lookup:
     raise SystemExit("EWR infallible callable selection must use the Core-compatible import scope resolver")
 function_arm = callable_lookup.find("Decl.Func(function_name")
 extern_arm = callable_lookup.find("Decl.Extern(extern_name")
@@ -161,7 +169,7 @@ binding_scope = function_source(EWR, "ewr_callable_binding_in_scope")
 if not all(fragment in binding_scope for fragment in (
         "Decl.Func(function_name",
         "Decl.Extern(extern_name",
-        "ewr_imported_callable_scope(annotations, name, current_module, caller_module)",
+        "ewr_imported_callable_scope(table.ewr_import_rows, name, current_module, caller_module)",
         "ewr_callable_binding_consider(binding, candidate_scope_length)",
         "not ewr_callable_name_visible(annotations, name, current_module, caller_module, position.line, position.offset)")):
     raise SystemExit("EWR ordinary binding scan must preserve Core's visible Func/Extern name precedence")
