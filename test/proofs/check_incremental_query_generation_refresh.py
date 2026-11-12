@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "src/semantic/incremental_function_facts.elisa"
+QUERY_SOURCE = ROOT / "src/semantic/incremental_function_facts"
 
 
 def compact(text: str) -> str:
@@ -34,14 +34,12 @@ def ordered(source: str, name: str, fragments: tuple[str, ...]) -> None:
         cursor = found + len(needle)
 
 
-if not SOURCE.is_file():
-    raise SystemExit(f"missing query graph source: {SOURCE}")
-source = SOURCE.read_text()
-compact_source = compact(source)
-dependencies = compact(section(source, "ifq_query_dependencies_check"))
-apply_dependencies = compact(section(source, "ifq_apply_dependency_set"))
-refresh = compact(section(source, "ifq_refresh_dependency_generations"))
-commit = compact(section(source, "ifq_query_commit"))
+handles = (QUERY_SOURCE / "query_handles.elisa").read_text()
+staleness = (QUERY_SOURCE / "query_staleness.elisa").read_text()
+dependencies = compact(section(handles, "ifq_query_dependencies_check"))
+apply_dependencies = compact(section(staleness, "ifq_apply_dependency_set"))
+refresh = compact(section(staleness, "ifq_refresh_dependency_generations"))
+commit = compact(section(staleness, "ifq_query_commit"))
 
 for fragment in (
     "dependencies.count > INCREMENTAL_SEMANTIC_QUERY_PER_DEPENDENCY_LIMIT",
@@ -53,7 +51,7 @@ for fragment in (
     if compact(fragment) not in dependencies:
         raise SystemExit(f"dependency validation no longer proves refresh eligibility: {fragment}")
 
-if "check.old_count <- steps" not in section(source, "ifq_query_dependencies_check"):
+if compact("check.old_count <- steps") not in dependencies:
     raise SystemExit("old dependency count must use the validated edge-chain traversal")
 if "matched_old:mutabledarray[bool]=[]" not in dependencies or "ifmatched_old[candidate]:" not in dependencies:
     raise SystemExit("old edge multiplicity must be checked by the bounded membership pass")
@@ -78,7 +76,7 @@ for forbidden in ("ifq_apply_dependency_set(", "ifq_query_note_incoming_edge_cha
     if forbidden in refresh:
         raise SystemExit(f"generation refresh must leave dependency adjacency untouched: {forbidden}")
 
-ordered(source, "ifq_query_commit", (
+ordered(staleness, "ifq_query_commit", (
     "if not check.all_dependencies_green:",
     "dependency_replacement_required: bool = not check.equal",
     "dependency_generation_refresh_required: bool = check.equal and not check.results_current and check.all_dependencies_green",
@@ -96,7 +94,8 @@ ordered(source, "ifq_query_commit", (
 
 if compact("if result_changed and not ifq_mark_reverse_closure(session, query_id, IncrementalSemanticQueryStatus.PotentiallyDirty):") not in commit:
     raise SystemExit("result changes must still dirty dependers through the reverse closure")
-if "if dependency_generation_refresh_required:" in commit and "ifq_apply_dependency_set" in commit[commit.find("if dependency_generation_refresh_required:"):]:
+after_refresh = commit.split(compact("if dependency_generation_refresh_required and not ifq_refresh_dependency_generations("), 1)[1]
+if "ifq_apply_dependency_set(" in after_refresh:
     raise SystemExit("unchanged dependency IDs must refresh generations without replacing edges")
 
 print("source-bound query generation refresh OK")
