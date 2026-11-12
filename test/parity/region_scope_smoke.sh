@@ -44,7 +44,13 @@ clean $'def id[T, @r](value: T& @r) -> T& @r:\n    return value\n'
 clean "$(cat "$REPO_ROOT/test/repro/region_binding_owner_line0.elisa")"
 clean "$(cat "$REPO_ROOT/test/repro/region_local_shadow_owner_offset.elisa")"
 clean "$(cat "$REPO_ROOT/test/repro/region_return_owner_offset.elisa")"
-clean "$(cat "$REPO_ROOT/test/repro/region_escape_param_owner_line_zero.elisa")"
+# The fixture intentionally grows a by-value container and names an internal Arena;
+# both produce warnings. Continue to reject every error, including region diagnostics.
+param_owner_out="$( { printf '# severity\n'; cat "$REPO_ROOT/test/repro/region_escape_param_owner_line_zero.elisa"; } | "$RPT")"
+grep -q '^P 0$' <<< "$param_owner_out" || fail "parameter-owner fixture has a parse error: $param_owner_out"
+if grep -q '^S 1$' <<< "$param_owner_out"; then
+    fail "parameter-owner fixture has a semantic error: $param_owner_out"
+fi
 local_view_owner_out="$(cat "$REPO_ROOT/test/repro/local_view_return_region_owner_offset.elisa" | "$RPT")"
 grep -q 'value backed by a short-lived region escapes via return' <<< "$local_view_owner_out" || fail "same-line sibling function supplied a caller-region return annotation: $local_view_owner_out"
 

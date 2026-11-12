@@ -29,7 +29,8 @@ if FIXTURE.count("#line 0 region-escape-param-owner.elisa") != 2 or \
         "def arena_owner(a: mutable Arena&, xs: mutable darray[u32]&):" not in FIXTURE or \
         "in a:" not in FIXTURE:
     raise SystemExit("owner regression must collide a region parameter with an Arena& block on the same logical line")
-if 'clean "$(cat "$REPO_ROOT/test/repro/region_escape_param_owner_line_zero.elisa")"' not in SMOKE or \
+if 'cat "$REPO_ROOT/test/repro/region_escape_param_owner_line_zero.elisa"' not in SMOKE or \
+        "printf '# severity\\n'" not in SMOKE or "grep -q '^S 1$'" not in SMOKE or \
         'python3 "$REPO_ROOT/test/proofs/check_region_escape_param_owner_identity.py"' not in SMOKE:
     raise SystemExit("region-scope smoke must retain the owner-collision fixture and source proof")
 
