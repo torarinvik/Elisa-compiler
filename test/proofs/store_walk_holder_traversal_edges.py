@@ -86,9 +86,9 @@ HOLDER_WALK_STATEMENT_EDGES = (
     ("Stmt.For(bind, loop_variables, iterable, loop_body, _):", "table <- chv_walk_statements(loop_body, in_region, ref_params, binders, owned, view_names, view_values, loop_flow, summary, table)"),
     ("Stmt.Block(kind, _, binding, block_body, _):", "table <- chv_walk_statements(block_body, in_region or kind == \"region\" or kind == \"in\", ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.Match(scrutinee, arms, _):", "table <- chv_walk_expression(scrutinee, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
-    ("Stmt.Match(scrutinee, arms, _):", "for arm in arms |table| -> table:"),
-    ("for arm in arms |table| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
-    ("for arm in arms |table| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
+    ("Stmt.Match(scrutinee, arms, _):", "for arm in arms |table, merged_ready, merged_flow| -> table:"),
+    ("for arm in arms |table, merged_ready, merged_flow| -> table:", "table <- chv_walk_expression(arm.guard, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
+    ("for arm in arms |table, merged_ready, merged_flow| -> table:", "table <- chv_walk_statements(arm.body, in_region, ref_params, binders, owned, view_names, view_values, arm_flow, summary, table)"),
     ("Stmt.Contract(_, expression, _):", "table <- chv_walk_expression(expression, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Stmt.VarDecl(declared_name, type_expression, declared_value, _):", "chv_flow_bind(flow, declared_name, not in_region and (typed_owned or literal_owned), flow.last_value_may_be_owned_view, declared_alias_ref)"),
 )
@@ -147,7 +147,7 @@ HOLDER_WALK_EXPRESSION_EDGES = (
     ("Expr.Binary(left, binary_operator, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
-    ("Expr.Binary(left, binary_operator, right, _):", "if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
+    ("Expr.Binary(left, binary_operator, right, _):", "if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or and not chv_binary_operator_returns_bool(binary_operator, right) and not binary_is_range:"),
     ("Expr.Unary(operator, operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.Move(operand, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.RegionNew(operand, _, _):", "table <- chv_walk_expression(operand, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
@@ -195,13 +195,13 @@ CATCH_ARM_PROVENANCE_EDGES = (
     ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:",
      "is_success_arm: bool = arm_index == 0"),
     ("for arm in arms |table, branch_value_may_be_owned, merged_flow, arm_index| -> table:",
-     "chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_direct_alias_reference if is_success_arm else true, guarded_may_contain_alias_reference if is_success_arm else true, arm_flow)"),
+     "chv_flow_bind_pattern(arm.pattern, true, guarded_flow.last_value_may_be_owned_view if is_success_arm else true, guarded_may_direct_alias_reference if is_success_arm else true, guarded_may_contain_alias_reference if is_success_arm else true, false, arm_flow)"),
 )
 
 CATCH_PATTERN_BINDING_EDGES = (
     ("if name != \"\":", "bound_may_direct_alias_reference: bool = root_may_direct_alias_reference if root_pattern else true"),
     ("if name != \"\":", "bound_may_contain_alias_reference: bool = root_may_contain_alias_reference if root_pattern else true"),
-    ("if name != \"\":", "chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern else true, bound_may_direct_alias_reference or bound_may_contain_alias_reference)"),
+    ("if name != \"\":", "chv_flow_bind(flow, name, false, root_may_owned_view if root_pattern or root_caller_rooted else true, bound_may_direct_alias_reference or bound_may_contain_alias_reference)"),
     ("if name != \"\":", "flow.may_direct_alias_reference[bound_index] <- bound_may_direct_alias_reference if bound_index < flow.names.count"),
     ("if name != \"\":", "flow.may_contain_alias_reference[bound_index] <- bound_may_contain_alias_reference if bound_index < flow.names.count"),
 )

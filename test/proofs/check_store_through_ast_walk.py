@@ -190,7 +190,13 @@ for record, expected in EXPECTED_SIDE_TABLE_FIELDS.items():
     if struct_fields(side_text, record) != expected:
         raise SystemExit(f"AST side-table record {record} changed without revising the store-through proof")
 
-collect_source = function_section(summary_text, "sts_collect_names")
+collector_wrapper = function_section(summary_text, "sts_collect_names")
+expected_collector_wrapper = compact_code("""can Memory.Allocate, Abort.Panic:
+    no_copy_safe: darray[sview] = []
+    sts_collect_names_except(expression, out, no_copy_safe, no_copy_safe)""")
+if compact_code(collector_wrapper) != expected_collector_wrapper:
+    raise SystemExit("ordinary name collection must not suppress copied values")
+collect_source = function_section(summary_text, "sts_collect_names_except")
 statement_collect_source = function_section(summary_text, "sts_collect_statement_names")
 unifier_source = function_section(summary_text, "sts_unify_calls")
 statements_source = function_section(summary_text, "sts_statements")
@@ -234,12 +240,18 @@ declared_type_id: u32 = annotation_type_id(declared_type, table) can Global{Read
 bound_type_is_reference_free: mutable bool = false
 can Memory.Allocate, Abort.Panic, Global{Read,Write}:
     bound_type_is_reference_free <- bam_type_is_proven_reference_free_cached(declared_type_id, reference_sites, table) if declared_type_id != 0
+if declared_type_id != 0 and not type_marker_present_here(declared_type, TokenKind.Ampersand):
+    bound_visited: mutable dict[u32, bool] = {}
+    if bam_type_has_no_direct_reference(declared_type_id, bound_visited, reference_sites, table):
+        bound_type_is_reference_free <- true
+        classes.copy_safe.push(name)
+        classes.copy_values.push(name)
 bound_type_id: u32 = declared_type_id
 bound_type_is_host_handle: bool = sts_type_is_llvm_handle(bound_type_id, table)
 if not bound_type_is_reference_free and not bound_type_is_host_handle:
     bound_names: mutable darray[sview] = []
     bound_names.push(name) if name != ""
-    sts_collect_names(value, bound_names)
+    sts_collect_names_except(value, bound_names, classes.copy_safe, classes.copy_values)
     sts_unify_all(classes, bound_names)
 sts_unify_calls(value, summary, has_unreadable_binder, function_owner, reference_sites, table, classes)""")
 if compact_code(bound_unifier_source) != expected_bound_unifier:
@@ -430,7 +442,8 @@ indexn_call_callee_arm = match_arm_body(call_callee_source, "match callee:", "Ex
 expected_indexn_call_callee_arm = compact_code("""table <- chv_walk_call_callee(head, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, receiver_owned_view, receiver_may_alias_reference, callee_may_be_owned_view, table)
 head_may_be_owned_view: bool = callee_may_be_owned_view or chv_is_owned_view(head, flow, 0)
 callee_may_be_owned_view <- head_may_be_owned_view
-flow.last_value_may_be_owned_view <- callee_may_be_owned_view""")
+callee_value_may_be_owned_view: bool = callee_may_be_owned_view
+flow.last_value_may_be_owned_view <- callee_value_may_be_owned_view""")
 if indexn_call_callee_arm is None or compact_code(indexn_call_callee_arm) != expected_indexn_call_callee_arm:
     raise SystemExit("IndexN call-callee type arguments must not be walked or treated as runtime result provenance")
 validate_edge_set(function_section(holder_text, "chv_is_owned_view"), UNARY_VIEW_RESULT_EDGES, "holder-view unary result provenance")
@@ -440,7 +453,7 @@ if "if owned.count > 0" in compact_code(function_section(holder_text, "chv_walk_
 holder_entry_source = function_section(holder_text, "check_call_holder_view_store")
 if "returnifsummary.writable_function.count==0" in compact_code(holder_entry_source):
     raise SystemExit("unknown-call holder checks must run even when no named callee summary rows exist")
-holder_summary_setup = compact("summary: StoreThroughSummary = chv_build_summary(file.top_decls, holders, reference_sites, table) can Global{Read,Write}")
+holder_summary_setup = compact("summary: mutable StoreThroughSummary = chv_build_summary(file.top_decls, holders, reference_sites, table) can Global{Read,Write}")
 holder_walk_setup = compact("table <- chv_walk_declarations(file.top_decls, summary, file.enum_annotations, table)")
 if holder_summary_setup not in compact_code(holder_entry_source) or holder_walk_setup not in compact_code(holder_entry_source) or compact_code(holder_entry_source).find(holder_walk_setup) < compact_code(holder_entry_source).find(holder_summary_setup):
     raise SystemExit("holder-view call walk is no longer reached after summary construction")
@@ -450,9 +463,17 @@ if "sts_declared_once" in compact_code(holder_summary_source):
 validate_edge_set(holder_summary_source, OVERLOAD_SUMMARY_EDGES, "holder-view overload summary")
 validate_edge_set(function_section(holder_text, "chv_check_named_callee"), FIELD_UNKNOWN_CALL_EDGES, "callable field conservative fallback")
 field_dispatch = function_section(holder_text, "chv_check_named_callee")
-field_arm = match_arm_body(field_dispatch, "match callee:", "Expr.Field(receiver, _, _):")
-if field_arm is None or "chv_check_named_call" in compact_code(field_arm):
-    raise SystemExit("field calls must not dispatch by name without resolved-call identity")
+field_arm = match_arm_body(field_dispatch, "match callee:", "Expr.Field(receiver, method, _):")
+method_proof = function_section(holder_text, "chv_has_direct_method_summary")
+required_method_guards = (
+    "return false if any binder in binders where binder == method",
+    "return false if chv_flow_latest(flow, method) < flow.names.count",
+    "return false if any field in table.struct_field_name where field == method",
+    "return false if not source_type_found or not function_found",
+    "interned_name(formal_type, table) == owner",
+)
+if field_arm is None or "chv_check_named_call" in compact_code(field_arm) or any(compact(guard) not in compact_code(method_proof) for guard in required_method_guards):
+    raise SystemExit("field calls must require an unambiguous source method before summary dispatch")
 if compact("comprehension_ref_params.push(outer_ref) if outer_ref != variable") not in compact_code(holder_walk_expressions):
     raise SystemExit("comprehension scope no longer masks a same-named outer reference parameter")
 if compact("comprehension_binders.push(variable)") not in compact_code(holder_walk_expressions):

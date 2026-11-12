@@ -46,23 +46,23 @@ from store_walk_view_flow_edges import (
 
 theorem_routes = {
     "proof_sts_match_names_reach_fallback": {
-        "scrutinee": (("Expr.Match(scrutinee, arms, _):", "sts_collect_names(scrutinee, out)"),),
-        "guard": (("for arm in arms |out|:", "sts_collect_names(arm.guard, out)", 0),),
-        "body": (("for arm in arms |out|:", "sts_collect_statement_names(arm.body, out)", 0),),
+        "scrutinee": (("Expr.Match(scrutinee, arms, _):", "sts_collect_names_except(scrutinee, out, copy_safe, copy_values)"),),
+        "guard": (("for arm in arms |out, copy_safe, copy_values|:", "sts_collect_names_except(arm.guard, out, copy_safe, copy_values)", 0),),
+        "body": (("for arm in arms |out, copy_safe, copy_values|:", "sts_collect_statement_names(arm.body, out)", 0),),
     },
     "proof_sts_catch_names_reach_fallback": {
-        "guarded": (("Expr.Catch(guarded, arms, _):", "sts_collect_names(guarded, out)"),),
-        "guard": (("for arm in arms |out|:", "sts_collect_names(arm.guard, out)", 1),),
-        "body": (("for arm in arms |out|:", "sts_collect_statement_names(arm.body, out)", 1),),
+        "guarded": (("Expr.Catch(guarded, arms, _):", "sts_collect_names_except(guarded, out, copy_safe, copy_values)"),),
+        "guard": (("for arm in arms |out, copy_safe, copy_values|:", "sts_collect_names_except(arm.guard, out, copy_safe, copy_values)", 1),),
+        "body": (("for arm in arms |out, copy_safe, copy_values|:", "sts_collect_statement_names(arm.body, out)", 1),),
     },
     "proof_sts_block_names_reach_fallback": {
-        "capture": (("for capture in captures |out|:", "out.push(capture) if capture != \"\""),),
+        "capture": (("for capture in captures |out, copy_safe, copy_values|:", "out.push(capture) if capture != \"\""),),
         "statement": (("Expr.Block(statements, value, captures, _):", "sts_collect_statement_names(statements, out)"),),
-        "value": (("Expr.Block(statements, value, captures, _):", "sts_collect_names(value, out)"),),
+        "value": (("Expr.Block(statements, value, captures, _):", "sts_collect_names_except(value, out, copy_safe, copy_values)"),),
     },
     "proof_sts_dict_names_reach_fallback": {
-        "key": (("for entry in entries |out|:", "sts_collect_names(entry.key, out)"),),
-        "value": (("for entry in entries |out|:", "sts_collect_names(entry.value, out)"),),
+        "key": (("for entry in entries |out, copy_safe, copy_values|:", "sts_collect_names_except(entry.key, out, copy_safe, copy_values)"),),
+        "value": (("for entry in entries |out, copy_safe, copy_values|:", "sts_collect_names_except(entry.value, out, copy_safe, copy_values)"),),
     },
     "proof_sts_effect_names_reach_fallback": {
         "capture": (),
@@ -236,8 +236,8 @@ theorem_routes = {
         "overload_body_checked": OVERLOAD_SUMMARY_EDGES,
     },
     "proof_chv_method_calls_check_receiver_and_arguments": {
-        "receiver_checked": (("Expr.Field(receiver, _, _):", "method_arguments: mutable darray[Ast::Expr] = [receiver]"),),
-        "arguments_checked": (("Expr.Field(receiver, _, _):", "method_arguments.extend(call_arguments)"),),
+        "receiver_checked": (("Expr.Field(receiver, method, _):", "method_arguments: mutable darray[Ast::Expr] = [receiver]"),),
+        "arguments_checked": (("Expr.Field(receiver, method, _):", "method_arguments.extend(call_arguments)"),),
     },
     "proof_chv_indirect_calls_fail_closed": {
         "reference_target_checked": (("for target in 0..<call_arguments.count |table| -> table:", "if chv_alias_reference_at(call_arguments, argument_may_alias_refs, target, ref_params, flow, table):"),),

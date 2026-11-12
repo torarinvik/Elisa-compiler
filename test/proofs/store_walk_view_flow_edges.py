@@ -15,8 +15,8 @@ BINARY_OPERATOR_FALLBACK_EDGES = (
     ("Expr.Binary(left, binary_operator, right, _):", "binary_arguments: darray[Ast::Expr] = [left, right]"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_owned_views: darray[bool] = [left_may_be_owned_view, right_may_be_owned_view]"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_alias_refs: darray[bool] = [left_may_alias_ref, right_may_alias_ref]"),
-    ("Expr.Binary(left, binary_operator, right, _):", "if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:"),
-    ("if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or:", "table <- chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("Expr.Binary(left, binary_operator, right, _):", "if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or and not chv_binary_operator_returns_bool(binary_operator, right) and not binary_is_range:"),
+    ("if binary_rhs_is_runtime_value and binary_operator != TokenKind.And and binary_operator != TokenKind.Or and not chv_binary_operator_returns_bool(binary_operator, right) and not binary_is_range:", "table <- chv_check_unknown_call(binary_arguments, binary_owned_views, binary_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
 )
 
 BINARY_NON_RUNTIME_TARGET_EDGES = (
@@ -103,14 +103,14 @@ CALLABLE_VIEW_RESULT_EDGES = (
 )
 
 CALL_RESULT_VIEW_TAINT_EDGES = (
-    ("Expr.Call(callee, arguments, _, _):", "result_may_be_owned_view: mutable bool = chv_is_owned_view(expression, flow, 0)"),
+    ("Expr.Call(callee, arguments, _, _):", "result_may_be_owned_view: bool = chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == \"as_sview\" or method_name == \"as_cstr\" or method_name == \"view\")) or callee_may_be_owned_view"),
     ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.Call(callee, arguments, _, _):", "flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view"),
 )
 
 CALL_RESULT_CALLEE_JOIN_EDGE = (
     "Expr.Call(callee, arguments, _, _):",
-    "result_may_be_owned_view <- chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == \"as_sview\" or method_name == \"as_cstr\" or method_name == \"view\")) or callee_may_be_owned_view",
+    "result_may_be_owned_view: bool = chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == \"as_sview\" or method_name == \"as_cstr\" or method_name == \"view\")) or callee_may_be_owned_view",
 )
 
 CALL_CALLEE_INDEXED_VIEW_EDGES = (
@@ -123,7 +123,7 @@ CALL_CALLEE_INDEXED_VIEW_EDGES = (
     ("if not index_receiver_is_type_application(head):", "index_may_be_owned_view <- flow.last_value_may_be_owned_view"),
     ("if not index_receiver_is_type_application(head):", "indexed_arguments: darray[Ast::Expr] = [head, index]"),
     ("if not index_receiver_is_type_application(head):", "indexed_owned_views: darray[bool] = [head_may_be_owned_view, index_may_be_owned_view]"),
-    ("if not index_receiver_is_type_application(head):", "indexed_alias_refs: darray[bool] = [chv_expression_may_alias_ref(head, ref_params, flow, table, 0), chv_expression_may_alias_ref(index, ref_params, flow, table, 0)]"),
+    ("if not index_receiver_is_type_application(head):", "indexed_alias_refs: darray[bool] = [chv_expression_may_alias_ref(head, ref_params, flow, table, 0), false]"),
     ("if not index_receiver_is_type_application(head):", "table <- chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
     ("Expr.Index(head, index, _):", "callee_may_be_owned_view <- head_may_be_owned_view or index_may_be_owned_view"),
     ("match callee:", "Expr.IndexN(head, arguments, _):"),
@@ -132,7 +132,8 @@ CALL_CALLEE_INDEXED_VIEW_EDGES = (
     ("Expr.IndexN(head, arguments, _):", "# In call position IndexN is explicit generic application. Its"),
     ("Expr.IndexN(head, arguments, _):", "# bracket arguments are type/shape inputs and never runtime values."),
     ("Expr.IndexN(head, arguments, _):", "callee_may_be_owned_view <- head_may_be_owned_view"),
-    ("Expr.IndexN(head, arguments, _):", "flow.last_value_may_be_owned_view <- callee_may_be_owned_view"),
+    ("Expr.IndexN(head, arguments, _):", "callee_value_may_be_owned_view: bool = callee_may_be_owned_view"),
+    ("Expr.IndexN(head, arguments, _):", "flow.last_value_may_be_owned_view <- callee_value_may_be_owned_view"),
 )
 
 STATIC_EFFECT_RESULT_VIEW_TAINT_EDGES = (
@@ -154,7 +155,7 @@ ASSIGN_VIEW_TAINT_EDGES = (
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "assigned_alias: bool = assigned_value_may_be_owned_view or ((operator != TokenKind.Assign or projection_assignment) and previous_may_owned_view)"),
     ("Stmt.Assign(target, operator, assigned_value, assign_pos):", "if assigned_root != \"\":"),
     ("if assigned_root != \"\":", "elif assigned_index < flow.names.count:"),
-    ("elif assigned_index < flow.names.count:", "flow.may_owned_view[assigned_index] <- assigned_alias"),
+    ("elif assigned_index < flow.names.count:", "flow.may_owned_view[assigned_index] <- assigned_alias or (projection_assignment and flow.may_owned_view[assigned_index])"),
 )
 
 PLACE_ROOT_PROJECTION_EDGES = (
@@ -270,7 +271,7 @@ INDEX_OPERATOR_EDGES = (
     ("if not index_receiver_is_type_application(object):", "table <- chv_walk_expression(index, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)", 0),
     ("if not index_receiver_is_type_application(object):", "indexed_arguments: darray[Ast::Expr] = [object, index]", 0),
     ("if not index_receiver_is_type_application(object):", "indexed_owned_views: darray[bool] = [object_may_be_owned_view, index_may_be_owned_view]", 0),
-    ("if not index_receiver_is_type_application(object):", "indexed_alias_refs: darray[bool] = [object_may_alias_ref, index_may_alias_ref]", 0),
+    ("if not index_receiver_is_type_application(object):", "indexed_alias_refs: darray[bool] = [object_may_alias_ref, false]", 0),
     ("if not index_receiver_is_type_application(object):", "table <- chv_check_unknown_call(indexed_arguments, indexed_owned_views, indexed_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)", 0),
     ("Expr.IndexN(object, arguments, _):", "table <- chv_walk_expression(object, in_region, ref_params, binders, owned, view_names, view_values, flow, summary, table)"),
     ("Expr.IndexN(object, arguments, _):", "if not index_receiver_is_type_application(object):"),
@@ -307,7 +308,7 @@ BINARY_VIEW_WALK_EDGES = (
     ("Expr.Binary(left, binary_operator, right, _):", "left_may_be_owned_view: bool = flow.last_value_may_be_owned_view"),
     ("Expr.Binary(left, binary_operator, right, _):", "right_may_be_owned_view: mutable bool = false"),
     ("Expr.Binary(left, binary_operator, right, _):", "binary_result_is_bool: bool = chv_binary_operator_returns_bool(binary_operator, right)"),
-    ("Expr.Binary(left, binary_operator, right, _):", "flow.last_value_may_be_owned_view <- (left_may_be_owned_view or right_may_be_owned_view) if not binary_result_is_bool else false"),
+    ("Expr.Binary(left, binary_operator, right, _):", "flow.last_value_may_be_owned_view <- (left_may_be_owned_view or right_may_be_owned_view) if not binary_result_is_bool and not binary_is_range else false"),
 )
 
 BINARY_BOOLEAN_RESULT_EDGES = (
@@ -335,10 +336,10 @@ REF_ALIAS_ADDRESS_EDGES = (
 )
 
 SUMMARY_CALL_EDGES = (
-    ("while target < call_arguments.count |target, table, source_cache_ready, source_checked, source_is_owned_view| -> table:", "if sts_is_writable(summary, callee_name, target):"),
-    ("if sts_is_writable(summary, callee_name, target):", "if chv_alias_reference_at(call_arguments, argument_may_alias_refs, target, ref_params, flow, table):"),
-    ("while source < call_arguments.count |source, table, source_is_owned_view, source_checked| -> table:", "if source != target and sts_has_pair(summary, callee_name, target, source):"),
-    ("if source != target and sts_has_pair(summary, callee_name, target, source):", "if not source_checked[source]:"),
+    ("while target < call_arguments.count |target, table, source_cache_ready, source_checked, source_is_owned_view| -> table:", "if sts_is_writable(summary, callee_name, target) and not target_is_owned_local:"),
+    ("if sts_is_writable(summary, callee_name, target) and not target_is_owned_local:", "if chv_alias_reference_at(call_arguments, argument_may_alias_refs, target, ref_params, flow, table):"),
+    ("while source < call_arguments.count |source, table, source_is_owned_view, source_checked| -> table:", "if source != target and sts_has_pair(summary, callee_name, target, source) and not sts_reads_reference_free(summary, callee_name, source):"),
+    ("if source != target and sts_has_pair(summary, callee_name, target, source) and not sts_reads_reference_free(summary, callee_name, source):", "if not source_checked[source]:"),
     ("if not source_checked[source]:", "source_is_owned_view[source] <- chv_owned_view_at(call_arguments, argument_owned_views, source, flow)"),
 )
 
@@ -361,13 +362,14 @@ CALLEE_DISPATCH_EDGES = (
 )
 
 FIELD_UNKNOWN_CALL_EDGES = (
-    ("Expr.Field(receiver, _, _):", "method_arguments: mutable darray[Ast::Expr] = [receiver]"),
-    ("Expr.Field(receiver, _, _):", "method_arguments.extend(call_arguments)"),
-    ("Expr.Field(receiver, _, _):", "method_owned_views: mutable darray[bool] = [method_receiver_owned_view]"),
-    ("Expr.Field(receiver, _, _):", "method_owned_views.extend(argument_owned_views)"),
-    ("Expr.Field(receiver, _, _):", "method_may_alias_refs: mutable darray[bool] = [method_receiver_may_alias_ref]"),
-    ("Expr.Field(receiver, _, _):", "method_may_alias_refs.extend(argument_may_alias_refs)"),
-    ("Expr.Field(receiver, _, _):", "table <- chv_check_unknown_call(method_arguments, method_owned_views, method_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
+    ("Expr.Field(receiver, method, _):", "method_arguments: mutable darray[Ast::Expr] = [receiver]"),
+    ("Expr.Field(receiver, method, _):", "method_arguments.extend(call_arguments)"),
+    ("Expr.Field(receiver, method, _):", "method_owned_views: mutable darray[bool] = [method_receiver_owned_view]"),
+    ("Expr.Field(receiver, method, _):", "method_owned_views.extend(argument_owned_views)"),
+    ("Expr.Field(receiver, method, _):", "method_may_alias_refs: mutable darray[bool] = [method_receiver_may_alias_ref]"),
+    ("Expr.Field(receiver, method, _):", "method_may_alias_refs.extend(argument_may_alias_refs)"),
+    ("Expr.Field(receiver, method, _):", "if sts_is_declared(summary, method) and chv_has_direct_method_summary(receiver, method, binders, flow, table) and not chv_call_has_named_arguments(argument_names):"),
+    ("else:", "table <- chv_check_unknown_call(method_arguments, method_owned_views, method_may_alias_refs, ref_params, binders, owned, view_names, view_values, flow, table)"),
 )
 
 NAMED_CALL_EDGES = (
