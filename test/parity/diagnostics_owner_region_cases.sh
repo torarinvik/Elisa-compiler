@@ -204,7 +204,7 @@ done
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "$region_return_msg"
 run_case region_param_container_return pos "$FIXTURES/region_param_container_return.pos.elisa" 'return contract @r cannot carry storage tied to independent region parameter "s"'
 run_case region_param_container_return neg "$FIXTURES/region_param_container_return.neg.elisa" "$region_return_msg"
-run_case region_param_container_return_reference_element pos "$FIXTURES/region_param_container_return_reference_element.pos.elisa" "$region_return_msg"
+run_case region_param_container_return_reference_element pos "$FIXTURES/region_param_container_return_reference_element.pos.elisa" 'value allocated in region "inner" escapes via return'
 run_case region_param_container_return_inferred_new pos "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" "$region_return_msg"
 run_case region_param_container_return_inner_new pos "$FIXTURES/region_param_container_return_inner_new.pos.elisa" "$region_return_msg"
 run_case region_param_container_return_auto_move pos "$FIXTURES/region_param_container_return_auto_move.pos.elisa" "$region_return_msg"
