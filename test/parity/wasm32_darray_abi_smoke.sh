@@ -4,8 +4,9 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE0="${ELISACORE_BIN:-$ROOT/../../nw-core/toolchain/elisac-stage0}"
+STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
 FIXTURE="$ROOT/test/repro/wasm32_darray_header_ops.elisa"
 LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
@@ -78,7 +79,8 @@ for (const path of process.argv.slice(2)) {
   const load = (await import(path)).default;
   wasm = await load(undefined, { imports: { env } });
   const actual = wasm.wasm_darray_header_ops();
-  if (actual !== 292) throw new Error(`${path}: got ${actual}, expected stage0 result 292`);
+  // 7 (fallback) + 28 (range sum) + 1 (count) + 8 (reserved capacity).
+  if (actual !== 44) throw new Error(`${path}: got ${actual}, expected 44`);
 }
-console.log("wasm32 darray ABI and behavior parity OK (stage0 == stage1 == 292)");
+console.log("wasm32 darray ABI and behavior parity OK (stage0 == stage1 == 44)");
 NODE
