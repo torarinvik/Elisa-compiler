@@ -55,6 +55,16 @@ if "owner_offset: u32" not in lookup or "annotation.offset == owner_offset" not 
 if 'fdt_value_at(file.enum_annotations, "__field_default_type", annotation.line, annotation.offset)' not in checker or \
         'fdt_value_at(file.enum_annotations, "__field_default_kind", annotation.line, annotation.offset)' not in checker:
     raise SystemExit("field default type and kind lookups must use the name row's source offset")
+if not all(fragment in checker for fragment in (
+    'type_row.owner == "__field_default_type"',
+    'kind_row.owner == "__field_default_kind"',
+    "type_row.line == annotation.line",
+    "kind_row.line == annotation.line",
+    "type_row.offset == annotation.offset",
+    "kind_row.offset == annotation.offset",
+    "if not adjacent:",
+)):
+    raise SystemExit("adjacent field default rows must match the exact owner and fall back when they do not")
 if FIXTURE.count("#line 0 field-default-owner.elisa") != 3 or \
         "good: i64 = 1" not in FIXTURE or "bad: bool = 1" not in FIXTURE or \
         "mutable_bad: mutable bool = 1" not in FIXTURE or \
