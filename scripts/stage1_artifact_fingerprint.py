@@ -1,6 +1,5 @@
 """Stable file identities and hashes for Stage1 provenance."""
 import hashlib
-import json
 from pathlib import Path
 
 
@@ -92,20 +91,24 @@ def stat_inventory_digest(inventory, freshness_extensions=(), *, writes_only=Fal
     newest_source_mtime_ns = None
     newest_source_path = None
     for relative, path in inventory:
-        identity = file_stat_identity(path)
+        stat = path.stat()
         name = relative.encode("utf-8") + b"\0"
+        # These are the existing canonical JSON fields in sorted order.
+        # All values are integers, so formatting them avoids two dicts and
+        # two general-purpose JSON encodes for every file.
+        fields = (
+            f'"device":{stat.st_dev},"inode":{stat.st_ino},'
+            f'"mtime_ns":{stat.st_mtime_ns},"size":{stat.st_size}}}\0'
+        )
         if digest is not None:
             digest.update(name)
-            digest.update(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii"))
-            digest.update(b"\0")
-        write_identity = {key: value for key, value in identity.items() if key != "ctime_ns"}
+            digest.update((f'{{"ctime_ns":{stat.st_ctime_ns},' + fields).encode("ascii"))
         write_digest.update(name)
-        write_digest.update(json.dumps(write_identity, sort_keys=True, separators=(",", ":")).encode("ascii"))
-        write_digest.update(b"\0")
+        write_digest.update(("{" + fields).encode("ascii"))
         # Preserve the former `find ... -newer BIN` freshness rule while collecting it
         # during this inventory pass. `find -type f` does not follow file symlinks.
         if freshness_extensions and path.suffix in freshness_extensions and not path.is_symlink():
-            mtime_ns = identity["mtime_ns"]
+            mtime_ns = stat.st_mtime_ns
             if newest_source_mtime_ns is None or mtime_ns > newest_source_mtime_ns:
                 newest_source_mtime_ns = mtime_ns
                 newest_source_path = relative
