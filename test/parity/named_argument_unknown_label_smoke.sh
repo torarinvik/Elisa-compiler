@@ -15,12 +15,12 @@ set -e
 unknown='function "sink" has no parameter "wrong"'
 missing='function "sink" is missing argument for parameter "value"'
 zero='function "ping" has no parameter "wrong"'
-[[ "$status" -ne 0 && $(grep -cF "$unknown" <<< "$core") == 1 && $(grep -cF "$missing" <<< "$core") == 1 && $(grep -cF "$zero" <<< "$core") == 1 ]] || {
+[[ "$status" -ne 0 && $(grep -cF "$unknown" <<< "$core") == 1 && $(grep -cF "$missing" <<< "$core") == 1 && $(grep -cF "$zero" <<< "$core") == 5 ]] || {
   printf 'Unexpected Stage0 diagnostics:\n%s\n' "$core" >&2
   exit 1
 }
 report="$("$RPT" < "$fixture")"
-[[ "$(printf '%s\n' "$report" | sed -n '/^D /p')" == 'D 3' && $(grep -cF "$unknown" <<< "$report") == 1 && $(grep -cF "$missing" <<< "$report") == 1 && $(grep -cF "$zero" <<< "$report") == 1 ]] || {
+[[ "$(printf '%s\n' "$report" | sed -n '/^D /p')" == 'D 7' && $(grep -cF "$unknown" <<< "$report") == 1 && $(grep -cF "$missing" <<< "$report") == 1 && $(grep -cF "$zero" <<< "$report") == 5 ]] || {
   printf 'Unexpected Stage1 diagnostics:\n%s\n' "$report" >&2
   exit 1
 }
