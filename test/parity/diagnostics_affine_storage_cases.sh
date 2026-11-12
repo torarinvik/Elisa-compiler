@@ -1,3 +1,6 @@
+echo "-- caller_arena_view --"
+run_case caller_arena_view neg "$FIXTURES/local_field_view_bound_return.pos.elisa" "via return"
+
 echo "-- joined_view_lifetime --"
 require_diagnostic_count joined_view_lifetime "$FIXTURES/submit_local_mutable_ref.pos.elisa" 'argument to "pool_submit1" is not structurally shareable across threads: non-static reference' 2
 

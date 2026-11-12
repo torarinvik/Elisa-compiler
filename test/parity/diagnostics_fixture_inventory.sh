@@ -56,7 +56,7 @@ NAMES=(
     storage_dependency_owned_return_qualified
     store_ref_local_global
     storage_growth_through_ref_self
-    local_field_view_bound_return
+    local_field_view_nonambient_return
     ref_bool_condition
     ref_bool_not_operand
     duplicate_bit_group_member
