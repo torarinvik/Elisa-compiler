@@ -27,7 +27,7 @@ import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 assert manifest["target"].startswith("wasm32"), manifest
-assert [item["name"] for item in manifest["exports"]] == ["add_wasm", "wasm_usize", "wasm_i64", "wasm_target_marker", "wasm_text_length", "wasm_echo_text", "wasm_arena_allocation_probe"], manifest
+assert [item["name"] for item in manifest["exports"]] == ["add_wasm", "wasm_usize", "wasm_i64", "wasm_target_marker", "wasm_text_length", "wasm_echo_text", "wasm_combined_text_length", "wasm_arena_allocation_probe"], manifest
 assert manifest["exports"][2]["wasm_type"] == "i64", manifest
 assert manifest["exports"][4]["parameters"][0]["binding"] == "string", manifest
 assert manifest["memory"]["heap_base_export"] == "__heap_base", manifest
@@ -45,6 +45,7 @@ if (wasm.wasm_i64(value) !== value) throw new Error("i64 export failed");
 if (wasm.wasm_target_marker() !== 7) throw new Error("WASM static target branch failed");
 if (wasm.wasm_text_length("Hei, WASM!") !== 10) throw new Error("automatic cstr input failed");
 if (wasm.wasm_echo_text("Hei, Elisa 🌍") !== "Hei, Elisa 🌍") throw new Error("automatic cstr output failed");
+if (wasm.wasm_combined_text_length("Hei", "Elisa") !== 8) throw new Error("multiple cstr inputs failed");
 for (let iteration = 0; iteration < 100; iteration++) {
   if (wasm.wasm_arena_allocation_probe() !== 42) throw new Error("Elisa arena allocation failed");
 }
