@@ -26,6 +26,10 @@ stage0_argument_rows="$(printf '%s\n' "$stage0_output" \
   | sed -E -n 's#^.*:([0-9]+):[0-9]+[^:]*: .*expects bool, got i64.*$#L\1#p' \
   | LC_ALL=C sort)"
 stage1_output="$("$RPT" < "$FIXTURE")"
+[[ "$(printf '%s\n' "$stage1_output" | sed -n '/^D /p')" == 'D 2' ]] || {
+  printf 'Stage1 produced unexpected diagnostics for the compatible local call:\n%s\n' "$stage1_output" >&2
+  exit 1
+}
 stage1_rows="$(printf '%s\n' "$stage1_output" \
   | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
   | LC_ALL=C sort)"
