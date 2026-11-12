@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Behavioral smoke for unary operator checks — `not` on non-bool and `-`/`~` on non-numeric.
-# A `not` operator with a firm non-bool operand, or a unary `-`/`~` with a firm non-numeric
+# Behavioral smoke for unary operator checks — `not` on non-bool and `+`/`-`/`~` on non-numeric.
+# A `not` operator with a firm non-bool operand, or a unary `+`/`-`/`~` with a firm non-numeric
 # operand, is flagged. Sound subset: unknown operands never fire; 0 FP across the frontend
 # + stdlib.
 set -uo pipefail
@@ -37,11 +37,11 @@ grep -q "not operator requires" <<< "$out" && fail "false positive on not-bool: 
 
 # 5. unary `-` on int must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    return -n\n' | "$RPT")
-grep -q "requires numeric operands" <<< "$out" && fail "false positive on minus-int: $out"
+grep -qE '^D 0$' <<< "$out" || fail "false positive on minus-int: $out"
 
 # 6. unary `~` on int must NOT be flagged.
 out=$(printf 'def f(n: i64) -> i64:\n    return ~n\n' | "$RPT")
-grep -q "requires numeric operands" <<< "$out" && fail "false positive on tilde-int: $out"
+grep -qE '^D 0$' <<< "$out" || fail "false positive on tilde-int: $out"
 
 # 7. 0 FP across frontend + stdlib.
 t=0
@@ -51,4 +51,4 @@ while IFS= read -r f; do
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t unary-operator false positives across frontend+stdlib"
 
-echo "unary-operator smoke OK: flags not on non-bool and unary -/~ on non-numeric, silent on bool/numeric, 0 FP across frontend+stdlib"
+echo "unary-operator smoke OK: flags not on non-bool and unary +/-/~ on non-numeric, silent on bool/numeric, 0 FP across frontend+stdlib"
