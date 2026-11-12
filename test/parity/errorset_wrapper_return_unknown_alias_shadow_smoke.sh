@@ -24,4 +24,22 @@ if grep -q 'cannot propagate CandidateFault' <<< "$(grep 'L10[01] ' <<< "$ambigu
   exit 1
 fi
 
+# A possible registration in an earlier branch may win before the selected
+# branch. Reversing the two declarations must therefore suppress inference.
+reversed="$(python3 - "$FIXTURE" <<'PYFIXTURE' | "$RPT"
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+earlier = 'static if true:\n    using CandidateProvider as Earlier\nstatic if UNKNOWN_PROVIDER_CHOICE:\n    using OtherProvider as Earlier'
+later = 'static if UNKNOWN_PROVIDER_CHOICE:\n    using OtherProvider as Earlier\nstatic if true:\n    using CandidateProvider as Earlier'
+if earlier not in source:
+    raise SystemExit('expected branch declarations missing from fixture')
+print(source.replace(earlier, later), end='')
+PYFIXTURE
+)"
+if grep -q 'L102 cannot propagate' <<< "$reversed"; then
+  printf 'earlier unresolved branch must prevent family inference:\n%s\n' "$reversed" >&2
+  exit 1
+fi
+
 echo 'errorset wrapper unresolved-alias shadow smoke OK'
