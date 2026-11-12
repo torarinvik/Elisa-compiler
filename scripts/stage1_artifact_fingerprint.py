@@ -54,37 +54,13 @@ def fingerprint_artifact(path, previous=None, exact=False, description="artifact
     return {"path": str(path), **identity, "sha256": digest}
 
 
-def digest_files(root, paths):
-    digest = hashlib.sha256()
+def file_inventory(root, paths):
     files = []
     for path in paths:
         if path.is_dir():
             files.extend(candidate for candidate in path.rglob("*") if candidate.is_file())
         elif path.is_file():
             files.append(path)
-    for path in sorted(set(files), key=lambda item: item.relative_to(root).as_posix()):
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-def stat_inventory_digest(root, paths, freshness_extensions=(), *, writes_only=False):
-    root = Path(root).resolve()
-    files = []
-    for path in paths:
-        if path.is_dir():
-            files.extend(candidate for candidate in path.rglob("*") if candidate.is_file())
-        elif path.is_file():
-            files.append(path)
-    digest = None if writes_only else hashlib.sha256()
-    # Without ctime: macOS bumps ctime when it attaches com.apple.macl/provenance
-    # attributes to a file about a second after an editor saves it, which says
-    # nothing about the bytes a build read. mtime, size and inode still change on
-    # every write, including a write that is reverted during the build.
-    write_digest = hashlib.sha256()
-    newest_source_mtime_ns = None
-    newest_source_path = None
     # Store each relative name once. The POSIX prefix is the common case;
     # relative_to retains Path's handling of other path spellings.
     prefix = root.as_posix().rstrip("/") + "/"
@@ -93,7 +69,29 @@ def stat_inventory_digest(root, paths, freshness_extensions=(), *, writes_only=F
         name = path.as_posix()
         relative = name[len(prefix):] if name.startswith(prefix) else path.relative_to(root).as_posix()
         inventory.append((relative, path))
-    for relative, path in sorted(inventory):
+    return sorted(inventory)
+
+
+def digest_files(inventory):
+    digest = hashlib.sha256()
+    for relative, path in inventory:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def stat_inventory_digest(inventory, freshness_extensions=(), *, writes_only=False):
+    digest = None if writes_only else hashlib.sha256()
+    # Without ctime: macOS bumps ctime when it attaches com.apple.macl/provenance
+    # attributes to a file about a second after an editor saves it, which says
+    # nothing about the bytes a build read. mtime, size and inode still change on
+    # every write, including a write that is reverted during the build.
+    write_digest = hashlib.sha256()
+    newest_source_mtime_ns = None
+    newest_source_path = None
+    for relative, path in inventory:
         identity = file_stat_identity(path)
         name = relative.encode("utf-8") + b"\0"
         if digest is not None:

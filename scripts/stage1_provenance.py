@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 from stage1_artifact_fingerprint import (file_stat_identity, valid_sha256, sha256_file, fingerprint_artifact,
-                                         digest_files, stat_inventory_digest)
+                                         digest_files, file_inventory, stat_inventory_digest)
 from stage1_toolchain_fingerprint import (stage1_seed_link_recipe, normalize_linker_probe_argv,
                                           effective_developer_dir, selected_external_linker, llvm_toolchain_fingerprint)
 
@@ -240,18 +240,18 @@ def input_fingerprint(
     if missing:
         raise RuntimeError(f"Stage1 provenance inputs are missing: {', '.join(missing)}")
     previous_inputs = previous_inputs if isinstance(previous_inputs, dict) else {}
-    source_paths = [root / name for name in SOURCE_DIRS]
-    recipe_paths = [root / name for name in BUILD_RECIPES]
+    source_inventory = file_inventory(root, [root / name for name in SOURCE_DIRS])
+    recipe_inventory = file_inventory(root, [root / name for name in BUILD_RECIPES])
     source_stats, source_writes, source_max_mtime_ns, source_max_mtime_path = stat_inventory_digest(
-        root, source_paths, freshness_extensions={".elisa", ".elisai"}
+        source_inventory, freshness_extensions={".elisa", ".elisai"}
     )
-    recipe_stats, recipe_writes, _, _ = stat_inventory_digest(root, recipe_paths)
+    recipe_stats, recipe_writes, _, _ = stat_inventory_digest(recipe_inventory)
     source_digest = previous_inputs.get("source_tree_sha256")
     if exact_content or previous_inputs.get("source_tree_stat_fingerprint") != source_stats or not valid_sha256(source_digest):
-        source_digest = digest_files(root, source_paths)
+        source_digest = digest_files(source_inventory)
     recipe_digest = previous_inputs.get("build_recipe_sha256")
     if exact_content or previous_inputs.get("build_recipe_stat_fingerprint") != recipe_stats or not valid_sha256(recipe_digest):
-        recipe_digest = digest_files(root, recipe_paths)
+        recipe_digest = digest_files(recipe_inventory)
     return {
         "source_tree_sha256": source_digest,
         "source_tree_stat_fingerprint": source_stats,
@@ -405,8 +405,10 @@ WRITE_FINGERPRINT_KEYS = ("source_tree_write_fingerprint", "build_recipe_write_f
 def write_fingerprint(root):
     """Stat-only (no content, no toolchain) snapshot of every source and recipe write."""
     root = Path(root).resolve()
-    _, source_writes, _, _ = stat_inventory_digest(root, [root / name for name in SOURCE_DIRS], writes_only=True)
-    _, recipe_writes, _, _ = stat_inventory_digest(root, [root / name for name in BUILD_RECIPES], writes_only=True)
+    source_inventory = file_inventory(root, [root / name for name in SOURCE_DIRS])
+    recipe_inventory = file_inventory(root, [root / name for name in BUILD_RECIPES])
+    _, source_writes, _, _ = stat_inventory_digest(source_inventory, writes_only=True)
+    _, recipe_writes, _, _ = stat_inventory_digest(recipe_inventory, writes_only=True)
     return dict(zip(WRITE_FINGERPRINT_KEYS, (source_writes, recipe_writes)))
 
 
