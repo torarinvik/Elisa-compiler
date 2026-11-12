@@ -56,8 +56,10 @@ trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 : > "$WORK/context-files"
 t=0
 while IFS= read -r f; do
-  c=$("$RPT" < "$f" 2>/dev/null | awk 'NR == 1 { print $2 }')
-  [ -n "$c" ] || fail "parse crash/empty output on $f"
+  c=$("$RPT" < "$f" 2>/dev/null | awk 'NR == 1 && $1 == "P" { print $2 }')
+  status=$?
+  [ "$status" -eq 0 ] || fail "parse reporter failed on $f (exit $status)"
+  case "$c" in ''|*[!0-9]*) fail "invalid parse report on $f" ;; esac
   if [ "$c" -ne 0 ]; then
     printf '%s\n' "$f" >> "$WORK/context-files"
   fi
