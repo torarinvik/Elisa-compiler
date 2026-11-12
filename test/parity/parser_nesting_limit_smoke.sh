@@ -50,6 +50,15 @@ for shape, depth in (("paren", 20000), ("binary", 200000),
                      ("prefix", 20000), ("postfix", 20000)):
     check(shape, depth, True)
 
+# Unary plus is not part of Stage0's expression grammar; infix addition remains valid.
+for expression, rejected in (("+1", True), ("1 + +2", True), ("1 + 2", False), ("-1 + 2", False)):
+    result = subprocess.run([reporter], input=f"def f() -> i32:\n    return {expression}\n",
+                            text=True, capture_output=True, timeout=20, check=True)
+    first = result.stdout.splitlines()[0]
+    count = int(first.split()[1]) if first.startswith("P ") else -1
+    if (count > 0) != rejected or count < 0:
+        raise SystemExit(f"expression {expression!r}: unexpected parser result {first}")
+
 siblings = "def f() -> i32:\n" + "".join(f"    x{i}: i32 = (((1)))\n" for i in range(3000)) + "    return 0\n"
 result = subprocess.run([reporter], input=siblings, text=True, capture_output=True,
                         timeout=20, check=True)
