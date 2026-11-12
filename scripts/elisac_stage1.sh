@@ -32,7 +32,9 @@ if [[ "$(uname -s)" == Darwin && -z "${DEVELOPER_DIR:-}" && -d /Library/Develope
 fi
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ "${1:-}" == "--seed" && "${ELISA_STAGE1_SEED_TIMEOUT_WRAPPED:-0}" != "1" ]]; then
+# An outer rebuild supervisor owns the process group and its deadline.
+if [[ "${1:-}" == "--seed" && "${ELISA_STAGE1_SEED_TIMEOUT_WRAPPED:-0}" != "1" &&
+      "${ELISA_REBUILD_SUPERVISED:-0}" != "1" ]]; then
   # setup_local_compilers.sh supplies this marker so aggregate RSS/footprint
   # accounting includes every child in its bounded process group. Direct
   # developer-script invocations get the same 3-second wall cap.

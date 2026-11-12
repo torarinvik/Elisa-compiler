@@ -27,10 +27,26 @@ with tempfile.TemporaryDirectory(prefix="self-host-budget-") as work:
 
     fake.write_text("#!/bin/bash\nexec /bin/sleep 60\n")
     env.pop("ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED", None)
+    env.pop("ELISA_REBUILD_SUPERVISED", None)
     run = subprocess.run(
         ["bash", str(root / "scripts/self_host_gen2.sh"), str(work / "deadline")],
         cwd=root, env=env, capture_output=True, text=True, timeout=8,
     )
     if run.returncode != 124 or "deadline exceeded (3s)" not in run.stderr:
         raise SystemExit(f"direct self-host deadline failed\n{run.stdout}{run.stderr}")
-print("PASS nested memory budgets and the direct three-second deadline")
+    fake.write_text(
+        '#!/bin/bash\nps -o pgid= -p "$$" > "$COMPILER_GROUP"\nexec /bin/sleep 60\n'
+    )
+    supervisor_group = work / "supervisor-group"
+    compiler_group = work / "compiler-group"
+    env.update(SUPERVISOR_GROUP=str(supervisor_group), COMPILER_GROUP=str(compiler_group))
+    run = subprocess.run(
+        ["bash", str(root / "test/parity/compiler_rebuild_timeout.sh"), "bash", "-c",
+         'ps -o pgid= -p "$$" > "$SUPERVISOR_GROUP"; exec bash "$@"',
+         "bash", str(root / "scripts/self_host_gen2.sh"), str(work / "supervised")],
+        cwd=root, env=env, capture_output=True, text=True, timeout=8,
+    )
+    if (run.returncode != 124 or not compiler_group.exists()
+            or compiler_group.read_text().strip() != supervisor_group.read_text().strip()):
+        raise SystemExit(f"supervised compiler escaped its deadline group\n{run.stdout}{run.stderr}")
+print("PASS memory budgets, direct deadline and outer deadline process group")

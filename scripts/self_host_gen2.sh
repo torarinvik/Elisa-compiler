@@ -6,7 +6,9 @@
 # Compiles src/driver/elisac.elisa with the stage1 product and links gen2.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ "${ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED:-0}" != "1" ]]; then
+# An outer rebuild supervisor owns the process group and its deadline.
+if [[ "${ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED:-0}" != "1" &&
+      "${ELISA_REBUILD_SUPERVISED:-0}" != "1" ]]; then
   export ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED=1
   ELISA_TIMEOUT_LIBRARY_PATH_SET="${LIBRARY_PATH+x}" \
   ELISA_TIMEOUT_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
