@@ -58,4 +58,13 @@ if grep -q 'enum "E" has no variant "LocalTag"' <<< "$wildcard"; then
     printf 'local wildcard enum did not outrank global import:\n%s\n' "$wildcard" >&2
     exit 1
 fi
+if grep -Eq 'L(36|58) raise cannot propagate' <<< "$report"; then
+    printf 'error-set alias rejected its resolved family:\n%s\n' "$report" >&2
+    exit 1
+fi
+wrong_alias="$(sed 's/raise SetProvider::Expected.Other(97)/raise Fault.BareTag(97)/' "$fixture" | "$RPT")"
+grep -q 'L36 raise cannot propagate tag "Fault.BareTag"' <<< "$wrong_alias" || {
+    printf 'error-set alias accepted an unrelated family:\n%s\n' "$wrong_alias" >&2
+    exit 1
+}
 echo 'imported error variant owner smoke OK'
