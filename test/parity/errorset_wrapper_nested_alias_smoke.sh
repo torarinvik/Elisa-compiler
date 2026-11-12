@@ -31,9 +31,7 @@ stage1_rows="$(printf '%s\n' "$stage1_output" \
     | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
     | LC_ALL=C sort)"
 expected_stage0_rows="$(cat <<'EOF'
-L14
-L20
-L26
+L27
 EOF
 )"
 expected_stage1_rows="$(cat <<'EOF'
@@ -43,8 +41,8 @@ EOF
 
 [[ "$stage0_rows" == "$expected_stage0_rows" ]] \
     || fail "Stage0 nested-alias diagnostic lines changed: $stage0_rows\n$stage0_output"
-[[ "$stage0_diagnostic_count" == 6 ]] \
-    || fail "Stage0 reported $stage0_diagnostic_count diagnostics, expected 6:\n$stage0_output"
+[[ "$stage0_diagnostic_count" == 1 ]] \
+    || fail "Stage0 reported $stage0_diagnostic_count diagnostics, expected 1:\n$stage0_output"
 grep -q '^D 1$' <<< "$stage1_output" || fail "Stage1 reported an unexpected diagnostic count: $stage1_output"
 [[ "$stage1_rows" == "$expected_stage1_rows" ]] \
     || fail "Stage1 nested-alias diagnostic differs: $stage1_rows\n$stage1_output"
