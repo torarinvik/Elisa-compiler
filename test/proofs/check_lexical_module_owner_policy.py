@@ -109,12 +109,24 @@ if semantic_text.count('include "./check_named_type_mismatch.elisa"') != 1:
     raise SystemExit("semantic root must include the lexical visibility consumer exactly once")
 
 for function_name, source in (
-    ("binding_module_alias_row", binding_text),
     ("binding_nominal_declaration", binding_text),
     ("named_struct_target", consumer_text),
 ):
     if "named_type_owner_is_lexical(" not in compact(function_section(source, function_name)):
         raise SystemExit(f"{function_name} must retain the proved lexical visibility predicate")
+# Module aliases use analyzer-wide registration order. Nominal declarations
+# and their imports still use the lexical visibility predicate above.
+alias_order = compact(function_section(binding_text, "binding_module_alias_precedes"))
+if "returnsemantic_possible_import_alias_precedes(left,right,table)" not in alias_order:
+    raise SystemExit("module alias resolution must share the import registration order")
+for function_name in ("binding_module_alias_row", "binding_module_alias_row_before"):
+    alias_lookup = compact(function_section(binding_text, function_name))
+    if not all(fragment in alias_lookup for fragment in (
+            "binding_module_alias_precedes(",
+            "table.definite_import_annotations",
+            "table.possible_import_annotations",
+            "BINDING_MODULE_ALIAS_ROW_AMBIGUOUS")) or "named_type_owner_is_lexical(" in alias_lookup:
+        raise SystemExit(f"{function_name} must resolve analyzer-wide aliases in registration order")
 static_alias_lookup = compact(function_section(static_string_text, "static_module_name_is_alias"))
 if not all(fragment in static_alias_lookup for fragment in (
         "table.definite_import_annotations",
