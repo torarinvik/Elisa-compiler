@@ -9,3 +9,22 @@ if ! grep -q '^P 1$' <<< "$out" || ! grep -q '^  0 L1 -$' <<< "$out"; then
     exit 1
 fi
 echo 'parser arrow recovery smoke OK'
+python3 - "$RPT" <<'PY'
+import subprocess
+import sys
+
+reporter = sys.argv[1]
+cases = (
+    ("def broken(x: i64)\n4:\n    return x\n", False),
+    ("def broken(x: i64)\n42:\n    return x\n", False),
+    ("def good(\n    x: i64\n) -> i64:\n    return x\n", True),
+)
+for source, accepted in cases:
+    result = subprocess.run([reporter], input=source, text=True, capture_output=True,
+                            timeout=20, check=True)
+    first = result.stdout.splitlines()[0]
+    count = int(first.split()[1]) if first.startswith("P ") else -1
+    if count < 0 or (count == 0) != accepted:
+        raise SystemExit(f"header recovery mismatch for {source!r}: {result.stdout}")
+print("multiline header recovery OK")
+PY
