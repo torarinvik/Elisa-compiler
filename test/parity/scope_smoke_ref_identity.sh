@@ -39,13 +39,14 @@ def note(b: mutable Box&) -> void:
     b.n <- b.n + 1
 
 
-def touch(b: mutable Box&) -> i64:
-    note(b) if b == &well_known
-    return b.n
+def touch(b: mutable Box&) -> i64 can[Global.Read]:
+    can Global.Read:
+        note(b) if b == &well_known
+        return b.n
 
 
-def main() -> i64:
-    can Abort.Panic:
+def main() -> i64 can[Abort.Panic, Global{Read,Write}]:
+    can Abort.Panic, Global{Read,Write}:
         other: mutable Box = Box{n: 5}
         return touch(&well_known) * 10 + touch(&other)
 EOF
