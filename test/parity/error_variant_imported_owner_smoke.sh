@@ -72,4 +72,13 @@ grep -q 'L47 raise cannot propagate tag "Fault.BareTag"' <<< "$wrong_imported_al
     printf 'alias through an import accepted an unrelated family:\n%s\n' "$wrong_imported_alias" >&2
     exit 1
 }
+grep -q '^D 0$' <<< "$report" || {
+    printf 'valid imported/qualified error families produced diagnostics:\n%s\n' "$report" >&2
+    exit 1
+}
+wrong_qualified="$(sed 's/raise SetProvider::Expected.Other(109) if fail/raise OtherTags.Expected(109) if fail/' "$fixture" | "$RPT")"
+grep -q 'L126 raise cannot propagate tag "OtherTags.Expected"' <<< "$wrong_qualified" || {
+    printf 'qualified error-set alias accepted an unrelated family:\n%s\n' "$wrong_qualified" >&2
+    exit 1
+}
 echo 'imported error variant owner smoke OK'
