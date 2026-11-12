@@ -23,7 +23,7 @@ grep -q '^D 1$' <<< "$report" || {
   printf 'local-type shadowing smoke diagnostics differ:\n%s\n%s\n' "$rows" "$report" >&2
   exit 1
 }
-grep -q 'cannot propagate Expected from a function returning Other' <<< "$report" || {
+grep -q 'cannot propagate Fault from a function returning Other' <<< "$report" || {
   printf 'Try did not resolve the bare variant after local type shadowing:\n%s\n' "$report" >&2
   exit 1
 }
