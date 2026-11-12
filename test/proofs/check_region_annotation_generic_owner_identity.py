@@ -33,6 +33,6 @@ if not all(fragment in smoke for fragment in (
     "#line 0 plain_struct.elisa\\nstruct Plain:",
     "values: darray[i64] @missing",
     "same-line generic function suppressed a plain struct's unknown region qualifier",
-    'unknown region qualifier \\"missing\\"',
+    'unknown region qualifier "missing"',
 )):
     raise SystemExit("region smoke must cover a generic function colliding with a plain struct at #line 0")

@@ -33,7 +33,7 @@ if not all(fragment in receiver_region for fragment in (
     "table.generic_param_lines.count != table.generic_param_owner_offsets.count",
     "table.generic_param_lines[row] == struct_identity.line",
     "table.generic_param_owner_offsets[row] == struct_identity.offset",
-    "region_escape_region_binding_id(field_region, struct_identity.line, table)",
+    "region_escape_region_binding_id(field_region, struct_identity.line, struct_identity.offset, table)",
 )):
     raise SystemExit("projected generic storage parameters must join by exact struct line and offset")
 if not all(fragment in owner_identity for fragment in (
