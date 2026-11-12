@@ -59,7 +59,7 @@ class Stage0ProvenanceTests(unittest.TestCase):
         if Path(args[1]).name != "run_with_timeout.py":
             return False
         self.assertEqual(args[0], sys.executable)
-        self.assertEqual(args[2:8], ["5", "--grace-seconds", "0", "--", "go", "build"])
+        self.assertEqual(args[2:8], ["3", "--grace-seconds", "0", "--", "go", "build"])
         return True
 
     def fake_go(self, args, **kwargs):
