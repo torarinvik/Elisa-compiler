@@ -30,6 +30,8 @@ random.seed(int(os.environ.get("FUZZ_SEED", "20260806")))
 # Programs that CRASHED stage1 before this check existed. Kept explicitly so a regression is
 # named rather than left to the random sweep to rediscover.
 REGRESSIONS = [
+    # An extra name inside an export parameter must be diagnosed before lowering.
+    ("malformed_export_parameter", "def target(first: mutable darray[i64]&) -> void:\n    pass\nexport fn exposed(first: mutable dart: mutable darray[i64]&) -> void = target\n"),
     ("void_call_into_vardecl", "def compute()\n\ndef f() -> void:\n    x: i64 = compute()\n"),
     ("void_call_into_return", "def compute()\n\ndef f() -> i64:\n    return compute()\n"),
     ("void_call_into_push", "def compute()\n\ndef f() -> void:\n    xs: mutable darray[i64] = []\n    xs.push(compute())\n"),
