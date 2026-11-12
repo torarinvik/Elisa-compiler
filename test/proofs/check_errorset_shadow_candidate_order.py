@@ -216,7 +216,7 @@ if not all(fragment in param_expression_walk for fragment in (
         "member.default_value")) or not all(fragment in nested_expression_fixture for fragment in (
         "def wrap[errorset R]() -> i64 error[R]",
         "def nested_conditional_call() -> i64 error[CallerFault]",
-        "return 7 if try wrap() == 1 else 0",
+        "return 7 if (try wrap()) == 1 else 0",
         "def default_parameter_call(value: i64 = wrap()) -> i64:",
         "value: i64 = wrap()",
         "def qualified_call() -> i64:",
@@ -225,7 +225,7 @@ if not all(fragment in param_expression_walk for fragment in (
         "def alias_qualified_call() -> i64:",
         "QP::Nested::wrap()")) or not all(fragment in nested_expression_smoke for fragment in (
         "errorset_param_nested_expression.elisa",
-        'L8 cannot infer error-set parameter "R" for call to "wrap"',
+        'L9 cannot infer error-set parameter "R" for call to "wrap"',
         'L11 cannot infer error-set parameter "R" for call to "wrap"',
         'L15 cannot infer error-set parameter "R" for call to "wrap"',
         'L24 cannot infer error-set parameter "Q" for call to "wrap"',
