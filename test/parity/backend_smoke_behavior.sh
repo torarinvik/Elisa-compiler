@@ -69,10 +69,7 @@ def main() -> i64:
 ' 65
 
 # The inactive alias must leave the real Bytes module visible to native calls.
-run_case inactive_static_module_alias "$(cat "$ROOT/test/fixtures/diagnostics/static_string_binding_inactive_alias.pos.elisa")"'
-def main() -> i64:
-    return Caller::call()
-' 0
+run_case inactive_static_module_alias "$(cat "$ROOT/test/repro/inactive_static_module_alias.elisa")" 0
 
 # The spine's modeled subset: a parameterless `-> i64` returning an int expression.
 run_case return_42        'def main() -> i64:\n    return 42\n'   42

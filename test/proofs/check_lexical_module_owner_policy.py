@@ -127,10 +127,12 @@ if "named_type_owner_is_lexical(" in static_alias_lookup:
 if not all(fragment in static_alias_positive_text for fragment in (
         "static if false:",
         "using Other as Bytes",
-        "Bytes::inspect(\"zero\")")) or not all(fragment in static_alias_negative_text for fragment in (
+        'raw = "zero"',
+        "Bytes::inspect(raw)")) or not all(fragment in static_alias_negative_text for fragment in (
         "static if true:",
         "using Other as Bytes",
-        "Bytes::inspect(\"zero\")")):
+        'raw = "zero"',
+        "Bytes::inspect(raw)")):
     raise SystemExit("static string alias fixtures must contrast inactive and active module-alias shadowing")
 
 positive_names = {
