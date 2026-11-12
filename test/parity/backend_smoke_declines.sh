@@ -188,6 +188,10 @@ run_case narrow_optional_ref_by_assert 'struct Node:\n    v: mutable i64\n\nstru
 # An `if` GUARD narrows the same way inside its then-arm, and `and` chains are walked
 # (the dict rehash writes `if old_items != null and old_capacity > 0:`).
 run_case narrow_optional_ref_by_guard 'struct Node:\n    v: mutable i64\n\nstruct Holder:\n    p: mutable Node&?\n\ndef fetch(h: Holder&, n: i64) -> i64:\n    if h.p != null and n > 0:\n        q: Node& = h.p\n        return q.v\n    return 7\n\ndef main() -> i64:\n    n: mutable Node = Node{v: 42}\n    hold: mutable Holder = Holder{p: &n}\n    return fetch(&hold, 1)\n' 42
+# Scalar optionals use an aggregate representation and must be unwrapped before
+# assigning a narrowed value, for both locals and struct fields.
+run_case narrow_optional_scalar_local_assign 'def take(input: u32?) -> u32:\n    return 99 if input == null\n    value: mutable u32 = 0\n    value <- input\n    return value\n\ndef main() -> i32:\n    return take(42).i32()\n' 42
+run_case narrow_optional_scalar_field_assign 'struct Number:\n    value: u32?\n\ndef load(number: Number) -> u32:\n    out: mutable u32 = 99\n    if number.value != null:\n        out <- number.value\n    return out\n\ndef main() -> i32:\n    good: Number = Number{value: 42}\n    missing: Number = Number{value: null}\n    return 1 if load(good) != 42\n    return 2 if load(missing) != 99\n    return 0\n' 0
 # WITHOUT a proof the assignment must still DECLINE -- narrowing is a fact, not a coercion.
 stripped_case narrow_optional_ref_unproven 'struct Node:\n    v: mutable i64\n\nstruct Holder:\n    p: mutable Node&?\n\ndef fetch(h: Holder&) -> i64:\n    q: Node& = h.p\n    return q.v\n\ndef main() -> i64:\n    n: mutable Node = Node{v: 42}\n    hold: mutable Holder = Holder{p: &n}\n    return fetch(&hold)\n'
 # A const's type ANNOTATION is optional: `const A = 0x20` takes its type from the
