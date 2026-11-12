@@ -12,12 +12,12 @@ set +e
 core="$("$ELISACORE_BIN" -emit semantic "$fixture" 2>&1)"
 status=$?
 set -e
-[[ "$status" -ne 0 && $(grep -c 'parameter "value" is specified more than once' <<< "$core") == 2 && "$core" != *'expects i64, got bool'* ]] || {
+[[ "$status" -ne 0 && $(grep -c 'parameter "value" is specified more than once' <<< "$core") == 2 && "$core" == *'function "needs_two" is missing argument for parameter "left"'* && $(grep -c 'argument 2 to "defaulted" expects i64, got bool' <<< "$core") == 1 ]] || {
   printf 'Unexpected Stage0 diagnostics:\n%s\n' "$core" >&2
   exit 1
 }
 report="$("$RPT" < "$fixture")"
-[[ "$(printf '%s\n' "$report" | sed -n '/^D /p')" == 'D 2' && $(grep -c 'parameter "value" is specified more than once' <<< "$report") == 2 ]] || {
+[[ "$(printf '%s\n' "$report" | sed -n '/^D /p')" == 'D 4' && $(grep -c 'parameter "value" is specified more than once' <<< "$report") == 2 && "$report" == *'function "needs_two" is missing argument for parameter "left"'* && $(grep -c 'argument 2 to "defaulted" expects i64, got bool' <<< "$report") == 1 ]] || {
   printf 'Unexpected Stage1 diagnostics:\n%s\n' "$report" >&2
   exit 1
 }
