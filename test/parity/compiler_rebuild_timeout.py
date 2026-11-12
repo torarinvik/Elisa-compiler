@@ -72,7 +72,9 @@ profile = None
 def schedule_sample(child):
     global sampler, profile
     profile = f"/tmp/elisa-rebuild-profile-{child.pid}.txt"
-    sampler = threading.Timer(1, sample_rebuild, args=(child, profile))
+    # Sample the work still active near the deadline, after short dependency
+    # compiles have finished. The one-second sample ends before the 3s kill.
+    sampler = threading.Timer(1.8, sample_rebuild, args=(child, profile))
     sampler.daemon = True
     sampler.start()
 
