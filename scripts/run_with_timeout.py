@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+from collections.abc import Callable
 from typing import NoReturn
 
 
@@ -43,7 +44,12 @@ def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: float = 1.
         pass
 
 
-def run(command: list[str], timeout_seconds: float) -> int:
+def run(
+    command: list[str],
+    timeout_seconds: float,
+    *,
+    on_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> int:
     if not command or not command[0]:
         print("run_with_timeout: missing command", file=sys.stderr)
         return 2
@@ -59,6 +65,8 @@ def run(command: list[str], timeout_seconds: float) -> int:
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, lambda received, _frame, child=process: _terminate_on_signal(child, received))
     try:
+        if on_start is not None:
+            on_start(process)
         return_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         try:
