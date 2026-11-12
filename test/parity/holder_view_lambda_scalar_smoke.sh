@@ -9,6 +9,36 @@ import sys
 
 reporter = sys.argv[1]
 cases = (
+    ("generic scalar callback", '''struct Holder:
+    value: sview
+def apply[T](seed: T, g: fn(T, T) -> T) -> T:
+    return g(seed, seed)
+def f() -> i64:
+    return apply(0, fn(a, b) => a + b)
+''', False),
+    ("generic reference callback", '''struct Holder:
+    value: sview
+def apply[T](seed: T, g: fn(T, T) -> T) -> T:
+    return g(seed, seed)
+def f(seed: sview) -> void:
+    apply(seed, fn(a, b) => a + b)
+''', True),
+    ("conflicting generic arguments", '''struct Holder:
+    value: sview
+def apply[T](first: T, second: T, g: fn(T, T) -> T) -> T:
+    return g(first, second)
+def f(seed: sview) -> void:
+    apply(0, seed, fn(a, b) => a + b)
+''', True),
+    ("generic bound is not a parameter", '''struct Holder:
+    value: sview
+struct R:
+    value: sview
+def apply[T: R](seed: R, g: fn(R, R) -> R) -> R:
+    return g(seed, seed)
+def f() -> void:
+    apply(0, fn(a, b) => a + b)
+''', True),
     ("contextual scalars", '''struct Holder:
     value: sview
 def apply(g: fn(i64, i64) -> i64) -> i64:

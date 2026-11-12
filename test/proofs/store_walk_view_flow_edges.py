@@ -104,7 +104,7 @@ CALLABLE_VIEW_RESULT_EDGES = (
 
 CALL_RESULT_VIEW_TAINT_EDGES = (
     ("Expr.Call(callee, arguments, _, _):", "result_may_be_owned_view: bool = chv_is_owned_view(expression, flow, 0) or (method_found and receiver_may_be_owned_view and (method_name == \"as_sview\" or method_name == \"as_cstr\" or method_name == \"view\")) or callee_may_be_owned_view"),
-    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
+    ("for argument in arguments |table, argument_may_alias_refs, argument_owned_views, flow, arguments_may_be_owned_view, arguments_may_contain_alias_reference, argument_index| -> table:", "arguments_may_be_owned_view <- arguments_may_be_owned_view or flow.last_value_may_be_owned_view"),
     ("Expr.Call(callee, arguments, _, _):", "flow.last_value_may_be_owned_view <- result_may_be_owned_view or arguments_may_be_owned_view"),
 )
 
