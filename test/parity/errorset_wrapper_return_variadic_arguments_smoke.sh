@@ -32,7 +32,7 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
 
 stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
-  | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
+  | sed -E -n 's#^[[:space:]]*L([0-9]+) return type expects.*$#L\1#p' \
   | LC_ALL=C sort)"
 expected_rows=$'L24'
 
@@ -40,7 +40,7 @@ expected_rows=$'L24'
   || fail "Stage0 did not retain the positional variadic family's mismatch alone: $stage0_output"
 [[ "$stage1_rows" == "$expected_rows" ]] \
   || fail "Stage1 dropped the positional variadic family or propagated an invalid shape: $stage1_output"
-[[ $(grep -cF 'cannot propagate' <<< "$stage1_output") == 1 ]] \
+[[ $(grep -cF 'return type expects' <<< "$stage1_output") == 1 ]] \
   || fail "Stage1 emitted a family diagnostic for an invalid variadic shape: $stage1_output"
 grep -qF 'named arguments and explicit bundle applications are not supported for variadic function "collect"' <<< "$stage1_output" \
   || fail "Stage1 did not reject named arguments to the selected variadic function: $stage1_output"
