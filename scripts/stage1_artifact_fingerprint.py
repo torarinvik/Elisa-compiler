@@ -69,7 +69,7 @@ def digest_files(root, paths):
         digest.update(b"\0")
     return digest.hexdigest()
 
-def stat_inventory_digest(root, paths, freshness_extensions=()):
+def stat_inventory_digest(root, paths, freshness_extensions=(), *, writes_only=False):
     root = Path(root).resolve()
     files = []
     for path in paths:
@@ -77,7 +77,7 @@ def stat_inventory_digest(root, paths, freshness_extensions=()):
             files.extend(candidate for candidate in path.rglob("*") if candidate.is_file())
         elif path.is_file():
             files.append(path)
-    digest = hashlib.sha256()
+    digest = None if writes_only else hashlib.sha256()
     # Without ctime: macOS bumps ctime when it attaches com.apple.macl/provenance
     # attributes to a file about a second after an editor saves it, which says
     # nothing about the bytes a build read. mtime, size and inode still change on
@@ -85,16 +85,23 @@ def stat_inventory_digest(root, paths, freshness_extensions=()):
     write_digest = hashlib.sha256()
     newest_source_mtime_ns = None
     newest_source_path = None
-    for path in sorted(set(files), key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root).as_posix()
+    # Store each relative name once. The POSIX prefix is the common case;
+    # relative_to retains Path's handling of other path spellings.
+    prefix = root.as_posix().rstrip("/") + "/"
+    inventory = []
+    for path in set(files):
+        name = path.as_posix()
+        relative = name[len(prefix):] if name.startswith(prefix) else path.relative_to(root).as_posix()
+        inventory.append((relative, path))
+    for relative, path in sorted(inventory):
         identity = file_stat_identity(path)
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii"))
-        digest.update(b"\0")
+        name = relative.encode("utf-8") + b"\0"
+        if digest is not None:
+            digest.update(name)
+            digest.update(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("ascii"))
+            digest.update(b"\0")
         write_identity = {key: value for key, value in identity.items() if key != "ctime_ns"}
-        write_digest.update(relative.encode("utf-8"))
-        write_digest.update(b"\0")
+        write_digest.update(name)
         write_digest.update(json.dumps(write_identity, sort_keys=True, separators=(",", ":")).encode("ascii"))
         write_digest.update(b"\0")
         # Preserve the former `find ... -newer BIN` freshness rule while collecting it
@@ -104,4 +111,4 @@ def stat_inventory_digest(root, paths, freshness_extensions=()):
             if newest_source_mtime_ns is None or mtime_ns > newest_source_mtime_ns:
                 newest_source_mtime_ns = mtime_ns
                 newest_source_path = relative
-    return digest.hexdigest(), write_digest.hexdigest(), newest_source_mtime_ns, newest_source_path
+    return digest.hexdigest() if digest is not None else None, write_digest.hexdigest(), newest_source_mtime_ns, newest_source_path

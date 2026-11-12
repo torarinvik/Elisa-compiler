@@ -405,8 +405,8 @@ WRITE_FINGERPRINT_KEYS = ("source_tree_write_fingerprint", "build_recipe_write_f
 def write_fingerprint(root):
     """Stat-only (no content, no toolchain) snapshot of every source and recipe write."""
     root = Path(root).resolve()
-    _, source_writes, _, _ = stat_inventory_digest(root, [root / name for name in SOURCE_DIRS])
-    _, recipe_writes, _, _ = stat_inventory_digest(root, [root / name for name in BUILD_RECIPES])
+    _, source_writes, _, _ = stat_inventory_digest(root, [root / name for name in SOURCE_DIRS], writes_only=True)
+    _, recipe_writes, _, _ = stat_inventory_digest(root, [root / name for name in BUILD_RECIPES], writes_only=True)
     return dict(zip(WRITE_FINGERPRINT_KEYS, (source_writes, recipe_writes)))
 
 
