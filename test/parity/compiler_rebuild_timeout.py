@@ -23,7 +23,7 @@ def sample_rebuild(child, profile):
     if child.poll() is not None or not os.path.exists("/usr/bin/sample"):
         return
     try:
-        rows = subprocess.check_output(["ps", "-axo", "pid=,ppid=,comm="], text=True).splitlines()
+        rows = subprocess.check_output(["ps", "-ww", "-axo", "pid=,ppid=,command="], text=True).splitlines()
         processes = {}
         for row in rows:
             parts = row.strip().split(None, 2)
@@ -35,7 +35,13 @@ def sample_rebuild(child, profile):
             if updated == descendants:
                 break
             descendants = updated
-        candidates = [pid for pid in descendants if "elisac" in os.path.basename(processes.get(pid, (0, ""))[1])]
+        def executable(pid):
+            try:
+                return os.path.basename(shlex.split(processes.get(pid, (0, ""))[1])[0])
+            except (ValueError, IndexError):
+                return ""
+
+        candidates = [pid for pid in descendants if "elisac" in executable(pid)]
         if candidates:
             # Prefer the oldest compiler process, not an arbitrary short-lived worker.
             # Set iteration order is unspecified, and sampling an exiting worker can
@@ -48,7 +54,7 @@ def sample_rebuild(child, profile):
             # Sample the worker while the driver waits for it.
             workers = []
             for pid in descendants:
-                command = os.path.basename(processes.get(pid, (0, ""))[1])
+                command = executable(pid)
                 if command in {"ld", "ld64.lld", "ld.lld", "dsymutil"}:
                     workers.append((0, pid))
                 elif command in {"compile", "clang", "clang++"} or command.startswith("clang-"):
@@ -62,10 +68,9 @@ def sample_rebuild(child, profile):
             target = min(workers)[1] if workers else child.pid
         # Report only the Go package name, not the full command line: compiler
         # arguments may contain paths or other user-provided values.
-        if os.path.basename(processes.get(target, (0, ""))[1]) == "compile":
+        if executable(target) == "compile":
             try:
-                command = subprocess.check_output(["ps", "-p", str(target), "-o", "command="], text=True).strip()
-                words = shlex.split(command)
+                words = shlex.split(processes[target][1])
                 if "-p" in words and words.index("-p") + 1 < len(words):
                     print(f"compiler rebuild sampled Go package: {words[words.index('-p') + 1]}", file=sys.stderr)
             except (OSError, ValueError, subprocess.SubprocessError):
