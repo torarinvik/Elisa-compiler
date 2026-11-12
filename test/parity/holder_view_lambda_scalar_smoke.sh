@@ -9,6 +9,44 @@ import sys
 
 reporter = sys.argv[1]
 cases = (
+    ("contextual scalars", '''struct Holder:
+    value: sview
+def apply(g: fn(i64, i64) -> i64) -> i64:
+    return g(1, 2)
+def f() -> i64:
+    return apply(fn(a, b) => a + b)
+''', False),
+    ("overloaded callback", '''struct Holder:
+    value: sview
+def apply(g: fn(i64, i64) -> i64) -> void:
+    pass
+def apply(g: fn(sview, sview) -> sview) -> void:
+    pass
+def f() -> void:
+    apply(fn(a, b) => a + b)
+''', True),
+    ("named callback argument", '''struct Holder:
+    value: sview
+def apply(g: fn(i64, i64) -> i64) -> void:
+    pass
+def f() -> void:
+    apply(g: fn(a, b) => a + b)
+''', True),
+    ("imported callable ambiguity", '''using Other
+struct Holder:
+    value: sview
+def apply(g: fn(i64, i64) -> i64) -> void:
+    pass
+def f() -> void:
+    apply(fn(a, b) => a + b)
+''', True),
+    ("shadowed callable", '''struct Holder:
+    value: sview
+def apply(g: fn(i64, i64) -> i64) -> void:
+    pass
+def f(apply: fn(fn(sview, sview) -> sview) -> void) -> void:
+    apply(fn(a, b) => a + b)
+''', True),
     ("explicit scalars", '''struct Holder:
     value: sview
 
@@ -21,6 +59,11 @@ def f() -> i64:
 
 def f() -> void:
     add = fn(a, b) => a + b
+''', True),
+    ("annotated references", '''struct Holder:
+    value: sview
+def f() -> void:
+    add = fn(a: i64&, b: i64&) => a + b
 ''', True),
     ("shadowed scalar name", '''struct Holder:
     value: sview
@@ -43,7 +86,7 @@ for name, source, want_escape in cases:
 same_line = """struct Holder:
     value: sview
 
-def combine(left: fn(i64, i64) -> i64, right: fn(i64, i64) -> i64) -> void:
+def combine(left: fn(i64, i64) -> i64, right: fn(sview, sview) -> sview) -> void:
     pass
 
 def f() -> void:
