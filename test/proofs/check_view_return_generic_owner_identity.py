@@ -50,7 +50,8 @@ collector = function_source(collection, "vro_collect")
 if not all(fragment in collector for fragment in (
     "generic_offsets: darray[u32]&",
     "vro_generics_of(pos.line, pos.offset, generic_lines, generic_offsets, generic_names, generics)",
-    "vro_collect(body, generic_lines, generic_offsets, generic_names, view_enums, prior, prior_index, update_prior, mutables, out)",
+    "vro_collect(body, generic_lines, generic_offsets, generic_names, view_enums, prior, prior_index, update_prior, mutables, out, scopes, pos.offset.u64() + 1.u64())",
+    "vro_collect(body, generic_lines, generic_offsets, generic_names, view_enums, prior, prior_index, update_prior, mutables, out, scopes, scope)",
 )):
     raise SystemExit("view-return declaration traversal must preserve owner offsets through nested scopes")
 
