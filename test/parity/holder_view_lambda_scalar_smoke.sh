@@ -39,5 +39,19 @@ for name, source, want_escape in cases:
     found = "short-lived region escapes via store" in result.stdout
     if found != want_escape:
         raise SystemExit(f"{name}: wrong escape diagnostic:\n{result.stdout}")
-print(f"holder view lambda scalar precision OK: {len(cases)} cases")
+# Two lambdas on one source line must use their own parameter metadata.
+same_line = """struct Holder:
+    value: sview
+
+def combine(left: fn(i64, i64) -> i64, right: fn(i64, i64) -> i64) -> void:
+    pass
+
+def f() -> void:
+    combine(fn(a: i64, b: i64) => a + b, fn(a, b) => a + b)
+"""
+result = subprocess.run([reporter], input=same_line, text=True, capture_output=True,
+                        timeout=20, check=True)
+if not result.stdout.startswith("P 0\n") or result.stdout.count("short-lived region escapes via store") != 2:
+    raise SystemExit("same-line lambda metadata was mixed:\n" + result.stdout)
+print(f"holder view lambda scalar precision OK: {len(cases)} cases and same-line isolation")
 PY
