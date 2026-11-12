@@ -63,6 +63,20 @@ grep -qE "(cannot assign (i64|int) to bool|expects bool, got (i64|int))" <<< "$o
 out=$(printf 'def f() -> void:\n    a: mutable darray[i64] = []\n    b: dict[cstr, i64] = {}\n    a <- b\n' | "$RPT")
 grep -q "expects darray, got dict" <<< "$out" || fail "generic container mismatch not flagged: $out"
 
+# An arity mismatch cannot borrow the signature of an inapplicable declaration.
+out=$("$RPT" <<'ELISA'
+def consume(flag: bool) -> void:
+    pass
+def correct_arity(values: darray[i64]) -> void:
+    consume(values)
+def wrong_arity(values: darray[i64]) -> void:
+    consume(values, false)
+ELISA
+)
+grep -q 'L6 function "consume" expects 1 arguments, got 2' <<< "$out" || fail "wrong-arity call diagnostic missing: $out"
+grep -q 'L4 argument 1 to "consume" expects bool, got container' <<< "$out" || fail "matching-arity call type diagnostic missing: $out"
+grep -q 'L6 argument 1 to "consume"' <<< "$out" && fail "wrong-arity call used an inapplicable signature: $out"
+
 # 10. A by-reference darray parameter must be compared by its referent element type.
 # Both outer types lower as references in the function body, but darray[i64]& cannot be
 # passed to a function that reads/writes the same buffer as darray[sview]&.
