@@ -56,13 +56,15 @@ def sample_rebuild(child, profile):
                     workers.append((2, pid))
                 elif command == "go":
                     workers.append((3, pid))
-            if not workers:
-                return
-            _, target = min(workers)
+            # Provenance discovery can still be running before Go starts.
+            # Capture its driver when no compiler worker is visible.
+            target = min(workers)[1] if workers else child.pid
         # Go can finish one package and start the next while sampling. Resolve
         # symbols up front so an exiting worker still leaves a usable call graph.
-        subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-mayDie", "-file", profile],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4, check=False)
+        result = subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-mayDie", "-file", profile],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=4, check=False)
+        if result.returncode != 0:
+            print(f"compiler rebuild sampling failed for pid {target}: {result.stderr.strip() or result.returncode}", file=sys.stderr)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
 
@@ -74,9 +76,8 @@ profile = None
 def schedule_sample(child):
     global sampler, profile
     profile = f"/tmp/elisa-rebuild-profile-{child.pid}.txt"
-    # Sample the work still active near the deadline, after short dependency
-    # compiles have finished. The one-second sample ends before the 3s kill.
-    sampler = threading.Timer(1.8, sample_rebuild, args=(child, profile))
+    # Leave time for process discovery and sample output before the deadline.
+    sampler = threading.Timer(1.3, sample_rebuild, args=(child, profile))
     sampler.daemon = True
     sampler.start()
 
