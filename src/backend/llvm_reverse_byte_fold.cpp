@@ -1,3 +1,15 @@
+#include <llvm/Config/llvm-config.h>
+#if LLVM_VERSION_MAJOR >= 23
+#include "llvm_loop_pass_policy.h"
+#include "llvm_scalar_pattern.h"
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/IntrinsicInst.h>
+
+using namespace llvm;
+
 // Fold a reverse polynomial reduction over a privately stored byte prefix.
 namespace {
 struct ReverseByteFold {
@@ -131,12 +143,12 @@ static bool foldReverseByteReduction(BasicBlock &Body, const DataLayout &DL) {
   Fold.Result->replaceAllUsesWith(Sum);
   for (Instruction &I : Body) I.dropAllReferences();
   while (!Body.empty()) Body.back().eraseFromParent();
-  BranchInst::Create(Fold.Exit, &Body);
+  UncondBrInst::Create(Fold.Exit, &Body);
   return true;
 }
 } // namespace
 
-static unsigned elisacoreFoldReverseByteReductions(Module &M) {
+unsigned elisacoreFoldReverseByteReductions(Module &M) {
   if (!M.getTargetTriple().isAArch64() || M.size() > 512) return 0;
   unsigned Changed = 0;
   for (Function &F : M) {
@@ -146,3 +158,4 @@ static unsigned elisacoreFoldReverseByteReductions(Module &M) {
   }
   return Changed;
 }
+#endif

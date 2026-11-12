@@ -14,6 +14,7 @@ backend="$ROOT/src/backend"
 sources=(
   "$backend/llvm_validation_peel.cpp"
   "$backend/llvm_scalar_loop_idioms.cpp"
+  "$backend/llvm_reverse_byte_fold.cpp"
   "$backend/llvm_memory_and_call_passes.cpp"
   "$backend/llvm_small_zero.cpp"
   "$backend/llvm_numeric_passes.cpp"
