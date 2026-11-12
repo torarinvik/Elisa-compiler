@@ -28,7 +28,7 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
 stage0_diagnostic_count="$(printf '%s\n' "$stage0_output" | grep -cF "$FIXTURE:" || true)"
 stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
-    | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
+    | sed -E -n 's#^[[:space:]]*L([0-9]+) return type expects.*$#L\1#p' \
     | LC_ALL=C sort)"
 expected_stage0_rows="$(cat <<'EOF'
 L27

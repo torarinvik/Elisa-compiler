@@ -22,7 +22,7 @@ if [[ "$stage0_status" -eq 0 || "$stage0_rows" != 'L20' || $(printf '%s\n' "$sta
     exit 1
 fi
 output="$("$RPT" < "$FIXTURE")"
-if ! grep -q '^D 1$' <<< "$output" || ! grep -q '^[[:space:]]*L20 cannot propagate' <<< "$output"; then
+if ! grep -q '^D 1$' <<< "$output" || ! grep -q '^[[:space:]]*L20 return type expects' <<< "$output"; then
     echo "EWR repeated-alias smoke expected one missing-Zed diagnostic at L20:\n$output" >&2
     exit 1
 fi
