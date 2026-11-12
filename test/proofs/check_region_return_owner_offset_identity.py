@@ -57,7 +57,7 @@ if 'python3 "$REPO_ROOT/test/proofs/check_region_return_owner_offset_identity.py
 if LOCAL_VIEW_FIXTURE.count("#line 0 local-view-return-owner.elisa") != 2 or \
         "def tied[@r]() -> mutable darray[i64] @r:" not in LOCAL_VIEW_FIXTURE or \
         "def ordinary() -> mutable darray[i64]:" not in LOCAL_VIEW_FIXTURE or \
-        "out: mutable darray[i64] = []" not in LOCAL_VIEW_FIXTURE or \
+        "out: mutable darray[i64] @scratch = []" not in LOCAL_VIEW_FIXTURE or \
         'local_view_return_region_owner_offset.elisa' not in SMOKE:
     raise SystemExit("local-view regression must pair same-line tied and ordinary container returns in region-scope smoke")
 
