@@ -24,6 +24,13 @@ grep -q "unary operator requires numeric operand" <<< "$out" || fail "minus-on-b
 out=$(printf 'def f(s: sview) -> i64:\n    x: i64 = ~s\n    return x\n' | "$RPT")
 grep -q "unary operator requires numeric operand" <<< "$out" || fail "tilde-on-string not flagged: $out"
 
+out=$(printf 'def f(b: bool) -> bool:\n    return +b\n' | "$RPT")
+grep -q "unary operator requires numeric operand" <<< "$out" || fail "plus-on-bool not flagged: $out"
+out=$(printf 'def f(n: i64) -> i64:\n    return +n\n' | "$RPT")
+grep -qE '^D 0$' <<< "$out" || fail "valid plus-on-int rejected: $out"
+out=$(printf 'def nothing() -> void:\n    pass\ndef f() -> void:\n    +nothing()\n' | "$RPT")
+grep -q "unary operator requires numeric operand" <<< "$out" || fail "plus-on-void not flagged: $out"
+
 # 4. `not` on bool operand must NOT be flagged.
 out=$(printf 'def f(b: bool) -> bool:\n    return not b\n' | "$RPT")
 grep -q "not operator requires" <<< "$out" && fail "false positive on not-bool: $out"
