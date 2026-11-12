@@ -48,15 +48,49 @@ out=$(printf 'def f(xs: darray[i64]) -> i64:\n    s: i64 =\n        for x in xs 
 grep -q "undefined identifier \"nope\"" <<< "$out" || fail "loop-header body not resolved: $out"
 
 # 8. zero parse false positives across frontend + stdlib.
+# Some files are include fragments or use declarations from earlier includes. Check
+# those in the complete driver as well, and require every such file to be present in
+# the expansion rather than dropping it from the corpus.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT INT TERM HUP
+: > "$WORK/context-files"
 t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | awk 'NR == 1 { print $2 }')
   [ -n "$c" ] || fail "parse crash/empty output on $f"
   if [ "$c" -ne 0 ]; then
-    printf '  %s: %s parse error(s)\n' "$f" "$c" >&2
+    printf '%s\n' "$f" >> "$WORK/context-files"
   fi
   t=$((t + c))
-done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
-[ "$t" -eq 0 ] || fail "$t parse errors across frontend+stdlib (regression)"
+done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa')
+if [ "$t" -ne 0 ]; then
+  python3 "$REPO_ROOT/scripts/expand_source_probe.py" "$REPO_ROOT/src/driver/elisac.elisa" "$WORK/driver.elisa" "$WORK/driver-map.json" || fail "cannot expand driver includes"
+  python3 - "$WORK/context-files" "$WORK/driver-map.json" <<'PY' || fail "a source with standalone parse errors was not covered by the driver expansion"
+import json
+from pathlib import Path
+import sys
+
+covered = {Path(row["source"]).resolve() for row in json.loads(Path(sys.argv[2]).read_text())}
+missing = [Path(line).resolve() for line in Path(sys.argv[1]).read_text().splitlines() if Path(line).resolve() not in covered]
+for path in missing:
+    print(f"  source missing from driver expansion: {path}", file=sys.stderr)
+if missing:
+    sys.exit(1)
+PY
+  printf 'using Ast\ninclude "%s"\n' "$REPO_ROOT/test/breadth/parse_probe.elisa" > "$WORK/parse-probe.elisa"
+  "$STAGE1_BIN" -emit obj -O0 -permissive -o "$WORK/parse-probe.o" "$WORK/parse-probe.elisa" > "$WORK/probe-build.log" 2>&1 || { cat "$WORK/probe-build.log" >&2; fail "cannot build parser probe"; }
+  probe_link_flags=()
+  case "$(uname -s)" in
+    Darwin) probe_link_flags=(-Wl,-undefined,dynamic_lookup -Wl,-stack_size,0x20000000) ;;
+    Linux) probe_link_flags=(-no-pie) ;;
+  esac
+  clang -O2 "${probe_link_flags[@]}" "$WORK/parse-probe.o" "$RUNTIME_OBJ" "$REPO_ROOT/test/parity/profile_hooks.c" -o "$WORK/parse-probe" || fail "cannot link parser probe"
+  if ! probe_output="$("$WORK/parse-probe" < "$WORK/driver.elisa")"; then
+    printf 'Sources requiring include context:\n' >&2
+    cat "$WORK/context-files" >&2
+    fail "expanded driver has parse errors: $probe_output"
+  fi
+  [[ "$probe_output" == errors=0\ * ]] || fail "unexpected parser probe output: $probe_output"
+fi
 
 echo "docs119-forms smoke OK: bare block / if-value / loop headers / capture / rebind parse + resolve, bitwise | safe, 0 FP"
