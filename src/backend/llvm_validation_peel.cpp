@@ -311,6 +311,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned stackViews = elisacoreInlineStackViewHelpers(*unwrap(module), target);
   if (stackViews == 2) return 2;
   if (stackViews) status = 1;
+  if (elisacoreFoldReverseByteReductions(*unwrap(module))) status = 1;
   if (elisacoreVersionBoundedQuotientSums(*unwrap(module))) status = 1;
 #endif
   if (elisacoreFoldBoundedRemainders(module)) status = 1;
