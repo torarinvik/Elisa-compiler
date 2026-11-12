@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run a compiler rebuild with a strict 3-second process-group deadline."""
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -59,6 +60,16 @@ def sample_rebuild(child, profile):
             # Provenance discovery can still be running before Go starts.
             # Capture its driver when no compiler worker is visible.
             target = min(workers)[1] if workers else child.pid
+        # Report only the Go package name, not the full command line: compiler
+        # arguments may contain paths or other user-provided values.
+        if os.path.basename(processes.get(target, (0, ""))[1]) == "compile":
+            try:
+                command = subprocess.check_output(["ps", "-p", str(target), "-o", "command="], text=True).strip()
+                words = shlex.split(command)
+                if "-p" in words and words.index("-p") + 1 < len(words):
+                    print(f"compiler rebuild sampled Go package: {words[words.index('-p') + 1]}", file=sys.stderr)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass  # The worker may finish between discovery and inspection.
         # Go can finish one package and start the next while sampling. Resolve
         # symbols up front so an exiting worker still leaves a usable call graph.
         result = subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-mayDie", "-file", profile],
@@ -86,6 +97,7 @@ try:
 finally:
     if sampler is not None:
         sampler.cancel()
+        sampler.join(timeout=4)
 if status == 124 and profile is not None and os.path.isfile(profile):
     print(f"compiler rebuild sample: {profile}", file=sys.stderr)
 raise SystemExit(status)
