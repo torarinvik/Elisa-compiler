@@ -5,6 +5,44 @@
 #
 # Sourced by elisac_stage1.sh, which owns ROOT/BIN and the toolchain variables this reads.
 
+watch_seed_memory() {
+  local pid="$1" limit="$2" interval="$3" marker="$4"
+  local peak=0 sleeper=""
+  trap 'if [[ -n "$sleeper" ]]; then kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; fi; exit 0' TERM
+  while kill -0 "$pid" 2>/dev/null; do
+    process_observe "$pid"
+    # macOS kill -0 also succeeds for a zombie.
+    if [[ -z "$PROCESS_STATE" || "$PROCESS_STATE" == Z* ]]; then
+      return
+    fi
+    if [[ -n "$PROCESS_RSS_KB" && "$PROCESS_RSS_KB" -gt "$peak" ]]; then
+      peak="$PROCESS_RSS_KB"
+    fi
+    if [[ -n "$PROCESS_RSS_KB" && "$PROCESS_RSS_KB" -gt "$limit" ]]; then
+      : >"$marker"
+      echo "seed: memory guard stopped pid $pid at ${PROCESS_RSS_KB} KB (limit ${limit} KB; peak ${peak} KB)" >&2
+      terminate_guarded_pid "$pid"
+      return
+    fi
+    if (( elisa_rss_have_proc && BASH_VERSINFO[0] >= 4 )); then
+      process_sleep "$interval"
+    else
+      sleep "$interval" &
+      sleeper=$!
+      wait "$sleeper" || return
+      sleeper=""
+    fi
+  done
+}
+
+stop_seed_memory_watch() {
+  if [[ -n "${ELISA_SEED_RSS_PID:-}" ]]; then
+    kill "$ELISA_SEED_RSS_PID" 2>/dev/null || true
+    wait "$ELISA_SEED_RSS_PID" 2>/dev/null || true
+    ELISA_SEED_RSS_PID=""
+  fi
+}
+
 seed_build() {
   local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source seed_runtime_obj seed_bootstrap_kind seed_runtime_sha256_expected seed_runtime_sha256_actual seed_retained_server
   local seed_hook_mode
@@ -114,6 +152,7 @@ seed_build() {
     return "$status"
   }
   cleanup_seed_lock() {
+    stop_seed_memory_watch
     finish_seed_freshness_check || true
     if [[ -n "${ELISA_SEED_BRIDGE_PID:-}" ]]; then
       kill "$ELISA_SEED_BRIDGE_PID" 2>/dev/null || true
@@ -293,41 +332,17 @@ seed_build() {
     "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
   echo "seed: bootstrap compiler SHA-256 $(elisa_sha256 "$BOOTSTRAP_BIN" | awk '{print $1}')" >&2
-  seed_peak_rss_kb=0
-  while kill -0 "$seed_pid" 2>/dev/null; do
-    # `kill -0` also succeeds for a zombie on macOS. A completed bootstrap child
-    # can therefore leave this loop spinning forever instead of reaching the
-    # explicit `wait` below. Treat an absent or zombie process as terminal;
-    # `wait` still collects the authoritative exit status.
-    # The child may exit between kill(0) and the observation. With `set -euo pipefail`, a
-    # failing ps(1) used to abort the seed shell before `wait` could collect the child's
-    # successful status, making a completed seed look failed; process_observe (fork-free
-    # on Linux, see scripts/process_rss.sh) reports a vanished child as empty instead.
-    process_observe "$seed_pid"
-    seed_process_stat="$PROCESS_STATE"
-    if [[ -z "$seed_process_stat" || "$seed_process_stat" == Z* ]]; then
-      break
-    fi
-    seed_rss_kb="$PROCESS_RSS_KB"
-    if [[ -n "$seed_rss_kb" && "$seed_rss_kb" -gt "$seed_peak_rss_kb" ]]; then
-      seed_peak_rss_kb="$seed_rss_kb"
-    fi
-    if [[ -n "$seed_rss_kb" && "$seed_rss_kb" -gt "$seed_max_rss_kb" ]]; then
-      echo "seed: memory guard stopped pid $seed_pid at ${seed_rss_kb} KB (limit ${seed_max_rss_kb} KB; peak ${seed_peak_rss_kb} KB)" >&2
-      terminate_guarded_pid "$seed_pid"
-      exit 125
-    fi
-    process_sleep "$seed_rss_poll_seconds"
-  done
-  # Collect the child status explicitly instead of letting `set -e` terminate the
-  # wrapper before it can explain why the seed failed. A host kill (for example,
-  # SIGKILL from memory pressure or an external process supervisor) otherwise
-  # leaves only a silent status-1 wrapper failure and no actionable evidence in
-  # the seed log.
-  set +e
-  wait "$seed_pid"
-  seed_status=$?
-  set -e
+  local seed_rss_limit_marker="$ELISA_SEED_STAGE_DIR/rss-limit"
+  watch_seed_memory "$seed_pid" "$seed_max_rss_kb" "$seed_rss_poll_seconds" "$seed_rss_limit_marker" &
+  ELISA_SEED_RSS_PID=$!
+  # Wait for the bootstrap directly. In particular, do not charge the last
+  # RSS polling interval to a child that has already saved its checkpoint.
+  seed_status=0
+  wait "$seed_pid" || seed_status=$?
+  stop_seed_memory_watch
+  if [[ -e "$seed_rss_limit_marker" ]]; then
+    exit 125
+  fi
   if [[ "$seed_status" -ne 0 ]]; then
     if [[ "$seed_status" -gt 128 ]]; then
       echo "seed: $seed_bootstrap_kind bootstrap compiler $BOOTSTRAP_BIN terminated with status $seed_status (signal $((seed_status - 128)))" >&2
