@@ -33,4 +33,22 @@ grep -Eq '^D [1-9][0-9]*$' <<< "$stage1_output" \
 ! grep -q 'cannot propagate' <<< "$stage1_output" \
     || fail "EWR diagnosed an inaccessible wrapper candidate: $stage1_output"
 
+CONTROL="$REPO_ROOT/test/repro/private_import_program_local_shadow.elisa"
+control_core="$("$ELISACORE_BIN" -emit semantic "$CONTROL" 2>&1)" \
+    || fail "Stage0 rejected a lexical function that shadows the import: $control_core"
+control_stage1="$("$RPT" < "$CONTROL")"
+grep -q '^D 0$' <<< "$control_stage1" \
+    || fail "Stage1 let the private import hide a lexical function: $control_stage1"
+
+CONFLICT="$REPO_ROOT/test/repro/private_import_program_conflict_order.elisa"
+set +e
+conflict_core="$("$ELISACORE_BIN" -emit semantic "$CONFLICT" 2>&1)"
+conflict_status=$?
+set -e
+[[ "$conflict_status" -ne 0 && "$conflict_core" == *'conflicting import'* && "$conflict_core" != *'is private to module'* ]] \
+    || fail "Stage0 did not preserve the selected public import: $conflict_core"
+conflict_stage1="$("$RPT" < "$CONFLICT")"
+[[ "$conflict_stage1" == *'conflicting import'* && "$conflict_stage1" != *'is private to module'* ]] \
+    || fail "Stage1 let a losing private import add an access error: $conflict_stage1"
+
 echo "errorset wrapper private-import smoke OK: inaccessible candidates do not produce EWR diagnostics"
