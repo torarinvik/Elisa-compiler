@@ -16,7 +16,6 @@ fi
 FIXTURE="$ROOT/test/parity/region_owner_lookup_smoke.elisa"
 CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 LIBDIR="$ELISA_LLVM_LIBDIR"
-RUNTIME_OBJECTS=()
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-region-owner.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
@@ -27,7 +26,6 @@ if [[ -n "${ELISA_STAGE1_BIN:-}" ]]; then
         echo "region owner lookup smoke FAIL: Stage1 runtime" >&2
         exit 1
     }
-    RUNTIME_OBJECTS=("$RUNTIME_OBJ")
 fi
 
 [[ -x "$CLANG" ]] || { echo "region owner lookup smoke: missing clang: $CLANG" >&2; exit 2; }
@@ -37,14 +35,24 @@ elisa_native_optional_hook_objects "$WORK" "$ROOT"
 # This harness includes the backend implementation directly to inspect the owner's
 # retained-table facts. Use a supplied, provenance-checked Stage1 product when available;
 # standalone invocations fall back to the configured Stage0 compiler.
-"$COMPILER" -emit obj -O0 -o "$WORK/region_owner_lookup.o" "$FIXTURE" >"$WORK/compile.log" 2>&1 || {
+compile_status=75
+for attempt in {1..16}; do
+    compile_status=0
+    "$COMPILER" -emit obj -O0 -o "$WORK/region_owner_lookup.o" "$FIXTURE" >"$WORK/compile.log" 2>&1 || compile_status=$?
+    [[ "$compile_status" -eq 75 ]] || break
+    echo "region owner lookup: resuming Stage0 analysis checkpoint ($attempt/16)" >&2
+done
+if [[ "$compile_status" -ne 0 ]]; then
     cat "$WORK/compile.log" >&2
-    echo "region owner lookup smoke FAIL: compile" >&2
+    echo "region owner lookup smoke FAIL: compile (status $compile_status)" >&2
     exit 1
-}
+fi
+LINK_OBJECTS=("$WORK/region_owner_lookup.o")
+if [[ -n "${ELISA_STAGE1_BIN:-}" ]]; then
+    LINK_OBJECTS+=("$RUNTIME_OBJ")
+fi
 "$CLANG" $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/region_owner_lookup" \
-    "$WORK/region_owner_lookup.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" \
-    "${RUNTIME_OBJECTS[@]}" \
+    "${LINK_OBJECTS[@]}" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" \
     -L"$LIBDIR" $ELISA_LLVM_LIBS $ELISA_LINK_EXE_FLAGS \
     -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
 "$WORK/region_owner_lookup"
