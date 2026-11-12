@@ -44,7 +44,7 @@ else
     echo "PASS extern effect owner treats explicit empty rows as pure"
 fi
 cross_module_extern_effect_collision_out=$(cat "$REPO_ROOT/test/repro/extern_cross_module_effect_leaf_collision.elisa" | "$RPT")
-if grep -Fq 'call to "inspect" requires can[Disk]' <<< "$cross_module_extern_effect_collision_out"; then
+if grep -Fq 'call to "inspect" requires can[Unsafe]' <<< "$cross_module_extern_effect_collision_out"; then
     echo "FAIL extern effect owner: a same-leaf module sibling supplied the wrong capability ref" >&2
     echo "$cross_module_extern_effect_collision_out" | sed 's/^/    /' >&2
     failed=$((failed + 1))
@@ -80,8 +80,8 @@ for source_worker in qualified_source_worker imported_source_worker imported_ret
         failed=$((failed + 1))
     fi
 done
-if grep -Fq 'call to "panic_callback_source" requires can[Abort]' <<< "$cross_module_extern_effect_collision_out"; then
-    echo "FAIL extern effect source identity: a local callback named panic created an Abort.Panic source row" >&2
+if grep -Fq 'call to "callback_source_shadow" requires can[Console]' <<< "$cross_module_extern_effect_collision_out"; then
+    echo "FAIL extern effect source identity: a local callback inherited an imported extern effect row" >&2
     echo "$cross_module_extern_effect_collision_out" | sed 's/^/    /' >&2
     failed=$((failed + 1))
 else
@@ -94,7 +94,7 @@ if grep -Fq 'call to "call_imported_block_tail_shadow" requires can[Console]' <<
 else
     echo "PASS extern effect source identity carries block-tail callback shadowing through both effect walkers"
 fi
-if ! grep -Fq 'call to "multi_source_caller" requires can[Console, Memory]' <<< "$cross_module_extern_effect_collision_out"; then
+if ! grep -Fq 'call to "multi_source_worker" requires can[Console, Memory]' <<< "$cross_module_extern_effect_collision_out"; then
     echo "FAIL extern effect source identity: a wrapper lost one of the selected extern's required refs" >&2
     echo "$cross_module_extern_effect_collision_out" | sed 's/^/    /' >&2
     failed=$((failed + 1))
@@ -102,7 +102,7 @@ else
     echo "PASS extern effect source identity preserves every selected extern ref through wrappers"
 fi
 shared_source_console_warning_count=$(grep -Fc 'call to "shared_source_worker" requires can[Console]' <<< "$cross_module_extern_effect_collision_out" || true)
-if [[ "$shared_source_console_warning_count" -lt 2 ]] || grep -Fq 'call to "shared_source_worker" requires can[Disk]' <<< "$cross_module_extern_effect_collision_out"; then
+if [[ "$shared_source_console_warning_count" -lt 2 ]] || grep -Fq 'call to "shared_source_worker" requires can[Unsafe]' <<< "$cross_module_extern_effect_collision_out"; then
     echo "FAIL extern effect source identity: qualified regular calls did not select only the module's declared effect row in outside-grant and block-coverage checks" >&2
     echo "$cross_module_extern_effect_collision_out" | sed 's/^/    /' >&2
     failed=$((failed + 1))
@@ -110,7 +110,7 @@ else
     echo "PASS extern effect source identity selects the exact module row in outside-grant and block-coverage checks"
 fi
 nested_module_console_warning_count=$(grep -Fc 'call to "nested_module_worker" requires can[Console]' <<< "$cross_module_extern_effect_collision_out" || true)
-if [[ "$nested_module_console_warning_count" -lt 1 ]] || grep -Fq 'call to "nested_module_worker" requires can[Disk]' <<< "$cross_module_extern_effect_collision_out"; then
+if [[ "$nested_module_console_warning_count" -lt 1 ]] || grep -Fq 'call to "nested_module_worker" requires can[Unsafe]' <<< "$cross_module_extern_effect_collision_out"; then
     echo "FAIL extern effect source identity: nested module declarations did not retain their canonical full module path" >&2
     echo "$cross_module_extern_effect_collision_out" | sed 's/^/    /' >&2
     failed=$((failed + 1))
