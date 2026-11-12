@@ -120,14 +120,12 @@ def compile_rc(path, work):
     return -9
 
 def invalid_ir(path, work):
-    """None when the IR is valid or unavailable; the verifier's first line when it is not."""
-    if not os.path.exists(OPT):
-        return None
+    """None when the IR verifies; otherwise explain why it could not be verified."""
+    if not os.path.isfile(OPT) or not os.access(OPT, os.X_OK):
+        return f"LLVM verifier is unavailable: {OPT}"
     ll = os.path.join(work, "out.ll")
-    # Same rule as compile_rc: an expired budget is retried wider, and if it expires again
-    # the IR is simply UNAVAILABLE — not invalid. This call had no guard at all, so under gate
-    # load a slow `-emit llvm` raised TimeoutExpired straight through main() and the whole
-    # check died with a traceback (Mac gate 2026-09-06).
+    # Retry an expired emission with the wider budget used by compile_rc. A missing result
+    # is a verification failure, not evidence that the generated IR is valid.
     budget = int(os.environ.get("ELISA_MALFORMED_TIMEOUT", "120"))
     r = None
     for attempt in (budget, budget * int(os.environ.get("ELISA_TIMEOUT_ESCALATE", "6"))):
@@ -137,13 +135,15 @@ def invalid_ir(path, work):
             break
         except subprocess.TimeoutExpired:
             continue
-    if r is None or r.returncode != 0:
-        return None
+    if r is None:
+        return "LLVM emission timed out after both attempts"
+    if r.returncode != 0:
+        return f"LLVM emission exited {r.returncode} after object compilation succeeded"
     try:
         v = run_bounded([OPT, "-passes=verify", "-disable-output", ll], budget,
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except subprocess.TimeoutExpired:
-        return None
+        return "LLVM verification timed out"
     if v.returncode == 0:
         return None
     lines = v.stderr.decode().splitlines()
@@ -182,7 +182,7 @@ def main():
         elif rc == 0:
             bad = invalid_ir(src, work)
             if bad:
-                failures.append((f"{name} [invalid IR] {bad}", rc))
+                failures.append((f"{name} [IR verification] {bad}", rc))
     seeds = []
     for d in ("test/repro", "test/fixtures/diagnostics"):
         p = os.path.join(ROOT, d)
@@ -205,10 +205,10 @@ def main():
                 if bad:
                     keep = os.path.join(work, f"invalid_{len(failures)}.elisa")
                     open(keep, "wb").write(open(src, "rb").read())
-                    failures.append((f"{os.path.basename(seed)}#{k} [invalid IR] {bad} -> {keep}", rc))
+                    failures.append((f"{os.path.basename(seed)}#{k} [IR verification] {bad} -> {keep}", rc))
     for name, rc in failures:
-        print(f"  CRASH rc={rc}  {name}")
-    print(f"malformed input: {checked} programs, {len(failures)} abnormal exits or invalid IR")
+        print(f"  FAIL rc={rc}  {name}")
+    print(f"malformed input: {checked} programs, {len(failures)} abnormal exits or IR verification failures")
     return 1 if failures else 0
 
 if __name__ == "__main__":

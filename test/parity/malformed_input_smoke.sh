@@ -9,7 +9,7 @@ out="$(REPO_ROOT="$ROOT" python3 "$ROOT/test/breadth/malformed_input_fuzz.py" 2>
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "$out" >&2
-    echo "malformed_input FAILED: stage1 crashed on input it should have diagnosed" >&2
+    echo "malformed_input FAILED: a compiler run or IR verification failed" >&2
     exit 1
 fi
 echo "malformed_input OK: $(echo "$out" | tail -1)"
