@@ -37,6 +37,7 @@
 #include <llvm/Transforms/Utils/Local.h>
 
 using namespace llvm;
+unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_validation_loop_passes.h"

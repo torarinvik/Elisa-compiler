@@ -1,8 +1,14 @@
 // Evaluate bounded, deterministic integer paths reached from the entry branch.
 // This runs after LLVM has inlined callees and exposed the scalar recurrence.
+#include <llvm/Config/llvm-config.h>
+#if LLVM_VERSION_MAJOR == 23
+#include "llvm_loop_pass_policy.h"
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Transforms/Utils/Local.h>
 using namespace llvm;
@@ -283,7 +289,7 @@ static bool foldZeroProductBypass(BasicBlock &Guard) {
 }
 } // namespace
 
-static unsigned elisacoreFoldConstantIntegerPaths(Module &M) {
+unsigned elisacoreFoldConstantIntegerPaths(Module &M) {
   if (!M.getTargetTriple().isAArch64()) return 0;
   unsigned Changed = 0, Budget = 48000;
   for (Function &F : M) {
@@ -320,3 +326,4 @@ static unsigned elisacoreFoldConstantIntegerPaths(Module &M) {
   }
   return Changed;
 }
+#endif
