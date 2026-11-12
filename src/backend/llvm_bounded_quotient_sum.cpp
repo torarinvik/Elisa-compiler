@@ -1,5 +1,17 @@
 // Version a bounded unsigned quotient sum into independent constant divisions.
 namespace {
+static Value *buildQuotientSum(IRBuilder<> &B, Value *Input, ArrayRef<uint32_t> Powers) {
+  Value *N = B.CreateTrunc(Input, B.getInt32Ty());
+  SmallVector<Value *, 12> Terms;
+  for (uint32_t Power : Powers)
+    Terms.push_back(B.CreateUDiv(N, B.getInt32(Power)));
+  // Pair independent terms so the sum does not introduce a serial chain.
+  for (unsigned Stride = 1; Stride < Terms.size(); Stride *= 2)
+    for (unsigned I = 0; I + Stride < Terms.size(); I += 2 * Stride)
+      Terms[I] = B.CreateAdd(Terms[I], Terms[I + Stride]);
+  return B.CreateZExt(Terms.front(), B.getInt64Ty());
+}
+
 static bool versionBoundedQuotientSum(BasicBlock &Body) {
   if (Body.size() != 6 || Body.hasAddressTaken()) return false;
   auto *Latch = dyn_cast<CondBrInst>(Body.getTerminator());
@@ -75,22 +87,24 @@ static bool versionBoundedQuotientSum(BasicBlock &Body) {
 
   LLVMContext &C = Body.getContext();
   Function *F = Body.getParent();
-  auto *Dispatch = BasicBlock::Create(C, "quotient.sum.dispatch", F, Pre);
-  auto *Fast = BasicBlock::Create(C, "quotient.sum.parallel", F, Pre);
-  BoundBranch->setSuccessor(1, Dispatch);
+  auto *Dispatch = BasicBlock::Create(C, "quotient.sum.dispatch", F, &Body);
+  auto *Fast = BasicBlock::Create(C, "quotient.sum.parallel", F, &Body);
+  auto *Small = BasicBlock::Create(C, "quotient.sum.small", F, &Body);
+  // Every quotient is zero below the radix. Return before choosing a tier.
+  IRBuilder<> Early(Enter);
+  Enter->setCondition(Early.CreateICmpULT(Input, Base));
+  Enter->setSuccessor(1, Dispatch);
   IRBuilder<> Check(Dispatch);
-  Check.CreateCondBr(Check.CreateICmpUGE(Input, Check.getInt64(Powers[5])), Fast, Pre);
+  Check.CreateCondBr(Check.CreateICmpUGE(Input, Check.getInt64(Powers[5])), Fast, Small);
   IRBuilder<> B(Fast);
-  Value *N = B.CreateTrunc(Input, B.getInt32Ty());
-  SmallVector<Value *, 12> Terms;
-  for (uint32_t Power : Powers)
-    Terms.push_back(B.CreateUDiv(N, B.getInt32(Power)));
-  // Pair independent terms so the sum does not introduce a serial chain.
-  for (unsigned Stride = 1; Stride < Terms.size(); Stride *= 2)
-    for (unsigned I = 0; I + Stride < Terms.size(); I += 2 * Stride)
-      Terms[I] = B.CreateAdd(Terms[I], Terms[I + Stride]);
-  Result->addIncoming(B.CreateZExt(Terms.front(), B.getInt64Ty()), Fast);
+  Result->addIncoming(buildQuotientSum(B, Input, Powers), Fast);
   B.CreateBr(Exit);
+
+  // The smaller arm cannot reach the sixth power.
+  IRBuilder<> SmallBuilder(Small);
+  Result->addIncoming(buildQuotientSum(SmallBuilder, Input, ArrayRef(Powers).take_front(5)), Small);
+  SmallBuilder.CreateBr(Exit);
+  DeleteDeadBlock(&Body);
   return true;
 }
 } // namespace
