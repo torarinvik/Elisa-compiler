@@ -29,8 +29,10 @@ for level in 0 2; do
             exit 1
         fi
         if [[ "$level" -eq 0 ]]; then
-            expected_return="$(sed -n '/^define .* @produce_expected(/,/^}/p' "$llvm" | rg -m1 '^  ret %[^ ]+ \{ i32 1, i64 37, i64 undef \}$' || true)"
-            other_return="$(sed -n '/^define .* @produce_other(/,/^}/p' "$llvm" | rg -m1 '^  ret %[^ ]+ \{ i32 2, i64 undef, i64 53 \}$' || true)"
+            # LLVM may print an equivalent literal aggregate instead of a named type.
+            # Keep checking the exact tags and payload positions for either spelling.
+            expected_return="$(sed -n '/^define .* @produce_expected(/,/^}/p' "$llvm" | rg -m1 '^  ret (%[^ ]+|\{ i32, i64, i64 \}) \{ i32 1, i64 37, i64 undef \}$' || true)"
+            other_return="$(sed -n '/^define .* @produce_other(/,/^}/p' "$llvm" | rg -m1 '^  ret (%[^ ]+|\{ i32, i64, i64 \}) \{ i32 2, i64 undef, i64 53 \}$' || true)"
             [[ -n "$expected_return" && -n "$other_return" ]] || {
                 echo "bare variant union order smoke: Stage$stage emitted noncanonical family order or tags at -O0" >&2
                 printf 'expected variant: %s\nother variant:    %s\n' "$expected_return" "$other_return" >&2
