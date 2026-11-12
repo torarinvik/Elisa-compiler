@@ -29,7 +29,7 @@ stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
     | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
     | LC_ALL=C sort)"
-expected_stage0_rows="$(cat <<'EOF'
+expected_stage0_rows="$(LC_ALL=C sort <<'EOF'
 L38
 L41
 L47
@@ -44,7 +44,7 @@ L118
 L135
 EOF
 )"
-expected_stage1_rows="$(cat <<'EOF'
+expected_stage1_rows="$(LC_ALL=C sort <<'EOF'
 L38
 L41
 L47
@@ -64,6 +64,7 @@ EOF
 [[ "$stage0_rows" == "$expected_stage0_rows" ]] || fail "Stage0 wrapper-return baseline changed: $stage0_rows"
 grep -q '^D 13$' <<< "$stage1_output" || fail "Stage1 reported an unexpected diagnostic count: $stage1_output"
 [[ "$stage1_rows" == "$expected_stage1_rows" ]] || fail "Stage1 wrapper-return coverage differs: $stage1_rows"
+[[ "$stage0_rows" == "$stage1_rows" ]] || fail "Stage0 and Stage1 disagree on wrapper-return diagnostics: Stage0 $stage0_rows; Stage1 $stage1_rows"
 
 # `error[Fault{}]` is malformed and already has a dedicated Stage1 diagnostic. EWR
 # must decline a second, misleading propagation mismatch for that callback.
