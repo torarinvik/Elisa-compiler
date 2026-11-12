@@ -59,7 +59,9 @@ def sample_rebuild(child, profile):
             if not workers:
                 return
             _, target = min(workers)
-        subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-file", profile],
+        # Go can finish one package and start the next while sampling. Resolve
+        # symbols up front so an exiting worker still leaves a usable call graph.
+        subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-mayDie", "-file", profile],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4, check=False)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
