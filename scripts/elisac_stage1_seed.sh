@@ -9,17 +9,8 @@ seed_build() {
   local libdir seed_lock seed_lock_pid global_seed_lock global_seed_lock_pid seed_max_rss_kb seed_rss_poll_seconds seed_opt_level seed_output seed_object seed_object_output seed_profile_hook_source seed_runtime_obj seed_bootstrap_kind seed_runtime_sha256_expected seed_runtime_sha256_actual seed_retained_server
   local seed_hook_mode
   local -a seed_link_flags seed_link_objects
-  # A newly-created Git worktree has no ignored build directory yet. Create the
-  # local output roots before taking the per-worktree lock; otherwise `mkdir`
-  # cannot create the nested lock path and every first seed fails as if a stale
-  # lock were present.
-  mkdir -p "$ROOT/bin" "$ROOT/build"
-  # The EXIT trap runs after this function's locals have gone out of scope under
-  # `set -u`; retain the private lock path in a function-external variable so a
-  # successful high-memory seed always releases its lock without an unbound-var exit.
-  # Create the lock's parent before taking the lock. A fresh checkout has no build/
-  # directory yet; treating a failed mkdir as a stale lock there makes the very first
-  # seed fail before it can create its own build outputs.
+  # The EXIT trap runs outside this function's local scope. Keep the lock
+  # path available to it and create its parent in a fresh checkout.
   mkdir -p "$ROOT/bin" "$ROOT/build"
   ELISA_SEED_LOCK_DIR="$ROOT/build/.elisac-stage1-seed.lock"
   seed_lock="$ELISA_SEED_LOCK_DIR"
@@ -28,7 +19,7 @@ seed_build() {
     if [[ -f "$seed_lock/pid" ]]; then
       seed_lock_pid="$(<"$seed_lock/pid")"
     fi
-    if [[ -z "$seed_lock_pid" ]]; then
+    if [[ ! "$seed_lock_pid" =~ ^[1-9][0-9]*$ ]]; then
       echo "seed: lock owner is not yet recorded; refusing to reclaim $seed_lock" >&2
       exit 2
     fi
@@ -36,8 +27,8 @@ seed_build() {
       echo "seed: another stage1 seed is already running (pid $seed_lock_pid); refusing a concurrent high-memory build" >&2
       exit 2
     fi
-    # A killed shell may leave only its lock directory behind. Reclaim it only when
-    # the recorded owner is no longer alive; the target is this private lock directory.
+    # Reclaim only the dead owner's private staging directory.
+    rm -rf -- "$seed_lock/staging.$seed_lock_pid"
     rm -f "$seed_lock/pid"
     rmdir "$seed_lock" 2>/dev/null || {
       echo "seed: could not acquire stale lock $seed_lock" >&2
@@ -102,16 +93,16 @@ seed_build() {
   # a concurrent stage1 invocation must never observe a truncated object while the guarded
   # seed is still running. Keeping the temporary name private also makes an RSS-guarded
   # termination recoverable without leaving a misleading apparently-valid artifact.
-  seed_object="$ROOT/build/elisac_stage1.o.tmp.$$"
+  ELISA_SEED_STAGE_DIR="$seed_lock/staging.$$"
+  seed_object="$ELISA_SEED_STAGE_DIR/elisac_stage1.o"
   seed_object_output="${ELISA_STAGE1_OBJECT:-$ROOT/build/elisac_stage1.o}"
   seed_profile_hook_source=""
   ELISA_SEED_OUTPUT=""
   ELISA_SEED_OUTPUT_DIR=""
   ELISA_SEED_RUNTIME_DIR=""
   ELISA_SEED_RECEIPT_PID=""
-  ELISA_SEED_OBJECT="$seed_object"
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
-  ELISA_SEED_LLVM_BRIDGE="$ROOT/build/elisac_stage1_llvm_bridge.tmp.$$.o"
+  ELISA_SEED_LLVM_BRIDGE="$ELISA_SEED_STAGE_DIR/llvm_bridge.o"
   finish_seed_freshness_check() {
     local status=0
     if [[ -n "${ELISA_SEED_STAGE0_FRESH_PID:-}" ]]; then
@@ -141,8 +132,7 @@ seed_build() {
     fi
     local file
     local -a files=("$ELISA_SEED_LOCK_DIR/pid") directories=("$ELISA_SEED_LOCK_DIR")
-    for file in "${ELISA_SEED_OUTPUT:-}" "${ELISA_SEED_OBJECT:-}" "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}" \
-        "${ELISA_SEED_LLVM_BRIDGE:-}" "${ELISA_SEED_INPUTS_FILE:-}" "${ELISA_SEED_FRESH_OUT:-}" "${ELISA_SEED_FRESH_ERR:-}"; do
+    for file in "${ELISA_SEED_OUTPUT:-}" "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}"; do
       if [[ -n "$file" ]]; then files+=("$file"); fi
     done
     if [[ -n "$ELISA_SEED_RUNTIME_DIR" ]]; then
@@ -157,21 +147,19 @@ seed_build() {
       files+=("$ELISA_SEED_GLOBAL_LOCK_DIR/pid")
       directories+=("$ELISA_SEED_GLOBAL_LOCK_DIR")
     fi
+    rm -rf -- "$ELISA_SEED_STAGE_DIR"
     rm -f -- "${files[@]}"
     rmdir -- "${directories[@]}" 2>/dev/null || true
   }
   trap cleanup_seed_lock EXIT INT TERM HUP
-  ELISA_SEED_OUTPUT_DIR="$(mktemp -d "${BIN}.tmp.XXXXXXXX")"
-  ELISA_SEED_FRESH_OUT="$ELISA_SEED_OUTPUT_DIR/fresh.stdout"
-  ELISA_SEED_FRESH_ERR="$ELISA_SEED_OUTPUT_DIR/fresh.stderr"
+  mkdir "$ELISA_SEED_STAGE_DIR"
+  ELISA_SEED_INPUTS_FILE="$ELISA_SEED_STAGE_DIR/inputs.json"
+  elisa_stage1_provenance inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
+  ELISA_SEED_INPUTS_PID=$!
+  ELISA_SEED_FRESH_OUT="$ELISA_SEED_STAGE_DIR/fresh.stdout"
+  ELISA_SEED_FRESH_ERR="$ELISA_SEED_STAGE_DIR/fresh.stderr"
   bash "$ROOT/scripts/assert_stage0_fresh.sh" "$BOOTSTRAP_BIN" >"$ELISA_SEED_FRESH_OUT" 2>"$ELISA_SEED_FRESH_ERR" &
   ELISA_SEED_STAGE0_FRESH_PID=$!
-  seed_output="$ELISA_SEED_OUTPUT_DIR/$(basename "$BIN")"
-  ELISA_SEED_OUTPUT="$seed_output"
-  # ELF symbol tables retain the C source basename. A PID in that name makes
-  # an otherwise identical executable miss the runtime's compiler digest.
-  seed_profile_hook_source="$ELISA_SEED_OUTPUT_DIR/elisac_stage1_profile_hooks.c"
-  ELISA_SEED_PROFILE_HOOK_SOURCE="$seed_profile_hook_source"
   if [[ ! -x "$BOOTSTRAP_BIN" ]]; then
     echo "seed requires an executable bootstrap compiler at ELISACORE_BIN=$BOOTSTRAP_BIN" >&2
     exit 2
@@ -369,6 +357,13 @@ seed_build() {
     elisa_stage1_provenance check-inputs "$ROOT" "$ELISA_STAGE1_SEED_INPUTS" ${ELISA_STAGE1_SEED_WRITES:+"$ELISA_STAGE1_SEED_WRITES"} &
     seed_inputs_check_pid=$!
   fi
+  ELISA_SEED_OUTPUT_DIR="$(mktemp -d "${BIN}.tmp.XXXXXXXX")"
+  seed_output="$ELISA_SEED_OUTPUT_DIR/$(basename "$BIN")"
+  ELISA_SEED_OUTPUT="$seed_output"
+  # ELF symbol tables retain the C source basename. A PID in that name makes
+  # an otherwise identical executable miss the runtime's compiler digest.
+  seed_profile_hook_source="$ELISA_SEED_OUTPUT_DIR/elisac_stage1_profile_hooks.c"
+  ELISA_SEED_PROFILE_HOOK_SOURCE="$seed_profile_hook_source"
   # -stack_size: a deeply left-nested expression (adversarial input, see
   # malformed_input_fuzz.py / the depth guard in codegen_scope.elisa's expression_type)
   # recurses once per AST level through emit_expression. 0x20000000 (512MB) is the max

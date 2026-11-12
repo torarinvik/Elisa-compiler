@@ -209,6 +209,11 @@ seed() {
   ELISA_CLANG="$WORK/clang" \
     bash "$WORK/scripts/elisac_stage1.sh" --seed >"$WORK/seed.log" 2>&1
 }
+# A killed bootstrap may leave its inputs and object under the dead lock.
+stale_lock="$WORK/build/.elisac-stage1-seed.lock"
+mkdir -p "$stale_lock/staging.2147483647"
+printf '%s\n' 2147483647 > "$stale_lock/pid"
+printf '%s\n' incomplete > "$stale_lock/staging.2147483647/elisac_stage1.o"
 if ! seed; then
   cat "$WORK/seed.log" >&2
   exit 1

@@ -206,17 +206,13 @@ if [[ "${1:-}" == "--seed" ]]; then
   # The freshness proof hashes Stage0's sources and binary (~0.4 s). It runs beside
   # the build; seed_build joins it before linking, so a stale Stage0 still never
   # publishes a product.
-  # seed_build starts this check after creating its private output directory,
+  # seed_build captures the check in its private staging directory,
   # so its messages can be replayed without interleaving compiler diagnostics.
   # A stat-only write snapshot anchors the input fingerprint before the build reads
   # anything; the full (content and toolchain) fingerprint is computed beside the
   # build. seed_build joins it and requires both it and the tree after the build to
   # match the anchor, so a write at any point of the build still refuses publication.
   ELISA_STAGE1_SEED_WRITES="$(elisa_stage1_provenance write-fingerprint "$ROOT")"
-  mkdir -p "$ROOT/build"
-  ELISA_SEED_INPUTS_FILE="$ROOT/build/.seed-inputs.$$"
-  elisa_stage1_provenance inputs "$ROOT" > "$ELISA_SEED_INPUTS_FILE" &
-  ELISA_SEED_INPUTS_PID=$!
   seed_build
   exit 0
 fi
