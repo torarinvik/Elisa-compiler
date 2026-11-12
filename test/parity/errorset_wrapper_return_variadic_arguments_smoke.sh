@@ -42,7 +42,11 @@ expected_rows=$'L24'
   || fail "Stage1 dropped the positional variadic family or propagated an invalid shape: $stage1_output"
 [[ $(grep -cF 'cannot propagate' <<< "$stage1_output") == 1 ]] \
   || fail "Stage1 emitted a family diagnostic for an invalid variadic shape: $stage1_output"
-grep -q '^D 1$' <<< "$stage1_output" \
-  || fail "Stage1 did not report exactly one selected-family mismatch: $stage1_output"
+grep -qF 'named arguments and explicit bundle applications are not supported for variadic function "collect"' <<< "$stage1_output" \
+  || fail "Stage1 did not reject named arguments to the selected variadic function: $stage1_output"
+grep -qF 'call argument forwarding `..` is not supported for variadic function "collect"' <<< "$stage1_output" \
+  || fail "Stage1 did not reject forwarding to the selected variadic function: $stage1_output"
+grep -q '^D 3$' <<< "$stage1_output" \
+  || fail "Stage1 did not report exactly the family mismatch and both invalid argument shapes: $stage1_output"
 
 echo "errorset wrapper variadic-arguments smoke OK"

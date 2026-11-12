@@ -29,7 +29,7 @@ stage1_rows="$(printf '%s\n' "$stage1_output" \
 expected_rows=$'L20\nL45'
 if [[ "$stage0_rows" != "$expected_rows" ]] \
     || ! grep -q 'argument 2 to "PairProvider.choose_pair" expects i64, got bool' <<< "$stage0_output" \
-    || ! grep -q '^D 2$' <<< "$stage1_output" \
+    || ! grep -q '^D 3$' <<< "$stage1_output" \
     || ! grep -q 'L45 argument 2 to "PairProvider.choose_pair" expects i64, got bool' <<< "$stage1_output" \
     || [[ "$stage1_rows" != "$expected_rows" ]]; then
     printf 'EWR overloaded-expression smoke expected L20 and L45 family mismatches plus the L45 argument error:\nStage0 rows: %s\nStage0 output:\n%s\nStage1 output:\n%s\n' \
