@@ -1,3 +1,6 @@
+echo "-- joined_view_lifetime --"
+require_diagnostic_count joined_view_lifetime "$FIXTURES/submit_local_mutable_ref.pos.elisa" 'argument to "pool_submit1" is not structurally shareable across threads: non-static reference' 2
+
 echo "-- affine_move_sites --"
 run_case affine_move_nested_call pos "$FIXTURES/affine_move_nested_call.pos.elisa" 'linear value "t" must be moved explicitly before argument to call "sink"'
 run_case affine_move_struct_field pos "$FIXTURES/affine_move_struct_field.pos.elisa" 'linear value "t" must be moved explicitly before move into struct literal field "a"'
