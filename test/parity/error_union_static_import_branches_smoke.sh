@@ -9,8 +9,9 @@ fixture="$REPO_ROOT/test/repro/error_union_static_import_branches.elisa"
 report="$(ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT" < "$fixture")"
 unhandled_count="$(grep -c 'error union result must be handled' <<< "$report" || true)"
 overload_line="$(awk '/^        choose\(1\)/ {print NR}' "$fixture")"
-if [[ "$unhandled_count" != 1 ]] || ! grep -qF "L$overload_line error union result must be handled" <<< "$report"; then
-  printf 'error-union static-branch smoke failed; expected only the active fallible overload to require handling, with unresolved module aliases blocking same-name raw-module fallback:\n%s\n' "$report" >&2
+raw_module_line="$(awk '/^    RootCollision::load\(\)/ {print NR}' "$fixture")"
+if [[ "$unhandled_count" != 2 ]] || ! grep -qF "L$overload_line error union result must be handled" <<< "$report" || ! grep -qF "L$raw_module_line error union result must be handled" <<< "$report"; then
+  printf 'error-union static-branch smoke failed; expected the active overload and the root module call to require handling:\n%s\n' "$report" >&2
   exit 1
 fi
 

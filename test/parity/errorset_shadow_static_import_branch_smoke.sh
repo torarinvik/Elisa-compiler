@@ -17,4 +17,6 @@ if grep -q 'shadows the declared error set' <<< "$unknown_report"; then
   exit 1
 fi
 
+wasm_report="$(sed 's/UNRESOLVED_TARGET_FLAG/ELISA_TARGET_OS_WASI/' "$REPO_ROOT/test/repro/errorset_shadow_unknown_static_import.elisa" | ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT")"
+grep -q 'shadows the declared error set' <<< "$wasm_report" || { printf 'Wasm import did not establish a shadow:\n%s\n' "$wasm_report" >&2; exit 1; }
 printf 'ErrorSet static-import shadow smoke OK\n'

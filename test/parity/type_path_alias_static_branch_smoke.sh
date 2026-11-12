@@ -15,19 +15,21 @@ check_report() {
         count="$(grep -Fc "\"$name\" is a namespace; write $name::" <<< "$report" || true)"
         [[ "$count" -eq 1 ]] || fail "$label expected one namespace diagnostic for $name, got $count: $report"
     done
-    for name in InactiveAlias PossibleAlias NestedGlobalAlias LateNestedAlias 'ScopedAlias::Nested' RawFallbackAlias RawAliasOnlyTarget 'BranchBeforeChild::Nested' 'SharedBranchAlias::Nested' 'BranchAfterChild::Nested'; do
+    for name in InactiveAlias NestedGlobalAlias LateNestedAlias 'ScopedAlias::Nested' RawFallbackAlias RawAliasOnlyTarget 'BranchBeforeChild::Nested' 'SharedBranchAlias::Nested' 'BranchAfterChild::Nested'; do
         if grep -Fq "\"$name\" is a namespace; write $name::" <<< "$report"; then
             fail "$label treated $name as a visible namespace: $report"
         fi
     done
     chained_count="$(grep -Fc '"ChainedAlias" is a namespace; write ChainedAlias::' <<< "$report" || true)"
-    [[ "$chained_count" -eq "$3" ]] || fail "$label has unexpected chained alias diagnostic: $report"
+    [[ "$chained_count" -eq 1 ]] || fail "$label has unexpected chained alias diagnostic: $report"
+    possible_count="$(grep -Fc '"PossibleAlias" is a namespace; write PossibleAlias::' <<< "$report" || true)"
+    [[ "$possible_count" -eq "$3" ]] || fail "$label has unexpected target alias diagnostic: $report"
     count="$(grep -Fc 'is a namespace; write ' <<< "$report" || true)"
-    [[ "$count" -eq $((6 + $3)) ]] || fail "$label produced unexpected namespace diagnostics ($count): $report"
+    [[ "$count" -eq $((7 + $3)) ]] || fail "$label produced unexpected namespace diagnostics ($count): $report"
 }
 
-check_report native "$("$RPT" < "$FIXTURE")" 1
-check_report unknown-target "$(ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT" < "$FIXTURE")" 0
+check_report native "$("$RPT" < "$FIXTURE")" 0
+check_report wasm-target "$(ELISA_STAGE1_TRIPLE=wasm32-unknown-unknown "$RPT" < "$FIXTURE")" 1
 
 shadow_report="$("$RPT" < "$REPO_ROOT/test/repro/type_path_alias_lexical_shadow.elisa")"
 for line in 11 14; do
