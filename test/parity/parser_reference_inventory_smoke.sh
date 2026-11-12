@@ -34,6 +34,13 @@ comm -23 "$WORK/all.txt" "$WORK/recorded.txt" > "$WORK/unrecorded.txt"
 # other parser-package test must hit the recorder. Keep this explicit: a newly added
 # source-parsing test must not silently disappear from the differential denominator.
 printf '%s\n' \
+    TestAutoRegionFieldPlansConcurrentPublication \
+    TestAutoRegionFieldPlansPreserveReachableNodes \
+    TestAutoRegionForwardingKeepsShadowedConstructors \
+    TestAutoRegionMemoPreservesTailContext \
+    TestAutoRegionMixedBlocksAndFreshInvocation \
+    TestAutoRegionNestedExprBlocks \
+    TestBoundedCommaEstimateStillParsesLongCall \
     TestEstimateCommaSeparatedCountStopsAtColon \
     TestFormatCallWithDoExprBlockArg \
     TestMachineCallInAssignmentTargetDrivesCapture \
@@ -46,6 +53,9 @@ printf '%s\n' \
     TestMachinePayloadPredicateWalksAggregate \
     TestMachineTransitionCopiesShadowingArmLocal \
     TestMachineTransitionLeavesArmLocalScopeBeforePayloadStore \
+    TestPeekKindMatchesCurrentAtBoundaries \
+    TestSyntaxTraceTokenReadChannelsAreClosed \
+    TestSyntaxTraceTracksSpeculationEOFAndRecovery \
     TestUnbracketedPermissionRefsDoNotEstimateToEOF \
     > "$WORK/non_parser_tests.txt"
 if ! diff -u "$WORK/non_parser_tests.txt" "$WORK/unrecorded.txt" >/dev/null; then
@@ -56,4 +66,4 @@ fi
 
 recorded_test_count="$(wc -l < "$WORK/recorded.txt" | tr -d ' ')"
 case_count="$(wc -l < "$ORACLE" | tr -d ' ')"
-echo "parser reference inventory OK: $recorded_test_count/$test_count parsing tests recorded as $case_count cases across $source_count Go files (13 non-source-parser tests)" >&2
+echo "parser reference inventory OK: $recorded_test_count/$test_count parsing tests recorded as $case_count cases across $source_count Go files (23 non-source-parser tests)" >&2
