@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable
+from contextlib import closing
 from typing import NoReturn
 
 
@@ -44,6 +47,26 @@ def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: float = 1.
         pass
 
 
+def _wait_for_exit(process: subprocess.Popen[bytes], deadline: float) -> int:
+    # POSIX Popen.wait(timeout=...) polls with up to 50 ms between checks.
+    # On macOS the exit notification can wake the supervisor immediately.
+    if hasattr(select, "kqueue"):
+        try:
+            with closing(select.kqueue()) as queue:
+                event = select.kevent(
+                    process.pid, filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                if not queue.control([event], 1, max(0.0, deadline - time.monotonic())):
+                    raise subprocess.TimeoutExpired(process.args, 0)
+        except OSError:
+            # The child may have exited before registration, or the OS may
+            # deny the event subscription. The ordinary wait handles both.
+            pass
+    return process.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+
 def run(
     command: list[str],
     timeout_seconds: float,
@@ -56,6 +79,7 @@ def run(
     if timeout_seconds <= 0:
         print("run_with_timeout: timeout must be positive", file=sys.stderr)
         return 2
+    deadline = time.monotonic() + timeout_seconds
     try:
         process = subprocess.Popen(command, start_new_session=True)
     except OSError as error:
@@ -67,7 +91,7 @@ def run(
     try:
         if on_start is not None:
             on_start(process)
-        return_code = process.wait(timeout=timeout_seconds)
+        return_code = _wait_for_exit(process, deadline)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
