@@ -3,7 +3,12 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
 . "$ROOT/scripts/platform.sh"
-COMPILER="${ELISA_REMAINDER_PROBE_COMPILER:?select the compiler used to build the source-bound probe}"
+COMPILER="${ELISA_REMAINDER_PROBE_COMPILER:-${ELISACORE_BIN:-}}"
+if [[ -z "$COMPILER" ]]; then
+    REPO_ROOT="$ROOT"
+    source "$ROOT/test/parity/resolve_elisac.sh"
+    COMPILER="$ELISACORE_BIN"
+fi
 TIMEOUT="$(command -v gtimeout || command -v timeout)"
 run() { "$TIMEOUT" -k 0.1s 29.7s "$@"; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/stage1-remainder.XXXXXX")"
@@ -13,7 +18,8 @@ LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 read -r -a LINK_FLAGS <<<"$("$LLVM_CONFIG" --ldflags --system-libs --libs core irreader analysis | tr '\n' ' ')"
 run "$COMPILER" -O0 -emit obj -o "$WORK/probe.o" "$ROOT/test/parity/stage1_remainder_reduction_probe.elisa"
-run "$CLANG" "$WORK/probe.o" "${LINK_FLAGS[@]}" -Wl,-rpath,"$ELISA_LLVM_LIBDIR" -o "$WORK/probe"
+run "$CLANG" "$WORK/probe.o" "${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}" \
+    "${LINK_FLAGS[@]}" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$ELISA_LLVM_LIBDIR" -o "$WORK/probe"
 if [[ "$(uname -s)" == Linux ]]; then
     run "$CLANG" -shared -fPIC "$ROOT/test/parity/stage1_remainder_foreign_flags.c" -o "$WORK/foreign.so"
     run python3 "$ROOT/test/parity/stage1_remainder_reduction_cases.py" "$WORK/probe" --foreign-flag-library "$WORK/foreign.so"
