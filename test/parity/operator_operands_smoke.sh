@@ -66,9 +66,8 @@ grep -q "for loop range step cannot be zero" <<< "$out" || fail "zero range step
 out=$(printf 'def f() -> void:\n    for i in 0..<10..2:\n        pass\n' | "$RPT")
 grep -q "for loop range step cannot be zero" <<< "$out" && fail "false positive on nonzero range step: $out"
 
-# 10. A long left-associated expression is parsed iteratively, but this semantic
-# pass recursively visits its AST. It must fail closed at its explicit safe bound
-# instead of overflowing the native stack or silently skipping the unvisited tail.
+# 10. Long left-associated expressions must be checked without exhausting the
+# native stack. An undefined name at either end must still be visited.
 deep_source="$(mktemp "${TMPDIR:-/tmp}/elisa-operator-depth.XXXXXX")"
 trap 'rm -f "$deep_source"' EXIT
 python3 - "$deep_source" <<'PY'
@@ -83,7 +82,60 @@ Path(sys.argv[1]).write_text(
 )
 PY
 out=$("$RPT" < "$deep_source")
-grep -q "expression nesting exceeds the safe semantic-analysis limit" <<< "$out" || fail "deep expression was not safely refused: $out"
+grep -Fxq 'D 0' <<< "$out" || fail "valid deep expression rejected: $out"
+for placement in first last; do
+  python3 - "$deep_source" "$placement" <<'PY'
+from pathlib import Path
+import sys
+
+terms = ["x"] * 768
+terms[0 if sys.argv[2] == "first" else -1] = "missing"
+Path(sys.argv[1]).write_text("def f(x: i64) -> i64:\n    return " + " + ".join(terms) + "\n")
+PY
+  out=$("$RPT" < "$deep_source")
+  grep -q 'undefined identifier "missing"' <<< "$out" || fail "deep expression skipped its $placement operand: $out"
+  if [[ "$placement" == first ]]; then
+    count=$(grep -c 'operator requires numeric operands' <<< "$out" || true)
+    [[ "$count" -eq 767 ]] || fail "expected 767 propagated operand diagnostics, got $count"
+  fi
+done
+python3 - "$deep_source" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(
+    'global mutable counter: i64 = 0\n'
+    'def f() -> i64:\n    return counter + ' + ' + '.join(['1'] * 768) + '\n'
+)
+PY
+out=$("$RPT" < "$deep_source")
+grep -q 'global mutable' <<< "$out" || fail "deep expression skipped a global read: $out"
+python3 - "$deep_source" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(
+    'def f(value: bool) -> bool:\n    return ' + ' and '.join(['value'] * 768) + '\n'
+)
+PY
+out=$("$RPT" < "$deep_source")
+grep -q 'nesting exceeds the safe semantic-analysis limit' <<< "$out" && fail "valid conjunction exceeded the authority walk limit: $out"
+for placement in first middle last; do
+  python3 - "$deep_source" "$placement" <<'PY'
+from pathlib import Path
+import sys
+
+terms = ['value'] * 768
+terms[{'first': 0, 'middle': 384, 'last': -1}[sys.argv[2]]] = 'flag'
+Path(sys.argv[1]).write_text(
+    'global mutable flag: bool = true\n'
+    'def f(value: bool) -> bool:\n    return ' + ' and '.join(terms) + '\n'
+)
+PY
+  out=$("$RPT" < "$deep_source")
+  grep -q 'global mutable' <<< "$out" || fail "deep conjunction skipped its $placement global read: $out"
+  grep -q 'nesting exceeds the safe semantic-analysis limit' <<< "$out" && fail "deep conjunction exceeded the authority walk limit: $out"
+done
 
 # 11. 0 FP across frontend + stdlib.
 # Counted per line, not per sentence: the reporter analyses one file at a time, so every
