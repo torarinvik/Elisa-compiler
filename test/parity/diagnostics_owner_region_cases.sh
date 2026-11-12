@@ -207,8 +207,8 @@ run_case region_param_container_return neg "$FIXTURES/region_param_container_ret
 run_case region_param_container_return_reference_element pos "$FIXTURES/region_param_container_return_reference_element.pos.elisa" 'value allocated in region "inner" escapes via return'
 run_case region_param_container_return_inferred_new pos "$FIXTURES/region_param_container_return_inferred_new.pos.elisa" "$region_return_msg"
 run_case region_param_container_return_inner_new pos "$FIXTURES/region_param_container_return_inner_new.pos.elisa" "$region_return_msg"
-run_case region_param_container_return_auto_move pos "$FIXTURES/region_param_container_return_auto_move.pos.elisa" "$region_return_msg"
-run_case region_param_container_return_inner_move pos "$FIXTURES/region_param_container_return_inner_move.pos.elisa" "$region_return_msg"
+run_case region_param_container_return_auto_move pos "$FIXTURES/region_param_container_return_auto_move.pos.elisa" 'value in region "<inferred>" is stored into longer-lived region "r"'
+run_case region_param_container_return_inner_move pos "$FIXTURES/region_param_container_return_inner_move.pos.elisa" 'value in region "inner" is stored into longer-lived region "r"'
 # The return-escape exception must not bless a local merely because its annotation says @r.
 # These are independent semantic-pass diagnostics from the initializer/assignment provenance.
 require_region_control() {
