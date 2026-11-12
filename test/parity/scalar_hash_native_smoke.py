@@ -28,7 +28,7 @@ def reference(value):
     return value ^ (value >> 31)
 
 
-production = (ROOT / "elisacore_std/collections.elisa").read_text()
+production = (ROOT / "elisacore_std/collections_hashing.elisa").read_text()
 start = production.index("const CTX_HASH_U64_INV_MUL_1")
 end = production.index("# Open-addressing probe", start)
 source = production[start:end] + "\ndef main() -> i64:\n"
