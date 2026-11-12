@@ -41,13 +41,13 @@ def main() -> i32:
 CASE
 
 for level in 0 2; do
-    bash "$ROOT/scripts/elisac_stage1.sh" -O"$level" -emit exe -o "$WORK/valid-$level" "$WORK/valid.elisa" >"$WORK/valid-$level.log" 2>&1 || {
+    ELISACORE_FORCE_CONTRACTS=1 bash "$ROOT/scripts/elisac_stage1.sh" -O"$level" -emit exe -o "$WORK/valid-$level" "$WORK/valid.elisa" >"$WORK/valid-$level.log" 2>&1 || {
         cat "$WORK/valid-$level.log" >&2
         echo "void ensure valid build failed at -O$level" >&2
         exit 1
     }
     "$WORK/valid-$level" || { echo "void ensure valid run failed at -O$level" >&2; exit 1; }
-    bash "$ROOT/scripts/elisac_stage1.sh" -O"$level" -emit exe -o "$WORK/violated-$level" "$WORK/violated.elisa" >"$WORK/violated-$level.log" 2>&1 || {
+    ELISACORE_FORCE_CONTRACTS=1 bash "$ROOT/scripts/elisac_stage1.sh" -O"$level" -emit exe -o "$WORK/violated-$level" "$WORK/violated.elisa" >"$WORK/violated-$level.log" 2>&1 || {
         cat "$WORK/violated-$level.log" >&2
         echo "void ensure violation did not compile at -O$level" >&2
         exit 1
@@ -63,4 +63,21 @@ for level in 0 2; do
     }
 done
 
-echo 'void return ensure smoke OK: explicit, value-form, fallthrough, and violation checks at O0/O2'
+# Optimized builds erase runtime contracts by default. Verify that policy separately
+# from the forced-contract checks above, even if the caller exported the override.
+env -u ELISACORE_FORCE_CONTRACTS bash "$ROOT/scripts/elisac_stage1.sh" -O2 -emit exe -o "$WORK/violated-release" "$WORK/violated.elisa" >"$WORK/violated-release.log" 2>&1 || {
+    cat "$WORK/violated-release.log" >&2
+    echo 'void ensure release build failed' >&2
+    exit 1
+}
+"$WORK/violated-release" || { echo 'optimized default unexpectedly enforced the void postcondition' >&2; exit 1; }
+
+# Stage0 treats an empty override like an unset value, not an enabled switch.
+ELISACORE_FORCE_CONTRACTS='' bash "$ROOT/scripts/elisac_stage1.sh" -O2 -emit exe -o "$WORK/violated-empty" "$WORK/violated.elisa" >"$WORK/violated-empty.log" 2>&1 || {
+    cat "$WORK/violated-empty.log" >&2
+    echo 'void ensure empty override build failed' >&2
+    exit 1
+}
+"$WORK/violated-empty" || { echo 'empty override unexpectedly enabled the void postcondition' >&2; exit 1; }
+
+echo 'void return ensure smoke OK: forced checks at O0/O2 and unchecked O2 defaults'
