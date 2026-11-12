@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a compiler rebuild with a strict 3-second process-group deadline."""
 import os
-import shlex
+import re
 import subprocess
 import sys
 import threading
@@ -36,10 +36,8 @@ def sample_rebuild(child, profile):
                 break
             descendants = updated
         def executable(pid):
-            try:
-                return os.path.basename(shlex.split(processes.get(pid, (0, ""))[1])[0])
-            except (ValueError, IndexError):
-                return ""
+            command = processes.get(pid, (0, ""))[1]
+            return os.path.basename(command.split(None, 1)[0]) if command else ""
 
         candidates = [pid for pid in descendants if "elisac" in executable(pid)]
         if candidates:
@@ -69,12 +67,9 @@ def sample_rebuild(child, profile):
         # Report only the Go package name, not the full command line: compiler
         # arguments may contain paths or other user-provided values.
         if executable(target) == "compile":
-            try:
-                words = shlex.split(processes[target][1])
-                if "-p" in words and words.index("-p") + 1 < len(words):
-                    print(f"compiler rebuild sampled Go package: {words[words.index('-p') + 1]}", file=sys.stderr)
-            except (OSError, ValueError, subprocess.SubprocessError):
-                pass  # The worker may finish between discovery and inspection.
+            match = re.search(r"(?:^|\s)-p\s+([A-Za-z0-9_./-]+)(?:\s|$)", processes[target][1])
+            if match:
+                print(f"compiler rebuild sampled Go package: {match.group(1)}", file=sys.stderr)
         # Go can finish one package and start the next while sampling. Resolve
         # symbols up front so an exiting worker still leaves a usable call graph.
         result = subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-mayDie", "-file", profile],
