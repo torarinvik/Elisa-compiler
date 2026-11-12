@@ -49,6 +49,10 @@ if [ "$((same + failed + rejected))" -eq 0 ]; then
     echo "emit_fmt parity FAILED: no fixtures found" >&2
     exit 1
 fi
+if [ "$((same + failed))" -eq 0 ]; then
+    echo "emit_fmt parity FAILED: no fixtures were comparable" >&2
+    exit 1
+fi
 if [ "$failed" -ne 0 ]; then
     echo "emit_fmt parity FAILED: $same matched, $failed failed, $rejected Stage0-rejected"
     exit 1
