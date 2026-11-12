@@ -7,8 +7,8 @@ FIXTURE="$REPO_ROOT/test/repro/errorset_wrapper_return_static_alias_unknown.elis
 
 report="$("$RPT" < "$FIXTURE")"
 diagnostics="$(grep -c 'cannot propagate' <<< "$report" || true)"
-[[ "$diagnostics" == 9 ]] || {
-  printf 'static-alias EWR smoke failed; expected nine definite family mismatches and no unresolved-alias cascade:\n%s\n' "$report" >&2
+[[ "$diagnostics" == 8 ]] || {
+  printf 'static-alias EWR smoke failed; expected eight definite family mismatches and no unresolved-alias cascade:\n%s\n' "$report" >&2
   exit 1
 }
 [[ "$(grep -c 'cannot propagate.*CandidateFault' <<< "$report" || true)" == 6 ]] || {
@@ -19,8 +19,12 @@ grep -q 'cannot propagate.*NestedFault' <<< "$report" || {
   printf 'static-alias EWR smoke failed; an alias spelling after the qualifier head blocked the direct module path:\n%s\n' "$report" >&2
   exit 1
 }
-grep -q 'cannot propagate.*NestedGlobalFault' <<< "$report" || {
-  printf 'static-alias EWR smoke failed; a nested module alias was not visible to the root call:\n%s\n' "$report" >&2
+if grep -q 'cannot propagate.*NestedGlobalFault' <<< "$report"; then
+  printf 'static-alias EWR smoke failed; an out-of-scope alias supplied an error family:\n%s\n' "$report" >&2
+  exit 1
+fi
+grep -q 'undefined identifier "NestedGlobal.wrap"' <<< "$report" || {
+  printf 'static-alias EWR smoke failed; missing out-of-scope alias diagnostic:\n%s\n' "$report" >&2
   exit 1
 }
 grep -q 'cannot propagate.*LexicalPathFault' <<< "$report" || {

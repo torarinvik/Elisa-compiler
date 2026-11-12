@@ -350,8 +350,8 @@ grep -q '^D 0$' <<< "$zero_offset_enclosing_identity_report" || {
 }
 
 nested_global_alias_report=$(cat "$REPO_ROOT/test/repro/try_nested_global_using_alias.elisa" | "$RPT")
-grep -q '^D 0$' <<< "$nested_global_alias_report" || {
-    echo "try_fallible FAILED: root call could not resolve a module alias declared in a nested module: $nested_global_alias_report"
+grep -q 'undefined identifier "Shared.load"' <<< "$nested_global_alias_report" || {
+    echo "try_fallible FAILED: nested module alias leaked into root scope: $nested_global_alias_report"
     exit 1
 }
 
