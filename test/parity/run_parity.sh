@@ -90,8 +90,6 @@ EOF
 (cd "$ELISA_CORE/compiler" && go build -o "$WORK/stage0_full_tokens" "$WORK/stage0_full_tokens.go")
 
 cat > "$WORK/stage1_lexer_harness.elisa" <<EOF
-# The lexer-only harness has no parser to declare the source region.
-global region source
 include "$FIXTURE"
 
 def stage1_lexer_checksums(source: u8&, source_len: usize, kind_out: mutable u64&, full_out: mutable u64&):
