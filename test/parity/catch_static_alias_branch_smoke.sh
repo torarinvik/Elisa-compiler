@@ -5,6 +5,14 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export REPO_ROOT="$ROOT"
 source "$ROOT/test/parity/build_parse_report.sh"
 
+# An error declaration with no indented body is invalid; keep the old empty-family
+# spelling covered separately so it cannot prevent the valid catch cases from running.
+empty_report="$(printf 'error Empty:\ndef main() -> i64:\n    return 0\n' | "$RPT")"
+if grep -q '^P 0$' <<< "$empty_report"; then
+  printf 'Catch parser smoke accepted an empty error-set body:\n%s\n' "$empty_report" >&2
+  exit 1
+fi
+
 report="$("$RPT" < "$ROOT/test/repro/catch_static_alias_branch.elisa")"
 diagnostic_count="$(grep -c 'non-exhaustive catch over Fault; missing Fault.Missing' <<< "$report" || true)"
 if [[ "$diagnostic_count" != 8 ]]; then
@@ -16,7 +24,7 @@ if grep -q 'WrongOnly' <<< "$report"; then
   exit 1
 fi
 if grep -q 'RootOnly' <<< "$report"; then
-  printf 'Catch relative-family smoke fell through a declared empty family to the root Provider::Fault:\n%s\n' "$report" >&2
+  printf 'Catch relative-family smoke fell through a declared local family to the root Provider::Fault:\n%s\n' "$report" >&2
   exit 1
 fi
 if grep -q 'SubsetFault.Excluded' <<< "$report"; then
