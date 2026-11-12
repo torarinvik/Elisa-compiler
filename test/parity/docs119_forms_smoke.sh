@@ -52,6 +52,9 @@ t=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | awk 'NR == 1 { print $2 }')
   [ -n "$c" ] || fail "parse crash/empty output on $f"
+  if [ "$c" -ne 0 ]; then
+    printf '  %s: %s parse error(s)\n' "$f" "$c" >&2
+  fi
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -name '*.elisa' | grep -v _unused)
 [ "$t" -eq 0 ] || fail "$t parse errors across frontend+stdlib (regression)"
