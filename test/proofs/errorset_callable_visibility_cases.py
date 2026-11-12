@@ -447,7 +447,7 @@ def check_callable_visibility_fixtures(
     if not all(fragment in entrypoint for fragment in (
             "lookup_annotations: mutable darray[Ast::EnumAnnotation] = ewr_static_import_annotations(file, table)",
             "callable_error_index_build(lookup_annotations",
-            "ewr_check_declarations(file.top_decls, file.top_decls, file.extern_params, lookup_annotations")) or "ewr_unknown_static_import_affects_call(annotations, all_declarations, name, qualifier, caller_module, table)" not in function_source(EWR, "ewr_callable_family"):
+            "ewr_check_declarations(file, file.top_decls, file.top_decls, file.extern_params, lookup_annotations")) or "ewr_unknown_static_import_affects_call(annotations, all_declarations, name, qualifier, caller_module, table)" not in function_source(EWR, "ewr_callable_family"):
         raise SystemExit("EWR call-family lookup must consume branch-filtered imports and decline when an unresolved branch can supply the queried callable")
 
     ambiguous_using_fixture = (ROOT / "test/repro/errorset_wrapper_return_ambiguous_outer_nested_using.elisa").read_text()

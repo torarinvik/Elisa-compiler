@@ -209,23 +209,22 @@ if "if call_arity_known and receiver_rank_active else (true, true)" not in ordin
 concrete_expression = function_source(EWR, "ewr_concrete_family_of_expression")
 if not all(fragment in concrete_expression for fragment in (
         'Expr.Ident(name, line):',
-        'ewr_callable_concrete_family(name, "", false, 0.usize(), [], []',
+        'ewr_callable_concrete_family(file, name, "", false, 0.usize(), [], []',
         'Expr.Call(callee, arguments, argument_names, call_line):',
         'ewr_call_has_argument_forward(annotations, call_line.line, call_line.offset)',
-        'ewr_callable_concrete_family(callable.name, callable.qualifier, true, arguments.count')):
+        'ewr_callable_concrete_family(file, callable.name, callable.qualifier, true, arguments.count')):
     raise SystemExit("EWR must distinguish function-value name lookup from a direct call before applying arity-ranked privacy barriers")
 
-wildcard_ambiguity = function_source(EWR, "ewr_wildcard_callable_name_is_ambiguous")
+wildcard_ambiguity = function_source(ROOT / "src/semantic/check_callable_wildcard_ambiguity.elisa", "callable_wildcard_ambiguous")
 if not all(fragment in wildcard_ambiguity for fragment in (
-        "ewr_first_visible_callable_binding(declarations, name, \"\", caller_module, annotations, table)",
-        "lexical_binding.scope_length > caller_module.len + 1.usize()",
+        "ewr_module_is_lexical_ancestor(symbol.module_owner, caller_module)",
         'binding.name != "__binding_wildcard_import"',
-        "ewr_callable_declared_in_module(declarations, name, binding.owner",
-        "any target in targets where target == binding.owner",
-        "targets.count >= 2.usize()")) or not all(fragment in ordinary_binding for fragment in (
-        "not receiver_rank_gate and ewr_wildcard_callable_name_is_ambiguous(all_declarations, name, caller_module, annotations, table)",
+        "semantic_import_module_path_matches(symbol.module_owner, binding.owner, binding.module)",
+        "pma_static_if_function_branch_selection(file, name, symbol, table, 0)",
+        "found and symbol.module_owner != selected_owner")) or not all(fragment in ordinary_binding for fragment in (
+        "not receiver_rank_gate and callable_wildcard_ambiguous(file, name, caller_module, table)",
         "return ewr_empty_family_ref()")):
-    raise SystemExit("EWR must fail closed for multiple distinct wildcard targets after lexical lookup")
+    raise SystemExit("EWR must fail closed for multiple distinct active wildcard targets after lexical lookup")
 
 # Core applies receiver specificity to positional calls (including qualified names)
 # when a visible overload set activates the free-call rewrite. Keep EWR conditional
@@ -330,7 +329,6 @@ canonical_module_walkers = {
     "ewr_raw_callable_in_module": "ewr_raw_callable_in_module(module_body, name, target_module, nested_module, table)",
     "ewr_raw_callable_matches_import_path": "ewr_raw_callable_matches_import_path(module_body, name, base_module, suffix, nested_module, table)",
     "ewr_callable_binding_in_scope": "ewr_callable_binding_in_scope(module_body, name, qualifier, nested_module, caller_module, annotations, table, binding)",
-    "ewr_callable_declared_in_module": "ewr_callable_declared_in_module(module_body, name, target_module, nested_module, caller_module, annotations, table)",
     "ewr_inaccessible_callable_binding_in_scope": "ewr_inaccessible_callable_binding_in_scope(module_body, name, qualifier, nested_module, caller_module",
     "ewr_visible_callable_overload_set_in_scope": "ewr_visible_callable_overload_set_in_scope(module_body, name, qualifier, nested_module, caller_module, annotations, table)",
     "ewr_infallible_callable_scope": "ewr_infallible_callable_scope(module_body, name, qualifier, nested_module, caller_module",

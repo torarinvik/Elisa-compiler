@@ -34,4 +34,11 @@ if grep -qF 'cannot propagate' <<< "$stage1_output"; then
     fail "Stage1 let one wildcard target supply an arbitrary ErrorSet to EWR: $stage1_output"
 fi
 
+CONTROL="$REPO_ROOT/test/repro/callable_wildcard_inactive_import.elisa"
+control_core="$("$ELISACORE_BIN" -emit semantic "$CONTROL" 2>&1)" \
+    || fail "Stage0 rejected a call with one active wildcard: $control_core"
+control_stage1="$("$RPT" < "$CONTROL")"
+grep -q '^D 0$' <<< "$control_stage1" \
+    || fail "Stage1 treated an inactive wildcard as an ambiguity: $control_stage1"
+
 echo "errorset wrapper ambiguous-using smoke OK: EWR declines ambiguous callbacks"
