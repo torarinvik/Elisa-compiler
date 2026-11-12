@@ -36,8 +36,8 @@ if "function_has_generic_params(line, function_offset, table)" not in contracts 
         "line.line, line.offset, table" not in declarations:
     raise SystemExit("annotation contract walk must pass the function declaration offset")
 if not all(fragment in smoke for fragment in (
-    '"#line 0 generic_owner.elisa\\n"',
-    '"#line 0 ordinary_owner.elisa\\n"',
+    '#line 0 generic_owner.elisa\\n',
+    '#line 0 ordinary_owner.elisa\\n',
     '@fixture function "ordinary_seed" must not have type or shape parameters',
 )):
     raise SystemExit("annotation smoke must prevent same-line generic owners from misclassifying nongeneric fixtures")

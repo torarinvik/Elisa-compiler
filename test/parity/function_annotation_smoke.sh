@@ -42,6 +42,9 @@ check_absent() {
 }
 
 check_diagnostic $'@smoke\ndef sample_case() -> void:\n    pass\n' 'unknown function annotation @smoke'
+check_diagnostic $'@c_variadic\ndef sample_case() -> void:\n    pass\n' 'unknown function annotation @c_variadic'
+check_diagnostic $'#line 0 explicit_annotation.elisa\n@c_variadic\ndef sample_case() -> void:\n    pass\n' 'unknown function annotation @c_variadic'
+check_clean $'def collect(value: i64, ...) -> i64:\n    return value\n'
 check_diagnostic $'@smoke\nextern borrow_value(holder: i32&) -> i32&\n' 'unknown extern function annotation @smoke on "borrow_value"'
 check_diagnostic $'@borrows_return(missing)\nextern borrow_value(holder: i32&) -> i32&\n' '@borrows_return on extern function "borrow_value" references unknown parameter "missing"'
 check_diagnostic $'@borrows_return(count)\nextern borrow_value(count: i32) -> i32&\n' '@borrows_return on extern function "borrow_value" cannot borrow from parameter "count" of type i32'
