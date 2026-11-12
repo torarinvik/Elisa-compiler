@@ -1,3 +1,16 @@
+# Bare capability aliases and type aliases share syntax; preserve both interpretations.
+bare_capability_alias_out=$(printf 'alias IO = Console\ndef f() -> void can[IO]:\n    pass\n' | "$RPT")
+bare_unknown_type_out=$(printf 'type Nope = Console\n' | "$RPT")
+total=$((total + 1))
+if grep -qx 'P 0' <<< "$bare_capability_alias_out" && grep -qx 'D 0' <<< "$bare_capability_alias_out" && grep -Fq 'unknown type "Console"' <<< "$bare_unknown_type_out"; then
+    echo "PASS bare capability aliases preserve permission and type distinction"
+else
+    echo "FAIL bare capability alias/type distinction" >&2
+    echo "$bare_capability_alias_out" >&2
+    echo "$bare_unknown_type_out" >&2
+    failed=$((failed + 1))
+fi
+
 # Generic operator checks must not borrow a type parameter from another declaration
 # that happens to share a logical line with `#line`.
 generic_operator_owner_out=$(printf 'type T = i64\n#line 0 generic_owner.elisa\ndef phantom[T]() -> void:\n    pass\n#line 0 concrete_owner.elisa\ndef concrete_sum(a: T, b: T) -> T:\n    return a + b\n' | "$RPT")
