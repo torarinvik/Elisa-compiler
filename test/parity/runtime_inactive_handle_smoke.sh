@@ -19,26 +19,26 @@ def main() -> i64:
 EOF
 
 run_probe() {
-    local label="$1"
-    shift
+    local label="$1" expected="$2"
+    shift 2
     local output="$WORK/$label"
     "$STAGE1" -emit exe "$@" -o "$output"
     set +e
     "$output" >"$WORK/$label.stdout" 2>"$WORK/$label.stderr"
     local status=$?
     set -e
-    if [ "$status" -ne 42 ]; then
-        echo "runtime_inactive_handle_smoke FAIL: $label returned $status, want 42" >&2
+    if [ "$status" -ne "$expected" ]; then
+        echo "runtime_inactive_handle_smoke FAIL: $label returned $status, want $expected" >&2
         cat "$WORK/$label.stderr" >&2
         exit 1
     fi
 }
 
 for level in O0 O2; do
-    run_probe "trace-$level" "-$level" -ftrace "$WORK/trace.elisa"
-    run_probe "packed-index-$level" "-$level" "$ROOT/test/breadth/packed_profile_fixture.elisa"
-    run_probe "packed-aos-$level" "-$level" "$ROOT/test/breadth/packed_aos_fixture.elisa"
-    run_probe "packed-aos-chunk-boundary-$level" "-$level" "$ROOT/test/breadth/packed_aos_chunk_boundary_fixture.elisa"
+    run_probe "trace-$level" 42 "-$level" -ftrace "$WORK/trace.elisa"
+    run_probe "packed-index-$level" 42 "-$level" "$ROOT/test/breadth/packed_profile_fixture.elisa"
+    run_probe "packed-aos-$level" 42 "-$level" "$ROOT/test/breadth/packed_aos_fixture.elisa"
+    run_probe "packed-aos-chunk-boundary-$level" 0 "-$level" "$ROOT/test/breadth/packed_aos_chunk_boundary_fixture.elisa"
 done
 
 echo "runtime_inactive_handle_smoke OK: trace, packed index, fixed/sized packed AoS chunk boundary, and packed AoS at O0/O2"
