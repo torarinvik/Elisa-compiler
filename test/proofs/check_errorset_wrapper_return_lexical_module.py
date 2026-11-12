@@ -21,7 +21,7 @@ if not all(fragment in FIXTURE for fragment in (
         "module Client:",
         "const PICK_A: bool = false",
         "using ProviderA as Selected",
-        "return Selected::wrap(Selected::origin())")):
+        "return Selected::wrap(Selected::origin)")):
     raise SystemExit("EWR lexical-module fixture must place a shadowed import beneath the outer condition")
 
 if not all(fragment in SMOKE for fragment in (
