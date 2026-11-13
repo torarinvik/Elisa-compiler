@@ -22,12 +22,19 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
     | sed -E -n 's#^.*:([0-9]+):[0-9]+-[0-9]+: raise cannot propagate tag.*$#L\1#p' \
     | LC_ALL=C sort)"
 output="$("$RPT" < "$FIXTURE")"
-expected_rows='L16'
+stage1_rows="$(printf '%s\n' "$output" | sed -E -n 's/^  (L[0-9]+) raise cannot propagate tag.*/\1/p' | LC_ALL=C sort)"
+expected_rows=$'L16\nL25'
 if [[ "$stage0_rows" != "$expected_rows" ]] \
-    || ! grep -q '^D 1$' <<< "$output" \
-    || ! grep -q '^L16 raise cannot propagate tag' <<< "$output"; then
-    printf 'overloaded Lambda raise smoke expected one mismatch at L16:\nStage0 rows: %s\nStage0 output:\n%s\nStage1 output:\n%s\n' \
-        "$stage0_rows" "$stage0_output" "$output" >&2
+    || [[ "$stage1_rows" != "$expected_rows" ]] \
+    || ! grep -q '^D 2$' <<< "$output"; then
+    printf 'overloaded Lambda raise smoke expected mismatches at L16 and L25:\nStage0 rows: %s\nStage1 rows: %s\nStage0 output:\n%s\nStage1 output:\n%s\n' \
+        "$stage0_rows" "$stage1_rows" "$stage0_output" "$output" >&2
+    exit 1
+fi
+
+shadow_output="$("$RPT" < "$REPO_ROOT/test/repro/lambda_raise_overload_shadow.elisa")"
+if ! grep -q '^P 0$' <<< "$shadow_output" || grep -q 'raise cannot propagate tag' <<< "$shadow_output"; then
+    printf 'overloaded Lambda raise smoke resolved a shadowed module root:\n%s\n' "$shadow_output" >&2
     exit 1
 fi
 
