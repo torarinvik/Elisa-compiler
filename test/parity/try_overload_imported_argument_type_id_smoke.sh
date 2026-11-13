@@ -26,7 +26,7 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
     | LC_ALL=C sort)"
 expected_rows=$'L24'
 [[ "$stage0_rows" == "$expected_rows" ]] || fail "Stage0 did not report the imported bool overload's ErrorSet: $stage0_output"
-grep -q 'cannot propagate BoolFault from a function returning IntegerFault' <<< "$stage0_output" \
+grep -q 'cannot propagate Consumer.BoolFault from a function returning Consumer.IntegerFault' <<< "$stage0_output" \
     || fail "Stage0 selected the wrong ErrorSet family: $stage0_output"
 
 stage1_output="$("$RPT" < "$FIXTURE")"
