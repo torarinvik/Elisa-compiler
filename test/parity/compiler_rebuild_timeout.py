@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Run a compiler rebuild with a strict 3-second process-group deadline."""
 import os
-import re
 import subprocess
 import sys
 import threading
 from functools import lru_cache
 from pathlib import Path
+
+from compiler_rebuild_profile import go_compiler_package
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from run_with_timeout import run
@@ -88,9 +89,9 @@ def sample_rebuild(child, profile):
         # Report only the Go package name, not the full command line: compiler
         # arguments may contain paths or other user-provided values.
         if executable(target) == "compile":
-            match = re.search(r"(?:^|\s)-p\s+([A-Za-z0-9_./-]+)(?:\s|$)", processes[target][1])
-            if match:
-                print(f"compiler rebuild sampled Go package: {match.group(1)}", file=sys.stderr)
+            package = go_compiler_package(processes[target][1])
+            if package:
+                print(f"compiler rebuild sampled Go package: {package}", file=sys.stderr)
         # Go can finish one package and start the next while sampling. Resolve
         # symbols up front so an exiting worker still leaves a usable call graph.
         result = subprocess.run(["/usr/bin/sample", str(target), "1", "10", "-mayDie", "-file", profile],
