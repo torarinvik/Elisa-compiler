@@ -166,7 +166,7 @@ for probe in (
     "guard_mutation_value: Ast::Expr = Ast::Expr.If(guard_mutation_condition, guard_push, Ast::Expr.IntLit(0, at), at)",
     "return 35 if guarded_mutation_region != \"inner\"",
     "region_escape_body_apply_statements_with_elements(statement_guard_body, region_annotations, region_view_fns, region_container_fns, region_nesting, statement_guard_names, statement_guard_regions, statement_guard_element_names, statement_guard_element_regions, region_context)",
-    'return 50 if region_escape_element_taint_lookup(statement_guard_element_names, statement_guard_element_regions, "xs") != "inner"',
+    'return 50 if statement_guard_result != "inner" and statement_guard_result != REGION_ESCAPE_UNKNOWN_WITH_LOCAL_ELEMENT_REGION',
     "catch_array: Ast::Expr = Ast::Expr.Array([nested_catch_value_block], at)",
     'return 51 if region_escape_element_taint_lookup(catch_array_element_names, catch_array_element_regions, "items") != "inner"',
 ):
