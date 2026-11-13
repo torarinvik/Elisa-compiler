@@ -279,6 +279,9 @@ run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "escape
 run_case local_view_escape_struct_field pos "$FIXTURES/local_view_escape_struct_field.pos.elisa" "view of local \"s\" escapes via return; the array dies at scope exit"
 run_case local_view_escape_view_call pos "$FIXTURES/local_view_escape_view_call.pos.elisa" "value backed by a short-lived region escapes via return"
 run_case auto_region_store_escape_nested pos "$FIXTURES/auto_region_store_escape_nested.pos.elisa" 'value escapes its `in auto:` scope via store into longer-lived storage; the inferred region is freed at scope exit. Give it an explicit lifetime — copy it into a caller-provided region param (def f[@r] ... -> ... @r) or a longer-lived region'
+run_case auto_region_store_escape_nested pos "$FIXTURES/auto_region_store_escape_nested.pos.elisa" 'value in region "<inferred>" is stored into longer-lived region "__rg_dst" via a by-value copy; region "<inferred>" is freed first, leaving a dangling element. Copy it into region "__rg_dst" (or a region that outlives "__rg_dst") before storing'
+run_case auto_region_store_escape_nested pos "$FIXTURES/auto_region_store_escape_nested.pos.elisa" 'value in region "<inferred>" is stored into longer-lived region "__rg_h" via a by-value copy; region "<inferred>" is freed first, leaving a dangling element. Copy it into region "__rg_h" (or a region that outlives "__rg_h") before storing'
+run_case auto_region_store_escape_nested neg "$FIXTURES/auto_region_store_escape_nested.neg.elisa" 'via a by-value copy'
 run_case local_view_escape_more neg "$FIXTURES/local_view_escape_more.neg.elisa" "escapes via return"
 run_case return_ref_local_in_block pos "$FIXTURES/return_ref_local_in_block.pos.elisa" "returning a reference into function-local storage"
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "returning a reference into function-local storage"
