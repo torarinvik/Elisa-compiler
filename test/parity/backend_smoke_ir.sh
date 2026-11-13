@@ -211,7 +211,22 @@ ir_case extern_same_name_fallibility_keeps_fallible_abi 'module Fallible:\n    p
 stage1_ir_case darray_checked_growth 'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(7)\n    return xs[0] can Unsafe.UncheckedIndex\n' 'umul.with.overflow.i64'
 stage1_ir_case darray_checked_reserve_bound 'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.reserve(2 * 3)\n    return xs.count.i64() + 42\n' 'umul.with.overflow.i64'
 stage1_ir_case defer_function '@link_name(sink)\nextern sink(value: i64) -> void\n\ndef keep() -> i64:\n    value: i64 = 10\n    defer function:\n        sink(value)\n    return value\n\ndef main() -> i64:\n    return keep()\n' 'call void @sink\(i64.*\)'
-stage1_ir_case defer_block_pool 'struct ThreadPool:\n    handle: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef observe(pool: ThreadPool&) -> void:\n    return\n\ndef keep() -> void:\n    pool workers(1):\n        defer block:\n            observe(&workers)\n\ndef main() -> i64:\n    keep()\n    return 42\n' 'call void @observe'
+defer_pool_source='struct ThreadPool:\n    handle: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef observe(value: i64) -> void:\n    return\n\ndef keep() -> void:\n    pool workers(1):\n        defer block:\n            observe(7.i64())\n\ndef main() -> i64:\n    keep()\n    return 42\n'
+stage1_ir_case defer_block_pool "$defer_pool_source" 'call void @observe\(i64 7\)'
+total=$((total + 1))
+if awk '/call void @observe\(/ { observed = 1 } /call void @pool_shutdown\(/ && observed { ordered = 1 } END { exit !ordered }' "$BUILD/s1ir_defer_block_pool.ll"; then
+    pass=$((pass + 1))
+else
+    echo "  FAIL s1ir_defer_block_pool: deferred call must precede pool shutdown"
+fi
+total=$((total + 1))
+if printf '%b' 'struct ThreadPool:\n    handle: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef observe(pool: ThreadPool&) -> void:\n    return\n\ndef keep() -> void:\n    pool workers(1):\n        defer block:\n            observe(&workers)\n\ndef main() -> i64:\n    keep()\n    return 42\n' | "$BUILD/emit_native" > "$BUILD/s1ir_defer_block_pool_escape.ll" 2>/dev/null; then
+    echo "  FAIL s1ir_defer_block_pool_escape: accepted passing the lexical pool to an ordinary call"
+elif grep -Fq 'Pool-lifetime handle argument passed inside a lexical pool needs ownership tracking' "$BUILD/s1ir_defer_block_pool_escape.ll"; then
+    pass=$((pass + 1))
+else
+    echo "  FAIL s1ir_defer_block_pool_escape: missing pool lifetime diagnostic"
+fi
 stage1_ir_case struct_align '@align(64)\nstruct Counter:\n    value: i64\n\nglobal counter: Counter = zeroed\n\ndef fold() -> i64:\n    local: Counter = zeroed\n    return local.value\n\ndef main() -> i64:\n    return fold()\n' '@counter = global %Counter zeroinitializer, align 64'
 stage1_ir_env_case noalias_mutable_scalar ELISACORE_NOALIAS_MUTABLE_REFS 1 'def bump(x: mutable i32&) -> void:\n    x <- x + 1\n\ndef main() -> i64:\n    return 0\n' 'define (internal )?void @bump\(ptr noalias'
 stage1_ir_absent_case noalias_default_off 'def bump(x: mutable i32&) -> void:\n    x <- x + 1\n\ndef main() -> i64:\n    return 0\n' 'define void @bump\(ptr noalias'
