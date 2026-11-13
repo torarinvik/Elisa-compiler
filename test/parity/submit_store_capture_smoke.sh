@@ -66,6 +66,17 @@ for level in O0 O2; do
             exit 1
         fi
     done
+    conditional_output="$WORK/conditional-$level"
+    if ! elisa_run_timeout 300 env -u ELISA_STAGE1_RUNTIME_STD "$STAGE1" -emit exe "-$level" -o "$conditional_output" "$ROOT/test/parity/conditional_nursery_submit_control.elisa" >"$WORK/conditional-build-$level.log" 2>&1; then
+        cat "$WORK/conditional-build-$level.log" >&2
+        echo "conditional nursery submit compilation failed at $level" >&2
+        exit 1
+    fi
+    if ! elisa_run_timeout 30 "$conditional_output" >"$WORK/conditional-run-$level.log" 2>&1; then
+        cat "$WORK/conditional-run-$level.log" >&2
+        echo "conditional nursery submit did not execute and join both branches at $level" >&2
+        exit 1
+    fi
     fake_output="$WORK/fake-group-O$level.o"
     fake_log="$WORK/fake-group-O$level.log"
     if elisa_run_timeout 300 env -u ELISA_STAGE1_RUNTIME_STD "$STAGE1" -emit obj "-$level" -o "$fake_output" "$ROOT/test/parity/submit_store_fake_group_control.elisa" >"$fake_log" 2>&1; then

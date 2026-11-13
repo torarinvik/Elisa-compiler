@@ -1,0 +1,129 @@
+# Bound fold comprehensions: `(name [: T] = value, body for item in source
+# [if condition] with accumulator [: T] = initial)`. Head bindings are
+# evaluated inside each iteration, before the filter and accumulator update.
+extend Parser:
+    private:
+        # A labelled tuple reaches a top-level comma or closing parenthesis before
+        # assignment. Nested delimiters belong to the type, not the fold head.
+        def fold_binding_ahead(parser: Parser&) -> bool:
+            return false if parser.peek() != TokenKind.Ident
+            return true if parser.peek_at(1) == TokenKind.Assign
+            return false if parser.peek_at(1) != TokenKind.Colon
+            offset: mutable usize = 2
+            depth: mutable int = 0
+            while parser.peek_at(offset) != TokenKind.Eof:
+                kind: TokenKind = parser.peek_at(offset)
+                return true if depth == 0 and kind == TokenKind.Assign
+                return false if depth == 0 and (kind == TokenKind.Comma or kind == TokenKind.RParen)
+                depth <- depth + 1 if kind == TokenKind.LParen or kind == TokenKind.LBracket or kind == TokenKind.LBrace
+                depth <- depth - 1 if kind == TokenKind.RParen or kind == TokenKind.RBracket or kind == TokenKind.RBrace
+                offset <- offset + 1
+            return false
+
+        # Binary-level parsing leaves `if` for the fold filter and `for`/`with`
+        # for the enclosing fold grammar, matching the comprehension parser.
+        def fold_component(parser: lmut Parser) -> Ast::Expr:
+            rebind first_option: Ast::Expr?, parser = parser.unary_expression() can Global{Read,Write}, Memory.Allocate
+            first: Ast::Expr = get first_option else (Ast::Expr.Invalid)
+            rebind value: Ast::Expr, parser = parser.binary_expression_at_level(first, 1) can Global{Read,Write}, Memory.Allocate
+            return value
+
+        def bound_fold_expression(parser: lmut Parser, opening: Token) -> Ast::Expr:
+            bindings: mutable darray[Ast::Stmt] @source = []
+            while parser.fold_binding_ahead() |parser, bindings|:
+                rebind binding_token: Token, parser = parser.expect(TokenKind.Ident)
+                binding_type: mutable Ast::Expr = (Ast::Expr.Invalid)
+                rebind annotated: bool, parser = parser.accept(TokenKind.Colon)
+                if annotated:
+                    saved_type_context: bool = parser.in_type_annotation
+                    parser.in_type_annotation <- true
+                    rebind parsed_type: Ast::Expr?, parser = parser.expression() can Global{Read,Write}
+                    parser.in_type_annotation <- saved_type_context
+                    binding_type <- get parsed_type else (Ast::Expr.Invalid)
+                parser, _ <- parser.expect(TokenKind.Assign)
+                rebind binding_value: Ast::Expr, parser = parser.fold_component() can Global{Read,Write}
+                bindings.push((Ast::Stmt.VarDecl(Lexer::text_or_empty(binding_token, parser.source, parser.source_length), binding_type, binding_value, Ast::pos_of_token(binding_token))))
+                parser, _ <- parser.expect(TokenKind.Comma)
+            rebind body: Ast::Expr, parser = parser.fold_component() can Global{Read,Write}
+            rebind result: Ast::Expr, parser = parser.finish_fold_expression(opening, body, bindings) can Global{Read,Write}
+            return result
+
+        def finish_fold_expression(parser: lmut Parser, opening: Token, body: Ast::Expr, bindings: mutable darray[Ast::Stmt]& @source) -> Ast::Expr:
+            for_token: Token = parser.cursor()
+            is_for: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(for_token, parser.source, parser.source_length) == "for"
+            parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, for_token) if not is_for
+            parser, _ <- parser.expect(TokenKind.Ident)
+            rebind item_token: Token, parser = parser.expect(TokenKind.Ident)
+            parser, _ <- parser.expect(TokenKind.In)
+            rebind iterable: Ast::Expr, parser = parser.fold_component() can Global{Read,Write}
+            condition: mutable Ast::Expr = (Ast::Expr.Absent)
+            rebind has_filter: bool, parser = parser.accept(TokenKind.If)
+            if has_filter:
+                rebind parsed_filter: Ast::Expr, parser = parser.fold_component() can Global{Read,Write}
+                condition <- parsed_filter
+            parser, _ <- parser.expect(TokenKind.With)
+            rebind accumulator_token: Token, parser = parser.expect(TokenKind.Ident)
+            accumulator: sview @source = Lexer::text_or_empty(accumulator_token, parser.source, parser.source_length)
+            accumulator_type: mutable Ast::Expr = (Ast::Expr.Invalid)
+            rebind typed: bool, parser = parser.accept(TokenKind.Colon)
+            if typed:
+                saved_context: bool = parser.in_type_annotation
+                parser.in_type_annotation <- true
+                rebind parsed_acc_type: Ast::Expr?, parser = parser.expression() can Global{Read,Write}
+                parser.in_type_annotation <- saved_context
+                accumulator_type <- get parsed_acc_type else (Ast::Expr.Invalid)
+            parser, _ <- parser.expect(TokenKind.Assign)
+            rebind seed: Ast::Expr, parser = parser.fold_component() can Global{Read,Write}
+            item_name: sview @source = Lexer::text_or_empty(item_token, parser.source, parser.source_length)
+            # A parallel reduction is valid only for an associative operation with
+            # the accumulator as a whole operand, an identifier source, no filter,
+            # and no per-element head bindings.
+            associative: mutable bool = false
+            fold_operator: mutable TokenKind = TokenKind.Plus
+            transform: mutable Ast::Expr = (Ast::Expr.Invalid)
+            if body is Ast::Expr.Binary(left, operator, right, _):
+                if operator == TokenKind.Plus or operator == TokenKind.Star:
+                    left_acc: bool = match left:
+                        Ast::Expr.Ident(name, _): name == accumulator
+                        _: false
+                    right_acc: bool = match right:
+                        Ast::Expr.Ident(name, _): name == accumulator
+                        _: false
+                    if left_acc or right_acc:
+                        associative <- true
+                        fold_operator <- operator
+                        transform <- right if left_acc else left
+            plain_source: bool = iterable is Ast::Expr.Ident(_, _)
+            independent_transform: bool = not machine_expr_mentions_ident(transform, accumulator)
+            parallel_shape: bool = bindings.count == 0 and not has_filter and plain_source and associative and independent_transform
+            pinned_candidate: bool = parallel_shape and (seed is Ast::Expr.IntLit(_, _) or seed is Ast::Expr.FloatLit(_, _)) and not fold_pinned_name_conflict(iterable, item_name, accumulator, transform)
+            cloned_transform: Ast::Expr? = fold_clone_transform(transform) if pinned_candidate else null
+            pinned_supported: bool = cloned_transform is not null
+            scalar_fallback: bool = pinned_candidate and not pinned_supported and fold_stage0_uncloneable(transform)
+            by_token: Token = parser.cursor()
+            has_by: bool = parser.peek() == TokenKind.Ident and Lexer::text_or_empty(by_token, parser.source, parser.source_length) == "by"
+            parallel: mutable bool = false
+            if has_by:
+                parser, _ <- parser.advance()
+                rebind mode_token: Token, parser = parser.expect(TokenKind.Ident)
+                mode: sview = Lexer::text_or_empty(mode_token, parser.source, parser.source_length)
+                parallel <- mode == "par" and parallel_shape
+                parser <- parser.error_at(Ast::ParseErrorKind.UnexpectedToken, by_token) if not parallel
+            parser <- parser.error_removed(opening, "pinned fold transform is not yet supported") if pinned_candidate and not pinned_supported and not scalar_fallback and not has_by
+            parser, _ <- parser.expect(TokenKind.RParen)
+            position: Ast::Pos = Ast::pos_of_token(opening)
+            accumulator_position: Ast::Pos = Ast::pos_of_token(accumulator_token)
+            return parallel_fold_expression(iterable, item_name, seed, transform, fold_operator, position) if parallel
+            if pinned_candidate and pinned_supported and not has_by:
+                first_transform: Ast::Expr = get cloned_transform else (Ast::Expr.Invalid)
+                rebind pinned: Ast::Expr, parser = parser.pinned_fold(iterable, item_name, accumulator, accumulator_type, seed, transform, first_transform, fold_operator, position, accumulator_position)
+                return pinned
+            parser.enum_annotations <- parser.enum_annotations.push(Ast::EnumAnnotation{owner: accumulator, name: "__loop_header_accumulator", line: accumulator_token.line, offset: accumulator_position.offset})
+            update: Ast::Stmt = (Ast::Stmt.Assign((Ast::Expr.Ident(accumulator, accumulator_position)), TokenKind.LArrow, body, position))
+            if has_filter:
+                bindings.push((Ast::Stmt.If(condition, [update], [], position)))
+            else:
+                bindings.push(update)
+            loop: Ast::Stmt = (Ast::Stmt.For("", [item_name], iterable, bindings, position))
+            declaration: Ast::Stmt = (Ast::Stmt.VarDecl(accumulator, accumulator_type, seed, accumulator_position))
+            return (Ast::Expr.Block([declaration, loop], (Ast::Expr.Ident(accumulator, accumulator_position)), [], position))

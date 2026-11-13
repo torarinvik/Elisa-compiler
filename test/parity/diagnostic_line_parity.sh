@@ -26,6 +26,7 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 ELISACORE_BIN="$ELISACORE_BIN" \
 ELISA_PARSE_REPORT="${ELISA_PARSE_REPORT:-$REPO_ROOT/build/parse_report}" \
 LINE_PARITY_FIXTURES="$FIXTURES" LINE_PARITY_BASELINE="$BASELINE" \
+ELISA_REPORT_PHYSICAL_LINES=1 \
 python3 - <<'PYEOF'
 import os, re, subprocess, sys
 from collections import Counter
