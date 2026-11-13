@@ -272,6 +272,9 @@ require_stage0_region_control region_param_container_return_auto_move "$FIXTURES
 require_stage0_region_control region_param_container_return_inner_move "$FIXTURES/region_param_container_return_inner_move.pos.elisa" 'value in region "inner" is stored into longer-lived region "r"'
 require_stage0_region_control region_param_container_return_reference_element "$FIXTURES/region_param_container_return_reference_element.pos.elisa" 'cannot return value: region dependency facts include local region "inner"'
 run_case local_view_escape_binding pos "$FIXTURES/local_view_escape_binding.pos.elisa" "view of local \"v\" escapes via return; the array dies at scope exit"
+for local_view_fixture in local_view_escape local_view_escape_binding local_view_escape_struct_field; do
+    run_case "$local_view_fixture" pos "$FIXTURES/$local_view_fixture.pos.elisa" "returning an aggregate or helper result that contains a reference into function-local storage; it dangles once the function returns. Store the value or owner by value, or clone it into a longer-lived region"
+done
 run_case view_return_escape neg "$FIXTURES/view_return_escape.neg.elisa" "escapes via return; the array dies at scope exit"
 run_case local_view_escape_struct_field pos "$FIXTURES/local_view_escape_struct_field.pos.elisa" "view of local \"s\" escapes via return; the array dies at scope exit"
 run_case local_view_escape_view_call pos "$FIXTURES/local_view_escape_view_call.pos.elisa" "value backed by a short-lived region escapes via return"
