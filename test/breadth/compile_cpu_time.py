@@ -40,7 +40,8 @@ def main():
     # Compile the actual source file so the compiler can attribute trusted
     # runtime declarations to their defining include files.
     source = ROOT / "src" / "driver" / "elisac.elisa"
-    command = [str(BIN), "-o", os.path.join(work, "out.o"), str(source)]
+    rebuild_guard = ROOT / "test" / "parity" / "compiler_rebuild_timeout.sh"
+    command = ["bash", str(rebuild_guard), str(BIN), "-o", os.path.join(work, "out.o"), str(source)]
     # The yardstick, measured in this same run and on this same machine state.
     reference = None
     for _ in range(2):
@@ -61,7 +62,7 @@ def main():
     for _ in range(2):
         before = child_cpu()
         r = subprocess.run(command, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE, text=True, errors="replace", timeout=900)
+                           stderr=subprocess.PIPE, text=True, errors="replace")
         used = child_cpu() - before
         if r.returncode != 0:
             print(f"compile_cpu FAILED: stage1 exited {r.returncode} on its own source")
