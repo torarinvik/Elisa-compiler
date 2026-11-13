@@ -20,7 +20,14 @@ for row in "stage0:$S0" "stage1:$S1"; do
     rc=0
     "$compiler" -emit llvm -o "$WORK/$stage.ll" "$FIXTURE" >"$WORK/$stage.out" 2>"$WORK/$stage.err" || rc=$?
     [[ "$rc" -eq 1 ]] || fail "$stage should reject a runtime call to the active static helper, got exit $rc"
-    grep -Fq 'static function "compile_time_helper" can only be called from a static context' "$WORK/$stage.err" || fail "$stage evaluated the enclosing static-if condition in Outer::Inner instead of Outer"
+    # Stage0 identifies the resolved declaration by its full module path; Stage1
+    # currently reports the leaf name. Both must name this exact static helper.
+    if [[ "$stage" == stage0 ]]; then
+        expected='static function "Outer.Inner.compile_time_helper" can only be called from a static context'
+    else
+        expected='static function "compile_time_helper" can only be called from a static context'
+    fi
+    grep -Fq "$expected" "$WORK/$stage.err" || fail "$stage evaluated the enclosing static-if condition in Outer::Inner instead of Outer"
 done
 
 # This executable reaches codegen without an earlier semantic rejection. The
