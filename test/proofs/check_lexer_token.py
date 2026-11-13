@@ -178,7 +178,8 @@ expected_identifier_scan_body = [
     "state ScanIdentifier",
     "start ScanIdentifier",
     "ScanIdentifier, character if is_identifier_char(character):",
-    "lexer <- lexer.advance_char()",
+    "lexer.position <- lexer.position + 1.usize()",
+    "lexer.column <- lexer.column + 1",
     "-> ScanIdentifier",
     "ScanIdentifier, _ if lexer.continues_unicode_identifier():",
     "lexer <- lexer.advance_latin1_identifier_char()",
@@ -189,6 +190,8 @@ expected_identifier_scan_body = [
     "kind: TokenKind = frontend_lookup_keyword(text)",
     "lexer.pending_grouped_block <- false",
     "lexer.pending_grouped_block <- true if kind == TokenKind.Ident and is_immediate_grouped_block_introducer(text)",
+    'if lexer.group_depth > 0 and (kind == TokenKind.Match or (kind == TokenKind.Ident and text == "when" and lexer.pattern_scrutinee_follows())):',
+    "lexer.pending_pattern_blocks <- lexer.pending_pattern_blocks.push(GroupedPatternHeader{group_depth: lexer.group_depth, head_start: lexer.position}) can Memory.Allocate, Abort.Panic",
     "return Token(kind, position, start, lexer.position)",
 ]
 if identifier_scan_body != expected_identifier_scan_body:
