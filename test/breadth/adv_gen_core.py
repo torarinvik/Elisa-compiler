@@ -114,14 +114,16 @@ extern probe_a(fd: FD) -> isize
 def main() -> i64:
     return FD.Out.i64() + FD.In.i64()
 """)
-    # Two externs on ONE C symbol with different signatures — LLVM used to uniquify.
+    # Multiple source names for one C symbol must reuse the same LLVM declaration.
     yield ("extern_dup_symbol", f"""
 include "{STD}"
 
-extern write(fd: int, buf: void&, count: usize) -> isize
+@link_name(write)
+extern alternate_write(fd: FileDescriptor, buf: void&, count: usize) -> isize can[Console.Write]
 
 def main() -> i64:
-    can Unsafe.PointerCast:
+    can Unsafe.PointerCast, Console.Write:
+        _ = alternate_write(FileDescriptor.Output, "".cast[void&], 0.usize())
         return 3
 """)
     yield ("extern_variadic_like", """
