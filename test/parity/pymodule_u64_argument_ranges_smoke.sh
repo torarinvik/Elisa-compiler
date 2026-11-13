@@ -64,9 +64,12 @@ assert 'PyErr_SetString(PyExc_OverflowError, "u64 dictionary value out of range"
 assert "if (arg0_materialized)" in optional_dict_failure, (
     "optional u64 dictionary overflow path skips owned-input cleanup"
 )
-assert "return NULL;" in optional_dict_failure, (
-    "optional u64 dictionary overflow branch is not closed"
+assert "goto elisa_pymodule_aggregate_inputs_error;" in optional_dict_failure, (
+    "optional u64 dictionary overflow must branch to the input failure handler"
 )
+input_failure = optional_dict.split("elisa_pymodule_aggregate_inputs_error:", 1)[1]
+input_failure = input_failure.split("elisa_pymodule_aggregate_inputs_ok:", 1)[0]
+assert "return NULL;" in input_failure, "input failure handler must return a Python error"
 
 record_marker = "static int elisa_pymodule_struct_U64Record_from_py("
 record_start = source.index(record_marker)
