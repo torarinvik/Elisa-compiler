@@ -82,7 +82,7 @@ grep -q 'L6 argument 1 to "consume"' <<< "$out" && fail "wrong-arity call used a
 # passed to a function that reads/writes the same buffer as darray[sview]&.
 MISMATCH_FIXTURE="$REPO_ROOT/test/fixtures/diagnostics/darray_ref_call_element_mismatch.pos.elisa"
 out=$("$RPT" < "$MISMATCH_FIXTURE")
-grep -q 'argument 1 to "take_texts" expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "by-reference darray element mismatch not flagged: $out"
+grep -Fq 'argument 1 to "take_texts" expects darray[sview]&, got darray[i64]&' <<< "$out" || fail "by-reference darray element mismatch not flagged: $out"
 if "$STAGE1_BIN" -emit obj -O0 -o /dev/null "$MISMATCH_FIXTURE" > /dev/null 2>&1; then
   fail "stage1 accepted by-reference darray element mismatch"
 fi
@@ -103,8 +103,8 @@ grep -q 'expects darray\[' <<< "$out" && fail "false positive on matching reorde
 "$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_reorder.pos.elisa" >/dev/null 2>&1 || fail "stage0 rejected matching reordered named darray arguments"
 "$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_reorder.pos.elisa" >/dev/null 2>&1 || fail "stage1 rejected matching reordered named darray arguments"
 out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_mismatch.neg.elisa")
-grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "named darray mismatch not mapped to its formal: $out"
-grep -q 'expects darray\[i64\], got darray\[sview\]' <<< "$out" || fail "reordered named darray mismatch not mapped to its formal: $out"
+grep -Fq 'argument 1 to "copy_pair" expects darray[sview]&, got darray[i64]&' <<< "$out" || fail "named darray mismatch not mapped to its formal: $out"
+grep -Fq 'argument 2 to "copy_pair" expects darray[i64]&, got darray[sview]&' <<< "$out" || fail "reordered named darray mismatch not mapped to its formal: $out"
 named_mismatch_count=$(grep -c 'expects darray\[' <<< "$out" || true)
 [ "$named_mismatch_count" -eq 2 ] || fail "named argument matching emitted unexpected darray findings: $out"
 if stage0_out=$("$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_named_mismatch.neg.elisa" 2>&1); then
