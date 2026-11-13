@@ -31,4 +31,13 @@ if [[ "$oob_count" -ne 1 || "$optional_count" -ne 1 || "$unsafe_count" -ne 2 ]] 
     exit 1
 fi
 
+# The same fixed-array extent feeds literal arity checking. Exercise both the
+# mismatch and the matching case for the two-argument array type spelling.
+arity_bad=$(printf 'def main() -> i32:\n    values: array[i64, 4] = [1, 2, 3]\n    return 0\n' | "$RPT")
+arity_ok=$(printf 'def main() -> i32:\n    values: array[i64, 4] = [1, 2, 3, 4]\n    return 0\n' | "$RPT")
+if ! grep -Fq 'array literal expects 4 elements, got 3' <<< "$arity_bad" || ! grep -qx 'D 0' <<< "$arity_ok"; then
+    echo "fixed-array arity smoke FAIL: bad=$arity_bad; good=$arity_ok" >&2
+    exit 1
+fi
+
 echo "checked-get owner smoke OK"
