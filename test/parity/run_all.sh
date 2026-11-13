@@ -447,12 +447,14 @@ done
 # The go-test ORACLE lane: these four each invoke stage0's Go test suite to produce their
 # oracle, sharing its build cache and fixed *_PARITY_OUT files. They run in sequence with
 # each other, but concurrently with everything else.
+oracle_checks=0
 if [[ ${#oracle_lane[@]} -gt 0 ]]; then
   oracle_script="$resultdir/oracle_lane.sh"
   {
     printf '#!/usr/bin/env bash\n'
     for i in "${!oracle_lane[@]}"; do
       in_profile "${oracle_names[$i]}" || continue
+      oracle_checks=$((oracle_checks + 1))
       printf 'bash %q --exec-one %q %q %q\n' "$REPO_ROOT/test/parity/run_all.sh" "$resultdir" "${oracle_names[$i]}" "${oracle_lane[$i]}"
     done
     printf 'exit 0\n'
@@ -473,7 +475,7 @@ if [[ ${#serial_lane[@]} -gt 0 ]]; then
 fi
 
 # Count CHECKS, not pool jobs: the two serial lanes are one job each but many checks.
-total_checks=$(( ${#JOB_NAMES[@]} + ${#serial_lane[@]} + ${#oracle_lane[@]} ))
+total_checks=$(( ${#JOB_NAMES[@]} + ${#serial_lane[@]} + oracle_checks ))
 TOTAL_AVAILABLE=$(( $(ls "$REPO_ROOT"/test/parity/*_smoke.sh | wc -l) + 11 ))
 if [[ "$GATE_PROFILE" == full ]]; then
   echo "stage1 parity gate — ${total_checks} checks, ${GATE_JOBS} at a time (2 serial lanes):"
@@ -505,11 +507,11 @@ export ELISA_GATE_DISPATCH_LIBRARY_PATH_SET="${LIBRARY_PATH+x}"
 export ELISA_GATE_DISPATCH_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}"
 export ELISA_GATE_DISPATCH_SDKROOT_SET="${SDKROOT+x}"
 export ELISA_GATE_DISPATCH_SDKROOT_VALUE="${SDKROOT-}"
-"$ELISA_TOOL_PYTHON" "$REPO_ROOT/test/parity/gate_dispatch.py" "$resultdir" "$REPO_ROOT" "$GATE_JOBS"
+dispatch_status=0
+"$ELISA_TOOL_PYTHON" "$REPO_ROOT/test/parity/gate_dispatch.py" "$resultdir" "$REPO_ROOT" "$GATE_JOBS" || dispatch_status=$?
 unset ELISA_GATE_DISPATCH_LIBRARY_PATH_SET ELISA_GATE_DISPATCH_LIBRARY_PATH_VALUE
 unset ELISA_GATE_DISPATCH_SDKROOT_SET ELISA_GATE_DISPATCH_SDKROOT_VALUE
 
-# Aggregate. Results are per-file, so nothing raced to produce this.
 for f in "$resultdir"/*.result; do
   [[ -f "$f" ]] || continue
   st="$(head -1 "$f" | cut -f1)"
@@ -519,9 +521,13 @@ for f in "$resultdir"/*.result; do
   printf '%s\t%s\n' "$el" "$nm" >> "$timings_file"
   if [[ "$st" == ok ]]; then pass=$((pass + 1)); else fail=$((fail + 1)); failed_names+=("$nm"); fi
 done
-# Keep every FAILING check's log where it can still be read after the run. The result dir is
-# a mktemp that macOS may reap, and the summary prints only a tail — twice today a failure was
-# diagnosed only by re-running the check by hand because its log was already gone.
+recorded_checks=$((pass + fail))
+if [[ "$dispatch_status" -ne 0 || "$recorded_checks" -ne "$total_checks" ]]; then
+  echo "parity dispatch incomplete: recorded $recorded_checks of $total_checks checks (dispatcher exit $dispatch_status)" >&2
+  fail=$((fail + 1))
+  failed_names+=("parity dispatch completeness")
+fi
+# Preserve failing results beyond the lifetime of the temporary directory.
 if [[ $fail -ne 0 ]]; then
   failure_dir="$REPO_ROOT/build/gate-failures"
   rm -rf "$failure_dir"; mkdir -p "$failure_dir"
