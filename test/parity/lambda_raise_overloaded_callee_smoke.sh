@@ -56,4 +56,20 @@ if [[ "$mixed_status" -eq 0 || "$mixed_rows" != 'L14' ]] || ! grep -q '^P 0$' <<
     exit 1
 fi
 
+callback_report="$("$RPT" < "$REPO_ROOT/test/repro/lambda_raise_callback_parameters.elisa")"
+if ! grep -q '^P 0$' <<< "$callback_report" || ! grep -q '^D 3$' <<< "$callback_report" \
+    || ! grep -q '^  L10 raise cannot propagate tag' <<< "$callback_report" \
+    || ! grep -q '^  L12 raise cannot propagate tag' <<< "$callback_report" \
+    || ! grep -q '^  L16 raise cannot propagate tag' <<< "$callback_report"; then
+    printf 'lambda callback error sets were not checked independently:\n%s\n' "$callback_report" >&2
+    exit 1
+fi
+
+infallible_report="$("$RPT" < "$REPO_ROOT/test/repro/lambda_raise_infallible_callback.elisa")"
+if ! grep -q '^P 0$' <<< "$infallible_report" || ! grep -q '^D 1$' <<< "$infallible_report" \
+    || ! grep -q '^  L6 raise requires the current function to return an error union' <<< "$infallible_report"; then
+    printf 'lambda raise was not rejected for an infallible callback:\n%s\n' "$infallible_report" >&2
+    exit 1
+fi
+
 echo "overloaded Lambda raise smoke OK"
