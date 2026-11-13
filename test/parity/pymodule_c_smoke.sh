@@ -25,7 +25,7 @@ bash "$ROOT/scripts/elisac_stage1.sh" -emit obj -o "$SOURCE_DIR/fastmath.o" \
     -o "$WORK/fastmath$("$PYTHON_BIN" -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")" "$SOURCE_DIR/fastmath.c" "$SOURCE_DIR/fastmath.o" \
     "$ROOT/build/runtime/elisacore_runtime.o" "$ROOT/scripts/pymodule_runtime_fallback.c"
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import fastmath
 assert fastmath.add(2, 3) == 5
 assert fastmath.negate(False) is True

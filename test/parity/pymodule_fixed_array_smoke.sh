@@ -44,7 +44,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/fixed_array_refs.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_fixed_array_refs.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import fixed_array_refs
 
 assert fixed_array_refs.sum_fixed([1, 2, 3]) == 6
@@ -92,7 +92,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/fixed_array_returns.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_fixed_array_returns.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import fixed_array_returns
 
 assert fixed_array_returns.make_fixed() == [10, 20, 30]

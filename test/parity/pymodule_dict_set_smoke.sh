@@ -108,7 +108,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/dict_set_probe$SUFFIX" "$SOURCE" >/dev/null
 
 cd "$WORK"
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import dict_set_probe
 import random
 import sys

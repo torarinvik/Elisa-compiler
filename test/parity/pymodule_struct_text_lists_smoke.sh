@@ -13,7 +13,7 @@ trap 'rm -rf "$WORK"' EXIT
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/struct_text_lists.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_struct_text_lists.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import struct_text_lists
 
 assert struct_text_lists.count({"names": ["one", "på"], "labels": ["A", "B"]}) == 4

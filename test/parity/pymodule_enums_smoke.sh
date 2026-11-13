@@ -13,7 +13,7 @@ trap 'rm -rf "$WORK"' EXIT
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/enums.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_enums.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import enums
 
 assert enums.mode_roundtrip(0) == 0

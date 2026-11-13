@@ -18,7 +18,7 @@ grep -Fq 'Py_XDECREF(arg0_owned); Py_DECREF(field_obj); return -1;' "$WORK/struc
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/struct_dicts.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_struct_dicts.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import struct_dicts
 
 first = {"name": "first"}

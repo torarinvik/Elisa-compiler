@@ -54,7 +54,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/nullable_aggregate_defaults.cpython-314-darwin.so" "$SOURCE" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import nullable_aggregate_defaults as module
 import gc
 import tracemalloc

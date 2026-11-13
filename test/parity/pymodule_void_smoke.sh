@@ -20,7 +20,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/voidmod.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_void.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import voidmod
 assert voidmod.ping() is None
 PY

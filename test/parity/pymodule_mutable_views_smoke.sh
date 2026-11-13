@@ -41,7 +41,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
 grep -q "def scale(values: _elisa_buffers.Buffer, factor: float) -> int" "$WORK/mutable_views.pyi"
 
 cd "$WORK"
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import array
 
 import mutable_views

@@ -47,7 +47,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/enum_defaults.cpython-314-darwin.so" "$SOURCE" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import enum_defaults as module
 
 assert module.defaulted() == 7

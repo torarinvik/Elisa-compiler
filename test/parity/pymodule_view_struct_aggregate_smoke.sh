@@ -25,7 +25,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/view_struct_aggregate.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_view_struct_aggregate.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import view_struct_aggregate
 
 values = [

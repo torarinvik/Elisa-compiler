@@ -16,7 +16,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so -o "$WORK/nullable_records$SUFFIX" \
     "$ROOT/test/repro/pymodule_nullable_record_returns.elisa" >/dev/null
 cd "$WORK"
-PYTHONPATH="$WORK" "$PYTHON_BIN" - "$WORK/nullable_records.pyi" <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - "$WORK/nullable_records.pyi" <<'PY'
 import gc
 from pathlib import Path
 import sys

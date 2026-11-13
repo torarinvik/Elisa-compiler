@@ -51,7 +51,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/nested_dict_named_aggregates.cpython-314-darwin.so" "$SOURCE" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import nested_dict_named_aggregates as module
 
 value = {1: {"a": [{"x": 2, "label": "α\x00β"}, {"x": -1, "label": "done"}], "empty": []}, 2: {}}

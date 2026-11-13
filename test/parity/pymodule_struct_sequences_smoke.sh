@@ -73,7 +73,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/struct_sequences.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_struct_sequences.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import struct_sequences
 
 payload = {"kind": "point"}
@@ -109,7 +109,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/struct_sequence_fields.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_struct_sequence_fields.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import struct_sequence_fields
 
 batch = {

@@ -22,7 +22,7 @@ for fixture in struct_codegen_names struct_codegen_nested_names; do
         "$ROOT/test/repro/pymodule_${fixture}.elisa" >/dev/null
 done
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import struct_codegen_names
 import struct_codegen_nested_names
 

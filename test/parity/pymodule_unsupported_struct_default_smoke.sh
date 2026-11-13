@@ -20,7 +20,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/unsupported_struct_default.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_unsupported_struct_default.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import unsupported_struct_default
 
 assert unsupported_struct_default.roundtrip({}) == {"values": [1]}

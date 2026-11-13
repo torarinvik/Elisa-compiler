@@ -20,7 +20,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/nested_structs.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_nested_structs.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import nested_structs
 
 profile = {"id": 7, "address": {"city": "Oslo\x00fjord", "zip": 1234}, "label": "primary"}

@@ -46,7 +46,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/nested_dict_probe.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_nested_dict_probe.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import nested_dict_probe
 
 value = {1: {10: 20, 11: -2}, 2: {}}

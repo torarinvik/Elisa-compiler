@@ -60,7 +60,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/sview_dict_keys.cpython-314-darwin.so" "$SOURCE" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import sview_dict_keys
 
 values = {"a\x00key": "x\x00value", "empty": "", "unicode-λ": "ok"}

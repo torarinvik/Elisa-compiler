@@ -23,7 +23,7 @@ grep -q "elisa_pymodule_borrow_buffer(arg0" < <(bash "$ROOT/scripts/elisac_stage
     -o /dev/stdout "$ROOT/test/repro/pymodule_buffer_views.elisa")
 
 cd "$WORK"
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 from array import array
 
 import buffer_views as b

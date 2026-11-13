@@ -43,7 +43,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/error_payload_dict.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_payload_dict.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import error_payload_dict
 
 assert error_payload_dict.__all__ == [

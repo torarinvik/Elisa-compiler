@@ -22,7 +22,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/darray_views.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_darray_views.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import darray_views
 
 assert darray_views.roundtrip_i64([[1, 2], [], [-3]]) == [[1, 2], [], [-3]]

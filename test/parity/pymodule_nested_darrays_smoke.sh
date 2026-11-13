@@ -96,7 +96,7 @@ if ! command -v clang >/dev/null 2>&1 || ! "$PYTHON_BIN" -c 'import sys; raise S
 fi
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so -o "$WORK/nested_darrays$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')" "$SOURCE" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import nested_darrays
 import sys
 

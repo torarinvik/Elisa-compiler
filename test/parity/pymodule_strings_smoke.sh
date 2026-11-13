@@ -20,7 +20,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/strings.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_strings.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import strings
 
 assert strings.cstr("hello π") == "hello π"

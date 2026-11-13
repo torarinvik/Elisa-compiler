@@ -27,7 +27,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/dict_view_special.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_dict_view_special.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import dict_view_special
 
 assert dict_view_special.roundtrip_sview({1: (item for item in ("α\x00β", "")), 2: ()}) == {

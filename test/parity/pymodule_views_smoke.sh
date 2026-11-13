@@ -36,7 +36,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/views.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_views.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import views
 
 assert views.count_i64([1, 2, 3]) == 3

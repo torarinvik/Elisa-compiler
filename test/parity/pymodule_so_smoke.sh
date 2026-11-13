@@ -38,7 +38,7 @@ test "$(wc -l < "$CLI_PYTHON_LOG" | tr -d ' ')" -gt 1
 test -f "$NESTED_WORK/fastmath.pyi"
 "$PYTHON_BIN" -m py_compile "$NESTED_WORK/fastmath.pyi"
 
-PYTHONPATH="$NESTED_WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$NESTED_WORK" "$PYTHON_BIN" -P - <<'PY'
 import fastmath
 assert fastmath.add(2, 3) == 5
 assert fastmath.negate(False) is True
@@ -65,7 +65,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG_NAME" ELISA_CLANG="$CLANG
     "$ROOT/test/repro/pymodule_export.elisa" >/dev/null
 test -f "$PLAIN_WORK/fastmath${PYTHON_EXT_SUFFIX}"
 test -f "$PLAIN_WORK/fastmath.pyi"
-PYTHONPATH="$PLAIN_WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$PLAIN_WORK" "$PYTHON_BIN" -P - <<'PY'
 import fastmath
 assert fastmath.add(4, 5) == 9
 PY
@@ -81,7 +81,7 @@ mkdir -p "$DERIVED_WORK"
 )
 test -f "$DERIVED_WORK/fastmath${PYTHON_EXT_SUFFIX}"
 test -f "$DERIVED_WORK/fastmath.pyi"
-PYTHONPATH="$DERIVED_WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$DERIVED_WORK" "$PYTHON_BIN" -P - <<'PY'
 import fastmath
 assert fastmath.add(8, 9) == 17
 PY
@@ -96,7 +96,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG_NAME" ELISA_CLANG="$CLANG
     "$ROOT/test/repro/pymodule_export.elisa" >/dev/null
 test -f "$AUTO_WORK/runtime.o"
 test -f "$AUTO_WORK/fastmath${PYTHON_EXT_SUFFIX}"
-PYTHONPATH="$AUTO_WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$AUTO_WORK" "$PYTHON_BIN" -P - <<'PY'
 import fastmath
 assert fastmath.add(6, 7) == 13
 PY

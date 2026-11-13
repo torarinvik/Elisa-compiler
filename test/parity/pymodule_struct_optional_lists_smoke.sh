@@ -13,7 +13,7 @@ trap 'rm -rf "$WORK"' EXIT
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/struct_optional_lists.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_struct_optional_lists.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import struct_optional_lists
 
 value = {

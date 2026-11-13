@@ -18,7 +18,7 @@ SO="$TMP/object_lists.cpython-314-darwin.so"
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so -o "$SO" "$ROOT/test/repro/pymodule_object_list.elisa"
 
-PYTHONPATH="$TMP" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$TMP" "$PYTHON_BIN" -P - <<'PY'
 import importlib
 
 mod = importlib.import_module("object_lists")

@@ -22,7 +22,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/optional_structs.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_optional_structs.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import optional_structs
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -113,7 +113,7 @@ if [[ -x "$PYTHON312_BIN" && -x "$PYTHON312_CONFIG" ]]; then
         bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
         -o "$WORK/py312/optional_structs${PY312_SUFFIX}" \
         "$ROOT/test/repro/pymodule_optional_structs.elisa" >/dev/null
-    PYTHONPATH="$WORK/py312" "$PYTHON312_BIN" - <<'PY'
+    PYTHONPATH="$WORK/py312" "$PYTHON312_BIN" -P - <<'PY'
 import typing
 
 if hasattr(typing, "NotRequired"):

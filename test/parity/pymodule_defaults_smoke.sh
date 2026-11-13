@@ -21,7 +21,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     "$ROOT/test/repro/pymodule_defaults.elisa" >/dev/null
 
 cd "$WORK"
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import inspect
 import sys
 import defaults
@@ -110,7 +110,7 @@ if "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.maxsize > 2**32 else 
         -o "$WORK/defaults_usize_max.cpython-314-darwin.so" \
         "$ROOT/test/repro/pymodule_defaults_usize_max.elisa" >/dev/null
 
-    PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+    PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import inspect
 from defaults_usize_max import usize_max
 
@@ -125,7 +125,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/defaults_unsupported.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_defaults_unsupported.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import inspect
 import defaults_unsupported
 

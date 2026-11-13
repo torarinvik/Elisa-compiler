@@ -57,7 +57,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/dict_optional_returns.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_dict_optional_returns.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import dict_optional_returns
 
 assert dict_optional_returns.maybe_count({}) is None

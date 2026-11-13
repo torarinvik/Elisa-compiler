@@ -39,7 +39,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/dict_literals.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_dict_literals.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import dict_literals
 
 assert dict_literals.literal_i64() == {1: 40, 2: 2}

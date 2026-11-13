@@ -34,7 +34,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/optional_errors.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_optional_errors.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import optional_errors
 
 assert optional_errors.value(7) == 7

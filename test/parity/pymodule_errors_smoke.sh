@@ -61,7 +61,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/errors.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_errors.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import inspect
 import errors
 
@@ -244,7 +244,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/payload_errors.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_payload.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import payload_errors
 import sys
 
@@ -295,7 +295,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/payload_text.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_payload_text.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import payload_text
 
 for fn, value, expected in ((payload_text.fail_sview, "héllo", "héllo"), (payload_text.fail_cstr, "world", "world")):
@@ -343,7 +343,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/payload_multi.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_payload_multi.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import payload_multi
 
 assert payload_multi.MultiPayloadErrorBadPayload.__module__ == "payload_multi"
@@ -393,7 +393,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/error_payload_darray.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_payload_darray.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import error_payload_darray
 
 for fn, value in ((error_payload_darray.fail_list, [4, 5, 6]), (error_payload_darray.fail_bytes, b"a\x00b")):
@@ -441,7 +441,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/error_payload_view.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_payload_view.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import error_payload_view
 
 for fn, value in ((error_payload_view.fail_view, [4, 5, 6]), (error_payload_view.fail_bytes, b"a\x00b")):
@@ -465,7 +465,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/container_errors.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_darray.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import container_errors
 
 assert container_errors.count() == {}

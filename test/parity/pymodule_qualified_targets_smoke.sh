@@ -65,7 +65,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/qualified_targets.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_qualified_targets.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import qualified_targets
 
 assert qualified_targets.add(2, 5) == 7
@@ -78,7 +78,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/target_owner_line_zero.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_target_owner_line_zero.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import target_owner_line_zero
 
 assert target_owner_line_zero.first_fn() == 11

@@ -20,7 +20,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/default_failure_cleanup.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_default_failure_cleanup.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import gc
 import tracemalloc
 

@@ -32,7 +32,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/nullable_sview_lists.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_nullable_sview_lists.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import nullable_sview_lists
 
 values = ["hello\x00på", None, "東京\x00value"]

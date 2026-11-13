@@ -18,7 +18,7 @@ grep -Fq 'Py_XDECREF(arg0_owned); Py_DECREF(field_obj); return -1;' "$WORK/struc
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so \
     -o "$WORK/struct_sets.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_struct_sets.elisa" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import struct_sets
 
 value = {"numbers": {-2, 4, 11}, "labels": {"first", "second"}, "views": {"embedded\x00nul", "unicode-λ"}}

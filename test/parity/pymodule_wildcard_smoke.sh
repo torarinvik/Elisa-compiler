@@ -33,7 +33,7 @@ grep -Fq 'def add(a: int, b: int) -> int: ...' "$WORK/wildcard.pyi"
 grep -Fq 'def greet(name: str | bytes) -> str: ...' "$WORK/wildcard.pyi"
 grep -Fq 'API_LEVEL: Final[int]' "$WORK/wildcard.pyi"
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import wildcard
 
 assert wildcard.add(2, 4) == 6

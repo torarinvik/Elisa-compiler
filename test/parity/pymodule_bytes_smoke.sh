@@ -20,7 +20,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/bytesprobe.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_bytes_probe.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import bytesprobe
 
 assert bytesprobe.count(b"abc\x00xyz") == 7

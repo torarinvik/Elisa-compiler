@@ -46,7 +46,7 @@ PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
     -o "$WORK/error_payload_nested_dict.cpython-314-darwin.so" \
     "$ROOT/test/repro/pymodule_error_payload_nested_dict.elisa" >/dev/null
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import error_payload_nested_dict
 
 values = {1: {"a": 2, "b": -3}, 4: {}, 7: {"z": 11}}

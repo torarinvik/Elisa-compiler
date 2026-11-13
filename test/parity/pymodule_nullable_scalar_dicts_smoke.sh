@@ -51,7 +51,7 @@ if ! PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG
     exit 0
 fi
 
-PYTHONPATH="$WORK" "$PYTHON_BIN" - <<'PY'
+PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
 import nullable_scalar_dicts
 
 assert nullable_scalar_dicts.optional_signed({"a": -2, "none": None, "z": 7}) == {"a": -2, "none": None, "z": 7}
