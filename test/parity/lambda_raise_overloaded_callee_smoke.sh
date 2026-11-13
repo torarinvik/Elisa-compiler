@@ -94,4 +94,18 @@ if [[ "$infallible_status" -eq 0 || "$infallible_rows" != 'L14' ]] || ! grep -q 
     exit 1
 fi
 
+extern_fixture="$REPO_ROOT/test/repro/lambda_raise_extern_callback.elisa"
+set +e
+extern_core="$("$ELISACORE_BIN" -emit semantic "$extern_fixture" 2>&1)"
+extern_status=$?
+set -e
+extern_rows="$(printf '%s\n' "$extern_core" | sed -E -n 's#^.*:([0-9]+):[0-9]+-[0-9]+: (raise cannot propagate tag|argument 1 to).*$#L\1#p' | LC_ALL=C sort)"
+extern_stage1="$("$RPT" < "$extern_fixture")"
+extern_stage1_rows="$(printf '%s\n' "$extern_stage1" | sed -E -n 's/^  (L[0-9]+) (raise cannot propagate tag|raise requires the current function).*$/\1/p' | LC_ALL=C sort)"
+if [[ "$extern_status" -eq 0 || "$extern_rows" != $'L15\nL17\nL21' || "$extern_stage1_rows" != "$extern_rows" ]] \
+    || ! grep -q '^P 0$' <<< "$extern_stage1" || ! grep -q '^D 3$' <<< "$extern_stage1"; then
+    printf 'extern callback error contracts disagree:\nStage0:\n%s\nStage1:\n%s\n' "$extern_core" "$extern_stage1" >&2
+    exit 1
+fi
+
 echo "overloaded Lambda raise smoke OK"
