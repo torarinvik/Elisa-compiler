@@ -9,4 +9,8 @@ if grep -Fq 'linear value "matching_ticket" must be consumed before scope exit' 
     echo "affine region binding identity: same-region argument lost its consuming postcondition" >&2
     exit 1
 fi
+if grep -Fq 'linear value "nominal_ticket" must be consumed before scope exit' <<< "$out"; then
+    echo "affine region binding identity: out-of-scope region name hid a nominal type" >&2
+    exit 1
+fi
 echo 'affine region binding identity OK'
