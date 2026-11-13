@@ -46,11 +46,27 @@ def may_value() -> i64 error[E]:
     return 1
 
 def nested(flag: bool) -> i64:
+    pair = (try may_value() else "".cast[u8&], 0) if flag else (0, 0)
+    return 0
+ELISA
+)
+grep -q "try fallback expects i64, got u8&" <<< "$nested_fallback" || fail "nested conditional/tuple fallback type mismatch not flagged: $nested_fallback"
+
+# A numeric cast is compatible with the integer payload; preserve this control
+# alongside the mismatched reference case above.
+numeric_fallback=$(cat <<'ELISA' | "$RPT"
+error E:
+    Bad(sview)
+
+def may_value() -> i64 error[E]:
+    return 1
+
+def nested(flag: bool) -> i64:
     pair = (try may_value() else "".cast[u8], 0) if flag else (0, 0)
     return 0
 ELISA
 )
-grep -q "try fallback expects i64, got u8" <<< "$nested_fallback" || fail "nested conditional/tuple fallback type mismatch not flagged: $nested_fallback"
+grep -q "try fallback expects" <<< "$numeric_fallback" && fail "numeric fallback incorrectly rejected: $numeric_fallback"
 
 # 6. The compiler must not TRAP on the offending shape, and must agree with stage0.
 #    (rc=133 is 128+SIGTRAP, the original crash. Checking the rc, not the wording, is the
