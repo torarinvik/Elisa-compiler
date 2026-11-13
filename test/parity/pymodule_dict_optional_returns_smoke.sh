@@ -43,13 +43,18 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     source = handle.read()
 
-cleanup = "arena_free(&arg0_arena); Py_DECREF(arg0);"
 for name in ("text_from_dict", "view_from_dict", "object_from_dict", "nullable_text_from_dict", "list_from_dict"):
     start = source.index(f"static PyObject *elisa_py_{name}")
     next_wrapper = source.find("\nstatic PyObject *elisa_py_", start + 1)
     body = source[start:] if next_wrapper < 0 else source[start:next_wrapper]
     native_call = body.index(f"elisa_pymodule_dict_optional_returns_{name}")
-    assert cleanup in body[native_call:], name
+    after_call = body[native_call:]
+    cleanup_paths = [line for line in after_call.splitlines() if "arena_free(&arg0_arena);" in line]
+    assert cleanup_paths, name
+    for cleanup in cleanup_paths:
+        assert "if (arg0_materialized)" in cleanup, name
+        assert cleanup.index("arg0 = NULL;") < cleanup.index("arena_free(&arg0_arena);"), name
+        assert cleanup.index("arena_free(&arg0_arena);") < cleanup.index("Py_XDECREF(elisa_cleanup_owned_arg0);"), name
 PY
 
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
