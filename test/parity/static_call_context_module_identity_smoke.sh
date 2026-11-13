@@ -18,23 +18,30 @@ for row in "stage0:$S0" "stage1:$S1"; do
     rc=0
     "$compiler" -emit llvm -o "$WORK/$stage.ll" "$ROOT/test/repro/static_call_context_module_identity.elisa" >"$WORK/$stage.out" 2>"$WORK/$stage.err" || rc=$?
     [[ "$rc" -eq 1 ]] || fail "$stage should diagnose Runtime.parse calling the static helper, got exit $rc"
-    grep -Fq 'static function "helper" can only be called from a static context' "$WORK/$stage.err" || fail "$stage missed the static helper call in the runtime parse body"
-    grep -Fq 'static function "hidden" can only be called from a static context' "$WORK/$stage.err" || fail "$stage missed static calls nested in runtime expressions"
-    hidden_count="$(grep -Fc 'static function "hidden" can only be called from a static context' "$WORK/$stage.err" || true)"
+    if [[ "$stage" == stage0 ]]; then
+        for qualified in Runtime.helper NestedCalls.hidden Outer.ancestor_helper BranchSelection.branch_static; do
+            grep -Fq "static function \"$qualified\" can only be called from a static context" "$WORK/$stage.err" || fail "stage0 missed the resolved owner of $qualified"
+        done
+    fi
+    # Preserve the exact owner checks above and compare diagnostic counts by leaf name.
+    sed -E 's/(static function ")[[:alnum:]_.]+\./\1/g' "$WORK/$stage.err" > "$WORK/$stage.normalized.err"
+    grep -Fq 'static function "helper" can only be called from a static context' "$WORK/$stage.normalized.err" || fail "$stage missed the static helper call in the runtime parse body"
+    grep -Fq 'static function "hidden" can only be called from a static context' "$WORK/$stage.normalized.err" || fail "$stage missed static calls nested in runtime expressions"
+    hidden_count="$(grep -Fc 'static function "hidden" can only be called from a static context' "$WORK/$stage.normalized.err" || true)"
     [[ "$hidden_count" -eq 8 ]] || fail "$stage should report all eight nested runtime hidden() calls, got $hidden_count"
-    grep -Fq 'static function "ancestor_helper" can only be called from a static context' "$WORK/$stage.err" || fail "$stage missed the ancestor static helper call in the nested module body"
-    if grep -Fq 'static function "parse" can only be called from a static context' "$WORK/$stage.err"; then
+    grep -Fq 'static function "ancestor_helper" can only be called from a static context' "$WORK/$stage.normalized.err" || fail "$stage missed the ancestor static helper call in the nested module body"
+    if grep -Fq 'static function "parse" can only be called from a static context' "$WORK/$stage.normalized.err"; then
         fail "$stage treated Runtime.caller's runtime parse call as the sibling Compile.parse static function"
     fi
-    if grep -Fq 'static function "branch_pick" can only be called from a static context' "$WORK/$stage.err"; then
+    if grep -Fq 'static function "branch_pick" can only be called from a static context' "$WORK/$stage.normalized.err"; then
         fail "$stage treated BranchSelection's inactive static overload as the selected runtime branch"
     fi
-    branch_static_count="$(grep -Fc 'static function "branch_static" can only be called from a static context' "$WORK/$stage.err" || true)"
+    branch_static_count="$(grep -Fc 'static function "branch_static" can only be called from a static context' "$WORK/$stage.normalized.err" || true)"
     [[ "$branch_static_count" -eq 1 ]] || fail "$stage should diagnose only the selected static-if runtime caller, not the inactive arm or bare static block (got $branch_static_count)"
-    if grep -Fq 'static function "shadowed_helper" can only be called from a static context' "$WORK/$stage.err"; then
+    if grep -Fq 'static function "shadowed_helper" can only be called from a static context' "$WORK/$stage.normalized.err"; then
         fail "$stage let an ancestor static function outrank a nearer runtime declaration"
     fi
-    if grep -Fq 'static function "choose" can only be called from a static context' "$WORK/$stage.err"; then
+    if grep -Fq 'static function "choose" can only be called from a static context' "$WORK/$stage.normalized.err"; then
         fail "$stage diagnosed a same-scope mixed overload without knowing which overload the call selects"
     fi
 done
