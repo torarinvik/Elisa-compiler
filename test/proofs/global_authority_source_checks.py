@@ -193,7 +193,8 @@ def check_global_authority_source(
     alias_diagnostic_source = ALIAS_CONFLICT_DIAGNOSTICS.read_text()
     if not all(fragment in alias_conflict_checker for fragment in (
             "forcurrent_aliasintable.definite_import_annotations",
-            "semantic_import_alias_is_global_winner(winner,table)",
+            "is_winner<-falseifnotorder.knownororder.precedes",
+            "semantic_possible_import_alias_precedes(possible,winner,table)",
             "semantic_possible_import_alias_precedes(winner,current_alias,table)",
             "current_target.target",
             "winner_target.target",
@@ -461,8 +462,9 @@ return GLOBAL_AUTHORITY_UNKNOWN_ALIAS if:
     ):
         if fragment not in variant_origin:
             raise SystemExit("enum payload origin summaries must join the exact constructor arguments and fail closed")
-    if "Expr.Call(callee,arguments,labels,_):variant_slot:usize=ga_enum_variant_slot(callee,state)" not in origin_walk or \
-            "ga_enum_constructor_origin(variant_slot,arguments,labels,state,depth+1)" not in origin_walk:
+    if 'Expr.Call(callee,arguments,labels,_):returnGLOBAL_AUTHORITY_NONEifident_name_of(callee)=="raise"' not in origin_walk or \
+            "variant_slot:usize=ga_enum_variant_slot(callee,state)" not in origin_walk or \
+            "returnga_enum_constructor_origin(variant_slot,arguments,labels,state,depth+1)ifvariant_slot<state.enum_variant_names.count" not in origin_walk:
         raise SystemExit("only resolved enum constructors may expose their payload origins")
     type_expression_classifier = compact(function_section(authority_types_text, "ga_type_expression_contains_reference"))
     if "returntrueifga_reference_type(resolved,state,depth+1)" not in type_expression_classifier or \

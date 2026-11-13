@@ -143,6 +143,7 @@ static_row_selection = compact(function_section(authority_text, "ga_static_if_ro
 static_condition_fold = compact(function_section(authority_text, "ga_static_if_condition_value"))
 static_target_fold = compact(function_section(authority_text, "ga_static_if_target_constant"))
 static_target_predicate = compact(function_section(authority_text, "ga_static_if_target_predicate"))
+explicit_target_fold = compact(function_section((ROOT / "src/semantic/static_target_predicates.elisa").read_text(), "semantic_explicit_target_constant"))
 alias_branch_selection = compact(function_section(authority_text, "ga_module_alias_branch_selection"))
 if not all(fragment in static_condition_fold for fragment in (
         "Expr.Unary(operator,operand,_)",
@@ -156,10 +157,11 @@ if not all(fragment in static_condition_fold for fragment in (
     raise SystemExit("GlobalAuthority static-if fold no longer follows the backend's checked integer expression subset")
 if not all(fragment in static_target_fold for fragment in (
         'getenv("ELISA_STAGE1_TRIPLE")istarget_triple',
-        "return(false,0)ifexplicit_triple")) or \
+        "returnsemantic_explicit_target_constant(name,target_text)ifsemantic_target_has_text(target_text)")) or \
+        "return(false,0)" not in explicit_target_fold or \
         'name=="ELISA_TARGET_OS_LINUX"' not in static_target_predicate or \
         "return(false,0,true)ifga_static_if_target_predicate(name)" not in static_condition_fold:
-    raise SystemExit("unresolved explicit-target predicates must stay backend-foldable and uncertain to GlobalAuthority")
+    raise SystemExit("explicit target predicates must use the shared target resolver and retain an unknown fallback")
 if not all(fragment in static_row_selection for fragment in (
         "static_if_depths[row]!=branch_depth",
         "branch_kind==StaticIfBranch::Kind.Fallback",
