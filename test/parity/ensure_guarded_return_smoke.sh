@@ -98,6 +98,10 @@ check_case captured_loop_dead_by_requires $'def choose(n: i64) -> i64:\n    requ
 # a different parameter and is directly present in the function body.
 check_case protocol_default_captured_loop $'protocol Eq:\n    def eq(self: Self, other: Self) -> bool\n    def choose(a: Self, b: Self, n: i64) -> Self:\n        ensure result.eq(a)\n        while n > 0 |n|:\n            return a\n        return b\n'
 
+# An unreachable captured-loop path must not receive a return-site warning.
+check_case protocol_default_dead_captured_loop $'protocol Eq:\n    def eq(self: Self, other: Self) -> bool\n    def choose(a: Self, b: Self, n: i64) -> Self:\n        requires n <= 0\n        ensure result.eq(a)\n        while n > 0 |n|:\n            return a\n        return b\n'
+# Explicit relational preconditions establish the contract on both return paths.
+check_case protocol_default_proven_by_requires $'protocol Eq:\n    def eq(self: Self, other: Self) -> bool\n    def choose(a: Self, b: Self, n: i64) -> Self:\n        requires a.eq(a) and b.eq(a)\n        ensure result.eq(a)\n        while n > 0 |n|:\n            return a\n        return b\n'
 if [ "$failed" -ne 0 ]; then
     echo "ensure guarded-return smoke FAILED: $failed/$checked cases disagree" >&2
     exit 1
