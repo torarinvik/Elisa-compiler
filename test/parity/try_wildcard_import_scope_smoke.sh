@@ -28,12 +28,24 @@ module Sibling:
             return try copied'
 report=$(printf '%s\n' "$case_source" | "$RPT")
 
-[[ $(grep -c 'try requires a fallible expression' <<< "$report") -eq 1 ]] || {
-    echo "try wildcard import scope FAILED: nested import leaked into or disappeared from the wrong module: $report"
+[[ $(grep -c 'undefined identifier "load"' <<< "$report") -eq 1 ]] || {
+    echo "try wildcard import scope FAILED: sibling must not inherit Importer's load: $report"
     exit 1
 }
 ! grep -q 'cannot propagate E from a function returning F' <<< "$report" || {
     echo "try wildcard import scope FAILED: sibling inherited another module's import: $report"
+    exit 1
+}
+# A visible sibling-local function is non-fallible: `try` must reject its value,
+# while Importer's separate wildcard import remains fallible and valid.
+local_source=${case_source/module Sibling:/$'module Sibling:\n    public:\n        def load() -> i64:\n            return 0'}
+local_report=$(printf '%s\n' "$local_source" | "$RPT")
+[[ $(grep -c 'try requires a fallible expression' <<< "$local_report") -eq 1 ]] || {
+    echo "try wildcard import scope FAILED: sibling local function lost its type: $local_report"
+    exit 1
+}
+! grep -q 'undefined identifier "load"' <<< "$local_report" || {
+    echo "try wildcard import scope FAILED: sibling local function was not visible: $local_report"
     exit 1
 }
 
