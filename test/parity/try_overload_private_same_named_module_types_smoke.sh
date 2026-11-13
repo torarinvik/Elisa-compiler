@@ -33,7 +33,11 @@ stage1_output="$("$RPT" < "$FIXTURE")"
 if grep -qF 'try requires a fallible expression' <<< "$stage1_output"; then
   fail "Stage1 cascaded `try` diagnostics after the invalid private call: $stage1_output"
 fi
-grep -qF 'try_overload_private_same_named_module_types.elisa' <<< "$stage1_output" \
-  || fail "Stage1 diagnostics did not retain the focused source path: $stage1_output"
+# The reporter reads stdin and reports logical lines, not a file path. Check both
+# call sites explicitly so a duplicate diagnostic at one site cannot mask another.
+for line in 24 27; do
+  grep -qF "L$line \"NamedProvider.inspect\" is private to module \"NamedProvider\"" <<< "$stage1_output" \
+    || fail "Stage1 missed the private winner at line $line: $stage1_output"
+done
 
 echo "try same-named module types smoke OK"
