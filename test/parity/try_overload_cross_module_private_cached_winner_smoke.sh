@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A hidden overload reached through a selective alias can win across modules.
+# A sibling-only private alias must not enter another module’s overload set.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,20 +20,17 @@ set +e
 stage0_output="$("$ELISACORE_BIN" -emit semantic "$FIXTURE" 2>&1)"
 stage0_rc=$?
 set -e
-[[ "$stage0_rc" -ne 0 ]] || fail "Stage0 accepted the inaccessible cross-module winner"
-[[ $(grep -cF 'is private to module' <<< "$stage0_output") == 2 ]] \
-    || fail "Stage0 did not reject both direct and cached private winners: $stage0_output"
-[[ $(grep -cF 'try requires a fallible expression' <<< "$stage0_output") == 2 ]] \
-    || fail "Stage0 did not reject both invalid Try expressions: $stage0_output"
-[[ $(grep -cF 'cannot propagate' <<< "$stage0_output") == 2 ]] \
-    || fail "Stage0 failed to preserve direct and cached public generic controls: $stage0_output"
-
+[[ "$stage0_rc" -ne 0 ]] || fail "Stage0 accepted the mismatched generic error family"
 stage1_output="$("$RPT" < "$FIXTURE")"
-[[ $(grep -cF 'is private to module' <<< "$stage1_output") == 2 ]] \
-    || fail "Stage1 did not reject both direct and cached private winners: $stage1_output"
-[[ $(grep -cF 'try requires a fallible expression' <<< "$stage1_output") == 2 ]] \
-    || fail "Stage1 did not reject both invalid Try expressions: $stage1_output"
-[[ $(grep -cF 'cannot propagate' <<< "$stage1_output") == 2 ]] \
-    || fail "Stage1 failed to preserve direct and cached public generic controls: $stage1_output"
+grep -q '^D 4$' <<< "$stage1_output" || fail "Stage1 reported an unexpected diagnostic count: $stage1_output"
+for line in 30 34 37 41; do
+    grep -Eq ":${line}:[0-9]+[^:]*: cannot propagate LibA\.GenericFault from a function returning App\.Destination" <<< "$stage0_output" \
+        || fail "Stage0 missed the public generic family at line $line: $stage0_output"
+    grep -qF "L$line cannot propagate GenericFault from a function returning Destination" <<< "$stage1_output" \
+        || fail "Stage1 missed the public generic family at line $line: $stage1_output"
+done
+if grep -qE 'is private to module|try requires a fallible expression' <<< "$stage0_output$stage1_output"; then
+    fail "A sibling-only private import affected an unrelated caller: $stage0_output $stage1_output"
+fi
 
-echo "cross-module Try private-winner smoke OK"
+echo "cross-module Try sibling-private-import smoke OK"
