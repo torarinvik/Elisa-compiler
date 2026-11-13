@@ -22,6 +22,8 @@ grep -Fq 'linear value "held.borrow" cannot be used: usage facts were consumed b
 [[ $(grep -Fc 'cannot be used: usage facts were consumed' <<< "$field_borrow") == 1 ]] || fail "unrelated sibling field was treated as borrowed: $field_borrow"
 scalar_copy=$(printf 'affine struct Handle:\n    value: i64\nstruct Holder:\n    borrow: Handle&\ndef sink(h: Handle) -> void:\n    pass\ndef ok() -> i64:\n    owner: Handle = Handle{value: 1}\n    held: Holder = Holder{borrow: &owner}\n    copied: i64 = held.borrow.value\n    sink(move owner)\n    return copied\n' | "$RPT")
 grep -q '^D 0$' <<< "$scalar_copy" || fail "scalar copied before owner move was treated as borrowed: $scalar_copy"
+payload_projection=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/affine_move_projection.pos.elisa")
+grep -Fq 'linear value "p.h" must be moved explicitly before move into enum payload "Box.Full" argument 1' <<< "$payload_projection" || fail "enum payload diagnostic lost its field path: $payload_projection"
 
 # A `linear` struct is borrowable for the same reason; a `darray` of them is NOT.
 linear_ref=$(printf 'linear struct Guard:\n    raw: mutable uintptr\ndef ok(guard: Guard&) -> void:\n    pass\ndef bad(guards: darray[Guard]&) -> void:\n    pass\n' | "$RPT")
