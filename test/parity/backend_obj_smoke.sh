@@ -125,7 +125,39 @@ obj_case recursive_generic 'struct Node[T]:\n    value: T\n    next: Node[T]&?\n
 obj_case parallel_range 'def for_indices_par(n: usize, body: fn(usize) -> i64, w: usize = 0.usize()) -> void:\n    return\n\ndef main() -> i64:\n    total: usize = 4.usize()\n    for i in 0.usize() ..< total by par:\n        _ = i.i64()\n    return 42\n' 42
 obj_case parallel_band_generic 'struct Slice[T]:\n    base: usize\n    count: usize\n\ndef each[T](s: Slice[T], body: fn(Slice[T]) -> i64, w: usize) -> void:\n    return\n\ndef main() -> i64:\n    whole: Slice[i64] = Slice[i64]{base: 0.usize(), count: 1.usize()}\n    parallel for band in whole:\n        _ = band.count.i64()\n    return 42\n' 42
 obj_case pool_scope 'struct ThreadPool:\n    handle: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef main() -> i64:\n    pool workers(2):\n        pass\n    return 42\n' 42
-obj_case nursery_submit 'struct ThreadPool:\n    handle: void&?\n\nstruct TaskGroup:\n    handle: void&?\n    cleanup: void&?\n\nstruct Task[T, S]:\n    handle: usize\n    state: void&?\n\ndef pool_new(threads: usize) -> ThreadPool:\n    return ThreadPool{handle: null}\n\ndef pool_shutdown(pool: ThreadPool&) -> void:\n    return\n\ndef task_group_new() -> TaskGroup:\n    return TaskGroup{handle: null, cleanup: null}\n\ndef task_group_wait_all(group: TaskGroup&) -> void:\n    return\n\ndef pool_submit1[A, R](pool: ThreadPool&, fn: fn(A) -> R, arg: A) -> Task[R, i64]:\n    return zeroed\n\ndef task_group_add[R](group: TaskGroup&, task: Task[R, i64]) -> void:\n    _ = move task\n    return\n\ndef bump(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    nursery workers(2):\n        submit bump(41)\n    return 42\n' 42
+# The stdin emitter has no trusted source identity. Exercise native object emission
+# for nursery submission through the product, which resolves the bundled runtime.
+nursery_object_case() {
+    total=$((total + 1))
+    local compiler="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+    local dir unit result
+    dir="$(mktemp -d "$BUILD/obj_nursery_submit.XXXXXX")" || return
+    for unit in elisacore_runtime_concurrency elisacore_runtime_prelude collections elisacore_runtime_strings; do
+        printf 'include "%s/elisacore_std/%s.elisa"\n' "$ROOT" "$unit"
+    done > "$dir/source.elisa"
+    cat >> "$dir/source.elisa" <<'ELISA'
+def bump(value: i64) -> i64:
+    return value + 1
+
+def main() -> i64:
+    nursery workers(2):
+        submit bump(41)
+    return 42
+ELISA
+    if bash "$ROOT/scripts/assert_stage1_fresh.sh" "$compiler" &&
+       RUN "$compiler" -emit obj -O2 -o "$dir/program.o" "$dir/source.elisa" &&
+       clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$dir/program" "$dir/program.o" "$RUNTIME_OBJ"; then
+        RUN "$dir/program"
+        result=$?
+        if [[ "$result" == 42 ]]; then
+            pass=$((pass + 1))
+            rm -rf -- "$dir"
+            return
+        fi
+    fi
+    echo "  FAIL obj_nursery_submit: compile, link or execution failed (artifacts: $dir)"
+}
+nursery_object_case
 obj_case await_task 'struct Task[T, S]:\n    handle: usize\n    state: void&?\n\ndef pool_await[R](task: Task[R, i64]) -> R:\n    return 42\n\ndef main() -> i64:\n    t: Task[i64, i64] = zeroed\n    return await t\n' 42
 obj_case comprehension 'def main() -> i64:\n    xs: darray[i64] = [i for i in 0..<10]\n    return (xs[3] can Unsafe.UncheckedIndex) + 39\n' 42
 obj_case struct   'struct P:\n    x: i64\n    y: i64\n\ndef main() -> i64:\n    p: P = P{x: 40, y: 2}\n    return p.x + p.y\n' 42
