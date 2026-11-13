@@ -181,7 +181,7 @@ expected_identifier_scan_body = [
     "lexer.position <- lexer.position + 1.usize()",
     "lexer.column <- lexer.column + 1",
     "-> ScanIdentifier",
-    "ScanIdentifier, _ if lexer.continues_unicode_identifier():",
+    "ScanIdentifier, character if character >= 128.char() and lexer.continues_unicode_identifier():",
     "lexer <- lexer.advance_latin1_identifier_char()",
     "-> ScanIdentifier",
     "ScanIdentifier, _:",
