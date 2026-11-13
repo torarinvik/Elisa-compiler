@@ -23,7 +23,7 @@ LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 LIBDIR="$("$LLVM_CONFIG" --libdir)"
 LLVM_DIS="$("$LLVM_CONFIG" --bindir)/llvm-dis"
 BUILD="$ROOT/build"; mkdir -p "$BUILD"
-RUNTIME_OBJ="$BUILD/runtime/elisacore_runtime.o"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$BUILD/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || { echo "backend_obj_smoke FAIL: no runtime object" >&2; exit 1; }
 FALLBACK_OBJ="$BUILD/runtime_fallback.o"
 clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"

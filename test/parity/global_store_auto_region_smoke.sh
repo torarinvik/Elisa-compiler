@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$ROOT/scripts/platform.sh"
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 CLANG="${ELISA_CLANG:-$ELISA_LLVM_BIN_DIR/clang}"
 [[ -x "$STAGE1" ]] || { echo "global-store auto-region smoke: missing stage1 compiler: $STAGE1" >&2; exit 2; }
 cd "$ROOT"
@@ -21,7 +22,7 @@ done
 # the caller's short-lived region is freed, not merely happen to retain readable
 # bytes in an ordinary build.
 "$STAGE1" -emit llvm -O0 -o "$WORK/asan.ll" "$ROOT/test/parity/fixtures/global_store_region_handoff.elisa" >"$WORK/asan-emit.log" 2>&1 || { cat "$WORK/asan-emit.log" >&2; echo "global-store auto-region smoke FAIL: ASan IR emit" >&2; exit 1; }
-"$CLANG" -O1 -g -fsanitize=address -fno-omit-frame-pointer $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS "$WORK/asan.ll" "$ROOT/build/runtime/elisacore_runtime.o" -o "$WORK/asan" >"$WORK/asan-link.log" 2>&1 || { cat "$WORK/asan-link.log" >&2; echo "global-store auto-region smoke FAIL: ASan link" >&2; exit 1; }
+"$CLANG" -O1 -g -fsanitize=address -fno-omit-frame-pointer $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS "$WORK/asan.ll" "$RUNTIME_OBJ" -o "$WORK/asan" >"$WORK/asan-link.log" 2>&1 || { cat "$WORK/asan-link.log" >&2; echo "global-store auto-region smoke FAIL: ASan link" >&2; exit 1; }
 rc=0; ASAN_OPTIONS=detect_leaks=0 "$WORK/asan" || rc=$?
 [[ "$rc" -eq 42 ]] || { echo "global-store auto-region smoke FAIL: ASan exit $rc, want 42 (global retained caller-region storage)" >&2; exit 1; }
 echo "global-store auto-region smoke OK"
