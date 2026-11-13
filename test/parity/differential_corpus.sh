@@ -254,6 +254,8 @@ one_program() {
         compile_status=$?
         if [[ "$compile_status" -eq 124 ]]; then
             printf 'TIMEOUT\t%s\tstage0 compile; log=%s\n' "$name" "$COMPILE_LOG"
+        elif [[ "$compile_status" -gt 125 ]] || grep -Eq '^(panic: |fatal error: |Stage0 provenance mismatch:|Stage0 oracle binary is stale|build incomplete:)' "$COMPILE_LOG"; then
+            printf 'ORACLE_FAILURE\t%s\tstage0 compile exit=%s; log=%s\n' "$name" "$compile_status" "$COMPILE_LOG"
         else
             printf 'SKIP\t%s\tstage0 compile exit=%s; log=%s\n' "$name" "$compile_status" "$COMPILE_LOG"
         fi
@@ -359,7 +361,8 @@ awk -F'\t' '$1=="FLAKY"{print $2" "$3}' "$WORK/results.txt" > "$WORK/flaky.txt"
 awk -F'\t' '$1=="INTERMITTENT"{print $2" "$3}' "$WORK/results.txt" > "$WORK/intermittent.txt"
 
 timed_out="$(count_kind TIMEOUT)"
-total=$((match + mismatch + declined + skipped + intermittent + timed_out))
+oracle_failures="$(count_kind ORACLE_FAILURE)"
+total=$((match + mismatch + declined + skipped + intermittent + timed_out + oracle_failures))
 echo "differential corpus: $total programs — $match match, $mismatch MISMATCH, $declined declined, $skipped skipped (stage0 could not arbitrate)" >&2
 
 if [ "$mismatch" -gt 0 ]; then
@@ -405,6 +408,11 @@ fi
 if [ "$timed_out" -gt 0 ]; then
     echo "differential corpus INCONCLUSIVE: $timed_out compile or execution timeouts; no parity qualification" >&2
     awk -F'\t' '$1=="TIMEOUT"{print $2" "$3}' "$WORK/results.txt" >&2
+    rc=1
+fi
+if [ "$oracle_failures" -gt 0 ]; then
+    echo "differential corpus INCONCLUSIVE: $oracle_failures Stage0 compiler failures" >&2
+    awk -F'\t' '$1=="ORACLE_FAILURE"{print $2" "$3}' "$WORK/results.txt" >&2
     rc=1
 fi
 if [ "$mismatch" -gt 0 ]; then
