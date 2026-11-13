@@ -17,6 +17,10 @@ grep -Fq 'references to values containing linear handles' <<< "$address" && fail
 moved=$(printf 'affine struct Handle:\n    raw: mutable uintptr\ndef sink(h: Handle) -> void:\n    pass\ndef bad(handle: Handle) -> void:\n    borrow: Handle& = &handle\n    sink(move handle)\n    _ = borrow\n' | "$RPT")
 grep -Fq 'linear value "borrow" cannot be used: usage facts were consumed by argument to call "sink"' <<< "$moved" || fail "borrow used after its owner moved accepted: $moved"
 
+field_borrow=$(printf 'affine struct Handle:\n    value: i64\nstruct Holder:\n    borrow: Handle&\n    count: i64\ndef sink(h: Handle) -> void:\n    pass\ndef peek(h: Handle&) -> i64:\n    h.value\ndef bad() -> i64:\n    owner: Handle = Handle{value: 1}\n    held: Holder = Holder{borrow: &owner, count: 4}\n    sink(move owner)\n    return peek(held.borrow)\ndef ok() -> i64:\n    owner: Handle = Handle{value: 1}\n    held: Holder = Holder{borrow: &owner, count: 4}\n    sink(move owner)\n    return held.count\n' | "$RPT")
+grep -Fq 'linear value "held.borrow" cannot be used: usage facts were consumed by argument to call "sink"' <<< "$field_borrow" || fail "field borrow used after its owner moved accepted: $field_borrow"
+[[ $(grep -Fc 'cannot be used: usage facts were consumed' <<< "$field_borrow") == 1 ]] || fail "unrelated sibling field was treated as borrowed: $field_borrow"
+
 # A `linear` struct is borrowable for the same reason; a `darray` of them is NOT.
 linear_ref=$(printf 'linear struct Guard:\n    raw: mutable uintptr\ndef ok(guard: Guard&) -> void:\n    pass\ndef bad(guards: darray[Guard]&) -> void:\n    pass\n' | "$RPT")
 grep -Fq 'got Guard&' <<< "$linear_ref" && fail "linear owner reference rejected: $linear_ref"
