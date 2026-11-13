@@ -48,4 +48,12 @@ if ! grep -qx 'P 0' <<< "$scoped_report" || ! grep -qx 'D 2' <<< "$scoped_report
     exit 1
 fi
 
+mixed_report="$("$RPT" < "$REPO_ROOT/test/repro/fn_value_extern_mixed_effects.elisa")"
+if ! grep -qx 'P 0' <<< "$mixed_report" || ! grep -qx 'D 1' <<< "$mixed_report" \
+    || ! grep -Fq 'variable "bad" expects fn() -> void can[Console], got fn() -> void can[Console, Memory]' <<< "$mixed_report"; then
+    echo "function-value extern module-row smoke: canonical and extern rows did not combine" >&2
+    printf '%s\n' "$mixed_report" >&2
+    exit 1
+fi
+
 echo "function-value extern module-row smoke OK"
