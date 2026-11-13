@@ -81,6 +81,7 @@ for name, body in {
 }.items():
     source = work / (name + '.elisa')
     source.write_text(state_prefix + 'def main() -> i64:\n' + body)
+    source = source.resolve()
     rejections = []
     for compiler in (stage0, stage1):
         result = subprocess.run([compiler, '-emit', 'obj', '-o', str(work/'invalid.o'), str(source)], capture_output=True, timeout=60)
