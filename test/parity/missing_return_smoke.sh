@@ -34,8 +34,11 @@ grep -q "may fall through" <<< "$out" && fail "false positive on two-arm abortin
 grep -q "unreachable code" <<< "$out" || fail "statement after two-arm aborting conditional not flagged: $out"
 
 # 6. An unknown condition with only one aborting arm is not a terminator.
-out=$(printf 'def f(flag: bool) -> i64:\n    1 if flag else panic("right")\n' | "$RPT")
+# Keep it out of tail position: a final value expression is an implicit return.
+out=$(printf 'def f(flag: bool) -> i64:\n    1 if flag else panic("right")\n    pass\n' | "$RPT")
 grep -q "may fall through without returning a value" <<< "$out" || fail "one-arm aborting conditional hid a fall-through path: $out"
+out=$(printf 'def f(flag: bool) -> i64:\n    1 if flag else panic("right")\n' | "$RPT")
+grep -q "may fall through" <<< "$out" && fail "tail conditional must return its continuing value: $out"
 
 # 7. A value block whose tail panics MUST terminate, and following code is unreachable.
 out=$(printf 'def f() -> i64:\n    do:\n        panic("bad")\n    return 0\n' | "$RPT")
