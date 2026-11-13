@@ -55,4 +55,12 @@ set -e
 [[ "$stage0_valid_status" -eq 0 ]] || { echo "packed sparse word bounds smoke: stage0 valid final word failed (status $stage0_valid_status)" >&2; exit 1; }
 [[ "$stage0_oob_status" -ne 0 ]] || { echo "packed sparse word bounds smoke: stage0 out-of-range row read returned normally" >&2; exit 1; }
 
+for log in "$WORK/oob.run.log" "$WORK/oob.stage0.run.log"; do
+    if ! grep -Fq "packed store row word offset out of bounds" "$log"; then
+        echo "packed sparse word bounds smoke: $(basename "$log") failed without the row-bounds panic" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+done
+
 echo "packed sparse word bounds smoke OK: stage0/stage1 valid row reads; out-of-range reads trap"
