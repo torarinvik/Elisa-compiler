@@ -14,7 +14,7 @@
 #   MATCH     both compiled, linked, ran, same exit code                — the good case
 #   MISMATCH  both ran, DIFFERENT exit codes                            — a silent miscompile
 #   DECLINED  stage0 built it, stage1 could not compile or link it      — the acceptance gap
-#   SKIP      stage0 itself could not build/link/run it                 — not a parity signal
+#   SKIP      stage0 could not compile or link it                     — not a parity signal
 #
 # MISMATCH is ratcheted at zero: a wrong answer is worse than a decline, because a decline
 # is loud (an undefined symbol at link) and a wrong answer is not. DECLINED is ratcheted
@@ -261,8 +261,10 @@ one_program() {
     fi
     if ! link_program "$work/s0" "$work/s0.o"; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
     RUN "$work/s0"; local s0_rc=$?
-    # 124 = timeout. An oracle that hangs cannot arbitrate.
-    if [ "$s0_rc" -eq 124 ]; then printf 'SKIP\t%s\t\n' "$name"; return 0; fi
+    if [ "$s0_rc" -eq 124 ]; then
+        printf 'TIMEOUT\t%s\tstage0 run; executable=%s\n' "$name" "$work/s0"
+        return 0
+    fi
     # ---- stage1. A compile or link failure is the ACCEPTANCE gap, not a wrong answer:
     # a declined function is dropped, so the link fails with an undefined symbol.
     COMPILE_LOG="$work/stage1.compile.log"
@@ -288,9 +290,21 @@ one_program() {
     if [ "$s0_rc" != "$s1_rc" ]; then
         RUN "$work/s0"; local s0_rc2=$?
         RUN "$work/s1"; local s1_rc2=$?
+        if [ "$s1_rc2" -eq 124 ]; then
+            RUN_LONG "$work/s1"; s1_rc2=$?
+            if [ "$s1_rc2" -eq 124 ]; then
+                printf 'TIMEOUT\t%s\tstage1 run; executable=%s\n' "$name" "$work/s1"
+                return 0
+            fi
+        fi
+        if [ "$s1_rc" -eq 124 ]; then s1_rc=$s1_rc2; fi
         # Only an UNSTABLE ORACLE justifies a skip. An unstable STAGE1 is a stage1 defect
         # (an intermittent segfault is worse than a steady wrong answer, not a reason to
         # look away): it is reported as a MISMATCH unless triaged in KNOWN_INTERMITTENT.
+        if [ "$s0_rc2" -eq 124 ]; then
+            printf 'TIMEOUT\t%s\tstage0 repeat run; executable=%s\n' "$name" "$work/s0"
+            return 0
+        fi
         if [ "$s0_rc" != "$s0_rc2" ]; then
             printf 'FLAKY\t%s\t(oracle nondeterministic: stage0 %s/%s)\n' "$name" "$s0_rc" "$s0_rc2"; return 0
         fi
@@ -300,22 +314,12 @@ one_program() {
         if [ "$s1_rc" != "$s1_rc2" ]; then
             printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%s/%s (INTERMITTENT)  %s' "$name" "$s0_rc" "$s1_rc" "$s1_rc2" "$src")"; return 0
         fi
-        # A reproduced stage1 TIMEOUT is not an answer. Give it one uncontended-sized budget
-        # before believing it (see RUN_LONG); the oracle already answered, so only stage1 runs.
-        if [ "$s1_rc2" -eq 124 ] && [ "$s0_rc2" -ne 124 ]; then
-            RUN_LONG "$work/s1"; local s1_rc3=$?
-            if [ "$s1_rc3" -ne 124 ]; then s1_rc2=$s1_rc3; fi
-        fi
         s0_rc=$s0_rc2; s1_rc=$s1_rc2
     fi
     if [ "$s0_rc" -eq "$s1_rc" ]; then
         printf 'MATCH\t%s\t\n' "$name"
     else
-        if [ "$s1_rc" -eq 124 ]; then
-            printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=TIMEOUT  %s' "$name" "$s0_rc" "$src")"
-        else
-            printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%-4s  %s' "$name" "$s0_rc" "$s1_rc" "$src")"
-        fi
+        printf 'MISMATCH\t%s\t%s\n' "$name" "$(printf '%-44s stage0=%-4s stage1=%-4s  %s' "$name" "$s0_rc" "$s1_rc" "$src")"
     fi
 }
 
@@ -337,6 +341,8 @@ mkdir -p "$WORK/res"
 tr '\n' '\0' < "$WORK/programs.txt" \
   | xargs -0 -P "$JOBS" -n 1 env ELISACORE_BIN="$ELISACORE_BIN" ELISA_STAGE1_BIN="$STAGE1" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" ELISA_CORE="$ELISA_CORE" LLVM_CONFIG="$LLVM_CONFIG" \
       bash "$0" --one "$WORK"
+
+dispatch_status=$?
 
 # Reduce: one line per program, deterministic order.
 cat "$WORK/res"/r.* 2>/dev/null | sort > "$WORK/results.txt"
@@ -387,8 +393,13 @@ allowed_declines=0
 [ -f "$BASELINE" ] && allowed_declines="$(tr -d '[:space:]' < "$BASELINE")"
 
 rc=0
+expected="$(wc -l < "$WORK/programs.txt")"
+if [[ "$dispatch_status" -ne 0 || "$total" -ne "$expected" || "$expected" -eq 0 ]]; then
+    echo "differential corpus INCONCLUSIVE: recorded $total of $((expected)) verdicts (dispatch exit $dispatch_status)" >&2
+    rc=1
+fi
 if [ "$timed_out" -gt 0 ]; then
-    echo "differential corpus INCONCLUSIVE: $timed_out compiler timeouts; no parity qualification" >&2
+    echo "differential corpus INCONCLUSIVE: $timed_out compile or execution timeouts; no parity qualification" >&2
     awk -F'\t' '$1=="TIMEOUT"{print $2" "$3}' "$WORK/results.txt" >&2
     rc=1
 fi
