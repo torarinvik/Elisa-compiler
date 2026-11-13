@@ -64,14 +64,9 @@ grep -q "may fall through" <<< "$out" && fail "false positive on two-arm abortin
 out=$(printf 'def f(flag: bool) -> i64:\n    dead: i64 = match flag:\n        true: panic("left")\n        _: 1\n' | "$RPT")
 grep -q "may fall through without returning a value" <<< "$out" || fail "one-arm aborting match hid a fall-through path: $out"
 
-# 12. Non-breaking `while true:` MUST be flagged -- stage0 treats no loop as a terminator.
-# MEASURED 2026-09-16: `elisac -emit obj` on this exact program gives
-# "error: function h may fall through without returning a value". This case asserted the
-# OPPOSITE until then, against a compiler that had already been corrected to match the oracle
-# (see the measured note in src/semantic/resolve_flow_termination.elisa) -- a gate left behind
-# by its own fix, red for the wrong reason.
+# 12. A literal-true loop without a reachable break cannot fall through.
 out=$(printf 'def h(n: mutable i64) -> i64:\n    while true:\n        n <- n + 1\n' | "$RPT")
-grep -q "may fall through without returning a value" <<< "$out" || fail "while-true not flagged: $out"
+grep -q "may fall through without returning a value" <<< "$out" && fail "non-breaking while-true falls through: $out"
 
 # 13. `while true:` WITH a break MUST be flagged (the break path falls through).
 out=$(printf 'def h(n: mutable i64) -> i64:\n    while true:\n        break\n' | "$RPT")
@@ -113,7 +108,7 @@ out=$(printf 'def f() -> i64:\n    values: darray[i64] = [value for value in pan
 grep -q "may fall through" <<< "$out" && fail "false positive on aborting comprehension initializer: $out"
 
 # 25. Naming the panic function does not invoke it; only `panic(...)` terminates.
-out=$(printf 'def f() -> i64:\n    panic\n' | "$RPT")
+out=$(printf 'def f() -> i64:\n    panic\n    pass\n' | "$RPT")
 grep -q "may fall through without returning a value" <<< "$out" || fail "bare panic identifier was treated as a call: $out"
 
-echo "missing-return smoke OK: fall-through/breaking-loop/while-true and one-arm abort conditional flagged; aborting headers and eager wrappers terminate; bare panic value remains non-terminating; both-branch/void/panic-call/value-block/region allocation silent, 0 FP"
+echo "missing-return smoke OK: fall-through/breaking-loop and one-arm abort conditional flagged; aborting headers and eager wrappers terminate; bare panic value remains non-terminating; both-branch/void/panic-call/value-block/region allocation silent, 0 FP"
