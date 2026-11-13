@@ -81,4 +81,17 @@ if ! grep -q '^P 0$' <<< "$callee_report" || ! grep -q '^D 3$' <<< "$callee_repo
     exit 1
 fi
 
+infallible_overload="$REPO_ROOT/test/repro/lambda_raise_infallible_overload.elisa"
+set +e
+infallible_core="$("$ELISACORE_BIN" -emit semantic "$infallible_overload" 2>&1)"
+infallible_status=$?
+set -e
+infallible_rows="$(printf '%s\n' "$infallible_core" | sed -E -n 's#^.*:([0-9]+):[0-9]+-[0-9]+: raise cannot propagate tag.*$#L\1#p')"
+infallible_stage1="$("$RPT" < "$infallible_overload")"
+if [[ "$infallible_status" -eq 0 || "$infallible_rows" != 'L14' ]] || ! grep -q '^P 0$' <<< "$infallible_stage1" \
+    || ! grep -q '^D 1$' <<< "$infallible_stage1" || ! grep -q '^  L14 raise cannot propagate tag' <<< "$infallible_stage1"; then
+    printf 'infallible overload did not preserve its callback error contract:\nStage0:\n%s\nStage1:\n%s\n' "$infallible_core" "$infallible_stage1" >&2
+    exit 1
+fi
+
 echo "overloaded Lambda raise smoke OK"
