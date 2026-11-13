@@ -29,13 +29,16 @@ for level in 0 2; do
             exit 1
         fi
         if [[ "$level" -eq 0 ]]; then
-            good_return="$(sed -n '/^define .* @produce_good(/,/^}/p' "$llvm" | rg -m1 '^  ret %[^ ]+ \{ i32 1, i64 37, i64 undef \}$' || true)"
-            other_return="$(sed -n '/^define .* @produce_other(/,/^}/p' "$llvm" | rg -m1 '^  ret %[^ ]+ \{ i32 2, i64 undef, i64 53 \}$' || true)"
+            good_return="$(sed -n '/^define .* @produce_good(/,/^}/p' "$llvm" | rg -m1 '^  ret (%[^ ]+|\{ i32, i64, i64 \}) \{ i32 1, i64 37, i64 undef \}$' || true)"
+            other_return="$(sed -n '/^define .* @produce_other(/,/^}/p' "$llvm" | rg -m1 '^  ret (%[^ ]+|\{ i32, i64, i64 \}) \{ i32 2, i64 undef, i64 53 \}$' || true)"
             good_type="${good_return#  ret }"
             good_type="${good_type%% \{*}"
             other_type="${other_return#  ret }"
             other_type="${other_type%% \{*}"
-            layout="$(rg -F -m1 "$good_type = type { i32, i64, i64 }" "$llvm" || true)"
+            layout="$good_type"
+            if [[ "$good_type" == %* ]]; then
+                layout="$(rg -F -m1 "$good_type = type { i32, i64, i64 }" "$llvm" || true)"
+            fi
             if [[ -z "$good_return" || -z "$other_return" || "$good_type" != "$other_type" || -z "$layout" ]]; then
                 echo "repeated error family subset order smoke: Stage$stage emitted a noncanonical Fault layout or tag ordinal at -O0" >&2
                 printf 'layout: %s\ngood:   %s\nother:  %s\n' "$layout" "$good_return" "$other_return" >&2
