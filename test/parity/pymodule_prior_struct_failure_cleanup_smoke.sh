@@ -75,6 +75,7 @@ for _ in range(1000):
     assert reference() is None, "struct conversion retained a Python object after later darray failure"
 
 marker = Marker()
-assert module.bad_struct_before_darray({"values": [marker]}, [1, 2]) == 2
+assert module.bad_struct_before_darray({"values": [marker]}, [1, 2]) == 1
+assert module.bad_struct_before_darray({"values": [marker, Marker(), Marker()]}, [1, 2]) == 3
 print("pymodule prior struct failure cleanup smoke OK")
 PY
