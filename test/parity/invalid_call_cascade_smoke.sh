@@ -1,18 +1,8 @@
 #!/usr/bin/env bash
-# Two-compiler parity for the CASCADE after a call with an unresolvable callee.
-#
-# stage0 types such a callee `<invalid>` and reports the call itself in addition to the
-# error that poisoned it, so a private call draws two diagnostics on one line:
-#   error: "Api.hidden" is private to module "Api"
-#   error: cannot call non-function value of type <invalid>
-# stage1 reported only the first. check_call_of_invalid.elisa adds the second from stage1's
-# own diagnostics; this smoke pins BOTH halves of the rule -- the lines that must carry the
-# cascade, and the lines that must NOT, where the poisoned name is an ARGUMENT rather than
-# the callee, or where an ambiguous UFCS call resolved to candidates instead of nothing.
-#
-# Only the cascade sentence is compared: these fixtures deliberately also carry the
-# poisoning error, and pinning the whole message set here would turn this into a second
-# copy of diagnostics_diff.sh.
+# Compare secondary invalid-callee diagnostics with Stage0. An already-invalid
+# callee should not produce an additional call error, while genuinely non-callable
+# values are checked separately. The cases retain coverage for private members,
+# unknown names, generic applications, poisoned arguments, and ambiguous calls.
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -42,7 +32,7 @@ check_case() {
     fi
 }
 
-# FIRES: the callee itself is what another diagnostic poisoned.
+# Poisoned callees: compare whether a secondary diagnostic is emitted.
 check_case private_member $'module Api:\n    private:\n        def hidden() -> i64:\n            return 1\n\nusing Api\n\ndef use() -> i64:\n    return Api::hidden()\n'
 check_case undefined_callee $'def use() -> i64:\n    return baz()\n'
 check_case ufcs_nonconforming $'struct Bare:\n    y: i64\n\nprotocol Eq:\n    def eq(self: Self, other: Self) -> bool\n\ndef same(a: Bare, b: Bare) -> bool:\n    return a.eq(b)\n'
