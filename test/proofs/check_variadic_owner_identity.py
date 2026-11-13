@@ -44,7 +44,7 @@ for path in (ROOT / "src").rglob("*.elisa"):
 if "test_variadic_marker_uses_function_owner_offset" not in AST_TESTS or \
         FIXTURE.count("#line 0 variadic-owner.elisa") != 2 or \
         "def takes_tail(value: i64, ...) -> void:" not in FIXTURE or \
-        "def takes_fixed(value: i64) -> void:" not in FIXTURE:
+        "def fixed(value: i64) -> void:" not in FIXTURE:
     raise SystemExit("line-zero regression must distinguish a variadic function from a fixed sibling")
 if "variadic_owner_line_zero.elisa" not in SMOKE or \
         "function \"fixed\" expects 1 arguments, got 2" not in SMOKE or \
