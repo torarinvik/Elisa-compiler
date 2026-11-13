@@ -30,17 +30,29 @@ differ=0
 rejected=0
 
 exact() {
-    local label="$1"; local src="$2"
+    local label="$1"; local src="$2"; local required="${3:-0}"
     # STDOUT only: the report goes to stdout and semantic WARNINGS to stderr, so folding
     # them together made three corpus fixtures "diverge" on stage0's own warning text.
-    s0 -emit packed "$src" </dev/null > "$WORK/s0" 2>/dev/null || { echo "SKIP $label (stage0 declined)"; return; }
+    s0 -emit packed "$src" </dev/null > "$WORK/s0" 2>/dev/null || {
+        if [ "$required" -eq 1 ]; then
+            differ=$((differ + 1)); echo "FAILED $label: stage0 declined a required case"
+        else
+            echo "SKIP $label (stage0 declined)"
+        fi
+        return
+    }
     # stage0's `-emit packed` skips the safety analyses, so a repro NEGATIVE reaches the report
     # there while stage1 rejects it. This gate compares LAYOUT REPORTS: the defect it owns is
     # stage1 declining `-emit packed` for a program its own full compile accepts. Whether the
     # program should be accepted at all (stage1's stricter safety verdicts) is gated elsewhere.
     s1 -emit packed -o "$WORK/s1" "$src" >/dev/null 2>&1 || {
         if ! s1 -emit obj -o "$WORK/s1.o" "$src" >/dev/null 2>&1; then
-            rejected=$((rejected + 1)); echo "SKIP $label (stage1 rejects the program)"; return
+            if [ "$required" -eq 1 ]; then
+                differ=$((differ + 1)); echo "FAILED $label: stage1 rejected a required case"
+            else
+                rejected=$((rejected + 1)); echo "SKIP $label (stage1 rejects the program)"
+            fi
+            return
         fi
         differ=$((differ + 1)); echo "FAILED $label: stage1 compiles it but emitted no packed report"; return; }
     if cmp -s "$WORK/s0" "$WORK/s1"; then
@@ -93,7 +105,7 @@ exact "packed-commons" "$WORK/commons.elisa"
 recursive_case() {
     local label="$1"; shift
     printf '%s\n' "$@" "" "def main() -> i64:" "    return 0" > "$WORK/$label.elisa"
-    exact "$label" "$WORK/$label.elisa"
+    exact "$label" "$WORK/$label.elisa" 1
 }
 recursive_case "recursive-packed" "packed enum Node:" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
 recursive_case "recursive-packed-inline-u32" "packed enum Node:" "    common:" "        @storage(inline)" "        t: u32" "    Leaf(v: i64)" "    Pair(left: Node, right: Node)"
@@ -104,6 +116,11 @@ recursive_case "recursive-plain-inline-i64" "enum Node:" "    common:" "        
 recursive_case "packed-subword-payload" "packed enum E:" "    A(x: i32, y: i32)" "    B(z: i64)"
 # Report order is SOURCE order: the promoted plain enum registers after the packed one.
 recursive_case "recursive-plain-before-packed" "enum Tree:" "    Leaf(v: i64)" "    Pair(left: Tree, right: Tree)" "" "packed enum Shape:" "    common:" "        a: u32" "    Circle(r: i64)" "    Rect(w: i64, h: i64)"
+
+# Packed profiles belong to individual enum roots, not the whole module.
+recursive_case "mixed-packed-profiles" "@packed_profile(build_heavy)" "packed enum Dense:" "    A(value: i64)" "    B" "" "packed enum Sparse:" "    C(value: i64)" "    D"
+recursive_case "mixed-packed-profiles-reversed" "packed enum Sparse:" "    C(value: i64)" "    D" "" "@packed_profile(retained_reads)" "packed enum Dense:" "    A(value: i64)" "    B"
+recursive_case "same-name-packed-profiles" "module First:" "    @packed_profile(build_heavy)" "    packed enum Dense:" "        A(value: i64)" "        B" "module Second:" "    @packed_profile(retained_reads)" "    packed enum Dense:" "        A(value: i64)" "        B"
 
 echo "emit_packed parity: $same exact, $differ divergent, $rejected rejected by stage1"
 [ "$differ" -eq 0 ] || { echo "emit_packed parity FAILED"; exit 1; }

@@ -50,7 +50,7 @@ extend Backend:
             sub_slot: i64 = packed_slot_of_path(sub_path, structs)
             sub_ord: i64 = packed_variant_index_of_path(sub_path, structs)
             return false if:
-                sub_slot < 0 or sub_ord < 0 or runtime.packed_mode != 2
+                sub_slot < 0 or sub_ord < 0
                 sub_fields.count > 0 and sub_fields.count != structs.packed_enums.packed_field_type_count[sub_slot.usize()]
             # Do not silently treat unimplemented constraints as wildcards.
             for sub_pattern in sub_fields:
@@ -61,9 +61,6 @@ extend Backend:
                         return false
             sub_state: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 2, "sub.state")
             sub_h64: LLVMValueRef = LLVMBuildZExt(builder, handle_value, LLVMInt64TypeInContext(ctx), "sub.h64")
-            sub_args: mutable darray[LLVMValueRef] = [sub_state, sub_h64]
-            sub_args_pointer: void& = (&sub_args[0]).cast[void&] can Unsafe.PointerCast
-            sub_record: LLVMValueRef = packed_ast_sized_record_read(structs, runtime, m, ctx, builder, sub_state, sub_h64, runtime.packed_read_word_type, runtime.packed_read_word, sub_args_pointer, 2, "sub.record")
             # packed_row_llvm_type is keyed by ENUM INDEX; `sub_slot` is a variant SLOT. Passing
             # the slot built a row from another enum's payload_words/common_counts, so the
             # payload GEP below landed at the wrong offset and every binder after the first came
@@ -72,9 +69,20 @@ extend Backend:
             # silently stopped reporting `pointer cast requires can[Unsafe]`.
             sub_enum_index: i64 = packed_enum_index_of_path(sub_path, structs)
             return false if sub_enum_index < 0
+            return false if not packed_store_matches_hierarchy(structs, runtime.active_store_enum, sub_enum_index)
             sub_row: LLVMTypeRef = packed_row_llvm_type(structs, sub_enum_index, ctx)
-            sub_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, sub_row, sub_record, 0, "sub.tag.ptr")
-            sub_tag: LLVMValueRef = LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), sub_tag_ptr, "sub.tag")
+            sub_record: mutable LLVMValueRef = LLVMConstNull(LLVMPointerTypeInContext(ctx, 0))
+            sub_tag: mutable LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0)
+            if runtime.packed_mode == 2:
+                sub_args: mutable darray[LLVMValueRef] = [sub_state, sub_h64]
+                sub_args_pointer: void& = (&sub_args[0]).cast[void&] can Unsafe.PointerCast
+                sub_record <- packed_ast_sized_record_read(structs, runtime, m, ctx, builder, sub_state, sub_h64, runtime.packed_read_word_type, runtime.packed_read_word, sub_args_pointer, 2, "sub.record")
+                sub_tag_ptr: LLVMValueRef = LLVMBuildStructGEP2(builder, sub_row, sub_record, 0, "sub.tag.ptr")
+                sub_tag <- LLVMBuildLoad2(builder, LLVMInt32TypeInContext(ctx), sub_tag_ptr, "sub.tag")
+            else:
+                sub_tag_args: mutable darray[LLVMValueRef] = [sub_state, handle_value]
+                sub_tag_pointer: void& = (&sub_tag_args[0]).cast[void&] can Unsafe.PointerCast
+                sub_tag <- LLVMBuildCall2(builder, runtime.packed_read_tag_type, runtime.packed_read_tag, sub_tag_pointer, 2, "sub.tag")
             sub_hit: LLVMValueRef = LLVMBuildICmp(builder, 32, sub_tag, LLVMConstInt(LLVMInt32TypeInContext(ctx), sub_ord.u64(), 0), "sub.cmp")
             sub_cont: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(ctx, function, "sub.cont")
             _ = LLVMBuildCondBr(builder, sub_hit, sub_cont, next_block)
@@ -83,10 +91,35 @@ extend Backend:
             sub_payload: ValueType = packed_payload_of_path(sub_path, structs)
             return false if sub_payload.kind == TypeKind.Unmodeled
             sub_pay: mutable LLVMValueRef = LLVMGetUndef(llvm_type_of(sub_payload, structs, ctx))
-            if packed_typed_row_load_payload(sub_payload, sub_slot.usize(), structs, sub_enum_index, sub_row, sub_record, sub_state, sub_h64, ctx, builder) is sub_pay_loaded:
-                sub_pay <- sub_pay_loaded
+            if runtime.packed_mode == 2:
+                if packed_typed_row_load_payload(sub_payload, sub_slot.usize(), structs, sub_enum_index, sub_row, sub_record, sub_state, sub_h64, ctx, builder) is sub_pay_loaded:
+                    sub_pay <- sub_pay_loaded
+                else:
+                    return false
             else:
-                return false
+                sub_type: LLVMTypeRef = llvm_type_of(sub_payload, structs, ctx)
+                sub_bytes: u64 = LLVMABISizeOfType(structs.target.target_data, sub_type)
+                sub_word_bytes: u64 = structs.target.target_pointer_bits.u64() / 8
+                return false if sub_word_bytes != 4 and sub_word_bytes != 8
+                sub_words: u64 = (sub_bytes + sub_word_bytes - 1) / sub_word_bytes
+                # Registered payload slots are eight bytes even for 32-bit targets.
+                return false if sub_words == 0 or sub_words * sub_word_bytes > structs.packed_enums.packed_payload_words[sub_enum_index.usize()].u64() * 8
+                sub_word_type: LLVMTypeRef = runtime_size_llvm_type(ctx, structs.target.target_pointer_bits)
+                sub_array_type: LLVMTypeRef = LLVMArrayType(sub_word_type, sub_words.u32())
+                sub_array: LLVMValueRef = build_entry_alloca(builder, sub_array_type, "sub.payload.words")
+                LLVMSetAlignment(sub_array, LLVMABIAlignmentOfType(structs.target.target_data, sub_type))
+                sub_offset: u32 = packed_legacy_payload_word_offset(structs, sub_enum_index)
+                sub_arena: LLVMValueRef = LLVMBuildExtractValue(builder, runtime.active_store, 0, "sub.arena")
+                for sub_word_index in 0..<sub_words.usize() |sub_state, handle_value, sub_offset, sub_arena, sub_array, sub_array_type, sub_word_type, runtime, ctx, builder|:
+                    sub_word_args: mutable darray[LLVMValueRef] = [handle_value, sub_state, LLVMConstInt(sub_word_type, (sub_offset.u64() + sub_word_index.u64()), 0)]
+                    sub_word_args <- [sub_arena, handle_value, sub_state, LLVMConstInt(sub_word_type, (sub_offset.u64() + sub_word_index.u64()), 0)] if runtime.packed_mode == 1
+                    sub_word_pointer: void& = (&sub_word_args[0]).cast[void&] can Unsafe.PointerCast
+                    sub_word: LLVMValueRef = LLVMBuildCall2(builder, runtime.packed_read_word_type, runtime.packed_read_word, sub_word_pointer, sub_word_args.count.u32(), "sub.payload.word")
+                    sub_indices: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt32TypeInContext(ctx), 0, 0), LLVMConstInt(LLVMInt32TypeInContext(ctx), sub_word_index.u64(), 0)]
+                    sub_indices_pointer: void& = (&sub_indices[0]).cast[void&] can Unsafe.PointerCast
+                    sub_word_slot: LLVMValueRef = LLVMBuildGEP2(builder, sub_array_type, sub_array, sub_indices_pointer, 2, "sub.payload.word.ptr")
+                    _ = LLVMBuildStore(builder, sub_word, sub_word_slot)
+                sub_pay <- LLVMBuildLoad2(builder, sub_type, sub_array, "sub.payload")
             sub_field_start: usize = structs.packed_enums.packed_field_type_start[sub_slot.usize()]
             sub_ok: mutable bool = true
             # One field: the payload IS the value, so there is no ExtractValue.
