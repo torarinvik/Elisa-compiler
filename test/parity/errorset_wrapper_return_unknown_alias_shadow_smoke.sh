@@ -6,11 +6,11 @@ source "$REPO_ROOT/test/parity/build_parse_report.sh"
 FIXTURE="$REPO_ROOT/test/repro/errorset_wrapper_return_static_alias_unknown.elisa"
 
 report="$("$RPT" < "$FIXTURE")"
-grep -q 'L99 cannot propagate CandidateFault' <<< "$report" || {
+grep -qE 'L99 (cannot propagate CandidateFault|return type expects error\[ExpectedFault\], got error\[CandidateFault\])' <<< "$report" || {
   printf 'definite alias must outrank the unresolved branch:\n%s\n' "$report" >&2
   exit 1
 }
-if grep -q 'L96 cannot propagate' <<< "$report"; then
+if grep -qE 'L96 (cannot propagate|return type expects error\[)' <<< "$report"; then
   printf 'unresolved alias must not select a family:\n%s\n' "$report" >&2
   exit 1
 fi
@@ -19,7 +19,7 @@ fi
 # winner unknown; the checker must not infer either error family.
 ambiguous="$(sed 's/^using CandidateProvider as Stable$/static if UNKNOWN_PROVIDER_CHOICE:\
     using CandidateProvider as Stable/' "$FIXTURE" | "$RPT")"
-if grep -q 'cannot propagate CandidateFault' <<< "$(grep 'L10[01] ' <<< "$ambiguous" || true)"; then
+if grep -qE '(cannot propagate CandidateFault|return type expects error\[[^]]+\], got error\[CandidateFault\])' <<< "$(grep 'L10[01] ' <<< "$ambiguous" || true)"; then
   printf 'competing unresolved aliases must not select a family:\n%s\n' "$ambiguous" >&2
   exit 1
 fi
@@ -37,7 +37,7 @@ if earlier not in source:
 print(source.replace(earlier, later), end='')
 PYFIXTURE
 )"
-if grep -q 'L102 cannot propagate' <<< "$reversed"; then
+if grep -qE 'L102 (cannot propagate|return type expects error\[)' <<< "$reversed"; then
   printf 'earlier unresolved branch must prevent family inference:\n%s\n' "$reversed" >&2
   exit 1
 fi

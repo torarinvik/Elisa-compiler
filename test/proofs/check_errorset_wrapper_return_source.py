@@ -219,9 +219,9 @@ wildcard_ambiguity = function_source(ROOT / "src/semantic/check_callable_wildcar
 if not all(fragment in wildcard_ambiguity for fragment in (
         "ewr_module_is_lexical_ancestor(symbol.module_owner, caller_module)",
         'binding.name != "__binding_wildcard_import"',
-        "semantic_import_module_path_matches(symbol.module_owner, binding.owner, binding.module)",
+        "semantic_import_resolved_owner_matches(table, symbol.module_owner, binding.owner, binding.module)",
         "pma_static_if_function_branch_selection(file, name, symbol, table, 0)",
-        "found and symbol.module_owner != selected_owner")) or not all(fragment in ordinary_binding for fragment in (
+        "found and symbol.module_owner != table.symbols[selected_row.usize()].module_owner")) or not all(fragment in ordinary_binding for fragment in (
         "not receiver_rank_gate and callable_wildcard_ambiguous(file, name, caller_module, table)",
         "return ewr_empty_family_ref()")):
     raise SystemExit("EWR must fail closed for multiple distinct active wildcard targets after lexical lookup")

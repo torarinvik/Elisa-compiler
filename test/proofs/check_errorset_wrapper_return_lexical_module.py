@@ -27,7 +27,7 @@ if not all(fragment in FIXTURE for fragment in (
 if not all(fragment in SMOKE for fragment in (
         "errorset_wrapper_return_static_if_lexical_module.elisa",
         "return type expects",
-        "cannot propagate.*FaultA")):
+        "return type expects error\\[ExpectedFault\\], got error\\[FaultA\\]")):
     raise SystemExit("EWR lexical-module smoke must require matching Stage0 and Stage1 family selection")
 
 print("EWR static-if lexical-module source binding passed")

@@ -90,7 +90,7 @@ def check_callable_visibility_fixtures(
     if not all(fragment in cross_module_singleton_smoke for fragment in (
             "return Consumer::choose(value)",
             "grep -q '^D 0$' <<< \"$stage1_output\"",
-            "! grep -q 'cannot propagate' <<< \"$stage1_output\"")):
+            "! grep -qE 'cannot propagate|return type expects error\\[' <<< \"$stage1_output\"")):
         raise SystemExit("EWR singleton scope control must preserve Core's lexical winner and keep Stage1 propagation clean")
 
     private_rank_fixture = (ROOT / "test/repro/errorset_wrapper_return_private_overload_rank.elisa").read_text()
@@ -113,8 +113,8 @@ def check_callable_visibility_fixtures(
             "return plain(value: value)")) or not all(fragment in private_primary_smoke for fragment in (
             'grep -qF \'"Provider.choose" is private to module "Provider"\' <<< "$stage1_output"',
             'grep -qF \'"Provider.plain" is private to module "Provider"\' <<< "$stage1_output"',
-            "grep -q '^D 4$' <<< \"$stage1_output\"",
-            "! grep -q 'cannot propagate' <<< \"$stage1_output\"")):
+            "grep -q '^D 2$' <<< \"$stage1_output\"",
+            "! grep -qE 'cannot propagate|return type expects error\\[' <<< \"$stage1_output\"")):
         raise SystemExit("EWR named-argument coverage must retain private fallible and infallible primary barriers")
 
     private_extern_fixture = (ROOT / "test/repro/errorset_wrapper_return_private_extern.elisa").read_text()
@@ -164,7 +164,7 @@ def check_callable_visibility_fixtures(
             "return fixed(value)")) or not all(fragment in defaulted_underflow_smoke for fragment in (
             "errorset_wrapper_return_defaulted_underflow_rank.elisa",
             "expected_rows=$'L44'",
-            "grep -cF 'cannot propagate'")):
+            "grep -cE 'cannot propagate|return type expects error\\['")):
         raise SystemExit("EWR underflow coverage must bind fallible and infallible defaulted winner barriers plus the fixed-arity filter control")
 
     later_mismatch_fixture = (ROOT / "test/repro/errorset_wrapper_return_later_argument_mismatch_rank.elisa").read_text()
@@ -251,7 +251,7 @@ def check_callable_visibility_fixtures(
     if not all(fragment in variadic_extern_smoke for fragment in (
             "errorset_wrapper_return_variadic_extern.elisa",
             "expected_rows=$'L20'",
-            "cannot propagate.*SelectedFault",
+            "return type expects error\\[SiblingFault\\], got error\\[SelectedFault\\]",
             "i64 variadic extern's ErrorSet")):
         raise SystemExit("EWR variadic-extern parity contract must require the selected i64 extern family at the overflow call")
     if "candidate_match.specificity > selected_specificity" not in fallible_selection or "candidate_type_viable: bool = candidate_match.viable if receiver_rank_active else true" not in fallible_selection:
@@ -372,24 +372,23 @@ def check_callable_visibility_fixtures(
             'target_row.name == "__using_alias_target"',
             "target_count <- target_count + 1.usize()",
             "return false if target_count != 1.usize()",
-            "callable_alias_path_matches_candidate(annotations, alias.module, target, suffix, candidate_module)")) or not all(fragment in qualified_module_match for fragment in (
+            "callable_alias_path_matches_candidate_bounded(alias.module, target, suffix, candidate_module, alias.offset, table)")) or not all(fragment in qualified_module_match for fragment in (
             "ewr_qualified_module_rank(candidate_module, qualifier, caller_module, annotations, table) > 0.usize()")) or "module_last_segment(candidate_module)" in qualified_module_match or not all(fragment in qualified_module_rank for fragment in (
             "ewr_qualified_module_path_rank(candidate_module, qualifier, caller_module)",
             "return lexical_rank if lexical_rank > 0.usize()",
-            "return 2.usize() if ewr_known_module_alias_path_matches_candidate(candidate_module, qualifier, annotations, table)",
+            "return 2.usize() if ewr_known_module_alias_path_matches_candidate(candidate_module, qualifier, caller_module, annotations, table)",
             "return 1.usize() if candidate_module == qualifier",
             "return 0.usize()")) or not all(fragment in qualified_module_path_rank for fragment in (
             "scope_module: mutable sview = caller_module",
             "return scope_module.len + 3.usize() if callable_module_path_matches_suffix(candidate_module, scope_module, qualifier)",
             "try_noncall_module_parent(scope_module)")) or not all(fragment in unknown_alias_winner for fragment in (
-            "table.possible_import_annotations",
-            "possible_alias.owner != marker.name",
-            "possible_alias.module != marker.module",
-            "possible_alias.line != marker.line",
-            "possible_alias.offset != marker.offset",
             "table.definite_import_annotations",
+            'unresolved.owner != "__ewr_unknown_using_alias"',
+            "unresolved.name != marker.name",
+            "unresolved.module == marker.module and unresolved.line == marker.line and unresolved.offset == marker.offset",
             "ewr_module_alias_order(definite_alias, possible_alias, table)",
-            "ordering.known and ordering.left_precedes",
+            "not ordering.known or not ordering.left_precedes",
+            "return true if found_marker and shadowed",
             "ewr_definite_module_alias_is_global_winner(definite_alias, table)")) or not all(fragment in alias_winner for fragment in (
             "table.definite_import_annotations",
             "table.possible_import_annotations",

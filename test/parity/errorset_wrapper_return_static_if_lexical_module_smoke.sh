@@ -26,9 +26,9 @@ grep -q 'return type expects' <<< "$stage0_output" \
   || fail "Stage0 did not report the active nested provider family: $stage0_output"
 
 stage1_output="$("$RPT" < "$FIXTURE")"
-grep -q 'cannot propagate.*FaultA' <<< "$stage1_output" \
+grep -qE '(cannot propagate.*FaultA|return type expects error\[ExpectedFault\], got error\[FaultA\])' <<< "$stage1_output" \
   || fail "Stage1 did not select App::ProviderA through the nested Client import: $stage1_output"
-[[ $(grep -cF 'cannot propagate' <<< "$stage1_output") == 1 ]] \
+[[ $(grep -cE 'cannot propagate|return type expects error\[' <<< "$stage1_output") == 1 ]] \
   || fail "Stage1 emitted an unexpected ErrorSet diagnostic: $stage1_output"
 
 echo "errorset wrapper static-if lexical-module smoke OK"
