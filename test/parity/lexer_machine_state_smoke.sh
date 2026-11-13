@@ -5,7 +5,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
-output="$("$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/lexer_machine_state_test.elisa" 2>&1)"
+output="$(ELISACORE_TEST_CACHE=0 "$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/lexer_machine_state_test.elisa" 2>&1)"
 printf '%s\n' "$output"
 
 summary="$(printf '%s\n' "$output" | grep '\[ SUMMARY  \]' | tail -1)"
@@ -13,7 +13,8 @@ summary="$(printf '%s\n' "$output" | grep '\[ SUMMARY  \]' | tail -1)"
     echo "lexer machine-state smoke FAILED: test summary was not emitted" >&2
     exit 1
 }
-grep -Eq 'failed=0$' <<< "$summary" || {
+grep -Eq 'failed=0$' <<< "$summary" &&
+    grep -Fq '[       OK ] lexer_identifier_cursor_crosses_unicode_and_newline' <<< "$output" || {
     echo "lexer machine-state smoke FAILED: $summary" >&2
     exit 1
 }
@@ -34,7 +35,8 @@ stage1_summary="$(printf '%s\n' "$stage1_output" | grep '\[ SUMMARY  \]' | tail 
     echo "lexer machine-state smoke FAILED: stage1 test summary was not emitted" >&2
     exit 1
 }
-grep -Eq 'failed=0$' <<< "$stage1_summary" || {
+grep -Eq 'failed=0$' <<< "$stage1_summary" &&
+    grep -Fq '[       OK ] lexer_identifier_cursor_crosses_unicode_and_newline' <<< "$stage1_output" || {
     echo "lexer machine-state smoke FAILED under stage1: $stage1_summary" >&2
     exit 1
 }
