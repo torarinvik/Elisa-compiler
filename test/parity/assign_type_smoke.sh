@@ -128,8 +128,8 @@ grep -q 'expects darray\[' <<< "$out" && fail "shadowed local callee was checked
 # the same bare function name with different darray formals. Both a matching qualified call
 # and a mismatching qualified call appear in this source; only the latter may be diagnosed.
 out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_qualified_same_name.neg.elisa")
-grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "qualified North::store mismatch not found: $out"
-grep -q 'expects darray\[i64\], got darray\[sview\]' <<< "$out" || fail "qualified South::store mismatch not found: $out"
+grep -Fq 'expects darray[sview]&, got darray[i64]&' <<< "$out" || fail "qualified North::store mismatch not found: $out"
+grep -Fq 'expects darray[i64]&, got darray[sview]&' <<< "$out" || fail "qualified South::store mismatch not found: $out"
 qualified_mismatch_count=$(grep -c 'expects darray\[' <<< "$out" || true)
 [ "$qualified_mismatch_count" -eq 2 ] || fail "qualified resolution or ambiguous bare-name fail-closed control produced unexpected darray findings: $out"
 if stage0_out=$("$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_qualified_same_name.neg.elisa" 2>&1); then
@@ -149,8 +149,8 @@ qualified_stage1_count=$(grep -c 'expects darray\[' <<< "$stage1_out" || true)
 # (Outer::Inner). The collector and call checker must use the same path without rebuilding
 # or truncating it. Matching calls pass; the two payload-layout mismatches are diagnosed.
 out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_module.neg.elisa")
-grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "nested module darray mismatch not found: $out"
-grep -q 'expects darray\[i64\], got darray\[sview\]' <<< "$out" || fail "nested module darray mismatch not found: $out"
+grep -Fq 'expects darray[sview]&, got darray[i64]&' <<< "$out" || fail "nested module darray mismatch not found: $out"
+grep -Fq 'expects darray[i64]&, got darray[sview]&' <<< "$out" || fail "nested module darray mismatch not found: $out"
 nested_module_mismatch_count=$(grep -c 'expects darray\[' <<< "$out" || true)
 [ "$nested_module_mismatch_count" -eq 2 ] || fail "nested module controls produced unexpected darray findings: $out"
 for compiler in "$ELISACORE_BIN" "$STAGE1_BIN"; do
@@ -169,7 +169,7 @@ grep -q 'expects darray\[' <<< "$out" && fail "false positive on matching nested
 "$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_match.pos.elisa" >/dev/null 2>&1 || fail "stage0 rejected matching nested-reference darray types"
 "$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_match.pos.elisa" >/dev/null 2>&1 || fail "stage1 rejected matching nested-reference darray types"
 out=$("$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_mismatch.neg.elisa")
-grep -q 'expects darray\[sview\], got darray\[i64\]' <<< "$out" || fail "nested-reference element mismatch not found: $out"
+grep -Fq 'expects darray[sview]&, got darray[i64]&' <<< "$out" || fail "nested-reference element mismatch not found: $out"
 if stage0_out=$("$ELISACORE_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtures/diagnostics/darray_ref_nested_mismatch.neg.elisa" 2>&1); then
   fail "stage0 accepted nested-reference darray element mismatch"
 fi
