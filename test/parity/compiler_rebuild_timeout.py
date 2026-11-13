@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+from functools import lru_cache
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -35,13 +36,20 @@ def sample_rebuild(child, profile):
             if updated == descendants:
                 break
             descendants = updated
+        compiler_names = {
+            os.path.basename(path)
+            for name in ("ELISACORE_BIN", "ELISA_STAGE1_BIN")
+            if (path := os.environ.get(name))
+        }
+
+        @lru_cache(maxsize=None)
         def executable(pid):
             command = processes.get(pid, (0, ""))[1]
             # The command column is not shell-quoted. An executable path may
             # contain spaces, so splitting it loses the basename (e.g. the
             # normal checkout under "Coding Projects"). Ask ps for the
             # executable path itself when this could be an Elisa compiler.
-            if "elisac" in command:
+            if "elisac" in command or any(name in command for name in compiler_names):
                 try:
                     path = subprocess.check_output(
                         ["ps", "-p", str(pid), "-o", "comm="], text=True
@@ -52,7 +60,7 @@ def sample_rebuild(child, profile):
                     pass
             return os.path.basename(command.split(None, 1)[0]) if command else ""
 
-        candidates = [pid for pid in descendants if "elisac" in executable(pid)]
+        candidates = [pid for pid in descendants if "elisac" in executable(pid) or executable(pid) in compiler_names]
         if candidates:
             # Prefer the oldest compiler process, not an arbitrary short-lived worker.
             # Set iteration order is unspecified, and sampling an exiting worker can
