@@ -6,7 +6,10 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
-output="$("$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/semantic_loop_view_test.elisa" 2>&1)"
+if ! output="$(ELISACORE_ANALYSIS_BOOTSTRAP=0 "$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/semantic_loop_view_test.elisa" 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    exit 1
+fi
 printf '%s\n' "$output"
 
 summary="$(printf '%s\n' "$output" | grep '\[ SUMMARY  \]' | tail -1)"
