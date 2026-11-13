@@ -25,12 +25,12 @@ assert rows["roundtrip_uintptr"]["parameters"] == [{"name": "values", "type": "d
 assert rows["roundtrip_optional_isize"]["parameters"] == [{"name": "values", "type": "darray[darray[isize?]]"}]
 assert rows["roundtrip_optional_uintptr"]["parameters"] == [{"name": "values", "type": "darray[darray[uintptr?]]"}]
 assert rows["roundtrip_optional_isize"]["return"] == "darray[darray[isize?]]"
-assert rows["roundtrip_optional_isize_scalar"]["parameters"] == [{"name": "value", "type": "isize?"}]
-assert rows["roundtrip_optional_uintptr_scalar"]["parameters"] == [{"name": "value", "type": "uintptr?"}]
+assert rows["roundtrip_optional_isize_scalar"]["parameters"] == [{"name": "value", "type": "isize?", "default": "None"}]
+assert rows["roundtrip_optional_uintptr_scalar"]["parameters"] == [{"name": "value", "type": "uintptr?", "default": "None"}]
 assert rows["echo_u8"]["parameters"] == [{"name": "value", "type": "u8"}]
 assert rows["echo_u8_after_default"]["parameters"] == [
-    {"name": "prior", "type": "darray[i64]"},
-    {"name": "value", "type": "u8"},
+    {"name": "prior", "type": "darray[i64]", "default": "[7]"},
+    {"name": "value", "type": "u8", "default": "0"},
 ]
 assert rows["echo_u64"]["parameters"] == [{"name": "value", "type": "u64"}]
 assert rows["echo_usize"]["parameters"] == [{"name": "value", "type": "usize"}]
@@ -40,8 +40,8 @@ assert rows["echo_uintptr_and_i64"]["parameters"] == [
     {"name": "count", "type": "i64"},
 ]
 assert rows["optional_uintptr_defaults"]["parameters"] == [
-    {"name": "prior", "type": "u64?"},
-    {"name": "value", "type": "uintptr?"},
+    {"name": "prior", "type": "u64?", "default": "7"},
+    {"name": "value", "type": "uintptr?", "default": "0"},
 ]
 assert rows["count"]["return"] == "i64"
 assert rows["roundtrip_deep"]["parameters"] == [{"name": "values", "type": "darray[darray[darray[darray[i64]]]]"}]
@@ -59,8 +59,8 @@ grep -Fq 'def roundtrip_usize(values: Sequence[Sequence[int]]) -> list[list[int]
 grep -Fq 'def roundtrip_uintptr(values: Sequence[Sequence[int]]) -> list[list[int]]: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_optional_isize(values: Sequence[Sequence[int | None]]) -> list[list[int | None]]: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def roundtrip_optional_uintptr(values: Sequence[Sequence[int | None]]) -> list[list[int | None]]: ...' "$WORK/nested_darrays.pyi"
-grep -Fq 'def roundtrip_optional_isize_scalar(value: int | None) -> int | None: ...' "$WORK/nested_darrays.pyi"
-grep -Fq 'def roundtrip_optional_uintptr_scalar(value: int | None) -> int | None: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_optional_isize_scalar(value: int | None = None) -> int | None: ...' "$WORK/nested_darrays.pyi"
+grep -Fq 'def roundtrip_optional_uintptr_scalar(value: int | None = None) -> int | None: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def echo_u8(value: int) -> int: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def echo_u8_after_default(prior: Sequence[int] = [7], value: int = 0) -> int: ...' "$WORK/nested_darrays.pyi"
 grep -Fq 'def echo_u64(value: int) -> int: ...' "$WORK/nested_darrays.pyi"
@@ -96,7 +96,7 @@ if ! command -v clang >/dev/null 2>&1 || ! "$PYTHON_BIN" -c 'import sys; raise S
 fi
 
 bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-so -o "$WORK/nested_darrays$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')" "$SOURCE" >/dev/null
-PYTHONPATH="$WORK" "$PYTHON_BIN" -P - <<'PY'
+(cd "$WORK" && PYTHONPATH="$WORK" "$PYTHON_BIN" -) <<'PY'
 import nested_darrays
 import sys
 

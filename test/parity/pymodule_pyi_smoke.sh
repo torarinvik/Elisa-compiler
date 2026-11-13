@@ -97,7 +97,7 @@ PYTHON_BIN="$PYTHON_BIN" bash "$ROOT/scripts/elisac_stage1.sh" -emit pymodule-py
 grep -Fq 'bytes: Final[_elisa_builtins.bytes]' "$WORK/text_constants.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/text_constants.pyi"
 
-PYTHONPATH="$ROOT/scripts" "$PYTHON_BIN" -P - "$WORK/final_collision.pyi" <<'PY'
+(cd "$WORK" && PYTHONPATH="$ROOT/scripts" "$PYTHON_BIN" - "$WORK/final_collision.pyi") <<'PY'
 import sys
 from pathlib import Path
 
@@ -371,7 +371,7 @@ grep -Fq 'def mode_roundtrip(mode: int) -> int' "$WORK/enums.pyi"
 grep -Fq 'def plain_roundtrip(value: int) -> int' "$WORK/enums.pyi"
 "$PYTHON_BIN" -m py_compile "$WORK/enums.pyi"
 
-PYTHONPATH="$ROOT/scripts" "$PYTHON_BIN" -P - "$WORK/keyword_fields.pyi" <<'PY'
+(cd "$WORK" && PYTHONPATH="$ROOT/scripts" "$PYTHON_BIN" - "$WORK/keyword_fields.pyi") <<'PY'
 import sys
 from pathlib import Path
 
@@ -396,7 +396,7 @@ PY
 "$PYTHON_BIN" -m py_compile "$WORK/keyword_fields.pyi"
 grep -Fq "Options = TypedDict('Options', {'class': NotRequired[int], 'normal': str})" "$WORK/keyword_fields.pyi"
 
-PYTHONPATH="$ROOT/scripts" "$PYTHON_BIN" -P - "$WORK/keyword_params.pyi" <<'PY'
+(cd "$WORK" && PYTHONPATH="$ROOT/scripts" "$PYTHON_BIN" - "$WORK/keyword_params.pyi") <<'PY'
 import sys
 from pathlib import Path
 
