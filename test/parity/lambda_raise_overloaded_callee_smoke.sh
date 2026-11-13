@@ -38,4 +38,17 @@ if ! grep -q '^P 0$' <<< "$shadow_output" || grep -q 'raise cannot propagate tag
     exit 1
 fi
 
+mixed_fixture="$REPO_ROOT/test/repro/lambda_raise_overload_mixed_returns.elisa"
+set +e
+mixed_stage0="$("$ELISACORE_BIN" -emit semantic "$mixed_fixture" 2>&1)"
+mixed_status=$?
+set -e
+mixed_rows="$(printf '%s\n' "$mixed_stage0" | sed -E -n 's#^.*:([0-9]+):[0-9]+-[0-9]+: raise cannot propagate tag.*$#L\1#p' | LC_ALL=C sort)"
+mixed_stage1="$("$RPT" < "$mixed_fixture")"
+if [[ "$mixed_status" -eq 0 || "$mixed_rows" != 'L14' ]] || ! grep -q '^P 0$' <<< "$mixed_stage1" \
+    || ! grep -q '^D 1$' <<< "$mixed_stage1" || ! grep -q '^  L14 raise cannot propagate tag' <<< "$mixed_stage1"; then
+    printf 'mixed fallible and infallible overloads disagree:\nStage0:\n%s\nStage1:\n%s\n' "$mixed_stage0" "$mixed_stage1" >&2
+    exit 1
+fi
+
 echo "overloaded Lambda raise smoke OK"
