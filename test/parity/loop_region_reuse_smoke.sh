@@ -67,9 +67,8 @@ def main() -> i64:
         out <- box.count
     return out[0]
 ELISA
-# Preserve stage1's existing rejection. Stage0 currently accepts this separate
-# user-field escape; it is not used as a negative oracle for this regression.
-for compiler in "$STAGE1"; do
+# Both compilers must reject an escaping user-defined count field.
+for compiler in "$STAGE0" "$STAGE1"; do
     if "$compiler" -emit obj -o "$WORK/escape.o" "$WORK/escape.elisa" > "$WORK/rejection" 2>&1; then
         echo "a user-defined count field incorrectly lost its region lifetime" >&2
         exit 1
