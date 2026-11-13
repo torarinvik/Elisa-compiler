@@ -83,6 +83,8 @@ grep -q 'L6 argument 1 to "consume"' <<< "$out" && fail "wrong-arity call used a
 MISMATCH_FIXTURE="$REPO_ROOT/test/fixtures/diagnostics/darray_ref_call_element_mismatch.pos.elisa"
 out=$("$RPT" < "$MISMATCH_FIXTURE")
 grep -Fq 'argument 1 to "take_texts" expects darray[sview]&, got darray[i64]&' <<< "$out" || fail "by-reference darray element mismatch not flagged: $out"
+mutable_out=$(printf 'def consume(v: mutable darray[sview]&) -> void:\n    pass\ndef f(v: mutable darray[i64]&) -> void:\n    consume(v)\n' | "$RPT")
+grep -Fq 'argument 1 to "consume" expects mutable darray[sview]&, got mutable darray[i64]&' <<< "$mutable_out" || fail "mutable darray references lost their capabilities: $mutable_out"
 if "$STAGE1_BIN" -emit obj -O0 -o /dev/null "$MISMATCH_FIXTURE" > /dev/null 2>&1; then
   fail "stage1 accepted by-reference darray element mismatch"
 fi
