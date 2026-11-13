@@ -34,7 +34,7 @@ bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$LLVM_BRIDGE_OBJ"
 CXX_RUNTIME=-lc++
 [[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
 
-"$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj.o" "$ROOT/test/breadth/emit_obj.elisa" 2>/dev/null \
+ELISACORE_ANALYSIS_BOOTSTRAP=0 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj.o" "$ROOT/test/breadth/emit_obj.elisa" \
   || { echo "backend_obj_smoke FAILED: could not compile emit_obj.elisa"; exit 1; }
 # The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks. The arena
 # calls the profiler ABI unconditionally, so without them this link fails on
