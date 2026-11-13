@@ -34,7 +34,9 @@ if [[ -n "$_en_fresh" ]]; then
 fi
 
 _en_bridge="$EMIT_NATIVE.$$.bridge.o"; _en_obj="$EMIT_NATIVE.$$.o"; _en_hooks="$EMIT_NATIVE.$$.hooks.c"; _en_tmp="$EMIT_NATIVE.$$"; _en_log="$EMIT_NATIVE.$$.log"
-if ! "$ELISACORE_BIN" -emit obj -O2 -o "$_en_obj" "$REPO_ROOT/test/breadth/emit_native.elisa" 2>"$_en_log"; then
+# This test helper needs one complete object. Stage0's bootstrap checkpoint
+# mode can return a continuation status before producing any object.
+if ! ELISACORE_ANALYSIS_BOOTSTRAP=0 "$ELISACORE_BIN" -emit obj -O2 -o "$_en_obj" "$REPO_ROOT/test/breadth/emit_native.elisa" 2>"$_en_log"; then
   echo "build_emit_native: stage0 could not compile emit_native.elisa" >&2; sed -n '1,10p' "$_en_log" >&2
   rm -f "$_en_obj" "$_en_hooks" "$_en_log"; return 1 2>/dev/null || exit 1
 fi
