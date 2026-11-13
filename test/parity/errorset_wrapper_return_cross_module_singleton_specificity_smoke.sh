@@ -27,7 +27,7 @@ grep -q '^D 0$' <<< "$stage1_output" || {
   printf 'Stage1 imported the unselected Provider error family:\n%s\n' "$stage1_output" >&2
   exit 1
 }
-! grep -q 'cannot propagate' <<< "$stage1_output" || {
+! grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output" || {
   printf 'Stage1 reported an unexpected propagation error:\n%s\n' "$stage1_output" >&2
   exit 1
 }

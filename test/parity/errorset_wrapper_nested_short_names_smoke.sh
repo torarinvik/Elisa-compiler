@@ -15,7 +15,7 @@ stage0_status=$?
 set -e
 stage0_rows="$(printf '%s\n' "$stage0_output" | sed -E -n 's#^.*:([0-9]+):[0-9]+[^:]*: return type expects.*$#L\1#p' | LC_ALL=C sort)"
 stage1_output="$("$RPT" < "$fixture")"
-stage1_rows="$(printf '%s\n' "$stage1_output" | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' | LC_ALL=C sort)"
+stage1_rows="$(printf '%s\n' "$stage1_output" | sed -E -n 's#^[[:space:]]*L([0-9]+) (cannot propagate|return type expects error\[).*$#L\1#p' | LC_ALL=C sort)"
 expected=$'L20\nL22'
 [[ "$stage0_status" -ne 0 && "$stage0_rows" == "$expected" && "$stage1_rows" == "$expected" && "$stage1_output" == *$'P 0\nD 2\n'* ]] || {
     printf 'nested short-name parity failed:\nStage0: %s\nStage1: %s\n' "$stage0_output" "$stage1_output" >&2

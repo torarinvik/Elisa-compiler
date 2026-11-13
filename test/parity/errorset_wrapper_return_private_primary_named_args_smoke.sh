@@ -46,7 +46,7 @@ grep -q '^D 2$' <<< "$stage1_output" || {
   printf 'Stage1 diagnostics differ from the two privacy errors:\n%s\n' "$stage1_output" >&2
   exit 1
 }
-! grep -q 'cannot propagate' <<< "$stage1_output" || {
+! grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output" || {
   printf 'EWR fell through to a later public generic after a private primary:\n%s\n' "$stage1_output" >&2
   exit 1
 }

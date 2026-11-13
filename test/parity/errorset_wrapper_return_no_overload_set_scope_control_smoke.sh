@@ -30,7 +30,7 @@ grep -q '^D 0$' <<< "$stage1_output" || {
   printf 'Stage1 reported an unexpected EWR error for the lexical overload:\n%s\n' "$stage1_output" >&2
   exit 1
 }
-! grep -q 'cannot propagate' <<< "$stage1_output" || {
+! grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output" || {
   printf 'EWR imported the unselected Provider error family:\n%s\n' "$stage1_output" >&2
   exit 1
 }

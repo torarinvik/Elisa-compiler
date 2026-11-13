@@ -25,7 +25,7 @@ set -e
 stage1_output="$("$RPT" < "$FIXTURE")"
 grep -q '^P 0$' <<< "$stage1_output" || fail "Stage1 did not parse the inherited-wildcard fixture: $stage1_output"
 grep -q '^D 0$' <<< "$stage1_output" || fail "EWR did not preserve the outer wildcard winner: $stage1_output"
-if grep -qF 'cannot propagate' <<< "$stage1_output"; then
+if grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output"; then
     fail "EWR selected the nested wildcard's ErrorSet instead of the inherited outer candidate: $stage1_output"
 fi
 

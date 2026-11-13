@@ -30,7 +30,7 @@ fi
 stage1_output="$("$RPT" < "$FIXTURE")"
 grep -qF 'ambiguous reference "origin"' <<< "$stage1_output" \
     || fail "Stage1 did not report the ambiguous callback name: $stage1_output"
-if grep -qF 'cannot propagate' <<< "$stage1_output"; then
+if grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output"; then
     fail "Stage1 let one wildcard target supply an arbitrary ErrorSet to EWR: $stage1_output"
 fi
 

@@ -29,7 +29,7 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
 
 stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
-  | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
+  | sed -E -n 's#^[[:space:]]*L([0-9]+) (cannot propagate|return type expects error\[).*$#L\1#p' \
   | LC_ALL=C sort)"
 expected_rows=$'L44'
 
@@ -37,7 +37,7 @@ expected_rows=$'L44'
   || fail "Stage0 did not retain the fixed-arity generic control while invalidating defaulted winners: $stage0_output"
 [[ "$stage1_rows" == "$expected_rows" ]] \
   || fail "Stage1 propagated a defaulted underflow winner or missed the fixed-arity control: $stage1_output"
-[[ $(grep -cF 'cannot propagate' <<< "$stage1_output") == 1 ]] \
+[[ $(grep -cE 'cannot propagate|return type expects error\[' <<< "$stage1_output") == 1 ]] \
   || fail "Stage1 emitted an unexpected fallback-family diagnostic: $stage1_output"
 
 echo "errorset wrapper defaulted-underflow rank smoke OK"

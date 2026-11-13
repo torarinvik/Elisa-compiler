@@ -21,7 +21,7 @@ grep -q '^D 0$' <<< "$stage1_output" || {
   printf 'EWR did not preserve Consumer.wrap over Api.wrap:\n%s\n' "$stage1_output" >&2
   exit 1
 }
-! grep -q 'cannot propagate' <<< "$stage1_output" || {
+! grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output" || {
   printf 'EWR selected the nested wildcard over its lexical parent:\n%s\n' "$stage1_output" >&2
   exit 1
 }

@@ -27,7 +27,7 @@ grep -q '^P 0$' <<< "$stage1_output" \
     || fail "Stage1 did not parse the overload fixture: $stage1_output"
 grep -q '^D 0$' <<< "$stage1_output" \
     || fail "Stage1 reported a mismatch for the selected infallible overload: $stage1_output"
-! grep -q 'cannot propagate' <<< "$stage1_output" \
+! grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output" \
     || fail "EWR propagated an error from the unselected fallible overload: $stage1_output"
 
 echo "errorset wrapper infallible-overload smoke OK: Core receiver ranking is honored"

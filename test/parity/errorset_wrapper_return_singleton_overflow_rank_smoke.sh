@@ -29,7 +29,7 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
 
 stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
-  | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
+  | sed -E -n 's#^[[:space:]]*L([0-9]+) (cannot propagate|return type expects error\[).*$#L\1#p' \
   | LC_ALL=C sort)"
 expected_rows=$'L19'
 
@@ -37,7 +37,7 @@ expected_rows=$'L19'
   || fail "Stage0 did not retain the singleton's return family after overflow: $stage0_output"
 [[ "$stage1_rows" == "$expected_rows" ]] \
   || fail "Stage1 dropped the singleton's ErrorSet after overflow: $stage1_output"
-[[ $(grep -cF 'cannot propagate' <<< "$stage1_output") == 1 ]] \
+[[ $(grep -cE 'cannot propagate|return type expects error\[' <<< "$stage1_output") == 1 ]] \
   || fail "Stage1 emitted an unexpected propagation family: $stage1_output"
 
 echo "errorset wrapper singleton-overflow rank smoke OK"

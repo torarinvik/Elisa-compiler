@@ -26,7 +26,7 @@ fi
 
 stage1_output="$("$RPT" < "$FIXTURE")"
 grep -q '^P 0$' <<< "$stage1_output" || fail "Stage1 returned a nonzero process status: $stage1_output"
-if grep -qF 'cannot propagate' <<< "$stage1_output"; then
+if grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output"; then
   fail "Stage1 let the inactive nested const select ProviderB: $stage1_output"
 fi
 

@@ -30,7 +30,7 @@ grep -Eq '^D [1-9][0-9]*$' <<< "$stage1_output" \
     || fail "Stage1 missed the private-access error: $stage1_output"
 ! grep -q 'cannot propagate' <<< "$stage0_output" \
     || fail "Stage0 diagnosed the inaccessible wrapper as an EWR mismatch: $stage0_output"
-! grep -q 'cannot propagate' <<< "$stage1_output" \
+! grep -qE 'cannot propagate|return type expects error\[' <<< "$stage1_output" \
     || fail "EWR diagnosed an inaccessible wrapper candidate: $stage1_output"
 
 CONTROL="$REPO_ROOT/test/repro/private_import_program_local_shadow.elisa"

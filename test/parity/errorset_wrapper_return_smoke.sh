@@ -27,7 +27,7 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
     | LC_ALL=C sort)"
 stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
-    | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
+    | sed -E -n 's#^[[:space:]]*L([0-9]+) (cannot propagate|return type expects error\[).*$#L\1#p' \
     | LC_ALL=C sort)"
 expected_stage0_rows="$(LC_ALL=C sort <<'EOF'
 L38
@@ -73,6 +73,6 @@ empty_subset_fixture="$REPO_ROOT/test/repro/errorset_wrapper_return_empty_subset
 empty_subset_output="$("$RPT" < "$empty_subset_fixture")"
 grep -q '^D 2$' <<< "$empty_subset_output" || fail "Empty callback subset produced extra diagnostics: $empty_subset_output"
 grep -q 'error\[\.\.\.\] requires at least one qualified error tag' <<< "$empty_subset_output" || fail "Empty callback subset lost its syntax diagnostic: $empty_subset_output"
-! grep -q 'cannot propagate' <<< "$empty_subset_output" || fail "EWR diagnosed malformed empty callback subset: $empty_subset_output"
+! grep -qE 'cannot propagate|return type expects error\[' <<< "$empty_subset_output" || fail "EWR diagnosed malformed empty callback subset: $empty_subset_output"
 
 echo "errorset wrapper return smoke OK: subset inclusion is honored across family paths"
