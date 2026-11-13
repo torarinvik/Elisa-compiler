@@ -22,6 +22,10 @@ linear_ref=$(printf 'linear struct Guard:\n    raw: mutable uintptr\ndef ok(guar
 grep -Fq 'got Guard&' <<< "$linear_ref" && fail "linear owner reference rejected: $linear_ref"
 grep -Fq 'references to values containing linear handles are not supported; got darray[Guard]&' <<< "$linear_ref" || fail "reference to a darray of linear values accepted: $linear_ref"
 
+# Tuples carry their fields by value, but a reference field only lends its owner.
+tuple_ref=$(printf 'affine struct Handle:\n    raw: i64\ndef bad(value: (number: i64, handle: Handle)&) -> void:\n    pass\ndef nested(value: (inner: (handle: Handle, number: i64), number: i64)&) -> void:\n    pass\ndef ok(value: (number: i64, handle: Handle&)&) -> void:\n    pass\n' | "$RPT")
+[[ $(grep -Fc 'references to values containing linear handles are not supported' <<< "$tuple_ref") == 2 ]] || fail "tuple handle borrow checking disagrees: $tuple_ref"
+
 global=$(printf 'affine struct Handle:\n    raw: mutable uintptr\nglobal current: Handle = zeroed\n' | "$RPT")
 grep -Fq 'global "current" cannot store linear handle values of type Handle' <<< "$global" || fail "affine global accepted: $global"
 
