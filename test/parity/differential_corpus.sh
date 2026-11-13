@@ -24,8 +24,8 @@
 #
 # PARALLEL (Phase T, 2026-09-06): every program is independent, so the per-program work
 # runs under `xargs -P` (ELISA_CORPUS_JOBS, default = core count). The script re-enters
-# itself as `--one <work> <src>` per program (xargs cannot call a bash function), each
-# worker writes ONE result line into its own file under $WORK/res, and the parent reduces.
+# itself as `--batch <work> <src>...` for small batches. Each worker verifies compiler
+# provenance once, then writes one result file per program under $WORK/res.
 # Nothing is shared between workers but the read-only compilers. Measured: 49 min serial
 # on a 32-core host -> minutes.
 set -uo pipefail
@@ -45,9 +45,9 @@ VERBOSE=0
 [ -x "$STAGE1" ] || { echo "differential_corpus FAIL: no stage1 seed at $STAGE1" >&2; exit 1; }
 [ -f "$RUNTIME_OBJ" ] || { echo "differential_corpus FAIL: no runtime object" >&2; exit 1; }
 
-# Worker mode (`--one <work> <src>`) receives the parent's work dir and must not create or
+# Worker mode (`--batch <work> <src>...`) receives the parent's work dir and must not create or
 # clean one. (`set -u` above: an unset WORK in a worker used to kill it silently.)
-if [[ "${1:-}" == "--one" ]]; then
+if [[ "${1:-}" == "--batch" || "${1:-}" == "--one" ]]; then
     WORK="$2"
 else
     WORK="$(mktemp -d)"
@@ -227,7 +227,7 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 # the same directory with its own ratchet, so an xfail landed here as an unexplained
 # MISMATCH: two harnesses over one corpus, disagreeing about what a known gap means. A
 # documented divergence is a filed bug, not a regression.
-if [[ "${1:-}" != "--one" ]]; then
+if [[ "${1:-}" != "--batch" && "${1:-}" != "--one" ]]; then
     # Build output may contain entire stale compiler snapshots, including compiler
     # sources. They are not corpus inputs and must not be rebuilt as test programs.
     find "${CORPUS_DIRS[@]}" \( -path "$ELISA_CORE/build" -o -path "$ELISA_CORE/compiler/build" \) -prune -o -name '*.elisa' -print0 2>/dev/null \
@@ -323,11 +323,15 @@ one_program() {
     fi
 }
 
-if [[ "${1:-}" == "--one" ]]; then
+if [[ "${1:-}" == "--batch" || "${1:-}" == "--one" ]]; then
     # /dev/null on stdin belongs on the WORKER, never on xargs: `... | xargs ... </dev/null`
     # replaces the pipe with an empty stream and xargs runs the worker once with no program.
     exec </dev/null
-    one_program "$3" > "$(mktemp "$WORK/res/r.XXXXXX")"
+    shift 2
+    for source_file in "$@"; do
+        result_file="$(mktemp "$WORK/res/r.XXXXXX")" || exit 2
+        one_program "$source_file" > "$result_file" || exit 2
+    done
     exit 0
 fi
 
@@ -339,8 +343,8 @@ mkdir -p "$WORK/res"
 # Workers get /dev/null on stdin (a compiled program that reads input must not drain the
 # list) and the corpus as NUL-separated arguments (paths contain spaces).
 tr '\n' '\0' < "$WORK/programs.txt" \
-  | xargs -0 -P "$JOBS" -n 1 env ELISACORE_BIN="$ELISACORE_BIN" ELISA_STAGE1_BIN="$STAGE1" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" ELISA_CORE="$ELISA_CORE" LLVM_CONFIG="$LLVM_CONFIG" \
-      bash "$0" --one "$WORK"
+  | xargs -0 -P "$JOBS" -n 8 env ELISACORE_BIN="$ELISACORE_BIN" ELISA_STAGE1_BIN="$STAGE1" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" ELISA_CORE="$ELISA_CORE" LLVM_CONFIG="$LLVM_CONFIG" \
+      bash "$0" --batch "$WORK"
 
 dispatch_status=$?
 
