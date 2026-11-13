@@ -7,13 +7,14 @@ STAGE0="${ELISACORE_BIN:-$ROOT/../../Go projects/Elisa-core/compiler/bin/elisac}
 bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 STAGE1="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1" || exit $?
+RUNTIME="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 clang -c "$ROOT/test/parity/profile_hooks.c" -o "$WORK/hooks.o"
-python3 - "$ROOT" "$STAGE0" "$STAGE1" "$WORK" <<'PY'
+python3 - "$ROOT" "$STAGE0" "$STAGE1" "$WORK" "$RUNTIME" <<'PY'
 from pathlib import Path
 import os, re, subprocess, sys
-root, stage0, stage1, work = sys.argv[1:]
+root, stage0, stage1, work, runtime = sys.argv[1:]
 work = Path(work)
 for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_expression_cleanup', 'block_expression_values', 'block_expression_drop', 'block_expression_tuple', 'tuple_function_tail', 'block_reference_threading', 'block_state_threading', 'with_collection_append'):
     outputs = []
@@ -23,7 +24,7 @@ for fixture in ('block_optional_guard_match', 'block_expression_scope', 'block_e
             obj, exe = work / (artifact + '.o'), work / artifact
             source = Path(root) / 'test/differential/cases' / (fixture + '.elisa')
             subprocess.run([compiler, '-emit', 'obj', level, '-o', str(obj), str(source)], check=True, timeout=60)
-            subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), str(Path(root)/'build/runtime/elisacore_runtime.o')], check=True)
+            subprocess.run(['clang', *os.environ['ELISA_LD_DEAD_STRIP'].split(), *os.environ['ELISA_LINK_EXE_FLAGS'].split(), '-o', str(exe), str(obj), str(work/'hooks.o'), runtime], check=True)
             result = subprocess.run([str(exe)], capture_output=True, timeout=90)
             assert result.returncode == 0, (fixture, compiler, level, result.returncode, result.stdout, result.stderr)
             outputs.append((result.stdout, result.stderr))
