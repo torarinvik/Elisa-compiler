@@ -24,7 +24,7 @@ set -e
 stage0_rows="$(printf '%s\n' "$stage0_output" \
   | sed -E -n 's#^.*:([0-9]+):[0-9]+[^:]*: cannot propagate.*$#L\1#p' \
   | LC_ALL=C sort)"
-expected_rows=$'L27\nL36'
+expected_rows=$'L27\nL30\nL36'
 [[ "$stage0_rows" == "$expected_rows" ]] \
   || fail "Stage0 did not select the public nested-call family and preserve forwarded singleton inference: $stage0_output"
 if grep -qE 'try requires a fallible expression|is private to module|undefined identifier' <<< "$stage0_output"; then
@@ -35,8 +35,8 @@ stage1_output="$("$RPT" < "$FIXTURE")"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
   | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
   | LC_ALL=C sort)"
-grep -q '^D 2$' <<< "$stage1_output" \
-  || fail "Stage1 did not report exactly the nested-call and forwarded-singleton controls: $stage1_output"
+grep -q '^D 3$' <<< "$stage1_output" \
+  || fail "Stage1 did not report all nested-call and forwarded-call controls: $stage1_output"
 [[ "$stage1_rows" == "$expected_rows" ]] \
   || fail "Stage1 did not preserve the same public family controls: $stage1_output"
 if grep -qE 'try requires a fallible expression|is private to module|undefined identifier' <<< "$stage1_output"; then
