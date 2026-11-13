@@ -41,7 +41,7 @@ stage0_pairs() {
 
 stage1_pairs() {
     { printf '# strict\n# smt\n'; cat "$1"; } > "$WORK/cased.txt"
-    "$REPO_ROOT/build/parse_report" < "$WORK/cased.txt" \
+    "$RPT" < "$WORK/cased.txt" \
         | awk '/^D [0-9]+$/{d=1; next} d && match($0, /^  L[0-9]+ /){printf "%d|%s\n", substr($0, 4, RLENGTH - 4) - 2, substr($0, RLENGTH + 1)}' \
         | sort
 }
@@ -90,6 +90,9 @@ check_case provable_rec   $'def rec(n: i64) -> i64:\n    requires n >= 0\n    en
 # Ordinary top-level functions must stay in the prover's declaration walk when a guarded
 # return occurs inside a captured-loop body.
 check_case top_level_captured_loop $'def choose(n: i64) -> i64:\n    ensure result == 3\n    while n > 0 |n|:\n        return 2\n    return 3\n'
+# A matching loop return and a loop ruled out by a precondition remain clean.
+check_case captured_loop_matching_return $'def choose(n: i64) -> i64:\n    ensure result == 3\n    while n > 0 |n|:\n        return 3\n    return 3\n'
+check_case captured_loop_dead_by_requires $'def choose(n: i64) -> i64:\n    requires n <= 0\n    ensure result == 3\n    while n > 0 |n|:\n        return 2\n    return 3\n'
 # Protocol defaults are checked by the same ensure pass. The captured loop's parameter
 # return must be visible to its nested statement walkers, even though the other return is
 # a different parameter and is directly present in the function body.
