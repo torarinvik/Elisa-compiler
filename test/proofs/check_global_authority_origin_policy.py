@@ -35,7 +35,7 @@ SMOKE = ROOT / "test/parity/mutable_global_grants_smoke.py"
 GLOBAL_AUTHORITY_SMOKE = ROOT / "test/parity/mutable_global_authority_smoke.sh"
 ALIAS_FIXTURE = ROOT / "test/fixtures/effects/qualified_permission_using_alias.elisa"
 ALIAS_LATE_CONFLICT_FIXTURE = ROOT / "test/fixtures/effects/qualified_permission_late_alias_conflict.neg.elisa"
-ALIAS_CONFLICT_FIXTURE = ROOT / "test/fixtures/effects/global_authority_nested_alias_conflict.elisa"
+NESTED_ALIAS_SCOPE_FIXTURE = ROOT / "test/fixtures/effects/global_authority_nested_alias_scope.elisa"
 STATIC_BRANCH_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_static_branch_alias_conflict.elisa"
 ACTIVE_STATIC_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_active_static_alias.elisa"
 SAME_TARGET_ALIAS_FIXTURE = ROOT / "test/fixtures/effects/global_authority_same_target_aliases.elisa"
@@ -308,7 +308,7 @@ check_global_authority_source(
     ACTIVE_STATIC_ALIAS_FIXTURE=ACTIVE_STATIC_ALIAS_FIXTURE,
     ALIAS_CONFLICT_CHECKER=ALIAS_CONFLICT_CHECKER,
     ALIAS_CONFLICT_DIAGNOSTICS=ALIAS_CONFLICT_DIAGNOSTICS,
-    ALIAS_CONFLICT_FIXTURE=ALIAS_CONFLICT_FIXTURE,
+    NESTED_ALIAS_SCOPE_FIXTURE=NESTED_ALIAS_SCOPE_FIXTURE,
     ALIAS_FIXTURE=ALIAS_FIXTURE,
     ALIAS_LATE_CONFLICT_FIXTURE=ALIAS_LATE_CONFLICT_FIXTURE,
     ALIAS_SMOKE=ALIAS_SMOKE,
@@ -513,7 +513,7 @@ inputs = [
     BIN, MANIFEST, MANIFEST.with_name(MANIFEST.name + ".sha256"), PROVER / "ELISA_COMPILER_REV",
     stage1, stage1_provenance, Path(__file__), HERE / "proof_product_gate.py",
     HERE / "global_authority_source_checks.py", HERE / "parity_smoke_source.py", *parity_smoke_inputs(GLOBAL_AUTHORITY_SMOKE),
-    POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_LATE_CONFLICT_FIXTURE, ALIAS_CONFLICT_FIXTURE, STATIC_BRANCH_ALIAS_FIXTURE, ACTIVE_STATIC_ALIAS_FIXTURE, SAME_TARGET_ALIAS_FIXTURE, ALIAS_SMOKE,
+    POLICY, SEMANTIC, *AUTHORITY_SOURCES, *AUTHORITY_TYPE_SOURCES, FN_VALUE_SIGNATURES, IMPL_CONFORMANCE, SMOKE, ALIAS_FIXTURE, ALIAS_LATE_CONFLICT_FIXTURE, NESTED_ALIAS_SCOPE_FIXTURE, STATIC_BRANCH_ALIAS_FIXTURE, ACTIVE_STATIC_ALIAS_FIXTURE, SAME_TARGET_ALIAS_FIXTURE, ALIAS_SMOKE,
     ALIAS_CONFLICT_CHECKER, ALIAS_CONFLICT_DIAGNOSTICS, DIAGNOSTIC_KINDS,
     *source_include_closure([DIAGNOSTIC_KINDS]),
     ROOT / "test/atoms/authority_coverage.elisa", POSITIVE, NEGATIVE, *source_closure,

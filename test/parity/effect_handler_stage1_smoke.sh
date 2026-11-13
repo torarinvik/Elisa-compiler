@@ -463,7 +463,7 @@ run_interpret_warning "deep_permission_alias_uncovered.warn.elisa" 'requires can
 run_negative "helper_generic_specialization_mismatch.neg.elisa" 'abstract effect specialization mismatch'
 run_negative "helper_clone_private.neg.elisa" 'is private'
 run_positive "global_authority_same_target_aliases.elisa"
-run_negative "global_authority_nested_alias_conflict.elisa" 'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "Parent.NestedTarget"'
+run_positive "global_authority_nested_alias_scope.elisa"
 run_negative "global_authority_static_branch_alias_conflict.elisa" 'conflicting alias: "Shared" already aliases module "RootTarget", cannot also alias "NestedTarget"'
 static_alias_log="$WORK/global_authority_static_branch_alias_conflict.log"
 [[ $(grep -cF 'conflicting alias:' "$static_alias_log") == 1 ]] \

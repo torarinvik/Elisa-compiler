@@ -5,7 +5,7 @@ def check_global_authority_source(
     ACTIVE_STATIC_ALIAS_FIXTURE,
     ALIAS_CONFLICT_CHECKER,
     ALIAS_CONFLICT_DIAGNOSTICS,
-    ALIAS_CONFLICT_FIXTURE,
+    NESTED_ALIAS_SCOPE_FIXTURE,
     ALIAS_FIXTURE,
     ALIAS_LATE_CONFLICT_FIXTURE,
     ALIAS_SMOKE,
@@ -207,15 +207,17 @@ def check_global_authority_source(
     same_target_alias_fixture = SAME_TARGET_ALIAS_FIXTURE.read_text()
     if same_target_alias_fixture.count("using Target as Shared") != 2 or 'run_positive "global_authority_same_target_aliases.elisa"' not in alias_smoke:
         raise SystemExit("same-target alias repetitions must remain a positive Stage1 control")
-    if "run_negative \"global_authority_nested_alias_conflict.elisa\" 'conflicting alias: \"Shared\" already aliases module \"RootTarget\", cannot also alias \"Parent.NestedTarget\"'" not in alias_smoke:
-        raise SystemExit("nested alias-conflict fixture is not bound to its expected negative diagnostic")
-    alias_conflict_fixture = ALIAS_CONFLICT_FIXTURE.read_text()
-    nested_conflict = alias_conflict_fixture.find("using NestedTarget as Shared")
-    root_conflict = alias_conflict_fixture.find("using RootTarget as Shared")
-    if nested_conflict < 0 or root_conflict < 0 or nested_conflict >= root_conflict or \
-            "# Core registers direct aliases in the current block before descending into nested modules." not in alias_conflict_fixture or \
-            "Shared::slot" not in alias_conflict_fixture:
-        raise SystemExit("nested alias-conflict control no longer exercises Core's reversed textual/registration order")
+    if 'run_positive "global_authority_nested_alias_scope.elisa"' not in alias_smoke:
+        raise SystemExit("nested aliases must remain a positive lexical-scope control")
+    nested_alias_fixture = NESTED_ALIAS_SCOPE_FIXTURE.read_text()
+    if not all(fragment in nested_alias_fixture for fragment in (
+            "    using NestedTarget as Shared",
+            "\nusing RootTarget as Shared",
+            "can NestedTarget::slot.Read:",
+            "Parent::call_with_nested_grant()",
+            "RootTarget::needs_read()",
+    )):
+        raise SystemExit("nested alias control must exercise both lexical permission targets")
     static_branch_alias_fixture = STATIC_BRANCH_ALIAS_FIXTURE.read_text()
     static_nested_alias = static_branch_alias_fixture.find("using NestedTarget as Shared")
     static_direct_alias = static_branch_alias_fixture.find("using RootTarget as Shared")
