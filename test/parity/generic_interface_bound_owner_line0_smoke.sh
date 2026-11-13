@@ -23,4 +23,20 @@ grep -Fq "$expected" <<< "$report" || {
     exit 1
 }
 
+qualified="$REPO_ROOT/test/differential/cases/impl_in_module.elisa"
+report="$("$RPT" < "$qualified")"
+grep -Fxq 'P 0' <<< "$report"
+grep -Fxq 'D 0' <<< "$report"
+
+# A same-named type from another module cannot use Studio's implementation.
+report="$(sed '/^def main()/i\
+module Other:\
+    public:\
+        struct ModulePen:\
+            tag: i32\
+' "$qualified" | sed 's/paint_with\[Studio::ModulePen\]/paint_with[Other::ModulePen]/' | "$RPT")"
+grep -Fxq 'P 0' <<< "$report"
+grep -Fxq 'D 1' <<< "$report"
+grep -Fq 'does not satisfy required interface fact "Painter"' <<< "$report"
+
 echo "generic interface line-zero smoke OK"
