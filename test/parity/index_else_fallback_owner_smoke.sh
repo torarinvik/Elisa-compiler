@@ -26,7 +26,7 @@ grep -q '^P 0$' <<< "$consumer_out" || {
 oob_count=$(grep -Fc 'constant index 9 out of bounds for i64[4]' <<< "$consumer_out" || true)
 optional_count=$(grep -Fc 'variable "plain" expects i64, got i64?' <<< "$consumer_out" || true)
 unsafe_count=$(grep -Fc 'unchecked index requires' <<< "$consumer_out" || true)
-if [[ "$oob_count" -ne 1 || "$optional_count" -ne 1 || "$unsafe_count" -ne 2 ]]; then
+if [[ "$oob_count" -ne 1 || "$optional_count" -ne 1 || "$unsafe_count" -ne 2 ]] || ! grep -qx 'D 4' <<< "$consumer_out"; then
     echo "checked-get owner smoke FAIL: expected one sibling OOB, one sibling optional mismatch, and two sibling unchecked-index diagnostics: $consumer_out" >&2
     exit 1
 fi

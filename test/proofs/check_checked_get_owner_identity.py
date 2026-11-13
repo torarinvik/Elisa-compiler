@@ -83,7 +83,7 @@ if FIXTURE.count("#line 0 checked-get-owner.elisa") != 2 or \
 if CONSUMER_FIXTURE.count("#line 0 checked-get-consumers.elisa") != 8 or \
         "get values[9] else 0" not in CONSUMER_FIXTURE or \
         "plain: i64 = values[9]" not in CONSUMER_FIXTURE or \
-        "checked: i64 = get (maybe)" not in CONSUMER_FIXTURE or \
+        "checked: i64 = get maybe" not in CONSUMER_FIXTURE or \
         "plain: i64 = maybe" not in CONSUMER_FIXTURE or \
         "checked: i64 = get values[index]" not in CONSUMER_FIXTURE or \
         "get values[index] else return 0" not in CONSUMER_FIXTURE:
