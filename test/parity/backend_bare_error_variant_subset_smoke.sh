@@ -33,7 +33,7 @@ for level in 0 2; do
         # At O2 LLVM can inline and remove the internal leaf; check its explicit ABI at O0
         # and keep O2 as a runtime parity check.
         if [[ "$level" -eq 0 ]]; then
-            leaf_abi="$(rg -F -m1 '@leaf(' "$llvm" | sed -E 's/%[-a-zA-Z$._0-9]+/%TYPE/g' || true)"
+            leaf_abi="$(rg -m1 '^define .* @leaf\(' "$llvm" | sed -E 's/^define (internal )?//; s/ #[0-9]+ \{$//; s/%[-a-zA-Z$._0-9]+/%TYPE/g' || true)"
             [[ -n "$leaf_abi" ]] || { echo "bare error variant subset smoke: missing leaf ABI at Stage$stage -O$level" >&2; exit 1; }
             if [[ "$stage" -eq 0 ]]; then
                 stage0_leaf_abi="$leaf_abi"
