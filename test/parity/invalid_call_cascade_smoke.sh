@@ -23,7 +23,7 @@ check_case() {
     local s0 s1
     s0="$("$ELISACORE_BIN" -emit semantic "$WORK/$name.elisa" 2>&1 >/dev/null \
         | grep -F "$SENTENCE" | sed -E 's#^[^:]*:([0-9]+):.*#\1#' | sort)"
-    s1="$("$REPO_ROOT/build/parse_report" < "$WORK/$name.elisa" \
+    s1="$("$RPT" < "$WORK/$name.elisa" \
         | grep -F "$SENTENCE" | sed -E 's#^  L([0-9]+) .*#\1#' | sort)"
     if [ "$s0" != "$s1" ]; then
         failed=$((failed + 1))
