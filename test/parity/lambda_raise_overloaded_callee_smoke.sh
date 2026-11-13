@@ -72,4 +72,13 @@ if ! grep -q '^P 0$' <<< "$infallible_report" || ! grep -q '^D 1$' <<< "$infalli
     exit 1
 fi
 
+callee_report="$("$RPT" < "$REPO_ROOT/test/repro/lambda_raise_infallible_callee.elisa")"
+if ! grep -q '^P 0$' <<< "$callee_report" || ! grep -q '^D 3$' <<< "$callee_report" \
+    || ! grep -q '^  L10 raise cannot propagate tag' <<< "$callee_report" \
+    || ! grep -q '^  L14 raise requires the current function to return an error union' <<< "$callee_report" \
+    || ! grep -q '^  L23 raise cannot propagate tag' <<< "$callee_report"; then
+    printf 'infallible callees did not preserve their callback error contracts:\n%s\n' "$callee_report" >&2
+    exit 1
+fi
+
 echo "overloaded Lambda raise smoke OK"
