@@ -66,11 +66,10 @@ direct_decode = body.index("PyUnicode_DecodeUTF8(result.data, (Py_ssize_t)result
 assert direct_length_guard < direct_decode, (
     "borrowed_default_plain_sview casts an oversized length before checking PY_SSIZE_T_MAX"
 )
-copy_result = direct_decode
-cleanup = body.find("Py_XDECREF(arg0_default); arg0_default = NULL;", copy_result)
-assert cleanup > copy_result, (
-    "borrowed_default_plain_sview releases its omitted sview default before copying the returned text"
-)
+# A plain sview literal default is backed by a C string with static lifetime.
+literal = '"borrowed direct sview return default"'
+assert f"const char *arg0_data = {literal};" in body
+assert "PyObject *arg0_default" not in body
 PY
 
 if [[ ! -x "$PYTHON_BIN" || ! -x "$PYTHON_CONFIG" || ! -x "$CLANG" || ! -f "$ROOT/build/runtime/elisacore_runtime.o" ]]; then
