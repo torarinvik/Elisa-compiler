@@ -318,6 +318,7 @@ for guard_case in pos neg; do
 done
 
 echo "-- local_borrow_container_escape --"
+run_case aggregate_reference_field_return_escape pos "$FIXTURES/aggregate_reference_field_return_escape.pos.elisa" "returning an aggregate or helper result that contains a reference into function-local storage; it dangles once the function returns. Store the value or owner by value, or clone it into a longer-lived region"
 lbe_pos="$FIXTURES/local_borrow_container_escape.pos.elisa"
 lbe_neg="$FIXTURES/local_borrow_container_escape.neg.elisa"
 for lbe_message in \
