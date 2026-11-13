@@ -37,6 +37,19 @@ def sample_rebuild(child, profile):
             descendants = updated
         def executable(pid):
             command = processes.get(pid, (0, ""))[1]
+            # The command column is not shell-quoted. An executable path may
+            # contain spaces, so splitting it loses the basename (e.g. the
+            # normal checkout under "Coding Projects"). Ask ps for the
+            # executable path itself when this could be an Elisa compiler.
+            if "elisac" in command:
+                try:
+                    path = subprocess.check_output(
+                        ["ps", "-p", str(pid), "-o", "comm="], text=True
+                    ).strip()
+                    if path:
+                        return os.path.basename(path)
+                except (OSError, subprocess.SubprocessError):
+                    pass
             return os.path.basename(command.split(None, 1)[0]) if command else ""
 
         candidates = [pid for pid in descendants if "elisac" in executable(pid)]
