@@ -248,7 +248,9 @@ one_program() {
     # ---- stage0 is the ORACLE. If IT cannot produce a running program, this file is not
     # a parity signal (a fixture meant to fail to compile, a driver needing stdin, ...).
     local COMPILE_LOG="$work/stage0.compile.log" compile_status
-    if COMPILE "$ELISACORE_BIN" -emit obj -o "$work/s0.o" "$src"; then
+    # Each fixture gets a single oracle invocation. Finish its analysis within
+    # the existing compile deadline instead of returning a resumable checkpoint.
+    if COMPILE env ELISACORE_ANALYSIS_BOOTSTRAP=0 "$ELISACORE_BIN" -emit obj -o "$work/s0.o" "$src"; then
         :
     else
         compile_status=$?
