@@ -11,25 +11,16 @@ LLVM_CONFIG="${LLVM_CONFIG:-$ELISA_LLVM_BIN_DIR/llvm-config}"
 
 BUILD="$ROOT/build/aos_smoke"
 mkdir -p "$BUILD"
-LIBDIR="$($LLVM_CONFIG --libdir)"
-RUNTIME_OBJ="$ROOT/build/runtime/elisacore_runtime.o"
+RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 [ -f "$RUNTIME_OBJ" ] || { echo "backend aos smoke FAIL: no runtime object" >&2; exit 1; }
 FALLBACK_OBJ="$BUILD/runtime_fallback.o"
 clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
 PROFILE_OBJ="$BUILD/profile_hooks.o"
 clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
 
-"$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/driver.o" "$ROOT/test/breadth/emit_native.elisa" >/dev/null 2>&1
-# The OPTIONAL hooks a real link resolves to the compiler's weak fallbacks.
-# Without them this link fails outright on _elisa_profile_* (the arena calls
-# the profiler ABI unconditionally), which is what kept this gate red.
-source "$ROOT/test/parity/native_optional_hook_objects.sh"
-elisa_native_optional_hook_objects "$BUILD" "$ROOT"
-bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$BUILD/llvm_validation_peel.o"
-CXX_RUNTIME=-lc++
-[[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
-clang -o "$BUILD/driver" "$BUILD/driver.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$BUILD/llvm_validation_peel.o" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
-"$BUILD/driver" < "$ROOT/test/breadth/packed_aos_fixture.elisa" > "$BUILD/aos.ll"
+EMITTER="${ELISA_EMIT_NATIVE:-$ROOT/build/emit_native}"
+REPO_ROOT="$ROOT" ELISA_EMIT_NATIVE="$EMITTER" ELISACORE_BIN="$ELISACORE_BIN" bash "$ROOT/test/parity/build_emit_native.sh"
+"$EMITTER" < "$ROOT/test/breadth/packed_aos_fixture.elisa" > "$BUILD/aos.ll"
 grep -q 'declare ptr @ctx_aos_store_new(ptr, i64)' "$BUILD/aos.ll"
 grep -q 'declare.*@ctx_aos_store_alloc(ptr, ptr)' "$BUILD/aos.ll"
 # The runtime declares `ctx_aos_store_record(state, index: usize)`, so the index is
