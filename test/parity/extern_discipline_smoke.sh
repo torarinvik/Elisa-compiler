@@ -14,7 +14,7 @@ python3 - "$STAGE0" "$STAGE1" "$WORK" <<'PY'
 from pathlib import Path
 import subprocess, sys
 stage0, stage1, work = sys.argv[1:]
-work = Path(work)
+work = Path(work).resolve()
 main = 'def main() -> i64:\n    return 0\n'
 rejected = {
     'untyped_param': 'extern adsr_process(envelope: mutable void&?, level: f64) -> f64 requires level >= 0.0\n',
