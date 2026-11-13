@@ -506,7 +506,7 @@ if FIXTURE.count("#line 0 affine-postcondition-call-owner.elisa") != 95 or \
         "pair_copy = pair" not in FIXTURE or \
         "consume_region_pair(region_pair_ticket, pair_copy)" not in FIXTURE or \
         "def region_pair_same_region_selects_consuming_overload[@r]" not in FIXTURE or \
-        "let pair_copy = pair" not in FIXTURE or \
+        "same_region_ticket: Ticket[Fresh] = Ticket.new(id: 1)\n    pair_copy = pair" not in FIXTURE or \
         "consume_region_pair(same_region_ticket, pair_copy)" not in FIXTURE or \
         "consume(mode: true, ticket: ticket)" not in FIXTURE or \
         "Other::consume(ticket, true)" not in FIXTURE:
