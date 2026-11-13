@@ -39,4 +39,13 @@ for forbidden in \
     fi
 done
 
+scoped_report="$("$RPT" < "$REPO_ROOT/test/repro/fn_value_extern_permission_scope.elisa")"
+if ! grep -qx 'P 0' <<< "$scoped_report" || ! grep -qx 'D 2' <<< "$scoped_report" \
+    || ! grep -Fq 'variable "bad_a" expects' <<< "$scoped_report" \
+    || ! grep -Fq 'variable "bad_b" expects' <<< "$scoped_report"; then
+    echo "function-value extern module-row smoke: permission identities were lost" >&2
+    printf '%s\n' "$scoped_report" >&2
+    exit 1
+fi
+
 echo "function-value extern module-row smoke OK"
