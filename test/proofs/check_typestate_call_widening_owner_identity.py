@@ -7,6 +7,7 @@ SOURCE = (ROOT / "src/semantic/check_typestate_call_widening.elisa").read_text()
 FIXTURE = (ROOT / "test/repro/typestate_call_widening_owner_line_zero.elisa").read_text()
 SMOKE = (ROOT / "test/parity/typestate_call_widening_owner_line_zero_smoke.sh").read_text()
 RUN_ALL = (ROOT / "test/parity/run_all.sh").read_text()
+CALLABLE_ROWS = "".join((ROOT / "src/semantic/check_try_fallible" / name).read_text() for name in ("callable_rows.elisa", "callable_arguments.elisa", "callable_overloads.elisa", "callable_noncall_expressions.elisa"))
 EXTERN_PARSER = (ROOT / "src/parser/parser_export_surface.elisa").read_text()
 
 
@@ -18,14 +19,14 @@ source = compact(SOURCE)
 scan_start = SOURCE.index("def typestate_widen_scan(")
 scan_end = SOURCE.index("def typestate_widen_statements(", scan_start)
 scan = compact(SOURCE[scan_start:scan_end])
-if "widening_param_indices[widening_index]==typestate_param_indexandwidening_positions[widening_index]==call_line" not in scan or \
+if "widening_param_indices[widening_index]==typestate_param_indexandwidening_positions[widening_index].line==call_line.lineandwidening_positions[widening_index].offset==call_line.offset" not in scan or \
         "ifnotalready_recorded:widening_param_indices.push(typestate_param_index)widening_positions.push(call_line)" not in scan or \
         "widening_positions:mutabledarray[Ast::Pos]=[]" not in source:
     raise SystemExit("one mutable argument cannot emit duplicate widening facts for the same parameter and callsite")
 if "pc.line==extern_lineandpc.function_offset==extern_offset" not in source:
     raise SystemExit("extern postcondition lookup must match the exact declaration line and offset")
-if "extern_lines.push(extern_line.line)" not in SOURCE or \
-        "extern_offsets.push(extern_line.offset)" not in SOURCE:
+if "lines.push(extern_line.line)" not in SOURCE or \
+        "offsets.push(extern_line.offset)" not in SOURCE:
     raise SystemExit("extern signature collection must preserve its declaration position")
 if "extern_param_mutable_at(extern_index," not in SOURCE or \
         "extern_param_mutable_at(extern_names," in SOURCE:
@@ -193,8 +194,8 @@ if "typestate_call_widening_owner_line_zero.elisa" not in SMOKE or \
         'before "call_move_operand" returns' not in SMOKE or \
         'before "call_region_operand" returns' not in SMOKE or \
         "call_offset_present" not in SOURCE or \
-        "alias.offset >= before_offset" not in Path((ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_arguments.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_overloads.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_noncall_expressions.elisa").read_text()) or \
-        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, before_offset, table)" not in Path((ROOT / "src/semantic/check_try_fallible/callable_rows.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_arguments.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_overloads.elisa").read_text() + (ROOT / "src/semantic/check_try_fallible/callable_noncall_expressions.elisa").read_text()):
+        "alias.offset >= before_offset" not in CALLABLE_ROWS or \
+        "semantic_possible_import_alias_head_target(alias_head, enclosing_module, before_offset, table)" not in CALLABLE_ROWS:
     raise SystemExit("smoke must cover local, qualified, imported, arity, and ambiguous-shape owner selection")
 
 if 'for smoke in "$REPO_ROOT"/test/parity/*_smoke.sh' not in RUN_ALL or \
