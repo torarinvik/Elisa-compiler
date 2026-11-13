@@ -94,7 +94,7 @@ if [ -f "$PROVENANCE" ]; then
         echo "cannot verify Stage0 provenance: python3 is unavailable (binary: $BIN)" >&2
         exit 2
     fi
-    PROVENANCE_CHECKER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/stage0_provenance.py"
+    PROVENANCE_CHECKER="$STAGE0_ROOT/scripts/stage0_provenance.py"
     if ! python3 - "$PROVENANCE" "$PROVENANCE_CHECKER" "$STAGE0_ROOT" "$BIN" <<'PY'
 import importlib.util
 import json
