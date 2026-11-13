@@ -2,7 +2,7 @@
 # Guards the self-host rewrite in parser_decl_handler.elisa (parse_handler_captures): a
 # container filled by a callee that allocates in its arguments' arenas must not be a
 # frame-local when its elements are stored into parser-owned storage. stage0 is the
-# oracle (stage1 does not yet check this shape): the .neg must be rejected with the
+# oracle (stage1 does not yet check this shape): the two-target .neg must be rejected with the
 # region-escape sentence at the store, the .pos (containers in the parser's region) accepted.
 set -euo pipefail
 
