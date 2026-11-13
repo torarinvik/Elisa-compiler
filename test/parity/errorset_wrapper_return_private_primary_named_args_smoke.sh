@@ -42,8 +42,8 @@ grep -qF '"Provider.plain" is private to module "Provider"' <<< "$stage1_output"
   printf 'Stage1 did not reject the private infallible primary callable:\n%s\n' "$stage1_output" >&2
   exit 1
 }
-grep -q '^D 4$' <<< "$stage1_output" || {
-  printf 'Stage1 diagnostics differ from the two privacy errors and their invalid-call cascades:\n%s\n' "$stage1_output" >&2
+grep -q '^D 2$' <<< "$stage1_output" || {
+  printf 'Stage1 diagnostics differ from the two privacy errors:\n%s\n' "$stage1_output" >&2
   exit 1
 }
 ! grep -q 'cannot propagate' <<< "$stage1_output" || {

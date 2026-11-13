@@ -17,7 +17,7 @@ stage0_rows="$(printf '%s\n' "$stage0_output" \
     | sed -E -n 's#^.*:([0-9]+):[0-9]+[^:]*: (cannot propagate|return type expects).*$#L\1#p' \
     | LC_ALL=C sort)"
 stage1_rows="$(printf '%s\n' "$stage1_output" \
-    | sed -E -n 's#^[[:space:]]*L([0-9]+) cannot propagate.*$#L\1#p' \
+    | sed -E -n 's#^[[:space:]]*L([0-9]+) (cannot propagate|return type expects error\[).*$#L\1#p' \
     | LC_ALL=C sort)"
 
 grep -qF 'is private to module' <<< "$stage0_output" || {
