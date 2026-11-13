@@ -8,6 +8,8 @@ report=$(ELISA_REPORT_COLUMNS=1 "$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/a
 for span in 'L23:15-17' 'L25:13-17' 'L27:13-14' 'L30:12-13' 'L33:15-17'; do
     grep -Fq "$span " <<< "$report"
 done
+grep -Fq 'L34:23-24 query expression value iteration' <<< "$report"
+grep -Fq 'L35:15-18 query expression value iteration' <<< "$report"
 fields=$(ELISA_REPORT_COLUMNS=1 "$RPT" < "$REPO_ROOT/test/fixtures/diagnostics/affine_bulk_copy_field.pos.elisa")
 grep -Fq 'L23:20-24 darray extend' <<< "$fields"
 grep -Fq 'L24:23-24 bulk darray push' <<< "$fields"
