@@ -25,6 +25,8 @@ grep -Fq 'references to values containing linear handles are not supported; got 
 # Tuples carry their fields by value, but a reference field only lends its owner.
 tuple_ref=$(printf 'affine struct Handle:\n    raw: i64\ndef bad(value: (number: i64, handle: Handle)&) -> void:\n    pass\ndef nested(value: (inner: (handle: Handle, number: i64), number: i64)&) -> void:\n    pass\ndef ok(value: (number: i64, handle: Handle&)&) -> void:\n    pass\n' | "$RPT")
 [[ $(grep -Fc 'references to values containing linear handles are not supported' <<< "$tuple_ref") == 2 ]] || fail "tuple handle borrow checking disagrees: $tuple_ref"
+grep -Fq 'got (number: i64, handle: Handle)&' <<< "$tuple_ref" || fail "tuple field spelling lost: $tuple_ref"
+grep -Fq 'got (inner: (handle: Handle, number: i64), number: i64)&' <<< "$tuple_ref" || fail "nested tuple field spelling lost: $tuple_ref"
 qualified_tuple_ref=$(printf 'module Vault:\n    public:\n        affine struct Handle:\n            value: i64\nmodule Other:\n    public:\n        struct Handle:\n            value: i64\ndef bad(value: (number: i64, handle: Vault::Handle)&) -> void:\n    pass\ndef ok(value: (number: i64, handle: Other::Handle)&) -> void:\n    pass\n' | "$RPT")
 [[ $(grep -Fc 'references to values containing linear handles are not supported' <<< "$qualified_tuple_ref") == 1 ]] || fail "qualified tuple handle borrow checking disagrees: $qualified_tuple_ref"
 
