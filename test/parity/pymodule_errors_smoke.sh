@@ -50,10 +50,14 @@ source = open(sys.argv[1], encoding="utf-8").read()
 start = source.index("static PyObject *elisa_py_fail_ref")
 end = source.index("static const char *elisa_pymodule_struct_names", start)
 wrapper = source[start:end]
-assert "goto elisa_pymodule_error_payload_after_cleanup_failed;" in wrapper
-assert "elisa_pymodule_error_payload_after_cleanup_failed:" in wrapper
-assert "elisa_pymodule_error_payload_after_cleanup_done:" in wrapper
-assert "arena_free(&arena);\n        return NULL;" in wrapper
+failed = "elisa_pymodule_error_payload_conversion_failed"
+done = "elisa_pymodule_error_payload_conversion_done"
+assert f"if (native_payload_object == NULL) goto {failed};" in wrapper
+assert f"goto {done};" in wrapper
+failure = wrapper.split(f"{failed}:", 1)[1].split(f"{done}:", 1)[0]
+assert failure.index("PyMem_Free(arg0_items);") < failure.index("arena_free(&arena);")
+assert failure.count("arena_free(&arena);") == 1
+assert failure.index("arena_free(&arena);") < failure.index("return NULL;")
 PY
 
 PYTHON_BIN="$PYTHON_BIN" PYTHON_CONFIG="$PYTHON_CONFIG" ELISA_CLANG="$CLANG" \
