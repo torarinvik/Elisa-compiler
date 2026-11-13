@@ -501,6 +501,7 @@ if FIXTURE.count("#line 0 affine-postcondition-call-owner.elisa") != 95 or \
         "def consume_qualified_nominal_optional(ticket: Ticket[Fresh], value: ImportedNominal::Foo?) -> void ensures ticket => Used:" not in FIXTURE or \
         "def qualified_nominal_optional_selects_postcondition(value: ImportedNominal::Foo?) -> void:" not in FIXTURE or \
         "consume_qualified_nominal_optional(qualified_nominal_optional_ticket, value)" not in FIXTURE or \
+        "def consume_region_pair[@r, @s](ticket: i64, pair: AffineRegionPair[r, s])" not in FIXTURE or \
         "def region_pair_selects_nonconsuming_overload[@a, @b]" not in FIXTURE or \
         "AffineRegionPair[a, b]" not in FIXTURE or \
         "pair_copy = pair" not in FIXTURE or \
