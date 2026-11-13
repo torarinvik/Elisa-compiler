@@ -85,7 +85,13 @@ def sample_rebuild(child, profile):
                     workers.append((3, pid))
             # Provenance discovery can still be running before Go starts.
             # Capture its driver when no compiler worker is visible.
-            target = min(workers)[1] if workers else child.pid
+            worker_ids = {pid for _, pid in workers}
+            waiting_workers = {
+                parent for pid, (parent, _) in processes.items()
+                if pid in descendants and parent in worker_ids
+            }
+            active_workers = [worker for worker in workers if worker[1] not in waiting_workers]
+            target = min(active_workers or workers)[1] if workers else child.pid
         # Report only the Go package name, not the full command line: compiler
         # arguments may contain paths or other user-provided values.
         if executable(target) == "compile":
