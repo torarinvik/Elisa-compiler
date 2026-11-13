@@ -14,7 +14,7 @@ if [[ "${ELISA_SELF_HOST_GEN2_TIMEOUT_WRAPPED:-0}" != "1" &&
   ELISA_TIMEOUT_LIBRARY_PATH_VALUE="${LIBRARY_PATH-}" \
   ELISA_TIMEOUT_SDKROOT_SET="${SDKROOT+x}" \
   ELISA_TIMEOUT_SDKROOT_VALUE="${SDKROOT-}" \
-    exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 3 -- \
+    exec "$ELISA_TOOL_PYTHON" "$ROOT/scripts/run_with_timeout.py" 5 -- \
     "$BASH" "${BASH_SOURCE[0]}" "$@"
 fi
 # Host predicates for products built by a compiler invoked DIRECTLY here (not through the

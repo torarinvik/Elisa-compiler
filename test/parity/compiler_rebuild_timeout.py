@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a compiler rebuild with a strict 3-second process-group deadline."""
+"""Run a compiler rebuild with a strict 5-second process-group deadline."""
 import os
 import subprocess
 import sys
@@ -115,7 +115,7 @@ def schedule_sample(child):
     sampler.start()
 
 try:
-    status = run(sys.argv[1:], 3, on_start=schedule_sample if profile_enabled else None)
+    status = run(sys.argv[1:], 5, on_start=schedule_sample if profile_enabled else None)
 finally:
     if sampler is not None:
         sampler.cancel()

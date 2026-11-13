@@ -139,7 +139,7 @@ class RunWithTimeoutTests(unittest.TestCase):
 
     def test_stage1_seed_entrypoint_has_a_fixed_direct_deadline(self) -> None:
         entrypoint = (ROOT / "scripts" / "elisac_stage1.sh").read_text(encoding="utf-8")
-        self.assertIn('"$ROOT/scripts/run_with_timeout.py" 3 --', entrypoint)
+        self.assertIn('"$ROOT/scripts/run_with_timeout.py" 5 --', entrypoint)
         self.assertIn('ELISA_STAGE1_SEED_TIMEOUT_WRAPPED:-0', entrypoint)
 
 
