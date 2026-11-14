@@ -84,10 +84,18 @@ run_guarded_stage1() {
 
 echo "gen1=$BIN"
 file "$BIN"
-run_guarded_stage1
 # -stack_size 512MB (arm64 ld64 max) — same rationale as scripts/elisac_stage1.sh's
 # seed_build: emit_expression recurses once per AST level, and this is the product binary.
-bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$OUT_DIR/llvm_validation_peel.o"
+# The bridge and the compiler object have independent inputs. Start the bridge
+# before compiling so its cache lookup or build can overlap the frontend.
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$OUT_DIR/llvm_validation_peel.o" &
+bridge_pid=$!
+compile_status=0
+bridge_status=0
+run_guarded_stage1 || compile_status=$?
+wait "$bridge_pid" || bridge_status=$?
+(( compile_status == 0 )) || exit "$compile_status"
+(( bridge_status == 0 )) || exit "$bridge_status"
 CXX_RUNTIME=-lc++
 [[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
 clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" "$OUT_DIR/llvm_validation_peel.o" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
