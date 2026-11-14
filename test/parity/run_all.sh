@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
-# The stage1 parity gate: run EVERY test/parity/*_smoke.sh plus the two standing
-# invariants (self-hostable 0 unresolved across the frontend, and lexer token parity
-# stage1 == stage0). Exists because the smoke scripts were previously ungated — no target
-# ran them, so a regression could rot silently (see the "test tree never gated" lesson).
-# One green run here means every stage1-owned guarantee still holds.
-#
-# As of 2026-07-14 the gate is FULLY GREEN — no known failures (the earlier machine_from
-# nested-binding SIGBUS and the diagnostics literal_comparison_impossible FP are both fixed).
-# It now also runs flow_strict_census_smoke.sh (docs/125 step 15 graduation): the strict
-# block-`if` ban is a gate-enforced standard — the compiler's src + std stay at 0 block-`if`s.
-#
-#   Usage:  ELISA_CORE=/path/to/Elisa-core  test/parity/run_all.sh
-#           (ELISA_CORE defaults to ../../Go projects/Elisa-core)
+# Run the Stage1 parity gate with a pinned Stage0 oracle.
+# ELISA_CORE defaults to the adjacent Elisa-core checkout.
 set -uo pipefail
 
 # SELF-INVOCATION: `run_all.sh --exec-one <resultdir> <name> <cmd...>` runs ONE check and
@@ -110,6 +99,9 @@ export ELISA_STAGE1_BIN="$STAGE1_BIN" ELISA_RUNTIME_OBJ="$RUNTIME_OBJ"
 # Gate fixtures are short-lived and often have distinct include roots. Do not
 # leave an automatic retained Stage0 server holding each fixture's analysis.
 export ELISACORE_RETAINED_SERVER="${ELISACORE_RETAINED_SERVER-}"
+# Each oracle check expects a complete result from one invocation. Checks
+# that exercise continuation can still enable it for their own commands.
+export ELISACORE_ANALYSIS_BOOTSTRAP=0
 
 [[ -x "$STAGE1_BIN" ]] || {
   echo "error: stage1 product missing at $STAGE1_BIN (run scripts/elisac_stage1.sh --seed)" >&2
