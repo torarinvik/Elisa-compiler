@@ -256,7 +256,7 @@ one_program() {
         compile_status=$?
         if [[ "$compile_status" -eq 124 ]]; then
             printf 'TIMEOUT\t%s\tstage0 compile; log=%s\n' "$name" "$COMPILE_LOG"
-        elif [[ "$compile_status" -gt 125 ]] || grep -Eq '^(panic: |fatal error: |Stage0 provenance mismatch:|Stage0 oracle binary is stale|build incomplete:)' "$COMPILE_LOG"; then
+        elif [[ "$compile_status" -gt 125 ]] || grep -Eq '^(panic: |fatal error: |Stage0 provenance mismatch:|Stage0 oracle binary is stale|build incomplete:|error: open .+: no such file or directory)' "$COMPILE_LOG"; then
             printf 'ORACLE_FAILURE\t%s\tstage0 compile exit=%s; log=%s\n' "$name" "$compile_status" "$COMPILE_LOG"
         else
             printf 'SKIP\t%s\tstage0 compile exit=%s; log=%s\n' "$name" "$compile_status" "$COMPILE_LOG"
