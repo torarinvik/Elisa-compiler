@@ -17,6 +17,9 @@ cat >>"$WORK/shared-pool.elisa" <<'ELISA'
 def bump(value: i64) -> i64:
     return value + 1
 
+def read_value(value: i64&) -> i64:
+    return value
+
 def early_exit() -> i64:
     pool workers(1):
         nursery on(workers):
@@ -28,7 +31,7 @@ def main() -> i64:
     pool workers(2):
         nursery on(workers):
             workers: i64 = 1
-            submit bump(41)
+            submit bump(read_value(&workers))
         nursery on(workers):
             submit bump(42)
     return 42
