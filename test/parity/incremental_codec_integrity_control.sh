@@ -8,7 +8,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-incremental-codec.XXXXXX")"
 source "$ROOT/test/parity/control_artifacts.sh"
 elisa_control_artifacts "$WORK"
 for level in O0 O2; do
-    if ! elisa_run_timeout 300 "$STAGE1" -emit exe "-$level" -o "$WORK/control-$level" "$ROOT/test/parity/incremental_codec_integrity_control.elisa" >"$WORK/build-$level.log" 2>&1; then
+    if ! ELISACORE_FORCE_CONTRACTS=1 elisa_run_timeout 300 "$STAGE1" -emit exe "-$level" -o "$WORK/control-$level" "$ROOT/test/parity/incremental_codec_integrity_control.elisa" >"$WORK/build-$level.log" 2>&1; then
         cat "$WORK/build-$level.log" >&2
         exit 1
     fi
