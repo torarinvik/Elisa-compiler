@@ -73,9 +73,11 @@ if [[ "${1:-}" == "--exec-one" ]]; then
   # The gen3 fixpoint is three SERIAL self-compiles and the gate's critical path; every other
   # check is bulk. Run the bulk at lower priority so the chain is never starved by 300 siblings
   # (measured: gen3 206-354 s idle, 1167-1252 s inside the gate). ELISA_GATE_NICE=0 disables.
-  _nice=("nice" "-n" "${ELISA_GATE_NICE:-10}")
-  case "$_name" in self_host_gen3_smoke.sh) _nice=() ;; esac
-  if "${_nice[@]}" bash "$@" >"$_log" 2>&1; then _st=ok; else _st=FAIL; fi
+  _command=(bash "$@")
+  if [[ "$_name" != self_host_gen3_smoke.sh ]]; then
+    _command=(nice -n "${ELISA_GATE_NICE:-10}" "${_command[@]}")
+  fi
+  if "${_command[@]}" >"$_log" 2>&1; then _st=ok; else _st=FAIL; fi
   _el=$((SECONDS - _t0))
   if [[ "$_st" == ok && -n "$_cachefile" ]]; then
     mkdir -p "$_cachedir" && printf '%s' "$_key" > "$_cachefile"
