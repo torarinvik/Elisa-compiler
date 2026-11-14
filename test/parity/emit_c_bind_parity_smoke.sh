@@ -79,7 +79,10 @@ same=0
 differ=0
 for case in match two mismatch none missing; do
     for mode in c-bind-check c-bind-check-json; do
-        "$ELISACORE_BIN" -emit "$mode" "$WORK/$case.elisa" </dev/null > "$WORK/s0.out" 2>&1; rc0=$?
+        # This check compares the report and error text, including stderr on failure.
+        # Keep optional Stage0 phase timings out of the compared stream.
+        env -u ELISACORE_BUILD_TIMING "$ELISACORE_BIN" -emit "$mode" "$WORK/$case.elisa" </dev/null > "$WORK/s0.out" 2>&1; rc0=$?
+        rm -f "$WORK/s1.out"
         bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit "$mode" -o "$WORK/s1.out" "$WORK/$case.elisa" > "$WORK/s1.err" 2>&1; rc1=$?
         # Failure paths write to stderr and leave no output file.
         [ -s "$WORK/s1.out" ] || cp "$WORK/s1.err" "$WORK/s1.out"
