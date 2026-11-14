@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# A cross-module error tag can match a unique short name, but a destination with
-# two families sharing that name is ambiguous as in Stage0's ErrorSetAssignable.
+# A qualified tag preserves its owner across a generic wrapper return.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -30,15 +29,16 @@ stage1_rows="$(printf '%s\n' "$stage1_output" \
     | sed -E -n 's#^[[:space:]]*L([0-9]+) return type expects error\[Fault\], got an incompatible error set also named Fault$#L\1#p' \
     | LC_ALL=C sort)"
 expected_rows="$(cat <<'EOF'
+L23
 L26
 EOF
 )"
 
 [[ "$stage0_rows" == "$expected_rows" ]] \
     || fail "Stage0 short-tag diagnostics changed:\n$stage0_rows\n$stage0_output"
-grep -q '^D 1$' <<< "$stage1_output" \
+grep -q '^D 2$' <<< "$stage1_output" \
     || fail "Stage1 reported an unexpected diagnostic count:\n$stage1_output"
 [[ "$stage1_rows" == "$expected_rows" ]] \
     || fail "Stage1 short-tag diagnostics differ:\n$stage1_rows\n$stage1_output"
 
-echo "errorset wrapper short-tag smoke OK: unique names match and duplicate names stay ambiguous"
+echo "errorset wrapper short-tag smoke OK: qualified tags retain their owner"
