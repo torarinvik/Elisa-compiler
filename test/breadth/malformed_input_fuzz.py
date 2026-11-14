@@ -18,7 +18,9 @@ NOT to crash is otherwise invisible (the object path tolerates it; see llvm_veri
 It found `ret ptr` from an `-> i64` function, from returning a `fn` value that stage0 rejects
 outright.
 """
-import os, random, signal, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import os, random, shutil, signal, subprocess, sys, tempfile
 
 ROOT = os.environ["REPO_ROOT"]
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -177,46 +179,43 @@ def mutate(data):
         b[i:i] = b[i:j]
     return bytes(b)
 
+def check_case(case):
+    index, name, data, work = case
+    directory = Path(work) / str(index)
+    directory.mkdir()
+    source = directory / "m.elisa"
+    source.write_bytes(data)
+    rc = compile_rc(str(source), str(directory))
+    failure = name if abnormal(rc) else None
+    if rc == 0:
+        bad = invalid_ir(str(source), str(directory))
+        if bad:
+            failure = f"{name} [IR verification] {bad}"
+    if failure:
+        return (f"{failure} -> {source}", rc)
+    shutil.rmtree(directory)
+    return None
+
+
 def main():
-    import tempfile
     work = tempfile.mkdtemp()
-    src = os.path.join(work, "m.elisa")
-    failures = []
-    for name, text in REGRESSIONS:
-        open(src, "w").write(text)
-        rc = compile_rc(src, work)
-        if abnormal(rc):
-            failures.append((name, rc))
-        elif rc == 0:
-            bad = invalid_ir(src, work)
-            if bad:
-                failures.append((f"{name} [IR verification] {bad}", rc))
-    seeds = []
-    for d in ("test/repro", "test/fixtures/diagnostics"):
-        p = os.path.join(ROOT, d)
-        for f in sorted(os.listdir(p)):
-            if f.endswith(".elisa"):
-                seeds.append(os.path.join(p, f))
-    checked = len(REGRESSIONS)
-    for seed in seeds:
-        data = open(seed, "rb").read()
-        for k in range(MUTANTS_PER_SEED):
-            open(src, "wb").write(mutate(data))
-            checked += 1
-            rc = compile_rc(src, work)
-            if abnormal(rc):
-                crash = os.path.join(work, f"crash_{len(failures)}.elisa")
-                open(crash, "wb").write(open(src, "rb").read())
-                failures.append((f"{os.path.basename(seed)}#{k} -> {crash}", rc))
-            elif rc == 0:
-                bad = invalid_ir(src, work)
-                if bad:
-                    keep = os.path.join(work, f"invalid_{len(failures)}.elisa")
-                    open(keep, "wb").write(open(src, "rb").read())
-                    failures.append((f"{os.path.basename(seed)}#{k} [IR verification] {bad} -> {keep}", rc))
+    cases = [(name, text.encode()) for name, text in REGRESSIONS]
+    # Generate the complete corpus in seed order before dispatching. Scheduling
+    # must never change which bytes a given mutant label denotes.
+    for folder in ("test/repro", "test/fixtures/diagnostics"):
+        for seed in sorted((Path(ROOT) / folder).glob("*.elisa")):
+            data = seed.read_bytes()
+            for index in range(MUTANTS_PER_SEED):
+                cases.append((f"{seed.name}#{index}", mutate(data)))
+    jobs = max(1, int(os.environ.get("ELISA_MALFORMED_JOBS") or os.environ.get("ELISA_JOBS") or "1"))
+    items = ((index, name, data, work) for index, (name, data) in enumerate(cases))
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        failures = [row for row in pool.map(check_case, items) if row is not None]
     for name, rc in failures:
         print(f"  FAIL rc={rc}  {name}")
-    print(f"malformed input: {checked} programs, {len(failures)} abnormal exits or IR verification failures")
+    if not failures:
+        Path(work).rmdir()
+    print(f"malformed input: {len(cases)} programs, {len(failures)} abnormal exits or IR verification failures")
     return 1 if failures else 0
 
 if __name__ == "__main__":
