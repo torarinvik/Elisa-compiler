@@ -132,6 +132,10 @@ def invalid_ir(path, work):
     r = None
     for attempt in (budget, budget * int(os.environ.get("ELISA_TIMEOUT_ESCALATE", "6"))):
         try:
+            os.unlink(ll)
+        except FileNotFoundError:
+            pass
+        try:
             r = run_bounded(["bash", WRAP, "-emit", "llvm", "-o", ll, path], attempt,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             break
@@ -141,6 +145,8 @@ def invalid_ir(path, work):
         return "LLVM emission timed out after both attempts"
     if r.returncode != 0:
         return f"LLVM emission exited {r.returncode} after object compilation succeeded"
+    if not os.path.isfile(ll):
+        return "LLVM emission succeeded without writing an IR file"
     try:
         v = run_bounded([OPT, "-passes=verify", "-disable-output", ll], budget,
                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
