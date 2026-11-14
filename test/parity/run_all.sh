@@ -453,13 +453,13 @@ oracle_checks=0
 if [[ ${#oracle_lane[@]} -gt 0 ]]; then
   oracle_script="$resultdir/oracle_lane.sh"
   {
-    printf '#!/usr/bin/env bash\n'
+    printf '#!/usr/bin/env bash\nlane_status=0\n'
     for i in "${!oracle_lane[@]}"; do
       in_profile "${oracle_names[$i]}" || continue
       oracle_checks=$((oracle_checks + 1))
-      printf 'bash %q --exec-one %q %q %q\n' "$REPO_ROOT/test/parity/run_all.sh" "$resultdir" "${oracle_names[$i]}" "${oracle_lane[$i]}"
+      printf 'bash %q --exec-one %q %q %q || lane_status=1\n' "$REPO_ROOT/test/parity/run_all.sh" "$resultdir" "${oracle_names[$i]}" "${oracle_lane[$i]}"
     done
-    printf 'exit 0\n'
+    printf 'exit "$lane_status"\n'
   } > "$oracle_script"
   chmod +x "$oracle_script"
 fi
@@ -467,11 +467,11 @@ fi
 if [[ ${#serial_lane[@]} -gt 0 ]]; then
   lane_script="$resultdir/serial_lane.sh"
   {
-    printf '#!/usr/bin/env bash\n'
+    printf '#!/usr/bin/env bash\nlane_status=0\n'
     for m in "${serial_lane[@]}"; do
-      printf 'bash %q --exec-one %q %q %q\n' "$REPO_ROOT/test/parity/run_all.sh" "$resultdir" "$(basename "$m")" "$m"
+      printf 'bash %q --exec-one %q %q %q || lane_status=1\n' "$REPO_ROOT/test/parity/run_all.sh" "$resultdir" "$(basename "$m")" "$m"
     done
-    printf 'exit 0\n'
+    printf 'exit "$lane_status"\n'
   } > "$lane_script"
   chmod +x "$lane_script"
 fi
