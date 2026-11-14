@@ -92,6 +92,14 @@ def sample_rebuild(child, profile):
             }
             active_workers = [worker for worker in workers if worker[1] not in waiting_workers]
             target = min(active_workers or workers)[1] if workers else child.pid
+            if executable(target) == "go" and not profile.endswith(".late"):
+                # A warm package graph may still be loading at the first observation.
+                # Try once more before sampling the waiting driver.
+                threading.Event().wait(0.5)
+                sample_rebuild(child, profile + ".late")
+                if os.path.isfile(profile + ".late"):
+                    os.replace(profile + ".late", profile)
+                return
         # Report only the Go package name, not the full command line: compiler
         # arguments may contain paths or other user-provided values.
         if executable(target) == "compile":
