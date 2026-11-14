@@ -49,7 +49,7 @@ grep -qx 'D 0' <<< "$report"
 # Trusted runtime units may contain direct calls to effectful libc helpers in low-level
 # implementation code. The stage1-only local-effect walk must honor the same # std boundary
 # as stage0 instead of turning those implementation details into user diagnostics.
-runtime_report="$(printf '# std\nextern write(fd: int, buf: void&, count: usize) -> isize can[Console]\ndef trace() -> void:\n    write(2, zeroed, 0) can Console\n' | "$WORK/parse_report")"
+runtime_report="$(printf '# std\nextern write(fd: int, buf: void&?, count: usize) -> isize can[Console]\ndef trace() -> void:\n    write(2, null, 0) can Console\n' | "$WORK/parse_report")"
 grep -qx 'P 0' <<< "$runtime_report"
 grep -qx 'D 0' <<< "$runtime_report"
 
