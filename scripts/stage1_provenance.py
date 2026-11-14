@@ -576,6 +576,7 @@ def main(argv):
         if argv[1] == "write-fingerprint":
             if len(argv) != 3:
                 raise RuntimeError("usage: stage1_provenance.py write-fingerprint ROOT")
+            source_revision(Path(argv[2]))
             print(json.dumps(write_fingerprint(argv[2]), separators=(",", ":"), sort_keys=True))
             return 0
         if argv[1] == "check-inputs":
