@@ -37,7 +37,7 @@ if "annotation.offset == declaration_pos.offset" not in record_generic:
 if "owner_offset: u32" not in bound_lookup or \
         "parser.generic_param_owner_offsets[index] == owner_offset" not in bound_lookup:
     raise SystemExit("protocol parameter shadowing must use generic rows owned by this declaration")
-if "Ast::decl_pos(parser.generic_func_decls[metadata_index]).offset == pos.offset" not in replace_lower:
+if "Ast::decl_pos(parser.generic_func_decls[metadata_index]).offset == pos.offset" not in replace_lowered:
     raise SystemExit("lowered protocol methods must replace only their own generic declaration row")
 if not all(fragment in unit_test for fragment in (
     "#line 0 generic-shadow.elisa",
