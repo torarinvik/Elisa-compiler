@@ -57,7 +57,9 @@ if not all("callable_function_declaration_is_static_inactive" in body for body i
     raise SystemExit("unknown static functions must stay possible visible/UFCS candidates until family selection becomes uncertain")
 
 if not all(fragment in candidate for fragment in (
-    "callable_function_declaration_is_static_unresolved",
+    'marker.owner != "__try_unresolved_function" or marker.name != name',
+    "marker.offset, marker.line",
+    "name, marker.module, marker.offset, marker.line",
     "callable_row_visible_for_try_call",
     "callable_try_call_forwards_arguments",
     "callable_symbol_accepts_arity",
