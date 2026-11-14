@@ -136,6 +136,8 @@ if [[ -z "${ELISA_GATE_PREBUILT:-}" ]]; then
   # invalidates the Stage1 product seeded from it. Keep the verified artifact.
   if ! bash "$REPO_ROOT/scripts/assert_stage0_fresh.sh" "$S0_BUILD_TARGET"; then
     env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LANG=en_US.UTF-8 \
+      ELISA_CORE="$ELISA_CORE" ELISA_REBUILD_PROFILE="${ELISA_REBUILD_PROFILE:-0}" \
+      bash "$REPO_ROOT/test/parity/compiler_rebuild_timeout.sh" \
       python3 "$REPO_ROOT/scripts/stage0_provenance.py" build --root "$ELISA_CORE/compiler" --binary "$S0_BUILD_TARGET" || {
       echo "error: could not build stage0 with current provenance" >&2; exit 2; }
   fi
