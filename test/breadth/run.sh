@@ -104,26 +104,33 @@ if [ "$mode" = write-baseline ]; then
     } > "$baseline_file"
     echo "wrote breadth diagnostic baseline: $baseline_file ($(wc -l < "$observed_file" | tr -d ' ') files)"
 elif [ "$mode" = baseline ]; then
-    changed=0
-    checked=0
-    while IFS=$'\t' read -r f d; do
-        key="${f#"$ROOT"/}"
-        expected=$(awk -F '\t' -v key="$key" '$1 == key { print $2; exit }' "$baseline_file")
-        if [ "${expected:-MISSING}" != "$d" ]; then
-            printf 'diagnostic-count changed: %s (%s -> %s)\n' "$key" "${expected:-MISSING}" "$d"
-            changed=$((changed + 1))
-        fi
-        checked=$((checked + 1))
-    done < "$observed_file"
-    while IFS=$'\t' read -r key expected; do
-        case "$key" in ''|'#'*) continue;; esac
-        if ! awk -F '\t' -v key="$key" '$1 == key { found = 1; exit } END { exit !found }' "$observed_file"; then
-            printf 'baseline file missing from scan: %s (expected %s diagnostics)\n' "$key" "$expected"
-            changed=$((changed + 1))
-        fi
-    done < "$baseline_file"
-    [ "$changed" -eq 0 ] || { echo "breadth baseline FAILED: $changed file(s) changed" >&2; exit 1; }
-    echo "breadth baseline OK: $checked files unchanged"
+    awk -F '\t' '
+        FILENAME == ARGV[1] {
+            if ($1 != "" && $1 !~ /^#/) expected[$1] = $2
+            next
+        }
+        {
+            wanted = $1 in expected ? expected[$1] : "MISSING"
+            if (wanted != $2) {
+                printf "diagnostic-count changed: %s (%s -> %s)\n", $1, wanted, $2
+                changed++
+            }
+            seen[$1] = 1
+            checked++
+        }
+        END {
+            for (path in expected)
+                if (!(path in seen)) {
+                    printf "baseline file missing from scan: %s (expected %s diagnostics)\n", path, expected[path]
+                    changed++
+                }
+            if (changed) {
+                printf "breadth baseline FAILED: %d file(s) changed\n", changed > "/dev/stderr"
+                exit 1
+            }
+            printf "breadth baseline OK: %d files unchanged\n", checked
+        }
+    ' "$baseline_file" "$observed_file"
 fi
 echo "---"
 echo "scanned=$files  files-with-parse-errors=$witherr  total-parse-errors=$total"
