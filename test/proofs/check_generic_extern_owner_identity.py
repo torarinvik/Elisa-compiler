@@ -44,8 +44,8 @@ if 'param_annotation.owner != "__extern_generic_param"' not in pair_block or \
 # The fixture's physical declaration positions are distinct, even though its logical lines
 # collide. The colliding logical line alone would produce four pairings; exact offsets leave
 # only each parameter/name pair owned by the same extern token.
-first_offset = fixture.index("extern first_record")
-second_offset = fixture.index("extern second_record")
+first_offset = FIXTURE.index("extern first_record")
+second_offset = FIXTURE.index("extern second_record")
 if first_offset == second_offset:
     raise SystemExit("same-line generic extern declarations must have distinct physical offsets")
 param_rows = [("T", 0, first_offset), ("U", 0, second_offset)]

@@ -21,7 +21,7 @@ for ir in "$WORK/stage0.ll" "$WORK/stage1.ll"; do
         echo "fixed array ref byte offset FAIL: declined body in $ir" >&2
         exit 1
     }
-    rg -q 'getelementptr \[64 x i8\], ptr .*i[0-9]+ 0, i[0-9]+ %' "$ir" || {
+    rg -q 'getelementptr (inbounds )?\[64 x i8\], ptr .*i[0-9]+ 0, i[0-9]+ %' "$ir" || {
         echo "fixed array ref byte offset FAIL: array GEP does not use [0, offset] in $ir" >&2
         rg -n 'getelementptr|read_u32' "$ir" >&2
         exit 1
