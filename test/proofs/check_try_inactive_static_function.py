@@ -24,7 +24,10 @@ def function_source(source: str, name: str) -> str:
 
 filter_body = function_source(FALLBACK, "try_static_binding_filtered_annotations")
 if not all(fragment in filter_body for fragment in (
-    'marker.owner != "__static_if_branch" or marker.name != "__function_static_branch"',
+    'continue if marker.owner != "__static_if_branch"',
+    'if marker.name == "__function_static_branch":',
+    "function_markers.push(marker)",
+    "for marker in function_markers",
     "pma_static_if_row_selection(file, marker.identity_id.usize(), marker.module, table)",
     "marker.identity_id == 4294967295",
     'owner: "__try_inactive_function"',

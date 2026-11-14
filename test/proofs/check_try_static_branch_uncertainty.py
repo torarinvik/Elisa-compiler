@@ -24,7 +24,7 @@ def function_source(source: str, name: str) -> str:
 
 filter_annotations = function_source(FALLBACK, "try_static_binding_filtered_annotations")
 unresolved_decl = function_source(CALLABLE_ROWS, "callable_function_declaration_is_static_unresolved")
-visible_function = function_source(CALLABLE_ROWS, "callable_function_declaration_visible")
+visible_function = function_source(CALLABLE_ROWS, "callable_function_declaration_visible_with")
 ufcs_candidate = function_source(CALLABLE_ROWS, "callable_row_in_ufcs_candidate_set_indexed")
 facts = function_source(CALLABLE_ROWS, "try_noncall_callable_facts_add")
 candidate = function_source(TRY_CHECK, "callable_try_call_has_unresolved_static_function_candidate")
@@ -39,7 +39,10 @@ import_module_match = function_source(CALLABLE_ROWS, "callable_import_module_mat
 NOMINAL_IMPORT_FIXTURE = (ROOT / "test/repro/try_overload_nominal_identity_controls.elisa").read_text()
 
 if not all(fragment in filter_annotations for fragment in (
-    'marker.name != "__function_static_branch"',
+    'continue if marker.owner != "__static_if_branch"',
+    'if marker.name == "__function_static_branch":',
+    "function_markers.push(marker)",
+    "for marker in function_markers",
     'owner: "__try_unresolved_function"',
     "if not branch.known",
     "marker.identity_id == 4294967295",
