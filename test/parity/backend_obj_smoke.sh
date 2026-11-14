@@ -382,15 +382,12 @@ debug_ir_case() {
     local name="$1" pattern="$2"
     total=$((total + 1))
     local dir="$BUILD/obj_dbgir"; mkdir -p "$dir"
-    if [ ! -f "$BUILD/emit_obj_debug_ir" ]; then
-        if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/emit_obj_debug_ir.o" "$ROOT/test/breadth/emit_obj_debug_ir.elisa" 2>/dev/null \
-           || ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/emit_obj_debug_ir" "$BUILD/emit_obj_debug_ir.o" "$RUNTIME_OBJ" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$LLVM_BRIDGE_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" 2>/dev/null; then
-            echo "  FAIL obj_dbgir_$name: could not build emit_obj_debug_ir"; return
-        fi
-    fi
     if [ ! -f "$dir/ir.txt" ]; then
         local src='def add(a: i64, b: i64) -> i64:\n    total: i64 = a + b\n    return total\n\ndef main() -> i64:\n    return add(40, 2)\n'
-        ( cd "$dir" && printf '%b' "$src" | "$BUILD/emit_obj_debug_ir" > ir.txt 2>/dev/null ) || true
+        if ! (cd "$dir" && set -o pipefail && printf '%b' "$src" | RUN ./emit_obj_debug_ir > ir.tmp); then
+            echo "  FAIL obj_dbgir_$name: could not emit debug IR"; return
+        fi
+        mv "$dir/ir.tmp" "$dir/ir.txt"
     fi
     if grep -qE "$pattern" "$dir/ir.txt" 2>/dev/null; then
         pass=$((pass + 1))
@@ -399,6 +396,13 @@ debug_ir_case() {
     fi
 }
 rm -rf "$BUILD/obj_dbgir"
+mkdir -p "$BUILD/obj_dbgir"
+# Like emit_obj, this helper includes the backend and its runtime definitions.
+if ! ELISACORE_ANALYSIS_BOOTSTRAP=0 "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/obj_dbgir/helper.o" "$ROOT/test/breadth/emit_obj_debug_ir.elisa" \
+   || ! clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$BUILD/obj_dbgir/emit_obj_debug_ir" "$BUILD/obj_dbgir/helper.o" "${ELISA_OPTIONAL_HOOK_OBJECTS[@]}" "$LLVM_BRIDGE_OBJ" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M; then
+    echo "backend_obj_smoke FAILED: could not build emit_obj_debug_ir"
+    exit 1
+fi
 # Parameters carry their DWARF argument NUMBER (1-based) and their type.
 debug_ir_case param_a 'DILocalVariable\(name: "a", arg: 1'
 debug_ir_case param_b 'DILocalVariable\(name: "b", arg: 2'
