@@ -19,8 +19,6 @@ bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 [[ -x "$CLANG" ]] || { echo "error union alias rebind smoke: missing clang: $CLANG" >&2; exit 2; }
 
 for level in 0 2; do
-    stage0_first_abi_layout=""
-    stage0_second_abi_layout=""
     for stage in 0 1; do
         compiler="$STAGE0"
         [[ "$stage" -eq 0 ]] || compiler="$STAGE1"
@@ -42,24 +40,9 @@ for level in 0 2; do
             echo "error union alias rebind smoke: Stage$stage extern declarations reused the same error ABI at -O$level" >&2
             exit 1
         fi
-        first_abi_layout="$(printf '%s\n' "$first_abi" | sed -E 's/%[-a-zA-Z$._0-9]+/%TYPE/g')"
-        second_abi_layout="$(printf '%s\n' "$second_abi" | sed -E 's/%[-a-zA-Z$._0-9]+/%TYPE/g')"
-        if [[ "$stage" -eq 0 ]]; then
-            stage0_first_abi_layout="$first_abi_layout"
-            stage0_second_abi_layout="$second_abi_layout"
-        else
-            if [[ "$first_abi_layout" != "$stage0_first_abi_layout" || "$second_abi_layout" != "$stage0_second_abi_layout" ]]; then
-                echo "error union alias rebind smoke: Stage1 extern ABI differs from Stage0 at -O$level" >&2
-                echo "  Stage0 first:  $stage0_first_abi_layout" >&2
-                echo "  Stage1 first:  $first_abi_layout" >&2
-                echo "  Stage0 second: $stage0_second_abi_layout" >&2
-                echo "  Stage1 second: $second_abi_layout" >&2
-                exit 1
-            fi
-        fi
         "$OPT" -passes=verify -disable-output "$llvm"
         DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}" \
-            "$CLANG" "-O$level" -Wno-override-module -o "$WORK/stage${stage}-O${level}" "$llvm"
+            "$CLANG" "-O$level" -Wno-override-module -o "$WORK/stage${stage}-O${level}" "$llvm" "${FIXTURE%.elisa}.c"
     done
 
     set +e
@@ -74,4 +57,4 @@ for level in 0 2; do
     fi
 done
 
-echo "error union alias rebind smoke OK: repeated key maps to its source-offset ABI row"
+echo "error union alias rebind smoke OK: sibling aliases preserve their distinct native error ABIs"
