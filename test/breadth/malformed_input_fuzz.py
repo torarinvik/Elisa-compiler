@@ -192,9 +192,10 @@ def check_case(case):
         if bad:
             failure = f"{name} [IR verification] {bad}"
     if failure:
-        return (f"{failure} -> {source}", rc)
+        print(f"  FAIL rc={rc}  {failure} -> {source}", flush=True)
+        return True
     shutil.rmtree(directory)
-    return None
+    return False
 
 
 def main():
@@ -210,12 +211,10 @@ def main():
     jobs = max(1, int(os.environ.get("ELISA_MALFORMED_JOBS") or os.environ.get("ELISA_JOBS") or "1"))
     items = ((index, name, data, work) for index, (name, data) in enumerate(cases))
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        failures = [row for row in pool.map(check_case, items) if row is not None]
-    for name, rc in failures:
-        print(f"  FAIL rc={rc}  {name}")
+        failures = sum(pool.map(check_case, items))
     if not failures:
         Path(work).rmdir()
-    print(f"malformed input: {len(cases)} programs, {len(failures)} abnormal exits or IR verification failures")
+    print(f"malformed input: {len(cases)} programs, {failures} abnormal exits or IR verification failures")
     return 1 if failures else 0
 
 if __name__ == "__main__":
