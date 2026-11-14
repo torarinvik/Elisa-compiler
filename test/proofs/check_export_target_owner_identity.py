@@ -121,7 +121,6 @@ if FIXTURE.count("#line 0 export-target-owner.elisa") != 2 or not all(
     for fragment in (
         "export fn public_first() -> i64 = target_first",
         "export fn public_second() -> i64 = target_second",
-        "return public_first() + public_second() - 33",
     )
 ):
     raise SystemExit("fixture must exercise two distinct targets on logical line zero")
@@ -131,8 +130,9 @@ if "test_export_target_rows_use_exact_line_zero_owner" not in AST_TESTS or \
     raise SystemExit("parser AST regression must pair each line-zero target row with its declaration offset")
 if "check_export_target_owner_identity.py" not in SMOKE or \
         "export_target_owner_line_zero.elisa" not in SMOKE or \
-        '"$STAGE0" -emit exe -O0' not in SMOKE or \
-        '"$STAGE1" -emit exe' not in SMOKE:
+        '"$STAGE0" -emit obj -O0' not in SMOKE or \
+        '"$STAGE1" -emit obj' not in SMOKE or \
+        "public_first() != 11 || public_second() != 22" not in SMOKE:
     raise SystemExit("parity smoke must run the AST proof and execute the line-zero export fixture")
 
 print("export target owner-offset source checks passed")

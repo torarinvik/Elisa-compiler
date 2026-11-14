@@ -13,11 +13,24 @@ bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0" || exit $?
 bash "$ROOT/scripts/assert_stage1_fresh.sh"
 python3 "$ROOT/test/proofs/check_export_target_owner_identity.py"
 
-"$STAGE0" -emit exe -O0 -o "$WORK/stage0" "$FIXTURE"
+cat > "$WORK/main.c" <<'EOF'
+#include <stdint.h>
+
+extern int64_t public_first(void);
+extern int64_t public_second(void);
+
+int main(void) {
+    return public_first() != 11 || public_second() != 22;
+}
+EOF
+
+"$STAGE0" -emit obj -O0 -o "$WORK/stage0.o" "$FIXTURE"
+cc "$WORK/main.c" "$WORK/stage0.o" -o "$WORK/stage0"
 "$WORK/stage0"
 for optimization in 0 2; do
 	output="$WORK/stage1-O$optimization"
-	"$STAGE1" -emit exe "-O$optimization" -o "$output" "$FIXTURE"
+	"$STAGE1" -emit obj "-O$optimization" -o "$output.o" "$FIXTURE"
+	cc "$WORK/main.c" "$output.o" -o "$output"
 	"$output"
 done
 
