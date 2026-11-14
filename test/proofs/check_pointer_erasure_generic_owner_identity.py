@@ -21,7 +21,7 @@ def function_source(source: str, name: str) -> str:
 source = SOURCE.read_text()
 smoke = SMOKE.read_text()
 generic_owner = function_source(source, "pointer_erasure_generic_line")
-declarations = function_source(source, "check_pointer_erasure_declarations")
+declarations = function_source(SOURCE.with_name("check_pointer_erasure_cast_buffers.elisa").read_text(), "check_pointer_erasure_declarations")
 
 if not all(fragment in generic_owner for fragment in (
     "offsets: darray[u32]&",
