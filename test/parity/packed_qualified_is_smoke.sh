@@ -23,10 +23,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
-# Cross-root semantics are still provisional until the oracle has been inspected.
-# Set this to its reviewed semantic diagnostic text; arbitrary backend declines
-# are not evidence that the language rejects a cross-root pattern.
-SEMANTIC_DIAGNOSTIC="${ELISA_PACKED_IS_CROSS_ROOT_DIAGNOSTIC:-}"
+SEMANTIC_DIAGNOSTIC='is expects a variant of enum "Alpha.Node", got Beta.Leaf.Value'
 {
     echo "source_head=$(git -C "$ROOT" rev-parse HEAD)"
     echo "stage0=$STAGE0"
@@ -63,11 +60,6 @@ for level in O0 O2; do
         # semantic root compatibility evidence, even with a structured error label.
         if rg -qi 'backend could not|backend decline|declined [0-9]|syntax error|could not open|cannot open|LLVM ERROR' "$log"; then
             echo 'cross-root rejection inconclusive: non-semantic compiler failure' >&2; cat "$log" >&2; exit 2
-        fi
-        if [[ -z "$SEMANTIC_DIAGNOSTIC" ]]; then
-            echo 'cross-root semantics provisional: inspect retained Stage0 diagnostic and set ELISA_PACKED_IS_CROSS_ROOT_DIAGNOSTIC to its reviewed semantic text' >&2
-            cat "$log" >&2
-            exit 2
         fi
         rg -Fq -- "$SEMANTIC_DIAGNOSTIC" "$log" || { echo 'missing oracle-validated semantic rejection diagnostic' >&2; cat "$log" >&2; exit 1; }
     done
