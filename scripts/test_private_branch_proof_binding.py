@@ -38,7 +38,9 @@ class PrivateBranchProofBinding(unittest.TestCase):
             ('pma_static_if_const_branch_rows(file.enum_annotations, file, name, symbol, table, depth)', 'pma_static_if_const_branch_rows(table.static_if_branch_annotations, file, name, symbol, table, depth)'),
             ('marker.offset != symbol.offset', 'marker.offset != 0'),
             ('return (false, false) if unknown', 'return (true, true) if unknown'),
-            ('push(annotation) if annotation.owner == "__static_if_branch"', 'push(annotation) if annotation.owner == "wrong"'),
+            ('if annotation.owner == "__static_if_branch":', 'if annotation.owner == "wrong":'),
+            ('static_if_branch_heads.get(symbol.offset)', 'static_if_branch_heads.get(symbol.line)'),
+            ('static_if_branch_next.push(previous)', 'static_if_branch_next.push(row)'),
         ]
         for old, new in changes:
             with self.subTest(change=old):

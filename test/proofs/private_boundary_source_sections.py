@@ -301,17 +301,35 @@ def pma_within_module(current_module: sview, owner: sview) -> bool:
         helper = "pma_static_if_" + kind + "_branch_rows"
         if not all(fragment in wrapper for fragment in (
                 "table.static_if_branch_source_count==file.enum_annotations.countandfile.enum_annotations.count>0",
-                helper + "(table.static_if_branch_annotations,file,name,symbol,table,depth)",
+                f'pma_static_if_indexed_branch_selection(file,name,symbol,table,depth,"__{kind}_static_branch")',
                 helper + "(file.enum_annotations,file,name,symbol,table,depth)")):
             raise SystemExit("static-if selection must validate its indexed rows and retain the complete-source fallback")
     static_if_projection = compact(function_section(consumer_text, "fill_static_if_branch_annotations"))
     if not all(fragment in static_if_projection for fragment in (
             "table.static_if_branch_annotations<-[]",
-            'table.static_if_branch_annotations.push(annotation)ifannotation.owner=="__static_if_branch"',
-            "table.static_if_branch_offsets<-{}",
-            'ifannotation.owner=="__static_if_branch":table.static_if_branch_offsets<-table.static_if_branch_offsets.put(annotation.offset,1.u8())',
+            "table.static_if_branch_heads<-{}",
+            "table.static_if_branch_next<-[]",
+            'ifannotation.owner=="__static_if_branch":previous:u32=headiftable.static_if_branch_heads.get(annotation.offset)isheadelseSYMBOL_INDEX_ROW_NONE',
+            "row:u32=table.static_if_branch_annotations.count.u32()",
+            "table.static_if_branch_annotations<-table.static_if_branch_annotations.push(annotation)",
+            "table.static_if_branch_next<-table.static_if_branch_next.push(previous)",
+            "table.static_if_branch_heads<-table.static_if_branch_heads.put(annotation.offset,row)",
             "table.static_if_branch_source_count<-file.enum_annotations.count")):
         raise SystemExit("static-if annotation projection must preserve complete exact branch rows")
+
+    indexed_selection = compact(function_section(consumer_text, "pma_static_if_indexed_branch_selection"))
+    if not all(fragment in indexed_selection for fragment in (
+            "return(false,false)ifdepth>=64",
+            "table.static_if_branch_heads.get(symbol.offset)",
+            "whilerow!=SYMBOL_INDEX_ROW_NONE",
+            "marker:Ast::EnumAnnotation=table.static_if_branch_annotations[row.usize()]",
+            "row<-table.static_if_branch_next[row.usize()]",
+            "continueifmarker.name!=marker_nameormarker.detail_name!=nameormarker.module!=symbol.module_ownerormarker.line!=symbol.line",
+            "pma_static_if_row_selection(file,marker.identity_id.usize(),symbol.module_owner,table,depth+1)ifmarker.identity_id!=4294967295",
+            "return(true,false)ifbranch.knownandnotbranch.selected",
+            "unknown<-trueifnotbranch.known",
+            "return(false,false)ifunknown")):
+        raise SystemExit("indexed branch selection must retain exact declaration matching and unknown branch behavior")
 
     if not all(fragment in private_import_visibility for fragment in (
             'pma_visible_wildcard_import(index,annotations,current_module,owner,false)',
