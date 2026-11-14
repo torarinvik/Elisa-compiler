@@ -92,7 +92,7 @@ for source, label in ((C_HEADER, "C header generation"), (C_HEADER_REACHABLE, "C
         raise SystemExit(f"{label} must match the export marker to the declaration position")
 
 unsafe = compact(UNSAFE_EXTERNS)
-if "unsafe_export_marker_matches(markers: darray[Ast::EnumAnnotation]&" not in unsafe or \
+if "unsafe_export_marker_matches(markers:darray[Ast::EnumAnnotation]&" not in unsafe or \
         'marker.owner==wantedandmarker.name=="__export_fn"andmarker.line==lineandmarker.offset==offset' not in unsafe:
     raise SystemExit("unsafe extern reporting must represent export declarations by exact owner position")
 if "unsafe_export_marker_matches(export_markers,name,line.line,line.offset)" not in unsafe or \
