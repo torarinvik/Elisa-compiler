@@ -13,6 +13,36 @@
 # intentionally not maintained) — see the precise glob below.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# PARALLEL (Phase T, 2026-09-06): one `parse_report` per file, files independent, so the scan
+# fans out under `xargs -P` (ELISA_BREADTH_JOBS, default = core count) via `--one <out> <file>`;
+# each worker appends one observation line to its own file and the parent merges them in
+# path order (the baseline is sorted anyway).
+one_file() {
+    local f="$1" report p diag relative_f
+    report=$("$RPT" < "$f")
+    # Read the two `P <n>` / `D <n>` lines WITHOUT a pipe. `printf … | head -1` raced head's
+    # exit: head closes the pipe after one line, printf takes SIGPIPE, and under `pipefail`
+    # + `set -e` the worker died with no observation line — which the parallel sweep then
+    # scored as a baseline mismatch. Rare when this loop was serial, frequent under xargs -P.
+    if ! read -r p diag < <(awk '
+        NR == 1 && /^P [0-9]+$/ { parse_count = $2 }
+        /^D [0-9]+$/ { diagnostic_count = $2 }
+        END {
+            if (parse_count != "" && diagnostic_count != "")
+                print parse_count, diagnostic_count
+        }
+    ' <<< "$report"); then
+        printf 'invalid reporter output for %s\n%s\n' "$f" "$report" >&2
+        return 1
+    fi
+    relative_f="${f#"$ROOT"/}"
+    printf '%s\t%s\t%s\n' "$relative_f" "$diag" "$p"
+}
+if [ "${1:-}" = "--one" ]; then
+    exec </dev/null
+    one_file "$3" > "$2/$(printf '%s' "$3" | tr '/ ' '__').obs"
+    exit 0
+fi
 STAGE1_BIN="${ELISA_STAGE1_BIN:-$ROOT/bin/elisac-stage1}"
 RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ROOT/build/runtime/elisacore_runtime.o}"
 RPT="${ELISA_PARSE_REPORT:-$ROOT/build/parse_report}"
@@ -41,26 +71,6 @@ if [ "$mode" = baseline ]; then
     [ -f "$baseline_file" ] || { echo "baseline not found: $baseline_file" >&2; exit 2; }
 fi
 
-# PARALLEL (Phase T, 2026-09-06): one `parse_report` per file, files independent, so the scan
-# fans out under `xargs -P` (ELISA_BREADTH_JOBS, default = core count) via `--one <out> <file>`;
-# each worker appends one observation line to its own file and the parent merges them in
-# path order (the baseline is sorted anyway).
-one_file() {
-    local f="$1" report p diag relative_f
-    report=$("$RPT" < "$f")
-    # Read the two `P <n>` / `D <n>` lines WITHOUT a pipe. `printf … | head -1` raced head's
-    # exit: head closes the pipe after one line, printf takes SIGPIPE, and under `pipefail`
-    # + `set -e` the worker died with no observation line — which the parallel sweep then
-    # scored as a baseline mismatch. Rare when this loop was serial, frequent under xargs -P.
-    { read -r _ p _ || true; read -r _ diag _ || true; } <<< "$report"
-    relative_f="${f#"$ROOT"/}"
-    printf '%s\t%s\t%s\n' "$relative_f" "${diag:-0}" "${p:-0}"
-}
-if [ "${1:-}" = "--one" ]; then
-    exec </dev/null
-    one_file "$3" > "$2/$(printf '%s' "$3" | tr '/ ' '__').obs"
-    exit 0
-fi
 obs_dir="$(mktemp -d)"
 source "$REPO_ROOT/test/parity/host_jobs.sh"
 JOBS="${ELISA_BREADTH_JOBS:-$(elisa_host_jobs)}"
