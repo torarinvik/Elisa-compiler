@@ -64,7 +64,9 @@ check_stage1_raise_mismatch() {
     printf '%s' "$source" > "$WORK/$name.elisa"
     local report
     report="$("$RPT" < "$WORK/$name.elisa")"
-    if ! printf '%s\n' "$report" | grep -Eq "^[[:space:]]*L${expected_line} raise cannot propagate tag "; then
+    local mismatches
+    mismatches="$(printf '%s\n' "$report" | grep -E '^[[:space:]]*L[0-9]+ raise cannot propagate tag ' || true)"
+    if ! [[ "$mismatches" =~ ^[[:space:]]*L${expected_line}\ raise\ cannot\ propagate\ tag\  ]] || [[ "$mismatches" == *$'\n'* ]]; then
         failed=$((failed + 1))
         printf 'qualified-error-set missing raise mismatch: %s (expected line %s)\n' \
             "$name" "$expected_line" >&2
@@ -90,7 +92,7 @@ check_case nested_module_qualified $'module Backend:\n    public:\n        error
 check_case qualified_both_sides $'module Backend:\n    public:\n        error SceneError:\n            Capacity\n\n        def record(n: i64) -> void error[Backend::SceneError]:\n            raise Backend::SceneError.Capacity if n > 10\n\ndef submit(n: i64) -> void error[Backend::SceneError]:\n    try Backend::record(n)\n\ndef main() -> i64:\n    return 0\n'
 check_case qualified_multi_family $'module Net:\n    public:\n        error SendError:\n            Refused\n\n        error RecvError:\n            Empty\n\n        def send(n: i64) -> void error[Net::SendError]:\n            raise Net::SendError.Refused if n > 10\n\n        def recv(n: i64) -> void error[Net::RecvError]:\n            raise Net::RecvError.Empty if n > 10\n\ndef relay(n: i64) -> void error[Net::SendError, Net::RecvError]:\n    try Net::send(n)\n    try Net::recv(n)\n\ndef main() -> i64:\n    return 0\n'
 check_stage1_raise_mismatch qualified_single_family_raise_mismatch $'module Net:\n    public:\n        error SendError:\n            Refused\n\n        error RecvError:\n            Empty\n\n        def send(n: i64) -> void error[Net::SendError]:\n            raise Net::RecvError.Empty if n > 10\n\ndef main() -> i64:\n    return 0\n' 10
-check_stage1_raise_mismatch qualified_lambda_raise_identity $'module Provider:\n    public:\n        error Fault:\n            Bad\n\nmodule Peer:\n    public:\n        error Fault:\n            Bad\n\n        def consume(callback: fn() -> i64 error[Provider::Fault]) -> i64 error[Fault]:\n            return try callback()\n\ndef bad() -> i64 error[Peer::Fault]:\n    return Peer::consume((fn() => raise Provider::Fault.Bad))\n\ndef good() -> i64 error[Peer::Fault]:\n    return Peer::consume(fn() => raise Peer::Fault.Bad)\n\ndef main() -> i64:\n    return 0\n' 15
+check_stage1_raise_mismatch qualified_lambda_raise_identity $'module Provider:\n    public:\n        error Fault:\n            Bad\n\nmodule Peer:\n    public:\n        error Fault:\n            Bad\n\n        def consume(callback: fn() -> i64 error[Provider::Fault]) -> i64 error[Provider::Fault]:\n            return try callback()\n\ndef bad() -> i64 error[Provider::Fault]:\n    return Peer::consume((fn() => raise Peer::Fault.Bad))\n\ndef good() -> i64 error[Provider::Fault]:\n    return Peer::consume(fn() => raise Provider::Fault.Bad)\n\ndef main() -> i64:\n    return 0\n' 15
 check_case bare_unchanged $'error DiskError:\n    Full\n\ndef write_one(n: i64) -> void error[DiskError]:\n    raise DiskError.Full if n > 10\n\ndef write_all(n: i64) -> void error[DiskError]:\n    try write_one(n)\n\ndef main() -> i64:\n    return 0\n'
 
 # FIRES: family leaves alone must not equate Provider::Fault with Peer::Fault when
