@@ -5,7 +5,10 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export ELISA_CORE="${ELISA_CORE:-$REPO_ROOT/../../Go projects/Elisa-core}"
 source "$REPO_ROOT/test/parity/resolve_elisac.sh"
 
-output="$(ELISACORE_TEST_CACHE=0 "$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/lexer_machine_state_test.elisa" 2>&1)"
+if ! output="$(ELISACORE_TEST_CACHE=0 "$ELISACORE_BIN" -emit test "$REPO_ROOT/test/parity/lexer_machine_state_test.elisa" 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    exit 1
+fi
 printf '%s\n' "$output"
 
 summary="$(printf '%s\n' "$output" | grep '\[ SUMMARY  \]' | tail -1)"
@@ -25,9 +28,12 @@ stage1_bin="${ELISA_STAGE1_BIN:-$REPO_ROOT/bin/elisac-stage1}"
     echo "lexer machine-state smoke FAILED: stage1 compiler unavailable: $stage1_bin" >&2
     exit 1
 }
-stage1_output="$(ELISA_STAGE1_BIN="$stage1_bin" ELISACORE_BIN="$ELISACORE_BIN" \
+if ! stage1_output="$(ELISA_STAGE1_BIN="$stage1_bin" ELISACORE_BIN="$ELISACORE_BIN" \
     bash "$REPO_ROOT/scripts/elisac_stage1.sh" -emit test \
-    "$REPO_ROOT/test/parity/lexer_machine_state_test.elisa" 2>&1)"
+    "$REPO_ROOT/test/parity/lexer_machine_state_test.elisa" 2>&1)"; then
+    printf '%s\n' "$stage1_output" >&2
+    exit 1
+fi
 printf '%s\n' "$stage1_output"
 
 stage1_summary="$(printf '%s\n' "$stage1_output" | grep '\[ SUMMARY  \]' | tail -1)"
