@@ -15,9 +15,9 @@ def check_private_import_resolution(
     if "pma_import_annotation_branch_selection_indexed(annotation,annotations,annotations,file,table)" not in facts['import_annotation_branch_wrapper']:
         raise SystemExit("non-indexed PMA callers must retain their complete annotation view")
     if not all(fragment in facts['selective_import_status'] for fragment in (
-            'pma_import_row_branch_uncertain(annotations,"__from_member",member_annotation.name,member_annotation.module,member_annotation.line,member_annotation.offset)',
+            'pma_indexed_import_row_uncertain(index,annotations,member_annotation)',
             'known_order<-false')) or not all(fragment in facts['wildcard_visibility'] for fragment in (
-            'notrequire_definiteornotpma_import_row_branch_uncertain(annotations,annotation.owner,annotation.name,annotation.module,annotation.line,annotation.offset)')):
+            'notrequire_definiteornotpma_indexed_import_row_uncertain(index,annotations,annotation)')):
         raise SystemExit("uncertain selective or wildcard imports must not establish a definite public winner")
     if not all(fragment in facts['active_import_annotations'] for fragment in (
             'annotation.owner=="__from_member"',
@@ -31,11 +31,11 @@ def check_private_import_resolution(
             'parser.record_static_if_branch_rows("__using_alias_static_branch",alias_name,alias_token)')):
         raise SystemExit("alias branch markers must stay tied to the alias-token coordinates used by import cache selection")
     if not all(fragment in facts['build_import_views'] for fragment in (
-            'pma_active_import_annotations(file,table)',
+            'pma_active_import_annotations(file,table,imports_only:true)',
             'table.definite_import_annotations<-[]',
             'table.possible_import_annotations<-[]',
             'semantic_is_synthetic_unknown_import_marker(annotation)',
-            'pma_import_row_branch_uncertain(active,annotation.owner,annotation.name,annotation.module,annotation.line,annotation.offset)',
+            'pma_import_row_branch_uncertain(uncertain,annotation.owner,annotation.name,annotation.module,annotation.line,annotation.offset)',
             'table.possible_import_annotations.push(annotation)',
             'table.definite_import_annotations.push(annotation)')) or not all(fragment in facts['synthetic_import_marker'] for fragment in (
             'annotation.owner=="__pma_unknown_static_import"',
@@ -244,7 +244,7 @@ def check_private_import_resolution(
     if not all(fragment in facts['possible_import_alias_head_target'] for fragment in (
             'table.definite_import_annotations',
             'semantic_possible_import_alias_precedes_position(alias,import_scope,before_offset,table)',
-            'semantic_possible_import_alias_precedes(other,alias,table)',
+            'semantic_lexical_alias_precedes(other,alias,table)',
             'raw_target_count!=1.usize()',
             'canonical_target_count!=1.usize()',
             'table.possible_import_annotations')):

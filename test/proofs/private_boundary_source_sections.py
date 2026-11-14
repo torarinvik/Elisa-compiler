@@ -135,7 +135,7 @@ def pma_within_module(current_module: sview, owner: sview) -> bool:
     call_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_call_owner"))
     private_import_owner_lookup = compact(function_section(consumer_text, "pma_unqualified_private_import_owner"))
     public_imported_value = compact(function_section(consumer_text, "pma_has_public_imported_function_value"))
-    wildcard_index_build = compact(function_section(consumer_text, "pma_build_wildcard_import_index"))
+    wildcard_index_build = compact(function_section(consumer_text, "pma_index_import_visibility_rows"))
     wildcard_visibility = compact(function_section(consumer_text, "pma_visible_wildcard_import"))
     private_import_visibility = compact(function_section(consumer_text, "pma_private_imported_module_member_visible"))
     public_import_visibility = compact(function_section(consumer_text, "pma_public_imported_module_member_visible"))
@@ -286,10 +286,12 @@ def pma_within_module(current_module: sview, owner: sview) -> bool:
             "notpma_within_module(current_module,owner)")):
         raise SystemExit("public import alternatives must be visible in scope and outside every private module path")
 
-    if 'index.wildcard_rows.push(row)ifannotations[row].name=="__binding_wildcard_import"' not in wildcard_index_build or not all(fragment in wildcard_visibility for fragment in (
+    if not all(fragment in wildcard_index_build for fragment in (
+            'annotation:Ast::EnumAnnotation=annotations[row]',
+            'index.wildcard_rows.push(row)ifannotation.name=="__binding_wildcard_import"')) or not all(fragment in wildcard_visibility for fragment in (
             'forrowinindex.wildcard_rows:',
             'annotation:Ast::EnumAnnotation=annotations[row]',
-            'annotation.owner!=ownerornotpma_import_scope_visible(current_module,annotation.module)')):
+            'notsemantic_import_module_path_matches(owner,annotation.owner,annotation.module)ornotpma_import_scope_visible(current_module,annotation.module)')):
         raise SystemExit("wildcard row projection must preserve exact annotations and lexical visibility")
 
     # The indexed wrappers and the row walkers jointly implement branch selection.
@@ -306,20 +308,22 @@ def pma_within_module(current_module: sview, owner: sview) -> bool:
     if not all(fragment in static_if_projection for fragment in (
             "table.static_if_branch_annotations<-[]",
             'table.static_if_branch_annotations.push(annotation)ifannotation.owner=="__static_if_branch"',
+            "table.static_if_branch_offsets<-{}",
+            'ifannotation.owner=="__static_if_branch":table.static_if_branch_offsets<-table.static_if_branch_offsets.put(annotation.offset,1.u8())',
             "table.static_if_branch_source_count<-file.enum_annotations.count")):
         raise SystemExit("static-if annotation projection must preserve complete exact branch rows")
 
     if not all(fragment in private_import_visibility for fragment in (
             'pma_visible_wildcard_import(index,annotations,current_module,owner,false)',
-            "pma_selective_import_target_status(annotations,current_module,owner,member)",
-            "target.foundand(nottarget.knownortarget.first)")) or not all(fragment in public_import_visibility for fragment in (
+            "pma_selective_import_target_status(index,annotations,current_module,owner,member)",
+            "returnnottarget.knownortarget.firstiftarget.found")) or not all(fragment in public_import_visibility for fragment in (
             'pma_visible_wildcard_import(index,annotations,current_module,owner,true)',
-            "target.foundandtarget.knownandtarget.first")) or not all(fragment in selective_import_status for fragment in (
+            "returntarget.knownandtarget.firstiftarget.found")) or not all(fragment in selective_import_status for fragment in (
             "member_annotation.offset",
             "member_annotation.module",
             "source_annotation.name==owner",
             "candidate_is_using",
-            'known_order<-falseifpma_import_row_branch_uncertain(annotations,"__from_member",member_annotation.name,member_annotation.module,member_annotation.line,member_annotation.offset)',
+            'known_order<-falseifpma_indexed_import_row_uncertain(index,annotations,member_annotation)',
             "known_order",
             "source_annotation.offset!=member_annotation.offset")) or not all(fragment in using_member_registration for fragment in (
             'annotation.name=="__using_member"',
@@ -348,11 +352,12 @@ def pma_within_module(current_module: sview, owner: sview) -> bool:
             "ga_static_if_target_predicate(name)",
             "pma_static_if_named_constant_value(name,current_module,file,table,depth+1)",
             "pma_static_if_named_constant_value(name,current_module,file,table,depth+1,base)",
-            "Expr.Scope(_,_,_)",
+            "Expr.Scope(base,name,_)",
             "Expr.Field(_,_,_)",
             "Expr.Call(_,_,_,_)",
             "return(false,0)ifdepth>=64",
-            "Expr.Unary(operator,operand,_)")) or not static_if_condition_value.endswith("_:return(false,0)") or not all(fragment in static_if_named_constant_value for fragment in (
+            "Expr.Unary(operator,operand,_)",
+            "_:return(false,0)")) or not all(fragment in static_if_named_constant_value for fragment in (
             "return(false,0)ifdepth>=64",
             "table.immutable_const_values",
             "table.immutable_const_names",
@@ -428,8 +433,10 @@ def pma_within_module(current_module: sview, owner: sview) -> bool:
             'marker.name==import_owner',
             'marker.detail_name==import_name')) or not all(fragment in active_import_annotations for fragment in (
             'pma_import_annotation_branch_selection_indexed(annotation,relevant,markers,file,table)',
-            'markers.push(candidate)ifcandidate.owner=="__static_if_branch"',
-            'branch_rowandmarkers.count>0',
+            'ifcandidate.owner=="__static_if_branch"and(',
+            'markers.push(candidate)',
+            'marker.offset==annotation.offsetandmarker.line==annotation.line',
+            'ifmarkedor(annotation.name=="__using"andhas_alias_marker)',
             'candidate.owner=="__from_member"',
             'candidate.owner=="__private_member_module"',
             'candidate.name=="__using"',

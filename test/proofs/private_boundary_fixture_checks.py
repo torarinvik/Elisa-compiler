@@ -341,7 +341,7 @@ def check_private_visibility_fixtures(
             "from PrivateProvider import pick",
             "return pick(true)")) or not all(fragment in same_line_import_pairing_smoke_text for fragment in (
             "private_call_same_line_import_pairing.elisa",
-            "first public selective import",
+            "first public binding",
             "another source at the same #line value")):
         raise SystemExit("selective-import regression must keep same-line source/member pairs distinct by token offset")
 
