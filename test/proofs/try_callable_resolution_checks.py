@@ -46,7 +46,7 @@ def check_try_callable_resolution(
             'unresolved.name == "__using_alias"',
             "try_noncall_visible_using_alias_target(environment, alias_head)",
             "continue if resolved_alias.known",
-            "return true if any callable_index in 0..<environment.callable_names.count where environment.callable_names[callable_index] == callee_name and environment.callable_visible[callable_index]")) or "continue if not try_noncall_module_is_ancestor(unresolved.module, environment.current_module)" in cached_static_binding or not all(fragment in cached_lookup_signature for fragment in (
+            "return true if environment.callable_names[callable_index] == callee_name and environment.callable_visible[callable_index]")) or "continue if not try_noncall_module_is_ancestor(unresolved.module, environment.current_module)" in cached_static_binding or not all(fragment in cached_lookup_signature for fragment in (
             "try_noncall_static_binding_may_affect_call(callee_name, callee_qualifier, callee, environment)",
             'return (false, "", false, false, false, true, "", 0.usize())')):
         raise SystemExit("Try cached callable facts must fail closed only when an unresolved static import or alias can reach a same-name candidate")
@@ -109,13 +109,13 @@ def check_try_callable_resolution(
     private_family_ref = compact_inline(function_section(source_text, "callable_error_indexed_family_ref"))
     if not all(fragment in private_family_ref for fragment in (
             "callable_row_visible_for_try_call(module_index, module_annotations, annotations, name, annotation.offset, annotation.line",
-            "callable_symbol_accepts_arity(table, annotations, try_named_arguments, argument_type_ids",
+            "callable_symbol_accepts_arity(file, table, annotations, try_named_arguments, argument_type_ids",
             "return TryErrorFamilyRef{family: \"\"")) or "selected_private_winner" in private_family_ref:
         raise SystemExit("Try's private-winner suppression must not expose an inaccessible ErrorSet to propagation checks")
     private_family_refs = compact_inline(function_section(source_text, "callable_error_indexed_family_refs"))
     if not all(fragment in private_family_refs for fragment in (
             "visible: bool = callable_row_visible_for_try_call",
-            "and callable_symbol_accepts_arity(table, annotations, try_named_arguments, argument_type_ids",
+            "and callable_symbol_accepts_arity(file, table, annotations, try_named_arguments, argument_type_ids",
             "if visible")):
         raise SystemExit("Try composite family collection must apply the same visibility filter before selecting a propagation family")
     unresolved_private_candidate = compact_inline(function_section(source_text, "callable_overload_declaration_is_inaccessible_arity_candidate"))
@@ -176,6 +176,7 @@ def check_try_callable_resolution(
     receiver_type = compact_inline(function_section(source_text, "callable_symbol_receiver_type"))
     if "table.function_param_mutable_ref[row]" not in receiver_type or "mutable_ref_known: bool" not in receiver_type:
         raise SystemExit("Receiver ranking must retain the selected formal reference mutability")
+    argument_types = compact_inline(function_section(source_text, "try_call_argument_type_ids"))
     if "declared.writable_borrow" not in argument_types or "receiver_ref_mutability_known" not in argument_types:
         raise SystemExit("Try receiver ranking must retain exact binding reference mutability when available")
     if not all(fragment in argument_types for fragment in (
@@ -271,7 +272,6 @@ def check_try_callable_resolution(
             "formal_identity.ambiguous or actual_identity.ambiguous",
             "formal_identity.owner == actual_identity.owner")):
         raise SystemExit("Try named receiver matching must compare lexical nominal owners and fail closed on ambiguity")
-    argument_types = compact_inline(function_section(source_text, "try_call_argument_type_ids"))
     if "try_overload_type_has_ambiguous_nominal_identity(file, argument_type_id, caller, annotations, table, 0)" not in argument_types or "argument_type_firm or argument_type_ambiguous" not in argument_types:
         raise SystemExit("Try argument typing must preserve ambiguous nominal identity for candidate lookup to fail closed")
     shared_ambiguous_match = compact_inline(function_section(source_text, "try_overload_type_shared_ambiguous_match_state"))
@@ -324,8 +324,13 @@ def check_try_callable_resolution(
             "offset: try_offset")):
         raise SystemExit("Try parser metadata must carry forwarding state and direct-call identity from each argument to its Try position")
     forward_try_selector = compact_inline(function_section(source_text, "callable_try_call_forwards_arguments"))
-    if 'marker.owner == "__try_callee_argument_forward"' not in forward_try_selector or "return invalid if callable_try_call_forwards_arguments" not in compact_inline(function_section(source_text, "callable_symbol_type_selected_candidate")):
-        raise SystemExit("Try receiver overload ranking must be disabled for forwarded argument calls")
+    forward_rows = compact_inline(function_section(source_text, "check_try_fallible_rows"))
+    if 'marker.owner == "__try_callee_argument_forward"' not in forward_try_selector or not all(fragment in forward_rows for fragment in (
+            "if callable_try_call_forwards_arguments(annotations, annotation.offset):",
+            "try_forwarded_parameter_types(table, caller_decl_id, receiver_ref_mutability_known, receiver_ref_mutable)",
+            "if forwarded.known:",
+            "argument_type_ids <- forwarded.types")):
+        raise SystemExit("Try receiver overload ranking must use forwarded argument types only when known")
     if not all(fragment in parser_try_expression for fragment in (
             'owner: "__try_callee_arity"',
             "line: get_token.line",
@@ -375,7 +380,7 @@ def check_try_callable_resolution(
         raise SystemExit("A bare root error-set declaration must win before Try scans lexical module candidates")
     if not all(fragment in family_module for fragment in (
             "(found: bool, uncertain: bool, module: sview @source) = catch_explicit_error_family_module",
-            'return (false, family_annotation.name, "", true) if qualified and explicit_module.uncertain',
+            'return (false, family_annotation.name, "", true) if explicit_module.uncertain',
             'return (false, family_annotation.name, "", true) if not qualified and family_path != "" and not catch_module_path_matches(family_path, family_annotation.name)')):
         raise SystemExit("Try must keep uncertain qualified ErrorSet aliases unknown before considering raw module candidates")
     bare_path_guard = 'return (false, family_annotation.name, "", true) if not qualified and family_path != "" and not catch_module_path_matches(family_path, family_annotation.name)'

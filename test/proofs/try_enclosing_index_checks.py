@@ -165,7 +165,7 @@ def enclosing_try_function_indexed(index: mutable FallibleFunctionPositionIndex&
         "try_error_family_has_empty_subset": (
             "family.declaration_offset == FALLIBLE_FUNCTION_NO_OFFSET or family.family_path == \"\"",
         ),
-        "callable_function_declaration_visible": (
+        "callable_function_declaration_visible_with": (
             "declaration_offset != FALLIBLE_FUNCTION_NO_OFFSET and annotation.offset != FALLIBLE_FUNCTION_NO_OFFSET",
             "annotation.offset == declaration_offset",
             "annotation.offset == FALLIBLE_FUNCTION_NO_OFFSET",
@@ -216,9 +216,11 @@ if try_site_count > 1:
     row_enclosing <- enclosing_try_function_indexed(function_positions, table, annotation.line, annotation.offset)
 else:
     row_enclosing <- enclosing_try_function(table, annotation.line, annotation.offset)
-row_module: sview = fallible_fn_module_indexed(module_index, module_annotations, row_enclosing.offset, row_enclosing.line)
 """
-    if not contains_contiguous_block(rows_function, expected_dispatch):
+    if not contains_contiguous_block(rows_function, expected_dispatch) or (
+        "row_module: sview = fallible_fn_module_indexed(module_index, module_annotations, row_enclosing.offset, row_enclosing.line)"
+        not in rows_function
+    ):
         raise SystemExit("try rows must use indexed enclosing-function lookup only for multiple try sites and feed its result into module scope resolution")
     if compact_inline(rows_function).count("enclosing_try_function_indexed(") != 1 or \
             compact_inline(rows_function).count("enclosing_try_function(") != 1:
@@ -236,7 +238,7 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
             'marker.owner != "__try_callee_argument_direct_call"',
             "ownership_binding_at_position(table, caller, nested_call_position)",
             "callable_try_static_binding_uncertain(annotations, nested_call_name, caller_module, \"\", table)",
-            "callable_row_in_scope_indexed(module_index, module_annotations, annotations, nested_call_name, symbol.offset, symbol.line, caller_module, \"\", table)",
+            "callable_row_in_scope_with_owner(annotations, nested_call_name, symbol.module_owner, symbol.offset, symbol.line, caller_module, \"\", table)",
             "symbol.return_type_id",
             "call_return_function_offset: mutable u32 = 0",
             "call_return_function_offset <- symbol.offset",
@@ -294,9 +296,9 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
     ranked_receiver_overload_gate = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_in_scope"))
     if not all(fragment in raw_receiver_overload_set for fragment in (
             "callable_row_in_ufcs_candidate_set_indexed",
-            "other.kind == SymbolKind.Func and other.name == name and other.module_owner == symbol.module_owner",
+            "symbol_chain_head(table, name)",
+            "other.kind != SymbolKind.Func or other.name != name or other.module_owner != symbol.module_owner",
             "candidate_count >= 2.usize()")) or not all(fragment in ranked_receiver_overload_gate for fragment in (
-            "callable_try_call_forwards_arguments(annotations, try_offset)",
             'argument.owner == "__try_callee_named_arg"',
             "return callable_name_has_ufcs_overload_set_candidate")):
         raise SystemExit("Try must distinguish Core's raw overload set from the call shapes eligible for receiver ranking")
@@ -311,11 +313,10 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
     visible_overloads = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_in_scope"))
     visible_overload_candidates = compact_inline(function_section(source_text, "callable_name_has_ufcs_overload_set_candidate"))
     if not all(fragment in visible_overloads for fragment in (
-            "callable_try_call_forwards_arguments(annotations, try_offset)",
             'argument.owner == "__try_callee_named_arg"',
             "callable_name_has_ufcs_overload_set_candidate(module_index, module_annotations, annotations, name, enclosing_module, callee_qualifier, table)")) or not all(fragment in visible_overload_candidates for fragment in (
             "callable_row_in_ufcs_candidate_set_indexed",
-            "other.module_owner == symbol.module_owner",
+            "other.module_owner != symbol.module_owner",
             "candidate_count >= 2.usize()")):
         raise SystemExit("Try receiver ranking must detect Core overload sets across all visible module candidates")
     candidate_set = compact_inline(function_section(source_text, "callable_row_in_ufcs_candidate_set_indexed"))
@@ -333,9 +334,12 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
             candidate_local < candidate_parent_walk < candidate_wildcard < candidate_selective):
         raise SystemExit("Try receiver lookup must scan all lexical declarations before wildcard imports and selective aliases")
     wildcard_imported_row = compact_inline(function_section(source_text, "callable_wildcard_imported_row_in_scope"))
-    if 'binding.name == "__binding_wildcard_import" and binding.owner == candidate_module and binding.module == scope_module' not in wildcard_imported_row:
+    if 'binding.name == "__binding_wildcard_import" and semantic_import_resolved_owner_matches(table, candidate_module, binding.owner, binding.module) and binding.module == scope_module' not in wildcard_imported_row:
         raise SystemExit("Try wildcard imports must remain tied to their lexical using scope")
-    ordinary_row = compact_inline(function_section(source_text, "callable_row_in_scope_indexed"))
+    ordinary_row = compact_inline(function_section(source_text, "callable_row_in_scope_with_owner"))
+    indexed_row = compact_inline(function_section(source_text, "callable_row_in_scope_indexed"))
+    if "return callable_row_in_scope_with_owner(annotations, name, candidate_module, declaration_offset, declaration_line, enclosing_module, callee_qualifier, table)" not in indexed_row:
+        raise SystemExit("Try indexed lookup must retain the shared owner-based visibility checks")
     qualified_module_match = compact_inline(function_section(source_text, "callable_qualified_module_matches_candidate"))
     if not all(fragment in qualified_module_match for fragment in (
             "callable_module_path_matches_suffix(symbol.module_owner, scope_module, callee_qualifier)",
@@ -365,7 +369,7 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
     if not all(fragment in static_alias_binding for fragment in (
             'unresolved.name == "__using_alias" and callee_qualifier != "" and unresolved.detail_name == alias_head',
             "semantic_possible_import_alias_head_target(alias_head, enclosing_module, 4294967295, table)",
-            "continue if selected_alias.known and selected_alias.found return true")) or "try_noncall_module_is_ancestor(unresolved.module, enclosing_module)" in static_alias_binding:
+            "continue if selected_alias.known and selected_alias.found return true")) or "try_noncall_module_is_ancestor(unresolved.module, enclosing_module)" in static_alias_binding.split('if unresolved.name == "__using_alias"', 1)[-1]:
         raise SystemExit("Try static alias uncertainty must follow the analyzer-wide alias winner rather than caller ancestry")
     if not all(fragment in qualified_leaf_fixture for fragment in (
             "module OuterB:", "def fail() -> i64 error[F]:", "module OuterA:",
@@ -374,8 +378,8 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
         raise SystemExit("Try smoke must bind the duplicate-leaf fixture where Common resolves only to the caller's OuterA ancestor")
     if not all(fragment in nested_global_alias_fixture for fragment in (
             "module AliasHome:", "module Provider:", "using Provider as Shared", "def good() -> i64 error[E]:", "return try Shared::load()")) or not all(fragment in try_smoke for fragment in (
-            "try_nested_global_using_alias.elisa", "root call could not resolve a module alias declared in a nested module")):
-        raise SystemExit("Try smoke must bind a root call through a module alias declared inside a nested module")
+            "try_nested_global_using_alias.elisa", 'undefined identifier "Shared.load"')):
+        raise SystemExit("Try smoke must reject a root call through a module alias declared inside a nested module")
     if not zero_offset_enclosing_fixture.startswith("def caller() -> i64 error[E]:\n") or not all(fragment in zero_offset_enclosing_fixture for fragment in (
             "return try load()", "def load() -> i64 error[E]:",
             "#line 1 zero-offset-enclosing.elisa", "def sibling() -> i64 error[F]:")) or not all(fragment in try_smoke for fragment in (
@@ -410,7 +414,7 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
             "callable_function_declaration_visible(annotations, name, module, symbol.line, symbol.offset, enclosing_module)",
             "symbol.kind != SymbolKind.Func or symbol.name != name or symbol.module_owner != module")):
         raise SystemExit("Try lexical lookup must skip inaccessible declarations instead of letting them shadow visible imports")
-    callable_declaration_visibility = compact_inline(function_section(source_text, "callable_function_declaration_visible"))
+    callable_declaration_visibility = compact_inline(function_section(source_text, "callable_function_declaration_visible_with"))
     if not all(fragment in callable_declaration_visibility for fragment in (
             "try_error_alias_module_visible(annotations, candidate_module, lexical_module)",
             'annotation.owner != "__section_private" and annotation.owner != "__section_public"',
@@ -424,11 +428,12 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
     if not all(fragment in first_wildcard for fragment in (
             'binding.name != "__binding_wildcard_import"',
             "try_noncall_module_is_ancestor(binding.module, enclosing_module)",
-            "callable_named_visible_declaration_in_module(table, annotations, name, binding.owner, enclosing_module)",
-            "ambiguous_imports <- true if selected_found and selected_target != binding.owner",
+            "semantic_import_resolved_owner_matches(table, symbol.module_owner, binding.owner, binding.module)",
+            "callable_function_declaration_visible(annotations, name, symbol.module_owner, symbol.line, symbol.offset, enclosing_module)",
+            "ambiguous_imports <- true if selected_found and selected_target != symbol.module_owner",
             "selected_scope_length: mutable usize = enclosing_module.len + 1.usize()",
             "binding.module.len < selected_scope_length",
-            "selected_target <- binding.owner",
+            "selected_target <- symbol.module_owner",
             "return (true, false) if ambiguous_imports",
             "return (selected_found, selected_target == candidate_module)")):
         raise SystemExit("Try ordinary wildcard lookup must preserve Core's outer-to-inner order and private visibility")
@@ -447,17 +452,19 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
     if not all(fragment in noncall_import_builder for fragment in (
             "already_imported_name: mutable bool = false",
             "environment.callable_imported_member_names[index] == import_annotation.name",
-            "try_noncall_module_path(import_annotation.module, source_annotation.name, table)",
+            "binding_import_module_owner(source_annotation.name, import_annotation.module, table)",
             "if imported_module != \"\" and not already_imported_name",
             "environment.callable_imported_member_names.push(import_annotation.name)")):
         raise SystemExit("Try non-call cached facts must retain only Core's first selective import for each bare name")
     noncall_module_path = compact_inline(function_section(source_text, "try_noncall_module_path"))
+    cached_fact_builder = compact_inline(function_section(source_text, "try_noncall_callable_facts_add"))
     if not all(fragment in noncall_module_path for fragment in (
             'return child if parent == ""',
-            "already_parent_qualified: mutable bool",
-            "child.len > parent.len + 1.usize()",
-            "child[parent.len + 1.usize()] == 58",
-            "return child if already_parent_qualified")):
+            "bytes.reserve(parent.len + 2.usize() + child.len)",
+            "bytes.push(58) bytes.push(58)",
+            "return intern_joined_text(bytes, table)")) or not all(fragment in cached_fact_builder for fragment in (
+            "nested_module: sview @source = module_name",
+            "try_noncall_callable_facts_add(module_body, annotations, marker_index, environment, nested_module, table)")):
         raise SystemExit("Try module path joins must preserve already-qualified declaration children while keeping relative joins")
     noncall_assignment_facts = compact_inline(function_section(source_text, "try_noncall_assignment_source_facts"))
     if 'return (call_facts.family, call_facts.return_nonfallible and call_facts.family == "") if call_facts.known' not in noncall_assignment_facts:
@@ -476,12 +483,11 @@ row_module: sview = fallible_fn_module_indexed(module_index, module_annotations,
             "wildcard_ambiguous <- true if first_visible_import_module != \"\" and first_visible_import_module != environment.callable_wildcard_import_modules[import_index]",
             'return (false, "", false, false, false, true, "", 0.usize()) if wildcard_ambiguous')):
         raise SystemExit("Try cached lookup must fail closed when distinct visible wildcard targets make a bare name ambiguous")
-    cached_fact_builder = compact_inline(function_section(source_text, "try_noncall_callable_facts_add"))
     if not all(fragment in cached_fact_builder for fragment in (
-            "callable_visible: bool = callable_function_declaration_visible(annotations, name, current_module, function_position.line, function_position.offset, environment.current_module)",
+            "callable_visible: bool = callable_function_declaration_visible_with(declaration_rows, annotations, name, current_module, function_position.line, function_position.offset, environment.current_module)",
             "environment.callable_names.push(name)",
             "environment.callable_visible.push(callable_visible)",
-            "environment.callable_facts_known.push(family_rows <= 1.usize())",
+            "environment.callable_facts_known.push(not unresolved_static_branch and family_rows <= 1.usize())",
             "environment.callable_first_param_type_names.push(first_param_type_name)",
             "environment.callable_first_param_generic.push(first_param_is_generic)",
             "environment.callable_max_param_counts.push(params.count)",

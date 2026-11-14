@@ -222,10 +222,10 @@ def check_try_family_visibility(
             "return try choose(..)",
             "return try singleton(..)")) or not all(fragment in nested_forward_smoke for fragment in (
             "try_overload_nested_and_forwarded_calls.elisa",
-            "expected_rows=$'L27\\nL36'",
-            "grep -q '^D 2$'",
+            "expected_rows=$'L27\\nL30\\nL36'",
+            "grep -q '^D 3$'",
             "try requires a fallible expression")):
-        raise SystemExit("Try receiver guards must preserve a known public nested-call winner, fail closed on forwarded overload families, and retain forwarded singleton inference")
+        raise SystemExit("Try receiver guards must preserve a known public nested-call winner, resolve forwarded overload families from known parameters, and retain forwarded singleton inference")
     cross_module_private_fixture = (ROOT / "test/repro/try_overload_cross_module_private_cached_winner.elisa").read_text()
     cross_module_private_smoke = (ROOT / "test/parity/try_overload_cross_module_private_cached_winner_smoke.sh").read_text()
     if not all(fragment in cross_module_private_fixture for fragment in (
@@ -239,11 +239,11 @@ def check_try_family_visibility(
             "def public_winner_direct(value: bool)",
             "def public_winner_cached(value: bool)")) or not all(fragment in cross_module_private_smoke for fragment in (
             "try_overload_cross_module_private_cached_winner.elisa",
-            "grep -cF 'is private to module'",
-            "grep -cF 'try requires a fallible expression'",
-            "grep -cF 'cannot propagate'",
-            "== 2")):
-        raise SystemExit("Try cached winner coverage must include hidden private candidates from a different selective-import module and retain a public generic control")
+            "grep -q '^D 4$'",
+            "for line in 30 34 37 41",
+            'grep -qF "L$line cannot propagate GenericFault from a function returning Destination"',
+            "if grep -qE 'is private to module|try requires a fallible expression'")):
+        raise SystemExit("Try cached winner coverage must keep sibling-only private imports out of public generic calls")
     static_import_fixture = (ROOT / "test/repro/try_overload_static_import_family.elisa").read_text()
     static_import_smoke = (ROOT / "test/parity/try_overload_static_import_family_smoke.sh").read_text()
     if not all(fragment in static_import_fixture for fragment in (
@@ -296,8 +296,8 @@ def check_try_family_visibility(
             "cannot propagate")):
         raise SystemExit("Try static-alias smoke must check both compiler stages against the inactive provider's ErrorSet")
     if "try_error_alias_name_visible(annotations, name, declaration_module, function_module)" not in facts['alias_visibility'] or not all(fragment in facts['private_alias_path'] for fragment in (
-            'row.owner == "__section_private"',
-            "row.name == segment",
+            'annotations[index].owner == "__section_private"',
+            "annotations[index].name == segment",
             "catch_module_is_ancestor(private_scope, lexical_module)")) or not all(fragment in facts['private_alias_name'] for fragment in (
             "try_error_alias_is_private(annotations, alias_name, alias_module)",
             "catch_module_is_ancestor(alias_module, lexical_module)")):

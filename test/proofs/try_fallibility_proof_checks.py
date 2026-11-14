@@ -22,7 +22,9 @@ def check_try_fallibility_proofs(
     may_raise_source = function_section(source_text, "try_noncall_expression_may_raise_catchably_with_annotations")
     call_argument_scan = """
 Expr.Call(callee, arguments, _, _):
-    direct_raise: bool = callee is Expr.Ident("raise", _)
+    direct_raise: mutable bool = false
+    if callee is Expr.Ident(callee_name, _):
+        direct_raise <- callee_name == "raise"
     if not direct_raise:
         return true if try_noncall_expression_may_raise_catchably_with_annotations(callee, annotations, lexical_module)
         return false if try_noncall_expression_aborts_with_annotations(callee, annotations, lexical_module)
@@ -42,7 +44,9 @@ Expr.Call(callee, arguments, _, _):
             "pma_static_if_row_selection(file, marker.identity_id.usize(), annotation.module, table)",
             "return (true, true, false) if branch.known and not branch.selected",
             "return (true, false, false) if unresolved")) or not all(fragment in static_binding_filter for fragment in (
-            "try_static_binding_branch_selection(annotation, file.enum_annotations, file, table)",
+            "try_static_binding_branch_selection(annotation, import_markers, file, table)",
+            'marker.name == "__from_member_static_branch" or marker.name == "__binding_wildcard_import_static_branch" or marker.name == "__using_alias_static_branch"',
+            "import_markers.push(marker)",
             "if branch.tracked and branch.known and not branch.active:",
             'owner: "__try_unresolved_static_binding"',
             'name: "__using_alias"')):
@@ -54,10 +58,10 @@ Expr.Call(callee, arguments, _, _):
             'unresolved.name == "__binding_wildcard_import"',
             'unresolved.name == "__using_alias"')):
         raise SystemExit("Try callable resolution must decline a family when an unresolved static binding could affect the call")
-    rows_call = "table <- check_try_fallible_rows(file, file.top_decls, try_annotations, projection.try_named_arguments, projection.try_argument_positions, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, projection.try_arities, error_index, try_site_count, table) can Global{Read,Write} if try_site_count > 0"
+    rows_call = "table <- check_try_fallible_rows(file, file.top_decls, try_annotations, projection.try_named_arguments, projection.try_argument_positions, projection.error_set_annotations, projection.error_set_family_paths, module_index, projection.module_annotations, projection.try_qualifiers, projection.try_arities, error_index, try_site_count + noncall_fallback_count, table) can Global{Read,Write} if try_site_count + noncall_fallback_count > 0"
     if compact_inline(main_try_check).count(compact_inline(rows_call)) != 1:
         raise SystemExit("check_try_fallible must invoke the source-row checker when at least one try site exists")
-    if 'try_annotations: darray[Ast::EnumAnnotation] = try_static_binding_filtered_annotations(file, table)' not in compact_inline(main_try_check):
+    if 'rebind try_annotations: darray[Ast::EnumAnnotation], table = try_static_binding_filtered_annotations(file, table)' not in compact_inline(main_try_check):
         raise SystemExit("check_try_fallible must derive its callable imports from the static-branch-filtered annotation set")
 
     if semantic_text.count('include "./check_try_fallible.elisa"') != 1:
