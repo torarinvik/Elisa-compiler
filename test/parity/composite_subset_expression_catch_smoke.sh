@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/platform.sh"  # host flags/paths: scripts/platform.sh
-# Exercise Stage0's LLVM-internal baseline and Stage1's target C ABI for the minimized
-# restricted-composite expression-catch path.
+# Exercise both compilers' native C ABI for the restricted-composite expression-catch path.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -12,7 +11,6 @@ LLVM_BIN="$(dirname -- "$LLVM_CONFIG")"
 OPT="${ELISA_OPT:-$LLVM_BIN/opt}"
 CLANG="${ELISA_CLANG:-$LLVM_BIN/clang}"
 FIXTURE="$ROOT/test/repro/catch_subset_minimal.elisa"
-STUB="$ROOT/test/repro/catch_subset_minimal_stub.ll"
 C_STUB="$ROOT/test/repro/catch_subset_minimal_c_stub.c"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/elisa-composite-subset-catch.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
@@ -21,7 +19,6 @@ bash "$ROOT/scripts/assert_stage0_fresh.sh" "$STAGE0"
 bash "$ROOT/scripts/assert_stage1_fresh.sh" "$STAGE1"
 [[ -x "$OPT" ]] || { echo "composite subset catch smoke: missing opt: $OPT" >&2; exit 2; }
 [[ -x "$CLANG" ]] || { echo "composite subset catch smoke: missing clang: $CLANG" >&2; exit 2; }
-"$OPT" -passes=verify -disable-output "$STUB"
 
 for level in 0 2; do
     for stage in 0 1; do
@@ -34,17 +31,13 @@ for level in 0 2; do
             exit 1
         fi
         "$OPT" -passes=verify -disable-output "$llvm"
-        stub="$STUB"
-        [[ "$stage" -eq 1 ]] && stub="$C_STUB"
-        if [[ "$stage" -eq 1 ]]; then
-            grep -Eq '^declare i64 @foo\(ptr\)' "$llvm" || {
-                echo "composite subset catch smoke: Stage1 declaration did not use the arm64 C return type at -O$level" >&2
-                rg -n '@foo' "$llvm" >&2 || true
-                exit 1
-            }
-        fi
+        grep -Eq '^declare i64 @foo\(ptr\)' "$llvm" || {
+            echo "composite subset catch smoke: Stage$stage declaration did not use the C return type at -O$level" >&2
+            rg -n '@foo' "$llvm" >&2 || true
+            exit 1
+        }
         DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}" \
-            "$CLANG" "-O$level" -Wno-override-module -o "$WORK/stage${stage}-O${level}" "$llvm" "$stub"
+            "$CLANG" "-O$level" -Wno-override-module -o "$WORK/stage${stage}-O${level}" "$llvm" "$C_STUB"
     done
 
     set +e
@@ -59,4 +52,4 @@ for level in 0 2; do
     fi
 done
 
-echo "composite subset expression catch smoke OK: Stage0 LLVM baseline and Stage1 C ABI return 42 at -O0 and -O2"
+echo "composite subset expression catch smoke OK: both compilers return 42 through the C ABI at -O0 and -O2"
