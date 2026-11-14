@@ -59,7 +59,12 @@ grep -q "mutable iteration requires a writable view" <<< "$out" || fail "readonl
 # catches the thing this guards: a `<-` to a name nothing in the unit declares.
 t=0
 while IFS= read -r d; do
-  c=$(cat "$d"/*.elisa 2>/dev/null | "$RPT" 2>/dev/null | grep -cE "undefined assignment target|invalid assignment target" || true)
+  sources=("$d"/*.elisa)
+  [[ -f "${sources[0]}" ]] || continue
+  if ! report=$(set -o pipefail; cat "${sources[@]}" | "$RPT"); then
+    fail "reporter failed while scanning $d"
+  fi
+  c=$(grep -cE "undefined assignment target|invalid assignment target" <<< "$report" || true)
   t=$((t + c))
 done < <(find "$REPO_ROOT/src" "$REPO_ROOT/elisacore_std" -type d | sort)
 [ "$t" -eq 0 ] || fail "$t assignment-target findings across frontend+stdlib"
