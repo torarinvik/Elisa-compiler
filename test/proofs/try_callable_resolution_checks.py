@@ -238,9 +238,10 @@ def check_try_callable_resolution(
         raise SystemExit("Try family uniqueness must ignore only exact, proven-inactive ErrorSets and retain unknown branch owners")
     type_owner_module = compact_inline(function_section(source_text, "try_overload_type_owner_in_module"))
     if not all(fragment in type_owner_module for fragment in (
-            "try_overload_type_symbol_is_nominal(symbol)",
-            "try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, declaration_module, symbol.line, symbol.offset, lexical_module, table)",
-            "return (count > 0.usize(), false, declaration_module)")):
+            "symbol_chain_head(table, name)",
+            "symbol.name != name or symbol.module_owner != declaration_module or not try_overload_type_symbol_is_nominal(symbol)",
+            "return (true, false, declaration_module) if try_overload_type_declaration_visible(file, annotations, symbol.kind == SymbolKind.Alias, name, declaration_module, symbol.line, symbol.offset, lexical_module, table)",
+            "return (false, false, declaration_module)")):
         raise SystemExit("Try nominal owner lookup must recognize a visible owner within one module and leave duplicate declarations to Core")
     nominal_type_identity = compact_inline(function_section(source_text, "try_overload_nominal_type_owner_for_module"))
     if not all(fragment in nominal_type_identity for fragment in (
