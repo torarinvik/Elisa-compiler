@@ -140,6 +140,7 @@ seed_build() {
   ELISA_SEED_RUNTIME_DIR=""
   ELISA_SEED_RECEIPT_PID=""
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
+  ELISA_SEED_BOOTSTRAP_DIR=""
   ELISA_SEED_LLVM_BRIDGE="$ELISA_SEED_STAGE_DIR/llvm_bridge.o"
   finish_seed_freshness_check() {
     local status=0
@@ -171,6 +172,10 @@ seed_build() {
     fi
     local file
     local -a files=("$ELISA_SEED_LOCK_DIR/pid") directories=("$ELISA_SEED_LOCK_DIR")
+    if [[ -n "$ELISA_SEED_BOOTSTRAP_DIR" ]]; then
+      files+=("$ELISA_SEED_BOOTSTRAP_DIR/elisac-stage1")
+      directories+=("$ELISA_SEED_BOOTSTRAP_DIR")
+    fi
     for file in "${ELISA_SEED_OUTPUT:-}" "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}"; do
       if [[ -n "$file" ]]; then files+=("$file"); fi
     done
@@ -218,6 +223,20 @@ seed_build() {
     stage0|stage1) ;;
     *) echo "seed: invalid bootstrap compiler kind: $seed_bootstrap_kind" >&2; exit 2 ;;
   esac
+  local seed_compiler="$BOOTSTRAP_BIN"
+  if [[ "$seed_bootstrap_kind" == stage1 ]]; then
+    if ! finish_seed_freshness_check; then
+      echo "seed: refusing to compile with a stale or unverifiable Stage1 bootstrap" >&2
+      exit 2
+    fi
+    # Stage1 resolves trusted runtime declarations relative to its executable.
+    # Verify the original in its source checkout, then run an identical copy
+    # beside the destination checkout's bundled runtime.
+    ELISA_SEED_BOOTSTRAP_DIR="$(mktemp -d "$ROOT/bin/.stage1-bootstrap.XXXXXXXX")"
+    seed_compiler="$ELISA_SEED_BOOTSTRAP_DIR/elisac-stage1"
+    cp "$BOOTSTRAP_BIN" "$seed_compiler"
+    cmp -s "$BOOTSTRAP_BIN" "$seed_compiler" || exit 2
+  fi
   # A Stage1 bootstrap may be built from compiler sources that import helpers from
   # native_runtime_support. The caller supplies a matching, SHA-256-pinned runtime
   # for this one link; the new product still rebuilds its runtime below.
@@ -329,7 +348,7 @@ seed_build() {
   ELISACORE_SMT_CACHE_DECLINED="$seed_smt_cache_declined" \
   ELISACORE_RETAINED_SERVER="$seed_retained_server" \
   ELISACORE_TRUSTED_RUNTIME_SOURCE="$ROOT/elisacore_std/elisacore_runtime_concurrency.elisa" \
-    "$BOOTSTRAP_BIN" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
+    "$seed_compiler" -emit obj "$seed_opt_level" -o "$seed_object" "$ROOT/src/driver/elisac.elisa" &
   seed_pid=$!
   echo "seed: bootstrap compiler SHA-256 $(elisa_sha256 "$BOOTSTRAP_BIN" | awk '{print $1}')" >&2
   local seed_rss_limit_marker="$ELISA_SEED_STAGE_DIR/rss-limit"
@@ -351,11 +370,9 @@ seed_build() {
     fi
     exit "$seed_status"
   fi
-  if [[ -n "${ELISA_SEED_STAGE0_FRESH_PID:-}" ]]; then
-    if ! finish_seed_freshness_check; then
-      echo "seed: refusing to link a product built by a stale or unverifiable Stage0" >&2
-      exit 2
-    fi
+  if ! finish_seed_freshness_check; then
+    echo "seed: refusing to link a product built by a stale or unverifiable Stage0" >&2
+    exit 2
   fi
   # Sources were read by the bootstrap compiler above; verify they did not change
   # meanwhile while the product links, and join before publishing it.
