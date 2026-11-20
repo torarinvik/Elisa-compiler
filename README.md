@@ -16,7 +16,7 @@
   &nbsp;·&nbsp;
   <a href="docs/">Documentation</a>
   &nbsp;·&nbsp;
-  <a href="docs/development/">Contributing</a>
+  <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 ---
