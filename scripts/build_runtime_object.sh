@@ -41,7 +41,7 @@ esac
 # -- 20+ fabricated differential-corpus mismatches, hidden from the link by the Linux shim's
 # --unresolved-symbols=ignore-all.
 if [[ "$(uname -s)" == "Linux" ]]; then export ELISA_HOST_LINUX=1; fi
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export ELISA_HOST_WINDOWS=1 ;; esac
+case "$(uname -s)" in MINGW*|MSYS*|UCRT*|CYGWIN*) export ELISA_HOST_WINDOWS=1 ;; esac
 if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
 
 [[ -x "$PRODUCT" ]] || {
@@ -52,6 +52,10 @@ if [[ "$(uname -m)" == "x86_64" ]]; then export ELISA_HOST_X86_64=1; fi
   echo "missing clang for profiler hook fallback: $ELISA_CLANG_TOOL" >&2
   exit 2
 }
+WINDOWS_THREAD_SOURCE=""
+if [[ "${ELISA_HOST_WINDOWS:-}" == 1 ]]; then
+  WINDOWS_THREAD_SOURCE="$ROOT/scripts/win32_thread_fallback.c"
+fi
 mkdir -p "$(dirname "$OUT")"
 # ATOMIC, and only when stale. This used to emit straight onto $OUT; six gate checks call this
 # script, so a rebuild mid-gate truncated the object under a sibling's link and backend_native
@@ -77,6 +81,9 @@ runtime_input_digest() {
       -exec "${HASH_COMMAND[@]}" {} + || return
     # The PRODUCT is an input: a reseed changes the compiler that builds the object.
     "${HASH_COMMAND[@]}" "$BUILD_SCRIPT" "$ROOT/scripts/write_profiler_hook_fallbacks.sh" "$ELISA_CLANG_TOOL" || return
+    if [[ -n "$WINDOWS_THREAD_SOURCE" ]]; then
+      "${HASH_COMMAND[@]}" "$WINDOWS_THREAD_SOURCE" || return
+    fi
     printf 'product %s %s\n' "$product_digest" "$PRODUCT_IDENTITY_PATH"
     # So is the optimisation level: an -O0 and an -O2 object are different products.
     printf 'opt-level %s\n' "$RUNTIME_OPT_LEVEL"
@@ -114,13 +121,14 @@ RUNTIME_TMP="$OUT.runtime.$$.tmp"
 HOOK_SOURCE="$OUT.hooks.$$.c"
 HOOK_OBJECT="$OUT.hooks.$$.o"
 STAMP_TMP="$STAMP.$$.tmp"
+THREAD_OBJECT="$OUT.threads.$$.o"
 HOOK_PID=""
 cleanup_runtime_build() {
   if [[ -n "$HOOK_PID" ]]; then
     kill "$HOOK_PID" 2>/dev/null || true
     wait "$HOOK_PID" 2>/dev/null || true
   fi
-  rm -f "$TMP" "$RUNTIME_TMP" "$HOOK_SOURCE" "$HOOK_OBJECT" "$STAMP_TMP"
+  rm -f "$TMP" "$RUNTIME_TMP" "$HOOK_SOURCE" "$HOOK_OBJECT" "$THREAD_OBJECT" "$STAMP_TMP"
 }
 trap cleanup_runtime_build EXIT
 # Prepare the C hook object independently of the Elisa runtime compilation.
@@ -128,7 +136,13 @@ trap cleanup_runtime_build EXIT
   # --host-callbacks: the object must link STANDALONE (`clang prog.o elisacore_runtime.o`),
   # not only through the driver, which adds its own weak callback shims and -dead_strip.
   bash "$ROOT/scripts/write_profiler_hook_fallbacks.sh" --host-callbacks >"$HOOK_SOURCE"
-  "$ELISA_CLANG_TOOL" -fno-builtin -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
+  HOOK_FLAGS=(-fno-builtin)
+  if [[ -n "$WINDOWS_THREAD_SOURCE" ]]; then
+    # MinGW's linker cannot resolve Elisa's direct calls to COFF weak aliases
+    # after the hooks have been folded into the relocatable runtime object.
+    HOOK_FLAGS+=(-DELISA_STRONG_RUNTIME_HOOKS)
+  fi
+  "$ELISA_CLANG_TOOL" "${HOOK_FLAGS[@]}" -c -o "$HOOK_OBJECT" "$HOOK_SOURCE"
 ) &
 HOOK_PID=$!
 # The raw product, not the elisac_stage1.sh wrapper: the wrapper refuses a product older
@@ -146,7 +160,12 @@ else
 fi
 wait "$HOOK_PID"
 HOOK_PID=""
-"$ELISA_CLANG_TOOL" -r -o "$TMP" "$RUNTIME_TMP" "$HOOK_OBJECT"
+LINK_INPUTS=("$RUNTIME_TMP" "$HOOK_OBJECT")
+if [[ -n "$WINDOWS_THREAD_SOURCE" ]]; then
+  "$ELISA_CLANG_TOOL" -c -o "$THREAD_OBJECT" "$WINDOWS_THREAD_SOURCE"
+  LINK_INPUTS+=("$THREAD_OBJECT")
+fi
+"$ELISA_CLANG_TOOL" -r -o "$TMP" "${LINK_INPUTS[@]}"
 if [[ "$INPUT_DIGEST" != "$(runtime_input_digest)" ]]; then
   echo "runtime inputs changed during build; keeping the previous runtime object" >&2
   exit 2

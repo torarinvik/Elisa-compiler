@@ -8,8 +8,8 @@ register allocator beats hand-written assembly: not through clever tricks, but
 because it sees every use site and never gets tired.
 
 This document fixes the invariant, maps the pieces stage1 already has onto it,
-and lays out the order of work. [memory-speed-automation.md](memory-speed-automation.md)
-and [loop-scratch-memory.md](loop-scratch-memory.md) describe individual
+and lays out the order of work. [memory-speed-automation.md](history/memory-speed-automation.md)
+and [loop-scratch-memory.md](language/loop-scratch-memory.md) describe individual
 optimizations in detail.
 
 ## The soundness invariant

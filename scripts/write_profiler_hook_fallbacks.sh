@@ -23,7 +23,7 @@ set -euo pipefail
 cat <<'EOF'
 #include <stddef.h>
 #include <stdint.h>
-#if defined(__GNUC__) || defined(__clang__)
+#if !defined(ELISA_STRONG_RUNTIME_HOOKS) && (defined(__GNUC__) || defined(__clang__))
 #define ELISA_WEAK __attribute__((weak))
 #else
 #define ELISA_WEAK

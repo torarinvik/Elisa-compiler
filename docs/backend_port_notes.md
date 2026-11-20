@@ -23,17 +23,17 @@
 The notes below were written as the port went, so each one is dated and says what was
 MEASURED rather than assumed. They are split by subject; this page is the index.
 
-- [stage1 backend port — generics](backend_port_generics.md)
+- stage1 backend port — generics (`backend_port_generics.md`, local working note)
   - generics: design constraint found before implementing (2026-07-17)
   - nested generics: diagnosed to the exact line, not yet fixed (2026-07-17)
   - dict/set — genuinely blocked, chain traced end to end
   - dict/set — the ACCURATE dependency chain (correcting "one AST field away")
-- [stage1 backend port — references and error unions](backend_port_references_errors.md)
+- stage1 backend port — references and error unions (`backend_port_references_errors.md`, local working note)
   - references (`T&`): LANDED (68402af)
   - references (superseded — the wrong diagnosis, kept for the lesson)
   - error unions: ABI fully mapped, not yet implemented (2026-07-17)
   - Historical error unions (#17) — ABI investigation and earlier blocker notes
-- [stage1 backend port — the features that landed](backend_port_landed.md)
+- stage1 backend port — the features that landed (`backend_port_landed.md`, local working note)
   - Modules — LANDED
   - Externs — LANDED (the AST gap was fixed)
   - Tuples — BLOCKED on the stage1 AST (labels discarded)
@@ -41,7 +41,7 @@ MEASURED rather than assumed. They are split by subject; this page is the index.
   - `packed enum` / the AoS store — LANDED (scalar-payload subset)
   - Struct-composition gaps — BOTH CLOSED (kept for the pickup notes)
   - MILESTONE (2026-07-28) — self-host CRASH FIXED (Elisa-core fd5cffee)
-- [stage1 backend port — verified as nothing to port, and the tooling passes](backend_port_verified_absent.md)
+- stage1 backend port — verified as nothing to port, and the tooling passes (`backend_port_verified_absent.md`, local working note)
   - Effects — NOTHING TO PORT (verified, not assumed)
   - DWARF — scoped: one 490-line file, and `-g` does NOT reach `-emit llvm`
   - `-Wperf` — LANDED (tagging + post-pass verdict)

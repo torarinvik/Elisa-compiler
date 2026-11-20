@@ -191,7 +191,7 @@ KNOWN_INTERMITTENT=()
 # stage0 cannot build and run is skipped, so scratch files cost nothing but time.
 # An ARRAY, not a space-joined string: these paths contain spaces, and word-splitting a
 # joined string yields nonexistent directories and a silent EMPTY corpus.
-CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
+CORPUS_DIRS=("$ROOT/test")
 [ -d "$ELISA_CORE" ] && CORPUS_DIRS+=("$ELISA_CORE")
 
 # `$ELISA_CORE/repro/` is EXCLUDED. It holds minimal BUG DEMONSTRATIONS, most of
@@ -230,7 +230,7 @@ CORPUS_DIRS=("$ROOT/test" "$ROOT/.probe")
 if [[ "${1:-}" != "--batch" && "${1:-}" != "--one" ]]; then
     # Build output may contain entire stale compiler snapshots, including compiler
     # sources. They are not corpus inputs and must not be rebuilt as test programs.
-    find "${CORPUS_DIRS[@]}" \( -path "$ELISA_CORE/build" -o -path "$ELISA_CORE/compiler/build" \) -prune -o -name '*.elisa' -print0 2>/dev/null \
+    find "${CORPUS_DIRS[@]}" \( -path "$ELISA_CORE/build" -o -path "$ELISA_CORE/compiler/build" -o -path "$ROOT/test/_probe" \) -prune -o -name '*.elisa' -print0 2>/dev/null \
       | xargs -0 grep -l '^def main' 2>/dev/null \
       | grep -v '/repro/' \
       | grep -v '\.xfail\.elisa$' \

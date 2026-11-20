@@ -1,210 +1,69 @@
-# Elisa-compiler (stage1, self-hosted)
+# Elisa compiler
 
-The Elisa compiler **written in Elisa** — the eventual single source of truth for
-the language, and the frontend that powers the Elisa LSP (→ JetBrains plugin via
-LSP4IJ).
+Elisa is a statically typed programming language with indentation-based syntax. It compiles to native code and WebAssembly and can expose functions to Python as native extensions. The compiler checks types, memory lifetimes, and effects before it emits executable code.
 
-Built **frontend-first**: lexer → parser → name resolution → typecheck → LLVM
-backend.
+This repository contains **Stage1**, the compiler written in Elisa. **Stage0** is the Go compiler in [Elisa-core](https://github.com/torarinvik/Elisa-core). Stage0 builds the first Stage1 binary, a step called *bootstrapping*. Once built, Stage1 compiles Elisa programs directly and can compile its own source.
 
-## Product binary (day-to-day: no stage0)
+## Run your first program
 
-After a one-time seed, day-to-day compiles use the stage1 product — not the Go
-stage0 `elisac`:
+These steps use Bash on macOS or Linux. Install Git, Go, Make, Python 3, LLVM development libraries with `llvm-config`, Clang, and Z3. The [Elisa-core build instructions](https://github.com/torarinvik/Elisa-core#build-the-compiler) cover platform-specific setup.
+
+From a directory where you keep your projects, clone both repositories and build Stage0 first:
 
 ```sh
-# Once (needs stage0 only for this seed):
+git clone https://github.com/torarinvik/Elisa-core.git
+git clone https://github.com/torarinvik/Elisa-compiler.git
+make -C Elisa-core/compiler build
+
+cd Elisa-compiler
+export ELISA_CORE="$(cd ../Elisa-core && pwd)"
+export ELISACORE_BIN="$ELISA_CORE/compiler/bin/elisac"
 scripts/elisac_stage1.sh --seed
-
-# Then compile Elisa → native object without stage0:
-scripts/elisac_stage1.sh -o out.o path/to/program.elisa
-# Opt in to the currently ported safe scalar/darray noalias subset:
-scripts/elisac_stage1.sh -fnoalias -o out.o path/to/program.elisa
-clang -o prog out.o build/runtime/elisacore_runtime.o
 ```
 
-`scripts/install_stage1.sh` installs a self-contained snapshot. It verifies and
-freezes the recorded bootstrap compiler and optional bootstrap runtime, so
-later development rebuilds cannot invalidate the installed compiler. Snapshot
-integrity checks continue to detect changed installed artifacts; a producer
-that no longer matches the build receipt must be rebuilt before installation.
-Linker provenance ignores exact duplicate library-search directories while
-preserving search order, library options and selected artifact checks.
+Adjust `ELISA_CORE` if your Elisa-core checkout lives elsewhere. Set `LLVM_CONFIG` to the path of your chosen `llvm-config` if the wrapper picks up a different LLVM installation.
 
-### Python modules
+The included [Hello, Elisa example](examples/hello.elisa) uses `extern` to declare the C function `puts`. The indented body of `main` prints a line and returns zero to indicate success.
 
-`export pymodule` generates a CPython extension and a typed `.pyi` interface:
+```elisa
+extern puts(message: cstr) -> i32
+
+def main() -> i64:
+    _ = puts("Hello, Elisa!")
+    return 0
+```
+
+Compile and run it:
 
 ```sh
-PYTHON_BIN=python3 scripts/elisac_stage1.sh -emit pymodule-so -o model.so model.elisa
+scripts/elisac_stage1.sh -emit exe -o build/hello examples/hello.elisa
+./build/hello
 ```
 
-Use records for structured results rather than packing unrelated values into
-numeric arrays. A function returning `Result?` maps to a Python
-`Result | None`; `Result` is a generated `TypedDict` with named fields.
-Supported scalar, text, nested-record and array fields use the ordinary record
-converters. Arrays become independently owned lists, including nested rows;
-text becomes `str`, and Python object fields retain their references. Conversion
-finishes before temporary native arenas and input owners are released.
-Throwing functions retain the ordinary typed Elisa exception interface, with
-`None` representing successful absence rather than an error. Nullable record
-inputs and nullable record-valued fields are not yet supported.
-
-Text inputs accept `str` or UTF-8 `bytes`, including inside records and
-containers. Invalid UTF-8 is rejected before calling native code. `cstr`
-rejects embedded NULs; `sview` preserves them. Nullable text also accepts
-`None`. Generated converters call Elisa's text helper explicitly, leaving
-the CPython API unchanged and avoiding redundant Unicode validation.
-
-Native collection methods require the standard-library collection helpers in
-scope. Text set queries support `set[cstr]` and `set[sview]`. String-view keys use
-length-aware byte-content hashing and equality, preserving embedded NULs.
-Borrowed key storage must remain alive and unchanged while the set uses it.
-
-Numeric read-only views borrow compatible one-dimensional C-contiguous,
-natively aligned buffers; other sequences and incompatible read-only buffers
-are converted into temporary native storage. Mutable numeric views require a
-writable buffer with matching type, layout and alignment, since copying would
-discard updates. Rejected borrows release the buffer before conversion or error.
-
-Generated annotations describe numeric view inputs as `Sequence[T] | Buffer`
-and writable view inputs as `Buffer`. This accepts NumPy and other buffer
-exporters without widening writable arguments to `Any`. Element format,
-rank, contiguity, alignment and write permission remain runtime constraints.
-The stubs use `collections.abc.Buffer` on Python 3.12+, and the official
-`typing_extensions.Buffer` backport under a type-checking-only import for
-older Python targets. Native module imports gain no backport dependency.
-
-### WebAssembly
-
-WASM is equally direct and includes the browser/Node integration layer:
-
-```sh
-scripts/elisac_stage1.sh -emit wasm -o build/hello.wasm path/to/hello.elisa
-# writes hello.wasm, hello.mjs, hello.d.mts, hello.d.ts, and hello.json
+```text
+Hello, Elisa!
 ```
 
-See [docs/wasm.md](docs/wasm.md) for export adapters, JavaScript loading, memory, and
-runtime import customization. The standing end-to-end check is
-`test/parity/wasm_smoke.sh`.
+Use `-emit obj` for an object file or `-emit llvm` to inspect the generated LLVM IR. To install a snapshot as `elisac-stage1`, run `scripts/install_stage1.sh`. It installs under `~/.elisac` by default.
 
-See [docs/structured_concurrency.md](docs/structured_concurrency.md) for task nurseries,
-worker pools, and task-group joins.
+## Explore Elisa
 
-| Piece | Role |
-|-------|------|
-| `src/driver/elisac.elisa` | Product entry: real lexer → parser → `Backend::emit` → object |
-| `scripts/elisac_stage1.sh` | Host CLI (`-o`, include flatten) wrapping `bin/elisac-stage1` |
-| `scripts/pymodule_pyi.py` | Dependency-free renderer for typed Python stubs from the manifest |
-| `bin/elisac-stage1` | Seeded product binary (not checked in; rebuild with `--seed`) |
-| `test/parity/stage1_product_smoke.sh` | Standing gate: fixture exit 42 without stage0 |
+- [Language style guide](STYLE_GUIDE.md) covers common syntax and idioms.
+- [Python extensions](docs/interop/python.md) explains native modules and generated type stubs.
+- [WebAssembly](docs/interop/wasm.md) shows how to export a function and call it from JavaScript.
+- [Documentation index](docs/) links to language notes, compiler internals, and development guides.
 
-Host tools still required: `clang`, LLVM (`llvm-config` / libLLVM), optional `ar` /
-`llvm-mc` / Z3 for archive, template, and SMT surfaces.
+## Find your way around the repository
 
-**Gen2 self-host** (stage1 compiling its own product sources into a second binary) is
-CLOSED, and closed as a byte-identical fixpoint: `test/parity/self_host_gen3_smoke.sh`
-asserts gen2 compiles the compiler and `gen3.o == gen4.o`. stage1 also builds the standard
-library's runtime object, gated by `test/parity/self_host_runtime_smoke.sh` — the half the
-fixpoint cannot see, since every generation otherwise links the stage0-built runtime.
-Track with `scripts/self_host_gen2.sh`. Optional stage0 remains a parity oracle only.
+| Path | Contents |
+| --- | --- |
+| [`examples/`](examples/) | Small programs you can compile and run |
+| [`src/driver/`](src/driver/) | Command-line driver and build orchestration |
+| [`src/lexer/`](src/lexer/), [`src/parser/`](src/parser/) | Source text, tokens, and syntax trees |
+| [`src/semantic/`](src/semantic/), [`src/ir/`](src/ir/) | Semantic checks and intermediate representation |
+| [`src/backend/`](src/backend/) | LLVM lowering and code generation |
+| [`elisacore_std/`](elisacore_std/) | Standard library and runtime vendored from Elisa-core |
+| [`scripts/`](scripts/), [`tools/`](tools/) | Build scripts and development utilities |
+| [`test/`](test/) | Fixtures, regressions, parity tests, and benchmarks |
 
-The semantic gate is mandatory before executable output; environment variables cannot turn
-it off. Parity is held by `test/parity/run_all.sh --profile full` (~346 checks), which is the
-only profile a commit may rely on; see `IMPLEMENTATION_PLAN.md` (local, gitignored) for what
-is still open and why.
-
-Built **frontend-first**: lexer → parser → name resolution → typecheck → LLVM
-backend.
-
-## Layout
-
-```
-src/
-  elisacore_frontend.elisa   entry (includes runtime + lexer)
-  lexer/                     the self-hosted lexer
-    lexer.elisa              module hub (includes the parts below)
-    tokens.elisa             token model
-    lexer_*.elisa            lexer parts: core, tokens, strings, cursor,
-                             comments, numbers, identifiers
-  parser/                    region-inferred parser
-    parser.elisa             parser
-    parser_tokens.elisa      parser AST/token model
-elisacore_std/               VENDORED copy of Elisa-core's stdlib (see drift guard)
-test/
-  fixtures/lexer/            parity fixtures (lexer entry + token-model cases)
-scripts/
-  check_runtime_drift.sh     fails if vendored runtime != Elisa-core canonical
-```
-
-## Status
-
-- **Lexer: complete + parity-locked** against the stage0 Go lexer (token-kind
-  FNV checksum). Builds standalone with stage0.
-- **Parser: active region-inferred implementation.** The older parser
-  prototypes have been removed; `src/parser/parser.elisa` is the single parser
-  source.
-- **Semantic: parity-complete against stage0 acceptance/diagnostics oracles.**
-  `src/semantic/` implements name resolution plus a large diagnostics suite
-  (hundreds of `check_*.elisa` passes aggregated by `src/semantic/semantic.elisa`),
-  covering regions, borrows, effects, contracts, refinement, and termination at
-  the standing semantic-acceptance and diagnostics-diff gates.
-- **Backend / EASM: broad parity, with known gaps** (see `docs/backend_port_notes.md`
-  current audit). Host tools `ar` / `llvm-mc` / optional Z3 remain platform boundaries.
-
-## Single source of truth
-
-Two guards keep stage1 honest while stage0 still exists:
-
-1. **Runtime drift guard** — `scripts/check_runtime_drift.sh` diffs the vendored
-   `elisacore_std` against Elisa-core's canonical copy and fails on any
-   difference. Run in CI. Set `$ELISA_CORE` to your Elisa-core checkout (defaults
-   to the sibling `../../Go projects/Elisa-core` stage0 worktree).
-2. **Lexer parity** — the frontend's token-kind checksum must equal the stage0 Go
-   lexer's on a shared corpus; `test/parity/run_all.sh` runs this as a standing gate.
-
-## Building / checking locally
-
-```sh
-export ELISA_CORE="$(cd '../../Go projects/Elisa-core' && pwd)"  # local stage0 worktree
-make -C "$ELISA_CORE/compiler" build             # build stage0 locally; installed elisac is untouched
-scripts/check_runtime_drift.sh                    # runtime in sync?
-"$ELISA_CORE/compiler/bin/elisac" -emit semantic test/fixtures/lexer/frontend_lexer.elisa
-"$ELISA_CORE/compiler/bin/elisac" -emit semantic src/parser/parser.elisa
-```
-
-## TODO
-
-Port status (stage0 → stage1): **substantially complete, but not yet complete**. Standing
-parity gates (`test/parity/run_all.sh`) are the authority. Intentional
-platform-tool boundaries only: host `ar`, `llvm-mc`, and optional Z3 for SMT
-proofs — not compiler logic left unported.
-
-- [x] Cross-repo **parity oracle** (equivalent from this repo): lexer token-kind
-      parity via `test/parity/run_parity.sh` against stage0; a dedicated stage0
-      CLI checksum flag remains optional Elisa-core polish, not a stage1 gap.
-- [x] Breadth diagnostic-count baselines: `test/breadth/run.sh` supports
-      `--write-baseline FILE` and `--baseline FILE` for per-file `D <n>` drift.
-- [x] Breadth corpus exclusions are explicit: paths containing a `_unused/`
-      segment and files ending in `_unused.elisa` are intentionally skipped.
-- [x] Type model for backend/analysis surfaces: named tuples (side-table labels),
-      refs, optionals, generics/monomorphization, GuestVAddr/HostPtr carriers.
-- [x] Analysis engines at acceptance parity with stage0 (regions, borrows,
-      effects, contracts, refinement, termination) via diagnostics fixtures and
-      semantic acceptance oracles.
-- [x] LLVM IR/native object backend, optimization, DWARF, exported C headers,
-      and trace hooks.
-  - [x] Stage0 backend/EASM parity for this repo: ordinary source paths, guest-overlay
-        source lowering, multi-level provenance joins, lockstep (structural +
-        symbolic GPR/ALU/flags/ambient + executable oracle), property/enforcement
-        suites, and project/template orchestration (llvm-mc/`ar` remain host tools).
-- [x] Whole-program disjoint-parameter alias scopes (`FuncDisjointParams` plus combined
-      `alias.scope`/`noalias` element metadata), including fresh, clone, aliased, and
-      forwarded-call cases under `-fnoalias`.
-- [x] Forced dereference/bounds guards (`-fbounds-check` / `ELISACORE_FORCE_BOUNDS_CHECK`).
-- [x] Signed-overflow traps at every optimization level by default; explicit whole-unit opt-out
-      `-foverflow=wrap` / `ELISACORE_OVERFLOW=wrap` (see `docs/integer-overflow.md`).
-- [ ] Remaining error-union value operations outside the covered local/parameter/struct clone,
-      `try value else fallback`, and expression `catch value:` paths (notably broader generic
-      and aggregate propagation forms).
-- [x] Cross-repo stage0 frontend retirement is out of band (Elisa-core consumers).
+To check a seeded compiler, run `test/parity/stage1_product_smoke.sh`. For compiler changes, run the full parity suite with `test/parity/run_all.sh --profile full`. The suite uses Stage0 as a reference for comparing compiler behavior. See the [contributor guide](docs/development/README.md) for test prerequisites and runtime synchronization.

@@ -64,11 +64,11 @@ the current backend-oracle number is `0` reachable.
 The inventory and the log that closes it out are kept apart: the first says what is still
 missing and how it was measured, the second is dated and says what closed and when.
 
-- [What stage1 has not ported — the measured inventory](porting_gaps_measured.md)
+- What stage1 has not ported — the measured inventory (`porting_gaps_measured.md`, local working note)
   - Part 1 — measured today
   - Part 2 — carried from earlier work, NOT re-measured
   - Suggested order
-- [What stage1 has not ported — the progress log](porting_gaps_log.md)
+- What stage1 has not ported — the progress log (`porting_gaps_log.md`, local working note)
   - Progress — 2026-08-17
   - `project abi-lint` — PORTED (2026-08-17)
   - Final state, 2026-08-17 — gate 170/170
