@@ -5,3 +5,4 @@
 #include "llvm_index_bounds.cpp"
 #include "llvm_array_copy_elision.cpp"
 #include "llvm_bounded_sum.cpp"
+#include "llvm_float_constant_pool.cpp"
