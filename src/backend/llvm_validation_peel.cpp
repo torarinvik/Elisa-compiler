@@ -7,6 +7,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IRBuilder.h>
@@ -35,8 +36,41 @@
 #include <llvm/Transforms/Utils/LoopUtils.h>
 #include <llvm/Transforms/Utils/UnrollLoop.h>
 #include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Transforms/Scalar/DivRemPairs.h>
 
 using namespace llvm;
+
+extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef moduleRef,
+                                                LLVMTargetMachineRef targetRef) {
+  auto &module = *unwrap(moduleRef);
+  if (!module.getTargetTriple().isAArch64()) return 0;
+  PassBuilder builder(reinterpret_cast<TargetMachine *>(targetRef));
+  FunctionAnalysisManager analyses;
+  builder.registerFunctionAnalyses(analyses);
+  FunctionPassManager passes;
+  passes.addPass(DivRemPairsPass());
+  for (Function &function : module) {
+    if (function.isDeclaration() || function.hasOptNone()) continue;
+    bool runtimeUnsignedRemainder = false;
+    bool otherRemainder = false;
+    for (const Instruction &instruction : instructions(function)) {
+      if (instruction.getOpcode() == Instruction::URem &&
+          instruction.getType()->isIntegerTy() &&
+          !isa<ConstantInt>(instruction.getOperand(1))) {
+        runtimeUnsignedRemainder = true;
+      } else if (instruction.getOpcode() == Instruction::URem ||
+                 instruction.getOpcode() == Instruction::SRem) {
+        otherRemainder = true;
+      }
+    }
+    // The default pipeline can retain a remainder test until AArch64
+    // instruction selection, where it can become MSUB and CBZ/CBNZ.
+    if (runtimeUnsignedRemainder && !otherRemainder) continue;
+    if (runtimeUnsignedRemainder || otherRemainder) passes.run(function, analyses);
+  }
+  return 1;
+}
+
 unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
@@ -44,6 +78,7 @@ unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_validation_bounded_division.h"
 
 #else
+extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef, LLVMTargetMachineRef) { return 0; }
 extern "C" unsigned elisacoreElideBoundedDivisionSums(LLVMModuleRef) {
   return 0;
 }
