@@ -125,7 +125,7 @@ made, exactly as in the statement form, and the block compiles to the same machi
 (`test/parity/early_exit_codegen_smoke.sh`):
 
 ```elisa
-for value in values:
+for value in values |sum| -> sum:
     doubled: i64 =
         tmp: i64 = value * 2
         continue if tmp < 0
@@ -294,7 +294,7 @@ def main() -> i64:
 ```
 
 ```text
-Prefer:      arr <- push_one(arr, 4)          def push_one(arr: darray[i64], x: i64) -> darray[i64]
+Prefer:      arr <- arr.push_one(4)          def push_one(arr: darray[i64], x: i64) -> darray[i64]
 Instead of:  push_one(&arr, 4)                def push_one(arr: mutable darray[i64]&, x: i64) -> void
 ```
 
@@ -344,8 +344,7 @@ def main() -> i64:
     filled: darray[i64] =
         for i in 0..<4 |filled: darray[i64] = []| -> filled:
             filled <- push_one(filled, i)
-    grown: mutable darray[i64] = []
-    for i in 0..<4 |grown|:
+    grown = for i in 0..<4 |grown: darray[i64] = []| -> grown:
         grown <- grown.push_one(i)
     return 0 if filled.count == 4 and grown.count == 4 else 1
 ```
