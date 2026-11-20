@@ -108,12 +108,14 @@ extern "C" void elisacoreConfigureBoundedUnroll() {
 }
 extern "C" void elisacoreConfigureAppleCodeLayout() {
 #if defined(__APPLE__) && defined(__aarch64__)
+  // Let PHI elimination move exit-only copies onto loop exit edges.
   static bool installed = false;
   if (installed) return;
   installed = true;
   const char *args[] = {"elisac", "-enable-ext-tsp-block-placement=true",
-                        "-aarch64-enable-early-ifcvt=false"};
-  LLVMParseCommandLineOptions(3, args, nullptr);
+                        "-aarch64-enable-early-ifcvt=false",
+                        "-no-phi-elim-live-out-early-exit"};
+  LLVMParseCommandLineOptions(4, args, nullptr);
 #elif defined(__aarch64__)
   static bool installed = false;
   if (installed) return;
@@ -125,13 +127,15 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
   auto scheduler = registered.find("misched");
   if (scheduler != registered.end() && scheduler->second->getNumOccurrences() == 0) {
     const char *args[] = {"elisac", "-aarch64-enable-early-ifcvt=false",
-                          "-misched=elisa-ordered-selective"};
-    LLVMParseCommandLineOptions(3, args, nullptr);
+                          "-misched=elisa-ordered-selective",
+                          "-no-phi-elim-live-out-early-exit"};
+    LLVMParseCommandLineOptions(4, args, nullptr);
     return;
   }
 #endif
-  const char *args[] = {"elisac", "-aarch64-enable-early-ifcvt=false"};
-  LLVMParseCommandLineOptions(2, args, nullptr);
+  const char *args[] = {"elisac", "-aarch64-enable-early-ifcvt=false",
+                        "-no-phi-elim-live-out-early-exit"};
+  LLVMParseCommandLineOptions(3, args, nullptr);
 #endif
 }
 #include "llvm_checked_mul.cpp"
