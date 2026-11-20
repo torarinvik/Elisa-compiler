@@ -1,10 +1,62 @@
-# Elisa compiler
+<p align="center">
+  <img src="docs/assets/elisa-logo.png" alt="Elisa logo" width="320">
+</p>
 
-Elisa is a statically typed programming language with indentation-based syntax. It compiles to native code and WebAssembly and can expose functions to Python as native extensions. The compiler checks types, memory lifetimes, and effects before it emits executable code.
+<h1 align="center">Elisa compiler</h1>
 
-This repository contains **Stage1**, the compiler written in Elisa. **Stage0** is the Go compiler in [Elisa-core](https://github.com/torarinvik/Elisa-core). Stage0 builds the first Stage1 binary, a step called *bootstrapping*. Once built, Stage1 compiles Elisa programs directly and can compile its own source.
+<p align="center">
+  <strong>A statically typed systems language with indentation-based syntax.</strong><br>
+  Native executables, WebAssembly modules, and Python extensions.
+</p>
+
+<p align="center">
+  <a href="#run-your-first-program"><strong>Quickstart</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#elisa-by-example">Examples</a>
+  &nbsp;·&nbsp;
+  <a href="docs/">Documentation</a>
+  &nbsp;·&nbsp;
+  <a href="docs/development/">Contributing</a>
+</p>
+
+---
+
+Elisa checks types, memory lifetimes, and effects before generating code. This repository contains **Stage1**, the self-hosted compiler written in Elisa. The Go compiler in [Elisa-core](https://github.com/torarinvik/Elisa-core), called **Stage0**, builds the first Stage1 binary. Stage1 can then compile Elisa programs and its own source.
+
+## Elisa by example
+
+<!-- GitHub's Linguist has no Elisa grammar. The python fences provide approximate highlighting for the Elisa snippets. -->
+
+### Blocks that return a value
+
+A block can produce a value. Here the last line of the indented block becomes
+`total`, and `subtotal` and `shipping` stay local to that block.
+
+```python
+def order_total_cents(unit_price_cents: i64, quantity: i64) -> i64:
+    total: i64 =
+        subtotal: i64 = unit_price_cents * quantity
+        shipping: i64 = 0 if subtotal >= 5000 else 499
+        subtotal + shipping
+    return total
+```
+
+### Loops that return a value
+
+The loop starts `total` at zero, adds each number squared, and yields the final
+total. The range `0..<limit` excludes `limit`, so `sum_of_squares(4)` returns `14`.
+
+```python
+def sum_of_squares(limit: i64) -> i64:
+    result: i64 =
+        for number in 0..<limit |total: i64 = 0| -> total:
+            total += number * number
+    return result
+```
 
 ## Run your first program
+
+### Bootstrap the compiler
 
 These steps use Bash on macOS or Linux. Install Git, Go, Make, Python 3, LLVM development libraries with `llvm-config`, Clang, and Z3. The [Elisa-core build instructions](https://github.com/torarinvik/Elisa-core#build-the-compiler) cover platform-specific setup.
 
@@ -23,9 +75,11 @@ scripts/elisac_stage1.sh --seed
 
 Adjust `ELISA_CORE` if your Elisa-core checkout lives elsewhere. Set `LLVM_CONFIG` to the path of your chosen `llvm-config` if the wrapper picks up a different LLVM installation.
 
+### Compile and run
+
 The included [Hello, Elisa example](examples/hello.elisa) uses `extern` to declare the C function `puts`. The indented body of `main` prints a line and returns zero to indicate success.
 
-```elisa
+```python
 extern puts(message: cstr) -> i32
 
 def main() -> i64:
@@ -44,7 +98,13 @@ scripts/elisac_stage1.sh -emit exe -o build/hello examples/hello.elisa
 Hello, Elisa!
 ```
 
-Use `-emit obj` for an object file or `-emit llvm` to inspect the generated LLVM IR. To install a snapshot as `elisac-stage1`, run `scripts/install_stage1.sh`. It installs under `~/.elisac` by default.
+| To get | Use |
+| --- | --- |
+| A native executable | `-emit exe` |
+| An object file | `-emit obj` |
+| Readable LLVM IR | `-emit llvm` |
+
+Run `scripts/install_stage1.sh` to install a snapshot as `elisac-stage1` under `~/.elisac`.
 
 ## Explore Elisa
 
