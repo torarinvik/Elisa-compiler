@@ -14,7 +14,9 @@
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/PatternMatch.h>
 #include <llvm/Support/CBindingWrapping.h>
+#include <llvm/Transforms/Utils/Local.h>
 using namespace llvm;
 namespace ValidationReturnLayout {
 static bool negativeSentinel(Value *V) {
@@ -25,6 +27,52 @@ static bool negativeSentinel(Value *V) {
     return N.isNegative() && !N.isZero() && !N.isNaN() && !N.isInfinity();
   }
   return false;
+}
+
+// Keep a low-bit rejection test eligible for AArch64 TBZ. Match an entry
+// guard where the same input word supplies both the bit and range tests.
+static unsigned splitLowBitGuard(Function &F, BasicBlock *Exit, PHINode *Result) {
+  using namespace PatternMatch;
+  BasicBlock *Entry = &F.getEntryBlock();
+  auto *Branch = dyn_cast<CondBrInst>(Entry->getTerminator());
+  if (!Branch || Branch->getSuccessor(0) != Exit ||
+      Branch->getSuccessor(1) == Exit || Branch->hasMetadataOtherThanDebugLoc() ||
+      !negativeSentinel(Result->getIncomingValueForBlock(Entry)))
+    return 0;
+  auto *Guard = dyn_cast<SelectInst>(Branch->getCondition());
+  if (!Guard || !match(Guard->getTrueValue(), m_One())) return 0;
+  auto *Either = dyn_cast<BinaryOperator>(Guard->getCondition());
+  auto *Null = dyn_cast<ICmpInst>(Guard->getFalseValue());
+  if (!Either || Either->getOpcode() != Instruction::Or || !Null ||
+      Null->getPredicate() != ICmpInst::ICMP_EQ ||
+      !isa<ConstantPointerNull>(Null->getOperand(1)) ||
+      !isa<Argument>(Null->getOperand(0))) return 0;
+  auto *Range = dyn_cast<ICmpInst>(Either->getOperand(0));
+  auto *Bit = dyn_cast<ICmpInst>(Either->getOperand(1));
+  if (!Range || !Bit || Range->getPredicate() != ICmpInst::ICMP_UGT ||
+      !isa<ConstantInt>(Range->getOperand(1)) ||
+      Bit->getPredicate() != ICmpInst::ICMP_EQ ||
+      !match(Bit->getOperand(1), m_Zero())) return 0;
+  auto *Mask = dyn_cast<BinaryOperator>(Bit->getOperand(0));
+  if (!Mask || Mask->getOpcode() != Instruction::And ||
+      !isa<Argument>(Mask->getOperand(0)) ||
+      Mask->getOperand(0) != Range->getOperand(0) ||
+      !match(Mask->getOperand(1), m_One())) return 0;
+
+  BasicBlock *Continue = Branch->getSuccessor(1);
+  BasicBlock *Remaining = BasicBlock::Create(F.getContext(), "validation.remaining",
+                                             &F, Continue);
+  IRBuilder<> Builder(Remaining);
+  // Preserve the select's masking of a poison null test on range failure.
+  auto *Invalid = Builder.CreateSelect(Range, Guard->getTrueValue(), Null);
+  Builder.CreateCondBr(Invalid, Exit, Continue);
+  Result->addIncoming(Result->getIncomingValueForBlock(Entry), Remaining);
+  for (PHINode &Phi : Continue->phis())
+    Phi.replaceIncomingBlockWith(Entry, Remaining);
+  Branch->setCondition(Bit);
+  Branch->setSuccessor(1, Remaining);
+  RecursivelyDeleteTriviallyDeadInstructions(Guard);
+  return 1;
 }
 static bool plainGuard(BasicBlock *B, unsigned &Loads) {
   unsigned Size = 0;
@@ -173,6 +221,7 @@ extern "C" unsigned elisacoreBiasValidationReturns(LLVMModuleRef Ref) {
       for (Instruction &I : BB)
         Simple &= &I == P || &I == R || isa<DbgInfoIntrinsic>(I);
       if (Simple) {
+        Changed += ValidationReturnLayout::splitLowBitGuard(F, &BB, P);
         Changed += ValidationReturnLayout::annotate(F, &BB, P);
         Changed += ValidationReturnLayout::outlineSplitFailure(F, &BB, P);
         break;
