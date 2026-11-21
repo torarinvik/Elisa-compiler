@@ -141,6 +141,8 @@ seed_build() {
   ELISA_SEED_RECEIPT_PID=""
   ELISA_SEED_PROFILE_HOOK_SOURCE=""
   ELISA_SEED_BOOTSTRAP_DIR=""
+  ELISA_SEED_RUNTIME_COMPILER_DIR=""
+  ELISA_SEED_RUNTIME_COMPILER=""
   ELISA_SEED_LLVM_BRIDGE="$ELISA_SEED_STAGE_DIR/llvm_bridge.o"
   finish_seed_freshness_check() {
     local status=0
@@ -179,6 +181,10 @@ seed_build() {
     for file in "${ELISA_SEED_OUTPUT:-}" "${ELISA_SEED_PROFILE_HOOK_SOURCE:-}"; do
       if [[ -n "$file" ]]; then files+=("$file"); fi
     done
+    if [[ -n "$ELISA_SEED_RUNTIME_COMPILER_DIR" ]]; then
+      files+=("$ELISA_SEED_RUNTIME_COMPILER")
+      directories+=("$ELISA_SEED_RUNTIME_COMPILER_DIR")
+    fi
     if [[ -n "$ELISA_SEED_RUNTIME_DIR" ]]; then
       files+=("$ELISA_SEED_RUNTIME_DIR"/runtime.o*)
       directories+=("$ELISA_SEED_RUNTIME_DIR")
@@ -472,7 +478,12 @@ seed_build() {
     cp -p "$runtime_out" "$runtime_stage"
     cp -p "$runtime_out.inputs.sha256" "$runtime_stage.inputs.sha256"
   fi
-  ELISA_STAGE1_BIN="$seed_output" ELISA_RUNTIME_PRODUCT_IDENTITY_PATH="$BIN" \
+  # The runtime compiler trusts bundled declarations relative to its actual
+  # executable under ROOT/bin, even when BIN stages the final product elsewhere.
+  ELISA_SEED_RUNTIME_COMPILER_DIR="$(mktemp -d "$ROOT/bin/.stage1-runtime-compiler.XXXXXXXX")"
+  ELISA_SEED_RUNTIME_COMPILER="$ELISA_SEED_RUNTIME_COMPILER_DIR/$(basename "$BIN")"
+  cp -p "$seed_output" "$ELISA_SEED_RUNTIME_COMPILER"
+  ELISA_STAGE1_BIN="$ELISA_SEED_RUNTIME_COMPILER" ELISA_RUNTIME_PRODUCT_IDENTITY_PATH="$BIN" \
     ELISA_RUNTIME_OBJ="$runtime_stage" bash "$ROOT/scripts/build_runtime_object.sh"
   wait "$ELISA_SEED_RECEIPT_PID"
   ELISA_SEED_RECEIPT_PID=""
