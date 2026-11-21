@@ -75,6 +75,7 @@ unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_validation_loop_passes.h"
+#include "llvm_copied_scratch.h"
 #include "llvm_validation_bounded_division.h"
 
 #else
@@ -266,6 +267,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (elisacoreBoundedLoopUnswitch(module)) status = 1;
 #endif
   if (elisacoreSinkPrivateInitializations(module)) status = 1;
+#if LLVM_VERSION_MAJOR == 23
+  ElisaCopiedScratch::eliminate(*unwrap(module));
+#endif
   unsigned sqrtStatus = elisacoreOptimizeSqrtNonNaN(module, target);
   if (sqrtStatus == 2) return 2;
   if (sqrtStatus) status = 1;
