@@ -1,3 +1,34 @@
+// Keep a scalar validation loop when it leads into a nested search of the
+// same input. A runtime remainder adds setup on short inputs, while the
+// nested comparisons dominate sustained work on inputs with long matches.
+static bool precedesNestedInputSearch(Loop &validation, LoopInfo &loops,
+                                     DominatorTree &dom, LoadInst &validated) {
+  BasicBlock *entry = validation.getLoopPredecessor();
+  auto *input = dyn_cast<Argument>(getUnderlyingObject(validated.getPointerOperand()));
+  if (!entry || !input || !entry->getParent()->onlyReadsMemory()) return false;
+  for (Loop *search : loops.getLoopsInPreorder()) {
+    if (!search->getParentLoop() || search->getNumBlocks() != 2 ||
+        !search->getSubLoops().empty() || !dom.dominates(entry, search->getHeader()))
+      continue;
+    for (BasicBlock *block : search->blocks()) {
+      auto *branch = dyn_cast<CondBrInst>(block->getTerminator());
+      if (!branch || search->contains(branch->getSuccessor(0)) ==
+                         search->contains(branch->getSuccessor(1)))
+        continue;
+      auto *comparison = dyn_cast<ICmpInst>(branch->getCondition());
+      if (!comparison || !comparison->isEquality()) continue;
+      auto *left = dyn_cast<LoadInst>(comparison->getOperand(0));
+      auto *right = dyn_cast<LoadInst>(comparison->getOperand(1));
+      if (left && right && left != right && left->isSimple() && right->isSimple() &&
+          search->contains(left) && search->contains(right) &&
+          getUnderlyingObject(left->getPointerOperand()) == input &&
+          getUnderlyingObject(right->getPointerOperand()) == input)
+        return true;
+    }
+  }
+  return false;
+}
+
 extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
   if (!moduleRef) return 0;
   Module &module = *unwrap(moduleRef);
@@ -17,10 +48,11 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
     for (Loop *L : LI) {
       if (!L->getSubLoops().empty() || L->getNumBlocks() != 2 || L->getLoopID()) continue;
       unsigned loads = 0, instructions = 0, exits = 0, cmps = 0;
+      LoadInst *validated = nullptr;
       bool safe = true;
       for (BasicBlock *BB : L->blocks()) for (Instruction &I : *BB) {
         ++instructions;
-        if (auto *load = dyn_cast<LoadInst>(&I)) { if (!load->isSimple()) safe = false; ++loads; }
+        if (auto *load = dyn_cast<LoadInst>(&I)) { if (!load->isSimple()) safe = false; validated = load; ++loads; }
         else if (I.mayHaveSideEffects() && !isa<BranchInst>(I)) safe = false;
         if (isa<ICmpInst>(I)) ++cmps;
         if (auto *branch = dyn_cast<CondBrInst>(&I))
@@ -30,6 +62,8 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
       // Larger bounded scans amortize the wider runtime unroll; retain the
       // existing compact code for unknown and small trip-count bounds.
       unsigned MaxTrips = SE.getSmallConstantMaxTripCount(L);
+      if (module.getTargetTriple().isAArch64() && MaxTrips >= 64 && MaxTrips <= 4096 &&
+          precedesNestedInputSearch(*L, LI, DT, *validated)) continue;
       unsigned UnrollCount = MaxTrips >= 64 && MaxTrips <= 4096 ? 8 : 4;
       if (module.getTargetTriple().isAArch64() && module.getTargetTriple().isOSDarwin() && MaxTrips >= 64 && MaxTrips <= 4096) UnrollCount = 16;
 #if defined(__linux__) && defined(__aarch64__)
