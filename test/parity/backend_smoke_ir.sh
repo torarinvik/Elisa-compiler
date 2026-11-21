@@ -192,6 +192,8 @@ stage1_ir_case autovec_loop_selfref 'def main() -> i64:\n    xs: darray[i64] = [
 # from stage0's llvm_inline_test.go.
 stage1_ir_case function_attr_alwaysinline '@inline(always)\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'alwaysinline'
 stage1_ir_case function_attr_noinline '@inline(never)\ndef helper() -> i64:\n    return 1\n\ndef main() -> i64:\n    return helper()\n' 'noinline'
+stage1_ir_case generic_function_attr_alwaysinline '@inline(always)\ndef helper[T](value: T) -> T:\n    return value\n\ndef main() -> i64:\n    return helper[i64](1)\n' '^attributes #[0-9]+ = \{ (.* )?alwaysinline'
+stage1_ir_case generic_function_attr_noinline '@inline(never)\ndef helper[T](value: T) -> T:\n    return value\n\ndef main() -> i64:\n    return helper[i64](1)\n' '^attributes #[0-9]+ = \{ (.* )?noinline'
 stage1_ir_case function_attr_hot '@hot\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'hot'
 stage1_ir_case function_attr_cold '@cold\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'cold'
 stage1_ir_case function_attr_norecurse '@norecurse\ndef helper(value: i64) -> i64:\n    return value + 1\n\ndef main() -> i64:\n    return helper(1)\n' 'norecurse'
