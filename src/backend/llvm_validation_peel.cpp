@@ -73,6 +73,7 @@ extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef moduleRef,
 
 unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
+unsigned elisacoreFoldOddTrailingZeroSelects(llvm::Module &);
 unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_validation_loop_passes.h"
 #include "llvm_copied_scratch.h"
@@ -361,5 +362,8 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
 #endif
   if (elisacoreFoldBoundedRemainders(module)) status = 1;
   if (elisacoreFoldSignedRangeMasks(module)) status = 1;
+#if LLVM_VERSION_MAJOR >= 23
+  elisacoreFoldOddTrailingZeroSelects(*unwrap(module));
+#endif
   return status;
 }
