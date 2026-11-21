@@ -52,6 +52,8 @@ bool poolFunctionConstants(Function &function) {
   SmallVector<Constant *, 8> constants;
   SmallVector<PoolUse, 8> uses;
   bool allReturnEdges = true;
+  unsigned comparisonUses = 0;
+  unsigned returnEdgeUses = 0;
   for (BasicBlock &block : function) {
     for (Instruction &instruction : block) {
       const bool tinyResult = instructionCount <= 12 &&
@@ -89,6 +91,8 @@ bool poolFunctionConstants(Function &function) {
           return false;
         uses.push_back({&instruction, operand, slot});
         allReturnEdges &= returnPhi;
+        comparisonUses += isa<FCmpInst>(instruction);
+        returnEdgeUses += returnPhi;
       }
     }
   }
@@ -108,8 +112,12 @@ bool poolFunctionConstants(Function &function) {
           (constants.size() >= 4 || instructionCount <= 12 || shortTable)
       : instructionCount <= 100 && constants.size() <= 8 &&
           uses.size() >= 6 && uses.size() <= 12 && constants.size() >= 3);
-  // Return-edge loads are reached only if that result is selected.
-  if (constants.empty() || (!allReturnEdges && !profitableInline))
+  // One expensive comparison literal can pay for its own load. The return
+  // literal is loaded only on its incoming edge.
+  const bool shortComparisonAndReturn = instructionCount <= 16 && distinct &&
+      comparisonUses == 1 && returnEdgeUses == 1 && uses.size() == 2;
+  if (constants.empty() ||
+      (!allReturnEdges && !profitableInline && !shortComparisonAndReturn))
     return false;
 
   for (auto component = scc_begin(&function); !component.isAtEnd(); ++component)
