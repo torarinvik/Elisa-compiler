@@ -462,6 +462,7 @@ run_case ref_index_base 'struct Bucket:\n    value: mutable i64\n\ndef second_va
 # translator intrinsic: this guards the general function-call/index composition.
 run_case ref_call_index_compound 'def pointer[T](value: mutable T&) -> mutable T&:\n    return value\n\ndef main() -> i64:\n    value: mutable i64 = 37\n    pointer(&value)[0] += 5\n    return value\n'  42
 run_case ref_call_index_store 'def pointer[T](value: mutable T&) -> mutable T&:\n    return value\n\ndef main() -> i64:\n    value: mutable i64 = 37\n    pointer(&value)[0] <- 42\n    return value\n'  42
+run_case boolean_reference_index_store 'def store(flag: mutable bool&, value: bool) -> void:\n    flag[1] <- value\n\ndef store_optional(flag: mutable bool&?, value: bool) -> void:\n    if flag != null:\n        flag[1] <- value\n\ndef main() -> i64:\n    flags: mutable bool[2] = [true, false]\n    store(&flags[0], true)\n    if not flags[0] or not flags[1]: return 1\n    store_optional(null, true)\n    store_optional(&flags[0], false)\n    if flags[0] and not flags[1]: return 42\n    return 2\n' 42
 # A pointer-to-pointer keeps the inner optional-reference layer when it is indexed as a
 # generic argument. Exercise both `**p += n` and replacing `*p` with null, the two C shapes
 # that exposed a missing Ref -> Optional result in expression type inference.
