@@ -102,6 +102,49 @@ static bool matchSymmetricRangeCheck(ICmpInst &Cmp, BinaryOperator *&Add,
 
 #include "llvm_cssc_extrema.h"
 
+// Recover an immediate subtraction from InstCombine's wrapped range check.
+// Rotating the interval turns (x + bias) < limit into
+// (x + bias - limit) > ~limit, with all arithmetic modulo 2^64.
+static unsigned preferImmediateRangeBias(Module &M) {
+  if (M.getNamedMetadata("llvm.dbg.cu")) return 0;
+  unsigned Changed = 0;
+  for (Function &F : M) {
+    if (F.hasOptNone() || F.hasOptSize() || F.hasMinSize())
+      continue;
+    for (BasicBlock &Block : F) {
+      auto *Branch = dyn_cast_or_null<CondBrInst>(Block.getTerminator());
+      auto *Compare = Branch ? dyn_cast<ICmpInst>(Branch->getCondition()) : nullptr;
+      if (!Compare || !Compare->hasOneUse() || Compare->hasSameSign() ||
+          Compare->getPredicate() != ICmpInst::ICMP_ULT ||
+          !Compare->getOperand(0)->getType()->isIntegerTy(64))
+        continue;
+      auto *Add = dyn_cast<BinaryOperator>(Compare->getOperand(0));
+      auto *Limit = dyn_cast<ConstantInt>(Compare->getOperand(1));
+      if (!Add || !Limit || !Limit->isNegative() ||
+          Add->getOpcode() != Instruction::Add || !Add->hasOneUse() ||
+          Add->hasNoUnsignedWrap() || Add->hasNoSignedWrap())
+        continue;
+      auto *Bias = dyn_cast<ConstantInt>(Add->getOperand(1));
+      if (!Bias || !Bias->isNegative()) continue;
+      APInt Lower = Limit->getValue() - Bias->getValue();
+      APInt OldSubtract = -Bias->getValue();
+      APInt NewLimit = ~Limit->getValue();
+      // The old subtraction needs a register. The replacement fits the
+      // unshifted 12-bit immediate, and the new limit is at most 32 bits.
+      if (Lower.isZero() || Lower.ugt(4095) ||
+          OldSubtract.ule(4095) ||
+          (OldSubtract.isIntN(24) && OldSubtract.getLoBits(12).isZero()) ||
+          NewLimit.getActiveBits() > 32)
+        continue;
+      Add->setOperand(1, ConstantInt::get(M.getContext(), -Lower));
+      Compare->setPredicate(ICmpInst::ICMP_UGT);
+      Compare->setOperand(1, ConstantInt::get(M.getContext(), NewLimit));
+      ++Changed;
+    }
+  }
+  return Changed;
+}
+
 // Tune CSSC lowering and map the unsigned range-check idiom for [-B, B] to llvm.abs plus an
 // unsigned comparison when the selected AArch64 CPU has CSSC. The intrinsic
 // uses wrapping semantics at INT_MIN; the unsigned comparison therefore still
@@ -110,9 +153,10 @@ extern "C" unsigned elisacoreCsscAbsoluteRangeChecks(
     LLVMModuleRef moduleRef, LLVMTargetMachineRef targetRef) {
   if (!moduleRef || !targetRef) return 0;
   auto &TM = *reinterpret_cast<TargetMachine *>(targetRef);
-  if (!hasCSSC(TM)) return 0;
+  if (!TM.getTargetTriple().isAArch64()) return 0;
   Module &M = *unwrap(moduleRef);
-  unsigned Changed = 0;
+  unsigned Changed = preferImmediateRangeBias(M);
+  if (!hasCSSC(TM)) return Changed;
   for (Function &F : M) {
     if (F.isDeclaration() || F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
         F.hasFnAttribute("target-cpu") || F.hasFnAttribute("target-features")) continue;
