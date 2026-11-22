@@ -31,11 +31,12 @@ static bool isStable(Value *Input, Instruction &At, BasicBlock &EdgeTarget,
 static void collect(Value *Condition, bool Taken, Instruction &At,
                     BasicBlock &EdgeTarget, DominatorTree &Tree,
                     AssumptionCache &Assumptions, Facts &Bounds,
-                    unsigned &Budget) {
+                    unsigned &Budget,
+                    SmallPtrSetImpl<LoadInst *> *UnstableLoads) {
   if (!Budget) return;
   --Budget;
   auto Visit = [&](Value *Operand, bool Truth) {
-    collect(Operand, Truth, At, EdgeTarget, Tree, Assumptions, Bounds, Budget);
+    collect(Operand, Truth, At, EdgeTarget, Tree, Assumptions, Bounds, Budget, UnstableLoads);
   };
   if (auto *Either = dyn_cast<BinaryOperator>(Condition)) {
     if ((Either->getOpcode() == Instruction::Or && !Taken) ||
@@ -78,7 +79,15 @@ static void collect(Value *Condition, bool Taken, Instruction &At,
     Input = Absolute->getArgOperand(0);
     Range = ConstantRange(-Bound, Bound + 1);
   }
-  if (!isStable(Input, At, EdgeTarget, Tree, Assumptions)) return;
+  if (!isStable(Input, At, EdgeTarget, Tree, Assumptions)) {
+    auto *Load = dyn_cast<LoadInst>(Input);
+    if (UnstableLoads && Load && Load->getType()->isIntegerTy(32) &&
+        Load->isSimple() && !Range.isEmptySet() &&
+        Range.getSignedMin().sge(-32) && Range.getSignedMax().sle(32) &&
+        !mayReexecute(*Load->getParent(), EdgeTarget))
+      UnstableLoads->insert(Load);
+    return;
+  }
   auto [Fact, Inserted] = Bounds.try_emplace(Input, Range);
   if (!Inserted) Fact->second = Fact->second.intersectWith(Range);
 }
@@ -185,7 +194,8 @@ static Facts incomingFieldBounds(Function &Function) {
 }
 
 static Facts dominatingBounds(IntrinsicInst &Call, DominatorTree &Tree,
-                              AssumptionCache &Assumptions, const Facts &Incoming) {
+                              AssumptionCache &Assumptions, const Facts &Incoming,
+                              SmallPtrSetImpl<LoadInst *> *UnstableLoads = nullptr) {
   Facts Bounds = Incoming;
   unsigned Budget = 96;
   for (auto *Node = Tree.getNode(Call.getParent()); Node && Budget;
@@ -197,7 +207,7 @@ static Facts dominatingBounds(IntrinsicInst &Call, DominatorTree &Tree,
       auto *Target = Branch->getSuccessor(Edge);
       if (Tree.dominates(BasicBlockEdge(Block, Target), Call.getParent()))
         collect(Branch->getCondition(), Edge == 0, *Branch, *Target, Tree,
-                Assumptions, Bounds, Budget);
+                Assumptions, Bounds, Budget, UnstableLoads);
     }
   }
   return Bounds;
@@ -251,7 +261,9 @@ static void findRelatedCalls(Function &Helper,
 
 } // namespace ElisaCheckedSignedRanges
 
-static unsigned foldProvenSignedChecks(Module &Module, TargetMachine *Machine) {
+static unsigned foldProvenSignedChecks(
+    Module &Module, TargetMachine *Machine,
+    SmallPtrSetImpl<Function *> *Inlined = nullptr, Function *Only = nullptr) {
   using namespace ElisaCheckedSignedRanges;
   if (!Module.getTargetTriple().isAArch64()) return 0;
   FunctionAnalysisManager Analyses;
@@ -260,7 +272,7 @@ static unsigned foldProvenSignedChecks(Module &Module, TargetMachine *Machine) {
   unsigned Changes = 0;
   SmallVector<CallBase *, 8> RelatedCalls;
   for (Function &Function : Module) {
-    if (Function.isDeclaration() || Function.hasOptNone() ||
+    if ((Only && &Function != Only) || Function.isDeclaration() || Function.hasOptNone() ||
         Function.getInstructionCount() > 1200)
       continue;
     SmallVector<IntrinsicInst *, 16> Candidates;
@@ -294,12 +306,41 @@ static unsigned foldProvenSignedChecks(Module &Module, TargetMachine *Machine) {
       Call->eraseFromParent();
       ++Changes;
     }
-    if (Safe.size() >= 8) findRelatedCalls(Function, Analyses, RelatedCalls);
+    if (Inlined && Safe.size() >= 8) findRelatedCalls(Function, Analyses, RelatedCalls);
     Analyses.invalidate(Function, PreservedAnalyses::none());
   }
   for (CallBase *Call : RelatedCalls) {
     InlineFunctionInfo Info;
-    Changes += InlineFunction(*Call, Info).isSuccess();
+    Function *Caller = Call->getFunction();
+    if (InlineFunction(*Call, Info).isSuccess()) {
+      Inlined->insert(Caller);
+      ++Changes;
+    }
   }
   return Changes;
+}
+
+
+// Stabilize the loads whose accepted guard edges prove useful narrow ranges.
+// Freeze picks a consistent value for undefined data and is inert for defined
+// inputs. All uses, including the guard, must see the same frozen value.
+static void stabilizeGuardedSignedOperands(Function &Function) {
+  using namespace ElisaCheckedSignedRanges;
+  DominatorTree Tree(Function);
+  AssumptionCache Assumptions(Function);
+  SmallPtrSet<LoadInst *, 16> Loads;
+  for (Instruction &Instruction : instructions(Function)) {
+    auto *Call = dyn_cast<IntrinsicInst>(&Instruction);
+    if (Call && checkedOpcode(Call->getIntrinsicID()))
+      dominatingBounds(*Call, Tree, Assumptions, Facts(), &Loads);
+  }
+  if (Loads.size() > 16) return;
+  for (BasicBlock &Block : Function)
+    for (Instruction &Instruction : make_early_inc_range(Block)) {
+      auto *Load = dyn_cast<LoadInst>(&Instruction);
+      if (!Load || !Loads.contains(Load)) continue;
+      IRBuilder<> Builder(Load->getNextNode());
+      auto *Stable = cast<FreezeInst>(Builder.CreateFreeze(Load, "validated.input"));
+      Load->replaceUsesWithIf(Stable, [&](Use &Use) { return Use.getUser() != Stable; });
+    }
 }

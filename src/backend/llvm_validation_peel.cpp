@@ -373,7 +373,20 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   elisacoreFoldOddTrailingZeroSelects(*unwrap(module));
 #endif
   if (elisacoreFoldInterleavedByteStores(*unwrap(module))) status = 1;
-  if (foldProvenSignedChecks(*unwrap(module), reinterpret_cast<TargetMachine *>(target))) status = 1;
+  auto *Machine = reinterpret_cast<TargetMachine *>(target);
+  SmallPtrSet<Function *, 4> InlinedCheckedCallers;
+  if (foldProvenSignedChecks(*unwrap(module), Machine, &InlinedCheckedCallers))
+    status = 1;
+  for (Function &Function : *unwrap(module)) {
+    if (!InlinedCheckedCallers.contains(&Function)) continue;
+    auto Options = LLVMCreatePassBuilderOptions();
+    auto Error = LLVMRunPassesOnFunction(wrap(&Function),
+        "function(sccp,instcombine<no-verify-fixpoint>,simplifycfg)", target, Options);
+    LLVMDisposePassBuilderOptions(Options);
+    if (Error) { LLVMConsumeError(Error); return 2; }
+    stabilizeGuardedSignedOperands(Function);
+    foldProvenSignedChecks(*unwrap(module), Machine, nullptr, &Function);
+  }
   foldGuardedUnsignedComparisons(*unwrap(module));
   foldWideVectorOrAccumulators(*unwrap(module));
   return status;
