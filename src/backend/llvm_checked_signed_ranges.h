@@ -101,8 +101,42 @@ static std::optional<Instruction::BinaryOps> checkedOpcode(Intrinsic::ID ID) {
   }
 }
 
+// A zero-based counter tested after increment visits [0, limit) when
+// the equality exit compares against one stable, positive limit.
+static Value *countedLoopLimit(PHINode &Counter, LoopInfo &Loops) {
+  Loop *Loop = Loops.getLoopFor(Counter.getParent());
+  if (!Loop || Loop->getHeader() != Counter.getParent() ||
+      Counter.getNumIncomingValues() != 2)
+    return nullptr;
+  BasicBlock *Latch = Loop->getLoopLatch();
+  BasicBlock *Entry = Loop->getLoopPredecessor();
+  if (!Latch || !Entry) return nullptr;
+  auto *Initial = dyn_cast<ConstantInt>(Counter.getIncomingValueForBlock(Entry));
+  auto *Next = dyn_cast<BinaryOperator>(Counter.getIncomingValueForBlock(Latch));
+  auto *Branch = dyn_cast<CondBrInst>(Latch->getTerminator());
+  if (!Initial || !Initial->isZero() || !Next ||
+      Next->getOpcode() != Instruction::Add || Next->getOperand(0) != &Counter ||
+      !Branch || Branch->getSuccessor(1) != Loop->getHeader() ||
+      Loop->contains(Branch->getSuccessor(0)))
+    return nullptr;
+  auto *Step = dyn_cast<ConstantInt>(Next->getOperand(1));
+  auto *Compare = dyn_cast<ICmpInst>(Branch->getCondition());
+  if (!Step || !Step->isOne() || !Compare ||
+      Compare->getPredicate() != ICmpInst::ICMP_EQ)
+    return nullptr;
+  Value *Limit = Compare->getOperand(0) == Next ? Compare->getOperand(1)
+                 : Compare->getOperand(1) == Next ? Compare->getOperand(0)
+                                                 : nullptr;
+  if (!Limit || !Loop->isLoopInvariant(Limit)) return nullptr;
+
+  Value *Stable = Limit;
+  while (isa<SExtInst, ZExtInst>(Stable))
+    Stable = cast<CastInst>(Stable)->getOperand(0);
+  return isa<FreezeInst, ConstantInt>(Stable) ? Limit : nullptr;
+}
+
 static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
-                             ScalarEvolution &Evolution, unsigned &Budget,
+                             ScalarEvolution &Evolution, LoopInfo &Loops, unsigned &Budget,
                              unsigned Depth = 0) {
   unsigned Width = ValueToCheck->getType()->getIntegerBitWidth();
   if (!Budget || Depth == 8) return ConstantRange::getFull(Width);
@@ -113,7 +147,7 @@ static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
     return ConstantRange(Constant->getValue());
 
   auto Recurse = [&](Value *Operand) {
-    return rangeOf(Operand, Bounds, Evolution, Budget, Depth + 1);
+    return rangeOf(Operand, Bounds, Evolution, Loops, Budget, Depth + 1);
   };
   if (auto *Cast = dyn_cast<CastInst>(ValueToCheck);
       Cast && Cast->getSrcTy()->isIntegerTy())
@@ -132,6 +166,12 @@ static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
       if (auto Opcode = checkedOpcode(Call->getIntrinsicID()))
         return Recurse(Call->getArgOperand(0)).binaryOp(
             *Opcode, Recurse(Call->getArgOperand(1)));
+  if (auto *Counter = dyn_cast<PHINode>(ValueToCheck))
+    if (Value *Limit = countedLoopLimit(*Counter, Loops)) {
+      auto Range = Recurse(Limit);
+      if (!Range.isEmptySet() && Range.getSignedMin().isStrictlyPositive())
+        return ConstantRange(APInt(Width, 0), Range.getSignedMax());
+    }
   return Evolution.getSignedRange(Evolution.getSCEV(ValueToCheck));
 }
 
@@ -285,14 +325,15 @@ static unsigned foldProvenSignedChecks(
     auto &Tree = Analyses.getResult<DominatorTreeAnalysis>(Function);
     auto &Assumptions = Analyses.getResult<AssumptionAnalysis>(Function);
     auto &Evolution = Analyses.getResult<ScalarEvolutionAnalysis>(Function);
+    auto &Loops = Analyses.getResult<LoopAnalysis>(Function);
     const auto Incoming = incomingFieldBounds(Function);
     SmallVector<IntrinsicInst *, 16> Safe;
     for (IntrinsicInst *Call : Candidates) {
       auto Bounds = dominatingBounds(*Call, Tree, Assumptions, Incoming);
       if (Bounds.empty()) continue;
       unsigned Budget = 64;
-      auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Budget);
-      auto Right = rangeOf(Call->getArgOperand(1), Bounds, Evolution, Budget);
+      auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Loops, Budget);
+      auto Right = rangeOf(Call->getArgOperand(1), Bounds, Evolution, Loops, Budget);
       if (cannotOverflow(*checkedOpcode(Call->getIntrinsicID()), Left, Right))
         Safe.push_back(Call);
     }
