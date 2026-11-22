@@ -4,12 +4,14 @@
 #if LLVM_VERSION_MAJOR == 23
 #include "llvm_loop_pass_policy.h"
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Local.h>
 using namespace llvm;
 
@@ -287,6 +289,90 @@ static bool foldZeroProductBypass(BasicBlock &Guard) {
   if (Compare->use_empty()) Compare->eraseFromParent();
   return true;
 }
+// A state carried by PHIs and selects remains in range when every value
+// entering that graph is a constant in range, including loop entry values.
+static bool fitsBooleanMask(Value *State) {
+  SmallVector<Value *, 16> Pending{State};
+  SmallPtrSet<Value *, 32> Seen;
+  bool HasConstant = false;
+  while (!Pending.empty()) {
+    Value *Current = Pending.pop_back_val();
+    if (!Seen.insert(Current).second) continue;
+    if (Seen.size() > 64) return false;
+    if (auto *C = dyn_cast<ConstantInt>(Current)) {
+      if (C->getValue().uge(64)) return false;
+      HasConstant = true;
+    } else if (auto *Phi = dyn_cast<PHINode>(Current)) {
+      if (Pending.size() + Phi->getNumIncomingValues() > 128) return false;
+      append_range(Pending, Phi->incoming_values());
+    } else if (auto *Select = dyn_cast<SelectInst>(Current)) {
+      Pending.push_back(Select->getTrueValue());
+      Pending.push_back(Select->getFalseValue());
+    } else {
+      return false;
+    }
+  }
+  return HasConstant;
+}
+
+static bool foldBooleanLookup(BasicBlock &Guard) {
+  auto *Branch = dyn_cast<CondBrInst>(Guard.getTerminator());
+  auto *Compare = Branch ? dyn_cast<ICmpInst>(Branch->getCondition()) : nullptr;
+  if (!Compare || Compare->getPredicate() != ICmpInst::ICMP_ULT || Compare->hasSameSign())
+    return false;
+  auto *Offset = dyn_cast<BinaryOperator>(Compare->getOperand(0));
+  auto *Count = dyn_cast<ConstantInt>(Compare->getOperand(1));
+  if (!Offset || Offset->getOpcode() != Instruction::Add || !Offset->getType()->isIntegerTy(64) ||
+      Offset->hasNoSignedWrap() || Offset->hasNoUnsignedWrap() ||
+      !Count || Count->isZero() || Count->getValue().ugt(64))
+    return false;
+  auto *Bias = dyn_cast<ConstantInt>(Offset->getOperand(1));
+  if (!Bias) return false;
+  APInt Start = -Bias->getValue();
+  if (Start.ugt(64 - Count->getZExtValue())) return false;
+
+  BasicBlock *Lookup = Branch->getSuccessor(0);
+  BasicBlock *Join = Branch->getSuccessor(1);
+  auto *Jump = dyn_cast<UncondBrInst>(Lookup->getTerminator());
+  if (Lookup == Join || Lookup == &Guard || Join == &Guard || Lookup->hasAddressTaken() ||
+      Lookup->getSinglePredecessor() != &Guard || !Jump || Jump->getSuccessor(0) != Join ||
+      Lookup->size() != 4 || Join->phis().empty())
+    return false;
+  PHINode &Result = *Join->phis().begin();
+  if (std::next(Join->phis().begin()) != Join->phis().end()) return false;
+  auto *Fallback = dyn_cast<ConstantInt>(Result.getIncomingValueForBlock(&Guard));
+  auto *Extend = dyn_cast<ZExtInst>(Result.getIncomingValueForBlock(Lookup));
+  auto *Load = Extend ? dyn_cast<LoadInst>(Extend->getOperand(0)) : nullptr;
+  auto *Address = Load ? dyn_cast<GetElementPtrInst>(Load->getPointerOperand()) : nullptr;
+  auto *Table = Address ? dyn_cast<GlobalVariable>(Address->getPointerOperand()) : nullptr;
+  if (!Fallback || !Fallback->isZero() || !Load || !Load->isSimple() ||
+      !Load->getType()->isIntegerTy(8) || Load->hasMetadataOtherThanDebugLoc() ||
+      !Table || !Table->isConstant() || !Table->hasLocalLinkage() ||
+      !Table->hasDefinitiveInitializer() || Table->isExternallyInitialized() ||
+      Address->getPointerAddressSpace() != 0 ||
+      Guard.getDataLayout().getIndexSizeInBits(0) != 64 ||
+      Address->getNumIndices() != 1 || !Address->getSourceElementType()->isIntegerTy(8) ||
+      Address->idx_begin()->get() != Offset || Address->getParent() != Lookup ||
+      Load->getParent() != Lookup || Extend->getParent() != Lookup ||
+      !Address->hasOneUse() || !Load->hasOneUse() || !Extend->hasOneUse())
+    return false;
+
+  uint64_t Mask = 0;
+  for (unsigned I = 0; I < Count->getZExtValue(); ++I) {
+    auto *Byte = dyn_cast_or_null<ConstantInt>(Table->getInitializer()->getAggregateElement(I));
+    if (!Byte || !Byte->getType()->isIntegerTy(8) || Byte->getValue().ugt(1)) return false;
+    Mask |= Byte->getZExtValue() << (Start.getZExtValue() + I);
+  }
+  Value *State = Offset->getOperand(0);
+  if (!fitsBooleanMask(State)) return false;
+  IRBuilder<> Builder(Branch);
+  Value *Bit = Builder.CreateAnd(Builder.CreateLShr(Builder.getInt64(Mask), State), 1);
+  Result.setIncomingValueForBlock(&Guard, Builder.CreateZExtOrTrunc(Bit, Result.getType()));
+  Builder.CreateBr(Join);
+  Branch->eraseFromParent();
+  DeleteDeadBlock(Lookup);
+  return true;
+}
 } // namespace
 
 #include "llvm_shared_divisibility.cpp"
@@ -301,6 +387,11 @@ unsigned elisacoreFoldConstantIntegerPaths(Module &M) {
       continue;
     if (F.size() <= 32)
       for (BasicBlock &Block : F) Changed += foldZeroProductBypass(Block);
+    for (BasicBlock &Block : F) {
+      if (!foldBooleanLookup(Block)) continue;
+      ++Changed;
+      break;
+    }
     auto *Entry = dyn_cast<CondBrInst>(F.getEntryBlock().getTerminator());
     if (!Entry || Entry->getSuccessor(0) == Entry->getSuccessor(1)) continue;
     auto *Test = dyn_cast<ICmpInst>(Entry->getCondition());
