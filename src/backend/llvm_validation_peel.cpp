@@ -75,6 +75,7 @@ unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldOddTrailingZeroSelects(llvm::Module &);
 unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
+#include "llvm_interleaved_byte_stores.cpp"
 #include "llvm_validation_loop_passes.h"
 #include "llvm_copied_scratch.h"
 #include "llvm_validation_bounded_division.h"
@@ -367,5 +368,6 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (ElisaCopiedScratch::forwardLoopLoads(*unwrap(module))) status = 1;
   elisacoreFoldOddTrailingZeroSelects(*unwrap(module));
 #endif
+  if (elisacoreFoldInterleavedByteStores(*unwrap(module))) status = 1;
   return status;
 }
