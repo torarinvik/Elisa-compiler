@@ -38,6 +38,9 @@
 #include <llvm/Transforms/Utils/UnrollLoop.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Scalar/DivRemPairs.h>
+#include "llvm_array_value_ranges.h"
+#include "llvm_dead_trap_exits.h"
+#include "llvm_indexed_prefix.h"
 
 using namespace llvm;
 
@@ -327,6 +330,9 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   unsigned orderedVector = elisacoreOptimizeOrderedConversions(module, target);
   if (orderedVector == 2) return 2;
   if (orderedVector) status = 1;
+  if (ElisaArrayRanges::annotateArrayValueRanges(*unwrap(module))) status = 1;
+  if (ElisaDeadTrapExits::removeDeadTrapExits(*unwrap(module))) status = 1;
+  if (ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(module))) status = 1;
   unsigned finalSimplifications = elisacoreSpecializeValidationEpilogues(module);
   finalSimplifications += elisacoreFoldShiftParityLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldShiftBitReverseLoops(*unwrap(module));
