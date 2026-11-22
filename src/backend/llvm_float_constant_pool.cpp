@@ -158,12 +158,14 @@ extern "C" unsigned elisacorePoolFloatingConstants(LLVMModuleRef module,
   auto &target = *reinterpret_cast<llvm::TargetMachine *>(machine);
   if (!target.getTargetTriple().isAArch64())
     return 0;
+  // This is the last module pass before emission, which is where the trap
+  // exit edges must be added (see llvm_trap_exit_edges.cpp).
+  unsigned changed = ElisaTrapExits::connectTrapExits(*llvm::unwrap(module));
   const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
       target.getTarget().createMCSubtargetInfo(
           target.getTargetTriple(), target.getTargetCPU(), target.getTargetFeatureString()));
   if (!subtarget || !subtarget->checkFeatures("+fuse-literals"))
-    return 0;
-  unsigned changed = 0;
+    return changed;
   for (llvm::Function &function : *llvm::unwrap(module))
     changed += poolFunctionConstants(function);
   return changed;
