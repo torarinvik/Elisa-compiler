@@ -6,6 +6,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
@@ -168,6 +169,64 @@ public:
   }
 };
 
+bool exposeValidatedDivisorBound(BasicBlock &Block) {
+  auto *Branch = dyn_cast<CondBrInst>(Block.getTerminator());
+  if (!Branch || Branch->getSuccessor(0) == Branch->getSuccessor(1))
+    return false;
+  BasicBlock *Accepted = Branch->getSuccessor(1);
+  if (Accepted->getSinglePredecessor() != &Block ||
+      Accepted->getFirstInsertionPt() == Accepted->end())
+    return false;
+
+  // On the false edge of select A, true, B, the comparison B was evaluated
+  // and returned false. Preserve its bound after short-circuit folding.
+  auto *Condition = dyn_cast<SelectInst>(Branch->getCondition());
+  auto *Reject = Condition ? dyn_cast<ConstantInt>(Condition->getTrueValue()) : nullptr;
+  if (!Reject || !Reject->isOne())
+    return false;
+  auto *Comparison = dyn_cast<ICmpInst>(Condition->getFalseValue());
+  if (!Comparison)
+    return false;
+  auto *Adjusted = dyn_cast<BinaryOperator>(Comparison->getOperand(0));
+  auto *Limit = dyn_cast<ConstantInt>(Comparison->getOperand(1));
+  if (!Adjusted || Adjusted->getOpcode() != Instruction::Add || !Limit)
+    return false;
+  auto *Offset = dyn_cast<ConstantInt>(Adjusted->getOperand(1));
+  auto *Divisor = dyn_cast<LoadInst>(Adjusted->getOperand(0));
+  if (!Offset || !Divisor || Divisor->getParent() != &Block ||
+      Limit->getBitWidth() > 64)
+    return false;
+  auto Range = ConstantRange::makeExactICmpRegion(
+      Comparison->getInversePredicate(), Limit->getValue()).subtract(Offset->getValue());
+  if (Range.isEmptySet() || Range.getUnsignedMax().isAllOnes())
+    return false;
+  APInt Maximum = Range.getUnsignedMax();
+  if (!llvm::any_of(Divisor->users(), [&](User *Use) {
+        auto *Remainder = dyn_cast<BinaryOperator>(Use);
+        if (!Remainder || Remainder->getOpcode() != Instruction::URem ||
+            Remainder->getOperand(1) != Divisor)
+          return false;
+        return llvm::any_of(Remainder->users(), [&](User *Use) {
+          auto *Check = dyn_cast<ICmpInst>(Use);
+          if (!Check || Check->getPredicate() != ICmpInst::ICMP_ULT ||
+              Check->getOperand(0) != Remainder)
+            return false;
+          auto *Extent = dyn_cast<ConstantInt>(Check->getOperand(1));
+          return Extent && Maximum.ule(Extent->getValue());
+        });
+      }))
+    return false;
+
+  // The comparison and remainder must use the same value if the load is undef.
+  IRBuilder<> AtLoad(Divisor->getNextNode());
+  auto *Defined = cast<FreezeInst>(AtLoad.CreateFreeze(Divisor, "validated.divisor"));
+  Divisor->replaceUsesWithIf(Defined, [&](Use &U) { return U.getUser() != Defined; });
+  IRBuilder<> AtAccepted(&*Accepted->getFirstInsertionPt());
+  auto *Upper = ConstantInt::get(Defined->getType(), Maximum);
+  AtAccepted.CreateAssumption(AtAccepted.CreateICmpULE(Defined, Upper));
+  return true;
+}
+
 unsigned foldBoundedRemainders(Module &M) {
   if (M.getNamedMetadata("llvm.dbg.cu") || !M.getTargetTriple().isAArch64())
     return 0;
@@ -186,6 +245,8 @@ unsigned foldBoundedRemainders(Module &M) {
                      Attribute::SanitizeRealtimeBlocking},
                     [&](Attribute::AttrKind Kind) { return F.hasFnAttribute(Kind); }))
       continue;
+    for (BasicBlock &Block : F)
+      Changed += exposeValidatedDivisorBound(Block);
     SmallVector<BinaryOperator *, 8> Candidates;
     for (Instruction &I : instructions(F)) {
       auto *Op = dyn_cast<BinaryOperator>(&I);
