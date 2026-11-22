@@ -30,6 +30,12 @@ public:
     return below(Index, Length, At);
   }
 
+  // Low <=u High wherever At executes, within the same budget.
+  bool proveAtMost(const SCEV *Low, const SCEV *High, Instruction *At) {
+    budget = 4000;
+    return atMost(Low, High, At);
+  }
+
 protected:
   ScalarEvolution &evolution;
   DominatorTree &tree;

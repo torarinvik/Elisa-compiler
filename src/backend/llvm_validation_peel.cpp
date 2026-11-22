@@ -43,6 +43,7 @@
 #include "llvm_path_ranges.h"
 #include "llvm_index_bounds.h"
 #include "llvm_indexed_prefix.h"
+#include "llvm_proven_checks.h"
 
 using namespace llvm;
 
@@ -335,6 +336,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (ElisaArrayRanges::annotateArrayValueRanges(*unwrap(module))) status = 1;
   if (ElisaDeadTrapExits::removeDeadTrapExits(*unwrap(module))) status = 1;
   if (ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(module))) status = 1;
+  if (ElisaProvenChecks::removeProvenChecks(*unwrap(module))) status = 1;
   unsigned finalSimplifications = elisacoreSpecializeValidationEpilogues(module);
   finalSimplifications += elisacoreFoldShiftParityLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldShiftBitReverseLoops(*unwrap(module));
