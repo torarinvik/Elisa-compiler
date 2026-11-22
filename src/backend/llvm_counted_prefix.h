@@ -93,9 +93,40 @@ static Value *elementIndex(GetElementPtrInst &Address, const DataLayout &Layout,
   return nullptr;
 }
 
+// Match a read immediately guarded by index < prefix length. Following a
+// chain of single predecessors ensures each read takes this guard again.
+static bool guardedPrefixIndex(Value *Index, Value *Length, LoadInst &Read) {
+  BasicBlock *Block = Read.getParent();
+  for (unsigned Depth = 0; Depth < 8; ++Depth) {
+    BasicBlock *Predecessor = Block->getSinglePredecessor();
+    if (!Predecessor || Predecessor == Block) return false;
+    auto *Branch = dyn_cast<CondBrInst>(Predecessor->getTerminator());
+    auto *Compare = Branch ? dyn_cast<ICmpInst>(Branch->getCondition()) : nullptr;
+    if (Compare && Branch->getSuccessor(0) != Branch->getSuccessor(1) &&
+        Compare->getOperand(0) == Index && Compare->getOperand(1) == Length) {
+      auto Predicate = Branch->getSuccessor(0) == Block
+          ? Compare->getPredicate() : Compare->getInversePredicate();
+      if (Predicate == ICmpInst::ICMP_ULT) return true;
+    }
+    Block = Predecessor;
+  }
+  return false;
+}
+
+static bool stabilizeIfNeeded(Value *ValueToCheck,
+                              SmallVectorImpl<Instruction *> &Stabilize) {
+  if (isa<FreezeInst, ConstantInt>(ValueToCheck)) return true;
+  auto *Definition = dyn_cast<Instruction>(ValueToCheck);
+  if (!Definition || (!isa<PHINode>(Definition) && !Definition->getNextNode()) ||
+      Definition->getParent()->getFirstInsertionPt() == Definition->getParent()->end())
+    return false;
+  if (!llvm::is_contained(Stabilize, Definition)) Stabilize.push_back(Definition);
+  return true;
+}
+
 static bool coversReads(AllocaInst &Buffer, MemSetInst &Init, Type *Element,
                         LoopInfo &Loops, DominatorTree &Tree,
-                        const DataLayout &Layout) {
+                        const DataLayout &Layout, SmallVectorImpl<Instruction *> &Stabilize) {
   SmallVector<std::pair<LoadInst *, Value *>, 4> Reads;
   StoreInst *Writer = nullptr;
   Value *WriteIndex = nullptr;
@@ -141,10 +172,15 @@ static bool coversReads(AllocaInst &Buffer, MemSetInst &Init, Type *Element,
   BasicBlockEdge Completion(Fill.loop->getHeader(), Exit);
   return llvm::all_of(Reads, [&](auto Entry) {
     auto [Read, Index] = Entry;
+    if (Fill.loop->contains(Read->getParent()) ||
+        !Tree.dominates(Completion, Read->getParent()))
+      return false;
+    if (Element->isIntegerTy(32))
+      return guardedPrefixIndex(Index, Fill.bound, *Read) &&
+             stabilizeIfNeeded(Index, Stabilize) &&
+             stabilizeIfNeeded(Fill.bound, Stabilize);
     Induction Scan;
-    return !Fill.loop->contains(Read->getParent()) &&
-           Tree.dominates(Completion, Read->getParent()) &&
-           induction(Index, Loops, Scan, false) &&
+    return induction(Index, Loops, Scan, false) &&
            Tree.dominates(BasicBlockEdge(Scan.loop->getHeader(), Scan.body),
                           Read->getParent()) &&
            boundIsCovered(Scan.bound, Fill.bound, *Read, Tree, Loops);
@@ -160,7 +196,8 @@ static Type *countedPrefixElement(MemSetInst &Init, const DataLayout &Layout) {
       Buffer->getAddressSpace() != 0 || Init.isVolatile() ||
       Init.hasOperandBundles() || Init.hasMetadataOtherThanDebugLoc() ||
       Init.getRawDest() != Buffer || !Length ||
-      !Array->getElementType()->isIntegerTy(16) ||
+      (!Array->getElementType()->isIntegerTy(16) &&
+       !Array->getElementType()->isIntegerTy(32)) ||
       Array->getNumElements() < 16 || Array->getNumElements() > 4096 ||
       !Length->equalsInt(Layout.getTypeAllocSize(Array).getFixedValue()) ||
       !isa<ConstantInt>(Init.getValue()) ||
@@ -198,15 +235,37 @@ static unsigned removeCountedPrefixInitializers(Module &Module,
         }))
       continue;
 
-    Canonicalize.run(Function, Analyses);
+    if (llvm::any_of(instructions(Function), [&](Instruction &Instruction) {
+          auto *Init = dyn_cast<MemSetInst>(&Instruction);
+          Type *Element = Init ? countedPrefixElement(*Init, Layout) : nullptr;
+          return Element && Element->isIntegerTy(16);
+        }))
+      Canonicalize.run(Function, Analyses);
     auto &Tree = Analyses.getResult<DominatorTreeAnalysis>(Function);
     auto &Loops = Analyses.getResult<LoopAnalysis>(Function);
     for (Instruction &Instruction : make_early_inc_range(instructions(Function))) {
       auto *Init = dyn_cast<MemSetInst>(&Instruction);
       Type *Element = Init ? countedPrefixElement(*Init, Layout) : nullptr;
+      SmallVector<llvm::Instruction *, 4> Stabilize;
       if (!Element || !ElisaCountedPrefix::coversReads(
-              *cast<AllocaInst>(Init->getRawDest()), *Init, Element, Loops, Tree, Layout))
+              *cast<AllocaInst>(Init->getRawDest()), *Init, Element, Loops, Tree, Layout, Stabilize))
         continue;
+      if (!Stabilize.empty()) {
+        SmallVector<llvm::Instruction *, 4> InOrder;
+        for (llvm::Instruction &Definition : instructions(Function))
+          if (llvm::is_contained(Stabilize, &Definition)) InOrder.push_back(&Definition);
+        Stabilize = std::move(InOrder);
+      }
+      for (llvm::Instruction *Definition : Stabilize) {
+        auto Insertion = isa<PHINode>(Definition)
+            ? Definition->getParent()->getFirstInsertionPt()
+            : std::next(Definition->getIterator());
+        IRBuilder<> Builder(&*Insertion);
+        Value *Stable = Builder.CreateFreeze(Definition, "prefix.index");
+        Definition->replaceUsesWithIf(Stable, [&](Use &Use) {
+          return Use.getUser() != Stable;
+        });
+      }
       Init->eraseFromParent();
       ++Removed;
     }
