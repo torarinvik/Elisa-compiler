@@ -144,8 +144,9 @@ private:
       });
     // Index = Length - c is below Length exactly when Length >= c.
     if (auto *Gap = dyn_cast<SCEVConstant>(evolution.getMinusSCEV(Length, Index));
-        Gap && !Gap->isZero() && atMost(Index, Length, At))
+        Gap && !Gap->isZero() && atMost(Index, Length, At, Depth + 1))
       return true;
+    if (guarded(Index, Length, At, Depth, true)) return true;
     if (auto *Recurrence = dyn_cast<SCEVAddRecExpr>(Index)) {
       const SCEV *Count = evolution.getSymbolicMaxBackedgeTakenCount(Recurrence->getLoop());
       const SCEV *Start = Recurrence->getStart();
@@ -161,7 +162,7 @@ private:
       }
       if (Step->isAllOnesValue())
         // Values Start - k for k <= Count <= Start never wrap below zero.
-        return atMost(Count, Start, Entry) &&
+        return atMost(Count, Start, Entry, Depth + 1) &&
                below(Start, Length, Entry, Depth + 1);
       return false;
     }
@@ -171,11 +172,58 @@ private:
     return false;
   }
 
+  // A branch edge dominating At decided Index <u Bound or Index <=u Bound,
+  // and Bound is in turn at most or below Length: Index <u Length when
+  // Strict, else Index <=u Length.
+  bool guarded(const SCEV *Index, const SCEV *Length, Instruction *At, unsigned Depth,
+               bool Strict) {
+    if (Depth > 6) return false;
+    BasicBlock *Block = At->getParent();
+    for (DomTreeNode *Node = tree.getNode(Block); Node; Node = Node->getIDom())
+      for (BasicBlock *Predecessor : predecessors(Node->getBlock())) {
+        auto *Branch = dyn_cast<CondBrInst>(Predecessor->getTerminator());
+        if (!Branch || Branch->getSuccessor(0) == Branch->getSuccessor(1)) continue;
+        for (unsigned Edge = 0; Edge < 2; ++Edge) {
+          if (Branch->getSuccessor(Edge) != Node->getBlock() ||
+              !tree.dominates(BasicBlockEdge(Predecessor, Node->getBlock()), Block))
+            continue;
+          SmallVector<std::pair<ICmpInst *, bool>, 4> Facts;
+          ElisaDeadTrapExits::decided(Branch->getCondition(), Edge == 0, Facts);
+          for (auto [Compare, Truth] : Facts)
+            if (boundedBy(*Compare, Truth, Index, Length, At, Depth, Strict)) return true;
+        }
+      }
+    return false;
+  }
+
+  bool boundedBy(ICmpInst &Compare, bool Truth, const SCEV *Index, const SCEV *Length,
+                 Instruction *At, unsigned Depth, bool Strict) {
+    auto Predicate = Truth ? Compare.getPredicate() : Compare.getInversePredicate();
+    Value *Left = Compare.getOperand(0), *Right = Compare.getOperand(1);
+    if (Predicate == ICmpInst::ICMP_UGT || Predicate == ICmpInst::ICMP_UGE) {
+      std::swap(Left, Right);
+      Predicate = ICmpInst::getSwappedPredicate(Predicate);
+    }
+    if ((Predicate != ICmpInst::ICMP_ULT && Predicate != ICmpInst::ICMP_ULE) ||
+        !evolution.isSCEVable(Left->getType()))
+      return false;
+    // The guarded value may be Index plus a constant that does not wrap.
+    const SCEV *Guarded = evolution.getSCEV(Left);
+    if (Guarded != Index && (Guarded->getType() != Index->getType() ||
+                             !isa<SCEVConstant>(evolution.getMinusSCEV(Guarded, Index)) ||
+                             !gapFits(evolution.getMinusSCEV(Guarded, Index), Guarded, At)))
+      return false;
+    const SCEV *Bound = evolution.getSCEV(Right);
+    return Predicate == ICmpInst::ICMP_ULT || !Strict ? atMost(Bound, Length, At, Depth + 1)
+                                                      : below(Bound, Length, At, Depth + 1);
+  }
+
   // Low <=u High wherever At executes: known outright, or Low = High - Gap
   // for a Gap that never exceeds High, so the subtraction does not wrap.
-  bool atMost(const SCEV *Low, const SCEV *High, Instruction *At) {
-    return evolution.isKnownPredicateAt(ICmpInst::ICMP_ULE, Low, High, At) ||
-           gapFits(evolution.getMinusSCEV(High, Low), High, At);
+  bool atMost(const SCEV *Low, const SCEV *High, Instruction *At, unsigned Depth = 0) {
+    return Low == High || evolution.isKnownPredicateAt(ICmpInst::ICMP_ULE, Low, High, At) ||
+           gapFits(evolution.getMinusSCEV(High, Low), High, At) ||
+           guarded(Low, High, At, Depth, false);
   }
 
   // Gap <=u High: a constant High is known to reach, or an unsigned minimum
