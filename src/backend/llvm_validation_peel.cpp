@@ -40,6 +40,8 @@
 #include <llvm/Transforms/Scalar/DivRemPairs.h>
 #include "llvm_array_value_ranges.h"
 #include "llvm_dead_trap_exits.h"
+#include "llvm_path_ranges.h"
+#include "llvm_index_bounds.h"
 #include "llvm_indexed_prefix.h"
 
 using namespace llvm;
