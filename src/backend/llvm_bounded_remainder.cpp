@@ -1,5 +1,6 @@
 // Reduce a remainder to one conditional subtraction when the dividend is
 // nonnegative and below twice the modulus, including bounded loop recurrences.
+// For unsigned Mersenne moduli, first fold a bounded dividend into this range.
 #include <llvm/Config/llvm-config.h>
 #include <llvm-c/Core.h>
 #if LLVM_VERSION_MAJOR >= 23
@@ -32,6 +33,7 @@ class BoundedRemainderProof {
   LoopInfo &LI;
   uint64_t Modulus;
   uint64_t SignedMax;
+  bool AllowProductBounds;
   unsigned Work = 0;
   SmallPtrSet<Value *, 16> Active;
   DenseMap<std::pair<Value *, Instruction *>, uint64_t> Known;
@@ -133,8 +135,15 @@ class BoundedRemainderProof {
         auto B = bound(Op->getOperand(1), Op);
         if (A && B && *A <= SignedMax && *B <= SignedMax - *A)
           return *A + *B;
+      } else if (AllowProductBounds && Op->getOpcode() == Instruction::Mul) {
+        auto A = bound(Op->getOperand(0), Op);
+        auto B = bound(Op->getOperand(1), Op);
+        if (A && B && (*A == 0 || *B <= SignedMax / *A))
+          return *A * *B;
       } else if (auto *K = remainderModulus(*Op);
-                 K && K->getValue().isStrictlyPositive() && bound(Op->getOperand(0), Op)) {
+                 K && K->getValue().isStrictlyPositive() &&
+                 ((AllowProductBounds && Op->getOpcode() == Instruction::URem) ||
+                  bound(Op->getOperand(0), Op))) {
         return K->getZExtValue() - 1;
       }
     }
@@ -147,12 +156,14 @@ class BoundedRemainderProof {
 public:
   SmallPtrSet<LoadInst *, 8> GuardedLoads;
 
-  BoundedRemainderProof(DominatorTree &DT, LoopInfo &LI, uint64_t Modulus, uint64_t SignedMax)
-      : DT(DT), LI(LI), Modulus(Modulus), SignedMax(SignedMax) {}
+  BoundedRemainderProof(DominatorTree &DT, LoopInfo &LI, uint64_t Modulus,
+                        uint64_t SignedMax, bool AllowProductBounds = false)
+      : DT(DT), LI(LI), Modulus(Modulus), SignedMax(SignedMax),
+        AllowProductBounds(AllowProductBounds) {}
 
-  bool prove(BinaryOperator &Remainder) {
+  bool prove(BinaryOperator &Remainder, uint64_t Limit) {
     auto Dividend = bound(Remainder.getOperand(0), &Remainder);
-    if (!Dividend || *Dividend >= 2 * Modulus)
+    if (!Dividend || *Dividend >= Limit)
       return false;
     // Discharge all hypotheses together. Each loop header's entry and
     // backedge must preserve the proposed bound, including cross-dependencies.
@@ -262,14 +273,27 @@ unsigned foldBoundedRemainders(Module &M) {
     DominatorTree DT(F);
     LoopInfo LI(DT);
     SmallPtrSet<LoadInst *, 16> Loads;
-    SmallVector<BinaryOperator *, 8> Proven;
+    SmallVector<std::pair<BinaryOperator *, unsigned>, 8> Proven;
     for (BinaryOperator *Op : Candidates) {
       const auto &Modulus = cast<ConstantInt>(Op->getOperand(1))->getValue();
       uint64_t SignedMax = APInt::getSignedMaxValue(Modulus.getBitWidth()).getZExtValue();
       BoundedRemainderProof Proof(DT, LI, Modulus.getZExtValue(), SignedMax);
-      if (Proof.prove(*Op)) {
-        Proven.push_back(Op);
+      uint64_t Divisor = Modulus.getZExtValue();
+      if (Proof.prove(*Op, 2 * Divisor)) {
+        Proven.emplace_back(Op, 0);
         Loads.insert(Proof.GuardedLoads.begin(), Proof.GuardedLoads.end());
+        continue;
+      }
+      unsigned Shift = Modulus.countr_one();
+      // Restrict the AArch64 rewrite to divisors whose constant-division
+      // sequence needs multiple instructions to materialize its constants.
+      if (Op->getOpcode() != Instruction::URem || Modulus.getBitWidth() != 64 ||
+          Shift < 17 || Shift > 31 || !Modulus.isMask())
+        continue;
+      BoundedRemainderProof MersenneProof(DT, LI, Divisor, SignedMax, true);
+      if (MersenneProof.prove(*Op, Divisor << Shift)) {
+        Proven.emplace_back(Op, Shift);
+        Loads.insert(MersenneProof.GuardedLoads.begin(), MersenneProof.GuardedLoads.end());
       }
     }
     if (Proven.empty())
@@ -285,10 +309,25 @@ unsigned foldBoundedRemainders(Module &M) {
       auto *Defined = cast<FreezeInst>(Builder.CreateFreeze(Load, "bounded.load"));
       Load->replaceUsesWithIf(Defined, [&](Use &U) { return U.getUser() != Defined; });
     }
-    for (BinaryOperator *Op : Proven) {
+    for (auto [Op, Shift] : Proven) {
       IRBuilder<> Builder(Op);
       Value *Dividend = Op->getOperand(0);
       Value *Modulus = Op->getOperand(1);
+      if (Shift) {
+        // Splitting at k preserves the residue modulo 2^k - 1. The
+        // proven limit bounds the high part by modulus - 1.
+        Dividend = Builder.CreateFreeze(Dividend);
+        Dividend = Builder.CreateAdd(Builder.CreateAnd(Dividend, Modulus),
+                                     Builder.CreateLShr(Dividend, Shift));
+        // The carry is one exactly when the folded value reaches the modulus.
+        Value *Carry = Builder.CreateLShr(Builder.CreateAdd(Dividend, Builder.getInt64(1)),
+                                         Shift);
+        Op->replaceAllUsesWith(Builder.CreateAnd(Builder.CreateAdd(Dividend, Carry), Modulus,
+                                                 "mersenne.remainder"));
+        Op->eraseFromParent();
+        ++Changed;
+        continue;
+      }
       Value *Large = Builder.CreateICmpUGE(Dividend, Modulus);
       Value *Reduced = Builder.CreateSub(Dividend, Modulus);
       Op->replaceAllUsesWith(Builder.CreateSelect(Large, Reduced, Dividend, "bounded.remainder"));
