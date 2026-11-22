@@ -62,9 +62,13 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
       // Larger bounded scans amortize the wider runtime unroll; retain the
       // existing compact code for unknown and small trip-count bounds.
       unsigned MaxTrips = SE.getSmallConstantMaxTripCount(L);
+      // A statically bounded short scan can keep its ordered exits in the
+      // unrolled body, avoiding a peeled iteration and runtime remainder.
+      bool TinyScan = module.getTargetTriple().isAArch64() && MaxTrips > 0 && MaxTrips <= 8;
       if (module.getTargetTriple().isAArch64() && MaxTrips >= 64 && MaxTrips <= 4096 &&
           precedesNestedInputSearch(*L, LI, DT, *validated)) continue;
       unsigned UnrollCount = MaxTrips >= 64 && MaxTrips <= 4096 ? 8 : 4;
+      if (TinyScan) UnrollCount = MaxTrips;
       if (module.getTargetTriple().isAArch64() && module.getTargetTriple().isOSDarwin() && MaxTrips >= 64 && MaxTrips <= 4096) UnrollCount = 16;
 #if defined(__linux__) && defined(__aarch64__)
       if (module.getTargetTriple().isOSLinux() && MaxTrips >= 64 && MaxTrips <= 4096)
@@ -82,13 +86,13 @@ extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef moduleRef) {
 #endif
         // Apple Silicon likewise benefits from unrolling without the extra
         // peeled iteration for large bounded scans.
-        if (!(module.getTargetTriple().isAArch64() && module.getTargetTriple().isOSDarwin() && MaxTrips >= 64 && MaxTrips <= 4096))
+        if (!TinyScan && !(module.getTargetTriple().isAArch64() && module.getTargetTriple().isOSDarwin() && MaxTrips >= 64 && MaxTrips <= 4096))
           peelLoop(L, 1, false, &LI, &SE, DT, &AC, true, values);
       // Preserve every load and early exit in order. LLVM's unroller handles
       // the runtime remainder without speculating accesses past an invalid item.
       auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
       auto &ORE = FAM.getResult<OptimizationRemarkEmitterAnalysis>(F);
-      UnrollLoopOptions options{UnrollCount, true, true, false, true, false, nullptr, 1000, true, false};
+      UnrollLoopOptions options{UnrollCount, true, !TinyScan, false, !TinyScan, false, nullptr, 1000, true, false};
       UnrollLoop(L, options, &LI, &SE, &DT, &AC, &TTI, &ORE, true);
       ++count;
       break; // Invalidate function analyses before inspecting another loop.
