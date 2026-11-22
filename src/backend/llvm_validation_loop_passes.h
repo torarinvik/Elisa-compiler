@@ -151,33 +151,45 @@ static unsigned preferImmediateRangeBias(Module &M) {
       continue;
     for (BasicBlock &Block : F) {
       auto *Branch = dyn_cast_or_null<CondBrInst>(Block.getTerminator());
-      auto *Compare = Branch ? dyn_cast<ICmpInst>(Branch->getCondition()) : nullptr;
-      if (!Compare || !Compare->hasOneUse() || Compare->hasSameSign() ||
-          Compare->getPredicate() != ICmpInst::ICMP_ULT ||
-          !Compare->getOperand(0)->getType()->isIntegerTy(64))
-        continue;
-      auto *Add = dyn_cast<BinaryOperator>(Compare->getOperand(0));
-      auto *Limit = dyn_cast<ConstantInt>(Compare->getOperand(1));
-      if (!Add || !Limit || !Limit->isNegative() ||
-          Add->getOpcode() != Instruction::Add || !Add->hasOneUse() ||
-          Add->hasNoUnsignedWrap() || Add->hasNoSignedWrap())
-        continue;
-      auto *Bias = dyn_cast<ConstantInt>(Add->getOperand(1));
-      if (!Bias || !Bias->isNegative()) continue;
-      APInt Lower = Limit->getValue() - Bias->getValue();
-      APInt OldSubtract = -Bias->getValue();
-      APInt NewLimit = ~Limit->getValue();
-      // The old subtraction needs a register. The replacement fits the
-      // unshifted 12-bit immediate, and the new limit is at most 32 bits.
-      if (Lower.isZero() || Lower.ugt(4095) ||
-          OldSubtract.ule(4095) ||
-          (OldSubtract.isIntN(24) && OldSubtract.getLoBits(12).isZero()) ||
-          NewLimit.getActiveBits() > 32)
-        continue;
-      Add->setOperand(1, ConstantInt::get(M.getContext(), -Lower));
-      Compare->setPredicate(ICmpInst::ICMP_UGT);
-      Compare->setOperand(1, ConstantInt::get(M.getContext(), NewLimit));
-      ++Changed;
+      if (!Branch) continue;
+      auto *Guard = dyn_cast<SelectInst>(Branch->getCondition());
+      auto *Reject = Guard ? dyn_cast<ConstantInt>(Guard->getTrueValue()) : nullptr;
+      SmallVector<Value *, 2> Conditions;
+      if (Reject && Reject->isOne() && Guard->hasOneUse()) {
+        Conditions.push_back(Guard->getCondition());
+        Conditions.push_back(Guard->getFalseValue());
+      } else {
+        Conditions.push_back(Branch->getCondition());
+      }
+      for (Value *Condition : Conditions) {
+        auto *Compare = dyn_cast<ICmpInst>(Condition);
+        if (!Compare || !Compare->hasOneUse() || Compare->hasSameSign() ||
+            Compare->getPredicate() != ICmpInst::ICMP_ULT ||
+            !Compare->getOperand(0)->getType()->isIntegerTy(64))
+          continue;
+        auto *Add = dyn_cast<BinaryOperator>(Compare->getOperand(0));
+        auto *Limit = dyn_cast<ConstantInt>(Compare->getOperand(1));
+        if (!Add || !Limit || !Limit->isNegative() ||
+            Add->getOpcode() != Instruction::Add || !Add->hasOneUse() ||
+            Add->hasNoUnsignedWrap() || Add->hasNoSignedWrap())
+          continue;
+        auto *Bias = dyn_cast<ConstantInt>(Add->getOperand(1));
+        if (!Bias || !Bias->isNegative()) continue;
+        APInt Lower = Limit->getValue() - Bias->getValue();
+        APInt OldSubtract = -Bias->getValue();
+        APInt NewLimit = ~Limit->getValue();
+        // The old subtraction needs a register. The replacement fits the
+        // unshifted 12-bit immediate, and the new limit is at most 32 bits.
+        if (Lower.isZero() || Lower.ugt(4095) ||
+            OldSubtract.ule(4095) ||
+            (OldSubtract.isIntN(24) && OldSubtract.getLoBits(12).isZero()) ||
+            NewLimit.getActiveBits() > 32)
+          continue;
+        Add->setOperand(1, ConstantInt::get(M.getContext(), -Lower));
+        Compare->setPredicate(ICmpInst::ICMP_UGT);
+        Compare->setOperand(1, ConstantInt::get(M.getContext(), NewLimit));
+        ++Changed;
+      }
     }
   }
   return Changed;
