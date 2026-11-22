@@ -423,6 +423,43 @@ static unsigned eliminateFullArrayInitializers(Module &M) {
 }
 // The final store on the backedge writes the address selected by the next
 // index PHI. Forward that value and load only on the initial entry edge.
+struct ReloadCandidate {
+  PHINode *Index;
+  GetElementPtrInst *Address;
+  LoadInst *Load;
+};
+
+// Loads in the loop body that reread the slot the latch stored last.
+static SmallVector<ReloadCandidate, 2>
+reloadCandidates(Loop &L, StoreInst &LastStore, GetElementPtrInst &StoreAddress,
+                 AllocaInst &Buffer) {
+  SmallVector<ReloadCandidate, 2> Candidates;
+  BasicBlock *Latch = L.getLoopLatch();
+  for (PHINode &Index : L.getHeader()->phis()) {
+    if (Index.getNumIncomingValues() != 2 ||
+        Index.getIncomingValueForBlock(Latch) != StoreAddress.idx_begin()->get())
+      continue;
+    for (User *Use : Index.users()) {
+      auto *Address = dyn_cast<GetElementPtrInst>(Use);
+      if (!Address || Address->getPointerOperand() != &Buffer || Address->getNumIndices() != 1 ||
+          Address->getSourceElementType() != StoreAddress.getSourceElementType() ||
+          Address->idx_begin()->get() != &Index)
+        continue;
+      LoadInst *Load = nullptr;
+      for (User *Access : Address->users())
+        if (auto *Read = dyn_cast<LoadInst>(Access); Read && Read->getPointerOperand() == Address) {
+          Load = Read;
+          break;
+        }
+      if (Load && Load->isSimple() && !Load->hasMetadataOtherThanDebugLoc() &&
+          Load->getType() == LastStore.getValueOperand()->getType() &&
+          Load->getParent() != Latch && L.contains(Load))
+        Candidates.push_back({&Index, Address, Load});
+    }
+  }
+  return Candidates;
+}
+
 static bool forwardLoopLoad(Loop &L, DominatorTree &DT, LoopInfo &LI) {
   BasicBlock *Header = L.getHeader();
   BasicBlock *Latch = L.getLoopLatch();
@@ -443,46 +480,30 @@ static bool forwardLoopLoad(Loop &L, DominatorTree &DT, LoopInfo &LI) {
   for (BasicBlock *B : L.blocks())
     if (B != Latch && llvm::any_of(*B, [](Instruction &I) { return I.mayWriteToMemory(); }))
       return false;
+  auto Candidates = reloadCandidates(L, *LastStore, *StoreAddress, *Buffer);
+  if (Candidates.empty()) return false;
+  // LoopSafetyInfo reads the preheader's incoming values when it proves an
+  // exit untaken on the first iteration, and reads out of bounds without one.
+  BasicBlock *Entry = L.getLoopPreheader();
+  bool Split = !Entry;
+  if (Split) Entry = SplitEdge(Predecessor, Header, &DT, &LI);
+  if (!Entry || Entry != L.getLoopPreheader()) return Split;
   ICFLoopSafetyInfo Safety;
   Safety.computeLoopSafetyInfo(&L);
-  for (PHINode &Index : Header->phis()) {
-    if (Index.getNumIncomingValues() != 2 ||
-        Index.getIncomingValueForBlock(Latch) != StoreAddress->idx_begin()->get())
-      continue;
-    for (User *Use : Index.users()) {
-      auto *Address = dyn_cast<GetElementPtrInst>(Use);
-      if (!Address || Address->getPointerOperand() != Buffer || Address->getNumIndices() != 1 ||
-          Address->getSourceElementType() != StoreAddress->getSourceElementType() ||
-          Address->idx_begin()->get() != &Index)
-        continue;
-      LoadInst *Load = nullptr;
-      for (User *Access : Address->users())
-        if (auto *Read = dyn_cast<LoadInst>(Access); Read && Read->getPointerOperand() == Address) {
-          Load = Read;
-          break;
-        }
-      if (!Load || !Load->isSimple() || Load->hasMetadataOtherThanDebugLoc() ||
-          Load->getType() != LastStore->getValueOperand()->getType() ||
-          Load->getParent() == Latch || !L.contains(Load) ||
-          !Safety.isGuaranteedToExecute(*Load, &DT, &L))
-        continue;
-      Value *InitialIndex = Index.getIncomingValueForBlock(Predecessor);
-      BasicBlock *Entry = L.getLoopPreheader();
-      if (!Entry)
-        Entry = SplitEdge(Predecessor, Header, &DT, &LI);
-      if (!Entry) return false;
-      IRBuilder<> Builder(Entry->getTerminator());
-      Value *InitialAddress = Builder.CreateGEP(Address->getSourceElementType(), Buffer, InitialIndex);
-      auto *Initial = Builder.CreateAlignedLoad(Load->getType(), InitialAddress, Load->getAlign());
-      auto *Forwarded = PHINode::Create(Load->getType(), 2, "forwarded.load", Header->begin());
-      Forwarded->addIncoming(Initial, Entry);
-      Forwarded->addIncoming(LastStore->getValueOperand(), Latch);
-      Load->replaceAllUsesWith(Forwarded);
-      Load->eraseFromParent();
-      return true;
-    }
+  for (auto [Index, Address, Load] : Candidates) {
+    if (!Safety.isGuaranteedToExecute(*Load, &DT, &L)) continue;
+    Value *InitialIndex = Index->getIncomingValueForBlock(Entry);
+    IRBuilder<> Builder(Entry->getTerminator());
+    Value *InitialAddress = Builder.CreateGEP(Address->getSourceElementType(), Buffer, InitialIndex);
+    auto *Initial = Builder.CreateAlignedLoad(Load->getType(), InitialAddress, Load->getAlign());
+    auto *Forwarded = PHINode::Create(Load->getType(), 2, "forwarded.load", Header->begin());
+    Forwarded->addIncoming(Initial, Entry);
+    Forwarded->addIncoming(LastStore->getValueOperand(), Latch);
+    Load->replaceAllUsesWith(Forwarded);
+    Load->eraseFromParent();
+    return true;
   }
-  return false;
+  return Split;
 }
 
 static unsigned forwardLoopLoads(Module &M) {
