@@ -161,6 +161,7 @@ extern "C" unsigned elisacorePoolFloatingConstants(LLVMModuleRef module,
   // This is the last module pass before emission, which is where the trap
   // exit edges must be added (see llvm_trap_exit_edges.cpp).
   unsigned changed = ElisaTrapExits::connectTrapExits(*llvm::unwrap(module));
+  changed += ElisaBitTests::orderBitTestOperands(*llvm::unwrap(module));
   const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
       target.getTarget().createMCSubtargetInfo(
           target.getTargetTriple(), target.getTargetCPU(), target.getTargetFeatureString()));

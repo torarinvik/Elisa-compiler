@@ -74,6 +74,15 @@ static bool recursiveInlineCandidate(Function &F) {
   }
   return (Binary && Calls == 2) || (Linear && Calls == 1);
 }
+// Uses of an argument, looking through a lone freeze (loop unswitching
+// freezes the arguments of the conditions it hoists).
+static unsigned argumentUses(Argument &Arg) {
+  if (Arg.hasOneUse())
+    if (auto *Frozen = dyn_cast<FreezeInst>(*Arg.user_begin()))
+      return Frozen->getNumUses();
+  return Arg.getNumUses();
+}
+
 // Specialize one literal integer argument of a private recursive function.
 // Recursive calls whose argument changes continue to use the original body.
 static unsigned specializeRecursiveLiteralCalls(Module &M) {
@@ -121,7 +130,7 @@ static unsigned specializeRecursiveLiteralCalls(Module &M) {
     if (Growth + F->getInstructionCount() > 2048) continue;
     for (unsigned Index = 0; Index < F->arg_size(); ++Index) {
       Argument *Arg = F->getArg(Index);
-      if (!Arg->getType()->isIntegerTy() || Arg->getNumUses() < 2) continue;
+      if (!Arg->getType()->isIntegerTy() || argumentUses(*Arg) < 2) continue;
       SmallVector<CallInst *, 4> Roots;
       ConstantInt *Literal = nullptr;
       bool Multiple = false;
