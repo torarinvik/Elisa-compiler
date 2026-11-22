@@ -143,9 +143,50 @@ static bool cannotOverflow(Instruction::BinaryOps Opcode,
   return true;
 }
 
-static Facts dominatingBounds(IntrinsicInst &Call, DominatorTree &Tree,
-                              AssumptionCache &Assumptions) {
+// A private helper can use ranges common to all of its direct callers.
+static Facts incomingFieldBounds(Function &Function) {
   Facts Bounds;
+  if (!Function.hasLocalLinkage() || Function.use_empty() ||
+      Function.getNumUses() > 8)
+    return Bounds;
+
+  SmallVector<CallBase *, 8> Callers;
+  for (Use &Use : Function.uses()) {
+    auto *Call = dyn_cast<CallBase>(Use.getUser());
+    if (!Call || &Use != &Call->getCalledOperandUse() ||
+        Call->getFunctionType() != Function.getFunctionType())
+      return Facts();
+    Callers.push_back(Call);
+  }
+
+  for (Instruction &Instruction : Function.getEntryBlock()) {
+    auto *Field = dyn_cast<ExtractValueInst>(&Instruction);
+    if (!Field || !Field->getType()->isIntegerTy(64)) continue;
+    auto *Argument = dyn_cast<llvm::Argument>(Field->getAggregateOperand());
+    if (!Argument) continue;
+
+    ConstantRange Combined = ConstantRange::getEmpty(64);
+    for (CallBase *Call : Callers) {
+      Value *Actual = FindInsertedValue(Call->getArgOperand(Argument->getArgNo()),
+                                       Field->getIndices());
+      if (auto *Constant = dyn_cast_or_null<ConstantInt>(Actual)) {
+        Combined = Combined.unionWith(ConstantRange(Constant->getValue()));
+      } else if (auto *Extend = dyn_cast_or_null<SExtInst>(Actual)) {
+        unsigned Width = Extend->getSrcTy()->getIntegerBitWidth();
+        Combined = Combined.unionWith(ConstantRange::getFull(Width).signExtend(64));
+      } else {
+        Combined = ConstantRange::getFull(64);
+        break;
+      }
+    }
+    if (!Combined.isFullSet()) Bounds.try_emplace(Field, Combined);
+  }
+  return Bounds;
+}
+
+static Facts dominatingBounds(IntrinsicInst &Call, DominatorTree &Tree,
+                              AssumptionCache &Assumptions, const Facts &Incoming) {
+  Facts Bounds = Incoming;
   unsigned Budget = 96;
   for (auto *Node = Tree.getNode(Call.getParent()); Node && Budget;
        Node = Node->getIDom()) {
@@ -184,9 +225,10 @@ static unsigned foldProvenSignedChecks(Module &Module) {
     auto &Tree = Analyses.getResult<DominatorTreeAnalysis>(Function);
     auto &Assumptions = Analyses.getResult<AssumptionAnalysis>(Function);
     auto &Evolution = Analyses.getResult<ScalarEvolutionAnalysis>(Function);
+    const auto Incoming = incomingFieldBounds(Function);
     SmallVector<IntrinsicInst *, 16> Safe;
     for (IntrinsicInst *Call : Candidates) {
-      auto Bounds = dominatingBounds(*Call, Tree, Assumptions);
+      auto Bounds = dominatingBounds(*Call, Tree, Assumptions, Incoming);
       if (Bounds.empty()) continue;
       unsigned Budget = 64;
       auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Budget);
