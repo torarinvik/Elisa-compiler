@@ -262,6 +262,66 @@ static unsigned mergeZeroExtendedByteStores(Module &M) {
   return Changed;
 }
 
+static Value *matchWordByte(StoreInst &Store, unsigned Shift) {
+  auto *Byte = dyn_cast<TruncInst>(Store.getValueOperand());
+  if (!Store.isSimple() || Store.hasMetadataOtherThanDebugLoc() ||
+      Store.getPointerAddressSpace() != 0 || !Byte || !Byte->getType()->isIntegerTy(8) ||
+      !Byte->getSrcTy()->isIntegerTy(32))
+    return nullptr;
+  Value *Word = Byte->getOperand(0);
+  if (!Shift) return Word;
+  auto *Extract = dyn_cast<BinaryOperator>(Word);
+  auto *Amount = Extract ? dyn_cast<ConstantInt>(Extract->getOperand(1)) : nullptr;
+  return Extract && Extract->getOpcode() == Instruction::LShr && Amount &&
+         Amount->equalsInt(Shift) ? Extract->getOperand(0) : nullptr;
+}
+
+// Pack a big-endian serialization of one word into REV and an unaligned store.
+static unsigned mergeBigEndianWordStores(Module &M) {
+  if (M.getNamedMetadata("llvm.dbg.cu")) return 0;
+  const DataLayout &DL = M.getDataLayout();
+  unsigned Changed = 0;
+  for (Function &F : M) {
+    if (F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
+        F.hasFnAttribute(Attribute::SanitizeAddress) ||
+        F.hasFnAttribute(Attribute::SanitizeHWAddress) ||
+        F.hasFnAttribute(Attribute::SanitizeMemory) ||
+        F.hasFnAttribute(Attribute::SanitizeThread))
+      continue;
+    for (BasicBlock &B : F) {
+      for (Instruction &I : llvm::make_early_inc_range(B)) {
+        auto *Last = dyn_cast<StoreInst>(&I);
+        Value *Word = Last ? matchWordByte(*Last, 0) : nullptr;
+        if (!Word) continue;
+        int64_t LastOffset;
+        Value *Base = GetPointerBaseWithConstantOffset(Last->getPointerOperand(), LastOffset, DL);
+        if (LastOffset < INT64_MIN + 3) continue;
+        SmallVector<StoreInst *, 4> Bytes{Last};
+        for (Instruction *Earlier = Last->getPrevNode(); Earlier && Bytes.size() < 4;
+             Earlier = Earlier->getPrevNode()) {
+          if (!Earlier->mayReadOrWriteMemory() && !Earlier->mayHaveSideEffects() &&
+              !isa<CallBase>(Earlier))
+            continue;
+          auto *Store = dyn_cast<StoreInst>(Earlier);
+          int64_t Offset;
+          if (!Store || matchWordByte(*Store, 8 * Bytes.size()) != Word ||
+              GetPointerBaseWithConstantOffset(Store->getPointerOperand(), Offset, DL) != Base ||
+              Offset != LastOffset - static_cast<int64_t>(Bytes.size()))
+            break;
+          Bytes.push_back(Store);
+        }
+        if (Bytes.size() != 4) continue;
+        IRBuilder<> Builder(Last);
+        Value *Reversed = Builder.CreateUnaryIntrinsic(Intrinsic::bswap, Word);
+        Builder.CreateAlignedStore(Reversed, Bytes.back()->getPointerOperand(), Bytes.back()->getAlign());
+        for (StoreInst *Store : Bytes) Store->eraseFromParent();
+        ++Changed;
+      }
+    }
+  }
+  return Changed;
+}
+
 extern "C" unsigned elisacoreExpandSmallZeroFills(LLVMModuleRef ref) {
   if (!ref) return 0;
   Module &M = *unwrap(ref);
@@ -273,6 +333,7 @@ extern "C" unsigned elisacoreExpandSmallZeroFills(LLVMModuleRef ref) {
   // Inline medium, aligned fixed-size fills on Apple AArch64. LLVM otherwise
   // lowers these to a library call. Keep the size bounded to control code growth.
   unsigned fixedChanged = inlineStackWordPatternFills(M) + mergeZeroExtendedByteStores(M);
+  fixedChanged += mergeBigEndianWordStores(M);
   if (M.getTargetTriple().isMacOSX()) {
     SmallVector<MemSetInst *, 8> fixed;
     for (Function &F : M) {
