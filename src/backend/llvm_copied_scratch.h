@@ -4,6 +4,7 @@
 #include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/MustExecute.h>
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/IR/Dominators.h>
@@ -11,6 +12,7 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 namespace ElisaCopiedScratch {
 using namespace llvm;
 
@@ -418,5 +420,88 @@ static unsigned eliminateFullArrayInitializers(Module &M) {
     }
   }
   return Removed;
+}
+// The final store on the backedge writes the address selected by the next
+// index PHI. Forward that value and load only on the initial entry edge.
+static bool forwardLoopLoad(Loop &L, DominatorTree &DT, LoopInfo &LI) {
+  BasicBlock *Header = L.getHeader();
+  BasicBlock *Latch = L.getLoopLatch();
+  BasicBlock *Predecessor = L.getLoopPredecessor();
+  if (!Latch || !Predecessor || !L.getSubLoops().empty() || L.getNumBlocks() > 8)
+    return false;
+  StoreInst *LastStore = nullptr;
+  for (Instruction &I : *Latch)
+    if (I.mayWriteToMemory())
+      LastStore = dyn_cast<StoreInst>(&I);
+  if (!LastStore || !LastStore->isSimple() || LastStore->hasMetadataOtherThanDebugLoc())
+    return false;
+  auto *StoreAddress = dyn_cast<GetElementPtrInst>(LastStore->getPointerOperand());
+  auto *Buffer = StoreAddress ? dyn_cast<AllocaInst>(StoreAddress->getPointerOperand()) : nullptr;
+  if (!Buffer || !Buffer->isStaticAlloca() || Buffer->getAddressSpace() != 0 ||
+      StoreAddress->getNumIndices() != 1 || PointerMayBeCaptured(Buffer, true, 128))
+    return false;
+  for (BasicBlock *B : L.blocks())
+    if (B != Latch && llvm::any_of(*B, [](Instruction &I) { return I.mayWriteToMemory(); }))
+      return false;
+  ICFLoopSafetyInfo Safety;
+  Safety.computeLoopSafetyInfo(&L);
+  for (PHINode &Index : Header->phis()) {
+    if (Index.getNumIncomingValues() != 2 ||
+        Index.getIncomingValueForBlock(Latch) != StoreAddress->idx_begin()->get())
+      continue;
+    for (User *Use : Index.users()) {
+      auto *Address = dyn_cast<GetElementPtrInst>(Use);
+      if (!Address || Address->getPointerOperand() != Buffer || Address->getNumIndices() != 1 ||
+          Address->getSourceElementType() != StoreAddress->getSourceElementType() ||
+          Address->idx_begin()->get() != &Index)
+        continue;
+      LoadInst *Load = nullptr;
+      for (User *Access : Address->users())
+        if (auto *Read = dyn_cast<LoadInst>(Access); Read && Read->getPointerOperand() == Address) {
+          Load = Read;
+          break;
+        }
+      if (!Load || !Load->isSimple() || Load->hasMetadataOtherThanDebugLoc() ||
+          Load->getType() != LastStore->getValueOperand()->getType() ||
+          Load->getParent() == Latch || !L.contains(Load) ||
+          !Safety.isGuaranteedToExecute(*Load, &DT, &L))
+        continue;
+      Value *InitialIndex = Index.getIncomingValueForBlock(Predecessor);
+      BasicBlock *Entry = L.getLoopPreheader();
+      if (!Entry)
+        Entry = SplitEdge(Predecessor, Header, &DT, &LI);
+      if (!Entry) return false;
+      IRBuilder<> Builder(Entry->getTerminator());
+      Value *InitialAddress = Builder.CreateGEP(Address->getSourceElementType(), Buffer, InitialIndex);
+      auto *Initial = Builder.CreateAlignedLoad(Load->getType(), InitialAddress, Load->getAlign());
+      auto *Forwarded = PHINode::Create(Load->getType(), 2, "forwarded.load", Header->begin());
+      Forwarded->addIncoming(Initial, Entry);
+      Forwarded->addIncoming(LastStore->getValueOperand(), Latch);
+      Load->replaceAllUsesWith(Forwarded);
+      Load->eraseFromParent();
+      return true;
+    }
+  }
+  return false;
+}
+
+static unsigned forwardLoopLoads(Module &M) {
+  if (!M.getTargetTriple().isAArch64() || M.getNamedMetadata("llvm.dbg.cu"))
+    return 0;
+  unsigned Changed = 0;
+  for (Function &F : M) {
+    if (F.isDeclaration() || F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
+        F.getSubprogram() || F.getInstructionCount() > 2000 ||
+        F.hasFnAttribute(Attribute::SanitizeAddress) ||
+        F.hasFnAttribute(Attribute::SanitizeHWAddress) ||
+        F.hasFnAttribute(Attribute::SanitizeMemory) ||
+        F.hasFnAttribute(Attribute::SanitizeThread))
+      continue;
+    DominatorTree DT(F);
+    LoopInfo LI(DT);
+    for (Loop *L : LI.getLoopsInPreorder())
+      Changed += forwardLoopLoad(*L, DT, LI);
+  }
+  return Changed;
 }
 } // namespace ElisaCopiedScratch

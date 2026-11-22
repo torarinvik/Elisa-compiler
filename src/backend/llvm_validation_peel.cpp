@@ -364,6 +364,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (elisacoreFoldSignedRangeMasks(module)) status = 1;
 #if LLVM_VERSION_MAJOR >= 23
   if (ElisaCopiedScratch::eliminateFullArrayInitializers(*unwrap(module))) status = 1;
+  if (ElisaCopiedScratch::forwardLoopLoads(*unwrap(module))) status = 1;
   elisacoreFoldOddTrailingZeroSelects(*unwrap(module));
 #endif
   return status;
