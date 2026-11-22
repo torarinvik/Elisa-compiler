@@ -86,7 +86,7 @@ protected:
     return Low == High || evolution.isKnownPredicateAt(ICmpInst::ICMP_ULE, Low, High, At) ||
            (Constant && lowest(High, At).uge(Constant->getAPInt())) ||
            gapFits(evolution.getMinusSCEV(High, Low), High, At) ||
-           guarded(Low, High, At, Depth, false);
+           guarded(Low, High, At, Depth, false) || successorAtMost(Low, High, At, Depth);
   }
 
 private:
@@ -107,6 +107,7 @@ private:
     if (isa<SCEVCouldNotCompute>(Count) || !Step || Count->getType() != Start->getType())
       return false;
     Instruction *Entry = &*Recurrence.getLoop()->getHeader()->getFirstInsertionPt();
+    Count = settle(Count, Entry, Depth);
     if (Step->isOne()) {
       // Values Start + k for k <= Count, none wrapping past Start + Count;
       // Count is at most each operand of an unsigned minimum.
@@ -122,6 +123,46 @@ private:
       // Values Start - k for k <= Count <= Start never wrap below zero.
       return atMost(Count, Start, Entry, Depth + 1) && below(Start, Length, Entry, Depth + 1);
     return false;
+  }
+
+  // X + 1 <=u High when X <u High: the increment cannot wrap.
+  bool successorAtMost(const SCEV *Low, const SCEV *High, Instruction *At, unsigned Depth) {
+    auto *Sum = dyn_cast<SCEVAddExpr>(Low);
+    auto *One = Sum && Sum->getNumOperands() == 2 ? dyn_cast<SCEVConstant>(Sum->getOperand(0)) : nullptr;
+    return One && One->isOne() && below(Sum->getOperand(1), High, At, Depth + 1);
+  }
+
+  // Index != Bound on a dominating edge, with Bound settling to Length and
+  // Index <=u Length: then Index <u Length. Loop exits test `!=` against
+  // the trip limit once the comparison is canonicalized.
+  bool differsBelow(Value *Left, Value *Right, const SCEV *Index, const SCEV *Length,
+                    Instruction *At, unsigned Depth, bool Strict) {
+    if (!Strict || Depth > 8) return false;
+    const SCEV *First = evolution.getSCEV(Left), *Second = evolution.getSCEV(Right);
+    const SCEV *Other = First == Index ? Second : Second == Index ? First : nullptr;
+    return Other && settle(Other, At, Depth + 1) == Length && atMost(Index, Length, At, Depth + 1);
+  }
+
+  // S with each two-operand unsigned maximum, also inside sums, replaced by
+  // its larger operand where one is known at most the other at At. Trip
+  // counts carry umax(start, limit) for loops entered under start < limit.
+  const SCEV *settle(const SCEV *S, Instruction *At, unsigned Depth) {
+    if (auto *Maximum = dyn_cast<SCEVUMaxExpr>(S); Maximum && Maximum->getNumOperands() == 2) {
+      const SCEV *First = Maximum->getOperand(0), *Second = Maximum->getOperand(1);
+      if (atMost(First, Second, At, Depth + 1)) return Second;
+      if (atMost(Second, First, At, Depth + 1)) return First;
+      return S;
+    }
+    if (auto *Sum = dyn_cast<SCEVAddExpr>(S)) {
+      SmallVector<SCEVUse, 4> Terms;
+      bool Changed = false;
+      for (const SCEV *Term : Sum->operands()) {
+        Terms.push_back(settle(Term, At, Depth));
+        Changed |= Terms.back() != Term;
+      }
+      return Changed ? evolution.getAddExpr(Terms) : S;
+    }
+    return S;
   }
 
   // Every incoming value is below Length on its edge. A loop-header phi may
@@ -182,9 +223,9 @@ private:
       std::swap(Left, Right);
       Predicate = ICmpInst::getSwappedPredicate(Predicate);
     }
-    if ((Predicate != ICmpInst::ICMP_ULT && Predicate != ICmpInst::ICMP_ULE) ||
-        !evolution.isSCEVable(Left->getType()) || Left->getType() != Index->getType())
-      return false;
+    if (!evolution.isSCEVable(Left->getType()) || Left->getType() != Index->getType()) return false;
+    if (Predicate == ICmpInst::ICMP_NE) return differsBelow(Left, Right, Index, Length, At, Depth, Strict);
+    if (Predicate != ICmpInst::ICMP_ULT && Predicate != ICmpInst::ICMP_ULE) return false;
     const SCEV *Guarded = evolution.getSCEV(Left);
     const SCEV *Bound = evolution.getSCEV(Right);
     const SCEV *Excess = evolution.getMinusSCEV(Index, Guarded);
@@ -197,8 +238,12 @@ private:
                !gapFits(evolution.getNegativeSCEV(Excess), Guarded, At))
         return false;
     }
-    return Predicate == ICmpInst::ICMP_ULT || !Strict ? atMost(Bound, Length, At, Depth + 1)
-                                                      : below(Bound, Length, At, Depth + 1);
+    if (Predicate == ICmpInst::ICMP_ULE)
+      return Strict ? below(Bound, Length, At, Depth + 1) : atMost(Bound, Length, At, Depth + 1);
+    // Index <u Bound also puts Index at most Bound - 1, which cannot wrap.
+    return atMost(Bound, Length, At, Depth + 1) ||
+           (!Strict && atMost(evolution.getMinusSCEV(Bound, evolution.getOne(Bound->getType())),
+                              Length, At, Depth + 1));
   }
 
   // Comparisons Low <u High between values at loop header H that hold
