@@ -202,15 +202,63 @@ static Facts dominatingBounds(IntrinsicInst &Call, DominatorTree &Tree,
   }
   return Bounds;
 }
+// Inline a pair of calls that share most of their aggregate inputs after
+// removing the checked arithmetic that previously kept the helper too large.
+static void findRelatedCalls(Function &Helper,
+                             FunctionAnalysisManager &Analyses,
+                             SmallVectorImpl<CallBase *> &Pending) {
+  if (Pending.size() >= 8 || !Helper.hasLocalLinkage() || !Helper.hasNUses(2) ||
+      Helper.hasFnAttribute(Attribute::NoInline) ||
+      Helper.getInstructionCount() > 300)
+    return;
+
+  SmallVector<CallBase *, 2> Calls;
+  for (Use &Use : Helper.uses()) {
+    auto *Call = dyn_cast<CallInst>(Use.getUser());
+    if (!Call || &Use != &Call->getCalledOperandUse() ||
+        Call->getFunctionType() != Helper.getFunctionType() ||
+        Call->getFunction() == &Helper || Call->isMustTailCall() || Call->isNoInline() ||
+        Call->hasOperandBundles() || Call->isConvergent())
+      return;
+    Calls.push_back(Call);
+  }
+  if (Calls[0]->getParent() != Calls[1]->getParent() ||
+      Calls[0]->getFunction()->hasOptSize() || Calls[0]->getFunction()->hasMinSize() ||
+      Calls[0]->getFunction()->hasOptNone() ||
+      Calls[0]->getFunction()->getInstructionCount() > 1200 ||
+      !isInlineViable(Helper).isSuccess())
+    return;
+
+  unsigned SharedAggregates = 0, Differences = 0;
+  for (unsigned Index = 0; Index < Helper.arg_size(); ++Index) {
+    Value *Left = Calls[0]->getArgOperand(Index);
+    Value *Right = Calls[1]->getArgOperand(Index);
+    SharedAggregates += Left == Right && Left->getType()->isAggregateType();
+    Differences += Left != Right;
+  }
+  if (SharedAggregates < 2 || Differences != 1) return;
+  auto &Target = Analyses.getResult<TargetIRAnalysis>(Helper);
+  auto GetLibrary = [&](Function &Function) -> const TargetLibraryInfo & {
+    return Analyses.getResult<TargetLibraryAnalysis>(Function);
+  };
+  for (CallBase *Call : Calls)
+    if (auto Decision = getAttributeBasedInliningDecision(
+            *Call, &Helper, Target, GetLibrary);
+        Decision && !Decision->isSuccess())
+      return;
+  Pending.append(Calls.begin(), Calls.end());
+}
+
 } // namespace ElisaCheckedSignedRanges
 
-static unsigned foldProvenSignedChecks(Module &Module) {
+static unsigned foldProvenSignedChecks(Module &Module, TargetMachine *Machine) {
   using namespace ElisaCheckedSignedRanges;
   if (!Module.getTargetTriple().isAArch64()) return 0;
   FunctionAnalysisManager Analyses;
-  PassBuilder Builder;
+  PassBuilder Builder(Machine);
   Builder.registerFunctionAnalyses(Analyses);
   unsigned Changes = 0;
+  SmallVector<CallBase *, 8> RelatedCalls;
   for (Function &Function : Module) {
     if (Function.isDeclaration() || Function.hasOptNone() ||
         Function.getInstructionCount() > 1200)
@@ -246,7 +294,12 @@ static unsigned foldProvenSignedChecks(Module &Module) {
       Call->eraseFromParent();
       ++Changes;
     }
+    if (Safe.size() >= 8) findRelatedCalls(Function, Analyses, RelatedCalls);
     Analyses.invalidate(Function, PreservedAnalyses::none());
+  }
+  for (CallBase *Call : RelatedCalls) {
+    InlineFunctionInfo Info;
+    Changes += InlineFunction(*Call, Info).isSuccess();
   }
   return Changes;
 }

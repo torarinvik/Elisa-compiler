@@ -22,6 +22,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/InlineCost.h>
 #include <llvm/Analysis/OptimizationRemarkEmitter.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Analysis/ScalarEvolution.h>
@@ -372,7 +373,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   elisacoreFoldOddTrailingZeroSelects(*unwrap(module));
 #endif
   if (elisacoreFoldInterleavedByteStores(*unwrap(module))) status = 1;
-  if (foldProvenSignedChecks(*unwrap(module))) status = 1;
+  if (foldProvenSignedChecks(*unwrap(module), reinterpret_cast<TargetMachine *>(target))) status = 1;
   foldGuardedUnsignedComparisons(*unwrap(module));
   foldWideVectorOrAccumulators(*unwrap(module));
   return status;
