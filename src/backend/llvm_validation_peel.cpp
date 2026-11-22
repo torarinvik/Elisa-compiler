@@ -80,6 +80,7 @@ unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_guarded_unsigned_compare.h"
 #include "llvm_vector_or_accumulators.h"
 #include "llvm_checked_signed_ranges.h"
+#include "llvm_recursive_argument_bounds.h"
 #include "llvm_validation_loop_passes.h"
 #include "llvm_copied_scratch.h"
 #include "llvm_validation_bounded_division.h"
@@ -387,6 +388,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
     stabilizeGuardedSignedOperands(Function);
     foldProvenSignedChecks(*unwrap(module), Machine, nullptr, &Function);
   }
+  if (foldRecursiveArgumentBounds(*unwrap(module))) status = 1;
   foldGuardedUnsignedComparisons(*unwrap(module));
   foldWideVectorOrAccumulators(*unwrap(module));
   return status;

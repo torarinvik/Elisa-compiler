@@ -233,7 +233,7 @@ static Facts incomingFieldBounds(Function &Function) {
   return Bounds;
 }
 
-static Facts dominatingBounds(IntrinsicInst &Call, DominatorTree &Tree,
+static Facts dominatingBounds(Instruction &Call, DominatorTree &Tree,
                               AssumptionCache &Assumptions, const Facts &Incoming,
                               SmallPtrSetImpl<LoadInst *> *UnstableLoads = nullptr) {
   Facts Bounds = Incoming;
