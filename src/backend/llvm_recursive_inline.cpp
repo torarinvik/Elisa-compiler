@@ -20,6 +20,7 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 using namespace llvm;
+#include "llvm_checked_accumulator_recursion.h"
 static bool hasGuardedLinearEntry(CondBrInst &Entry, ICmpInst &Compare) {
   if (Compare.getPredicate() != ICmpInst::ICMP_ULT) return false;
   Value *Index = Compare.getOperand(0);
@@ -339,12 +340,13 @@ static unsigned inlineSmallRecursiveFunctions(Module &M, TargetMachine *TM) {
       M.getTargetTriple().getArch() != Triple::aarch64 ||
       M.getNamedMetadata("llvm.dbg.cu"))
     return 0;
+  unsigned Looped = ElisaCheckedRecursion::loopCheckedAccumulatorRecursion(M);
   SmallVector<Function *, 8> Candidates;
   for (Function &F : M)
     if (recursiveInlineCandidate(F))
       Candidates.push_back(&F);
-  if (Candidates.size() > 16) return 0;
-  unsigned Changed = specializeRecursiveLiteralCalls(M), Growth = 0;
+  if (Candidates.size() > 16) return Looped;
+  unsigned Changed = specializeRecursiveLiteralCalls(M) + Looped, Growth = 0;
   if (Candidates.empty() && !Changed) return 0;
   for (Function *F : Candidates) {
     for (unsigned Depth = 0; Depth < 2; ++Depth) {
@@ -400,6 +402,7 @@ static unsigned inlineSmallRecursiveFunctions(Module &M, TargetMachine *TM) {
     ModulePassManager SecondCleanup = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
     SecondCleanup.run(M, MAM);
   }
+  if (Looped) ElisaCheckedRecursion::proveBoundedAccumulators(M, FAM);
   (void)biasGuardedRecursiveCalls(M);
   return 1;
 }
