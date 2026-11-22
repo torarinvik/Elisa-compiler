@@ -289,9 +289,36 @@ static bool foldZeroProductBypass(BasicBlock &Guard) {
   if (Compare->use_empty()) Compare->eraseFromParent();
   return true;
 }
-// A state carried by PHIs and selects remains in range when every value
-// entering that graph is a constant in range, including loop entry values.
-static bool fitsBooleanMask(Value *State) {
+// Recognize a read reached only through its unsigned bounds check.
+static GlobalVariable *checkedStateTable(LoadInst &Load) {
+  auto *Address = dyn_cast<GetElementPtrInst>(Load.getPointerOperand());
+  auto *Table = Address ? dyn_cast<GlobalVariable>(Address->getPointerOperand()) : nullptr;
+  auto *Array = Table ? dyn_cast<ArrayType>(Table->getValueType()) : nullptr;
+  if (!Load.isSimple() || !Address || Address->getNumIndices() != 1 ||
+      !Table || !Table->isConstant() || !Table->hasLocalLinkage() ||
+      !Table->hasDefinitiveInitializer() || Table->isExternallyInitialized() ||
+      Table->getAddressSpace() != 0 || !Array || Array->getNumElements() > 64 ||
+      Array->getElementType() != Load.getType() ||
+      Load.getDataLayout().getIndexSizeInBits(0) != 64 ||
+      Load.getDataLayout().getTypeAllocSize(Address->getSourceElementType()) !=
+          Load.getDataLayout().getTypeStoreSize(Load.getType()))
+    return nullptr;
+  BasicBlock *Guard = Load.getParent()->getSinglePredecessor();
+  auto *Branch = Guard ? dyn_cast<CondBrInst>(Guard->getTerminator()) : nullptr;
+  auto *Compare = Branch ? dyn_cast<ICmpInst>(Branch->getCondition()) : nullptr;
+  auto *Count = Compare ? dyn_cast<ConstantInt>(Compare->getOperand(1)) : nullptr;
+  if (!Compare || Compare->getPredicate() != ICmpInst::ICMP_ULT ||
+      Compare->hasSameSign() || Compare->getOperand(0) != Address->idx_begin()->get() ||
+      Branch->getSuccessor(0) != Load.getParent() ||
+      Branch->getSuccessor(1) == Load.getParent() || !Count ||
+      !Count->equalsInt(Array->getNumElements()))
+    return nullptr;
+  return Table;
+}
+
+// PHIs and selects can carry only values introduced by constants or checked
+// immutable tables. Inspect all inputs, including the initial loop entry.
+static bool stateFits(Value *State, uint64_t Limit) {
   SmallVector<Value *, 16> Pending{State};
   SmallPtrSet<Value *, 32> Seen;
   bool HasConstant = false;
@@ -300,7 +327,7 @@ static bool fitsBooleanMask(Value *State) {
     if (!Seen.insert(Current).second) continue;
     if (Seen.size() > 64) return false;
     if (auto *C = dyn_cast<ConstantInt>(Current)) {
-      if (C->getValue().uge(64)) return false;
+      if (C->getValue().uge(Limit)) return false;
       HasConstant = true;
     } else if (auto *Phi = dyn_cast<PHINode>(Current)) {
       if (Pending.size() + Phi->getNumIncomingValues() > 128) return false;
@@ -308,6 +335,13 @@ static bool fitsBooleanMask(Value *State) {
     } else if (auto *Select = dyn_cast<SelectInst>(Current)) {
       Pending.push_back(Select->getTrueValue());
       Pending.push_back(Select->getFalseValue());
+    } else if (auto *Load = dyn_cast<LoadInst>(Current)) {
+      GlobalVariable *Table = checkedStateTable(*Load);
+      if (!Table) return false;
+      for (unsigned I = 0; I < cast<ArrayType>(Table->getValueType())->getNumElements(); ++I) {
+        auto *Element = dyn_cast_or_null<ConstantInt>(Table->getInitializer()->getAggregateElement(I));
+        if (!Element || Element->getValue().uge(Limit)) return false;
+      }
     } else {
       return false;
     }
@@ -364,7 +398,7 @@ static bool foldBooleanLookup(BasicBlock &Guard) {
     Mask |= Byte->getZExtValue() << (Start.getZExtValue() + I);
   }
   Value *State = Offset->getOperand(0);
-  if (!fitsBooleanMask(State)) return false;
+  if (!stateFits(State, 64)) return false;
   IRBuilder<> Builder(Branch);
   Value *Bit = Builder.CreateAnd(Builder.CreateLShr(Builder.getInt64(Mask), State), 1);
   Result.setIncomingValueForBlock(&Guard, Builder.CreateZExtOrTrunc(Bit, Result.getType()));
@@ -372,6 +406,29 @@ static bool foldBooleanLookup(BasicBlock &Guard) {
   Branch->eraseFromParent();
   DeleteDeadBlock(Lookup);
   return true;
+}
+
+static bool foldStateTableBounds(BasicBlock &Guard) {
+  auto *Branch = dyn_cast<CondBrInst>(Guard.getTerminator());
+  auto *Compare = Branch ? dyn_cast<ICmpInst>(Branch->getCondition()) : nullptr;
+  auto *Limit = Compare ? dyn_cast<ConstantInt>(Compare->getOperand(1)) : nullptr;
+  if (!Limit || Limit->getValue().ugt(64)) return false;
+  BasicBlock *Accepted = Branch->getSuccessor(0);
+  BasicBlock *Rejected = Branch->getSuccessor(1);
+  if (Rejected == &Guard || Rejected->hasAddressTaken() ||
+      Rejected->getSinglePredecessor() != &Guard)
+    return false;
+  for (Instruction &I : *Accepted) {
+    auto *Load = dyn_cast<LoadInst>(&I);
+    if (!Load || !checkedStateTable(*Load)) continue;
+    if (!stateFits(Compare->getOperand(0), Limit->getZExtValue())) return false;
+    IRBuilder<> Builder(Branch);
+    Builder.CreateBr(Accepted);
+    Branch->eraseFromParent();
+    DeleteDeadBlock(Rejected);
+    return true;
+  }
+  return false;
 }
 } // namespace
 
@@ -389,6 +446,11 @@ unsigned elisacoreFoldConstantIntegerPaths(Module &M) {
       for (BasicBlock &Block : F) Changed += foldZeroProductBypass(Block);
     for (BasicBlock &Block : F) {
       if (!foldBooleanLookup(Block)) continue;
+      ++Changed;
+      break;
+    }
+    for (BasicBlock &Block : F) {
+      if (!foldStateTableBounds(Block)) continue;
       ++Changed;
       break;
     }
