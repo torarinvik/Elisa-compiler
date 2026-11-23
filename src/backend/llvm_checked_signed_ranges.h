@@ -32,11 +32,13 @@ static void collect(Value *Condition, bool Taken, Instruction &At,
                     BasicBlock &EdgeTarget, DominatorTree &Tree,
                     AssumptionCache &Assumptions, Facts &Bounds,
                     unsigned &Budget,
-                    SmallPtrSetImpl<LoadInst *> *UnstableLoads) {
+                    SmallPtrSetImpl<LoadInst *> *UnstableLoads,
+                    SmallPtrSetImpl<Argument *> *FrozenArguments = nullptr) {
   if (!Budget) return;
   --Budget;
   auto Visit = [&](Value *Operand, bool Truth) {
-    collect(Operand, Truth, At, EdgeTarget, Tree, Assumptions, Bounds, Budget, UnstableLoads);
+    collect(Operand, Truth, At, EdgeTarget, Tree, Assumptions, Bounds, Budget, UnstableLoads,
+            FrozenArguments);
   };
   if (auto *Either = dyn_cast<BinaryOperator>(Condition)) {
     if ((Either->getOpcode() == Instruction::Or && !Taken) ||
@@ -79,7 +81,12 @@ static void collect(Value *Condition, bool Taken, Instruction &At,
     Input = Absolute->getArgOperand(0);
     Range = ConstantRange(-Bound, Bound + 1);
   }
-  if (!isStable(Input, At, EdgeTarget, Tree, Assumptions)) {
+  // A parameter is defined once, at entry; freezing it there (when a proof
+  // uses this fact) gives the guard and every later use the same value.
+  if (auto *Parameter = dyn_cast<Argument>(Input);
+      Parameter && FrozenArguments && !isStable(Input, At, EdgeTarget, Tree, Assumptions))
+    FrozenArguments->insert(Parameter);
+  else if (!isStable(Input, At, EdgeTarget, Tree, Assumptions)) {
     auto *Load = dyn_cast<LoadInst>(Input);
     if (UnstableLoads && Load && Load->getType()->isIntegerTy(32) &&
         Load->isSimple() && !Range.isEmptySet() &&
@@ -135,20 +142,48 @@ static Value *countedLoopLimit(PHINode &Counter, LoopInfo &Loops) {
   return isa<FreezeInst, ConstantInt>(Stable) ? Limit : nullptr;
 }
 
+// Values fixed for one case of a case split (see splitCannotOverflow).
+using Cases = SmallDenseMap<Value *, APInt, 4>;
+
 static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
                              ScalarEvolution &Evolution, LoopInfo &Loops, unsigned &Budget,
-                             unsigned Depth = 0) {
+                             unsigned Depth = 0, const Cases *Assigned = nullptr) {
   unsigned Width = ValueToCheck->getType()->getIntegerBitWidth();
   if (!Budget || Depth == 8) return ConstantRange::getFull(Width);
   --Budget;
+  if (Assigned)
+    if (auto Fixed = Assigned->find(ValueToCheck); Fixed != Assigned->end())
+      return ConstantRange(Fixed->second);
   if (auto Fact = Bounds.find(ValueToCheck); Fact != Bounds.end())
     return Fact->second;
   if (auto *Constant = dyn_cast<ConstantInt>(ValueToCheck))
     return ConstantRange(Constant->getValue());
 
   auto Recurse = [&](Value *Operand) {
-    return rangeOf(Operand, Bounds, Evolution, Loops, Budget, Depth + 1);
+    return rangeOf(Operand, Bounds, Evolution, Loops, Budget, Depth + 1, Assigned);
   };
+  // Within one case, shifts, masks, comparisons and selects narrow too.
+  if (Assigned) {
+    if (auto *Compare = dyn_cast<ICmpInst>(ValueToCheck);
+        Compare && Compare->getOperand(0)->getType()->isIntegerTy()) {
+      ConstantRange Left = Recurse(Compare->getOperand(0)), Right = Recurse(Compare->getOperand(1));
+      if (Left.icmp(Compare->getPredicate(), Right)) return ConstantRange(APInt(1, 1));
+      if (Left.icmp(Compare->getInversePredicate(), Right)) return ConstantRange(APInt(1, 0));
+      return ConstantRange::getFull(1);
+    }
+    if (auto *Choice = dyn_cast<SelectInst>(ValueToCheck)) {
+      ConstantRange Condition = Recurse(Choice->getCondition());
+      if (const APInt *Known = Condition.getSingleElement())
+        return Recurse(Known->isOne() ? Choice->getTrueValue() : Choice->getFalseValue());
+      return Recurse(Choice->getTrueValue()).unionWith(Recurse(Choice->getFalseValue()));
+    }
+    if (isa<ICmpInst>(ValueToCheck) || Width == 1) return ConstantRange::getFull(Width);
+    if (auto *Binary = dyn_cast<BinaryOperator>(ValueToCheck))
+      return Recurse(Binary->getOperand(0))
+          .binaryOp(Binary->getOpcode(), Recurse(Binary->getOperand(1)))
+          .intersectWith(Evolution.getSignedRange(Evolution.getSCEV(ValueToCheck)),
+                         ConstantRange::Signed);
+  }
   if (auto *Cast = dyn_cast<CastInst>(ValueToCheck);
       Cast && Cast->getSrcTy()->isIntegerTy())
     return Recurse(Cast->getOperand(0)).castOp(Cast->getOpcode(), Width);
@@ -189,6 +224,40 @@ static bool cannotOverflow(Instruction::BinaryOps Opcode,
     for (const APInt &B : {Right.getSignedMin(), Right.getSignedMax()})
       if (!(A.sext(2 * Width) * B.sext(2 * Width)).isSignedIntN(Width))
         return false;
+  return true;
+}
+
+// The checked operation cannot overflow in any case of a split on the low
+// bits `x & 1` its operands depend on, each 0 or 1. Only bits computed
+// outside loops are split on, so each has one value whenever the check runs.
+static bool splitCannotOverflow(IntrinsicInst &Call, const Facts &Bounds,
+                                ScalarEvolution &Evolution, LoopInfo &Loops) {
+  using namespace PatternMatch;
+  SmallVector<Value *, 3> Bits;
+  SmallPtrSet<Value *, 32> Seen;
+  SmallVector<std::pair<Value *, unsigned>, 32> Work{{Call.getArgOperand(0), 0}, {Call.getArgOperand(1), 0}};
+  while (!Work.empty()) {
+    auto [V, Depth] = Work.pop_back_val();
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || Depth == 8 || !Seen.insert(I).second || isa<PHINode>(I)) continue;
+    if (match(I, m_And(m_Value(), m_One())) && !Loops.getLoopFor(I->getParent())) {
+      if (Bits.size() == 3) return false;
+      Bits.push_back(I);
+    }
+    for (Value *Operand : I->operands()) Work.push_back({Operand, Depth + 1});
+  }
+  if (Bits.empty()) return false;
+  auto Opcode = *checkedOpcode(Call.getIntrinsicID());
+  for (unsigned Choice = 0; Choice < (1u << Bits.size()); ++Choice) {
+    Cases Assigned;
+    for (unsigned Index = 0; Index < Bits.size(); ++Index)
+      Assigned.try_emplace(Bits[Index], APInt(Bits[Index]->getType()->getIntegerBitWidth(),
+                                              (Choice >> Index) & 1));
+    unsigned Budget = 128;
+    auto Left = rangeOf(Call.getArgOperand(0), Bounds, Evolution, Loops, Budget, 0, &Assigned);
+    auto Right = rangeOf(Call.getArgOperand(1), Bounds, Evolution, Loops, Budget, 0, &Assigned);
+    if (!cannotOverflow(Opcode, Left, Right)) return false;
+  }
   return true;
 }
 
@@ -235,7 +304,8 @@ static Facts incomingFieldBounds(Function &Function) {
 
 static Facts dominatingBounds(Instruction &Call, DominatorTree &Tree,
                               AssumptionCache &Assumptions, const Facts &Incoming,
-                              SmallPtrSetImpl<LoadInst *> *UnstableLoads = nullptr) {
+                              SmallPtrSetImpl<LoadInst *> *UnstableLoads = nullptr,
+                              SmallPtrSetImpl<Argument *> *FrozenArguments = nullptr) {
   Facts Bounds = Incoming;
   unsigned Budget = 96;
   for (auto *Node = Tree.getNode(Call.getParent()); Node && Budget;
@@ -247,7 +317,7 @@ static Facts dominatingBounds(Instruction &Call, DominatorTree &Tree,
       auto *Target = Branch->getSuccessor(Edge);
       if (Tree.dominates(BasicBlockEdge(Block, Target), Call.getParent()))
         collect(Branch->getCondition(), Edge == 0, *Branch, *Target, Tree,
-                Assumptions, Bounds, Budget, UnstableLoads);
+                Assumptions, Bounds, Budget, UnstableLoads, FrozenArguments);
     }
   }
   return Bounds;
@@ -328,14 +398,30 @@ static unsigned foldProvenSignedChecks(
     auto &Loops = Analyses.getResult<LoopAnalysis>(Function);
     const auto Incoming = incomingFieldBounds(Function);
     SmallVector<IntrinsicInst *, 16> Safe;
+    SmallPtrSet<Argument *, 4> Frozen;
     for (IntrinsicInst *Call : Candidates) {
       auto Bounds = dominatingBounds(*Call, Tree, Assumptions, Incoming);
-      if (Bounds.empty()) continue;
-      unsigned Budget = 64;
-      auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Loops, Budget);
-      auto Right = rangeOf(Call->getArgOperand(1), Bounds, Evolution, Loops, Budget);
-      if (cannotOverflow(*checkedOpcode(Call->getIntrinsicID()), Left, Right))
+      if (!Bounds.empty()) {
+        unsigned Budget = 64;
+        auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Loops, Budget);
+        auto Right = rangeOf(Call->getArgOperand(1), Bounds, Evolution, Loops, Budget);
+        if (cannotOverflow(*checkedOpcode(Call->getIntrinsicID()), Left, Right)) {
+          Safe.push_back(Call);
+          continue;
+        }
+      }
+      // Within the cases of a split, with guarded parameters frozen.
+      SmallPtrSet<Argument *, 4> Parameters;
+      auto Split = dominatingBounds(*Call, Tree, Assumptions, Incoming, nullptr, &Parameters);
+      if (!Split.empty() && splitCannotOverflow(*Call, Split, Evolution, Loops)) {
         Safe.push_back(Call);
+        Frozen.insert(Parameters.begin(), Parameters.end());
+      }
+    }
+    for (Argument *Parameter : Frozen) {
+      IRBuilder<> Entry(&*Function.getEntryBlock().getFirstInsertionPt());
+      auto *Stable = cast<FreezeInst>(Entry.CreateFreeze(Parameter, "validated.parameter"));
+      Parameter->replaceUsesWithIf(Stable, [&](Use &Use) { return Use.getUser() != Stable; });
     }
     for (IntrinsicInst *Call : Safe) {
       IRBuilder<> Builder(Call);
