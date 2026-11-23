@@ -272,12 +272,49 @@ static bool cannotOverflow(Instruction::BinaryOps Opcode,
   return true;
 }
 
+// Operand's range narrowed by guards that compare it with another value
+// (`factor <= remaining / factor`) on edges dominating Call. Both sides are
+// defined in blocks dominating the guard and never undefined, so the values
+// the guard tested are the ones in use at Call (as for directFact).
+static ConstantRange comparedRange(Value *Operand, IntrinsicInst &Call, const Facts &Bounds,
+                                   ScalarEvolution &Evolution, LoopInfo &Loops, unsigned &Budget,
+                                   const Scope &Context) {
+  ConstantRange Result = ConstantRange::getFull(Operand->getType()->getIntegerBitWidth());
+  if (isa<Constant>(Operand) || !ElisaCheckedLoopRanges::neverUndefined(Operand)) return Result;
+  unsigned Steps = 32;
+  for (auto *Node = Context.Tree.getNode(Call.getParent()); Node && Steps; Node = Node->getIDom(), --Steps) {
+    auto *Branch = dyn_cast<CondBrInst>(Node->getBlock()->getTerminator());
+    auto *Compare = Branch ? dyn_cast<ICmpInst>(Branch->getCondition()) : nullptr;
+    if (!Compare || Branch->getSuccessor(0) == Branch->getSuccessor(1)) continue;
+    bool Swapped = Compare->getOperand(1) == Operand;
+    Value *Other = Compare->getOperand(Swapped ? 0 : 1);
+    if ((!Swapped && Compare->getOperand(0) != Operand) || isa<Constant>(Other) ||
+        !ElisaCheckedLoopRanges::neverUndefined(Other))
+      continue;
+    for (unsigned Edge = 0; Edge < 2; ++Edge) {
+      if (!Context.Tree.dominates(BasicBlockEdge(Node->getBlock(), Branch->getSuccessor(Edge)), Call.getParent()))
+        continue;
+      auto Predicate = Edge == 0 ? Compare->getPredicate() : Compare->getInversePredicate();
+      if (Swapped) Predicate = ICmpInst::getSwappedPredicate(Predicate);
+      ConstantRange Bound = rangeOf(Other, Bounds, Evolution, Loops, Budget, 1, nullptr, &Context);
+      Result = Result.intersectWith(ConstantRange::makeAllowedICmpRegion(Predicate, Bound), ConstantRange::Signed);
+    }
+  }
+  return Result;
+}
+
 static bool provenSafe(IntrinsicInst &Call, const Facts &Bounds, ScalarEvolution &Evolution,
                        LoopInfo &Loops, const Scope &Context) {
   unsigned Budget = 256;
   auto Left = rangeOf(Call.getArgOperand(0), Bounds, Evolution, Loops, Budget, 0, nullptr, &Context);
   auto Right = rangeOf(Call.getArgOperand(1), Bounds, Evolution, Loops, Budget, 0, nullptr, &Context);
-  return cannotOverflow(*checkedOpcode(Call.getIntrinsicID()), Left, Right);
+  auto Opcode = *checkedOpcode(Call.getIntrinsicID());
+  if (cannotOverflow(Opcode, Left, Right)) return true;
+  Left = Left.intersectWith(comparedRange(Call.getArgOperand(0), Call, Bounds, Evolution, Loops, Budget, Context),
+                            ConstantRange::Signed);
+  Right = Right.intersectWith(comparedRange(Call.getArgOperand(1), Call, Bounds, Evolution, Loops, Budget, Context),
+                              ConstantRange::Signed);
+  return cannotOverflow(Opcode, Left, Right);
 }
 
 // The checked operation cannot overflow in any case of a split on the low

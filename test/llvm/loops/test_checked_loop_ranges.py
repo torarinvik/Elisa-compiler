@@ -4,8 +4,11 @@
 A sum of one bounded term per iteration of a loop counted to a guarded limit,
 and a stack top pushed below a capacity and popped above zero, make checked
 arithmetic over them provably safe. The stack's top scaled by 2e16 fits only
-under its capacity of 256, not under the 512 pushes the loop could make. Each negative removes the fact a proof
-needs, and the check must stay.
+under its capacity of 256, not under the 512 pushes the loop could make.
+Euler's totient divides `remaining` by its factors and takes `result -
+result / factor`: both only shrink from a nonnegative start, and the counter
+`factor` is bounded by the guard `factor <= remaining / factor`. Each
+negative removes the fact a proof needs, and the check must stay.
 """
 import os, shlex, subprocess, tempfile
 from pathlib import Path
@@ -139,6 +142,73 @@ invalid:
 }
 '''.replace('TRIPLE', TRIPLE)
 
+TOTIENT = '''target triple = "TRIPLE"
+declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)
+declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)
+declare void @llvm.trap()
+define i64 @totient(i64 %argument, i64 %other) {
+entry:
+  %n = freeze i64 %argument
+  %low = icmp slt i64 %n, 1
+  br i1 %low, label %invalid, label %check
+check:
+  %high = icmp sgt i64 %n, 1000000
+  br i1 %high, label %invalid, label %head
+head:
+  %result = phi i64 [ %n, %check ], [ %result.next, %stepped ]
+  %remaining = phi i64 [ %n, %check ], [ %remaining.next, %stepped ]
+  %factor = phi i64 [ 2, %check ], [ %factor.next, %stepped ]
+  %quotient = sdiv i64 %remaining, %factor
+  %past = icmp sgt i64 %factor, %quotient
+  br i1 %past, label %exit, label %body
+body:
+  %product = mul i64 %quotient, %factor
+  %divides = icmp eq i64 %remaining, %product
+  br i1 %divides, label %inner, label %latch
+inner:
+  %left = phi i64 [ %remaining, %body ], [ %divided, %inner ]
+  %divided = sdiv i64 %left, %factor
+  %back = mul i64 %divided, %factor
+  %again = icmp eq i64 %left, %back
+  br i1 %again, label %inner, label %reduce
+reduce:
+  %share = sdiv i64 %result, %factor
+  %pair = call { i64, i1 } @llvm.ssub.with.overflow.i64(i64 %result, i64 %share)
+  %overflow = extractvalue { i64, i1 } %pair, 1
+  br i1 %overflow, label %trap, label %reduced
+reduced:
+  %smaller = extractvalue { i64, i1 } %pair, 0
+  br label %latch
+latch:
+  %result.next = phi i64 [ %result, %body ], [ %smaller, %reduced ]
+  %remaining.next = phi i64 [ %remaining, %body ], [ %left, %reduced ]
+  %step = call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 %factor, i64 1)
+  %step.overflow = extractvalue { i64, i1 } %step, 1
+  br i1 %step.overflow, label %trap, label %stepped
+stepped:
+  %factor.next = extractvalue { i64, i1 } %step, 0
+  br label %head
+exit:
+  %rest = icmp sgt i64 %remaining, 1
+  br i1 %rest, label %last, label %done
+last:
+  %last.share = sdiv i64 %result, %remaining
+  %last.pair = call { i64, i1 } @llvm.ssub.with.overflow.i64(i64 %result, i64 %last.share)
+  %last.overflow = extractvalue { i64, i1 } %last.pair, 1
+  br i1 %last.overflow, label %trap, label %last.done
+last.done:
+  %final = extractvalue { i64, i1 } %last.pair, 0
+  ret i64 %final
+done:
+  ret i64 %result
+trap:
+  call void @llvm.trap()
+  unreachable
+invalid:
+  ret i64 -1
+}
+'''.replace('TRIPLE', TRIPLE)
+
 CASES = {
     'sum': (SUM, 1),
     'sum_unbounded_count': (SUM.replace('icmp ugt i64 %count, 1000', 'icmp eq i64 %count, 7'), 0),
@@ -150,6 +220,16 @@ CASES = {
     'stack_unguarded_push': (STACK.replace('br i1 %full, label %invalid, label %pushed', 'br label %pushed'), 0),
     'stack_push_two': (STACK.replace('add i64 %top, 1', 'add i64 %top, 2'), 0),
     'stack_wide_capacity': (STACK.replace('icmp eq i64 %top, 256', 'icmp eq i64 %top, 100000'), 0),
+    'totient': (TOTIENT, 3),
+    # A negative start: the result does not shrink toward zero. The factor
+    # still stays below a quotient by at least 2, so its step folds.
+    'totient_negative_start': (TOTIENT.replace('br i1 %low, label %invalid, label %check', 'br label %check'), 1),
+    # A result that grows: only the factor's guard still bounds its step.
+    'totient_growing_result': (TOTIENT.replace('ssub.with.overflow.i64(i64 %result, i64 %share)', 'sadd.with.overflow.i64(i64 %result, i64 %share)'), 1),
+    # A divisor that may be -1 negates the remaining value instead of shrinking it.
+    'totient_negative_divisor': (TOTIENT.replace('[ 2, %check ]', '[ -1, %check ]'), 0),
+    # A guard against an unbounded argument says nothing about the factor.
+    'totient_unbounded_guard': (TOTIENT.replace('icmp sgt i64 %factor, %quotient', 'icmp sgt i64 %factor, %other'), 2),
     'non_arm': (SUM.replace(TRIPLE, 'x86_64-unknown-linux-gnu'), 0),
 }
 
@@ -166,7 +246,8 @@ with tempfile.TemporaryDirectory(prefix='checked-loop-ranges-') as temporary:
         got = int(output.splitlines()[0])
         assert got == want, (name, got)
         body = output.split('\n', 1)[1]
-        assert ('call { i64, i1 } @llvm.s' in body) != bool(want), (name, output)
+        checks = 'call { i64, i1 } @llvm.s'
+        assert body.count(checks) == source.count(checks) - want, (name, output)
         # Only the sum's proof uses the guarded count, which it must freeze.
         assert ('freeze i64 %count' in body) == (name == 'sum'), (name, output)
         print('PASS', name)

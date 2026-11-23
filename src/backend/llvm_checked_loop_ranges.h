@@ -8,7 +8,10 @@
 //   zero) stays in a hull of its start and those guards' constants, checked by
 //   induction over every path to the latch;
 // - a sum that adds at most one bounded term per iteration of a counted loop
-//   stays within its start plus that many terms.
+//   stays within its start plus that many terms;
+// - a value with a nonnegative start that every iteration keeps or moves
+//   toward zero (divided by at least one, or less such a quotient of
+//   itself: `x - x / f`) stays between zero and its start.
 // A phi inside one iteration takes one of its incoming values, each bounded
 // by the facts that hold where the phi is.
 #include <llvm/IR/PatternMatch.h>
@@ -32,6 +35,13 @@ static bool neverUndefined(Value *Root) {
     if (!Seen.insert(Current).second) continue;
     if (Seen.size() > 32) return false;
     if (isa<ConstantInt>(Current)) continue;
+    // A checked operation's result: the operation on defined operands.
+    if (auto *Field = dyn_cast<ExtractValueInst>(Current)) {
+      auto *Checked = dyn_cast<WithOverflowInst>(Field->getAggregateOperand());
+      if (!Checked || Field->getNumIndices() != 1 || Field->getIndices()[0] != 0) return false;
+      Work.append({Checked->getLHS(), Checked->getRHS()});
+      continue;
+    }
     if (!isa<PHINode, BinaryOperator, CastInst, SelectInst, ICmpInst, FreezeInst>(Current))
       return false;
     if (isa<FreezeInst>(Current)) continue;
@@ -244,13 +254,68 @@ static std::optional<ConstantRange> steppedRange(PHINode &Phi, LoopInfo &Loops, 
   return Best;
 }
 
+// Leaf lies in [0, Base] whenever Base is nonnegative: Base itself, a
+// quotient of such a value by a divisor of at least one, such a value less
+// its own quotient (`x - x / f`, checked or not), a phi joining such values,
+// or the header phi of a loop that starts from one and only shrinks itself.
+static bool shrinks(Value *Leaf, Value *Base, LoopInfo &Loops, RangeIn Range, FactsAt At,
+                    unsigned Depth) {
+  using namespace PatternMatch;
+  if (Leaf == Base) return true;
+  auto *Step = dyn_cast<Instruction>(Leaf);
+  if (!Step || Depth > 6) return false;
+  auto Quotient = [&](Value *V, Value *&Dividend) {
+    Value *Divisor = nullptr;
+    if (!match(V, m_SDiv(m_Value(Dividend), m_Value(Divisor)))) return false;
+    ConstantRange Divisors = Range(Divisor, At(*cast<Instruction>(V)));
+    return !Divisors.isEmptySet() && Divisors.getSignedMin().sge(1);
+  };
+  auto Recurse = [&](Value *V, Value *Within) { return shrinks(V, Within, Loops, Range, At, Depth + 1); };
+  Value *Dividend = nullptr, *Whole = nullptr, *Part = nullptr;
+  if (Quotient(Leaf, Dividend)) return Recurse(Dividend, Base);
+  auto *Field = dyn_cast<ExtractValueInst>(Leaf);
+  auto *Checked = Field ? dyn_cast<WithOverflowInst>(Field->getAggregateOperand()) : nullptr;
+  if (Checked && Checked->getBinaryOp() == Instruction::Sub && Field->getNumIndices() == 1 &&
+      Field->getIndices()[0] == 0) {
+    Whole = Checked->getLHS();
+    Part = Checked->getRHS();
+  }
+  if (Whole || match(Leaf, m_Sub(m_Value(Whole), m_Value(Part))))
+    return Quotient(Part, Dividend) && Dividend == Whole && Recurse(Whole, Base);
+  auto *Inner = dyn_cast<PHINode>(Leaf);
+  if (!Inner) return false;
+  auto Shape = headerOf(*Inner, Loops);
+  if (!Shape)
+    return llvm::all_of(Inner->incoming_values(), [&](Value *V) { return Recurse(V, Base); });
+  SmallVector<Value *, 4> Leaves;
+  return Recurse(Inner->getIncomingValueForBlock(Shape->Entry), Base) &&
+         backEdgeLeaves(Inner->getIncomingValueForBlock(Shape->Latch), *Inner, Loops, Leaves) &&
+         llvm::all_of(Leaves, [&](Value *V) { return Recurse(V, Inner); });
+}
+
+// A header phi from a nonnegative start whose every iteration shrinks it.
+static std::optional<ConstantRange> shrinkingRange(PHINode &Phi, LoopInfo &Loops, RangeIn Range,
+                                                   FactsAt At) {
+  auto Shape = headerOf(Phi, Loops);
+  if (!Shape || !Phi.getType()->isIntegerTy()) return std::nullopt;
+  ConstantRange Start = Range(Phi.getIncomingValueForBlock(Shape->Entry),
+                              At(*Shape->Owner->getHeader()->getFirstNonPHI()));
+  SmallVector<Value *, 4> Leaves;
+  if (Start.isEmptySet() || Start.isSignWrappedSet() || Start.getSignedMin().isNegative() ||
+      !backEdgeLeaves(Phi.getIncomingValueForBlock(Shape->Latch), Phi, Loops, Leaves) ||
+      !llvm::all_of(Leaves, [&](Value *Leaf) { return shrinks(Leaf, &Phi, Loops, Range, At, 0); }))
+    return std::nullopt;
+  return ConstantRange::getNonEmpty(APInt::getZero(Start.getBitWidth()), Start.getSignedMax() + 1);
+}
+
 // A header phi's range under every shape that bounds it.
 static std::optional<ConstantRange> headerRange(PHINode &Phi, LoopInfo &Loops, RangeIn Range,
                                                 FactsAt At, FactOn On) {
   auto Summed = summedRange(Phi, Loops, Range, At, On);
   auto Stepped = steppedRange(Phi, Loops, Range, At, On);
   if (Summed && Stepped) return Summed->intersectWith(*Stepped, ConstantRange::Signed);
-  return Summed ? Summed : Stepped;
+  if (Summed || Stepped) return Summed ? Summed : Stepped;
+  return shrinkingRange(Phi, Loops, Range, At);
 }
 
 // A phi inside an iteration: the value its loop carries when it feeds a
