@@ -47,6 +47,13 @@
 
 using namespace llvm;
 
+// Also run before O3 (from the scratch-prefix pass), while loops are still
+// in source shape: a countdown scan the unroller later splits into a
+// prologue and a stride -4 body is a guarded `n - 1` loop there.
+extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
+  return Module ? ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(Module)) : 0;
+}
+
 extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef moduleRef,
                                                 LLVMTargetMachineRef targetRef) {
   auto &module = *unwrap(moduleRef);
@@ -92,6 +99,7 @@ unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_validation_bounded_division.h"
 
 #else
+extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef) { return 0; }
 extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef, LLVMTargetMachineRef) { return 0; }
 extern "C" unsigned elisacoreElideBoundedDivisionSums(LLVMModuleRef) {
   return 0;

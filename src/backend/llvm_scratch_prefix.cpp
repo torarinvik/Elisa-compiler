@@ -167,6 +167,8 @@ static bool canonicalizeTrustedMemset(CallInst *CI, AllocaInst *A,
 #include "llvm_stack_prefix.cpp"
 #include "llvm_compact_shift_loop.cpp"
 
+extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module);
+
 extern "C" unsigned elisacoreElideScratchPrefixInitializers(LLVMModuleRef Ref) {
   if (!Ref) return 0;
   Module &M = *unwrap(Ref);
@@ -189,6 +191,7 @@ extern "C" unsigned elisacoreElideScratchPrefixInitializers(LLVMModuleRef Ref) {
   if ((M.getTargetTriple().isMacOSX() || M.getTargetTriple().isOSLinux()) &&
       M.getTargetTriple().getArch() == Triple::aarch64)
     Removed += removeStackPrefixZeros(M);
+  Removed += elisacoreRemoveIndexedPrefixFills(Ref);
   for (Function &F : M) {
     if (F.isDeclaration() || F.hasOptNone() ||
         F.hasFnAttribute(Attribute::SanitizeAddress) ||
