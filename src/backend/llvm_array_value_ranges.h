@@ -42,6 +42,9 @@ struct Accesses {
   // Copies and pattern fills into the array from its first element.
   SmallVector<MemIntrinsic *, 1> Writes;
   SmallVector<Instruction *, 1> Fills;
+  // Views {data, length} of the array from its first element, each used
+  // only as an argument of calls to defined functions.
+  SmallVector<InsertValueInst *, 2> Views;
   // Byte offsets inside its element of an access to a field of a struct
   // element; absent for an access at the element's start.
   SmallDenseMap<Instruction *, uint64_t, 8> Residues;
@@ -82,6 +85,27 @@ static std::optional<uint64_t> elementResidue(GetElementPtrInst &Address, uint64
 // it, Residue bytes into its element); false when some use could read or
 // write it in another way. A struct Element is Composite: its fields are
 // loaded and stored separately, each access inside one element.
+// The view `{Data, length}` that Data starts when Data points at the
+// array's first element and the view only reaches defined functions'
+// arguments, as `find(scratch[0:count], key)` passes a slice.
+static InsertValueInst *viewFromStart(InsertValueInst &Data, Value &Pointer, const DataLayout &Layout) {
+  auto *Shape = dyn_cast<StructType>(Data.getType());
+  APInt Offset(Layout.getIndexTypeSizeInBits(Pointer.getType()), 0);
+  if (!Shape || Shape->getNumElements() != 2 || Data.getNumIndices() != 1 || Data.getIndices()[0] != 0 ||
+      Data.getInsertedValueOperand() != &Pointer || !isa<UndefValue>(Data.getAggregateOperand()) ||
+      !isa<AllocaInst>(Pointer.stripAndAccumulateConstantOffsets(Layout, Offset, true)) || !Offset.isZero() ||
+      !Data.hasOneUse())
+    return nullptr;
+  auto *View = dyn_cast<InsertValueInst>(Data.user_back());
+  if (!View || View->getNumIndices() != 1 || View->getIndices()[0] != 1 || View->use_empty()) return nullptr;
+  for (Use &Passed : View->uses()) {
+    auto *Call = dyn_cast<CallBase>(Passed.getUser());
+    Function *Callee = Call ? Call->getCalledFunction() : nullptr;
+    if (!Callee || Callee->isDeclaration() || !Call->isArgOperand(&Passed)) return nullptr;
+  }
+  return View;
+}
+
 static bool collect(Value *Pointer, Type *Element, uint64_t ElementSize,
                     const DataLayout &Layout, Accesses &Out, unsigned Depth = 0,
                     bool AllowVectorStores = false, uint64_t Residue = 0) {
@@ -140,6 +164,10 @@ static bool collect(Value *Pointer, Type *Element, uint64_t ElementSize,
       // Copies out of the array read it; they cannot change it.
       if (Copy->getRawDest() == Pointer) Out.Writes.push_back(Copy);
       else Out.Copies.push_back(Copy);
+    } else if (auto *Data = dyn_cast<InsertValueInst>(Use)) {
+      InsertValueInst *View = Residue ? nullptr : viewFromStart(*Data, *Pointer, Layout);
+      if (!View) return false;
+      Out.Views.push_back(View);
     } else if (!isa<LifetimeIntrinsic>(Use) && !isa<ICmpInst>(Use)) {
       // Comparing addresses (a vectorizer's overlap check) touches no element.
       return false;
@@ -311,7 +339,7 @@ static unsigned annotateFunctionArrayRanges(Function &F, FunctionAnalysisManager
     if (collect(Array, Type->getElementType(),
                 Layout.getTypeAllocSize(Type->getElementType()).getFixedValue(), Layout,
                 Next.Uses, 0, true) &&
-        (Next.Uses.Filled || Array->getMetadata(WrittenPrefix)))
+        (Next.Uses.Filled || Array->getMetadata(WrittenPrefix)) && Next.Uses.Views.empty())
       Candidates.push_back(std::move(Next));
   }
   if (Candidates.empty()) return 0;
