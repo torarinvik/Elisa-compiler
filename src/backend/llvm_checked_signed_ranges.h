@@ -1,4 +1,5 @@
 // Propagate dominating validation ranges into checked signed arithmetic.
+#include "llvm_checked_loop_ranges.h"
 namespace ElisaCheckedSignedRanges {
 using Facts = DenseMap<Value *, ConstantRange>;
 
@@ -33,12 +34,13 @@ static void collect(Value *Condition, bool Taken, Instruction &At,
                     AssumptionCache &Assumptions, Facts &Bounds,
                     unsigned &Budget,
                     SmallPtrSetImpl<LoadInst *> *UnstableLoads,
-                    SmallPtrSetImpl<Argument *> *FrozenArguments = nullptr) {
+                    SmallPtrSetImpl<Argument *> *FrozenArguments = nullptr,
+                    Value *Only = nullptr) {
   if (!Budget) return;
   --Budget;
   auto Visit = [&](Value *Operand, bool Truth) {
     collect(Operand, Truth, At, EdgeTarget, Tree, Assumptions, Bounds, Budget, UnstableLoads,
-            FrozenArguments);
+            FrozenArguments, Only);
   };
   if (auto *Either = dyn_cast<BinaryOperator>(Condition)) {
     if ((Either->getOpcode() == Instruction::Or && !Taken) ||
@@ -81,6 +83,23 @@ static void collect(Value *Condition, bool Taken, Instruction &At,
     Input = Absolute->getArgOperand(0);
     Range = ConstantRange(-Bound, Bound + 1);
   }
+  // Read only where the edge dominates (directFact): the last definition of
+  // the value before that point dominates the guard, so the guard tested it.
+  // A parameter must be frozen, and other values cannot be undefined.
+  if (Only) {
+    if (Input != Only) return;
+    if (auto *Parameter = dyn_cast<Argument>(Input)) {
+      if (!isStable(Input, At, EdgeTarget, Tree, Assumptions)) {
+        if (!FrozenArguments) return;
+        FrozenArguments->insert(Parameter);
+      }
+    } else if (!ElisaCheckedLoopRanges::neverUndefined(Input)) {
+      return;
+    }
+    auto [Fact, Inserted] = Bounds.try_emplace(Input, Range);
+    if (!Inserted) Fact->second = Fact->second.intersectWith(Range);
+    return;
+  }
   // A parameter is defined once, at entry; freezing it there (when a proof
   // uses this fact) gives the guard and every later use the same value.
   if (auto *Parameter = dyn_cast<Argument>(Input);
@@ -108,48 +127,33 @@ static std::optional<Instruction::BinaryOps> checkedOpcode(Intrinsic::ID ID) {
   }
 }
 
-// A zero-based counter tested after increment visits [0, limit) when
-// the equality exit compares against one stable, positive limit.
-static Value *countedLoopLimit(PHINode &Counter, LoopInfo &Loops) {
-  Loop *Loop = Loops.getLoopFor(Counter.getParent());
-  if (!Loop || Loop->getHeader() != Counter.getParent() ||
-      Counter.getNumIncomingValues() != 2)
-    return nullptr;
-  BasicBlock *Latch = Loop->getLoopLatch();
-  BasicBlock *Entry = Loop->getLoopPredecessor();
-  if (!Latch || !Entry) return nullptr;
-  auto *Initial = dyn_cast<ConstantInt>(Counter.getIncomingValueForBlock(Entry));
-  auto *Next = dyn_cast<BinaryOperator>(Counter.getIncomingValueForBlock(Latch));
-  auto *Branch = dyn_cast<CondBrInst>(Latch->getTerminator());
-  if (!Initial || !Initial->isZero() || !Next ||
-      Next->getOpcode() != Instruction::Add || Next->getOperand(0) != &Counter ||
-      !Branch || Branch->getSuccessor(1) != Loop->getHeader() ||
-      Loop->contains(Branch->getSuccessor(0)))
-    return nullptr;
-  auto *Step = dyn_cast<ConstantInt>(Next->getOperand(1));
-  auto *Compare = dyn_cast<ICmpInst>(Branch->getCondition());
-  if (!Step || !Step->isOne() || !Compare ||
-      Compare->getPredicate() != ICmpInst::ICMP_EQ)
-    return nullptr;
-  Value *Limit = Compare->getOperand(0) == Next ? Compare->getOperand(1)
-                 : Compare->getOperand(1) == Next ? Compare->getOperand(0)
-                                                 : nullptr;
-  if (!Limit || !Loop->isLoopInvariant(Limit)) return nullptr;
-
-  Value *Stable = Limit;
-  while (isa<SExtInst, ZExtInst>(Stable))
-    Stable = cast<CastInst>(Stable)->getOperand(0);
-  return isa<FreezeInst, ConstantInt>(Stable) ? Limit : nullptr;
-}
-
 // Values fixed for one case of a case split (see splitCannotOverflow).
 using Cases = SmallDenseMap<Value *, APInt, 4>;
 
+static Facts dominatingBounds(Instruction &Call, DominatorTree &Tree,
+                              AssumptionCache &Assumptions, const Facts &Incoming,
+                              SmallPtrSetImpl<LoadInst *> *UnstableLoads,
+                              SmallPtrSetImpl<Argument *> *FrozenArguments);
+
+static ConstantRange directFact(Instruction &Point, Value *Subject, DominatorTree &Tree,
+                                AssumptionCache &Assumptions, SmallPtrSetImpl<Argument *> *Parameters);
+
+// What loop-carried values need to find the facts at their own definitions
+// (ElisaCheckedLoopRanges). Facts on unstable parameters go to Parameters,
+// which a successful proof freezes.
+struct Scope {
+  DominatorTree &Tree;
+  AssumptionCache &Assumptions;
+  const Facts &Incoming;
+  SmallPtrSetImpl<Argument *> *Parameters;
+};
+
 static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
                              ScalarEvolution &Evolution, LoopInfo &Loops, unsigned &Budget,
-                             unsigned Depth = 0, const Cases *Assigned = nullptr) {
+                             unsigned Depth = 0, const Cases *Assigned = nullptr,
+                             const Scope *Context = nullptr) {
   unsigned Width = ValueToCheck->getType()->getIntegerBitWidth();
-  if (!Budget || Depth == 8) return ConstantRange::getFull(Width);
+  if (!Budget || Depth == 14) return ConstantRange::getFull(Width);
   --Budget;
   if (Assigned)
     if (auto Fixed = Assigned->find(ValueToCheck); Fixed != Assigned->end())
@@ -160,7 +164,7 @@ static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
     return ConstantRange(Constant->getValue());
 
   auto Recurse = [&](Value *Operand) {
-    return rangeOf(Operand, Bounds, Evolution, Loops, Budget, Depth + 1, Assigned);
+    return rangeOf(Operand, Bounds, Evolution, Loops, Budget, Depth + 1, Assigned, Context);
   };
   // Within one case, shifts, masks, comparisons and selects narrow too.
   if (Assigned) {
@@ -188,19 +192,34 @@ static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
       Cast && Cast->getSrcTy()->isIntegerTy())
     return Recurse(Cast->getOperand(0)).castOp(Cast->getOpcode(), Width);
   if (auto Hull = ElisaBisectionRanges::bisectionHull(ValueToCheck, Recurse)) return *Hull;
-  // A load whose `!range` holds is never poison, so freezing it keeps it.
-  if (auto *Frozen = dyn_cast<FreezeInst>(ValueToCheck))
-    if (auto *Load = dyn_cast<LoadInst>(Frozen->getOperand(0));
-        Load && Load->getMetadata(LLVMContext::MD_range))
-      return Recurse(Load);
+  // A load whose `!range` holds is never poison, so freezing it keeps it; so
+  // is a join of such loads and of values computed from defined ones.
+  if (auto *Frozen = dyn_cast<FreezeInst>(ValueToCheck)) {
+    auto *Load = dyn_cast<LoadInst>(Frozen->getOperand(0));
+    if ((Load && Load->getMetadata(LLVMContext::MD_range)) ||
+        (Context && !Load && !isa<Argument>(Frozen->getOperand(0))))
+      return Recurse(Frozen->getOperand(0));
+  }
 
   if (auto *Binary = dyn_cast<BinaryOperator>(ValueToCheck)) {
     auto Opcode = Binary->getOpcode();
+    // An exact quotient of a nonnegative range rounds its least value up.
+    if (auto *Divisor = dyn_cast<ConstantInt>(Binary->getOperand(1));
+        Divisor && Binary->isExact() && (Opcode == Instruction::LShr || Opcode == Instruction::UDiv)) {
+      ConstantRange Dividend = Recurse(Binary->getOperand(0));
+      APInt Scale = Opcode == Instruction::UDiv ? Divisor->getValue()
+                                                : APInt::getOneBitSet(Width, Divisor->getZExtValue() % Width);
+      if (!Scale.isZero() && !Dividend.isEmptySet() && !Dividend.isSignWrappedSet() &&
+          Dividend.getSignedMin().isNonNegative())
+        return ConstantRange::getNonEmpty(APIntOps::RoundingUDiv(Dividend.getSignedMin(), Scale, APInt::Rounding::UP),
+                                          Dividend.getSignedMax().udiv(Scale) + 1);
+    }
     // A remainder is bounded by its divisor whatever the dividend is; a
     // quotient by the ranges of both operands.
     if (Opcode == Instruction::Add || Opcode == Instruction::Sub ||
         Opcode == Instruction::Mul || Opcode == Instruction::SRem ||
-        Opcode == Instruction::URem || Opcode == Instruction::SDiv)
+        Opcode == Instruction::URem || Opcode == Instruction::SDiv ||
+        Opcode == Instruction::UDiv || Opcode == Instruction::LShr || Opcode == Instruction::And)
       return Recurse(Binary->getOperand(0)).binaryOp(
           Opcode, Recurse(Binary->getOperand(1)));
   }
@@ -210,12 +229,29 @@ static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
       if (auto Opcode = checkedOpcode(Call->getIntrinsicID()))
         return Recurse(Call->getArgOperand(0)).binaryOp(
             *Opcode, Recurse(Call->getArgOperand(1)));
-  if (auto *Counter = dyn_cast<PHINode>(ValueToCheck))
-    if (Value *Limit = countedLoopLimit(*Counter, Loops)) {
-      auto Range = Recurse(Limit);
-      if (!Range.isEmptySet() && Range.getSignedMin().isStrictlyPositive())
-        return ConstantRange(APInt(Width, 0), Range.getSignedMax());
+  if (auto *Phi = dyn_cast<PHINode>(ValueToCheck)) {
+    auto On = [&](Instruction &Point, Value *Subject) {
+      return directFact(Point, Subject, Context->Tree, Context->Assumptions, Context->Parameters);
+    };
+    if (auto Counted = ElisaCheckedLoopRanges::counterRange(
+            *Phi, Loops, Recurse, Context ? ElisaCheckedLoopRanges::FactOn(On) : nullptr))
+      return *Counted;
+    if (Context && Width <= 64) {
+      auto In = [&](Value *Operand, const Facts &Where) {
+        return rangeOf(Operand, Where, Evolution, Loops, Budget, Depth + 1, Assigned, Context);
+      };
+      auto At = [&](Instruction &Point) {
+        return dominatingBounds(Point, Context->Tree, Context->Assumptions, Context->Incoming, nullptr,
+                                Context->Parameters);
+      };
+      auto Carried = Loops.isLoopHeader(Phi->getParent())
+                         ? ElisaCheckedLoopRanges::headerRange(*Phi, Loops, In, At, On)
+                         : ElisaCheckedLoopRanges::joinRange(*Phi, Loops, In, At, On);
+      if (Carried)
+        return Carried->intersectWith(Evolution.getSignedRange(Evolution.getSCEV(Phi)),
+                                      ConstantRange::Signed);
     }
+  }
   return Evolution.getSignedRange(Evolution.getSCEV(ValueToCheck));
 }
 
@@ -234,6 +270,14 @@ static bool cannotOverflow(Instruction::BinaryOps Opcode,
       if (!(A.sext(2 * Width) * B.sext(2 * Width)).isSignedIntN(Width))
         return false;
   return true;
+}
+
+static bool provenSafe(IntrinsicInst &Call, const Facts &Bounds, ScalarEvolution &Evolution,
+                       LoopInfo &Loops, const Scope &Context) {
+  unsigned Budget = 256;
+  auto Left = rangeOf(Call.getArgOperand(0), Bounds, Evolution, Loops, Budget, 0, nullptr, &Context);
+  auto Right = rangeOf(Call.getArgOperand(1), Bounds, Evolution, Loops, Budget, 0, nullptr, &Context);
+  return cannotOverflow(*checkedOpcode(Call.getIntrinsicID()), Left, Right);
 }
 
 // The checked operation cannot overflow in any case of a split on the low
@@ -331,6 +375,28 @@ static Facts dominatingBounds(Instruction &Call, DominatorTree &Tree,
   }
   return Bounds;
 }
+// The guards on `Subject` that hold at `Point`, for that value itself and
+// none computed from it.
+static ConstantRange directFact(Instruction &Point, Value *Subject, DominatorTree &Tree,
+                                AssumptionCache &Assumptions, SmallPtrSetImpl<Argument *> *Parameters) {
+  Facts Found;
+  unsigned Budget = 96;
+  for (auto *Node = Tree.getNode(Point.getParent()); Node && Budget; Node = Node->getIDom()) {
+    BasicBlock *Block = Node->getBlock();
+    auto *Branch = dyn_cast<CondBrInst>(Block->getTerminator());
+    if (!Branch || Branch->getSuccessor(0) == Branch->getSuccessor(1)) continue;
+    for (unsigned Edge = 0; Edge < 2; ++Edge) {
+      auto *Target = Branch->getSuccessor(Edge);
+      if (Tree.dominates(BasicBlockEdge(Block, Target), Point.getParent()))
+        collect(Branch->getCondition(), Edge == 0, *Branch, *Target, Tree, Assumptions, Found,
+                Budget, nullptr, Parameters, Subject);
+    }
+  }
+  auto Fact = Found.find(Subject);
+  return Fact == Found.end() ? ConstantRange::getFull(Subject->getType()->getIntegerBitWidth())
+                             : Fact->second;
+}
+
 // Inline a pair of calls that share most of their aggregate inputs after
 // removing the checked arithmetic that previously kept the helper too large.
 static void findRelatedCalls(Function &Helper,
@@ -413,16 +479,20 @@ static unsigned foldProvenSignedChecks(
       // Operands can be bounded without any dominating fact (loads with a
       // proven `!range`, bisection webs), so every candidate is tried.
       auto Bounds = dominatingBounds(*Call, Tree, Assumptions, Incoming);
-      unsigned Budget = 64;
-      auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Loops, Budget);
-      auto Right = rangeOf(Call->getArgOperand(1), Bounds, Evolution, Loops, Budget);
-      if (cannotOverflow(*checkedOpcode(Call->getIntrinsicID()), Left, Right)) {
+      Scope Stable{Tree, Assumptions, Incoming, nullptr};
+      if (provenSafe(*Call, Bounds, Evolution, Loops, Stable)) {
         Safe.push_back(Call);
         continue;
       }
-      // Within the cases of a split, with guarded parameters frozen.
+      // With guarded parameters frozen, then within the cases of a split.
       SmallPtrSet<Argument *, 4> Parameters;
       auto Split = dominatingBounds(*Call, Tree, Assumptions, Incoming, nullptr, &Parameters);
+      Scope Freezing{Tree, Assumptions, Incoming, &Parameters};
+      if (!Parameters.empty() && provenSafe(*Call, Split, Evolution, Loops, Freezing)) {
+        Safe.push_back(Call);
+        Frozen.insert(Parameters.begin(), Parameters.end());
+        continue;
+      }
       if (!Split.empty() && splitCannotOverflow(*Call, Split, Evolution, Loops)) {
         Safe.push_back(Call);
         Frozen.insert(Parameters.begin(), Parameters.end());
