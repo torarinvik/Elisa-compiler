@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "llvm_exit_dead_stores.h"
+
 namespace {
 using namespace llvm;
 
@@ -159,8 +161,10 @@ extern "C" unsigned elisacorePoolFloatingConstants(LLVMModuleRef module,
   if (!target.getTargetTriple().isAArch64())
     return 0;
   // This is the last module pass before emission, which is where the trap
-  // exit edges must be added (see llvm_trap_exit_edges.cpp).
-  unsigned changed = ElisaTrapExits::connectTrapExits(*llvm::unwrap(module));
+  // exit edges must be added (see llvm_trap_exit_edges.cpp). Stores that
+  // only the final cleanups sink into a shared exit block die here first.
+  unsigned changed = ElisaExitDeadStores::removeExitDeadStores(*llvm::unwrap(module));
+  changed += ElisaTrapExits::connectTrapExits(*llvm::unwrap(module));
   changed += ElisaBitTests::orderBitTestOperands(*llvm::unwrap(module));
   const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
       target.getTarget().createMCSubtargetInfo(
