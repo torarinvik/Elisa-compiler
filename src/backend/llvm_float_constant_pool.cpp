@@ -158,12 +158,14 @@ extern "C" unsigned elisacorePoolFloatingConstants(LLVMModuleRef module,
   if (!module || !machine)
     return 0;
   auto &target = *reinterpret_cast<llvm::TargetMachine *>(machine);
+  // Late, so the bounded length reaches the copy after every inlining.
+  unsigned expanded = ElisaBoundedCopies::expandBoundedCopies(*llvm::unwrap(module));
   if (!target.getTargetTriple().isAArch64())
-    return 0;
+    return expanded;
   // This is the last module pass before emission, which is where the trap
   // exit edges must be added (see llvm_trap_exit_edges.cpp). Stores that
   // only the final cleanups sink into a shared exit block die here first.
-  unsigned changed = ElisaExitDeadStores::removeExitDeadStores(*llvm::unwrap(module));
+  unsigned changed = expanded + ElisaExitDeadStores::removeExitDeadStores(*llvm::unwrap(module));
   changed += ElisaTrapExits::connectTrapExits(*llvm::unwrap(module));
   changed += ElisaBitTests::orderBitTestOperands(*llvm::unwrap(module));
   const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
