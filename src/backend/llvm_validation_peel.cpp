@@ -95,6 +95,7 @@ unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_interleaved_byte_stores.cpp"
 #include "llvm_guarded_unsigned_compare.h"
 #include "llvm_vector_or_accumulators.h"
+#include "llvm_bisection_ranges.h"
 #include "llvm_checked_signed_ranges.h"
 #include "llvm_recursive_argument_bounds.h"
 #include "llvm_validation_loop_passes.h"

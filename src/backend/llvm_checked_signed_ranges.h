@@ -187,11 +187,20 @@ static ConstantRange rangeOf(Value *ValueToCheck, const Facts &Bounds,
   if (auto *Cast = dyn_cast<CastInst>(ValueToCheck);
       Cast && Cast->getSrcTy()->isIntegerTy())
     return Recurse(Cast->getOperand(0)).castOp(Cast->getOpcode(), Width);
+  if (auto Hull = ElisaBisectionRanges::bisectionHull(ValueToCheck, Recurse)) return *Hull;
+  // A load whose `!range` holds is never poison, so freezing it keeps it.
+  if (auto *Frozen = dyn_cast<FreezeInst>(ValueToCheck))
+    if (auto *Load = dyn_cast<LoadInst>(Frozen->getOperand(0));
+        Load && Load->getMetadata(LLVMContext::MD_range))
+      return Recurse(Load);
 
   if (auto *Binary = dyn_cast<BinaryOperator>(ValueToCheck)) {
     auto Opcode = Binary->getOpcode();
+    // A remainder is bounded by its divisor whatever the dividend is; a
+    // quotient by the ranges of both operands.
     if (Opcode == Instruction::Add || Opcode == Instruction::Sub ||
-        Opcode == Instruction::Mul)
+        Opcode == Instruction::Mul || Opcode == Instruction::SRem ||
+        Opcode == Instruction::URem || Opcode == Instruction::SDiv)
       return Recurse(Binary->getOperand(0)).binaryOp(
           Opcode, Recurse(Binary->getOperand(1)));
   }
@@ -383,7 +392,7 @@ static unsigned foldProvenSignedChecks(
   SmallVector<CallBase *, 8> RelatedCalls;
   for (Function &Function : Module) {
     if ((Only && &Function != Only) || Function.isDeclaration() || Function.hasOptNone() ||
-        Function.getInstructionCount() > 1200)
+        Function.getInstructionCount() > 4000)
       continue;
     SmallVector<IntrinsicInst *, 16> Candidates;
     for (Instruction &Instruction : instructions(Function))
@@ -391,7 +400,8 @@ static unsigned foldProvenSignedChecks(
           Call && checkedOpcode(Call->getIntrinsicID()) &&
           Call->getArgOperand(0)->getType()->isIntegerTy(64))
         Candidates.push_back(Call);
-    if (Candidates.empty() || Candidates.size() > 64) continue;
+    // Each candidate's proof is budgeted, so the cap only bounds pathological bodies.
+    if (Candidates.empty() || Candidates.size() > 256) continue;
     auto &Tree = Analyses.getResult<DominatorTreeAnalysis>(Function);
     auto &Assumptions = Analyses.getResult<AssumptionAnalysis>(Function);
     auto &Evolution = Analyses.getResult<ScalarEvolutionAnalysis>(Function);
@@ -400,15 +410,15 @@ static unsigned foldProvenSignedChecks(
     SmallVector<IntrinsicInst *, 16> Safe;
     SmallPtrSet<Argument *, 4> Frozen;
     for (IntrinsicInst *Call : Candidates) {
+      // Operands can be bounded without any dominating fact (loads with a
+      // proven `!range`, bisection webs), so every candidate is tried.
       auto Bounds = dominatingBounds(*Call, Tree, Assumptions, Incoming);
-      if (!Bounds.empty()) {
-        unsigned Budget = 64;
-        auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Loops, Budget);
-        auto Right = rangeOf(Call->getArgOperand(1), Bounds, Evolution, Loops, Budget);
-        if (cannotOverflow(*checkedOpcode(Call->getIntrinsicID()), Left, Right)) {
-          Safe.push_back(Call);
-          continue;
-        }
+      unsigned Budget = 64;
+      auto Left = rangeOf(Call->getArgOperand(0), Bounds, Evolution, Loops, Budget);
+      auto Right = rangeOf(Call->getArgOperand(1), Bounds, Evolution, Loops, Budget);
+      if (cannotOverflow(*checkedOpcode(Call->getIntrinsicID()), Left, Right)) {
+        Safe.push_back(Call);
+        continue;
       }
       // Within the cases of a split, with guarded parameters frozen.
       SmallPtrSet<Argument *, 4> Parameters;

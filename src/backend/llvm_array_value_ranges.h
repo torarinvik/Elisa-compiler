@@ -5,12 +5,25 @@
 // the union of those ranges: a fill or an outside store puts one there, and a
 // copied element was already there. The loads get `!range` metadata, which
 // lets later folding remove bounds checks on indices read from the array
-// (permutation and order arrays indexing a second array are the common case).
+// (permutation and order arrays indexing a second array are the common case)
+// and overflow checks on arithmetic over its values. Vector stores contribute
+// their lanes, and an element-aligned copy from another analyzed array
+// contributes that array's range, so values moved between scratch arrays
+// (a matrix and its squared copy) stay bounded. Ranges are signed, so
+// remainders such as [-96, 96] survive.
 #include <llvm/Analysis/LazyValueInfo.h>
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/MDBuilder.h>
+// Defined with the signed-check prover later in the same translation unit.
+namespace ElisaCheckedSignedRanges {
+using Facts = llvm::DenseMap<llvm::Value *, llvm::ConstantRange>;
+static Facts dominatingBounds(llvm::Instruction &Call, llvm::DominatorTree &Tree,
+                              llvm::AssumptionCache &Assumptions, const Facts &Incoming,
+                              llvm::SmallPtrSetImpl<llvm::LoadInst *> *UnstableLoads,
+                              llvm::SmallPtrSetImpl<llvm::Argument *> *FrozenArguments);
+} // namespace ElisaCheckedSignedRanges
 namespace ElisaArrayRanges {
 using namespace llvm;
 
@@ -19,6 +32,8 @@ struct Accesses {
   // Loads of several consecutive elements, as the vectorizer emits.
   SmallVector<LoadInst *, 4> VectorLoads;
   SmallVector<StoreInst *, 16> Stores;
+  // Stores of several consecutive elements; only collected on request.
+  SmallVector<StoreInst *, 4> VectorStores;
   SmallVector<MemTransferInst *, 2> Copies;
   // Copies and pattern fills into the array from its first element.
   SmallVector<MemIntrinsic *, 1> Writes;
@@ -49,7 +64,8 @@ static bool elementAligned(GetElementPtrInst &Address, uint64_t ElementSize,
 // Collect the accesses of Pointer (Array or an element-aligned address in
 // it); false when some use could read or write it in another way.
 static bool collect(Value *Pointer, Type *Element, uint64_t ElementSize,
-                    const DataLayout &Layout, Accesses &Out, unsigned Depth = 0) {
+                    const DataLayout &Layout, Accesses &Out, unsigned Depth = 0,
+                    bool AllowVectorStores = false) {
   if (Depth > 4) return false;
   for (User *Use : Pointer->users()) {
     if (auto *Load = dyn_cast<LoadInst>(Use)) {
@@ -61,8 +77,11 @@ static bool collect(Value *Pointer, Type *Element, uint64_t ElementSize,
     } else if (auto *Store = dyn_cast<StoreInst>(Use)) {
       if (!Store->isSimple() || Store->getPointerOperand() != Pointer) return false;
       Type *Stored = Store->getValueOperand()->getType();
+      auto *Lanes = dyn_cast<FixedVectorType>(Stored);
       if (Stored == Element) {
         Out.Stores.push_back(Store);
+      } else if (AllowVectorStores && Lanes && Lanes->getElementType() == Element) {
+        Out.VectorStores.push_back(Store);
       } else if (isa<ConstantAggregateZero>(Store->getValueOperand()) && Depth == 0) {
         Out.Filled = true;
         Out.Fills.push_back(Store);
@@ -71,7 +90,7 @@ static bool collect(Value *Pointer, Type *Element, uint64_t ElementSize,
       }
     } else if (auto *Address = dyn_cast<GetElementPtrInst>(Use)) {
       if (!elementAligned(*Address, ElementSize, Layout) ||
-          !collect(Address, Element, ElementSize, Layout, Out, Depth + 1))
+          !collect(Address, Element, ElementSize, Layout, Out, Depth + 1, AllowVectorStores))
         return false;
     } else if (auto *Fill = dyn_cast<MemSetInst>(Use)) {
       auto *Byte = dyn_cast<ConstantInt>(Fill->getValue());
@@ -100,18 +119,25 @@ static bool collect(Value *Pointer, Type *Element, uint64_t ElementSize,
 
 class Bounds {
 public:
-  Bounds(Accesses &Uses, ScalarEvolution &Evolution, LazyValueInfo &Values)
-      : uses(Uses), evolution(Evolution), values(Values) {
+  Bounds(Accesses &Uses, ScalarEvolution &Evolution, LazyValueInfo &Values,
+         DominatorTree &Tree, AssumptionCache &Assumptions)
+      : uses(Uses), evolution(Evolution), values(Values), tree(Tree),
+        assumptions(Assumptions) {
     for (LoadInst *Load : Uses.Loads) own.insert(Load);
+    for (LoadInst *Load : Uses.VectorLoads) own.insert(Load);
   }
 
   // The union of the ranges of values the array can hold, or the full set.
-  ConstantRange hull() {
-    unsigned Width = uses.Loads.front()->getType()->getIntegerBitWidth();
+  ConstantRange hull(unsigned Width) {
     ConstantRange Result(APInt(Width, 0));
     for (StoreInst *Store : uses.Stores) {
       Result = Result.unionWith(rangeOf(Store->getValueOperand(), Store),
-                                ConstantRange::Unsigned);
+                                ConstantRange::Signed);
+      if (Result.isFullSet()) return Result;
+    }
+    for (StoreInst *Store : uses.VectorStores) {
+      Result = Result.unionWith(laneRange(Store->getValueOperand(), Width),
+                                ConstantRange::Signed);
       if (Result.isFullSet()) break;
     }
     return Result;
@@ -121,27 +147,74 @@ private:
   Accesses &uses;
   ScalarEvolution &evolution;
   LazyValueInfo &values;
+  DominatorTree &tree;
+  AssumptionCache &assumptions;
   SmallPtrSet<Value *, 16> own, visiting;
+
+  // A remainder is smaller in magnitude than its divisor, whose range the
+  // guards dominating the store bound even where the store sits in a loop
+  // that lazy value info cannot see through.
+  ConstantRange remainderRange(BinaryOperator &Remainder, Instruction *At) {
+    unsigned Width = Remainder.getType()->getIntegerBitWidth();
+    Value *Divisor = Remainder.getOperand(1);
+    ConstantRange DivisorRange = values.getConstantRange(Divisor, At, false);
+    using ElisaCheckedSignedRanges::dominatingBounds;
+    auto Facts = dominatingBounds(*At, tree, assumptions, ElisaCheckedSignedRanges::Facts(),
+                                  nullptr, nullptr);
+    if (auto Fact = Facts.find(Divisor); Fact != Facts.end())
+      DivisorRange = DivisorRange.intersectWith(Fact->second, ConstantRange::Signed);
+    ConstantRange Dividend = ConstantRange::getFull(Width);
+    return Dividend.binaryOp(Remainder.getOpcode(), DivisorRange);
+  }
+
+  // Every lane of a stored vector: constant lanes, or a load whose
+  // `!range` bounds each lane. Lanes of the array's own loads add nothing.
+  ConstantRange laneRange(Value *Stored, unsigned Width) {
+    if (own.count(Stored)) return ConstantRange::getEmpty(Width);
+    if (auto *Lanes = dyn_cast<Constant>(Stored)) {
+      auto *Type = cast<FixedVectorType>(Stored->getType());
+      ConstantRange Result = ConstantRange::getEmpty(Width);
+      for (unsigned Lane = 0; Lane < Type->getNumElements(); ++Lane) {
+        auto *Value = dyn_cast_or_null<ConstantInt>(Lanes->getAggregateElement(Lane));
+        if (!Value) return ConstantRange::getFull(Width);
+        Result = Result.unionWith(ConstantRange(Value->getValue()), ConstantRange::Signed);
+      }
+      return Result;
+    }
+    if (auto *Load = dyn_cast<LoadInst>(Stored))
+      if (MDNode *Range = Load->getMetadata(LLVMContext::MD_range))
+        return getConstantRangeFromMetadata(*Range);
+    return ConstantRange::getFull(Width);
+  }
 
   // Values flowing from the array's own loads add nothing new.
   ConstantRange rangeOf(Value *Stored, Instruction *At, unsigned Depth = 0) {
     unsigned Width = Stored->getType()->getIntegerBitWidth();
     if (own.count(Stored) || visiting.count(Stored)) return ConstantRange::getEmpty(Width);
     if (Depth > 6) return ConstantRange::getFull(Width);
-    SmallVector<Value *, 4> Choices;
-    if (auto *Merge = dyn_cast<PHINode>(Stored)) Choices.append(Merge->incoming_values().begin(),
-                                                                Merge->incoming_values().end());
+    // Each choice is judged where it is available: a phi input at the end of
+    // its incoming block, a select operand at the select. Lazy value info
+    // must not be asked about a value at a point it does not dominate.
+    SmallVector<std::pair<Value *, Instruction *>, 4> Choices;
+    if (auto *Merge = dyn_cast<PHINode>(Stored))
+      for (unsigned Index = 0; Index < Merge->getNumIncomingValues(); ++Index)
+        Choices.push_back({Merge->getIncomingValue(Index),
+                           Merge->getIncomingBlock(Index)->getTerminator()});
     if (auto *Choice = dyn_cast<SelectInst>(Stored))
-      Choices.append({Choice->getTrueValue(), Choice->getFalseValue()});
-    if (!Choices.empty() && llvm::any_of(Choices, [&](Value *V) { return own.count(V); })) {
+      Choices.append({{Choice->getTrueValue(), Choice}, {Choice->getFalseValue(), Choice}});
+    if (!Choices.empty()) {
       visiting.insert(Stored);
       ConstantRange Result = ConstantRange::getEmpty(Width);
-      for (Value *Choice : Choices)
-        Result = Result.unionWith(rangeOf(Choice, At, Depth + 1), ConstantRange::Unsigned);
+      for (auto [Choice, Context] : Choices)
+        Result = Result.unionWith(rangeOf(Choice, Context, Depth + 1), ConstantRange::Signed);
       visiting.erase(Stored);
       return Result;
     }
     ConstantRange Known = values.getConstantRange(Stored, At, false);
+    if (auto *Remainder = dyn_cast<BinaryOperator>(Stored);
+        Remainder && (Remainder->getOpcode() == Instruction::SRem ||
+                      Remainder->getOpcode() == Instruction::URem))
+      Known = Known.intersectWith(remainderRange(*Remainder, At), ConstantRange::Signed);
     if (evolution.isSCEVable(Stored->getType()))
       Known = Known.intersectWith(evolution.getUnsignedRange(evolution.getSCEV(Stored)),
                                   ConstantRange::Unsigned);
@@ -149,10 +222,16 @@ private:
   }
 };
 
+// A range that wraps as unsigned but not as signed (remainders such as
+// [-96, 96]) is still a valid `!range` and bounds signed arithmetic.
 static bool annotate(Accesses &Uses, const ConstantRange &Range) {
-  if (Range.isFullSet() || Range.isEmptySet() || Range.isWrappedSet()) return false;
+  if (Range.isFullSet() || Range.isEmptySet() ||
+      (Range.isWrappedSet() && Range.isSignWrappedSet()))
+    return false;
   bool Changed = false;
-  for (LoadInst *Load : Uses.Loads) {
+  SmallVector<LoadInst *, 20> Loads(Uses.Loads.begin(), Uses.Loads.end());
+  Loads.append(Uses.VectorLoads.begin(), Uses.VectorLoads.end());
+  for (LoadInst *Load : Loads) {
     if (Load->getMetadata(LLVMContext::MD_range)) continue;
     MDBuilder Builder(Load->getContext());
     Load->setMetadata(LLVMContext::MD_range,
@@ -162,6 +241,76 @@ static bool annotate(Accesses &Uses, const ConstantRange &Range) {
   return Changed;
 }
 
+struct Candidate {
+  AllocaInst *Array;
+  Accesses Uses;
+};
+
+// An element-aligned copy into the array from another analyzed array moves
+// that array's values; the copied range is that array's hull.
+static ConstantRange copiedRange(MemIntrinsic &Write, Type *Element, uint64_t ElementSize,
+                                 const DenseMap<AllocaInst *, ConstantRange> &Hulls,
+                                 const DataLayout &Layout) {
+  unsigned Width = Element->getIntegerBitWidth();
+  auto *Copy = dyn_cast<MemTransferInst>(&Write);
+  if (!Copy) return ConstantRange::getFull(Width);
+  auto *Source = dyn_cast<AllocaInst>(getUnderlyingObject(Copy->getRawSource()));
+  auto Known = Source ? Hulls.find(Source) : Hulls.end();
+  if (Known == Hulls.end() ||
+      cast<ArrayType>(Source->getAllocatedType())->getElementType() != Element)
+    return ConstantRange::getFull(Width);
+  APInt Offset(Layout.getIndexTypeSizeInBits(Copy->getRawSource()->getType()), 0);
+  Value *Base = Copy->getRawSource()->stripAndAccumulateConstantOffsets(Layout, Offset, true);
+  unsigned Zeros = computeKnownBits(Copy->getLength(), Layout).countMinTrailingZeros();
+  if (Base != Source || Offset.urem(ElementSize) != 0 ||
+      (Zeros < 64 && (uint64_t(1) << Zeros) % ElementSize != 0))
+    return ConstantRange::getFull(Width);
+  return Known->second;
+}
+
+static unsigned annotateFunctionArrayRanges(Function &F, FunctionAnalysisManager &Analyses) {
+  const DataLayout &Layout = F.getParent()->getDataLayout();
+  SmallVector<Candidate, 8> Candidates;
+  for (Instruction &Instruction : F.getEntryBlock()) {
+    auto *Array = dyn_cast<AllocaInst>(&Instruction);
+    auto *Type = Array ? dyn_cast<ArrayType>(Array->getAllocatedType()) : nullptr;
+    if (!Type || !Type->getElementType()->isIntegerTy() || !Array->isStaticAlloca())
+      continue;
+    Candidate Next{Array, {}};
+    if (collect(Array, Type->getElementType(),
+                Layout.getTypeAllocSize(Type->getElementType()).getFixedValue(), Layout,
+                Next.Uses, 0, true) &&
+        Next.Uses.Filled)
+      Candidates.push_back(std::move(Next));
+  }
+  if (Candidates.empty()) return 0;
+  auto &Evolution = Analyses.getResult<ScalarEvolutionAnalysis>(F);
+  auto &Values = Analyses.getResult<LazyValueAnalysis>(F);
+  auto &Tree = Analyses.getResult<DominatorTreeAnalysis>(F);
+  auto &Assumptions = Analyses.getResult<AssumptionAnalysis>(F);
+  // Arrays written only by stores first, so copies can read their hulls.
+  DenseMap<AllocaInst *, ConstantRange> Hulls;
+  for (bool Copied : {false, true})
+    for (Candidate &Target : Candidates) {
+      if (Target.Uses.Writes.empty() == Copied) continue;
+      auto *Element = cast<ArrayType>(Target.Array->getAllocatedType())->getElementType();
+      unsigned Width = Element->getIntegerBitWidth();
+      uint64_t ElementSize = Layout.getTypeAllocSize(Element).getFixedValue();
+      ConstantRange Range = Bounds(Target.Uses, Evolution, Values, Tree, Assumptions).hull(Width);
+      for (MemIntrinsic *Write : Target.Uses.Writes)
+        Range = Range.unionWith(copiedRange(*Write, Element, ElementSize, Hulls, Layout),
+                                ConstantRange::Signed);
+      Hulls.try_emplace(Target.Array, Range);
+    }
+  unsigned Changed = 0;
+  for (Candidate &Target : Candidates)
+    if (auto Hull = Hulls.find(Target.Array); Hull != Hulls.end())
+      Changed += annotate(Target.Uses, Hull->second);
+  return Changed;
+}
+
+// A second round lets an array filled by copying from another bounded array
+// (`matrix <- squared`) see that array's freshly annotated loads.
 static unsigned annotateArrayValueRanges(Module &Module) {
   PassBuilder Builder;
   FunctionAnalysisManager Analyses;
@@ -169,25 +318,11 @@ static unsigned annotateArrayValueRanges(Module &Module) {
   unsigned Changed = 0;
   for (Function &F : Module) {
     if (F.isDeclaration()) continue;
-    const DataLayout &Layout = Module.getDataLayout();
-    ScalarEvolution *Evolution = nullptr;
-    LazyValueInfo *Values = nullptr;
-    for (Instruction &Instruction : F.getEntryBlock()) {
-      auto *Array = dyn_cast<AllocaInst>(&Instruction);
-      auto *Type = Array ? dyn_cast<ArrayType>(Array->getAllocatedType()) : nullptr;
-      if (!Type || !Type->getElementType()->isIntegerTy() || !Array->isStaticAlloca())
-        continue;
-      Accesses Uses;
-      if (!collect(Array, Type->getElementType(),
-                   Layout.getTypeAllocSize(Type->getElementType()).getFixedValue(), Layout,
-                   Uses) ||
-          !Uses.Filled || Uses.Loads.empty() || !Uses.Writes.empty())
-        continue;
-      if (!Evolution) {
-        Evolution = &Analyses.getResult<ScalarEvolutionAnalysis>(F);
-        Values = &Analyses.getResult<LazyValueAnalysis>(F);
-      }
-      Changed += annotate(Uses, Bounds(Uses, *Evolution, *Values).hull());
+    for (unsigned Round = 0; Round < 2; ++Round) {
+      unsigned Annotated = annotateFunctionArrayRanges(F, Analyses);
+      Analyses.invalidate(F, PreservedAnalyses::none());
+      Changed += Annotated;
+      if (!Annotated) break;
     }
   }
   return Changed;
