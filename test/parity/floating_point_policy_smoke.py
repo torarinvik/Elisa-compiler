@@ -10,6 +10,18 @@ import tempfile
 SOURCE = '''def product_sum(a: f64, b: f64, c: f64) -> f64:
     return a*b+c
 
+# Contraction is expression-local (clang's -ffp-contract=on): a product bound
+# to a local keeps its own rounding when a later statement adds to it.
+def split_product_sum(a: f64, b: f64, c: f64) -> f64:
+    product: f64 = a*b
+    return product+c
+
+# A compound assignment is one expression: its product may still fuse.
+def compound_product_sum(a: f64, b: f64, c: f64) -> f64:
+    total: mutable f64 = c
+    total += a*b
+    return total
+
 @fast_math
 def opted_product_sum(a: f64, b: f64, c: f64) -> f64:
     return a*b+c
@@ -32,6 +44,7 @@ def product_sum_f32(a: f32, b: f32, c: f32) -> f32:
 
 export fn rounding_probe_f32(a: f32, b: f32, c: f32) -> f32 = product_sum_f32
 export fn rounding_probe(a: f64, b: f64, c: f64) -> f64 = product_sum
+export fn split_probe(a: f64, b: f64, c: f64) -> f64 = split_product_sum
 export fn opted_probe(a: f64, b: f64, c: f64) -> f64 = opted_product_sum
 export fn division_probe(a: f64, b: f64) -> f64 = quotient
 export fn neg_probe(a: f64) -> f64 = negate_value
@@ -41,7 +54,7 @@ export fn constant_probe() -> f64 = folded_value
 C_SOURCE = r'''#include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
-extern double rounding_probe(double,double,double),opted_probe(double,double,double);
+extern double rounding_probe(double,double,double),opted_probe(double,double,double),split_probe(double,double,double);
 extern double division_probe(double,double),neg_probe(double),constant_probe(void);
 extern int64_t nan_probe(double);
 extern float rounding_probe_f32(float,float,float);
@@ -51,6 +64,7 @@ int main(int argc,char **argv){
  double expected=strict?0.0:-0x1p-54;
  if(rounding_probe(a,b,c)!=expected)return 1;
  if(opted_probe(a,b,c)!=expected)return 2;
+ if(split_probe(a,b,c)!=0.0)return 10;
  if(constant_probe()!=6.0)return 3;
  float af=1.0f+0x1p-13f,bf=1.0f-0x1p-13f;
  if(rounding_probe_f32(af,bf,-1.0f)!=(strict?0.0f:-0x1p-26f))return 9;
@@ -101,7 +115,12 @@ def main():
             elif fast:
                 if 'fmul fast' not in text or 'fdiv fast' not in text:raise RuntimeError(name+': missing explicit fast-math flags')
             else:
-                if 'fmul contract' not in text or 'fdiv arcp contract' not in text:raise RuntimeError(name+': missing default policy')
+                if 'fmul contract' not in text or 'fdiv arcp double' not in text:raise RuntimeError(name+': missing default policy')
+                if 'fdiv arcp contract' in text:raise RuntimeError(name+': default division allowed contraction')
+                split=text.split('@split_product_sum(',1)[-1].split('\n}',1)[0]
+                if 'contract' in split:raise RuntimeError(name+': contraction crossed a statement')
+                compound=text.split('@compound_product_sum(',1)[-1].split('\n}',1)[0]
+                if 'fadd contract' not in compound:raise RuntimeError(name+': compound product lost contraction')
                 normal=text.split('@nan_value(',1)[-1].split('\n}',1)[0]
                 if re.search(r'fcmp (?:fast|nnan|ninf)',normal):raise RuntimeError(name+': default assumed finite input')
             if name in ('default','strict-cli','strict-over-global'):
