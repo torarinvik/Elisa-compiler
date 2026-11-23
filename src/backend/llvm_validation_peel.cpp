@@ -43,6 +43,7 @@
 #include "llvm_path_ranges.h"
 #include "llvm_index_bounds.h"
 #include "llvm_indexed_prefix.h"
+#include "llvm_view_bounded_fills.h"
 #include "llvm_proven_checks.h"
 
 using namespace llvm;
@@ -51,7 +52,9 @@ using namespace llvm;
 // in source shape: a countdown scan the unroller later splits into a
 // prologue and a stride -4 body is a guarded `n - 1` loop there.
 extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
-  return Module ? ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(Module)) : 0;
+  if (!Module) return 0;
+  unsigned Removed = ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(Module));
+  return Removed + ElisaViewBounds::shrinkViewFills(*unwrap(Module));
 }
 
 extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef moduleRef,
@@ -344,6 +347,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (ElisaArrayRanges::annotateArrayValueRanges(*unwrap(module))) status = 1;
   if (ElisaDeadTrapExits::removeDeadTrapExits(*unwrap(module))) status = 1;
   if (ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(module))) status = 1;
+  if (ElisaViewBounds::shrinkViewFills(*unwrap(module))) status = 1;
   if (ElisaProvenChecks::removeProvenChecks(*unwrap(module))) status = 1;
   unsigned finalSimplifications = elisacoreSpecializeValidationEpilogues(module);
   finalSimplifications += elisacoreFoldShiftParityLoops(*unwrap(module));
