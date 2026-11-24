@@ -179,6 +179,22 @@ if stage1_out=$("$STAGE1_BIN" -emit obj -O0 -o /dev/null "$REPO_ROOT/test/fixtur
 fi
 grep -q 'expects darray\[sview\].*darray\[i64\]' <<< "$stage1_out" || fail "stage1 rejected nested-ref mismatch for another reason: $stage1_out"
 
+# 10b. An array literal stored into a scalar is a type error, not a backend decline. A
+# `cstr` head with an extent is a SHAPED C string (stage0, spec 05), so `cstr[3]` keeps
+# its extent in the sentence; an array of C strings is spelled `array[cstr, 3]`.
+out=$(printf 'def f(i: i64) -> cstr:\n    names: cstr[3] = ["Brava", "Norde", "Kelto"]\n    return names[i.usize()]\n' | "$RPT")
+grep -q 'variable "names" expects cstr\[3\], got static u8&\[3\]' <<< "$out" || fail "array literal into shaped cstr not flagged: $out"
+grep -q 'return type expects cstr, got char' <<< "$out" || fail "shaped cstr local not indexed as a cstr: $out"
+out=$(printf 'def f() -> void:\n    x: i64 = [1, 2, 3]\n    y: f64 = [1.5]\n' | "$RPT")
+grep -q 'variable "x" expects i64, got int\[3\]' <<< "$out" || fail "array literal into i64 not flagged: $out"
+grep -q 'variable "y" expects f64, got f64\[1\]' <<< "$out" || fail "array literal into f64 not flagged: $out"
+out=$(printf 'def f(i: i64) -> cstr:\n    names: array[cstr, 3] = ["Brava", "Norde", "Kelto"]\n    return names[i.usize()]\n' | "$RPT")
+grep -qE 'expects|got' <<< "$out" && fail "false positive on array[cstr, 3]: $out"
+out=$(printf 'def f() -> u8:\n    name: cstr[3] = "abc"\n    return name[0]\n' | "$RPT")
+grep -qE 'expects|got' <<< "$out" && fail "false positive on a shaped cstr read: $out"
+out=$(printf 'def f() -> void:\n    bytes: dstr = [1, 2]\n' | "$RPT")
+grep -qE 'expects' <<< "$out" && fail "false positive on a dstr byte literal: $out"
+
 # 11. 0 findings across frontend + stdlib (self-contained resolution set).
 t=0
 while IFS= read -r f; do
