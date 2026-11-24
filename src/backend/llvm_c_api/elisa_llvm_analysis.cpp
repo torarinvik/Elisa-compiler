@@ -265,6 +265,44 @@ unsigned ElisaLLVMConstantIntActiveBits(LLVMValueRef constant) {
   return cast<ConstantInt>(unwrap(constant))->getValue().getActiveBits();
 }
 
+unsigned ElisaLLVMConstantIntMaskWidth(LLVMValueRef constant) {
+  const APInt &Value = cast<ConstantInt>(unwrap(constant))->getValue();
+  return Value.isMask() ? Value.popcount() : 0;
+}
+
+int ElisaLLVMConstantIntUnsignedGreater(LLVMValueRef first, LLVMValueRef second) {
+  return cast<ConstantInt>(unwrap(first))->getValue().ugt(cast<ConstantInt>(unwrap(second))->getValue());
+}
+
+unsigned ElisaLLVMConstantIntTrailingZeros(LLVMValueRef constant) {
+  return cast<ConstantInt>(unwrap(constant))->getValue().countr_zero();
+}
+
+LLVMValueRef ElisaLLVMConstantIntOddPart(LLVMValueRef constant) {
+  auto *Value = cast<ConstantInt>(unwrap(constant));
+  const APInt &Bits = Value->getValue();
+  return wrap(ConstantInt::get(Value->getType(), Bits.lshr(Bits.countr_zero())));
+}
+
+LLVMValueRef ElisaLLVMConstantIntLowBits(LLVMTypeRef type, unsigned bits) {
+  auto *Integer = cast<IntegerType>(unwrap(type));
+  return wrap(ConstantInt::get(Integer, APInt::getLowBitsSet(Integer->getBitWidth(), bits)));
+}
+
+int ElisaLLVMConstantIntsAgreeInLowBits(LLVMValueRef first, LLVMValueRef second, unsigned bits) {
+  const APInt &First = cast<ConstantInt>(unwrap(first))->getValue();
+  const APInt &Second = cast<ConstantInt>(unwrap(second))->getValue();
+  return ((First ^ Second) & APInt::getLowBitsSet(First.getBitWidth(), bits)).isZero();
+}
+
+int ElisaLLVMMayReadOrWriteMemory(LLVMValueRef instruction) {
+  return cast<Instruction>(unwrap(instruction))->mayReadOrWriteMemory();
+}
+
+LLVMValueRef ElisaLLVMStripPointerCasts(LLVMValueRef value) {
+  return wrap(unwrap(value)->stripPointerCasts());
+}
+
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant) {
   const APFloat &Value = cast<ConstantFP>(unwrap(constant))->getValueAPF();
   return Value.isNegative() && !Value.isZero() && !Value.isNaN() && !Value.isInfinity();

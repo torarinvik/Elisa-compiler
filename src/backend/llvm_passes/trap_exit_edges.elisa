@@ -1,0 +1,163 @@
+# Gives every trap block a CFG edge to the function's single return block. Shrink-wrapping
+# needs one restore point that post-dominates every frame use; a bounds-check trap inside a
+# loop is a second exit, so the prologue stays in the entry block and early validation
+# returns pay for a frame they never use. `llvm.trap` is noreturn, so a branch after it is
+# folded back to `unreachable` before instruction selection. An inline `brk #1` is the same
+# AArch64 instruction without that attribute, and the edge it keeps is never taken at run
+# time.
+include "./ir/ir_editing.elisa"
+
+extern LLVMInitializeAArch64AsmParser() -> void
+
+const module TrapEdgeWeight:
+    UNLIKELY: u64 = 1
+    LIKELY: u64 = 1048575
+
+extend Backend:
+    private:
+        # `call @llvm.trap(); unreachable`: the trap call, when BLOCK ends that way.
+        def trap_call(block: LLVMBasicBlockRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return null
+            return null if LLVMGetInstructionOpcode(terminator) != LLVMOpcode::UNREACHABLE
+            trap: LLVMValueRef = get LLVMGetPreviousInstruction(terminator) else return null
+            name_storage: mutable darray[u8] = []
+            trap_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.trap", name_storage), 9)
+            trap if called_intrinsic_id(trap) == trap_id else null
+
+        # `!{"branch_weights", true_weight, false_weight}`.
+        def set_branch_weights(branch: LLVMValueRef, true_weight: u64, false_weight: u64, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            weights_storage: mutable darray[u8] = []
+            i32_type: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            operands: mutable darray[LLVMMetadataRef] = [LLVMMDStringInContext2(context, sview_to_cstr("branch_weights", weights_storage), 14), LLVMValueAsMetadata(LLVMConstInt(i32_type, true_weight, 0)), LLVMValueAsMetadata(LLVMConstInt(i32_type, false_weight, 0))]
+            operand_slots: void& = (&operands[0]).cast[void&] can Unsafe.PointerCast
+            node: LLVMMetadataRef = LLVMMDNodeInContext2(context, operand_slots, 3)
+            LLVMSetMetadata(branch, profile_kind(context), LLVMMetadataAsValue(context, node))
+
+        def profile_kind(context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            kind_storage: mutable darray[u8] = []
+            LLVMGetMDKindIDInContext(context, sview_to_cstr("prof", kind_storage), 4)
+
+        # Keeps the trap edge unlikely: branch probabilities no longer see the `unreachable`
+        # that marked it cold.
+        def mark_trap_edge_unlikely(trap: LLVMBasicBlockRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for predecessor in predecessor_edges(trap) |trap, context|:
+                weigh_trap_edge(predecessor, trap, context)
+
+        # PREDECESSOR's conditional branch to TRAP, when it has no weights yet.
+        def weigh_trap_edge(predecessor: LLVMBasicBlockRef, trap: LLVMBasicBlockRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            branch: LLVMValueRef = get conditional_terminator(predecessor) else return
+            return if LLVMGetMetadata(branch, profile_kind(context)) != null or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            trap_first: bool = LLVMGetSuccessor(branch, 0) == trap
+            set_branch_weights(branch, TrapEdgeWeight::UNLIKELY if trap_first else TrapEdgeWeight::LIKELY, TrapEdgeWeight::LIKELY if trap_first else TrapEdgeWeight::UNLIKELY, context)
+
+        # The definitions outside EXIT that its non-phi instructions use. A new edge keeps
+        # the exit dominated only by definitions that also dominate the trap.
+        def exit_outside_definitions(exit: LLVMBasicBlockRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            outside: mutable darray[LLVMValueRef] = []
+            instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(exit)
+            while instruction_cursor is instruction |instruction_cursor, outside, exit|:
+                instruction_cursor <- LLVMGetNextInstruction(instruction)
+                continue if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI)
+                for operand_index in 0..<LLVMGetNumOperands(instruction) |instruction, outside, exit|:
+                    operand: LLVMValueRef = LLVMGetOperand(instruction, operand_index.u32())
+                    outside.push(operand) if LLVMIsAInstruction(operand) != null and LLVMGetInstructionParent(operand) != exit
+            outside
+
+        def dominated_by_all(trap: LLVMBasicBlockRef, outside: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> bool:
+            for definition in outside |trap, analyses|:
+                return false if ElisaLLVMBlockDominates(analyses, LLVMGetInstructionParent(definition), trap) == 0
+            true
+
+        def add_call_function_attribute(call: LLVMValueRef, name: sview, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            kind: u32 = LLVMGetEnumAttributeKindForName(sview_to_cstr(name, name_storage), name.len)
+            # LLVMAttributeFunctionIndex is UINT32_MAX.
+            LLVMAddCallSiteAttribute(call, 4294967295, LLVMCreateEnumAttribute(context, kind, 0))
+
+        # The trap becomes a cold `brk #0x1` and a branch to EXIT, whose phis take poison
+        # from the new edge.
+        def connect_trap(trap: LLVMBasicBlockRef, exit: LLVMBasicBlockRef, breakpoint: LLVMValueRef, builder: LLVMBuilderRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            mark_trap_edge_unlikely(trap, context)
+            intrinsic: LLVMValueRef = get trap_call(trap) else return
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(trap) else return
+            position_builder_before(builder, intrinsic)
+            set_builder_debug_location(builder, intrinsic)
+            call: LLVMValueRef = LLVMBuildCall2(builder, LLVMFunctionType(LLVMVoidTypeInContext(context), null, 0, 0), breakpoint, null, 0, "")
+            add_call_function_attribute(call, "cold", context)
+            add_call_function_attribute(call, "nounwind", context)
+            LLVMInstructionEraseFromParent(terminator)
+            LLVMInstructionEraseFromParent(intrinsic)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            LLVMPositionBuilderAtEnd(builder, trap)
+            _ = LLVMBuildBr(builder, exit)
+            phi_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(exit)
+            while phi_cursor is phi |phi_cursor, trap|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                phi_cursor <- LLVMGetNextInstruction(phi)
+                values: mutable darray[LLVMValueRef] = [LLVMGetPoison(LLVMTypeOf(phi))]
+                blocks: mutable darray[LLVMBasicBlockRef] = [trap]
+                value_slots: void& = (&values[0]).cast[void&] can Unsafe.PointerCast
+                block_slots: void& = (&blocks[0]).cast[void&] can Unsafe.PointerCast
+                LLVMAddIncoming(phi, value_slots, block_slots, 1)
+
+        def ends_in_return(block: LLVMBasicBlockRef) -> bool:
+            if LLVMGetBasicBlockTerminator(block) is terminator:
+                return LLVMGetInstructionOpcode(terminator) == LLVMOpcode::RET
+            false
+
+        # The function's single return block, when it is not the entry block.
+        def single_return_block(function: LLVMValueRef) -> LLVMBasicBlockRef?:
+            exit: mutable LLVMBasicBlockRef? = null
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, exit|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                continue if not ends_in_return(block)
+                return null if exit != null
+                exit <- block
+            return null if same_optional_block(exit, LLVMGetEntryBasicBlock(function))
+            exit
+
+        def trap_blocks(function: LLVMValueRef) -> darray[LLVMBasicBlockRef] can[Abort.Panic, Memory.Allocate]:
+            traps: mutable darray[LLVMBasicBlockRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, traps|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                traps.push(block) if trap_call(block) != null
+            traps
+
+        def connect_function_trap_exits(function: LLVMValueRef, breakpoint: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+            exit: LLVMBasicBlockRef = get single_return_block(function) else return 0
+            candidates: darray[LLVMBasicBlockRef] = trap_blocks(function)
+            return 0 if candidates.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            outside: darray[LLVMValueRef] = exit_outside_definitions(exit)
+            traps: mutable darray[LLVMBasicBlockRef] = []
+            for trap in candidates |traps, outside, analyses|:
+                traps.push(trap) if dominated_by_all(trap, &outside, analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            context: LLVMContextRef = LLVMGetModuleContext(LLVMGetGlobalParent(function))
+            for trap in traps |exit, breakpoint, builder, context|:
+                connect_trap(trap, exit, breakpoint, builder, context)
+            traps.count.u32()
+
+    public:
+        # The trap blocks connected to their function's return block, on AArch64.
+        def connect_trap_exits(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            # The object streamer parses inline asm; the driver may not have registered the
+            # parser. Registration is idempotent.
+            LLVMInitializeAArch64AsmParser()
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            asm_storage: mutable darray[u8] = []
+            constraint_storage: mutable darray[u8] = []
+            breakpoint_type: LLVMTypeRef = LLVMFunctionType(LLVMVoidTypeInContext(context), null, 0, 0)
+            breakpoint: LLVMValueRef = LLVMGetInlineAsm(breakpoint_type, sview_to_cstr("brk #0x1", asm_storage), 8, sview_to_cstr("", constraint_storage), 0, 1, 0, 0, 0)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, breakpoint, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + connect_function_trap_exits(function, breakpoint, builder)
+            LLVMDisposeBuilder(builder)
+            changed

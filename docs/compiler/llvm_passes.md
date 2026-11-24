@@ -9,7 +9,7 @@ one.
 
 | Directory | What it holds |
 |---|---|
-| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution (constant maximum backedge-taken counts, unsigned range maxima), value-tracking facts (including implied conditions and context-sensitive poison checks), lazy value ranges, PatternMatch constant tests (`m_One`, `m_Zero`, `m_SpecificInt`, which also accept splat vectors) and target-triple queries. `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows, subtraction, membership, and signed- and unsigned-maximum queries. `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks, dead-block deletion and compare predicates. |
+| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution (constant maximum backedge-taken counts, unsigned range maxima), value-tracking facts (including implied conditions and context-sensitive poison checks), lazy value ranges, PatternMatch constant tests (`m_One`, `m_Zero`, `m_SpecificInt`, which also accept splat vectors), constant-integer bit queries (`isMask` width, agreement in the low bits, trailing zeros, the odd part, `getLowBitsSet` constants, unsigned comparison), instruction memory queries (`mayHaveSideEffects`, `mayReadOrWriteMemory`), `stripPointerCasts` and target-triple queries. `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows, subtraction, membership, and signed- and unsigned-maximum queries. `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks, dead-block deletion, unreachable-block removal and compare predicates. |
 | `src/backend/llvm_passes/` | The standalone passes. `llvm_passes.elisa` includes every pass. `llvm_pass_registry.elisa` maps a pass name to its entry point. |
 | `src/backend/llvm_passes/ir/` | The shared IR helpers. `ir_editing.elisa`, `llvm_ir_queries.elisa` and `llvm_ir_constants.elisa` hold the editing helpers, IR queries and the LLVM 23 enum values (for example, `br` is now opcode 70 unconditional and 71 conditional). `loop_pass_policy.elisa` decides which functions a pass skips. |
 | `src/backend/llvm_passes/late_cleanup/` | The late scalar cleanup (`late_scalar_cleanup.elisa`) and the folds it runs, one file each. |
@@ -32,7 +32,9 @@ Registered names: `bit-tests`, `remainder-tests`, `remainder-tails`, `compact-sh
 `conditional-doubling`, `decimal-digit-counts`, `power-positions`, `validation-returns`,
 `shared-reciprocals`, `guarded-increments`, `nonnegative-remainders`,
 `masked-single-bits`, `interleaved-byte-stores`, `bounded-carries`, `implied-loop-exits`,
-`ring-index-bounds`, `halving-runs`, `factored-divisions`.
+`ring-index-bounds`, `halving-runs`, `factored-divisions`, `shift-parity-loops`,
+`masked-split-multiplies`, `trap-exit-edges`, `shared-divisibility`,
+`guarded-counter-bounds`, `bounded-quotient-sums`.
 
 The pass tests in `test/llvm/` and `test/parity/validation_layout_smoke.py` drive the passes
 through this command, using `test/llvm/elisa_llvm_pass.py`
@@ -54,5 +56,10 @@ Porting traps seen so far:
   Pass only non-optional pointer arrays to C.
 - `LLVMPositionBuilderBefore` does not set the debug location that the C++ `IRBuilder` sets.
   Use `position_builder_before` in `ir/ir_editing.elisa`.
+- An instruction the C++ creates directly (`UncondBrInst::Create(Target, Block)`) has no debug
+  location, but a builder keeps the last one it was given. Clear it with
+  `LLVMSetCurrentDebugLocation2(builder, null)` before building such an instruction.
+- Not every `LLVMIsA*` class test is exported: libLLVM has no `LLVMIsACallBase`. Use
+  `is_call_base` in `ir/ir_editing.elisa`, which tests the call, invoke and callbr opcodes.
 - Match the C++ predicate exactly. For example, `Triple::isAArch64()` is not a prefix test on
   the triple string, so it is a shim.

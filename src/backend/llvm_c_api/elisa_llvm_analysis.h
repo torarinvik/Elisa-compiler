@@ -84,6 +84,10 @@ int ElisaLLVMIsConstantZero(LLVMValueRef value);
 int ElisaLLVMIsSpecificInt(LLVMValueRef value, uint64_t expected);
 /* Instruction::mayHaveSideEffects. */
 int ElisaLLVMMayHaveSideEffects(LLVMValueRef instruction);
+/* Instruction::mayReadOrWriteMemory. */
+int ElisaLLVMMayReadOrWriteMemory(LLVMValueRef instruction);
+/* Value::stripPointerCasts: the value with pointer casts and zero GEPs removed. */
+LLVMValueRef ElisaLLVMStripPointerCasts(LLVMValueRef value);
 /* CallBase::doesNotAccessMemory. */
 int ElisaLLVMCallDoesNotAccessMemory(LLVMValueRef call);
 /* Whether Function::getEntryCount() has a value (a profile entry count). */
@@ -96,6 +100,18 @@ int ElisaLLVMConstantIntIsPositivePowerOfTwo(LLVMValueRef constant);
 int ElisaLLVMConstantIntEquals(LLVMValueRef constant, uint64_t value);
 /* APInt::getActiveBits of a ConstantInt: the bits up to its highest set bit. */
 unsigned ElisaLLVMConstantIntActiveBits(LLVMValueRef constant);
+/* The width of a ConstantInt that is a low-bit mask (APInt::isMask: 2^n - 1, n >= 1), else 0. */
+unsigned ElisaLLVMConstantIntMaskWidth(LLVMValueRef constant);
+/* APInt::ugt of two ConstantInts of one width. */
+int ElisaLLVMConstantIntUnsignedGreater(LLVMValueRef first, LLVMValueRef second);
+/* APInt::countr_zero of a ConstantInt: its trailing zero bits (the width for 0). */
+unsigned ElisaLLVMConstantIntTrailingZeros(LLVMValueRef constant);
+/* The ConstantInt shifted right past its trailing zeros, of the same type. */
+LLVMValueRef ElisaLLVMConstantIntOddPart(LLVMValueRef constant);
+/* APInt::getLowBitsSet(width of `type`, bits) as a ConstantInt of the integer `type`. */
+LLVMValueRef ElisaLLVMConstantIntLowBits(LLVMTypeRef type, unsigned bits);
+/* Whether two ConstantInts of one width agree in their low `bits` bits. */
+int ElisaLLVMConstantIntsAgreeInLowBits(LLVMValueRef first, LLVMValueRef second, unsigned bits);
 /* A floating-point constant that is negative, finite and not zero. */
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant);
 /* llvm::isGuaranteedNotToBeUndefOrPoison with no context instruction. */

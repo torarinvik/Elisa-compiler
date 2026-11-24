@@ -1,0 +1,144 @@
+# Proves `counter <u bound` checks true. A loop counter seeded in [0, cap] stays there when
+# its only update is +1, reached only while the counter differs from cap; a check on an edge
+# where `counter <s bound` already holds is then always true.
+include "../ir/ir_editing.elisa"
+include "../ir/loop_pass_policy.elisa"
+
+const module GuardedCounterLimit:
+    FUNCTION_BLOCKS: u32 = 128
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+    CHECKS: usize = 32
+    UPDATE_BUDGET: u32 = 32
+
+# The counter phi, its loop and the `counter ==/!= cap` test an update must be guarded by.
+struct CounterCapTest:
+    counter: LLVMValueRef
+    loop: ElisaLoopRef
+    cap_test: LLVMValueRef
+    at_cap: bool
+
+# Whether an update proved guarded, and the recursion budget left.
+struct CounterUpdate:
+    proven: bool
+    budget: u32
+
+extend Backend:
+    private:
+        # Some conditional branch on COMPARE takes its TRUTH edge on every path to AT.
+        def guarded_counter_edge(compare: LLVMValueRef, truth: bool, at: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(compare)
+            while use_cursor is use |use_cursor, compare, truth, at, analyses|:
+                use_cursor <- LLVMGetNextUse(use)
+                branch: LLVMValueRef = LLVMGetUser(use)
+                continue if not is_llvm_instruction_with_opcode(branch, LLVMOpcode::CONDITIONAL_BR) or LLVMGetCondition(branch) != compare
+                continue if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                return true if ElisaLLVMEdgeDominates(analyses, LLVMGetInstructionParent(branch), LLVMGetSuccessor(branch, 0 if truth else 1), at) != 0
+            false
+
+        # `counter + 1` reached only where the counter differs from cap.
+        def guarded_increment(update: LLVMValueRef, test: CounterCapTest&, analyses: ElisaFunctionAnalysesRef) -> bool:
+            return false if LLVMGetInstructionOpcode(update) != LLVMOpcode::ADD or LLVMGetOperand(update, 0) != test.counter
+            step: LLVMValueRef = LLVMGetOperand(update, 1)
+            return false if LLVMIsAConstantInt(step) == null or ElisaLLVMConstantIntEquals(step, 1) == 0
+            guarded_counter_edge(test.cap_test, not test.at_cap, LLVMGetInstructionParent(update), analyses)
+
+        # Whether VALUE, the counter's value at the latch, is the counter itself or a guarded
+        # increment of it, through phis and selects, within the recursion budget.
+        def guarded_counter_update(value: LLVMValueRef, test: CounterCapTest&, analyses: ElisaFunctionAnalysesRef, budget: u32) -> CounterUpdate:
+            return CounterUpdate{proven: false, budget: budget} if budget == 0
+            remaining: u32 = budget - 1
+            return CounterUpdate{proven: true, budget: remaining} if value == test.counter
+            return CounterUpdate{proven: false, budget: remaining} if LLVMIsAInstruction(value) == null
+            return CounterUpdate{proven: false, budget: remaining} if ElisaLLVMLoopContainsBlock(test.loop, LLVMGetInstructionParent(value)) == 0 or ElisaLLVMInstructionDominates(analyses, test.counter, value) == 0
+            return CounterUpdate{proven: guarded_increment(value, test, analyses), budget: remaining} if LLVMIsABinaryOperator(value) != null
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI):
+                merged: mutable CounterUpdate = CounterUpdate{proven: true, budget: remaining}
+                for edge in 0..<LLVMCountIncoming(value) |merged, value, test, analyses|:
+                    merged <- guarded_counter_update(LLVMGetIncomingValue(value, edge), test, analyses, merged.budget)
+                    return CounterUpdate{proven: false, budget: merged.budget} if not merged.proven
+                return merged
+            return CounterUpdate{proven: false, budget: remaining} if not is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT)
+            chosen: CounterUpdate = guarded_counter_update(LLVMGetOperand(value, 1), test, analyses, remaining)
+            return chosen if not chosen.proven
+            guarded_counter_update(LLVMGetOperand(value, 2), test, analyses, chosen.budget)
+
+        # `counter ==/!= cap` in LOOP with a nonnegative cap at or above the seed.
+        def counter_cap_test(user: LLVMValueRef, counter: LLVMValueRef, seed: LLVMValueRef, loop: ElisaLoopRef) -> CounterCapTest?:
+            return null if not is_llvm_instruction_with_opcode(user, LLVMOpcode::ICMP) or LLVMGetOperand(user, 0) != counter
+            predicate: i32 = LLVMGetICmpPredicate(user)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            return null if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(user)) == 0
+            cap: LLVMValueRef = LLVMGetOperand(user, 1)
+            return null if LLVMIsAConstantInt(cap) == null or ElisaLLVMConstantIntIsNegative(cap) != 0 or ElisaLLVMConstantIntUnsignedGreater(seed, cap) != 0
+            CounterCapTest{counter: counter, loop: loop, cap_test: user, at_cap: predicate == LLVMIntPredicate::EQ}
+
+        # The counter, a phi heading an innermost loop, is seeded in [0, cap] and only
+        # updated by guarded increments.
+        def guarded_counter_has_cap(counter: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            header: LLVMBasicBlockRef = LLVMGetInstructionParent(counter)
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, header) else return false
+            return false if ElisaLLVMLoopHeader(loop) != header or ElisaLLVMLoopSubLoopCount(loop) != 0 or LLVMCountIncoming(counter) != 2
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return false
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            seed: LLVMValueRef = get phi_incoming_for_block(counter, predecessor) else return false
+            return false if LLVMIsAConstantInt(seed) == null or ElisaLLVMConstantIntIsNegative(seed) != 0
+            back: LLVMValueRef = get phi_incoming_for_block(counter, latch) else return false
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(counter)
+            while use_cursor is use |use_cursor, counter, seed, loop, back, analyses|:
+                use_cursor <- LLVMGetNextUse(use)
+                if counter_cap_test(LLVMGetUser(use), counter, seed, loop) is test:
+                    return true if guarded_counter_update(back, &test, analyses, GuardedCounterLimit::UPDATE_BUDGET).proven
+            false
+
+        # `counter <s bound` (or its negation `>=s`) holds on every path to CHECK.
+        def guarded_counter_check(check: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            counter: LLVMValueRef = LLVMGetOperand(check, 0)
+            bound: LLVMValueRef = LLVMGetOperand(check, 1)
+            return false if LLVMIsAConstantInt(bound) == null or ElisaLLVMConstantIntIsNegative(bound) != 0 or ElisaLLVMConstantIntEquals(bound, 0) != 0
+            return false if ElisaLLVMInstructionDominates(analyses, counter, check) == 0
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(counter)
+            while use_cursor is use |use_cursor, counter, bound, check, analyses|:
+                use_cursor <- LLVMGetNextUse(use)
+                signed_guard: LLVMValueRef = LLVMGetUser(use)
+                continue if not is_llvm_instruction_with_opcode(signed_guard, LLVMOpcode::ICMP) or LLVMGetOperand(signed_guard, 0) != counter or LLVMGetOperand(signed_guard, 1) != bound
+                predicate: i32 = LLVMGetICmpPredicate(signed_guard)
+                continue if predicate != LLVMIntPredicate::SLT and predicate != LLVMIntPredicate::SGE
+                return guarded_counter_has_cap(counter, analyses) if guarded_counter_edge(signed_guard, predicate == LLVMIntPredicate::SLT, LLVMGetInstructionParent(check), analyses)
+            false
+
+        # The single-use `phi <u constant` conditions of the function's branches.
+        def unsigned_counter_checks(function: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            checks: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, checks|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if conditional_terminator(block) is branch:
+                    check: LLVMValueRef = LLVMGetCondition(branch)
+                    continue if not is_llvm_instruction_with_opcode(check, LLVMOpcode::ICMP) or not has_one_use(check) or LLVMGetICmpPredicate(check) != LLVMIntPredicate::ULT
+                    checks.push(check) if ElisaLLVMHasMetadataOtherThanDebugLoc(check) == 0 and is_llvm_instruction_with_opcode(LLVMGetOperand(check, 0), LLVMOpcode::PHI)
+            checks
+
+        def fold_function_counter_bounds(function: LLVMValueRef, true_value: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if skipped_by_scalar_pass_policy(function) or function_block_count(function) > GuardedCounterLimit::FUNCTION_BLOCKS or function_instruction_count(function) > GuardedCounterLimit::FUNCTION_INSTRUCTIONS
+            checks: darray[LLVMValueRef] = unsigned_counter_checks(function)
+            return 0 if checks.count == 0 or checks.count > GuardedCounterLimit::CHECKS
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            proven: mutable darray[LLVMValueRef] = []
+            for check in checks |proven, analyses|:
+                proven.push(check) if guarded_counter_check(check, analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            for check in proven |true_value|:
+                LLVMReplaceAllUsesWith(check, true_value)
+            proven.count.u32()
+
+    public:
+        # The unsigned counter checks proven true, on AArch64 without debug info.
+        def fold_guarded_counter_bounds(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not module_targets_aarch64(module) or module_has_debug_info(module)
+            true_value: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(LLVMGetModuleContext(module)), 1, 0)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, true_value|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + fold_function_counter_bounds(function, true_value)
+            changed

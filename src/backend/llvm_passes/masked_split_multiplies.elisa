@@ -1,0 +1,134 @@
+# Folds a multiply split into limbs back into one multiply under its mask. For a k-bit low
+# limb, x = low + (high << k); under a 2k-bit mask the high limb's product only needs the low k
+# bits of its multiplier, so `((x & m) * f + (((x >> k) * g) & m) << k) & M` with f and g
+# agreeing in their low k bits is `(x * f) & M` (plus any constant added before the mask).
+include "./ir/ir_editing.elisa"
+
+const module MaskedSplitLimit:
+    LOAD_DISTANCE: u32 = 32
+
+# `value OP constant` with the constant on either side for the commutative opcodes.
+struct ConstantOperand:
+    value: LLVMValueRef
+    constant: LLVMValueRef
+
+# The pieces of the matched expression the fold rebuilds from.
+struct MaskedSplitMultiply:
+    input: LLVMValueRef
+    factor: LLVMValueRef
+    increment: LLVMValueRef?
+    mask: LLVMValueRef
+
+extend Backend:
+    private:
+        # `value OP constant` (or, when COMMUTATIVE, `constant OP value`), as PatternMatch's
+        # `m_c_Op(m_Value(), m_APInt())` binds it: the constant operand is tried on the right
+        # first.
+        def constant_operand(value: LLVMValueRef, opcode: u32, commutative: bool) -> ConstantOperand?:
+            return null if not is_llvm_instruction_with_opcode(value, opcode)
+            return ConstantOperand{value: LLVMGetOperand(value, 0), constant: LLVMGetOperand(value, 1)} if LLVMIsAConstantInt(LLVMGetOperand(value, 1)) != null
+            return ConstantOperand{value: LLVMGetOperand(value, 1), constant: LLVMGetOperand(value, 0)} if commutative and LLVMIsAConstantInt(LLVMGetOperand(value, 0)) != null
+            null
+
+        def is_low_bit_mask(constant: LLVMValueRef, bits: u32) -> bool:
+            ElisaLLVMConstantIntMaskWidth(constant) == bits
+
+        # A simple load: neither volatile nor atomic.
+        def is_simple_load(value: LLVMValueRef) -> bool:
+            LLVMIsALoadInst(value) != null and LLVMGetVolatile(value) == 0 and LLVMGetOrdering(value) == 0
+
+        # Whether LATER follows EARLIER in their shared block.
+        def comes_before(earlier: LLVMValueRef, later: LLVMValueRef) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(earlier)
+            while cursor is instruction |cursor, later|:
+                return true if instruction == later
+                cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+        # At most 32 instructions between two loads, none of them a call, a fence, or a
+        # memory access other than a simple load.
+        def loads_adjacent(first: LLVMValueRef, second: LLVMValueRef) -> bool:
+            distance: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(first)
+            while cursor is instruction |cursor, distance, second|:
+                return true if instruction == second
+                distance <- distance + 1
+                return false if distance > MaskedSplitLimit::LOAD_DISTANCE or is_call_base(instruction) or LLVMIsAFenceInst(instruction) != null
+                return false if ElisaLLVMMayReadOrWriteMemory(instruction) != 0 and not is_simple_load(instruction)
+                cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+        # The two limbs read the same value: one value, or two simple loads of one address
+        # with no intervening write.
+        def same_split_source(low: LLVMValueRef, high: LLVMValueRef) -> bool:
+            return true if low == high
+            return false if not is_simple_load(low) or not is_simple_load(high) or LLVMGetInstructionParent(low) != LLVMGetInstructionParent(high)
+            return false if ElisaLLVMStripPointerCasts(LLVMGetOperand(low, 0)) != ElisaLLVMStripPointerCasts(LLVMGetOperand(high, 0))
+            return loads_adjacent(low, high) if comes_before(low, high)
+            loads_adjacent(high, low)
+
+        # The input and factor of `(input & low_mask) * factor` at ADD's operand INDEX when
+        # the other operand is the matching high limb `(((input >> k) * g) & low_mask) << k`.
+        def split_limbs(sum: LLVMValueRef, index: u32, half: u32) -> ConstantOperand?:
+            low_product: ConstantOperand = get constant_operand(LLVMGetOperand(sum, index), LLVMOpcode::MUL, true) else return null
+            low: ConstantOperand = get constant_operand(low_product.value, LLVMOpcode::AND, true) else return null
+            return null if not is_low_bit_mask(low.constant, half)
+            shifted: ConstantOperand = get constant_operand(LLVMGetOperand(sum, 1 - index), LLVMOpcode::SHL, false) else return null
+            return null if ElisaLLVMConstantIntEquals(shifted.constant, half.u64()) == 0
+            high_masked: ConstantOperand = get constant_operand(shifted.value, LLVMOpcode::AND, true) else return null
+            return null if not is_low_bit_mask(high_masked.constant, half)
+            high_product: ConstantOperand = get constant_operand(high_masked.value, LLVMOpcode::MUL, true) else return null
+            return null if ElisaLLVMConstantIntsAgreeInLowBits(low_product.constant, high_product.constant, half) == 0
+            high: ConstantOperand = get constant_operand(high_product.value, LLVMOpcode::LSHR, false) else return null
+            return null if ElisaLLVMConstantIntEquals(high.constant, half.u64()) == 0 or not same_split_source(low.value, high.value)
+            ConstantOperand{value: low.value, constant: low_product.constant}
+
+        def masked_split_multiply(root: LLVMValueRef) -> MaskedSplitMultiply?:
+            masked: ConstantOperand = get constant_operand(root, LLVMOpcode::AND, true) else return null
+            bits: u32 = ElisaLLVMConstantIntMaskWidth(masked.constant)
+            return null if bits < 2 or bits % 2 != 0
+            sum: mutable LLVMValueRef = masked.value
+            increment: mutable LLVMValueRef? = null
+            if constant_operand(sum, LLVMOpcode::ADD, true) is incremented:
+                sum <- incremented.value
+                increment <- incremented.constant
+            return null if not is_llvm_instruction_with_opcode(sum, LLVMOpcode::ADD)
+            for index in 0..<2 |sum, bits, increment, masked|:
+                if split_limbs(sum, index.u32(), bits / 2) is limbs:
+                    return MaskedSplitMultiply{input: limbs.value, factor: limbs.constant, increment: increment, mask: masked.constant}
+            null
+
+        # `(input * factor [+ increment]) & mask` in place of ROOT.
+        def fold_masked_split_multiply(root: LLVMValueRef, builder: LLVMBuilderRef) -> bool:
+            split: MaskedSplitMultiply = get masked_split_multiply(root) else return false
+            position_builder_before(builder, root)
+            product: mutable LLVMValueRef = LLVMBuildMul(builder, split.input, split.factor, "")
+            if split.increment is increment:
+                product <- LLVMBuildAdd(builder, product, increment, "")
+            LLVMReplaceAllUsesWith(root, LLVMBuildAnd(builder, product, split.mask, ""))
+            LLVMInstructionEraseFromParent(root)
+            true
+
+        def fold_masked_split_multiplies_in(block: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> u32:
+            folded: mutable u32 = 0
+            instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while instruction_cursor is instruction |instruction_cursor, folded, builder|:
+                instruction_cursor <- LLVMGetNextInstruction(instruction)
+                continue if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::AND) or LLVMGetTypeKind(LLVMTypeOf(instruction)) != LLVMTypeKindValue::INTEGER
+                folded <- folded + 1 if fold_masked_split_multiply(instruction, builder)
+            folded
+
+    public:
+        # The split multiplies folded, in every function.
+        def fold_masked_split_multiplies(module: LLVMModuleRef) -> u32:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            folded: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, folded, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, folded, builder|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    folded <- folded + fold_masked_split_multiplies_in(block, builder)
+            LLVMDisposeBuilder(builder)
+            folded

@@ -19,7 +19,6 @@ sources=(
   "$backend/llvm_memory_and_call_passes.cpp"
   "$backend/llvm_small_zero.cpp"
   "$backend/llvm_numeric_passes.cpp"
-  "$backend/llvm_masked_split_multiply.cpp"
   "$backend/llvm_bounded_remainder.cpp"
   "$backend/llvm_signed_range_masks.cpp"
   "$backend/llvm_c_api/elisa_llvm_analysis.cpp"

@@ -4,6 +4,5 @@
 #include "llvm_index_bounds.cpp"
 #include "llvm_array_copy_elision.cpp"
 #include "llvm_bounded_sum.cpp"
-#include "llvm_trap_exit_edges.cpp"
 #include "llvm_bounded_copies.cpp"
 #include "llvm_float_constant_pool.cpp"

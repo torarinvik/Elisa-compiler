@@ -29,6 +29,10 @@ void ElisaLLVMDeleteDeadBlocks(LLVMBasicBlockRef *blocks, uint32_t count);
  * becomes one. */
 void ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(LLVMValueRef value);
 
+/* llvm::removeUnreachableBlocks: deletes the blocks the function's entry
+ * cannot reach; whether any was deleted. */
+int ElisaLLVMRemoveUnreachableBlocks(LLVMValueRef function);
+
 /* ICmpInst::setPredicate: `predicate` is an LLVMIntPredicate. */
 void ElisaLLVMSetICmpPredicate(LLVMValueRef compare, LLVMIntPredicate predicate);
 

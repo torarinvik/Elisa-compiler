@@ -153,20 +153,27 @@ bool poolFunctionConstants(Function &function) {
 }
 } // namespace
 
+// Late, so the bounded length reaches the copy after every inlining. On
+// AArch64, stores that only the final cleanups sink into a shared exit block
+// die here, before the trap exit edges (trap_exit_edges.elisa) are added.
+extern "C" unsigned elisacoreExpandLateCopies(LLVMModuleRef module, LLVMTargetMachineRef machine) {
+  if (!module || !machine)
+    return 0;
+  auto &target = *reinterpret_cast<llvm::TargetMachine *>(machine);
+  unsigned expanded = ElisaBoundedCopies::expandBoundedCopies(*llvm::unwrap(module));
+  if (!target.getTargetTriple().isAArch64())
+    return expanded;
+  return expanded + ElisaExitDeadStores::removeExitDeadStores(*llvm::unwrap(module));
+}
+
 extern "C" unsigned elisacorePoolFloatingConstants(LLVMModuleRef module,
                                                    LLVMTargetMachineRef machine) {
   if (!module || !machine)
     return 0;
   auto &target = *reinterpret_cast<llvm::TargetMachine *>(machine);
-  // Late, so the bounded length reaches the copy after every inlining.
-  unsigned expanded = ElisaBoundedCopies::expandBoundedCopies(*llvm::unwrap(module));
   if (!target.getTargetTriple().isAArch64())
-    return expanded;
-  // This is the last module pass before emission, which is where the trap
-  // exit edges must be added (see llvm_trap_exit_edges.cpp). Stores that
-  // only the final cleanups sink into a shared exit block die here first.
-  unsigned changed = expanded + ElisaExitDeadStores::removeExitDeadStores(*llvm::unwrap(module));
-  changed += ElisaTrapExits::connectTrapExits(*llvm::unwrap(module));
+    return 0;
+  unsigned changed = 0;
   const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
       target.getTarget().createMCSubtargetInfo(
           target.getTargetTriple(), target.getTargetCPU(), target.getTargetFeatureString()));

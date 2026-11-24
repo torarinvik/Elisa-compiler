@@ -31,6 +31,10 @@ void ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(LLVMValueRef value) {
   RecursivelyDeleteTriviallyDeadInstructions(unwrap(value));
 }
 
+int ElisaLLVMRemoveUnreachableBlocks(LLVMValueRef function) {
+  return removeUnreachableBlocks(*cast<Function>(unwrap(function)));
+}
+
 void ElisaLLVMSetICmpPredicate(LLVMValueRef compare, LLVMIntPredicate predicate) {
   cast<ICmpInst>(unwrap(compare))->setPredicate(static_cast<CmpInst::Predicate>(predicate));
 }
