@@ -76,6 +76,26 @@ grep -q 'struct "Point" has no field "z"' <<< "$out" || fail "unknown let-destru
 out=$(printf "${P2}def lr(point: Point) -> i64:\n    let {x: renamed} = point\n    return renamed\n" | "$RPT")
 grep -q 'has no field "renamed"' <<< "$out" && fail "binder was confused with let field selector: $out"
 
+# Field access on a struct reached through a module-qualified type. stage0 names the
+# struct by its dotted module path; a bare name only for a top-level struct.
+out=$(printf "${P2}def fa(point: Point) -> i64:\n    point.z\n" | "$RPT")
+grep -q 'struct "Point" has no field "z"' <<< "$out" || fail "top-level field access not flagged bare: $out"
+out=$(printf "module Outer:\n    struct Thing:\n        a: i64\nmodule Other:\n    def fq(t: Outer::Thing) -> i64:\n        t.missing\n" | "$RPT")
+grep -q 'struct "Outer.Thing" has no field "missing"' <<< "$out" || fail "qualified parameter field not flagged: $out"
+out=$(printf "module Outer:\n    module Inner:\n        struct Thing:\n            a: i64\nmodule Other:\n    struct Box:\n        thing: Outer::Inner::Thing\n    def fc(b: Box) -> i64:\n        b.thing.missing\n" | "$RPT")
+grep -q 'struct "Outer.Inner.Thing" has no field "missing"' <<< "$out" || fail "qualified field-chain field not flagged: $out"
+# Two modules declaring `Thing`: each access is checked against the struct it names, not
+# the union of both field lists.
+SAME='module Left:\n    struct Thing:\n        a: i64\nmodule Right:\n    struct Thing:\n        b: i64\n'
+out=$(printf "${SAME}    def fl(t: Left::Thing) -> i64:\n        t.b\n    def fr(t: Thing) -> i64:\n        t.a\n" | "$RPT")
+grep -q 'struct "Left.Thing" has no field "b"' <<< "$out" || fail "field of the other same-named struct not flagged: $out"
+grep -q 'struct "Right.Thing" has no field "a"' <<< "$out" || fail "bare same-named struct not resolved to its module: $out"
+out=$(printf "${SAME}    def fv(t: Left::Thing, u: Thing) -> i64:\n        t.a + u.b\n" | "$RPT")
+grep -q "has no field" <<< "$out" && fail "false positive on valid same-named struct fields: $out"
+# A loop binder shadows only inside its loop.
+out=$(printf "module Outer:\n    struct Thing:\n        a: i64\n    def fs(t: Thing) -> i64:\n        inner: Thing = t\n        for t in 0..<3:\n            pass\n        inner.missing\n" | "$RPT")
+grep -q 'struct "Outer.Thing" has no field "missing"' <<< "$out" || fail "local in a module not flagged with its module: $out"
+
 n=0
 while IFS= read -r f; do
   c=$("$RPT" < "$f" 2>/dev/null | grep -cE "has no field|more than once|is missing field" || true)
