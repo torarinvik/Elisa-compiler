@@ -1,0 +1,176 @@
+# Stage1 backend — call arguments no hidden region can be inferred for. A callee that grows
+# a reference parameter's storage takes that storage's arena as a hidden argument. When the
+# argument is rooted at a LOCAL reference whose referent this function does not track (a
+# cast, a global, a call result with no named root), no arena of this function is right:
+# its own arena dies at return and the callee's growth dangles. stage0 rejects the call with
+# "cannot infer region parameter"; the backend records the same fact, declines the body,
+# and the driver reports it as that diagnostic.
+# Part of `module Backend` (see codegen.elisa).
+
+const module RegionUninferableField:
+    LINE: u32 = 0
+    COLUMN: u32 = 1
+    OFFSET: u32 = 2
+    END_LINE: u32 = 3
+    END_COLUMN: u32 = 4
+    END_OFFSET: u32 = 5
+    OWNER: u32 = 6
+    CALLEE: u32 = 7
+    PARAMETER: u32 = 8
+    COUNT: u32 = 9
+
+extend Backend:
+    private:
+        # Whether the local reference NAME has a referent this function does not track: an
+        # alias root that is not a named local ("?", a global, a call result), or one that is
+        # itself an untracked local reference. A reference with no recorded alias is left to
+        # the existing fallback.
+        def ref_local_referent_untracked(name: sview, local_scope: mutable Scope&, depth: u32) -> bool can[Abort.Panic]:
+            return true if depth >= 8
+            untracked: mutable bool = false
+            for alias_index in 0..<local_scope.ref_alias_names.count |local_scope, name, depth, untracked|:
+                continue if local_scope.ref_alias_names[alias_index] != name
+                alias_root: sview = local_scope.ref_alias_roots[alias_index]
+                root_index: i64 = -1 if alias_root == "?" else lookup_index(local_scope, alias_root)
+                if root_index < 0:
+                    untracked <- true
+                    continue
+                root_type: ValueType = lookup_type(local_scope, alias_root)
+                continue if loop_scratch_scalar_type(root_type) or root_type.kind != TypeKind.Ref
+                continue if root_index.usize() < local_scope.source_parameter_count
+                untracked <- true if ref_local_referent_untracked(alias_root, local_scope, depth + 1)
+            untracked
+
+        # Whether ARGUMENT is rooted at a local reference (not a parameter) whose referent
+        # this function does not track.
+        def region_argument_untracked(argument: Expr, local_scope: mutable Scope&) -> bool can[Abort.Panic]:
+            root: sview = growth_root_name(argument)
+            return false if root == ""
+            root_index: i64 = lookup_index(local_scope, root)
+            return false if root_index < 0 or root_index.usize() < local_scope.source_parameter_count
+            return false if lookup_type(local_scope, root).kind != TypeKind.Ref
+            ref_local_referent_untracked(root, local_scope, 0)
+
+        # The arena for the hidden region slot of the callee row's parameter POSITION, whose
+        # source argument is ARGUMENT. An untracked argument inside a program-lifetime block
+        # (`in perm:`, a program region) takes the ambient arena, which outlives every
+        # referent, as stage0 binds `perm`. Otherwise the call has no inferable region: the
+        # fact is recorded and the call declines.
+        def hidden_region_argument_arena(argument: Expr, fn_index: i64, position: usize, fns: FnTable&, local_scope: mutable Scope&, runtime: Runtime&, structs: mutable StructTable&) -> LLVMValueRef? can[Abort.Panic]:
+            return growth_arena_for(argument, local_scope, runtime) if not region_argument_untracked(argument, local_scope)
+            return runtime.arena if not llvm_value_is_null(runtime.arena) and LLVMIsAGlobalVariable(runtime.arena) != null
+            if structs.diagnostics.region_uninferable.callee == "":
+                row: usize = fn_index.usize()
+                structs.diagnostics.region_uninferable.owner <- fns.owners[row]
+                structs.diagnostics.region_uninferable.callee <- fns.names[row]
+                structs.diagnostics.region_uninferable.parameter <- fns.param_names[fns.param_start[row] + position]
+            null
+
+        # The name a call expression calls: `f` for `f(...)`, `m` for `x.m(...)` and
+        # `M.m(...)`, "" otherwise.
+        def called_name(expression: Expr) -> sview:
+            if expression is Expr.Call(callee, _, _, _):
+                return match callee:
+                    Expr.Ident(name, _): name
+                    Expr.Field(_, field, _): field
+                    Expr.Scope(_, member, _): member
+                    _: ""
+            ""
+
+        # The span of the declining call named by a recorded uninferable region, taken from
+        # the first call expression with that name to decline after it was recorded.
+        def remember_region_uninferable_call(expression: Expr, structs: mutable StructTable&) -> void:
+            return if structs.diagnostics.region_uninferable.callee == "" or structs.diagnostics.region_uninferable.located
+            return if called_name(expression) != structs.diagnostics.region_uninferable.callee
+            if expression is Expr.Call(_, _, _, position):
+                structs.diagnostics.region_uninferable.position <- position
+                structs.diagnostics.region_uninferable.located <- true
+
+        def reset_region_uninferable(structs: mutable StructTable&) -> void:
+            structs.diagnostics.region_uninferable <- RegionUninferableCall{}
+
+        def region_uninferable_text(text: sview, ctx: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            storage: mutable darray[u8] = []
+            text_cstr: cstr = sview_to_cstr(text, storage)
+            LLVMMetadataAsValue(ctx, LLVMMDStringInContext2(ctx, text_cstr, text.len))
+
+        def region_uninferable_number(value: u32, ctx: LLVMContextRef) -> LLVMValueRef:
+            LLVMConstInt(LLVMInt32TypeInContext(ctx), value.u64(), 0)
+
+        # `!elisa.region_uninferable`: one node per declined body whose decline is a located
+        # uninferable region, fields in RegionUninferableField order.
+        def record_region_uninferable(structs: StructTable&, m: LLVMModuleRef, ctx: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fact: RegionUninferableCall = structs.diagnostics.region_uninferable
+            return if not fact.located
+            fields: mutable darray[LLVMValueRef] = []
+            fields.push(region_uninferable_number(fact.position.line, ctx))
+            fields.push(region_uninferable_number(fact.position.column, ctx))
+            fields.push(region_uninferable_number(fact.position.offset, ctx))
+            fields.push(region_uninferable_number(fact.position.end_line, ctx))
+            fields.push(region_uninferable_number(fact.position.end_column, ctx))
+            fields.push(region_uninferable_number(fact.position.end_offset, ctx))
+            fields.push(region_uninferable_text(fact.owner, ctx))
+            fields.push(region_uninferable_text(fact.callee, ctx))
+            fields.push(region_uninferable_text(fact.parameter, ctx))
+            metadata: mutable darray[LLVMMetadataRef] = []
+            for field in fields |metadata|:
+                metadata.push(LLVMValueAsMetadata(field))
+            # The postfix `can` grant does not parse inside an argument list.
+            metadata_slots: void& = (&metadata[0]).cast[void&] can Unsafe.PointerCast
+            metadata_node: LLVMMetadataRef = LLVMMDNodeInContext2(ctx, metadata_slots, metadata.count)
+            LLVMAddNamedMetadataOperand(m, "elisa.region_uninferable", LLVMMetadataAsValue(ctx, metadata_node))
+
+        # Appends the text of an MDString operand to OUT.
+        def append_region_uninferable_text(field: LLVMValueRef, out: mutable darray[u8]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            length: mutable u32 = 0
+            length_slot: void& = (&length).cast[void&] can Unsafe.PointerCast
+            if LLVMGetMDString(field, length_slot) is text:
+                text_bytes: u8& = text.cast[u8&] can Unsafe.PointerCast
+                out.extend(unsafe_sview_bounded_bytes(text_bytes, length.usize()))
+
+        def region_uninferable_field_number(field: LLVMValueRef) -> u32:
+            LLVMConstIntGetZExtValue(field).u32()
+
+        # The operands of one recorded node, or none when it is not one of ours. LLVM
+        # overwrites every slot; each is seeded with the node itself, a valid handle.
+        def region_uninferable_fields(metadata_node: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fields: mutable darray[LLVMValueRef] = []
+            return fields if LLVMIsAMDNode(metadata_node) == null or LLVMGetMDNodeNumOperands(metadata_node) != RegionUninferableField::COUNT
+            fields <- [metadata_node for _ in 0..<RegionUninferableField::COUNT.usize()]
+            field_slots: void& = (&fields[0]).cast[void&] can Unsafe.PointerCast
+            LLVMGetMDNodeOperands(metadata_node, field_slots)
+            fields
+
+        def region_uninferable_node(m: LLVMModuleRef, index: u32) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            placeholder: LLVMValueRef = LLVMConstInt(LLVMInt32TypeInContext(LLVMGetModuleContext(m)), 0, 0)
+            nodes: mutable darray[LLVMValueRef] = [placeholder for _ in 0..<region_uninferable_count(m).usize()]
+            node_slots: void& = (&nodes[0]).cast[void&] can Unsafe.PointerCast
+            LLVMGetNamedMetadataOperands(m, "elisa.region_uninferable", node_slots)
+            nodes[index.usize()]
+
+    public:
+        # One call whose hidden region could not be inferred: the callee row's module and
+        # name, the parameter, and the call's span once a declining call supplied it.
+        struct RegionUninferableCall:
+            owner: mutable sview = ""
+            callee: mutable sview = ""
+            parameter: mutable sview = ""
+            located: mutable bool = false
+            position: mutable Ast::Pos = Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+
+        # How many uninferable-region calls the declined bodies recorded.
+        def region_uninferable_count(m: LLVMModuleRef) -> u32:
+            LLVMGetNamedMetadataNumOperands(m, "elisa.region_uninferable")
+
+        # Recorded call INDEX (below region_uninferable_count): its callee, module-qualified
+        # as stage0 names it (`Game.steer`), appended to CALLEE, its parameter to PARAMETER,
+        # and its span returned.
+        def region_uninferable_entry(m: LLVMModuleRef, index: u32, callee: mutable darray[u8]&, parameter: mutable darray[u8]&) -> Ast::Pos can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fields: darray[LLVMValueRef] = region_uninferable_fields(region_uninferable_node(m, index))
+            return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0} if fields.count == 0
+            owner_start: usize = callee.count
+            append_region_uninferable_text(fields[RegionUninferableField::OWNER.usize()], callee)
+            callee.push(46) if callee.count > owner_start            # '.'
+            append_region_uninferable_text(fields[RegionUninferableField::CALLEE.usize()], callee)
+            append_region_uninferable_text(fields[RegionUninferableField::PARAMETER.usize()], parameter)
+            Ast::Pos{line: region_uninferable_field_number(fields[RegionUninferableField::LINE.usize()]), column: region_uninferable_field_number(fields[RegionUninferableField::COLUMN.usize()]), offset: region_uninferable_field_number(fields[RegionUninferableField::OFFSET.usize()]), end_line: region_uninferable_field_number(fields[RegionUninferableField::END_LINE.usize()]), end_column: region_uninferable_field_number(fields[RegionUninferableField::END_COLUMN.usize()]), end_offset: region_uninferable_field_number(fields[RegionUninferableField::END_OFFSET.usize()])}
