@@ -77,6 +77,9 @@ int ElisaLLVMHasMetadataOtherThanDebugLoc(LLVMValueRef instruction);
  * of them (a splat, or lanes that are all the value or poison). */
 int ElisaLLVMIsConstantOne(LLVMValueRef value);
 int ElisaLLVMIsConstantZero(LLVMValueRef value);
+/* PatternMatch's m_SpecificInt(value): an integer constant, or a splat vector of
+ * one, equal to `value` at any width. */
+int ElisaLLVMIsSpecificInt(LLVMValueRef value, uint64_t expected);
 /* Instruction::mayHaveSideEffects. */
 int ElisaLLVMMayHaveSideEffects(LLVMValueRef instruction);
 /* CallBase::doesNotAccessMemory. */

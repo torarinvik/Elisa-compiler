@@ -9,7 +9,7 @@ one.
 
 | Directory | What it holds |
 |---|---|
-| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution, value-tracking facts and target-triple queries. `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows, subtraction, and signed-maximum queries. `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks, dead-block deletion and compare predicates. |
+| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution, value-tracking facts, PatternMatch constant tests (`m_One`, `m_Zero`, `m_SpecificInt`, which also accept splat vectors) and target-triple queries. `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows, subtraction, and signed-maximum queries. `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks, dead-block deletion and compare predicates. |
 | `src/backend/llvm_passes/` | The standalone passes. `llvm_passes.elisa` includes every pass. `llvm_pass_registry.elisa` maps a pass name to its entry point. |
 | `src/backend/llvm_passes/ir/` | The shared IR helpers. `ir_editing.elisa`, `llvm_ir_queries.elisa` and `llvm_ir_constants.elisa` hold the editing helpers, IR queries and the LLVM 23 enum values (for example, `br` is now opcode 70 unconditional and 71 conditional). `loop_pass_policy.elisa` decides which functions a pass skips. |
 | `src/backend/llvm_passes/late_cleanup/` | The late scalar cleanup (`late_scalar_cleanup.elisa`) and the folds it runs, one file each. |
@@ -31,7 +31,7 @@ after the pass.
 Registered names: `bit-tests`, `remainder-tests`, `remainder-tails`, `compact-shift-loops`,
 `conditional-doubling`, `decimal-digit-counts`, `power-positions`, `validation-returns`,
 `shared-reciprocals`, `guarded-increments`, `nonnegative-remainders`,
-`masked-single-bits`.
+`masked-single-bits`, `interleaved-byte-stores`.
 
 The pass tests in `test/llvm/` and `test/parity/validation_layout_smoke.py` drive the passes
 through this command, using `test/llvm/elisa_llvm_pass.py`

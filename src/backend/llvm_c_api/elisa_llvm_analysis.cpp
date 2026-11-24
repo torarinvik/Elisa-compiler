@@ -217,6 +217,10 @@ int ElisaLLVMIsConstantZero(LLVMValueRef value) {
   return PatternMatch::match(unwrap(value), PatternMatch::m_Zero());
 }
 
+int ElisaLLVMIsSpecificInt(LLVMValueRef value, uint64_t expected) {
+  return PatternMatch::match(unwrap(value), PatternMatch::m_SpecificInt(expected));
+}
+
 int ElisaLLVMMayHaveSideEffects(LLVMValueRef instruction) {
   return cast<Instruction>(unwrap(instruction))->mayHaveSideEffects();
 }

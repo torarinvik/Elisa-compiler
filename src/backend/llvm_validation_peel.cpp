@@ -97,7 +97,6 @@ unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldOddTrailingZeroSelects(llvm::Module &);
 unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
-#include "llvm_interleaved_byte_stores.cpp"
 #include "llvm_guarded_unsigned_compare.h"
 #include "llvm_vector_or_accumulators.h"
 #include "llvm_bisection_ranges.h"
