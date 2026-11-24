@@ -1,0 +1,255 @@
+# Even-integer range tests and halved even differences on AArch64 Linux and Darwin.
+#
+# - `(x + offset) <u limit or trunc(x)` (x outside a range or odd), where the accepted
+#   range is `[lower, lower + span]` with an even lower bound and `span + 1` a power of two
+#   times two, becomes `((x - lower) & ~span) != 0`: one subtract-and-mask test.
+# - `(a - (b + ((a - b) & 1))) sdiv 2`, the difference rounded down to an even number and
+#   halved, becomes `(a - b) >> 1` on frozen inputs (also through an even bias and a
+#   checked even addition).
+# - On an AArch64 host, a loop with eight or more `(x - 32768) <u -65536` checks compares
+#   `x + 32768 >u 65535` against a limit an inline `mov` materializes, which keeps the
+#   backend from replacing the comparison with a slower sign-extend test.
+include "../../ir/loop_pass_policy.elisa"
+
+const module EvenRangeLimit:
+    SIGNED16_OFFSET: i64 = -32768
+    SIGNED16_LIMIT: i64 = -65536
+    SIGNED16_BIAS: u64 = 32768
+    SIGNED16_CHECKS: usize = 8
+    SIGNED16_ASM: sview = "mov $0, #65535"
+    SIGNED16_CONSTRAINTS: sview = "=r"
+
+# The constant and the other operand of an `add` with one constant side.
+struct ConstantAddend:
+    constant: LLVMValueRef
+    input: LLVMValueRef
+
+extend Backend:
+    private:
+        def is_plain_wrapping_add(value: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::ADD) and is_llvm_integer_type(LLVMTypeOf(value), 64) and LLVMGetNSW(value) == 0 and LLVMGetNUW(value) == 0 and ElisaLLVMHasMetadataOtherThanDebugLoc(value) == 0
+
+        def is_even_constant(value: LLVMValueRef) -> bool:
+            LLVMIsAConstantInt(value) != null and (LLVMConstIntGetZExtValue(value) & 1) == 0
+
+        # The constant side of ADD (the right one when both are) and the other operand.
+        def constant_addend(add: LLVMValueRef) -> ConstantAddend?:
+            right: LLVMValueRef = LLVMGetOperand(add, 1)
+            return ConstantAddend{constant: right, input: LLVMGetOperand(add, 0)} if LLVMIsAConstantInt(right) != null
+            left: LLVMValueRef = LLVMGetOperand(add, 0)
+            return ConstantAddend{constant: left, input: right} if LLVMIsAConstantInt(left) != null
+            null
+
+        # The lower bound of the even range that `(x + offset) <u limit` rejects outside
+        # of, with its span as the second element, when the range has the even shape.
+        def even_range_bounds(offset: i64, limit: i64) -> darray[u64] can[Memory.Allocate]:
+            return [] if offset >= 0 or limit >= 0
+            # `~v` is `-v - 1`. The most negative limit gives an odd span and is rejected
+            # with the other odd spans.
+            upper: u64 = (~offset).u64()
+            span: u64 = (~limit).u64()
+            half: u64 = span >> 1
+            return [] if span == 0 or (span & 1) != 0 or half == 0 or (half & (half + 1)) != 0 or upper < span
+            lower: u64 = upper - span
+            return [] if (lower & 1) != 0
+            [lower, span]
+
+        # `compare or odd` with compare `(x + offset) <u limit` and odd `trunc x to i1`,
+        # rewritten to the masked test; whether it was.
+        def fold_even_range_test(root: LLVMValueRef, builder: LLVMBuilderRef) -> bool can[Memory.Allocate]:
+            return false if not is_llvm_integer_type(LLVMTypeOf(root), 1) or ElisaLLVMHasMetadataOtherThanDebugLoc(root) != 0
+            for order in 0..<2.u32() |root, builder|:
+                compare: LLVMValueRef = LLVMGetOperand(root, order)
+                odd: LLVMValueRef = LLVMGetOperand(root, 1 - order)
+                if is_even_range_compare(compare) and is_low_bit_truncation(odd):
+                    add: LLVMValueRef = LLVMGetOperand(compare, 0)
+                    if constant_addend(add) is addend:
+                        if addend.input == LLVMGetOperand(odd, 0):
+                            bounds: darray[u64] = even_range_bounds(LLVMConstIntGetSExtValue(addend.constant), LLVMConstIntGetSExtValue(LLVMGetOperand(compare, 1)))
+                            if bounds.count == 2:
+                                replace_with_masked_test(root, addend.input, bounds, builder)
+                                return true
+            false
+
+        def is_even_range_compare(compare: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT or ElisaLLVMHasMetadataOtherThanDebugLoc(compare) != 0
+            LLVMIsAConstantInt(LLVMGetOperand(compare, 1)) != null and is_plain_wrapping_add(LLVMGetOperand(compare, 0))
+
+        def is_low_bit_truncation(odd: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(odd, LLVMOpcode::TRUNC) and is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(odd, 0)), 64) and is_llvm_integer_type(LLVMTypeOf(odd), 1) and ElisaLLVMHasMetadataOtherThanDebugLoc(odd) == 0
+
+        def replace_with_masked_test(root: LLVMValueRef, input: LLVMValueRef, bounds: darray[u64]&, builder: LLVMBuilderRef) -> void:
+            position_builder_before(builder, root)
+            type: LLVMTypeRef = LLVMTypeOf(input)
+            adjusted: LLVMValueRef = LLVMBuildSub(builder, input, LLVMConstInt(type, bounds[0], 0), "")
+            masked: LLVMValueRef = LLVMBuildAnd(builder, adjusted, LLVMConstInt(type, ~bounds[1], 0), "")
+            LLVMReplaceAllUsesWith(root, LLVMBuildICmp(builder, LLVMIntPredicate::NE, masked, LLVMConstInt(type, 0, 0), ""))
+            LLVMInstructionEraseFromParent(root)
+
+        # The checked `sadd.with.overflow(value, even)` whose result DIVIDEND extracts.
+        def checked_even_bias(dividend: LLVMValueRef, identifier: u32) -> LLVMValueRef?:
+            return null if not is_extract_of_field(dividend, 0)
+            checked: LLVMValueRef = LLVMGetOperand(dividend, 0)
+            return null if called_intrinsic_id(checked) != identifier or LLVMGetNumOperandBundles(checked) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(checked) != 0
+            return null if not is_even_constant(LLVMGetOperand(checked, 1))
+            checked
+
+        # `(left [+ even]) - (right + ((left - right) & 1))` with PARITY_SIDE the side of the
+        # outer `add` holding the parity: the left input and its bias, if the shape matches.
+        def parity_adjusted_inputs(difference: LLVMValueRef, adjusted: LLVMValueRef, parity_side: u32) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            right: LLVMValueRef = LLVMGetOperand(adjusted, 1 - parity_side)
+            parity: LLVMValueRef = LLVMGetOperand(adjusted, parity_side)
+            return [] if not is_llvm_instruction_with_opcode(parity, LLVMOpcode::AND) or not is_constant_integer(LLVMGetOperand(parity, 1), 1)
+            unadjusted: LLVMValueRef = LLVMGetOperand(parity, 0)
+            return [] if not is_llvm_instruction_with_opcode(unadjusted, LLVMOpcode::SUB) or LLVMGetOperand(unadjusted, 1) != right
+            left: LLVMValueRef = LLVMGetOperand(difference, 0)
+            original_left: LLVMValueRef = LLVMGetOperand(unadjusted, 0)
+            return [original_left, right] if left == original_left
+            return [] if not is_llvm_instruction_with_opcode(left, LLVMOpcode::ADD) or LLVMGetOperand(left, 0) != original_left
+            bias: LLVMValueRef = LLVMGetOperand(left, 1)
+            return [] if not is_even_constant(bias)
+            [original_left, right, bias]
+
+        # Rewrites DIVISION (`dividend sdiv 2`) as `(left - right) >> 1` over frozen inputs;
+        # through a checked bias, the bias adds to the even-rounded difference instead.
+        def build_even_half(division: LLVMValueRef, inputs: darray[LLVMValueRef]&, checked: LLVMValueRef?, builder: LLVMBuilderRef) -> void:
+            anchor: mutable LLVMValueRef = division
+            if checked is bias_call:
+                anchor <- bias_call
+            position_builder_before(builder, anchor)
+            original_left: LLVMValueRef = inputs[0]
+            right: LLVMValueRef = inputs[1]
+            stable_left: LLVMValueRef = LLVMBuildFreeze(builder, original_left, "")
+            stable_right: LLVMValueRef = stable_left if right == original_left else LLVMBuildFreeze(builder, right, "")
+            biased_left: mutable LLVMValueRef = stable_left
+            if inputs.count == 3:
+                bias: LLVMValueRef = inputs[2]
+                biased_left <- LLVMBuildAdd(builder, stable_left, bias, "")
+            delta: mutable LLVMValueRef = LLVMBuildSub(builder, biased_left, stable_right, "")
+            if checked is bias_call:
+                # Both operands of the checked addition are now even, so its successful
+                # result needs no rounding before halving.
+                even_mask: LLVMValueRef = LLVMConstInt(LLVMTypeOf(delta), 18446744073709551614, 0)
+                LLVMSetOperand(bias_call, 0, LLVMBuildAnd(builder, delta, even_mask, ""))
+                position_builder_before(builder, division)
+                delta <- LLVMGetOperand(division, 0)
+            set_builder_debug_location(builder, division)
+            half: LLVMValueRef = LLVMBuildAShr(builder, delta, LLVMConstInt(LLVMTypeOf(delta), 1, 0), "even.half")
+            LLVMReplaceAllUsesWith(division, half)
+            LLVMInstructionEraseFromParent(division)
+
+        # `(a - (b + ((a - b) & 1))) sdiv 2`, the difference rounded down to an even
+        # number and halved; whether it was rewritten.
+        def fold_parity_adjusted_half(division: LLVMValueRef, identifier: u32, builder: LLVMBuilderRef) -> bool can[Memory.Allocate]:
+            return false if not is_constant_integer(LLVMGetOperand(division, 1), 2) or ElisaLLVMHasMetadataOtherThanDebugLoc(division) != 0
+            dividend: LLVMValueRef = LLVMGetOperand(division, 0)
+            checked: LLVMValueRef? = checked_even_bias(dividend, identifier)
+            return false if is_llvm_instruction_with_opcode(dividend, LLVMOpcode::EXTRACT_VALUE) and checked == null
+            difference: mutable LLVMValueRef = dividend
+            if checked is bias_call:
+                difference <- LLVMGetOperand(bias_call, 0)
+            return false if not is_llvm_instruction_with_opcode(difference, LLVMOpcode::SUB)
+            adjusted: LLVMValueRef = LLVMGetOperand(difference, 1)
+            return false if not is_llvm_instruction_with_opcode(adjusted, LLVMOpcode::ADD)
+            for parity_side in 0..<2.u32() |difference, adjusted, checked, division, builder|:
+                inputs: darray[LLVMValueRef] = parity_adjusted_inputs(difference, adjusted, parity_side)
+                if inputs.count > 0:
+                    build_even_half(division, &inputs, checked, builder)
+                    return true
+            false
+
+        # The `(x - 32768) <u -65536` checks of LOOP's blocks.
+        def signed16_checks(loop: ElisaLoopRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            checks: mutable darray[LLVMValueRef] = []
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |checks, loop|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor, checks|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    checks.push(instruction) if is_signed16_check(instruction)
+            checks
+
+        def is_signed16_check(compare: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT or ElisaLLVMHasMetadataOtherThanDebugLoc(compare) != 0
+            add: LLVMValueRef = LLVMGetOperand(compare, 0)
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return false if not is_plain_wrapping_add(add) or LLVMIsAConstantInt(limit) == null or LLVMConstIntGetSExtValue(limit) != EvenRangeLimit::SIGNED16_LIMIT
+            offset: LLVMValueRef = LLVMGetOperand(add, 1)
+            LLVMIsAConstantInt(offset) != null and LLVMConstIntGetSExtValue(offset) == EvenRangeLimit::SIGNED16_OFFSET
+
+        # `mov $0, #65535` before the preheader's TERMINATOR, the opaque limit the checks
+        # compare against. The object streamer parses inline asm, so the AArch64 parser is
+        # registered first (registration is idempotent).
+        def signed16_scan_limit(terminator: LLVMValueRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            LLVMInitializeAArch64AsmParser()
+            position_builder_before(builder, terminator)
+            word: LLVMTypeRef = LLVMInt64TypeInContext(LLVMGetTypeContext(LLVMTypeOf(terminator)))
+            asm_storage: mutable darray[u8] = []
+            constraint_storage: mutable darray[u8] = []
+            name_storage: mutable darray[u8] = []
+            asm_type: LLVMTypeRef = LLVMFunctionType(word, null, 0, 0)
+            limit_asm: LLVMValueRef = LLVMGetInlineAsm(asm_type, sview_to_cstr(EvenRangeLimit::SIGNED16_ASM, asm_storage), EvenRangeLimit::SIGNED16_ASM.len.usize(), sview_to_cstr(EvenRangeLimit::SIGNED16_CONSTRAINTS, constraint_storage), EvenRangeLimit::SIGNED16_CONSTRAINTS.len.usize(), 0, 0, 0, 0)
+            LLVMBuildCall2(builder, asm_type, limit_asm, null, 0, sview_to_cstr("signed16.scan.limit", name_storage))
+
+        # Rewrites eight or more signed 16-bit range checks in each innermost top-level
+        # loop with a preheader; the checks rewritten.
+        def compact_signed16_scans(function: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if function_is_sanitized(function)
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = 0
+            for index in 0..<ElisaLLVMTopLevelLoopCount(analyses) |changed, analyses, builder|:
+                loop: ElisaLoopRef = ElisaLLVMTopLevelLoopAt(analyses, index)
+                if ElisaLLVMLoopSubLoopCount(loop) == 0:
+                    if ElisaLLVMLoopPreheader(loop) is preheader:
+                        checks: darray[LLVMValueRef] = signed16_checks(loop)
+                        if checks.count >= EvenRangeLimit::SIGNED16_CHECKS:
+                            if LLVMGetBasicBlockTerminator(preheader) is terminator:
+                                changed <- changed + rewrite_signed16_checks(&checks, signed16_scan_limit(terminator, builder), builder)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+        def rewrite_signed16_checks(checks: darray[LLVMValueRef]&, limit: LLVMValueRef, builder: LLVMBuilderRef) -> u32:
+            for compare in checks |limit, builder|:
+                add: LLVMValueRef = LLVMGetOperand(compare, 0)
+                position_builder_before(builder, compare)
+                adjusted: LLVMValueRef = LLVMBuildAdd(builder, LLVMGetOperand(add, 0), LLVMConstInt(LLVMTypeOf(add), EvenRangeLimit::SIGNED16_BIAS, 0), "")
+                LLVMReplaceAllUsesWith(compare, LLVMBuildICmp(builder, LLVMIntPredicate::UGT, adjusted, limit, ""))
+                LLVMInstructionEraseFromParent(compare)
+                LLVMInstructionEraseFromParent(add) if LLVMGetFirstUse(add) == null
+            checks.count.u32()
+
+        # The even-range folds of FUNCTION, in instruction order, then its scans.
+        def compact_function_even_ranges(function: LLVMValueRef, builder: LLVMBuilderRef, identifier: u32) -> u32 can[Abort.Panic, Memory.Allocate]:
+            candidates: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, candidates|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    candidates.push(instruction) if is_even_range_candidate(instruction)
+            changed: mutable u32 = 0
+            for candidate in candidates |changed, builder, identifier|:
+                folded: bool = fold_parity_adjusted_half(candidate, identifier, builder) if LLVMGetInstructionOpcode(candidate) == LLVMOpcode::SDIV else fold_even_range_test(candidate, builder)
+                changed <- changed + 1 if folded
+            static if ELISA_TARGET_ARCH_ARM64:
+                changed <- changed + compact_signed16_scans(function, builder)
+            changed
+
+        def is_even_range_candidate(instruction: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            (opcode == LLVMOpcode::OR and is_llvm_integer_type(LLVMTypeOf(instruction), 1)) or (opcode == LLVMOpcode::SDIV and is_llvm_integer_type(LLVMTypeOf(instruction), 64))
+
+    public:
+        # The even-range rewrites in a module for AArch64 Linux or Darwin without debug info.
+        def compact_even_ranges(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not module_targets_aarch64(module) or (ElisaLLVMModuleTargetIsLinux(module) == 0 and ElisaLLVMModuleTargetIsDarwin(module) == 0) or module_has_debug_info(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            identifier: u32 = intrinsic_identifier("llvm.sadd.with.overflow")
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, builder, identifier|:
+                function_cursor <- LLVMGetNextFunction(function)
+                if LLVMIsDeclaration(function) == 0 and not function_is_size_optimized(function):
+                    changed <- changed + compact_function_even_ranges(function, builder, identifier)
+            LLVMDisposeBuilder(builder)
+            changed

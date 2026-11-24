@@ -4,7 +4,8 @@ These standalone tests exercise the compiler's LLVM passes. Tests of the passes 
 in Elisa run them through `elisac llvm-pass` (see `elisa_llvm_pass.py`, which uses `$ELISAC`
 or `bin/elisac-stage1`); tests of the passes still in C++ compile small C++ harnesses.
 They cover [loop rewrites](loops/), [recursive functions](recursion/),
-and [layout and vector rewrites](layout/).
+[memory rewrites](memory/) and [layout and vector rewrites](layout/); the target-specific
+passes' tests sit at the top level.
 
 To run a test, set `LLVM_CONFIG` to the `llvm-config` for the LLVM installation
 used by the compiler:

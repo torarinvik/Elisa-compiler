@@ -1,0 +1,213 @@
+# Pools expensive double constants in small, acyclic AArch64 functions.
+#
+# A normal double whose bit pattern needs three or more 16-bit move-immediate chunks
+# takes several instructions to materialize. On a core that fuses literal loads
+# (`+fuse-literals`), a small acyclic function loads such constants from a private table
+# when enough uses share the table address, or when each load stays on a cold return
+# edge.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+include "../llvm_c_api/elisa_llvm_ir_edits.elisa"
+
+const module FloatPoolLimit:
+    FUNCTION_BLOCKS: u32 = 16
+    FUNCTION_INSTRUCTIONS: u32 = 160
+    TABLE_ENTRIES: usize = 24
+    TABLE_ALIGNMENT: u32 = 8
+    EXPONENT_MASK: u64 = 2047
+    CHUNK_MASK: u64 = 65535
+    TABLE_NAME: sview = "elisa.float.constants"
+
+# One operand that loads its constant from the table.
+struct PoolUse:
+    instruction: LLVMValueRef
+    operand: u32
+    constant: LLVMValueRef
+    return_edge: bool
+    comparison: bool
+
+extend Backend:
+    private:
+        # A normal double needing at least three 16-bit chunks whether it is built from
+        # zeros (`movz`/`movk`) or from ones (`movn`/`movk`).
+        def needs_multiple_immediate_instructions(constant: LLVMValueRef) -> bool:
+            return false if LLVMGetTypeKind(LLVMTypeOf(constant)) != LLVMTypeKindValue::DOUBLE
+            bits: u64 = ElisaLLVMConstantDoubleBits(constant)
+            exponent: u64 = (bits >> 52) & FloatPoolLimit::EXPONENT_MASK
+            return false if exponent == 0 or exponent == FloatPoolLimit::EXPONENT_MASK
+            nonzero: mutable u32 = 0
+            nonones: mutable u32 = 0
+            for chunk_index in 0..<4.u64() |nonzero, nonones, bits|:
+                chunk: u64 = (bits >> (chunk_index * 16)) & FloatPoolLimit::CHUNK_MASK
+                nonzero <- nonzero + 1 if chunk != 0
+                nonones <- nonones + 1 if chunk != FloatPoolLimit::CHUNK_MASK
+            nonzero >= 3 and nonones >= 3
+
+        # A phi of at most four entries whose only user is a return.
+        def is_return_phi(instruction: LLVMValueRef, instruction_count: u32) -> bool:
+            return false if instruction_count > 16 or LLVMGetInstructionOpcode(instruction) != LLVMOpcode::PHI or LLVMCountIncoming(instruction) > 4
+            if LLVMGetFirstUse(instruction) is use:
+                return LLVMGetNextUse(use) == null and is_llvm_instruction_with_opcode(LLVMGetUser(use), LLVMOpcode::RET)
+            false
+
+        # The instructions whose constant operands may come from the table.
+        def takes_pooled_constants(instruction: LLVMValueRef, instruction_count: u32, return_phi: bool) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            return true if return_phi or opcode == LLVMOpcode::FCMP or opcode == LLVMOpcode::FMUL
+            return true if instruction_count <= 20 and opcode == LLVMOpcode::FSUB
+            instruction_count <= 12 and (opcode == LLVMOpcode::SELECT or opcode == LLVMOpcode::RET)
+
+        # Whether the return phi's entry OPERAND has an edge of its own: its predecessor
+        # ends in a branch and reaches the phi through no other entry.
+        def has_own_return_edge(phi: LLVMValueRef, operand: u32) -> bool:
+            predecessor: LLVMBasicBlockRef = LLVMGetIncomingBlock(phi, operand)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(predecessor) else return false
+            opcode: u32 = LLVMGetInstructionOpcode(terminator)
+            return false if opcode != LLVMOpcode::UNCONDITIONAL_BR and opcode != LLVMOpcode::CONDITIONAL_BR
+            for other in 0..<LLVMCountIncoming(phi) |phi, operand, predecessor|:
+                return false if other != operand and LLVMGetIncomingBlock(phi, other) == predecessor
+            true
+
+        # The expensive constant operands of INSTRUCTION, or none when a return phi's
+        # constant has no edge of its own.
+        def instruction_pool_uses(instruction: LLVMValueRef, instruction_count: u32) -> darray[PoolUse]? can[Memory.Allocate]:
+            uses: mutable darray[PoolUse] = []
+            return_phi: bool = is_return_phi(instruction, instruction_count)
+            return uses if not takes_pooled_constants(instruction, instruction_count, return_phi)
+            comparison: bool = LLVMGetInstructionOpcode(instruction) == LLVMOpcode::FCMP
+            for operand in 0..<LLVMGetNumOperands(instruction) |uses, instruction, return_phi, comparison|:
+                if LLVMIsAConstantFP(LLVMGetOperand(instruction, operand)) is constant:
+                    if needs_multiple_immediate_instructions(constant):
+                        return null if return_phi and not has_own_return_edge(instruction, operand)
+                        uses.push(PoolUse{instruction: instruction, operand: operand, constant: constant, return_edge: return_phi, comparison: comparison})
+            uses
+
+        # Every expensive constant operand of the function, in instruction order, or none
+        # when one rules the function out.
+        def function_pool_uses(function: LLVMValueRef, instruction_count: u32) -> darray[PoolUse]? can[Memory.Allocate]:
+            uses: mutable darray[PoolUse] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, uses, instruction_count|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, uses, instruction_count|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    found: darray[PoolUse] = get instruction_pool_uses(instruction, instruction_count) else return null
+                    uses.extend([use for use in found])
+            uses
+
+        # The table slot holding CONSTANT, if it has one.
+        def constant_slot(constants: darray[LLVMValueRef]&, constant: LLVMValueRef) -> u32?:
+            for slot in 0..<constants.count.u32() |constants, constant|:
+                return slot if constants[slot] == constant
+            null
+
+        # The distinct constants of USES, in first-use order.
+        def pool_constants(uses: darray[PoolUse]&) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            constants: mutable darray[LLVMValueRef] = []
+            for use in uses |constants|:
+                constants.push(use.constant) if constant_slot(&constants, use.constant) == null
+            constants
+
+        # Whether every use is in the first use's block.
+        def uses_share_block(uses: darray[PoolUse]&) -> bool:
+            first: LLVMBasicBlockRef = LLVMGetInstructionParent(uses[0].instruction)
+            for use in uses |first|:
+                return false if LLVMGetInstructionParent(use.instruction) != first
+            true
+
+        # Whether the table pays for its address: a tiny function, or enough uses sharing
+        # it, or every load on a cold return edge.
+        def is_pool_profitable(function: LLVMValueRef, uses: darray[PoolUse]&, constant_count: u32, instruction_count: u32) -> bool:
+            use_count: u32 = uses.count.u32()
+            all_return_edges: mutable bool = true
+            comparison_uses: mutable u32 = 0
+            return_edge_uses: mutable u32 = 0
+            for use in uses |all_return_edges, comparison_uses, return_edge_uses|:
+                all_return_edges <- all_return_edges and use.return_edge
+                comparison_uses <- comparison_uses + 1 if use.comparison
+                return_edge_uses <- return_edge_uses + 1 if use.return_edge
+            small: bool = LLVMCountBasicBlocks(function) <= 12 and instruction_count <= 64
+            distinct: bool = constant_count == use_count
+            # Three operands can share the table address in short straight-line code.
+            short_table: bool = instruction_count <= 20 and constant_count >= 3
+            # A dense block can amortize the table address even across calls.
+            dense: bool = constant_count >= 12 and distinct and uses_share_block(uses)
+            distinct_inline: bool = small and constant_count <= 8 and (constant_count >= 4 or instruction_count <= 12 or short_table)
+            shared_inline: bool = instruction_count <= 100 and constant_count <= 8 and use_count >= 6 and use_count <= 12 and constant_count >= 3
+            profitable_inline: bool = dense or (distinct_inline if distinct else shared_inline)
+            # One expensive comparison literal can pay for its own load; the return literal
+            # is loaded only on its incoming edge.
+            short_comparison_and_return: bool = instruction_count <= 16 and distinct and comparison_uses == 1 and return_edge_uses == 1 and use_count == 2
+            all_return_edges or profitable_inline or short_comparison_and_return
+
+        # The private, 8-aligned table of CONSTANTS.
+        def build_constant_table(module: LLVMModuleRef, constants: darray[LLVMValueRef]&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            element: LLVMTypeRef = LLVMDoubleTypeInContext(LLVMGetModuleContext(module))
+            name_storage: mutable darray[u8] = []
+            table: LLVMValueRef = LLVMAddGlobal(module, LLVMArrayType2(element, constants.count.u64()), sview_to_cstr(FloatPoolLimit::TABLE_NAME, name_storage))
+            constant_slots: void& = (&constants[0]).cast[void&] can Unsafe.PointerCast
+            LLVMSetInitializer(table, LLVMConstArray2(element, constant_slots, constants.count.u64()))
+            LLVMSetGlobalConstant(table, 1)
+            LLVMSetLinkage(table, LLVMLinkageValue::PRIVATE)
+            LLVMSetUnnamedAddress(table, LLVMUnnamedAddressValue::GLOBAL)
+            LLVMSetAlignment(table, FloatPoolLimit::TABLE_ALIGNMENT)
+            table
+
+        # Where USE's load goes: before its instruction, or for a return phi at the end of
+        # its incoming edge, split from a branching predecessor so a cold return adds no
+        # work to the path computing the normal result.
+        # The scan checked that a return phi's predecessor ends in a branch.
+        def pooled_load_position(use: PoolUse) -> LLVMValueRef?:
+            return use.instruction if not use.return_edge
+            predecessor: LLVMBasicBlockRef = LLVMGetIncomingBlock(use.instruction, use.operand)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(predecessor) else return null
+            return terminator if LLVMGetNumSuccessors(terminator) == 1
+            LLVMGetBasicBlockTerminator(ElisaLLVMSplitEdge(predecessor, LLVMGetInstructionParent(use.instruction)))
+
+        # Points USE's operand at a load of SLOT from TABLE.
+        def load_pooled_constant(use: PoolUse, table: LLVMValueRef, slot: u32, table_type: LLVMTypeRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: LLVMValueRef = get pooled_load_position(use) else return
+            position_builder_before(builder, position)
+            index_type: LLVMTypeRef = LLVMInt32TypeInContext(LLVMGetTypeContext(table_type))
+            indices: mutable darray[LLVMValueRef] = [LLVMConstInt(index_type, 0, 0), LLVMConstInt(index_type, slot.u64(), 0)]
+            index_slots: void& = (&indices[0]).cast[void&] can Unsafe.PointerCast
+            address: LLVMValueRef = LLVMBuildInBoundsGEP2(builder, table_type, table, index_slots, 2, "")
+            value: LLVMValueRef = LLVMBuildLoad2(builder, LLVMTypeOf(use.constant), address, "")
+            LLVMSetAlignment(value, FloatPoolLimit::TABLE_ALIGNMENT)
+            LLVMSetOperand(use.instruction, use.operand, value)
+
+        # Whether the function's expensive constants now load from a table.
+        def pool_function_constants(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsDeclaration(function) != 0 or LLVMCountBasicBlocks(function) > FloatPoolLimit::FUNCTION_BLOCKS or function_has_attribute(function, "optnone")
+            return false if function_has_string_attribute(function, "target-cpu") or function_has_string_attribute(function, "target-features")
+            instruction_count: u32 = function_instruction_count(function)
+            return false if instruction_count > FloatPoolLimit::FUNCTION_INSTRUCTIONS
+            uses: darray[PoolUse] = get function_pool_uses(function, instruction_count) else return false
+            return false if uses.count == 0 or uses.count > FloatPoolLimit::TABLE_ENTRIES
+            constants: darray[LLVMValueRef] = pool_constants(&uses)
+            return false if constants.count > FloatPoolLimit::TABLE_ENTRIES or not is_pool_profitable(function, &uses, constants.count.u32(), instruction_count)
+            return false if ElisaLLVMFunctionHasCycle(function) != 0
+            table: LLVMValueRef = build_constant_table(module, &constants)
+            table_type: LLVMTypeRef = LLVMGlobalGetValueType(table)
+            for use in uses |constants, table, table_type, builder|:
+                if constant_slot(&constants, use.constant) is slot:
+                    load_pooled_constant(use, table, slot, table_type, builder)
+            true
+
+    public:
+        # The functions whose expensive double constants now load from a table, on an
+        # AArch64 MACHINE that fuses literal loads.
+        def pool_floating_constants(module: LLVMModuleRef, machine: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            target: void& = get machine else return 0
+            return 0 if ElisaLLVMTargetMachineIsAArch64(target) == 0
+            feature_storage: mutable darray[u8] = []
+            return 0 if ElisaLLVMTargetMachineChecksFeatures(target, sview_to_cstr("+fuse-literals", feature_storage)) == 0
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + 1 if pool_function_constants(function, module, builder)
+            LLVMDisposeBuilder(builder)
+            changed

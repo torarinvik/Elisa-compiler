@@ -4,8 +4,8 @@ import ctypes
 import os
 import random
 import shutil
-import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -18,7 +18,6 @@ def run(args):
     p=subprocess.run([TIMEOUT,'-k','1s','28s',*map(str,args)],capture_output=True,text=True)
     if p.returncode:raise RuntimeError(f'{args}: {p.stderr}')
     return p.stdout.strip()
-def flags(*args):return shlex.split(run([CONFIG,*args]))
 TRIPLE='arm64-apple-darwin' if os.uname().sysname=='Darwin' else 'aarch64-unknown-linux-gnu'
 def fixture(lower=2,span=6):
     upper=lower+span
@@ -32,26 +31,16 @@ entry:
   ret i1 %bad
 }}
 '''
-DRIVER=r'''
-#include <llvm-c/Core.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/raw_ostream.h>
-extern "C" unsigned elisacoreCompactEvenRanges(LLVMModuleRef);
-int main(int argc,char **argv) {
- llvm::LLVMContext c;llvm::SMDiagnostic d;auto m=llvm::parseIRFile(argv[1],d,c);
- if(!m){d.print(argv[0],llvm::errs());return 2;}
- auto a=elisacoreCompactEvenRanges(llvm::wrap(m.get()));auto b=elisacoreCompactEvenRanges(llvm::wrap(m.get()));
- if(llvm::verifyModule(*m,&llvm::errs()))return 3;
- std::error_code e;llvm::raw_fd_ostream out(argv[2],e);m->print(out,nullptr);llvm::outs()<<a<<" "<<b;return e?4:0;
-}
-'''
+sys.path.insert(0, str(ROOT / 'test' / 'llvm'))
+from elisa_llvm_pass import run_pass
+def transform(source, output):
+    """Run the pass twice, as the pipeline may, and keep the module it left."""
+    first, module = run_pass('even-ranges', source.read_text())
+    second, again = run_pass('even-ranges', module)
+    output.write_text(again)
+    return f'{first} {second}'
 with tempfile.TemporaryDirectory(prefix='elisa-even-range-') as tmp:
-    d=Path(tmp);bindir=Path(run([CONFIG,'--bindir']));libdir=run([CONFIG,'--libdir']);(d/'driver.cpp').write_text(DRIVER)
-    run([bindir/'clang++',*flags('--cxxflags'),d/'driver.cpp',ROOT/'src/backend/llvm_even_range.cpp',*flags('--ldflags','--libs','--system-libs'),'-Wl,-rpath,'+libdir,'-o',d/'driver'])
+    d=Path(tmp);bindir=Path(run([CONFIG,'--bindir']))
     src=fixture();cases={
       'eligible':(src,'1 0'),
       'different input':(src.replace('%odd = trunc i64 %x','%odd = trunc i64 %y'),'0 0'),
@@ -63,10 +52,10 @@ with tempfile.TemporaryDirectory(prefix='elisa-even-range-') as tmp:
       'optsize':(src.replace(') {',') optsize {'),'0 0'),
     }
     for name,(ir,want) in cases.items():
-        n=name.replace(' ','_');inp=d/(n+'.ll');out=d/(n+'.out.ll');inp.write_text(ir);got=run([d/'driver',inp,out]);assert got==want,(name,got,want);print('PASS',name,flush=True)
+        n=name.replace(' ','_');inp=d/(n+'.ll');out=d/(n+'.out.ll');inp.write_text(ir);got=transform(inp,out);assert got==want,(name,got,want);print('PASS',name,flush=True)
     rng=random.Random(612042)
     for lower,span in [(0,2),(2,6),(10,14),(100,30),(1024,62),(2**40,126)]:
-        inp=d/'numeric.ll';out=d/'numeric.out.ll';inp.write_text(fixture(lower,span));assert run([d/'driver',inp,out])=='1 0'
+        inp=d/'numeric.ll';out=d/'numeric.out.ll';inp.write_text(fixture(lower,span));assert transform(inp,out)=='1 0'
         fs=[]
         for i,path in enumerate([inp,out]):
             lib=d/f'numeric-{lower}-{span}-{i}.so';run([bindir/'clang','-O3','-shared','-fPIC',path,'-o',lib]);h=ctypes.CDLL(str(lib));f=h.outside;f.argtypes=[ctypes.c_int64,ctypes.c_int64];f.restype=ctypes.c_bool;fs.append((h,f))

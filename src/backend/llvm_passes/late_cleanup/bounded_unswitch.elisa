@@ -1,0 +1,244 @@
+# Bounded late loop versioning on AArch64: an innermost loop that branches on a
+# loop-invariant condition is cloned behind one frozen test of that condition, with the
+# branch folded in each copy, without LLVM's global unswitch tuning. The loop must be
+# small, safe to duplicate (no allocas, tokens, indirect branches, EH pads, volatile or
+# atomic accesses, or calls other than traps and checked add, subtract and multiply), and
+# the function may at most quadruple, up to 1800 instructions, over eight rounds.
+include "../ir/loop_pass_policy.elisa"
+include "../ir/pass_pipelines.elisa"
+include "../../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module BoundedUnswitchLimit:
+    LOOP_BLOCKS: u32 = 40
+    LOOP_INSTRUCTIONS_MINIMUM: u32 = 20
+    LOOP_INSTRUCTIONS: u32 = 300
+    FUNCTION_INSTRUCTIONS_MINIMUM: u32 = 20
+    FUNCTION_INSTRUCTIONS: u32 = 1000
+    GROWN_INSTRUCTIONS: u32 = 1800
+    GROWTH_FACTOR: u32 = 4
+    ROUNDS: u32 = 8
+    # The branch to the clone and the frozen condition replacing the preheader's branch.
+    DISPATCH_INSTRUCTIONS: u32 = 3
+    VERSIONED: sview = "elisa.unswitch.versioned"
+    PREPARE: sview = "loop-simplify,lcssa"
+    CLEANUP: sview = "instcombine<no-verify-fixpoint>,simplifycfg,loop-simplify,lcssa"
+    INDIRECT_BRANCH: u32 = 4
+    TOKEN_TYPE: u32 = 16
+
+# The intrinsics a duplicated loop may call.
+struct DuplicableIntrinsics:
+    trap: u32
+    signed_add: u32
+    signed_subtract: u32
+    signed_multiply: u32
+
+extend Backend:
+    private:
+        def unswitch_intrinsics() -> DuplicableIntrinsics can[Abort.Panic, Memory.Allocate]:
+            DuplicableIntrinsics{trap: intrinsic_identifier("llvm.trap"), signed_add: intrinsic_identifier("llvm.sadd.with.overflow"), signed_subtract: intrinsic_identifier("llvm.ssub.with.overflow"), signed_multiply: intrinsic_identifier("llvm.smul.with.overflow")}
+
+        # The loop and its descendants in preorder (Loop::getLoopsInPreorder).
+        def loops_in_preorder(root: ElisaLoopRef) -> darray[ElisaLoopRef] can[Memory.Allocate]:
+            ordered: mutable darray[ElisaLoopRef] = []
+            pending: mutable darray[ElisaLoopRef] = [root]
+            while pending.count > 0 |ordered, pending|:
+                loop: ElisaLoopRef = pending.pop()
+                ordered.push(loop)
+                count: u32 = ElisaLLVMLoopSubLoopCount(loop)
+                for offset in 0..<count |pending, loop, count|:
+                    pending.push(ElisaLLVMLoopSubLoopAt(loop, count - 1 - offset))
+            ordered
+
+        # Every loop of the function: each top-level loop's tree in preorder.
+        def function_loops_in_preorder(analyses: ElisaFunctionAnalysesRef) -> darray[ElisaLoopRef] can[Memory.Allocate]:
+            loops: mutable darray[ElisaLoopRef] = []
+            for index in 0..<ElisaLLVMTopLevelLoopCount(analyses) |loops, analyses|:
+                loops.extend(loops_in_preorder(ElisaLLVMTopLevelLoopAt(analyses, index)))
+            loops
+
+        def is_simple_access(instruction: LLVMValueRef) -> bool:
+            LLVMGetVolatile(instruction) == 0 and LLVMGetOrdering(instruction) == 0
+
+        # Whether a copy of the instruction behaves like the original.
+        def is_duplicable_instruction(instruction: LLVMValueRef, intrinsics: DuplicableIntrinsics&) -> bool can[Abort.Panic, Memory.Allocate]:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            return false if opcode == LLVMOpcode::ALLOCA or opcode == BoundedUnswitchLimit::INDIRECT_BRANCH or LLVMGetTypeKind(LLVMTypeOf(instruction)) == BoundedUnswitchLimit::TOKEN_TYPE
+            return is_simple_access(instruction) if opcode == LLVMOpcode::LOAD or opcode == LLVMOpcode::STORE
+            return true if not is_call_base(instruction)
+            identifier: u32 = called_intrinsic_id(instruction)
+            return false if identifier == 0 or ElisaLLVMCallHasFunctionAttribute(instruction, attribute_kind("convergent")) != 0 or ElisaLLVMCallHasFunctionAttribute(instruction, attribute_kind("noduplicate")) != 0 or LLVMGetNumOperandBundles(instruction) != 0
+            identifier == intrinsics.trap or identifier == intrinsics.signed_add or identifier == intrinsics.signed_subtract or identifier == intrinsics.signed_multiply
+
+        # The loop's instruction count when every block and instruction may be copied,
+        # otherwise none.
+        def duplicable_loop_size(loop: ElisaLoopRef, intrinsics: DuplicableIntrinsics&) -> u32? can[Abort.Panic, Memory.Allocate]:
+            size: mutable u32 = 0
+            safe: mutable bool = true
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |size, safe, loop, intrinsics|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, index)
+                safe <- safe and ElisaLLVMBlockHasAddressTaken(block) == 0 and ElisaLLVMBlockIsEHPad(block) == 0
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, size, safe, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    size <- size + 1
+                    safe <- safe and is_duplicable_instruction(instruction, intrinsics)
+            return null if not safe
+            size
+
+        # The first loop-invariant, non-constant condition of a branch between two loop
+        # blocks that is available before the loop.
+        def invariant_branch_condition(loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic]:
+            entry_branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return null
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop, entry_branch, analyses|:
+                if conditional_terminator(ElisaLLVMLoopBlockAt(loop, index)) is branch:
+                    condition: LLVMValueRef = LLVMGetCondition(branch)
+                    available: bool = LLVMIsAInstruction(condition) == null or ElisaLLVMInstructionDominates(analyses, condition, entry_branch) != 0
+                    if ElisaLLVMLoopIsInvariant(loop, condition) != 0 and LLVMIsAConstant(condition) == null and available:
+                        return condition if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 0)) != 0 and ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1)) != 0
+            null
+
+        # The loop's exit blocks without repeats, in the order its blocks reach them
+        # (Loop::getUniqueExitBlocks).
+        def unique_exit_blocks(loop: ElisaLoopRef) -> darray[LLVMBasicBlockRef] can[Memory.Allocate]:
+            exits: mutable darray[LLVMBasicBlockRef] = []
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |exits, loop|:
+                if LLVMGetBasicBlockTerminator(ElisaLLVMLoopBlockAt(loop, index)) is terminator:
+                    for successor_index in 0..<LLVMGetNumSuccessors(terminator) |exits, loop, terminator|:
+                        successor: LLVMBasicBlockRef = LLVMGetSuccessor(terminator, successor_index)
+                        if ElisaLLVMLoopContainsBlock(loop, successor) == 0 and not (any seen in exits where seen == successor):
+                            exits.push(successor)
+            exits
+
+        # Gives each exit phi an entry from every cloned block, with the cloned value.
+        def extend_exit_phis(loop: ElisaLoopRef, map: ElisaValueMapRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for exit in unique_exit_blocks(loop) |map|:
+                for phi in block_phis(exit) |map|:
+                    count: u32 = LLVMCountIncoming(phi)
+                    for index in 0..<count |phi, map|:
+                        if cloned_block(map, LLVMGetIncomingBlock(phi, index)) is copy:
+                            add_phi_incoming(phi, mapped_value(map, LLVMGetIncomingValue(phi, index)), copy)
+
+        def cloned_block(map: ElisaValueMapRef, block: LLVMBasicBlockRef) -> LLVMBasicBlockRef?:
+            if ElisaLLVMValueMapGet(map, LLVMBasicBlockAsValue(block)) is cloned:
+                return LLVMValueAsBasicBlock(cloned)
+            null
+
+        # VALUE's clone, or VALUE when the clone left it alone.
+        def mapped_value(map: ElisaValueMapRef, value: LLVMValueRef) -> LLVMValueRef:
+            if ElisaLLVMValueMapGet(map, value) is cloned:
+                return cloned
+            value
+
+        # Splits a dispatch block off the preheader, clones the loop behind it, and
+        # branches on the frozen CONDITION: true to the original loop, false to the
+        # clone, where the condition's branches are folded to match.
+        def unswitch_loop(loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, condition: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return
+            name_storage: mutable darray[u8] = []
+            suffix_storage: mutable darray[u8] = []
+            # Every preheader computation stays in the common dispatcher: only the newly
+            # split, empty preheader and the loop are cloned, never setup side effects.
+            loop_entry: LLVMBasicBlockRef = ElisaLLVMSplitBlockKeepingLoops(analyses, terminator, sview_to_cstr("unswitch.preheader", name_storage))
+            map: ElisaValueMapRef = ElisaLLVMCreateValueMap()
+            _ = ElisaLLVMCloneLoopWithPreheader(analyses, loop_entry, preheader, loop, map, sview_to_cstr(".unswitch", suffix_storage))
+            # The clone has the same exits; their phis gain its entries before any
+            # simplification.
+            extend_exit_phis(loop, map)
+            dispatch: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return
+            cloned_entry: LLVMBasicBlockRef = get cloned_block(map, loop_entry) else return
+            position_builder_before(builder, dispatch)
+            frozen_storage: mutable darray[u8] = []
+            frozen: LLVMValueRef = LLVMBuildFreeze(builder, condition, sview_to_cstr("unswitch.condition", frozen_storage))
+            _ = LLVMBuildCondBr(builder, frozen, loop_entry, cloned_entry)
+            LLVMInstructionEraseFromParent(dispatch)
+            boolean: LLVMTypeRef = LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(condition)))
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop, condition, map, boolean|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, index)
+                if conditional_terminator(block) is branch:
+                    if LLVMGetCondition(branch) == condition:
+                        LLVMSetCondition(branch, LLVMConstInt(boolean, 1, 0))
+                        if cloned_block(map, block) is copy:
+                            if conditional_terminator(copy) is cloned_branch:
+                                LLVMSetCondition(cloned_branch, LLVMConstInt(boolean, 0, 0))
+            ElisaLLVMDisposeValueMap(map)
+
+        # Versions the first eligible innermost loop; whether one was.
+        def unswitch_first_loop(function: LLVMValueRef, budget: u32, intrinsics: DuplicableIntrinsics&, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            unswitched: mutable bool = false
+            for loop in function_loops_in_preorder(analyses) |unswitched, function, budget, intrinsics, analyses, builder|:
+                if ElisaLLVMLoopSubLoopCount(loop) == 0 and ElisaLLVMLoopIsSimplifyForm(loop) != 0 and ElisaLLVMLoopBlockCount(loop) <= BoundedUnswitchLimit::LOOP_BLOCKS:
+                    if ElisaLLVMLoopPreheader(loop) is preheader:
+                        if duplicable_loop_size(loop, intrinsics) is size:
+                            sized: bool = size >= BoundedUnswitchLimit::LOOP_INSTRUCTIONS_MINIMUM and size <= BoundedUnswitchLimit::LOOP_INSTRUCTIONS and function_instruction_count(function) + size + BoundedUnswitchLimit::DISPATCH_INSTRUCTIONS <= budget
+                            if sized:
+                                if invariant_branch_condition(loop, preheader, analyses) is condition:
+                                    unswitch_loop(loop, preheader, condition, analyses, builder)
+                                    unswitched <- true
+                                    break
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            unswitched
+
+        # Whether some innermost loop of at most 40 blocks branches between two of its
+        # blocks on a loop-invariant, non-constant condition.
+        def has_unswitch_candidate(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            found: mutable bool = false
+            for loop in function_loops_in_preorder(analyses) |found|:
+                break if found
+                if ElisaLLVMLoopSubLoopCount(loop) == 0 and ElisaLLVMLoopBlockCount(loop) <= BoundedUnswitchLimit::LOOP_BLOCKS:
+                    for index in 0..<ElisaLLVMLoopBlockCount(loop) |found, loop|:
+                        found <- found or is_invariant_inner_branch(loop, ElisaLLVMLoopBlockAt(loop, index))
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            found
+
+        def is_invariant_inner_branch(loop: ElisaLoopRef, block: LLVMBasicBlockRef) -> bool:
+            branch: LLVMValueRef = get conditional_terminator(block) else return false
+            condition: LLVMValueRef = LLVMGetCondition(branch)
+            return false if LLVMIsAConstant(condition) != null or ElisaLLVMLoopIsInvariant(loop, condition) == 0
+            ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 0)) != 0 and ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1)) != 0
+
+        # Declarations, size-optimized, debug-info, EH, garbage-collected, profiled,
+        # convergent and already versioned functions, and those under 20 or over 1000
+        # instructions.
+        def skipped_by_unswitch_policy(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function) or llvm_function_subprogram_or_null(function) != null
+            return true if LLVMHasPersonalityFn(function) != 0 or LLVMGetGC(function) != null
+            size: u32 = function_instruction_count(function)
+            return true if size < BoundedUnswitchLimit::FUNCTION_INSTRUCTIONS_MINIMUM or size > BoundedUnswitchLimit::FUNCTION_INSTRUCTIONS
+            return true if function_has_string_attribute(function, BoundedUnswitchLimit::VERSIONED) or function_has_attribute(function, "convergent") or function_has_attribute(function, "noduplicate")
+            ElisaLLVMFunctionHasEntryCount(function) != 0
+
+        # Puts the function in loop-simplify and LCSSA form, then versions one loop per
+        # round, cleaning up after each, while it stays under four times its size and 1800
+        # instructions; whether any loop was versioned.
+        def unswitch_function_loops(function: LLVMValueRef, intrinsics: DuplicableIntrinsics&, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if skipped_by_unswitch_policy(function) or not has_unswitch_candidate(function)
+            initial: u32 = function_instruction_count(function)
+            growth_limit: u32 = initial * BoundedUnswitchLimit::GROWTH_FACTOR
+            budget: u32 = BoundedUnswitchLimit::GROWN_INSTRUCTIONS if BoundedUnswitchLimit::GROWN_INSTRUCTIONS < growth_limit else growth_limit
+            _ = run_function_pipeline(function, null, BoundedUnswitchLimit::PREPARE)
+            changed: mutable bool = false
+            for round in 0..<BoundedUnswitchLimit::ROUNDS |changed, function, growth_limit, budget, intrinsics, builder|:
+                size: u32 = function_instruction_count(function)
+                break if size >= growth_limit or size >= BoundedUnswitchLimit::GROWN_INSTRUCTIONS
+                break if not unswitch_first_loop(function, budget, intrinsics, builder)
+                changed <- true
+                _ = run_function_pipeline(function, null, BoundedUnswitchLimit::CLEANUP)
+            add_valueless_function_attribute(function, BoundedUnswitchLimit::VERSIONED) if changed
+            changed
+
+    public:
+        # The functions with a loop versioned on an invariant condition, for little-endian
+        # 64-bit AArch64 modules without debug info.
+        def unswitch_bounded_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64_architecture(module) or module_has_debug_info(module)
+            intrinsics: DuplicableIntrinsics = unswitch_intrinsics()
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, intrinsics, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + 1 if unswitch_function_loops(function, &intrinsics, builder)
+            LLVMDisposeBuilder(builder)
+            changed

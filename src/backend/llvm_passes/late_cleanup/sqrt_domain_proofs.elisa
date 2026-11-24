@@ -1,0 +1,343 @@
+# Proves the `nnan` fact of recognized `sqrt` library calls whose argument is never NaN
+# or negative, then lets LLVM use it: AggressiveInstCombine turns such a call into the
+# intrinsic. Only the result fact is added; the call, its rounding, errno effects, negative
+# zero and infinity stay represented.
+#
+# The argument's domain comes from a dominating ordered comparison against a nonnegative
+# constant, or from a bounded walk over its definition: known floating-point classes,
+# integer conversions, uniform broadcasts, phis (loop recurrences by induction), sums,
+# differences, squares, divisions by a nonzero unsigned count, and `fadd` reductions.
+include "../ir/loop_pass_policy.elisa"
+include "../ir/pass_pipelines.elisa"
+include "../../llvm_c_api/elisa_llvm_constant_range.elisa"
+
+const module SqrtFact:
+    NOT_NAN: u32 = 1
+    FINITE: u32 = 2
+    NONNEGATIVE: u32 = 4
+
+const module SqrtProofLimit:
+    BUDGET: u32 = 4096
+    DEPTH: u32 = 32
+    GUARD_STEPS: u32 = 16
+    CALLS: usize = 8
+    FUNCTION_INSTRUCTIONS: u32 = 2500
+    REDUCTION_LANES: u32 = 256
+    # The FPClassTest bits of NaNs and of negative values other than -0.
+    NAN_CLASSES: u32 = 3
+    NEGATIVE_NONZERO_CLASSES: u32 = 28
+    # LLVMFastMathNoNaNs.
+    NO_NANS_FLAG: u32 = 2
+    UNSIGNED_TO_FLOAT: u32 = 35
+    SIGNED_TO_FLOAT: u32 = 36
+    INSERT_ELEMENT: u32 = 51
+    ORDERED_GREATER: i32 = 2
+    ORDERED_GREATER_OR_EQUAL: i32 = 3
+    CLEANUP: sview = "function(aggressive-instcombine,instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg)"
+
+# One query's answer and the budget left after it.
+struct SqrtStep:
+    proven: bool
+    budget: u32
+
+# The phi a loop recurrence is proved under, and the facts assumed of it.
+struct SqrtHypothesis:
+    phi: LLVMValueRef?
+    facts: u32
+
+# Where a query is asked: its context instruction, the phis being proved above it, and
+# its depth.
+struct SqrtQuery:
+    at: LLVMValueRef
+    hypothesis: SqrtHypothesis
+    depth: u32
+
+extend Backend:
+    private:
+        def has_facts(facts: u32, wanted: u32) -> bool:
+            (facts & wanted) == wanted
+
+        def scalar_type(type: LLVMTypeRef) -> LLVMTypeRef:
+            kind: u32 = LLVMGetTypeKind(type)
+            LLVMGetElementType(type) if kind == LLVMTypeKindValue::VECTOR or kind == LLVMTypeKindValue::SCALABLE_VECTOR else type
+
+        # An `sitofp`/`uitofp` from an integer of at most 64 bits to float or double.
+        def is_integer_conversion(value: LLVMValueRef) -> bool:
+            return false if LLVMIsAInstruction(value) == null
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            return false if opcode != SqrtProofLimit::SIGNED_TO_FLOAT and opcode != SqrtProofLimit::UNSIGNED_TO_FLOAT
+            source: LLVMTypeRef = scalar_type(LLVMTypeOf(LLVMGetOperand(value, 0)))
+            destination: u32 = LLVMGetTypeKind(scalar_type(LLVMTypeOf(value)))
+            is_llvm_integer_type(source, 0) and LLVMGetIntTypeWidth(source) <= 64 and (destination == LLVMTypeKindValue::FLOAT or destination == LLVMTypeKindValue::DOUBLE)
+
+        # FCmpInst::getSwappedPredicate.
+        def swapped_float_predicate(predicate: i32) -> i32:
+            when predicate:
+                2 -> 4
+                4 -> 2
+                3 -> 5
+                5 -> 3
+                10 -> 12
+                12 -> 10
+                11 -> 13
+                13 -> 11
+                _ -> predicate
+
+        # Whether the constant is neither NaN nor negative other than -0.
+        def is_domain_bound(bound: LLVMValueRef) -> bool:
+            return false if LLVMIsAConstantFP(bound) == null
+            (ElisaLLVMConstantFloatClass(bound) & (SqrtProofLimit::NAN_CLASSES | SqrtProofLimit::NEGATIVE_NONZERO_CLASSES)) == 0
+
+        # Whether BLOCK's branch on `ARGUMENT >= bound` (or `>`) for a nonnegative constant
+        # bound takes an edge that dominates USE_BLOCK.
+        def guards_domain(block: LLVMBasicBlockRef, argument: LLVMValueRef, use_block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            branch: LLVMValueRef = get conditional_terminator(block) else return false
+            return false if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::FCMP)
+            argument_first: bool = LLVMGetOperand(compare, 0) == argument
+            return false if not argument_first and LLVMGetOperand(compare, 1) != argument
+            bound: LLVMValueRef = LLVMGetOperand(compare, 1) if argument_first else LLVMGetOperand(compare, 0)
+            predicate: i32 = LLVMGetFCmpPredicate(compare) if argument_first else swapped_float_predicate(LLVMGetFCmpPredicate(compare))
+            return false if not is_domain_bound(bound)
+            for edge in 0..<2.u32() |block, branch, use_block, analyses, predicate|:
+                taken: i32 = predicate if edge == 0 else 15 - predicate
+                if taken == SqrtProofLimit::ORDERED_GREATER or taken == SqrtProofLimit::ORDERED_GREATER_OR_EQUAL:
+                    return true if ElisaLLVMEdgeDominates(analyses, block, LLVMGetSuccessor(branch, edge), use_block) != 0
+            false
+
+        # A dominating ordered comparison can establish the domain even when the
+        # argument's arithmetic (a discriminant, say) cannot.
+        def has_guarded_domain(argument: LLVMValueRef, call: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            use_block: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            return false if ElisaLLVMIsReachableFromEntry(analyses, use_block) == 0
+            node: mutable LLVMBasicBlockRef? = use_block
+            steps: mutable u32 = 0
+            while node is block |node, steps, argument, use_block, analyses|:
+                break if steps >= SqrtProofLimit::GUARD_STEPS
+                return true if guards_domain(block, argument, use_block, analyses)
+                node <- ElisaLLVMImmediateDominator(analyses, block)
+                steps <- steps + 1
+            false
+
+        def answered(proven: bool, budget: u32) -> SqrtStep:
+            SqrtStep{proven: proven, budget: budget}
+
+        def deeper(query: SqrtQuery&, at: LLVMValueRef) -> SqrtQuery:
+            SqrtQuery{at: at, hypothesis: query.hypothesis, depth: query.depth + 1}
+
+        # Whether VALUE has the WANTED facts at the query's instruction.
+        def prove_sqrt_facts(value: LLVMValueRef, wanted: u32, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            return answered(false, budget) if query.depth > SqrtProofLimit::DEPTH or budget == 0
+            remaining: u32 = budget - 1
+            if query.hypothesis.phi is phi:
+                return answered(has_facts(query.hypothesis.facts, wanted), remaining) if value == phi
+            known: u32 = ElisaLLVMKnownFPClassFacts(analyses, value, query.at)
+            return answered(true, remaining) if (not has_facts(wanted, SqrtFact::NOT_NAN) or has_facts(known, SqrtFact::NOT_NAN)) and (not has_facts(wanted, SqrtFact::FINITE) or has_facts(known, SqrtFact::FINITE)) and (not has_facts(wanted, SqrtFact::NONNEGATIVE) or has_facts(known, SqrtFact::NONNEGATIVE))
+            if is_integer_conversion(value):
+                return answered(not has_facts(wanted, SqrtFact::NONNEGATIVE) or LLVMGetInstructionOpcode(value) == SqrtProofLimit::UNSIGNED_TO_FLOAT, remaining)
+            return answered(false, remaining) if LLVMIsAInstruction(value) == null
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            return prove_broadcast_facts(value, wanted, query, remaining, active, analyses) if opcode == LLVMOpcode::SHUFFLE_VECTOR
+            return prove_phi_facts(value, wanted, query, remaining, active, analyses) if opcode == LLVMOpcode::PHI
+            if opcode == LLVMOpcode::FADD or opcode == LLVMOpcode::FSUB or opcode == LLVMOpcode::FMUL or opcode == LLVMOpcode::FDIV:
+                return prove_arithmetic_facts(value, opcode, wanted, query, remaining, active, analyses)
+            return answered(false, remaining) if opcode >= LLVMOpcode::ADD and opcode <= LLVMOpcode::XOR
+            prove_reduction_facts(value, wanted, query, remaining, active, analyses)
+
+        # A uniform broadcast whose every lane selects the inserted scalar. Facts are never
+        # inferred from the poison or undef lanes it discards.
+        def prove_broadcast_facts(shuffle: LLVMValueRef, wanted: u32, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            insert: LLVMValueRef = LLVMGetOperand(shuffle, 0)
+            return answered(false, budget) if not is_llvm_instruction_with_opcode(insert, SqrtProofLimit::INSERT_ELEMENT)
+            index: LLVMValueRef = LLVMGetOperand(insert, 2)
+            return answered(false, budget) if LLVMIsAConstantInt(index) == null or ElisaLLVMConstantIntActiveBits(index) > 32
+            lane: u64 = LLVMConstIntGetZExtValue(index)
+            vector_type: LLVMTypeRef = LLVMTypeOf(insert)
+            same: mutable bool = LLVMGetTypeKind(vector_type) == LLVMTypeKindValue::VECTOR and lane < LLVMGetVectorSize(vector_type).u64()
+            for element in 0..<LLVMGetNumMaskElements(shuffle) |same, shuffle, lane|:
+                mask: i32 = LLVMGetMaskValue(shuffle, element)
+                same <- same and mask >= 0 and mask.u64() == lane
+            return answered(false, budget) if not same
+            prove_sqrt_facts(LLVMGetOperand(insert, 1), wanted, deeper(&query, query.at), budget, active, analyses)
+
+        # The terminator of the block entry INDEX of PHI comes from.
+        def incoming_terminator(phi: LLVMValueRef, index: u32) -> LLVMValueRef:
+            if LLVMGetBasicBlockTerminator(LLVMGetIncomingBlock(phi, index)) is terminator:
+                return terminator
+            phi
+
+        def unassumed(phi: LLVMValueRef, index: u32, query: SqrtQuery&) -> SqrtQuery:
+            SqrtQuery{at: incoming_terminator(phi, index), hypothesis: SqrtHypothesis{phi: null, facts: 0}, depth: query.depth + 1}
+
+        # Every entry of a phi has the facts. A loop header's recurrence is proved by
+        # induction: its entry from outside the loop has them, and its entry from inside
+        # has them when the phi does. Finiteness is never assumed of a recurrence: finite
+        # summands may overflow.
+        def prove_phi_facts(phi: LLVMValueRef, wanted: u32, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            return answered(false, budget) if has_facts(wanted, SqrtFact::FINITE) or (any open in active where open == phi)
+            nested: mutable darray[LLVMValueRef] = []
+            nested.extend([open for open in active])
+            nested.push(phi)
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(phi)
+            if ElisaLLVMLoopForBlock(analyses, block) is loop:
+                if ElisaLLVMLoopHeader(loop) == block and LLVMCountIncoming(phi) == 2:
+                    return prove_recurrence_facts(phi, loop, wanted, query, budget, &nested, analyses)
+            step: mutable SqrtStep = answered(true, budget)
+            for index in 0..<LLVMCountIncoming(phi) |step, phi, wanted, query, nested, analyses|:
+                break if not step.proven
+                step <- prove_sqrt_facts(LLVMGetIncomingValue(phi, index), wanted, unassumed(phi, index, &query), step.budget, &nested, analyses)
+            step
+
+        def prove_recurrence_facts(phi: LLVMValueRef, loop: ElisaLoopRef, wanted: u32, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            first_inside: bool = ElisaLLVMLoopContainsBlock(loop, LLVMGetIncomingBlock(phi, 0)) != 0
+            second_inside: bool = ElisaLLVMLoopContainsBlock(loop, LLVMGetIncomingBlock(phi, 1)) != 0
+            return answered(false, budget) if first_inside == second_inside
+            outside: u32 = 1 if first_inside else 0
+            inside: u32 = 1 - outside
+            entry: SqrtStep = prove_sqrt_facts(LLVMGetIncomingValue(phi, outside), wanted, unassumed(phi, outside, &query), budget, active, analyses)
+            return entry if not entry.proven
+            induction: SqrtQuery = SqrtQuery{at: incoming_terminator(phi, inside), hypothesis: SqrtHypothesis{phi: phi, facts: wanted}, depth: query.depth + 1}
+            prove_sqrt_facts(LLVMGetIncomingValue(phi, inside), wanted, induction, entry.budget, active, analyses)
+
+        # Whether one side is finite and the other never NaN, trying LEFT finite first.
+        def prove_one_finite_side(left: LLVMValueRef, right: LLVMValueRef, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            left_finite: SqrtStep = prove_sqrt_facts(left, SqrtFact::FINITE, query, budget, active, analyses)
+            if left_finite.proven:
+                right_not_nan: SqrtStep = prove_sqrt_facts(right, SqrtFact::NOT_NAN, query, left_finite.budget, active, analyses)
+                return right_not_nan if right_not_nan.proven
+                return retry_right_finite(left, right, query, right_not_nan.budget, active, analyses)
+            retry_right_finite(left, right, query, left_finite.budget, active, analyses)
+
+        def retry_right_finite(left: LLVMValueRef, right: LLVMValueRef, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            right_finite: SqrtStep = prove_sqrt_facts(right, SqrtFact::FINITE, query, budget, active, analyses)
+            return right_finite if not right_finite.proven
+            prove_sqrt_facts(left, SqrtFact::NOT_NAN, query, right_finite.budget, active, analyses)
+
+        # Both sides never NaN and nonnegative.
+        def prove_both_nonnegative(left: LLVMValueRef, right: LLVMValueRef, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            first: SqrtStep = prove_sqrt_facts(left, SqrtFact::NOT_NAN | SqrtFact::NONNEGATIVE, query, budget, active, analyses)
+            return first if not first.proven
+            prove_sqrt_facts(right, SqrtFact::NOT_NAN | SqrtFact::NONNEGATIVE, query, first.budget, active, analyses)
+
+        def prove_arithmetic_facts(operation: LLVMValueRef, opcode: u32, wanted: u32, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            return answered(false, budget) if has_facts(wanted, SqrtFact::FINITE)
+            left: LLVMValueRef = LLVMGetOperand(operation, 0)
+            right: LLVMValueRef = LLVMGetOperand(operation, 1)
+            operand_query: SqrtQuery = deeper(&query, operation)
+            if opcode == LLVMOpcode::FADD:
+                both: SqrtStep = prove_both_nonnegative(left, right, operand_query, budget, active, analyses)
+                return both if both.proven or has_facts(wanted, SqrtFact::NONNEGATIVE)
+                return prove_one_finite_side(left, right, operand_query, both.budget, active, analyses)
+            if opcode == LLVMOpcode::FSUB:
+                return answered(false, budget) if has_facts(wanted, SqrtFact::NONNEGATIVE)
+                return prove_one_finite_side(left, right, operand_query, budget, active, analyses)
+            if opcode == LLVMOpcode::FMUL:
+                return answered(false, budget) if left != right
+                return prove_sqrt_facts(left, SqrtFact::NOT_NAN, operand_query, budget, active, analyses)
+            prove_quotient_facts(operation, left, right, wanted, operand_query, budget, active, analyses)
+
+        # A quotient by `uitofp` of an integer count the lazy value ranges keep above zero.
+        def prove_quotient_facts(operation: LLVMValueRef, numerator: LLVMValueRef, denominator: LLVMValueRef, wanted: u32, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            return answered(false, budget) if not is_llvm_instruction_with_opcode(denominator, SqrtProofLimit::UNSIGNED_TO_FLOAT)
+            count: LLVMValueRef = LLVMGetOperand(denominator, 0)
+            return answered(false, budget) if LLVMGetTypeKind(LLVMTypeOf(count)) != LLVMTypeKindValue::INTEGER or not is_integer_conversion(denominator)
+            numerator_step: SqrtStep = prove_sqrt_facts(numerator, SqrtFact::NOT_NAN | (wanted & SqrtFact::NONNEGATIVE), query, budget, active, analyses)
+            return numerator_step if not numerator_step.proven
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, count, operation, 0)
+            nonzero: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsWrapped(range) == 0 and ElisaLLVMConstantRangeUnsignedMin(range) != 0
+            ElisaLLVMDisposeConstantRange(range)
+            answered(nonzero, numerator_step.budget)
+
+        # `llvm.vector.reduce.fadd(seed, vector)` over at most 256 double lanes: nonnegative
+        # when both are, and never NaN when the lanes are integer conversions (every partial
+        # lane sum is finite, in any order) and the seed is never NaN.
+        def prove_reduction_facts(call: LLVMValueRef, wanted: u32, query: SqrtQuery, budget: u32, active: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> SqrtStep can[Abort.Panic, Memory.Allocate]:
+            return answered(false, budget) if called_intrinsic_id(call) == 0 or called_intrinsic_id(call) != intrinsic_identifier("llvm.vector.reduce.fadd")
+            return answered(false, budget) if LLVMGetNumArgOperands(call) != 2 or has_facts(wanted, SqrtFact::FINITE)
+            seed: LLVMValueRef = LLVMGetOperand(call, 0)
+            lanes: LLVMValueRef = LLVMGetOperand(call, 1)
+            lane_type: LLVMTypeRef = LLVMTypeOf(lanes)
+            return answered(false, budget) if LLVMGetTypeKind(lane_type) != LLVMTypeKindValue::VECTOR or LLVMGetVectorSize(lane_type) > SqrtProofLimit::REDUCTION_LANES or LLVMGetTypeKind(LLVMGetElementType(lane_type)) != LLVMTypeKindValue::DOUBLE
+            operand_query: SqrtQuery = deeper(&query, call)
+            both: SqrtStep = prove_both_nonnegative(seed, lanes, operand_query, budget, active, analyses)
+            return both if both.proven or has_facts(wanted, SqrtFact::NONNEGATIVE)
+            return answered(false, both.budget) if not is_integer_conversion(lanes)
+            prove_sqrt_facts(seed, SqrtFact::NOT_NAN, operand_query, both.budget, active, analyses)
+
+        # A direct call of the declared library `sqrt` on one double, without operand
+        # bundles, extra metadata, `nobuiltin`, `convergent`, `strictfp` or `nnan`.
+        def is_sqrt_candidate(instruction: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMGetInstructionOpcode(instruction) != LLVMOpcode::CALL
+            callee: LLVMValueRef = LLVMGetCalledValue(instruction)
+            return false if LLVMIsAFunction(callee) == null or LLVMGlobalGetValueType(callee) != LLVMGetCalledFunctionType(instruction)
+            return false if not has_value_name(callee, "sqrt") or LLVMIsDeclaration(callee) == 0
+            return false if LLVMGetNumArgOperands(instruction) != 1 or LLVMGetTypeKind(LLVMTypeOf(instruction)) != LLVMTypeKindValue::DOUBLE
+            return false if ElisaLLVMCallIsNoBuiltin(instruction) != 0 or ElisaLLVMCallHasFunctionAttribute(instruction, attribute_kind("convergent")) != 0 or ElisaLLVMCallHasFunctionAttribute(instruction, attribute_kind("strictfp")) != 0
+            return false if LLVMGetNumOperandBundles(instruction) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+            (LLVMGetFastMathFlags(instruction) & SqrtProofLimit::NO_NANS_FLAG) == 0
+
+        # The candidate calls of FUNCTION, none when it has more than eight or more than
+        # 2500 instructions.
+        def sqrt_candidates(function: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: mutable darray[LLVMValueRef] = []
+            size: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, calls, size|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, calls, size|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    size <- size + 1
+                    calls.push(instruction) if is_sqrt_candidate(instruction)
+            return [] if calls.count > SqrtProofLimit::CALLS or size > SqrtProofLimit::FUNCTION_INSTRUCTIONS
+            calls
+
+        # Declarations, size-optimized, strict floating-point, debug-info and sanitized
+        # functions keep their calls.
+        def skipped_by_sqrt_policy(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function) or function_has_attribute(function, "strictfp")
+            llvm_function_subprogram_or_null(function) != null or function_is_sanitized(function)
+
+        # Whether the call's argument is never NaN or negative.
+        def has_sqrt_domain(call: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            argument: LLVMValueRef = LLVMGetOperand(call, 0)
+            return true if has_guarded_domain(argument, call, analyses)
+            no_phis: darray[LLVMValueRef] = []
+            query: SqrtQuery = SqrtQuery{at: call, hypothesis: SqrtHypothesis{phi: null, facts: 0}, depth: 0}
+            prove_sqrt_facts(argument, SqrtFact::NOT_NAN | SqrtFact::NONNEGATIVE, query, SqrtProofLimit::BUDGET, &no_phis, analyses).proven
+
+        # The calls of FUNCTION that gained `nnan`.
+        def prove_function_sqrt_domains(function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: darray[LLVMValueRef] = sqrt_candidates(function)
+            return 0 if calls.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            name_storage: mutable darray[u8] = []
+            library_name: cstr = sview_to_cstr("sqrt", name_storage)
+            changed: mutable u32 = 0
+            for call in calls |changed, analyses, library_name|:
+                if ElisaLLVMCallIsAvailableLibFunction(analyses, call, library_name) != 0 and has_sqrt_domain(call, analyses):
+                    LLVMSetFastMathFlags(call, LLVMGetFastMathFlags(call) | SqrtProofLimit::NO_NANS_FLAG)
+                    changed <- changed + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # The `sqrt` calls that gained `nnan`; none in a module with debug info.
+        def prove_sqrt_domains(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_debug_info(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed|:
+                function_cursor <- LLVMGetNextFunction(function)
+                if not skipped_by_sqrt_policy(function):
+                    changed <- changed + prove_function_sqrt_domains(function)
+            changed
+
+        # Proves the calls' domains, then lets LLVM turn them into the intrinsic before
+        # instruction selection (in LLVM 23 AggressiveInstCombine simplifies the libcall).
+        # 0 unchanged, 1 changed, 2 when the cleanup pipeline failed.
+        def optimize_sqrt_domains(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if prove_sqrt_domains(module) == 0
+            return 2 if not run_module_pipeline(module, target, SqrtProofLimit::CLEANUP)
+            1

@@ -12,6 +12,7 @@
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Support/KnownFPClass.h>
 #include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Dominators.h>
@@ -360,6 +361,36 @@ int ElisaLLVMFunctionHasCycle(LLVMValueRef function) {
   for (auto Component = scc_begin(F); !Component.isAtEnd(); ++Component)
     if (Component.hasCycle()) return 1;
   return 0;
+}
+
+unsigned ElisaLLVMConstantFloatClass(LLVMValueRef constant) {
+  return cast<ConstantFP>(unwrap(constant))->getValueAPF().classify();
+}
+
+unsigned ElisaLLVMKnownFPClassFacts(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
+                                    LLVMValueRef context) {
+  Instruction *At = cast<Instruction>(unwrap(context));
+  KnownFPClass Known = computeKnownFPClass(unwrap(value), At->getModule()->getDataLayout(),
+                                           fcAllFlags, nullptr, nullptr, At,
+                                           unwrapAnalyses(analyses)->dominators.get());
+  return (Known.isKnownNeverNaN() ? 1u : 0u) | (Known.isKnownNeverInfOrNaN() ? 2u : 0u) |
+         (Known.isKnownNever(fcNan | fcNegative) ? 4u : 0u);
+}
+
+int ElisaLLVMIsReachableFromEntry(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef block) {
+  return unwrapAnalyses(analyses)->dominators->getNode(unwrap(block)) != nullptr;
+}
+
+int ElisaLLVMCallIsAvailableLibFunction(ElisaFunctionAnalysesRef analyses, LLVMValueRef call,
+                                        const char *name) {
+  TargetLibraryInfo &Library = unwrapAnalyses(analyses)->targetLibraryInfo();
+  LibFunc Called, Named;
+  return Library.getLibFunc(*cast<CallBase>(unwrap(call)), Called) &&
+         Library.getLibFunc(StringRef(name), Named) && Called == Named && Library.has(Called);
+}
+
+int ElisaLLVMCallIsNoBuiltin(LLVMValueRef call) {
+  return cast<CallBase>(unwrap(call))->isNoBuiltin();
 }
 
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant) {

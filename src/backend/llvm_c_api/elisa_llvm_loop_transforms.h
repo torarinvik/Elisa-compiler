@@ -6,6 +6,7 @@
 #define ELISA_LLVM_LOOP_TRANSFORMS_H
 
 #include "elisa_llvm_analysis.h"
+#include "elisa_llvm_ir_edits.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,19 @@ int ElisaLLVMCanPeelLoop(ElisaLoopRef loop);
 /* peelLoop(L, count, peel_last, LI, SE, DT, AC, preserve_lcssa, map). */
 void ElisaLLVMPeelLoop(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop, uint32_t count,
                        int peel_last, int preserve_lcssa);
+
+/* SplitBlock(block of `instruction`, instruction, DT, LI, nullptr, name): the new block
+ * holds the instruction and everything after it. Updates the dominator tree and loop
+ * info. */
+LLVMBasicBlockRef ElisaLLVMSplitBlockKeepingLoops(ElisaFunctionAnalysesRef analyses,
+                                                  LLVMValueRef instruction, const char *name);
+/* cloneLoopWithPreheader(before, loop_dominator, loop, map, suffix, LI, DT, blocks), then
+ * remapInstructionsInBlocks(blocks, map): a copy of the loop and its preheader placed
+ * before `before`, dominated by `loop_dominator`. Returns the copied loop. */
+ElisaLoopRef ElisaLLVMCloneLoopWithPreheader(ElisaFunctionAnalysesRef analyses,
+                                             LLVMBasicBlockRef before,
+                                             LLVMBasicBlockRef loop_dominator, ElisaLoopRef loop,
+                                             ElisaValueMapRef map, const char *suffix);
 
 /* UnrollLoopOptions flags; the options without a flag take the values below. */
 enum {

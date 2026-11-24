@@ -10,6 +10,7 @@
 // (ElisaPathRanges), through constant scalings, and from the size of an
 // alloca the copy reads or writes; only the lengths its known bits allow
 // get a chunk size.
+#include <llvm-c/Core.h>
 #include <llvm/Analysis/AssumptionCache.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -184,3 +185,8 @@ static unsigned expandBoundedCopies(Module &M) {
   return Changed;
 }
 } // namespace ElisaBoundedCopies
+
+// Late, so the bounded length reaches the copy after every inlining.
+extern "C" unsigned elisacoreExpandBoundedCopies(LLVMModuleRef module) {
+  return module ? ElisaBoundedCopies::expandBoundedCopies(*llvm::unwrap(module)) : 0;
+}

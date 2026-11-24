@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Check sqrt no-NaN proofs and linked reduction results, including exclusions."""
-import json
+"""Check sqrt no-NaN proofs and linked reduction results, including exclusions.
+
+The proofs run through `elisac llvm-pass` ($ELISAC, or bin/elisac-stage1).
+"""
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'test' / 'llvm'))
+from elisa_llvm_pass import run_pass, run_pass_with_target
 def run(args):
     p = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=28)
     if p.returncode:
@@ -24,9 +28,6 @@ def main():
         print('sqrt proof requires LLVM 23; skipped'); return
     bindir = Path(run([config, '--bindir']).stdout.strip())
     host = run([config, '--host-target']).stdout.strip()
-    flags = shlex.split(run([config, '--cxxflags']).stdout)
-    links = shlex.split(run([config, '--ldflags', '--libs', '--system-libs']).stdout)
-    libdir = run([config, '--libdir']).stdout.strip()
     fixture = re.sub(r'target triple = "[^"]+"', f'target triple = "{host}"', (ROOT/'test/parity/sqrt_proof_fixture.ll').read_text())
     controls = {
         'nan-seed': fixture.replace('phi double [ 0.000000e+00,', 'phi double [ 0x7FF8000000000000,', 1),
@@ -59,29 +60,13 @@ exit:
 '''
     controls['opposite-infinities'] = opposite
     with tempfile.TemporaryDirectory(prefix='elisa-sqrt-proof-') as tmp:
-        q=Path(tmp);driver=q/'driver.cpp'
-        driver.write_text('#include '+json.dumps(str(ROOT/'src/backend/llvm_sqrt_proof.cpp'))+r'''
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm-c/Target.h>
-int main(int argc,char **argv){using namespace llvm;LLVMContext C;SMDiagnostic E;
- auto M=parseIRFile(argv[1],E,C);if(!M){E.print(argv[0],errs());return 2;}
- if(verifyModule(*M,&errs()))return 2;
- LLVMTargetMachineRef TM=nullptr;
- if(argc==3){LLVMInitializeNativeTarget();LLVMInitializeNativeAsmPrinter();LLVMTargetRef T;char *Error=nullptr;
- auto Triple=M->getTargetTriple().str();if(LLVMGetTargetFromTriple(Triple.c_str(),&T,&Error))return 2;
- TM=LLVMCreateTargetMachine(T,Triple.c_str(),"generic","",LLVMCodeGenLevelAggressive,LLVMRelocDefault,LLVMCodeModelDefault);if(!TM)return 2;}
- errs()<<"changed="<<(argc==3 ? elisacoreOptimizeSqrtNonNaN(wrap(M.get()), TM) : elisacoreProveSqrtNonNaN(wrap(M.get())))<<"\n";
- if(TM)LLVMDisposeTargetMachine(TM);
- if(verifyModule(*M,&errs()))return 2;M->print(outs(),nullptr);}
-''')
-        transform=q/'transform'
-        run([bindir/'clang++', *flags, '-O2', driver, *links, '-Wl,-rpath,'+libdir, '-o', transform])
+        q=Path(tmp)
         def apply(name, text, changed, cleanup=False):
-            source=q/(name+'.ll');source.write_text(text);p=run([transform,source]+(["cleanup"] if cleanup else []))
-            if ('changed=1' in p.stderr)!=changed: raise RuntimeError(name+': '+p.stderr)
-            return p.stdout
+            # sqrt-domains also runs the cleanup that turns proven calls into the intrinsic;
+            # its target machine is the module's triple with the generic CPU.
+            count, module = run_pass_with_target('sqrt-domains', text, 'generic', '') if cleanup else run_pass('sqrt-domain-proofs', text)
+            if (count != 0) != changed: raise RuntimeError(f'{name}: changed {count}')
+            return module
         candidate=apply('original',fixture,True)
         if apply('idempotent',candidate,False).splitlines()[1:]!=candidate.splitlines()[1:]: raise RuntimeError('not idempotent')
         for name,text in controls.items(): apply(name,text,False)

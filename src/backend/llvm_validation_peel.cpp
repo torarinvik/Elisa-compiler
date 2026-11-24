@@ -132,16 +132,13 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
   LLVMParseCommandLineOptions(3, args, nullptr);
 #endif
 }
-extern "C" unsigned elisacoreBoundedLoopUnswitch(LLVMModuleRef);
 #include "llvm_bounded_factorial.cpp"
 extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);
-extern "C" unsigned elisacoreOptimizeSqrtNonNaN(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreOptimizeBoundedSums(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreOptimizeIndexBounds(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreFoldBoundedRemainders(LLVMModuleRef);
 extern "C" unsigned elisacoreFoldSignedRangeMasks(LLVMModuleRef);
 #include "llvm_ordered_vector.cpp"
-#include "llvm_even_range.cpp"
 
 // The late scalar cleanup sequence lives in Elisa
 // (llvm_passes/late_cleanup/late_scalar_cleanup.elisa); these are its entries.

@@ -174,6 +174,23 @@ uint64_t ElisaLLVMConstantDoubleBits(LLVMValueRef constant);
 /* Whether some strongly connected component of the function's control flow graph has a
  * cycle (scc_iterator::hasCycle): a loop or a self-edge. */
 int ElisaLLVMFunctionHasCycle(LLVMValueRef function);
+/* The FPClassTest bits of a ConstantFP's value (APFloat::classify): 1 signaling NaN,
+ * 2 quiet NaN, 4 -inf, 8 -normal, 16 -subnormal, 32 -0, 64 +0, 128 +subnormal,
+ * 256 +normal, 512 +inf. */
+unsigned ElisaLLVMConstantFloatClass(LLVMValueRef constant);
+/* computeKnownFPClass of `value` at the instruction `context`, with the dominator tree and
+ * no library info or assumption cache, as facts: 1 never NaN, 2 never infinite or NaN,
+ * 4 never NaN or negative (isKnownNever(fcNan | fcNegative)). */
+unsigned ElisaLLVMKnownFPClassFacts(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
+                                    LLVMValueRef context);
+/* DominatorTree::isReachableFromEntry: the block has a dominator tree node. */
+int ElisaLLVMIsReachableFromEntry(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef block);
+/* TargetLibraryInfo::getLibFunc(call) names the library function `name`, and the target
+ * has it (TargetLibraryInfo::has). */
+int ElisaLLVMCallIsAvailableLibFunction(ElisaFunctionAnalysesRef analyses, LLVMValueRef call,
+                                        const char *name);
+/* CallBase::isNoBuiltin: `nobuiltin` on the call site or callee without `builtin`. */
+int ElisaLLVMCallIsNoBuiltin(LLVMValueRef call);
 /* llvm::isGuaranteedNotToBeUndefOrPoison with no context instruction. */
 int ElisaLLVMIsGuaranteedNotToBeUndefOrPoison(LLVMValueRef value);
 /* llvm::isGuaranteedNotToBeUndefOrPoison at the instruction `context`, with the dominator
