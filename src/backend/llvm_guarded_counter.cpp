@@ -13,7 +13,7 @@
 using namespace llvm;
 namespace {
 // Whether a dominating guard keeps Bound below the signed maximum. Moved here from
-// the guarded-increment pass, now written in Elisa (llvm_passes/guarded_increments.elisa).
+// the guarded-increment pass, now written in Elisa (llvm_passes/late_cleanup/guarded_increments.elisa).
 static bool guardEdge(DominatorTree &DT,CondBrInst *Br,unsigned Edge,BasicBlock *Use){
  return Br->getSuccessor(0)!=Br->getSuccessor(1) && DT.dominates(BasicBlockEdge(Br->getParent(),Br->getSuccessor(Edge)),Use);
 }

@@ -220,5 +220,5 @@ static bool shouldRevisitNestedVectorLoops(Module &M) {
 }
 
 // The late scalar cleanup sequence lives in Elisa
-// (llvm_passes/late_scalar_cleanup.elisa); these are its entries.
+// (llvm_passes/late_cleanup/late_scalar_cleanup.elisa); these are its entries.
 #include "llvm_late_cleanup_entries.h"

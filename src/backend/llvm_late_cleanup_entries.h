@@ -1,6 +1,6 @@
 // C entry points for each pass of the late scalar cleanup, so its sequence
 // (pass order, cleanup pipelines, status) lives in Elisa
-// (`llvm_passes/late_scalar_cleanup.elisa`) while the passes themselves are
+// (`llvm_passes/late_cleanup/late_scalar_cleanup.elisa`) while the passes themselves are
 // still C++. Included at the end of llvm_validation_peel.cpp, the
 // translation unit that defines every pass named here.
 //
