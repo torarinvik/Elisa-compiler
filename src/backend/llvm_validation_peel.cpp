@@ -45,6 +45,7 @@
 #include "llvm_view_bounded_fills.h"
 #include "llvm_indexed_prefix.h"
 #include "llvm_proven_checks.h"
+#include "llvm_validated_reads.h"
 
 using namespace llvm;
 
@@ -54,6 +55,7 @@ using namespace llvm;
 extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
   if (!Module) return 0;
   unsigned Removed = ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(Module));
+  Removed += ElisaValidatedReads::annotateValidatedReads(*unwrap(Module));
   return Removed + ElisaViewBounds::shrinkViewFills(*unwrap(Module));
 }
 
