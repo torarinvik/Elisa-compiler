@@ -138,15 +138,15 @@ extend Semantic:
                 # declaration in the whole program, per direct call — see the matching
                 # comment on direct_function_count below. Walks only function_name's own
                 # hash chain now; `cur` is loop-internal (not part of the result tuple).
-                found_func, fits, func_count, only_min, only_max =
-                    while cur != 4294967295 |found_func = false, fits = false, func_count: u32 = 0, only_min: u32 = 0, only_max: u32 = 0, cur: u32 = symbol_chain_head(table, function_name)| -> found_func, fits, func_count, only_min, only_max:
+                found_func, fits, func_count, only_max, only_module =
+                    while cur != 4294967295 |found_func = false, fits = false, func_count: u32 = 0, only_max: u32 = 0, only_module: sview @source = "", cur: u32 = symbol_chain_head(table, function_name)| -> found_func, fits, func_count, only_max, only_module:
                         symbol: Symbol = table.symbols[cur.usize()]
                         if symbol.name == function_name:
                             if symbol.kind == SymbolKind.Func:
                                 found_func <- true
                                 func_count <- func_count + 1
-                                only_min <- symbol.arity_min
                                 only_max <- symbol.arity_max
+                                only_module <- symbol.module_owner
                                 if argument_count.u32() >= symbol.arity_min and argument_count.u32() <= symbol.arity_max:
                                     fits <- true
                             else:
@@ -154,11 +154,92 @@ extend Semantic:
                                 # builtin, ...) -- callable shapes we don't model; skip.
                                 fits <- true
                         cur <- table.symbol_name_next[cur.usize()]
-                # When exactly one declaration and no defaults (min == max), the
-                # expected count is unambiguous — report it (stage0 parity). With
-                # overloads or defaults, keep the generic message. `expected` = "n"
-                # marks the enriched form for diagnostic_message.
-                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArityMismatch, name: function_name, line: line, pos: extra_pos, expected: "n", actual: "", expected_count: only_max, actual_count: argument_count.u32(), detail: bounds_length_hint(table, function_name)} if func_count == 1 and only_min == only_max else Diagnostic{kind: DiagnosticKind.ArityMismatch, name: function_name, line: line, expected: "", actual: ""}) if found_func and not fits
+                # One declaration: stage0 names it with its module (`Hub.count`) and counts
+                # every parameter, defaulted ones included (`count()` against
+                # `count(a: bool, b: bool = true)` reads "expects 2 arguments, got 0").
+                # Overloads keep the generic message. `expected` = "n" marks the counted form.
+                return if not found_func or fits
+                if func_count != 1:
+                    table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArityMismatch, name: function_name, line: line, expected: "", actual: ""})
+                    return
+                rebind display_name: sview @source, table = module_qualified_name(only_module, function_name, table)
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArityMismatch, name: display_name, line: line, pos: extra_pos, expected: "n", actual: "", expected_count: only_max, actual_count: argument_count.u32(), detail: bounds_length_hint(table, function_name)})
+
+        # Whether the call at `call_pos` forwards the caller's matching parameters with `..`,
+        # so its written argument count is not the callee's arity.
+        def call_forwards_arguments(table: SymbolTable&, call_pos: Ast::Pos) -> bool:
+            can Abort.Panic:
+                for forward_index in 0..<table.forward_arg_lines.count:
+                    continue if forward_index >= table.forward_arg_offsets.count
+                    return true if table.forward_arg_lines[forward_index] == call_pos.line and table.forward_arg_offsets[forward_index] == call_pos.offset
+                return false
+
+        # stage0's dotted spelling of a module function, `Hub.count` (`count` at top level).
+        def module_qualified_name(module_name: sview, function_name: sview @source, table: lmut SymbolTable) -> sview @source:
+            can Memory.Allocate, Abort.Panic:
+                return function_name if module_name == ""
+                spelled: mutable darray[u8] = []
+                append_dotted_module_name(module_name, &spelled)
+                spelled.push(46)
+                for byte in function_name |spelled|:
+                    spelled.push(byte)
+                return intern_joined_text(spelled, table)
+
+        # `Outer::Hub::count(...)` against the one function `count` declared in the module
+        # that path names. A nested module's declarations are recorded under its qualified
+        # name (`Outer::Hub`, parser_decl_module.elisa), so the callee path must spell the
+        # declaration's module exactly. Without this check a qualified call with the wrong
+        # argument count reached the backend, which declined the function. stage0 spells the
+        # module dotted: `function "Outer.Hub.count" expects 1 arguments, got 2`.
+        def check_qualified_call_arity(table: lmut SymbolTable, callee: Ast::Expr, argument_count: usize, line: u32) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match callee:
+                    Expr.Scope(module_expression, function_name, scope_line):
+                        matches, only_min, only_max, only_owner =
+                            while cur != SYMBOL_INDEX_ROW_NONE |matches: u32 = 0, only_min: u32 = 0, only_max: u32 = 0, only_owner: sview @source = "", cur: u32 = symbol_chain_head(table, function_name)| -> matches, only_min, only_max, only_owner:
+                                symbol: Symbol = table.symbols[cur.usize()]
+                                if symbol.name == function_name and symbol.kind == SymbolKind.Func and module_path_spells(module_expression, symbol.module_owner):
+                                    matches <- matches + 1
+                                    only_min <- symbol.arity_min
+                                    only_max <- symbol.arity_max
+                                    only_owner <- symbol.module_owner
+                                cur <- table.symbol_name_next[cur.usize()]
+                        return if matches != 1 or (argument_count.u32() >= only_min and argument_count.u32() <= only_max)
+                        rebind display_name: sview @source, table = module_qualified_name(only_owner, function_name, table)
+                        # A Scope's position is its last `::`; the `(` follows the function name.
+                        paren_column: u32 = scope_line.end_column + function_name.len.u32()
+                        paren_offset: u32 = scope_line.end_offset + function_name.len.u32()
+                        paren_pos: Ast::Pos = Ast::Pos{line: scope_line.end_line, column: paren_column, offset: paren_offset, end_line: scope_line.end_line, end_column: paren_column + 1, end_offset: paren_offset + 1}
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ArityMismatch, name: display_name, line: line, pos: paren_pos, expected: "n", actual: "", expected_count: only_max, actual_count: argument_count.u32()})
+                    _:
+                        pass
+
+        # Whether a callee's module path (`Outer::Hub` as Scope(Ident Outer, Hub)) spells the
+        # module name a declaration was recorded under.
+        def module_path_spells(path: Ast::Expr, module_name: sview) -> bool:
+            can Abort.Panic:
+                match path:
+                    Expr.Ident(segment, _):
+                        return module_name == segment
+                    Expr.Scope(base, segment, _):
+                        return false if module_name.len < segment.len + 2
+                        prefix_length: usize = module_name.len - segment.len - 2
+                        return false if module_name[prefix_length] != 58 or module_name[prefix_length + 1] != 58
+                        return module_name[prefix_length + 2:module_name.len] == segment and module_path_spells(base, module_name[0:prefix_length])
+                    _:
+                        return false
+
+        # Copies a recorded module name (`Outer::Hub`) in stage0's dotted spelling (`Outer.Hub`).
+        def append_dotted_module_name(module_name: sview, spelled: mutable darray[u8]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                index: mutable usize = 0
+                while index < module_name.len |index, spelled, module_name|:
+                    if module_name[index] == 58 and index + 1 < module_name.len and module_name[index + 1] == 58:
+                        spelled.push(46)
+                        index <- index + 2
+                    else:
+                        spelled.push(module_name[index])
+                        index <- index + 1
 
 
         # Was an O(symbols.count) scan of every declaration in the whole program — called on

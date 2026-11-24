@@ -29,7 +29,17 @@ grep -q "expects.*arguments, got" <<< "$out" && fail "false positive on defaulte
 
 # 5. Required parameters before defaults are still required.
 out=$(printf 'def add(x: i64, y: i64 = 7) -> i64:\n    return x + y\n\ndef g() -> i64:\n    return add()\n' | "$RPT")
-grep -q "expects 1-2 arguments, got 0\|wrong number of arguments" <<< "$out" || fail "missing required arg before default not flagged: $out"
+# stage0 counts every parameter, defaulted ones included.
+grep -q 'function "add" expects 2 arguments, got 0' <<< "$out" || fail "missing required arg before default not flagged: $out"
+
+# 5b. A qualified call into a module is arity-checked too, spelled with the dotted path as
+# stage0 does. Unchecked, `Hub::count(true, true, true)` reached the backend and was declined.
+out=$(printf 'module Hub:\n    def count(a: bool = true, b: bool = true) -> i64:\n        1 if a and b else 0\n\ndef g() -> i64:\n    Hub::count(true, true, true)\n' | "$RPT")
+grep -q 'function "Hub.count" expects 2 arguments, got 3' <<< "$out" || fail "qualified extra argument not flagged: $out"
+out=$(printf 'module Outer:\n    module Hub:\n        def count(a: bool) -> i64:\n            1 if a else 0\n\ndef g() -> i64:\n    Outer::Hub::count(true, true)\n' | "$RPT")
+grep -q 'function "Outer.Hub.count" expects 1 arguments, got 2' <<< "$out" || fail "nested qualified extra argument not flagged: $out"
+out=$(printf 'module Hub:\n    def count(a: bool = true, b: bool = true) -> i64:\n        1 if a and b else 0\n\ndef g() -> i64:\n    Hub::count(true)\n' | "$RPT")
+grep -q "expects.*arguments, got" <<< "$out" && fail "false positive on a qualified defaulted call: $out"
 
 # 6. Required parameters after defaulted parameters are rejected.
 out=$(printf 'def bad(x: i64 = 1, y: i64) -> i64:\n    return x + y\n' | "$RPT")
