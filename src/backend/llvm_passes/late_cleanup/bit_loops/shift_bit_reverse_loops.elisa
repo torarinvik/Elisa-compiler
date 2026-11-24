@@ -1,0 +1,218 @@
+# Folds a shift-and-append loop that reverses the significant bits of its input,
+#   reverse' = (reverse << 1) | (word & 1); word' = word >> 1  until word == 0,
+# entered only for a nonzero input, into `bitreverse(input) >> ctlz(input)`: the
+# full-width reverse moves the leading zeros to the low end, and shifting right by
+# their count removes them. The checked signed form, whose doubling traps once the
+# partial reverse reaches 2^62, qualifies when the input is known nonnegative: a
+# nonnegative i64 has at most 63 bits, so no doubling reaches that bound.
+include "../../ir/trap_blocks.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module BitReverseLimit:
+    FUNCTION_BLOCKS: u32 = 24
+    # 2^62, the bound the checked doubling tests.
+    CHECKED_DOUBLING_BIAS: u64 = 4611686018427387904
+
+# The loop's blocks and its word recurrence.
+struct BitReverseLoop:
+    latch: LLVMBasicBlockRef
+    head: LLVMBasicBlockRef
+    exit: LLVMBasicBlockRef
+    entry: LLVMBasicBlockRef
+    back: LLVMValueRef
+    done: LLVMValueRef
+    shift: LLVMValueRef
+    word: LLVMValueRef
+    input: LLVMValueRef
+    enter: LLVMValueRef
+    nonzero_side: u32
+
+# The reverse recurrence: `reverse = phi(0, append)`, `append = grow | bit`.
+struct BitReverseAccumulator:
+    reverse: LLVMValueRef
+    append: LLVMValueRef
+    grow: LLVMValueRef
+    bit: LLVMValueRef
+
+# The checked doubling between head and latch; all null when the loop is one block.
+struct BitReverseCheck:
+    overflow_branch: LLVMValueRef?
+    overflow: LLVMValueRef?
+    offset: LLVMValueRef?
+    trap: LLVMBasicBlockRef?
+
+extend Backend:
+    private:
+        def is_compare_against_constant(compare: LLVMValueRef, value: LLVMValueRef, constant: u64) -> bool:
+            is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) and LLVMGetOperand(compare, 0) == value and is_constant_integer(LLVMGetOperand(compare, 1), constant)
+
+        def is_equality_compare(compare: LLVMValueRef) -> bool:
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            predicate == LLVMIntPredicate::EQ or predicate == LLVMIntPredicate::NE
+
+        # A parameter marked `noundef`.
+        def is_noundef_argument(value: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsAArgument(value) == null
+            function: LLVMValueRef = LLVMGetParamParent(value)
+            name_storage: mutable darray[u8] = []
+            noundef: u32 = LLVMGetEnumAttributeKindForName(sview_to_cstr("noundef", name_storage), 7)
+            for index in 0..<LLVMCountParams(function) |function, value, noundef|:
+                return LLVMGetEnumAttributeAtIndex(function, index + 1, noundef) != null if LLVMGetParam(function, index) == value
+            false
+
+        # A word the entry guards and the replacement both see the same: a freeze, a
+        # constant or a `noundef` parameter.
+        def is_stable_reverse_input(input: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            is_llvm_instruction_with_opcode(input, LLVMOpcode::FREEZE) or LLVMIsAConstantInt(input) != null or is_noundef_argument(input)
+
+        # ENTRY is reached only from a branch on `input <s 0` (or `>=s`) taking its
+        # nonnegative side.
+        def has_nonnegative_input(entry: LLVMBasicBlockRef, input: LLVMValueRef) -> bool:
+            predecessor: LLVMBasicBlockRef = get single_predecessor(entry) else return false
+            branch: LLVMValueRef = get conditional_terminator(predecessor) else return false
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_compare_against_constant(compare, input, 0)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return false if predicate != LLVMIntPredicate::SLT and predicate != LLVMIntPredicate::SGE
+            nonnegative: u32 = 1 if predicate == LLVMIntPredicate::SLT else 0
+            LLVMGetSuccessor(branch, nonnegative) == entry and LLVMGetSuccessor(branch, 1 - nonnegative) != entry
+
+        # The loop latched by LATCH and its `word` recurrence, entered on a nonzero input.
+        def match_bit_reverse_loop(latch: LLVMBasicBlockRef, context: LLVMContextRef) -> BitReverseLoop? can[Abort.Panic, Memory.Allocate]:
+            back: LLVMValueRef = get conditional_terminator(latch) else return null
+            done: LLVMValueRef = LLVMGetCondition(back)
+            return null if not is_llvm_instruction_with_opcode(done, LLVMOpcode::ICMP) or not is_equality_compare(done)
+            return null if ElisaLLVMBlockHasAddressTaken(latch) != 0 or has_loop_metadata(back, context)
+            exit_side: u32 = 0 if LLVMGetICmpPredicate(done) == LLVMIntPredicate::EQ else 1
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(back, exit_side)
+            head: LLVMBasicBlockRef = LLVMGetSuccessor(back, 1 - exit_side)
+            return null if head == exit or ElisaLLVMBlockHasAddressTaken(head) != 0 or not same_optional_block(single_predecessor(exit), latch) or block_has_phis(exit)
+            shift: LLVMValueRef = LLVMGetOperand(done, 0)
+            return null if not is_llvm_instruction_with_opcode(shift, LLVMOpcode::LSHR) or LLVMGetInstructionParent(shift) != latch
+            return null if not is_constant_integer(LLVMGetOperand(shift, 1), 1) or not is_constant_integer(LLVMGetOperand(done, 1), 0)
+            word: LLVMValueRef = LLVMGetOperand(shift, 0)
+            return null if not is_llvm_instruction_with_opcode(word, LLVMOpcode::PHI) or LLVMGetInstructionParent(word) != head or not is_llvm_integer_type(LLVMTypeOf(word), 64)
+            return null if LLVMCountIncoming(word) != 2 or not is_optional_value(phi_incoming_for_block(word, latch), shift)
+            entry_index: u32 = 1 if LLVMGetIncomingBlock(word, 0) == latch else 0
+            entry: LLVMBasicBlockRef = LLVMGetIncomingBlock(word, entry_index)
+            return null if entry == exit or entry == head or entry == latch
+            input: LLVMValueRef = LLVMGetIncomingValue(word, entry_index)
+            return null if not is_stable_reverse_input(input)
+            enter: LLVMValueRef = get conditional_terminator(entry) else return null
+            zero: LLVMValueRef = LLVMGetCondition(enter)
+            return null if not is_compare_against_constant(zero, input, 0) or not is_equality_compare(zero)
+            nonzero_side: u32 = 1 if LLVMGetICmpPredicate(zero) == LLVMIntPredicate::EQ else 0
+            return null if LLVMGetSuccessor(enter, nonzero_side) != head or LLVMGetSuccessor(enter, 1 - nonzero_side) == head or LLVMGetSuccessor(enter, 1 - nonzero_side) == exit
+            BitReverseLoop{latch: latch, head: head, exit: exit, entry: entry, back: back, done: done, shift: shift, word: word, input: input, enter: enter, nonzero_side: nonzero_side}
+
+        # The `reverse` phi next to `word` (or first in the head) and its update.
+        def match_bit_reverse_accumulator(loop: BitReverseLoop&) -> BitReverseAccumulator?:
+            next: LLVMValueRef = get LLVMGetNextInstruction(loop.word) else return null
+            first: LLVMValueRef = get LLVMGetFirstInstruction(loop.head) else return null
+            reverse: LLVMValueRef = next if is_llvm_instruction_with_opcode(next, LLVMOpcode::PHI) else first
+            return null if not is_llvm_instruction_with_opcode(reverse, LLVMOpcode::PHI) or reverse == loop.word or LLVMCountIncoming(reverse) != 2
+            return null if not is_optional_constant_integer(phi_incoming_for_block(reverse, loop.entry), 0)
+            append: LLVMValueRef = get phi_incoming_for_block(reverse, loop.latch) else return null
+            return null if not is_llvm_instruction_with_opcode(append, LLVMOpcode::OR) or LLVMGetInstructionParent(append) != loop.latch
+            left: LLVMValueRef = LLVMGetOperand(append, 0)
+            right: LLVMValueRef = LLVMGetOperand(append, 1)
+            swapped: bool = is_llvm_instruction_with_opcode(left, LLVMOpcode::AND)
+            grow: LLVMValueRef = right if swapped else left
+            bit: LLVMValueRef = left if swapped else right
+            return null if not is_llvm_instruction_with_opcode(grow, LLVMOpcode::SHL) or LLVMGetInstructionParent(grow) != loop.latch
+            return null if LLVMGetOperand(grow, 0) != reverse or not is_constant_integer(LLVMGetOperand(grow, 1), 1)
+            return null if not is_llvm_instruction_with_opcode(bit, LLVMOpcode::AND) or LLVMGetInstructionParent(bit) != loop.latch
+            return null if LLVMGetOperand(bit, 0) != loop.word or not is_constant_integer(LLVMGetOperand(bit, 1), 1)
+            BitReverseAccumulator{reverse: reverse, append: append, grow: grow, bit: bit}
+
+        # The checked doubling of a two-block loop, `reverse + 2^62 <s 0` branching to a
+        # trap; null when it does not qualify.
+        def match_bit_reverse_check(loop: BitReverseLoop&, reverse: LLVMValueRef) -> BitReverseCheck? can[Abort.Panic, Memory.Allocate]:
+            return BitReverseCheck{overflow_branch: null, overflow: null, offset: null, trap: null} if loop.head == loop.latch
+            overflow_branch: LLVMValueRef = get conditional_terminator(loop.head) else return null
+            overflow: LLVMValueRef = LLVMGetCondition(overflow_branch)
+            return null if not is_llvm_instruction_with_opcode(overflow, LLVMOpcode::ICMP)
+            offset: LLVMValueRef = LLVMGetOperand(overflow, 0)
+            return null if not is_llvm_instruction_with_opcode(offset, LLVMOpcode::ADD) or LLVMGetInstructionParent(offset) != loop.head or LLVMGetOperand(offset, 0) != reverse
+            return null if not is_constant_integer(LLVMGetOperand(offset, 1), BitReverseLimit::CHECKED_DOUBLING_BIAS)
+            return null if LLVMGetICmpPredicate(overflow) != LLVMIntPredicate::SLT or not is_constant_integer(LLVMGetOperand(overflow, 1), 0)
+            return null if LLVMGetSuccessor(overflow_branch, 1) != loop.latch or not same_optional_block(single_predecessor(loop.latch), loop.head)
+            return null if not has_nonnegative_input(loop.entry, loop.input)
+            trap: LLVMBasicBlockRef = LLVMGetSuccessor(overflow_branch, 0)
+            return null if trap == loop.latch or ElisaLLVMBlockHasAddressTaken(trap) != 0 or not same_optional_block(single_predecessor(trap), loop.head) or not is_bare_trap_block(trap)
+            BitReverseCheck{overflow_branch: overflow_branch, overflow: overflow, offset: offset, trap: trap}
+
+        def is_bit_reverse_member(instruction: LLVMValueRef, loop: BitReverseLoop&, accumulator: BitReverseAccumulator&, check: BitReverseCheck&) -> bool:
+            return true if instruction == loop.word or instruction == accumulator.reverse or instruction == accumulator.append or instruction == accumulator.grow
+            return true if instruction == accumulator.bit or instruction == loop.shift or instruction == loop.done or instruction == loop.back
+            is_optional_value(check.overflow_branch, instruction) or is_optional_value(check.overflow, instruction) or is_optional_value(check.offset, instruction)
+
+        # BLOCK holds only the loop's own instructions, used only inside the loop
+        # except for `append`, which the exit may use.
+        def is_closed_bit_reverse_block(block: LLVMBasicBlockRef, loop: BitReverseLoop&, accumulator: BitReverseAccumulator&, check: BitReverseCheck&) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, loop, accumulator, check|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                return false if not is_bit_reverse_member(instruction, loop, accumulator, check)
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(instruction)
+                while use_cursor is use |use_cursor, instruction, loop, accumulator|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    return false if LLVMIsAInstruction(user) == null
+                    parent: LLVMBasicBlockRef = LLVMGetInstructionParent(user)
+                    continue if parent == loop.head or parent == loop.latch
+                    return false if instruction != accumulator.append or parent != loop.exit
+            true
+
+        def is_closed_bit_reverse_loop(loop: BitReverseLoop&, accumulator: BitReverseAccumulator&, check: BitReverseCheck&) -> bool:
+            return false if not is_closed_bit_reverse_block(loop.head, loop, accumulator, check)
+            return false if loop.head != loop.latch and not is_closed_bit_reverse_block(loop.latch, loop, accumulator, check)
+            return true if LLVMIsAInstruction(loop.input) == null
+            parent: LLVMBasicBlockRef = LLVMGetInstructionParent(loop.input)
+            parent != loop.head and parent != loop.latch and parent != loop.exit
+
+        # Computes the reverse in the exit, sends the nonzero entry there, and deletes the loop.
+        def replace_bit_reverse_loop(loop: BitReverseLoop&, accumulator: BitReverseAccumulator&, check: BitReverseCheck&, module: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            position_builder_before(builder, first_non_phi(loop.exit))
+            bits: LLVMValueRef = build_unary_intrinsic(builder, module, "llvm.bitreverse", loop.input)
+            count: LLVMValueRef = build_count_leading_zeros(builder, module, loop.input)
+            name_storage: mutable darray[u8] = []
+            result: LLVMValueRef = LLVMBuildLShr(builder, bits, count, sview_to_cstr("significant.reverse", name_storage))
+            LLVMDisposeBuilder(builder)
+            replace_uses_in_block(accumulator.append, result, loop.exit)
+            LLVMSetSuccessor(loop.enter, loop.nonzero_side, loop.exit)
+            two_blocks: bool = loop.head != loop.latch
+            ElisaLLVMBlockDropAllReferences(loop.head)
+            if two_blocks:
+                ElisaLLVMBlockDropAllReferences(loop.latch)
+            LLVMDeleteBasicBlock(loop.head)
+            if two_blocks:
+                LLVMDeleteBasicBlock(loop.latch)
+            if check.trap is trap:
+                LLVMDeleteBasicBlock(trap)
+
+        def fold_shift_bit_reverse(latch: LLVMBasicBlockRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            loop: BitReverseLoop = get match_bit_reverse_loop(latch, LLVMGetModuleContext(module)) else return false
+            accumulator: BitReverseAccumulator = get match_bit_reverse_accumulator(loop) else return false
+            check: BitReverseCheck = get match_bit_reverse_check(loop, accumulator.reverse) else return false
+            return false if not is_closed_bit_reverse_loop(loop, accumulator, check)
+            replace_bit_reverse_loop(loop, accumulator, check, module)
+            true
+
+    public:
+        # The bit-reverse loops folded on AArch64, at most one per function.
+        def fold_shift_bit_reverse_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_loop_pass_policy(function, module) or function_block_count(function) > BitReverseLimit::FUNCTION_BLOCKS
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, module|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    if fold_shift_bit_reverse(block, module):
+                        changed <- changed + 1
+                        break
+            changed

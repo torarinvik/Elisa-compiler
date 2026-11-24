@@ -1,0 +1,174 @@
+# Folds a loop clearing the low set bit of `upper` while it stays above `lower`,
+#   next = upper & (upper - 1)  while lower <u next,
+# entered only when `lower <u initial`, into the common prefix of the two endpoints:
+# `initial & ~(all_ones >> ctlz(lower ^ initial))`. The first bit where the endpoints
+# differ fixes the prefix, however many bits the loop would clear.
+#
+# When a dominating guard admits only ordered endpoints below 2^32, a 64-bit loop uses a
+# 32-bit count: a shift by 32 then clears the whole 32-bit suffix mask, so equal
+# endpoints keep `initial` too, and the entry test is dropped.
+include "../../ir/scalar_loop_patterns.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module RangeAndLimit:
+    FUNCTION_BLOCKS: u32 = 16
+    LOOP_INSTRUCTIONS: u32 = 5
+    NARROW_BOUND_BITS: u32 = 32
+    NARROW_SUFFIX: u64 = 4294967295
+
+# The loop: `upper = phi(initial, next)`, `next = upper & step`, `step = upper + -1`.
+struct RangeAndLoop:
+    loop: LLVMBasicBlockRef
+    entry: LLVMBasicBlockRef
+    exit: LLVMBasicBlockRef
+    back: LLVMValueRef
+    upper: LLVMValueRef
+    next: LLVMValueRef
+    step: LLVMValueRef
+    initial: LLVMValueRef
+    lower: LLVMValueRef
+    test: LLVMValueRef
+    entry_branch: LLVMValueRef
+    entry_test: LLVMValueRef
+
+# The entry guard's `lower >u initial` and `initial >u bound` compares.
+struct RangeGuardCompares:
+    order: LLVMValueRef
+    bound: LLVMValueRef
+
+# The frozen endpoints the prefix is computed from.
+struct RangeEndpoints:
+    low: LLVMValueRef
+    high: LLVMValueRef
+
+extend Backend:
+    private:
+        def is_all_ones_constant(value: LLVMValueRef) -> bool:
+            LLVMIsAConstantInt(value) != null and LLVMConstIntGetSExtValue(value) == -1
+
+        def match_range_and_loop(loop: LLVMBasicBlockRef) -> RangeAndLoop?:
+            back: LLVMValueRef = get conditional_terminator(loop) else return null
+            upper: LLVMValueRef = get LLVMGetFirstInstruction(loop) else return null
+            return null if not is_llvm_instruction_with_opcode(upper, LLVMOpcode::PHI) or LLVMCountIncoming(upper) != 2
+            return null if not is_llvm_integer_type(LLVMTypeOf(upper), 32) and not is_llvm_integer_type(LLVMTypeOf(upper), 64)
+            return null if instruction_count(loop) != RangeAndLimit::LOOP_INSTRUCTIONS or ElisaLLVMBlockHasAddressTaken(loop) != 0
+            return null if LLVMGetSuccessor(back, 0) != loop and LLVMGetSuccessor(back, 1) != loop
+            next: LLVMValueRef = get block_binary_operator(phi_incoming_for_block(upper, loop), LLVMOpcode::AND, loop) else return null
+            other: LLVMValueRef? = LLVMGetOperand(next, 1) if LLVMGetOperand(next, 0) == upper else (LLVMGetOperand(next, 0) if LLVMGetOperand(next, 1) == upper else null)
+            step: LLVMValueRef = get block_binary_operator(other, LLVMOpcode::ADD, loop) else return null
+            return null if not has_one_use(step) or LLVMGetOperand(step, 0) != upper or use_count(upper) != 2 or not is_all_ones_constant(LLVMGetOperand(step, 1))
+            test: UnsignedContinueTest = get unsigned_continue_test(back, loop, next) else return null
+            return null if LLVMIsAInstruction(test.lower) != null and LLVMGetInstructionParent(test.lower) == loop
+            entry: LLVMBasicBlockRef = LLVMGetIncomingBlock(upper, 1 if LLVMGetIncomingBlock(upper, 0) == loop else 0)
+            return null if entry == loop
+            entry_branch: LLVMValueRef = get conditional_terminator(entry) else return null
+            initial: LLVMValueRef = get phi_incoming_for_block(upper, entry) else return null
+            entry_test: UnsignedContinueTest = get unsigned_continue_test(entry_branch, loop, initial) else return null
+            return null if entry_test.lower != test.lower or test.lower == initial
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(back, 1 if LLVMGetSuccessor(back, 0) == loop else 0)
+            RangeAndLoop{loop: loop, entry: entry, exit: exit, back: back, upper: upper, next: next, step: step, initial: initial, lower: test.lower, test: test.compare, entry_branch: entry_branch, entry_test: entry_test.compare}
+
+        # The ordered 32-bit guard: the entry's only predecessor branches to it exactly when
+        # neither `lower >u initial` nor `initial >u bound` (a bound below 2^32) holds, and
+        # the exit's phis take the same value from the entry as from the loop.
+        def narrow_range_guard(range: RangeAndLoop&) -> RangeGuardCompares?:
+            return null if not is_llvm_integer_type(LLVMTypeOf(range.initial), 64)
+            return null if LLVMGetSuccessor(range.entry_branch, 0) != range.exit and LLVMGetSuccessor(range.entry_branch, 1) != range.exit
+            predecessor: LLVMBasicBlockRef = get single_predecessor(range.entry) else return null
+            check: LLVMValueRef = get conditional_terminator(predecessor) else return null
+            either: LLVMValueRef = LLVMGetCondition(check)
+            return null if not is_llvm_instruction_with_opcode(either, LLVMOpcode::OR) or not has_one_use(either)
+            return null if LLVMGetSuccessor(check, 1) != range.entry or LLVMGetSuccessor(check, 0) == range.entry
+            order: mutable LLVMValueRef? = null
+            bound: mutable LLVMValueRef? = null
+            for index in 0..<2 |either, predecessor, range, order, bound|:
+                term: LLVMValueRef = LLVMGetOperand(either, index.u32())
+                return null if not is_llvm_instruction_with_opcode(term, LLVMOpcode::ICMP) or LLVMGetInstructionParent(term) != predecessor
+                return null if not has_one_use(term) or LLVMGetICmpPredicate(term) != LLVMIntPredicate::UGT
+                order <- term if LLVMGetOperand(term, 0) == range.lower and LLVMGetOperand(term, 1) == range.initial
+                limit: LLVMValueRef = LLVMGetOperand(term, 1)
+                bound <- term if LLVMGetOperand(term, 0) == range.initial and LLVMIsAConstantInt(limit) != null and ElisaLLVMConstantIntActiveBits(limit) <= RangeAndLimit::NARROW_BOUND_BITS
+            order_compare: LLVMValueRef = get order else return null
+            bound_compare: LLVMValueRef = get bound else return null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(range.exit)
+            while cursor is phi |cursor, range|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                skipped: LLVMValueRef? = phi_incoming_for_block(phi, range.entry)
+                ran: LLVMValueRef? = phi_incoming_for_block(phi, range.loop)
+                return null if not same_optional_value(skipped, ran) and (not is_optional_value(skipped, range.initial) or not is_optional_value(ran, range.next))
+            RangeGuardCompares{order: order_compare, bound: bound_compare}
+
+        # Freezes the endpoints into the guard's compares and sends the entry straight
+        # into the loop: the guard already proved `lower <u initial`.
+        def narrow_range_bounds(range: RangeAndLoop&, compares: RangeGuardCompares&, builder: LLVMBuilderRef) -> RangeEndpoints:
+            order: LLVMValueRef = compares.order
+            bound: LLVMValueRef = compares.bound
+            position_builder_before(builder, order)
+            low: LLVMValueRef = LLVMBuildFreeze(builder, range.lower, "")
+            position_builder_before(builder, order if comes_before(order, bound) else bound)
+            high: LLVMValueRef = LLVMBuildFreeze(builder, range.initial, "")
+            LLVMSetOperand(order, 0, low)
+            LLVMSetOperand(order, 1, high)
+            LLVMSetOperand(bound, 0, high)
+            ElisaLLVMBlockRemovePredecessor(range.exit, range.entry, 0)
+            position_builder_before(builder, range.entry_branch)
+            _ = LLVMBuildBr(builder, range.loop)
+            LLVMInstructionEraseFromParent(range.entry_branch)
+            RangeEndpoints{low: low, high: high}
+
+        def fold_range_and_loop(loop: LLVMBasicBlockRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            range: RangeAndLoop = get match_range_and_loop(loop) else return false
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            narrow_compares: RangeGuardCompares? = narrow_range_guard(range)
+            narrow: bool = narrow_compares != null
+            endpoints: mutable RangeEndpoints = RangeEndpoints{low: range.lower, high: range.initial}
+            if narrow_compares is compares:
+                endpoints <- narrow_range_bounds(range, compares, builder)
+                LLVMInstructionEraseFromParent(range.entry_test)
+            else:
+                position_builder_before(builder, range.entry_test)
+                low: LLVMValueRef = LLVMBuildFreeze(builder, range.lower, "")
+                high: LLVMValueRef = LLVMBuildFreeze(builder, range.initial, "")
+                endpoints <- RangeEndpoints{low: low, high: high}
+                replace_operand_uses(range.entry_test, range.lower, endpoints.low)
+                replace_operand_uses(range.entry_test, range.initial, endpoints.high)
+            position_builder_before(builder, range.test)
+            difference: mutable LLVMValueRef = LLVMBuildXor(builder, endpoints.low, endpoints.high, "")
+            difference <- LLVMBuildTrunc(builder, difference, LLVMInt32TypeInContext(context), "") if narrow
+            prefix_length: mutable LLVMValueRef = build_count_zeros_intrinsic(builder, module, "llvm.ctlz", difference, not narrow)
+            suffix_bits: mutable LLVMValueRef = LLVMConstAllOnes(LLVMTypeOf(range.upper))
+            if narrow:
+                prefix_length <- LLVMBuildZExt(builder, prefix_length, LLVMTypeOf(range.upper), "")
+                suffix_bits <- LLVMConstInt(LLVMInt64TypeInContext(context), RangeAndLimit::NARROW_SUFFIX, 0)
+            suffix: LLVMValueRef = LLVMBuildLShr(builder, suffix_bits, prefix_length, "")
+            name_storage: mutable darray[u8] = []
+            result: LLVMValueRef = LLVMBuildAnd(builder, endpoints.high, LLVMBuildNot(builder, suffix, ""), sview_to_cstr("range.and", name_storage))
+            position_builder_before(builder, range.back)
+            _ = LLVMBuildBr(builder, range.exit)
+            LLVMDisposeBuilder(builder)
+            LLVMInstructionEraseFromParent(range.back)
+            LLVMInstructionEraseFromParent(range.test)
+            ElisaLLVMRemoveIncomingForBlock(range.upper, range.loop)
+            LLVMReplaceAllUsesWith(range.next, result)
+            LLVMInstructionEraseFromParent(range.next)
+            LLVMInstructionEraseFromParent(range.step)
+            LLVMInstructionEraseFromParent(range.upper)
+            true
+
+    public:
+        # The range-and loops folded on AArch64.
+        def fold_range_and_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if function_block_count(function) > RangeAndLimit::FUNCTION_BLOCKS or skipped_by_loop_pass_policy(function, module)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, module|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    if instruction_count(block) == RangeAndLimit::LOOP_INSTRUCTIONS and fold_range_and_loop(block, module):
+                        changed <- changed + 1
+            changed

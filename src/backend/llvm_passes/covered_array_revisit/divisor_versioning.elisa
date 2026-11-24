@@ -1,0 +1,169 @@
+# Versions a function on its frozen loop divisor being 2. The block holding the
+# `freeze` is split after it, the split-off suffix and every block reachable from it
+# are cloned with the divisor replaced by 2, and the block then dispatches on the
+# frozen value: everything before the dispatch still runs exactly once. The suffix
+# must not reach back to the dispatch and is capped at 200 blocks.
+include "./divisor_screening.elisa"
+include "../../llvm_c_api/elisa_llvm_ir_edits.elisa"
+
+const module DivisorVersioningLimit:
+    SUFFIX_BLOCKS: usize = 200
+    WORKLIST: usize = 1024
+    SPECIALIZED_DIVISOR: u64 = 2
+
+# The blocks a versioning clones after the dispatch, and whether it may.
+struct DivisorSuffix:
+    blocks: darray[LLVMBasicBlockRef]
+    cloneable: bool
+
+# A cloned loop ID and the fresh distinct node its copies carry instead.
+struct LoopIDRenaming:
+    original: LLVMValueRef
+    renamed: LLVMValueRef
+
+extend Backend:
+    private:
+        def contains_suffix_block(blocks: darray[LLVMBasicBlockRef]&, block: LLVMBasicBlockRef) -> bool:
+            any candidate in blocks where candidate == block
+
+        # Pushes TERMINATOR's successors; false when the worklist would pass 1024 entries.
+        def push_successors(terminator: LLVMValueRef, work: mutable darray[LLVMBasicBlockRef]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<LLVMGetNumSuccessors(terminator) |terminator, work|:
+                return false if work.count >= DivisorVersioningLimit::WORKLIST
+                work.push(LLVMGetSuccessor(terminator, index))
+            true
+
+        # The blocks reachable from the successors of DIVISOR's block, which may be cloned
+        # unless one of them is or dominates that block, ends in another terminator, or
+        # there are more than 200.
+        def divisor_suffix(divisor: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> DivisorSuffix can[Abort.Panic, Memory.Allocate]:
+            seen: mutable darray[LLVMBasicBlockRef] = []
+            work: mutable darray[LLVMBasicBlockRef] = []
+            dispatch: LLVMBasicBlockRef = LLVMGetInstructionParent(divisor)
+            dispatch_terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(dispatch) else return DivisorSuffix{blocks: seen, cloneable: false}
+            for index in 0..<LLVMGetNumSuccessors(dispatch_terminator) |dispatch_terminator, work|:
+                work.push(LLVMGetSuccessor(dispatch_terminator, index))
+            while work.count > 0 |work, seen, dispatch, analyses|:
+                block: LLVMBasicBlockRef = work[work.count - 1]
+                _ = work.pop()
+                continue if contains_suffix_block(seen, block)
+                seen.push(block)
+                return DivisorSuffix{blocks: seen, cloneable: false} if block == dispatch or ElisaLLVMBlockDominates(analyses, block, dispatch) != 0 or seen.count > DivisorVersioningLimit::SUFFIX_BLOCKS
+                terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return DivisorSuffix{blocks: seen, cloneable: false}
+                return DivisorSuffix{blocks: seen, cloneable: false} if not is_versionable_terminator(terminator) or not push_successors(terminator, work)
+            DivisorSuffix{blocks: seen, cloneable: true}
+
+        # Drops the copy's phi entries from blocks outside the cloned region: only
+        # suffix blocks, the split-off start and, for the start, the dispatch remain.
+        def drop_outside_entries(phi: LLVMValueRef, original: LLVMBasicBlockRef, start: LLVMBasicBlockRef, dispatch: LLVMBasicBlockRef, seen: darray[LLVMBasicBlockRef]&) -> void:
+            count: u32 = LLVMCountIncoming(phi)
+            for step in 0..<count |phi, original, start, dispatch, seen, count|:
+                index: u32 = count - 1 - step
+                predecessor: LLVMBasicBlockRef = LLVMGetIncomingBlock(phi, index)
+                kept: bool = contains_suffix_block(seen, predecessor) or predecessor == start or (original == start and predecessor == dispatch)
+                if not kept:
+                    ElisaLLVMRemoveIncomingValue(phi, index)
+
+        # The distinct node that replaces LOOP_ID in the copies: the same properties
+        # under a fresh self-reference, one per original.
+        def renamed_loop_id(loop_id: LLVMValueRef, context: LLVMContextRef, renamings: mutable darray[LoopIDRenaming]&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for renaming in renamings |loop_id|:
+                return renaming.renamed if renaming.original == loop_id
+            words: darray[usize] = metadata_operand_words(loop_id)
+            # Metadata pointers of the properties, then a slot so the array is never empty.
+            properties: mutable darray[usize] = []
+            for index in 1..<words.count |words, properties|:
+                property_word: mutable usize = 0
+                if metadata_word_value(words, index) is property:
+                    metadata: LLVMMetadataRef = LLVMValueAsMetadata(property)
+                    property_word <- ((&metadata).cast[usize&])[0]
+                properties.push(property_word)
+            count: u32 = properties.count.u32()
+            properties.push(0)
+            renamed: LLVMValueRef = LLVMMetadataAsValue(context, ElisaLLVMCreateLoopID(context, (&properties[0]).cast[void&], count))
+            renamings.push(LoopIDRenaming{original: loop_id, renamed: renamed})
+            renamed
+
+        # Prunes and remaps each copy's instructions, giving cloned loops their own IDs.
+        def remap_divisor_copies(blocks: darray[LLVMBasicBlockRef]&, copies: darray[LLVMBasicBlockRef]&, map: ElisaValueMapRef, dispatch: LLVMBasicBlockRef, seen: darray[LLVMBasicBlockRef]&, loop_kind: u32, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            renamings: mutable darray[LoopIDRenaming] = []
+            start: LLVMBasicBlockRef = blocks[0]
+            for position in 0..<blocks.count |blocks, copies, map, dispatch, seen, loop_kind, context, renamings, start|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(copies[position])
+                while cursor is instruction |cursor, blocks, position, map, dispatch, seen, loop_kind, context, renamings, start|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI):
+                        drop_outside_entries(instruction, blocks[position], start, dispatch, seen)
+                    ElisaLLVMRemapInstruction(instruction, map)
+                    if LLVMGetMetadata(instruction, loop_kind) is loop_id:
+                        LLVMSetMetadata(instruction, loop_kind, renamed_loop_id(loop_id, context, renamings))
+
+        # Clones the suffix after DIVISOR and dispatches to the copy when it is 2.
+        def version_on_divisor(function: LLVMValueRef, divisor: LLVMValueRef, seen: darray[LLVMBasicBlockRef]&, loop_kind: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(divisor))
+            dispatch: LLVMBasicBlockRef = LLVMGetInstructionParent(divisor)
+            after_divisor: LLVMValueRef = get LLVMGetNextInstruction(divisor) else return
+            start: LLVMBasicBlockRef = ElisaLLVMSplitBlock(after_divisor)
+            blocks: mutable darray[LLVMBasicBlockRef] = [start]
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, blocks, seen|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if contains_suffix_block(seen, block):
+                    blocks.push(block)
+            map: ElisaValueMapRef = ElisaLLVMCreateValueMap()
+            copies: mutable darray[LLVMBasicBlockRef] = []
+            for block in blocks |map, function, copies|:
+                suffix_storage: mutable darray[u8] = []
+                copy: LLVMBasicBlockRef = ElisaLLVMCloneBasicBlock(block, map, sview_to_cstr(".divisor2", suffix_storage), function)
+                ElisaLLVMValueMapSet(map, LLVMBasicBlockAsValue(block), LLVMBasicBlockAsValue(copy))
+                copies.push(copy)
+            two: LLVMValueRef = LLVMConstInt(LLVMTypeOf(divisor), DivisorVersioningLimit::SPECIALIZED_DIVISOR, 0)
+            ElisaLLVMValueMapSet(map, divisor, two)
+            remap_divisor_copies(blocks, copies, map, dispatch, seen, loop_kind, context)
+            ElisaLLVMDisposeValueMap(map)
+            if LLVMGetBasicBlockTerminator(dispatch) is jump:
+                LLVMInstructionEraseFromParent(jump)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            LLVMPositionBuilderAtEnd(builder, dispatch)
+            name_storage: mutable darray[u8] = []
+            is_two: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::EQ, divisor, two, sview_to_cstr("", name_storage))
+            _ = LLVMBuildCondBr(builder, is_two, copies[0], start)
+            LLVMDisposeBuilder(builder)
+            key_storage: mutable darray[u8] = []
+            value_storage: mutable darray[u8] = []
+            key: sview = "elisa.divisor-versioned"
+            marker: LLVMAttributeRef = LLVMCreateStringAttribute(context, sview_to_cstr(key, key_storage), key.len.u32(), sview_to_cstr("", value_storage), 0)
+            LLVMAddAttributeAtIndex(function, LLVMAttributeIndexValue::FUNCTION, marker)
+
+        def uncloneable_suffix() -> DivisorSuffix:
+            blocks: darray[LLVMBasicBlockRef] = []
+            DivisorSuffix{blocks: blocks, cloneable: false}
+
+        # The suffix after a frozen loop divisor; uncloneable without one, or when the
+        # divisor ends its block.
+        def suffix_after(divisor_or_null: LLVMValueRef?, analyses: ElisaFunctionAnalysesRef) -> DivisorSuffix can[Abort.Panic, Memory.Allocate]:
+            divisor: LLVMValueRef = get divisor_or_null else return uncloneable_suffix()
+            return uncloneable_suffix() if LLVMGetNextInstruction(divisor) == null
+            divisor_suffix(divisor, analyses)
+
+        def version_function_divisor(function: LLVMValueRef, screening: DivisorScreening&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if function_declines_divisor_versioning(function)
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            divisor_or_null: LLVMValueRef? = versionable_divisor(function, analyses, screening)
+            suffix: DivisorSuffix = suffix_after(divisor_or_null, analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            divisor: LLVMValueRef = get divisor_or_null else return false
+            return false if not suffix.cloneable
+            version_on_divisor(function, divisor, suffix.blocks, screening.kinds.loop)
+            true
+
+    public:
+        # Versions the first function, in module order, that has a frozen loop divisor
+        # to version on; whether one was versioned.
+        def version_first_loop_divisor(module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            screening: DivisorScreening = divisor_screening(module)
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, screening|:
+                function_cursor <- LLVMGetNextFunction(function)
+                return true if version_function_divisor(function, screening)
+            false

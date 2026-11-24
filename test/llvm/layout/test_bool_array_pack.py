@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""Verify packed Boolean arrays across word boundaries and pointer-index wrapping."""
-import os,shlex,subprocess,tempfile
+"""Verify packed Boolean arrays across word boundaries and pointer-index wrapping: the
+`private-bool-arrays` pass through `elisac llvm-pass`, then every write/read pair run."""
+import os,subprocess,sys,tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[3]
+sys.path.insert(0,str(ROOT/'test'/'llvm'))
+from elisa_llvm_pass import run_pass
 CONFIG=os.environ.get('LLVM_CONFIG','/opt/homebrew/opt/llvm@23/bin/llvm-config')
 def run(cmd):return subprocess.run(list(map(str,cmd)),capture_output=True,text=True,check=True,timeout=28)
-def flags(*args):return shlex.split(run([CONFIG,*args]).stdout)
-DRIVER=r'''
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/IR/Verifier.h>
-#include "llvm_bool_array_pack.cpp"
-int main(int argc,char**argv){llvm::LLVMContext C;llvm::SMDiagnostic E;auto M=llvm::parseIRFile(argv[1],E,C);if(!M){E.print(argv[0],llvm::errs());return 2;}auto N=elisacorePackPrivateBoolArrays(wrap(M.get()),nullptr);if(llvm::verifyModule(*M,&llvm::errs()))return 3;llvm::errs()<<N<<"\n";M->print(llvm::outs(),nullptr);}
-'''
 def fixture(n,volatile=False,wrap=False):
  # The chained non-inbounds GEPs deliberately leave and return to the allocation.
  ptr='%a'
@@ -37,13 +32,12 @@ define i32 @probe(i64 %write, i64 %read, i1 %v) {{
 }}
 '''
 with tempfile.TemporaryDirectory(prefix='bool-array-pack-') as tmp:
- d=Path(tmp);(d/'driver.cpp').write_text(DRIVER);bindir=Path(run([CONFIG,'--bindir']).stdout.strip())
- run([bindir/'clang++',*flags('--cxxflags'),'-I'+str(ROOT/'src/backend'),d/'driver.cpp',*flags('--ldflags','--libs','core','irreader','passes','--system-libs'),'-Wl,-rpath,'+run([CONFIG,'--libdir']).stdout.strip(),'-o',d/'driver'])
+ d=Path(tmp);bindir=Path(run([CONFIG,'--bindir']).stdout.strip())
  for n,vol,wrap in [(64,False,False),(65,False,False),(100,False,False),(128,False,False),(129,False,False),(100,True,False),(100,False,True)]:
   # A two-byte partial clear requires an array of at least 65 elements.
   ir=fixture(n,vol,wrap) if n>=65 else fixture(n,vol,wrap).replace('i64 2, i1 false','i64 1, i1 false')
-  (d/'input.ll').write_text(ir);r=run([d/'driver',d/'input.ll']);changed=int(r.stderr.strip());assert changed==(0 if n>128 or vol else 1),(n,vol,wrap,r.stderr)
-  (d/'output.ll').write_text(r.stdout)
+  changed,module=run_pass('private-bool-arrays',ir);assert changed==(0 if n>128 or vol else 1),(n,vol,wrap,module)
+  (d/'output.ll').write_text(module)
   (d/'main.c').write_text(f'''extern int probe(unsigned long,unsigned long,_Bool);
 int main(void){{for(unsigned long w=0;w<{n};++w)for(unsigned long r=0;r<{n};++r)for(int v=0;v<2;++v){{int expected=w==r && v && !(r>=63 && r<{min(65,n)});if(probe(w,r,v)!=expected)return 1;}}return 0;}}''')
   run([bindir/'clang','-O2',d/'output.ll',d/'main.c','-o',d/'check']);run([d/'check'])

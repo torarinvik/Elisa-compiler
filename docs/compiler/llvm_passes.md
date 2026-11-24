@@ -9,11 +9,12 @@ one.
 
 | Directory | What it holds |
 |---|---|
-| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution (constant maximum backedge-taken counts, unsigned range maxima), value-tracking facts (including implied conditions and context-sensitive poison checks), lazy value ranges, PatternMatch constant tests (`m_One`, `m_Zero`, `m_SpecificInt`, which also accept splat vectors), constant-integer bit queries (`isMask` width, agreement in the low bits, trailing zeros, the odd part, `getLowBitsSet` constants, unsigned comparison), instruction memory queries (`mayHaveSideEffects`, `mayReadOrWriteMemory`), `stripPointerCasts`, `GetPointerBaseWithConstantOffset`, alloca queries (`isStaticAlloca`, `isUsedWithInAlloca`, `isSwiftError`), the bytes of a wide integer constant, target-triple queries (`isAArch64`, `isMacOSX`) on a module or a target machine, and subtarget feature checks (`checkFeatures`). `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows, subtraction, membership, and signed- and unsigned-maximum queries. `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks, dead-block deletion, unreachable-block removal, function cloning, call inlining and compare predicates. |
+| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution (constant maximum backedge-taken counts, unsigned range maxima), value-tracking facts (including implied conditions and context-sensitive poison checks), lazy value ranges, PatternMatch constant tests (`m_One`, `m_Zero`, `m_SpecificInt`, which also accept splat vectors), irreducible control flow (`containsIrreducibleCFG`), constant-integer bit queries (signed less-than, `isMask` width, agreement in the low bits, trailing zeros, the odd part, `getLowBitsSet` constants, unsigned comparison), instruction memory queries (`mayHaveSideEffects`, `mayReadOrWriteMemory`), memset tests, metadata uses (`isUsedByMetadata`), the data layout's index width, `stripPointerCasts`, `getUnderlyingObject`, `GetPointerBaseWithConstantOffset`, alloca queries (`isStaticAlloca`, `isUsedWithInAlloca`, `isSwiftError`), the bytes of a wide integer constant, target-triple queries (`isAArch64`, `isOSDarwin`, `isOSLinux`, `isMacOSX`) on a module or a target machine, and subtarget feature checks (`checkFeatures`). `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows or exactly satisfies, the full and single-value ranges, intersection, subtraction, membership, signed-minimum comparisons, and signed- and unsigned-maximum queries, including the unsigned maximum as a 64-bit value. `elisa_llvm_pass_pipelines` runs `buildPerModuleDefaultPipeline(O3)` as `PassBuilder` builds it, which `LLVMRunPasses` cannot (see the traps below). `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks and entries, dead-block deletion, unreachable-block removal, block splitting, function and block cloning through an opaque value map (`ValueToValueMapTy`, which can also drop a mapped argument from a cloned function) with `RemapInstruction` (optionally leaving module-level values alone), moving an instruction to a block's end, copying a function's attribute list to a call, `emitGEPOffset`, call inlining, compare predicates, distinct-node tests and named-metadata erasure. `elisa_llvm_loop_transforms` exposes LLVM's loop utilities over the same analyses handle: top-level and sub-loop iteration, loop-simplify form, `simplifyLoop`, `formLCSSA`, peeling and `UnrollLoop`. `elisa_llvm_function_analyses.h` is the C++ object behind that handle, shared by both shim files. |
 | `src/backend/llvm_passes/` | The standalone passes. `llvm_passes.elisa` includes every pass. `llvm_pass_registry.elisa` maps a pass name to its entry point. |
-| `src/backend/llvm_passes/ir/` | The shared IR helpers. `ir_editing.elisa`, `llvm_ir_queries.elisa` and `llvm_ir_constants.elisa` hold the editing helpers, IR queries and the LLVM 23 enum values (for example, `br` is now opcode 70 unconditional and 71 conditional). `loop_pass_policy.elisa` decides which functions a pass skips. |
+| `src/backend/llvm_passes/ir/` | The shared IR helpers. `trap_blocks.elisa` recognizes blocks that only trap; `scalar_loop_patterns.elisa` holds the operand and continue-test patterns of single-block loop folds. `ir_editing.elisa`, `llvm_ir_queries.elisa` and `llvm_ir_constants.elisa` hold the editing helpers, IR queries and the LLVM 23 enum values (for example, `br` is now opcode 70 unconditional and 71 conditional). `loop_pass_policy.elisa` decides which functions a pass skips. `pass_pipelines.elisa` runs a textual pass pipeline over a module or one function, with or without a target machine. |
+| `src/backend/llvm_passes/covered_array_revisit/` | The covered-array revisit (a second O3 run over small modules) and the loop-divisor versioning it runs: `divisor_screening.elisa` decides which function and frozen divisor qualify, and `divisor_versioning.elisa` clones the suffix after it. |
 | `src/backend/llvm_passes/small_fills/` | The small-fill expansion and the byte- and word-store merges it runs first. `linked_helpers.elisa` links a helper written in textual IR into the module and inlines it at each expanded site. |
-| `src/backend/llvm_passes/late_cleanup/` | The late scalar cleanup (`late_scalar_cleanup.elisa`) and the folds it runs, one file each. |
+| `src/backend/llvm_passes/late_cleanup/` | The late scalar cleanup (`late_scalar_cleanup.elisa`), the C++ entries it still calls (`late_cleanup_externs.elisa`), and the folds it runs, one file each, grouped by subject: `bit_loops/` (loops computing a bit function: parity, bit reverse, common prefix, xor, powers and digit counts), `divisions/` (quotients, remainders and divisibility tests), `range_checks/` (checks proven by guards and recurrences) and `vector_loops/` (vectorized loops and their stores). |
 | `src/backend/llvm_*.cpp` | The C++ passes not yet ported. `scripts/build_stage1_llvm_bridge.sh` lists the sources it compiles. |
 
 A shim exists only for something the C API cannot do. Before adding one, check
@@ -35,13 +36,20 @@ Registered names: `bit-tests`, `remainder-tests`, `remainder-tails`, `compact-sh
 `conditional-doubling`, `decimal-digit-counts`, `power-positions`, `validation-returns`,
 `shared-reciprocals`, `guarded-increments`, `nonnegative-remainders`,
 `masked-single-bits`, `interleaved-byte-stores`, `bounded-carries`, `implied-loop-exits`,
-`ring-index-bounds`, `halving-runs`, `factored-divisions`, `shift-parity-loops`,
+`ring-index-bounds`, `halving-runs`, `factored-divisions`, `remainder-recurrences`,
+`shift-parity-loops`,
 `masked-split-multiplies`, `trap-exit-edges`, `shared-divisibility`,
 `guarded-counter-bounds`, `bounded-quotient-sums`, `literal-divisors` (uses the target
 machine when given a CPU), `guarded-unsigned-compares`, `vector-or-accumulators`,
 `exit-dead-stores` (on any target; the pipeline runs it on AArch64),
 `nested-vector-loops` (prints 1 when the late cleanup would rerun O3 for the module),
-`cssc-range-checks` (needs a CPU; without one it changes nothing), `small-fills`.
+`cssc-range-checks` (needs a CPU; without one it changes nothing), `small-fills`,
+`guarded-reductions`, `divisor-versioning` (versions the first qualifying function),
+`covered-array-revisit` (runs as if the reductions had been unrolled),
+`early-division-pairs` (uses the target machine when given a CPU; prints 0 off AArch64),
+`shift-bit-reverse-loops`, `range-and-loops`, `shift-xor-loops`, `short-trips` (uses the target
+machine when given a CPU), `guarded-counters`, `validation-epilogues`,
+`private-bool-arrays` (uses the target machine when given a CPU).
 
 The pass tests in `test/llvm/` and `test/parity/validation_layout_smoke.py` drive the passes
 through this command, using `test/llvm/elisa_llvm_pass.py`
@@ -50,9 +58,8 @@ They run `$ELISAC`, or `bin/elisac-stage1` when it is unset.
 
 ## Porting a pass
 
-1. Port the C++ pass to a file in `src/backend/llvm_passes/` (or `late_cleanup/` for a late
-   cleanup fold) and call it where the C++ entry
-   point was called. Delete the C++ file and its includes, macro entries and externs.
+1. Port the C++ pass to a file in `src/backend/llvm_passes/` (or the matching `late_cleanup/`
+   subfolder for a late cleanup fold) and call it where the C++ entry point was called. Delete the C++ file and its includes, macro entries and externs.
 2. Register it in `llvm_pass_registry.elisa`.
 3. Compare the C++ and Elisa outputs on the same inputs: the change count and the printed
    module must match exactly. Then check that the benchmark corpus objects are unchanged.
@@ -70,5 +77,20 @@ Porting traps seen so far:
   `is_call_base` in `ir/ir_editing.elisa`, which tests the call, invoke and callbr opcodes.
 - Match the C++ predicate exactly. For example, `Triple::isAArch64()` is not a prefix test on
   the triple string, so it is a shim.
+- `LLVMGetMDNodeOperands` writes null for a null operand. Read operands into pointer-sized
+  words, as `metadata_operand_words` in `covered_array_revisit/divisor_screening.elisa` does,
+  so a null stays distinguishable.
+- `LLVMRunPasses` with the text `default<O3>` does not run the pipeline that
+  `PassBuilder::buildPerModuleDefaultPipeline(O3)` returns: on LLVM 23 the text form
+  vectorized doitgen differently. A pass whose C++ built the pipeline calls
+  `ElisaLLVMRunDefaultO3Pipeline` instead.
+- `sview_to_cstr(text, storage)` appends to `storage` and returns its start. A second
+  call on the same buffer returns the first string again, so give each name its own buffer
+  (or `truncate(0)` it first).
+- An `else` right after an index (`a[i] else …`) is the removed implicit index fallback, even
+  inside a conditional expression such as `x if n == a[1] else y`. Bind the element first with
+  `get a[1] else …`.
+- Reserved keywords such as `packed`, `error`, `to`, `tail`, `stack` and `heap` cannot name a
+  local or a parameter (the lexer's keyword table in `src/lexer/lexer_identifiers.elisa`).
 - A string literal cannot span lines. Write a textual-IR helper as an array of lines, as
   `small_fills/stack_word_pattern_fills.elisa` does; `link_internal_helper` joins them.

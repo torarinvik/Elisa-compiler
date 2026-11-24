@@ -1,0 +1,151 @@
+# Which functions the divisor versioning may clone, and on which frozen divisor. A
+# function qualifies when every block and instruction can be duplicated as is: no
+# exception handling, address-taken blocks, dynamic allocas or alias-scope metadata;
+# only branches, switches, returns and unreachables as terminators; calls only of a
+# short list of intrinsics; and loop IDs made of plain properties.
+include "../ir/ir_editing.elisa"
+include "../ir/loop_pass_policy.elisa"
+include "../ir/llvm_ir_queries.elisa"
+
+const module DivisorScreeningLimit:
+    FUNCTION_INSTRUCTIONS: u32 = 3000
+    LOOP_REMAINDERS: u32 = 2
+
+# The metadata kinds the screening reads.
+struct DivisorMetadataKinds:
+    alias_scope: u32
+    noalias: u32
+    access_group: u32
+    loop: u32
+
+# What the screening needs looked up once per module.
+struct DivisorScreening:
+    kinds: DivisorMetadataKinds
+    convergent: u32
+    no_duplicate: u32
+
+extend Backend:
+    private:
+        def divisor_metadata_kind(context: LLVMContextRef, name: sview) -> u32 can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            LLVMGetMDKindIDInContext(context, sview_to_cstr(name, name_storage), name.len.u32())
+
+        def divisor_attribute_kind(name: sview) -> u32 can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            LLVMGetEnumAttributeKindForName(sview_to_cstr(name, name_storage), name.len.usize())
+
+        # The intrinsics a versioned function may call.
+        def duplicable_intrinsics() -> darray[u32] can[Abort.Panic, Memory.Allocate]:
+            names: darray[sview] = ["llvm.trap", "llvm.assume", "llvm.lifetime.start", "llvm.lifetime.end", "llvm.memcpy", "llvm.memmove", "llvm.memset", "llvm.umax", "llvm.vector.reduce.fadd"]
+            intrinsics: mutable darray[u32] = []
+            for name in names |intrinsics|:
+                name_storage: mutable darray[u8] = []
+                intrinsics.push(LLVMLookupIntrinsicID(sview_to_cstr(name, name_storage), name.len.usize()))
+            intrinsics
+
+        # Operand INDEX of a metadata node's operand words; null for a null operand.
+        def metadata_word_value(words: darray[usize]&, index: usize) -> LLVMValueRef? can[Abort.Panic, Unsafe.PointerCast]:
+            word: usize = words[index]
+            return null if word == 0
+            slot: LLVMValueRef& = (&word).cast[LLVMValueRef&]
+            slot[0]
+
+        # A loop property: a node naming a string, then only constants and strings.
+        def is_plain_loop_property(property: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAMDNode(property) == null
+            words: darray[usize] = metadata_operand_words(property)
+            return false if words.count == 0
+            name: LLVMValueRef = get metadata_word_value(words, 0) else return false
+            return false if LLVMIsAMDString(name) == null
+            for index in 1..<words.count |words|:
+                value: LLVMValueRef = get metadata_word_value(words, index) else return false
+                return false if LLVMIsAMDString(value) == null and LLVMIsAConstant(value) == null
+            true
+
+        # A distinct node that names itself first and plain properties after.
+        def is_plain_loop_id(loop_id: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMMetadataIsDistinct(LLVMValueAsMetadata(loop_id)) == 0
+            words: darray[usize] = metadata_operand_words(loop_id)
+            return false if words.count == 0 or not is_optional_value(metadata_word_value(words, 0), loop_id)
+            for index in 1..<words.count |words|:
+                property: LLVMValueRef = get metadata_word_value(words, index) else return false
+                return false if not is_plain_loop_property(property)
+            true
+
+        # An intrinsic call of the list that is neither convergent nor marked
+        # non-duplicable and carries no operand bundles.
+        def is_duplicable_call(call: LLVMValueRef, screening: DivisorScreening&, intrinsics: darray[u32]&) -> bool:
+            return false if LLVMIsAIntrinsicInst(call) == null or LLVMGetNumOperandBundles(call) != 0
+            return false if ElisaLLVMCallHasFunctionAttribute(call, screening.convergent) != 0 or ElisaLLVMCallHasFunctionAttribute(call, screening.no_duplicate) != 0
+            intrinsic: u32 = LLVMGetIntrinsicID(LLVMGetCalledValue(call))
+            any known in intrinsics where known == intrinsic
+
+        def instruction_blocks_versioning(instruction: LLVMValueRef, screening: DivisorScreening&, intrinsics: darray[u32]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if LLVMIsATerminatorInst(instruction) != null and not is_versionable_terminator(instruction)
+            kinds: DivisorMetadataKinds = screening.kinds
+            return true if LLVMGetMetadata(instruction, kinds.alias_scope) != null or LLVMGetMetadata(instruction, kinds.noalias) != null or LLVMGetMetadata(instruction, kinds.access_group) != null
+            if LLVMGetMetadata(instruction, kinds.loop) is loop_id:
+                return true if not is_plain_loop_id(loop_id)
+            return true if is_call_base(instruction) and not is_duplicable_call(instruction, screening, intrinsics)
+            is_llvm_instruction_with_opcode(instruction, LLVMOpcode::ALLOCA) and ElisaLLVMIsStaticAlloca(instruction) == 0
+
+        # The `urem`s inside loops that divide by DIVISOR.
+        def loop_remainder_count(divisor: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> u32:
+            count: mutable u32 = 0
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(divisor)
+            while use_cursor is use |use_cursor, count, divisor, analyses|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                in_loop: bool = is_llvm_instruction_with_opcode(user, LLVMOpcode::UREM) and LLVMGetOperand(user, 1) == divisor and ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(user)) != null
+                count <- count + 1 if in_loop
+            count
+
+        # `freeze (load X)` of i64 outside any loop, the load simple and in the same
+        # block, dividing at least two `urem`s inside loops.
+        def is_frozen_loop_divisor(instruction: LLVMValueRef, block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::FREEZE)
+            loaded: LLVMValueRef = LLVMGetOperand(instruction, 0)
+            return false if not is_llvm_instruction_with_opcode(loaded, LLVMOpcode::LOAD) or LLVMGetVolatile(loaded) != 0 or LLVMGetOrdering(loaded) != 0
+            return false if LLVMGetInstructionParent(loaded) != block or not is_llvm_integer_type(LLVMTypeOf(instruction), 64)
+            return false if ElisaLLVMLoopForBlock(analyses, block) != null
+            loop_remainder_count(instruction, analyses) >= DivisorScreeningLimit::LOOP_REMAINDERS
+
+    public:
+        def divisor_screening(module: LLVMModuleRef) -> DivisorScreening can[Abort.Panic, Memory.Allocate]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            kinds: DivisorMetadataKinds = DivisorMetadataKinds{alias_scope: divisor_metadata_kind(context, "alias.scope"), noalias: divisor_metadata_kind(context, "noalias"), access_group: divisor_metadata_kind(context, "llvm.access.group"), loop: divisor_metadata_kind(context, "llvm.loop")}
+            DivisorScreening{kinds: kinds, convergent: divisor_attribute_kind("convergent"), no_duplicate: divisor_attribute_kind("noduplicate")}
+
+        # The operands of the metadata node NODE as pointer words, 0 for a null operand.
+        def metadata_operand_words(node: LLVMValueRef) -> darray[usize] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            count: usize = LLVMGetMDNodeNumOperands(node).usize()
+            return [] if count == 0
+            words: mutable darray[usize] = [0 for _ in 0..<count]
+            LLVMGetMDNodeOperands(node, (&words[0]).cast[void&])
+            words
+
+        def is_versionable_terminator(terminator: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(terminator)
+            opcode == LLVMOpcode::UNCONDITIONAL_BR or opcode == LLVMOpcode::CONDITIONAL_BR or opcode == LLVMOpcode::SWITCH or opcode == LLVMOpcode::RET or opcode == LLVMOpcode::UNREACHABLE
+
+        def function_declines_divisor_versioning(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function) or LLVMHasPersonalityFn(function) != 0 or LLVMGetGC(function) != null
+            return true if llvm_function_subprogram_or_null(function) != null or function_has_attribute(function, "convergent") or function_has_attribute(function, "noduplicate") or function_has_attribute(function, "naked")
+            return true if function_instruction_count(function) > DivisorScreeningLimit::FUNCTION_INSTRUCTIONS or function_has_string_attribute(function, "elisa.divisor-versioned")
+            function_is_sanitized(function)
+
+        # The first frozen loop divisor of a function whose every block can be
+        # duplicated; null when a block cannot or there is no such divisor.
+        def versionable_divisor(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, screening: DivisorScreening&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            intrinsics: darray[u32] = duplicable_intrinsics()
+            divisor: mutable LLVMValueRef? = null
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, divisor, analyses, screening, intrinsics|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                return null if ElisaLLVMBlockHasAddressTaken(block) != 0 or ElisaLLVMBlockIsEHPad(block) != 0
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, divisor, block, analyses, screening, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return null if instruction_blocks_versioning(instruction, screening, intrinsics)
+                    divisor <- instruction if divisor == null and is_frozen_loop_divisor(instruction, block, analyses)
+            divisor

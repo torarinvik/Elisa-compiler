@@ -37,7 +37,6 @@
 #include <llvm/Transforms/Utils/LoopUtils.h>
 #include <llvm/Transforms/Utils/UnrollLoop.h>
 #include <llvm/Transforms/Utils/Local.h>
-#include <llvm/Transforms/Scalar/DivRemPairs.h>
 #include "llvm_array_value_ranges.h"
 #include "llvm_dead_trap_exits.h"
 #include "llvm_path_ranges.h"
@@ -62,37 +61,6 @@ extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
   return Removed + ElisaViewBounds::shrinkViewFills(*unwrap(Module));
 }
 
-extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef moduleRef,
-                                                LLVMTargetMachineRef targetRef) {
-  auto &module = *unwrap(moduleRef);
-  if (!module.getTargetTriple().isAArch64()) return 0;
-  PassBuilder builder(reinterpret_cast<TargetMachine *>(targetRef));
-  FunctionAnalysisManager analyses;
-  builder.registerFunctionAnalyses(analyses);
-  FunctionPassManager passes;
-  passes.addPass(DivRemPairsPass());
-  for (Function &function : module) {
-    if (function.isDeclaration() || function.hasOptNone()) continue;
-    bool runtimeUnsignedRemainder = false;
-    bool otherRemainder = false;
-    for (const Instruction &instruction : instructions(function)) {
-      if (instruction.getOpcode() == Instruction::URem &&
-          instruction.getType()->isIntegerTy() &&
-          !isa<ConstantInt>(instruction.getOperand(1))) {
-        runtimeUnsignedRemainder = true;
-      } else if (instruction.getOpcode() == Instruction::URem ||
-                 instruction.getOpcode() == Instruction::SRem) {
-        otherRemainder = true;
-      }
-    }
-    // The default pipeline can retain a remainder test until AArch64
-    // instruction selection, where it can become MSUB and CBZ/CBNZ.
-    if (runtimeUnsignedRemainder && !otherRemainder) continue;
-    if (runtimeUnsignedRemainder || otherRemainder) passes.run(function, analyses);
-  }
-  return 1;
-}
-
 unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldOddTrailingZeroSelects(llvm::Module &);
@@ -106,7 +74,6 @@ unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 
 #else
 extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef) { return 0; }
-extern "C" unsigned elisacorePairEarlyDivisions(LLVMModuleRef, LLVMTargetMachineRef) { return 0; }
 extern "C" unsigned elisacoreElideBoundedDivisionSums(LLVMModuleRef) {
   return 0;
 }
@@ -172,11 +139,9 @@ extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);
 extern "C" unsigned elisacoreOptimizeSqrtNonNaN(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreOptimizeBoundedSums(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreOptimizeIndexBounds(LLVMModuleRef, LLVMTargetMachineRef);
-#include "llvm_guarded_counter.cpp"
 extern "C" unsigned elisacoreFoldBoundedRemainders(LLVMModuleRef);
 extern "C" unsigned elisacoreFoldSignedRangeMasks(LLVMModuleRef);
 #include "llvm_ordered_vector.cpp"
-#include "llvm_special_epilogue.cpp"
 #include "llvm_even_range.cpp"
 
 // The late scalar cleanup sequence lives in Elisa

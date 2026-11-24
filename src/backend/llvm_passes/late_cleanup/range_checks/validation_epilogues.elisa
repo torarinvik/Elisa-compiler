@@ -1,0 +1,192 @@
+# Specializes the remainder of a runtime-unrolled, early-exit validation scan. The
+# unroller leaves a chain of per-element remainder tests (`rem == k`) between the
+# load-and-guard steps; when an assume proves `rem = x & 15` nonzero and the remainder is
+# eight, clones of exactly the first eight steps run without those tests. The original
+# chain stays the fallback for every other remainder. AArch64 Linux and Darwin only.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module ValidationEpilogueLimit:
+    STEPS: u32 = 8
+    REMAINDER_MASK: u64 = 15
+    CLONE_SUFFIX: sview = ".fast8"
+
+# The matched chain: the remainder, the block every remainder test exits to, and the
+# eight steps with the successor index of each guard that continues the scan.
+struct ValidationEpilogue:
+    remainder: LLVMValueRef
+    exit: LLVMBasicBlockRef
+    steps: darray[LLVMBasicBlockRef]
+    continue_edges: darray[u32]
+
+# A step's remainder test block and the guard successor index that reaches it.
+struct RemainderCheck:
+    block: LLVMBasicBlockRef
+    edge: u32
+
+extend Backend:
+    private:
+        # No phis, debug intrinsics, calls, or side effects other than the terminator, and
+        # exactly EXPECTED_LOADS loads, all simple.
+        def is_plain_epilogue_block(block: LLVMBasicBlockRef, expected_loads: u32) -> bool can[Abort.Panic]:
+            loads: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, loads|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                return false if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI) or LLVMIsADbgInfoIntrinsic(instruction) != null or is_call_base(instruction)
+                if LLVMIsALoadInst(instruction) != null:
+                    return false if LLVMGetVolatile(instruction) != 0 or LLVMGetOrdering(instruction) != 0
+                    loads <- loads + 1
+                elif LLVMIsATerminatorInst(instruction) == null and ElisaLLVMMayHaveSideEffects(instruction) != 0:
+                    return false
+            loads == expected_loads
+
+        # The `x & 15` that the block's `assume(x & 15 != 0)` calls all name; null when there
+        # is none or two name different values.
+        def assumed_remainder(block: LLVMBasicBlockRef, assume_id: u32) -> LLVMValueRef? can[Abort.Panic]:
+            remainder: mutable LLVMValueRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, remainder, assume_id|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                continue if called_intrinsic_id(instruction) != assume_id
+                compare: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                continue if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::NE
+                masked: LLVMValueRef = LLVMGetOperand(compare, 0)
+                continue if not is_constant_integer(LLVMGetOperand(compare, 1), 0) or not is_llvm_instruction_with_opcode(masked, LLVMOpcode::AND)
+                continue if not is_constant_integer(LLVMGetOperand(masked, 1), ValidationEpilogueLimit::REMAINDER_MASK)
+                if remainder is earlier:
+                    return null if earlier != masked
+                remainder <- masked
+            remainder
+
+        # Whether BLOCK is a plain, load-free block ending in a branch on a single-use
+        # `remainder == step`, its only other instruction.
+        def is_remainder_test_block(block: LLVMBasicBlockRef, remainder: LLVMValueRef, step: u32) -> bool can[Abort.Panic]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return false
+            return false if not is_plain_epilogue_block(block, 0)
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::EQ
+            LLVMGetOperand(compare, 0) == remainder and is_constant_integer(LLVMGetOperand(compare, 1), step.u64()) and has_one_use(compare)
+
+        # The one guard successor that tests `remainder == step`; null when neither or both do.
+        def remainder_check(step_branch: LLVMValueRef, remainder: LLVMValueRef, step: u32) -> RemainderCheck? can[Abort.Panic]:
+            first: bool = is_remainder_test_block(LLVMGetSuccessor(step_branch, 0), remainder, step)
+            second: bool = is_remainder_test_block(LLVMGetSuccessor(step_branch, 1), remainder, step)
+            return null if first == second
+            edge: u32 = 0 if first else 1
+            RemainderCheck{block: LLVMGetSuccessor(step_branch, edge), edge: edge}
+
+        # Every value the step defines is used only inside it.
+        def step_values_stay_local(step: LLVMBasicBlockRef) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(step)
+            while cursor is instruction |cursor, step|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(instruction)
+                while use_cursor is use |use_cursor, step|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    return false if LLVMIsAInstruction(user) == null or LLVMGetInstructionParent(user) != step
+            true
+
+        # The test block holds only the remainder compare and its branch.
+        def holds_only_its_test(check: LLVMBasicBlockRef) -> bool:
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(check) else return false
+            condition: LLVMValueRef = LLVMGetCondition(branch)
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(check)
+            while cursor is instruction |cursor, branch, condition|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                return false if instruction != branch and instruction != condition
+            true
+
+        # The eight-step chain after PRE, which ends in an unconditional branch and assumes
+        # its remainder nonzero.
+        def validation_epilogue(pre: LLVMBasicBlockRef, assume_id: u32) -> ValidationEpilogue? can[Abort.Panic, Memory.Allocate]:
+            entry_branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(pre) else return null
+            return null if LLVMGetInstructionOpcode(entry_branch) != LLVMOpcode::UNCONDITIONAL_BR
+            remainder: LLVMValueRef = get assumed_remainder(pre, assume_id) else return null
+            return null if LLVMGetTypeKind(LLVMTypeOf(remainder)) != LLVMTypeKindValue::INTEGER
+            steps: mutable darray[LLVMBasicBlockRef] = []
+            continue_edges: mutable darray[u32] = []
+            failure: mutable LLVMBasicBlockRef? = null
+            done: mutable LLVMBasicBlockRef? = null
+            expected_predecessor: mutable LLVMBasicBlockRef = pre
+            current: mutable LLVMBasicBlockRef = LLVMGetSuccessor(entry_branch, 0)
+            for step in 1..<(ValidationEpilogueLimit::STEPS + 1) |steps, continue_edges, failure, done, expected_predecessor, current, remainder|:
+                return null if any seen in steps where seen == current
+                return null if not is_plain_epilogue_block(current, 1) or not same_optional_block(single_predecessor(current), expected_predecessor)
+                step_branch: LLVMValueRef = get conditional_terminator(current) else return null
+                remainder_test: RemainderCheck = get remainder_check(step_branch, remainder, step) else return null
+                return null if not same_optional_block(single_predecessor(remainder_test.block), current) or not holds_only_its_test(remainder_test.block)
+                check_branch: LLVMValueRef = get conditional_terminator(remainder_test.block) else return null
+                exit: LLVMBasicBlockRef = LLVMGetSuccessor(check_branch, 0)
+                failure_target: LLVMBasicBlockRef = LLVMGetSuccessor(step_branch, 1 - remainder_test.edge)
+                if failure is earlier_failure:
+                    return null if earlier_failure != failure_target
+                if done is earlier_done:
+                    return null if earlier_done != exit
+                failure <- failure_target
+                done <- exit
+                return null if block_has_phis(failure_target) or block_has_phis(exit) or not step_values_stay_local(current)
+                steps.push(current)
+                continue_edges.push(remainder_test.edge)
+                expected_predecessor <- remainder_test.block
+                current <- LLVMGetSuccessor(check_branch, 1)
+            exit_block: LLVMBasicBlockRef = get done else return null
+            ValidationEpilogue{remainder: remainder, exit: exit_block, steps: steps, continue_edges: continue_edges}
+
+        # Clones the eight steps, chains each clone's continuing edge to the next (the last
+        # to the exit), and branches from PRE to the clones when the remainder is eight.
+        def specialize_validation_epilogue(function: LLVMValueRef, pre: LLVMBasicBlockRef, epilogue: ValidationEpilogue&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            map: ElisaValueMapRef = ElisaLLVMCreateValueMap()
+            suffix_storage: mutable darray[u8] = []
+            suffix: cstr = sview_to_cstr(ValidationEpilogueLimit::CLONE_SUFFIX, suffix_storage)
+            clones: mutable darray[LLVMBasicBlockRef] = []
+            for step in epilogue.steps |map, suffix, function, clones|:
+                clone: LLVMBasicBlockRef = ElisaLLVMCloneBasicBlock(step, map, suffix, function)
+                ElisaLLVMValueMapSet(map, LLVMBasicBlockAsValue(step), LLVMBasicBlockAsValue(clone))
+                clones.push(clone)
+            for clone in clones |map|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(clone)
+                while cursor is instruction |cursor, map|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    ElisaLLVMRemapInstructionKeepingModule(instruction, map)
+            ElisaLLVMDisposeValueMap(map)
+            for index in 0..<clones.count |clones, epilogue|:
+                target: LLVMBasicBlockRef = epilogue.exit if index + 1 == clones.count else clones[index + 1]
+                if LLVMGetBasicBlockTerminator(clones[index]) is branch:
+                    LLVMSetSuccessor(branch, epilogue.continue_edges[index], target)
+            if LLVMGetBasicBlockTerminator(pre) is entry_branch:
+                LLVMInstructionEraseFromParent(entry_branch)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetTypeContext(LLVMTypeOf(function)))
+            LLVMPositionBuilderAtEnd(builder, pre)
+            eight: LLVMValueRef = LLVMConstInt(LLVMTypeOf(epilogue.remainder), ValidationEpilogueLimit::STEPS.u64(), 0)
+            fast: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::EQ, epilogue.remainder, eight, "")
+            _ = LLVMBuildCondBr(builder, fast, clones[0], epilogue.steps[0])
+            LLVMDisposeBuilder(builder)
+
+        # Specializes the first matching chain of the function.
+        def specialize_function_validation_epilogue(function: LLVMValueRef, assume_id: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is pre |block_cursor, function, assume_id|:
+                block_cursor <- LLVMGetNextBasicBlock(pre)
+                if validation_epilogue(pre, assume_id) is epilogue:
+                    specialize_validation_epilogue(function, pre, &epilogue)
+                    return true
+            false
+
+    public:
+        # The validation epilogues specialized, at most one per function, in AArch64 Linux
+        # and Darwin modules without debug information or a profile summary.
+        def specialize_validation_epilogues(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module) or (ElisaLLVMModuleTargetIsLinux(module) == 0 and ElisaLLVMModuleTargetIsDarwin(module) == 0)
+            return 0 if module_has_debug_info(module) or module_has_flag(module, "ProfileSummary")
+            assume_storage: mutable darray[u8] = []
+            assume_name: sview = "llvm.assume"
+            assume_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr(assume_name, assume_storage), assume_name.len.usize())
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, assume_id, changed|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_scalar_pass_policy(function)
+                changed <- changed + 1 if specialize_function_validation_epilogue(function, assume_id)
+            changed

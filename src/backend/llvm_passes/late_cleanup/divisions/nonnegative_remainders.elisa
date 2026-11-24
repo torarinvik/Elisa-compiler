@@ -1,0 +1,159 @@
+# Rewrites `srem x, 2^k` as `urem x, 2^k` where `x` is proven nonnegative: the two agree
+# on a nonnegative dividend, and AArch64 selects the unsigned form as a mask. The proof
+# follows guarded values and non-wrapping monotone recurrences, including loop-header
+# phis. Unknown expressions, unanchored cycles and undefined seeds decline.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../../llvm_c_api/elisa_llvm_constant_range.elisa"
+
+const module NonnegativeRemainderLimit:
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+    FUNCTION_BLOCKS: u32 = 128
+    MAXIMUM_CANDIDATES: usize = 32
+    PROOF_WORK: u32 = 1024
+    PROOF_DEPTH: u32 = 64
+
+# One function's proof state. `work` bounds a single candidate's proof.
+struct NonnegativeProof:
+    function: LLVMValueRef
+    analyses: ElisaFunctionAnalysesRef
+    work: mutable u32
+
+extend Backend:
+    private:
+        # Whether a dominating `value <predicate> K` branch edge admits only nonnegative values.
+        def guarded_nonnegative(proof_state: NonnegativeProof&, value: LLVMValueRef, at: LLVMValueRef) -> bool can[Abort.Panic]:
+            use: LLVMBasicBlockRef = LLVMGetInstructionParent(at)
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(proof_state.function)
+            while block_cursor is block |block_cursor, proof_state, value, use|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if conditional_terminator(block) is branch:
+                    compare: LLVMValueRef = LLVMGetCondition(branch)
+                    continue if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetOperand(compare, 0) != value
+                    continue if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                    limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+                    continue if LLVMIsAConstantInt(limit) == null
+                    predicate: i32 = LLVMGetICmpPredicate(compare)
+                    for edge in 0..<2.u32() |proof_state, block, branch, use, predicate, limit|:
+                        continue if ElisaLLVMEdgeDominates(proof_state.analyses, block, LLVMGetSuccessor(branch, edge), use) == 0
+                        allowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeAllowedByCompare(predicate if edge == 0 else inverse_integer_predicate(predicate), limit)
+                        nonnegative: bool = ElisaLLVMConstantRangeIsEmpty(allowed) == 0 and ElisaLLVMConstantRangeSignedMinIsNegative(allowed) == 0
+                        ElisaLLVMDisposeConstantRange(allowed)
+                        return true if nonnegative
+            false
+
+        def is_nonnegative_constant(value: LLVMValueRef) -> bool:
+            LLVMIsAConstantInt(value) != null and ElisaLLVMConstantIntIsNegative(value) == 0
+
+        def is_positive_constant(value: LLVMValueRef) -> bool:
+            is_nonnegative_constant(value) and ElisaLLVMIsConstantZero(value) == 0
+
+        # A loop-header phi entered from outside its loop starts a recurrence: its own
+        # back edges may then return to it.
+        def anchors_recurrence(proof_state: NonnegativeProof&, phi: LLVMValueRef) -> bool can[Abort.Panic]:
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(phi)
+            if ElisaLLVMLoopForBlock(proof_state.analyses, block) is loop:
+                return false if ElisaLLVMLoopHeader(loop) != block
+                for incoming in 0..<LLVMCountIncoming(phi) |loop, phi|:
+                    return true if ElisaLLVMLoopContainsBlock(loop, LLVMGetIncomingBlock(phi, incoming)) == 0
+            false
+
+        # Every incoming value of PHI, each used at its edge's terminator. Without a
+        # ROOT, PHI anchors a new recurrence whose path starts afresh at it.
+        def prove_phi_nonnegative(proof_state: mutable NonnegativeProof&, phi: LLVMValueRef, root: LLVMValueRef?, active: mutable darray[LLVMValueRef]&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            recurrence_root: LLVMValueRef = get root else phi
+            recurrence_path: mutable darray[LLVMValueRef] = [phi]
+            for incoming in 0..<LLVMCountIncoming(phi) |proof_state, phi, root, active, depth, recurrence_root, recurrence_path|:
+                at: LLVMValueRef = get LLVMGetBasicBlockTerminator(LLVMGetIncomingBlock(phi, incoming)) else phi
+                incoming_value: LLVMValueRef = LLVMGetIncomingValue(phi, incoming)
+                proven: bool = prove_nonnegative(proof_state, incoming_value, at, recurrence_root, active, depth + 1) if root != null else prove_nonnegative(proof_state, incoming_value, at, recurrence_root, &recurrence_path, depth + 1)
+                return false if not proven
+            true
+
+        # The shapes whose nonnegativity follows from their operands.
+        def prove_shape_nonnegative(proof_state: mutable NonnegativeProof&, value: LLVMValueRef, root: LLVMValueRef?, active: mutable darray[LLVMValueRef]&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            opcode: u32 = LLVMGetInstructionOpcode(value) if LLVMIsAInstruction(value) != null else 0
+            return prove_phi_nonnegative(proof_state, value, root, active, depth) if opcode == LLVMOpcode::PHI
+            if opcode == LLVMOpcode::SELECT:
+                return prove_nonnegative(proof_state, LLVMGetOperand(value, 1), value, root, active, depth + 1) and prove_nonnegative(proof_state, LLVMGetOperand(value, 2), value, root, active, depth + 1)
+            if (opcode == LLVMOpcode::ADD or opcode == LLVMOpcode::MUL) and LLVMGetNSW(value) != 0:
+                return prove_nonnegative(proof_state, LLVMGetOperand(value, 0), value, root, active, depth + 1) and prove_nonnegative(proof_state, LLVMGetOperand(value, 1), value, root, active, depth + 1)
+            return is_nonnegative_constant(LLVMGetOperand(value, 0)) or is_nonnegative_constant(LLVMGetOperand(value, 1)) if opcode == LLVMOpcode::AND
+            return is_positive_constant(LLVMGetOperand(value, 1)) and prove_nonnegative(proof_state, LLVMGetOperand(value, 0), value, root, active, depth + 1) if opcode == LLVMOpcode::SREM
+            false
+
+        # Whether `value`, used at `at`, is nonnegative. `root` is the recurrence phi being
+        # proven and `active` the values on the current path, so a cycle back to the root
+        # closes the proof and any other cycle declines it.
+        def prove_nonnegative(proof_state: mutable NonnegativeProof&, value: LLVMValueRef, at: LLVMValueRef, root: LLVMValueRef?, active: mutable darray[LLVMValueRef]&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            proof_state.work <- proof_state.work + 1
+            return false if proof_state.work > NonnegativeRemainderLimit::PROOF_WORK or depth > NonnegativeRemainderLimit::PROOF_DEPTH
+            return false if LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMTypeKindValue::INTEGER
+            return ElisaLLVMConstantIntIsNegative(value) == 0 if LLVMIsAConstantInt(value) != null
+            return false if LLVMIsUndef(value) != 0
+            on_path: bool = any visited in active where visited == value
+            if root is known_root:
+                return true if value == known_root and on_path
+            return false if on_path
+            # A phi outside any recurrence's path must anchor one, or the proof declines
+            # without consulting guards.
+            return false if root == null and LLVMIsAInstruction(value) != null and LLVMGetInstructionOpcode(value) == LLVMOpcode::PHI and not anchors_recurrence(proof_state, value)
+            active.push(value)
+            proven: mutable bool = prove_shape_nonnegative(proof_state, value, root, active, depth)
+            proven <- guarded_nonnegative(proof_state, value, at) if not proven
+            _ = active.pop()
+            proven
+
+        # `srem x, 2^k` with no metadata other than its debug location.
+        def is_power_of_two_remainder(instruction: LLVMValueRef) -> bool can[Abort.Panic]:
+            return false if LLVMGetInstructionOpcode(instruction) != LLVMOpcode::SREM or ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+            divisor: LLVMValueRef = LLVMGetOperand(instruction, 1)
+            LLVMIsAConstantInt(divisor) != null and ElisaLLVMConstantIntIsPositivePowerOfTwo(divisor) != 0
+
+        def power_of_two_remainders(function: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            candidates: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, candidates|:
+                    candidates.push(instruction) if is_power_of_two_remainder(instruction)
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            candidates
+
+        def skipped_by_nonnegative_remainders(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if skipped_by_scalar_pass_policy(function)
+            function_instruction_count(function) > NonnegativeRemainderLimit::FUNCTION_INSTRUCTIONS or function_block_count(function) > NonnegativeRemainderLimit::FUNCTION_BLOCKS
+
+        # The function's remainders whose dividends are proven nonnegative, in order.
+        def nonnegative_remainders_of(function: LLVMValueRef, candidates: darray[LLVMValueRef]&) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            safe: mutable darray[LLVMValueRef] = []
+            if ElisaLLVMCreateFunctionAnalyses(function) is analyses:
+                proof_state: mutable NonnegativeProof = NonnegativeProof{function: function, analyses: analyses, work: 0}
+                for remainder in candidates |proof_state, safe|:
+                    proof_state.work <- 0
+                    active: mutable darray[LLVMValueRef] = []
+                    safe.push(remainder) if prove_nonnegative(&proof_state, LLVMGetOperand(remainder, 0), remainder, null, &active, 0)
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+            safe
+
+    public:
+        # The signed power-of-two remainders rewritten as unsigned ones.
+        def fold_nonnegative_remainders(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if module_has_debug_info(module) or not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_nonnegative_remainders(function)
+                candidates: darray[LLVMValueRef] = power_of_two_remainders(function)
+                continue if candidates.count == 0 or candidates.count > NonnegativeRemainderLimit::MAXIMUM_CANDIDATES
+                for remainder in nonnegative_remainders_of(function, &candidates) |builder, changed|:
+                    position_builder_before(builder, remainder)
+                    unsigned_remainder: LLVMValueRef = LLVMBuildURem(builder, LLVMGetOperand(remainder, 0), LLVMGetOperand(remainder, 1), "nonnegative.remainder")
+                    LLVMReplaceAllUsesWith(remainder, unsigned_remainder)
+                    LLVMInstructionEraseFromParent(remainder)
+                    changed <- changed + 1
+            LLVMDisposeBuilder(builder)
+            changed

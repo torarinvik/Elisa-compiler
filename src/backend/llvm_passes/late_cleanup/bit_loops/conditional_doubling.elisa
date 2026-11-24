@@ -1,0 +1,81 @@
+# Expose a shift and a subtract as the two recurrence values so AArch64
+# can reuse the subtraction's flags for the conditional select. A 64-bit
+# loop value updated as
+#
+#     next = phi + (phi <u distance ? phi : 0 - distance)
+#
+# (both wrapping) becomes `phi <u distance ? phi << 1 : phi - distance`.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+extend Backend:
+    private:
+        def has_no_wrap_flags(instruction: LLVMValueRef) -> bool:
+            LLVMGetNSW(instruction) == 0 and LLVMGetNUW(instruction) == 0
+
+        # The operand of a wrapping `phi + offset` (either order) that is not the phi.
+        def doubling_offset(sum: LLVMValueRef, phi: LLVMValueRef) -> LLVMValueRef?:
+            return LLVMGetOperand(sum, 0) if LLVMGetOperand(sum, 1) == phi
+            return LLVMGetOperand(sum, 1) if LLVMGetOperand(sum, 0) == phi
+            null
+
+        # `phi <u distance ? phi : 0 - distance`, with a wrapping negation and
+        # a select used only by the sum; returns the compare.
+        def doubling_choice_compare(choice: LLVMValueRef, phi: LLVMValueRef) -> LLVMValueRef?:
+            return null if not is_llvm_instruction_with_opcode(choice, LLVMOpcode::SELECT) or not has_one_use(choice)
+            return null if LLVMGetOperand(choice, 1) != phi
+            compare: LLVMValueRef = LLVMGetOperand(choice, 0)
+            negation: LLVMValueRef = LLVMGetOperand(choice, 2)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT
+            return null if LLVMGetOperand(compare, 0) != phi
+            return null if not is_llvm_instruction_with_opcode(negation, LLVMOpcode::SUB) or not has_no_wrap_flags(negation)
+            zero: LLVMValueRef = LLVMGetOperand(negation, 0)
+            return null if LLVMIsAConstantInt(zero) == null or LLVMConstIntGetZExtValue(zero) != 0
+            return null if LLVMGetOperand(negation, 1) != LLVMGetOperand(compare, 1)
+            compare
+
+        def rewrite_conditional_doubling(phi: LLVMValueRef, edge: u32, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            sum: LLVMValueRef = LLVMGetIncomingValue(phi, edge)
+            return false if not is_llvm_instruction_with_opcode(sum, LLVMOpcode::ADD) or not has_no_wrap_flags(sum)
+            return false if LLVMGetInstructionParent(sum) != LLVMGetIncomingBlock(phi, edge)
+            if doubling_offset(sum, phi) is choice:
+                if doubling_choice_compare(choice, phi) is compare:
+                    distance: LLVMValueRef = LLVMGetOperand(compare, 1)
+                    position_builder_before(builder, sum)
+                    one: LLVMValueRef = LLVMConstInt(LLVMTypeOf(phi), 1, 0)
+                    doubled: LLVMValueRef = LLVMBuildShl(builder, phi, one, "")
+                    reduced: LLVMValueRef = LLVMBuildSub(builder, phi, distance, "")
+                    LLVMReplaceAllUsesWith(sum, LLVMBuildSelect(builder, compare, doubled, reduced, ""))
+                    ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(sum)
+                    return true
+            false
+
+        def is_two_edge_i64_phi(instruction: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI) and is_llvm_integer_type(LLVMTypeOf(instruction), 64) and LLVMCountIncoming(instruction) == 2
+
+        def fold_block_conditional_doubling(block: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            changed: mutable u32 = 0
+            phi_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while phi_cursor is phi |phi_cursor, changed, builder|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                if is_two_edge_i64_phi(phi):
+                    for edge in 0..<2 |phi, changed, builder|:
+                        changed <- changed + 1 if rewrite_conditional_doubling(phi, edge.u32(), builder)
+                phi_cursor <- LLVMGetNextInstruction(phi)
+            changed
+
+    public:
+        def fold_conditional_doubling(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, builder, module|:
+                if not skipped_by_loop_pass_policy(function, module):
+                    block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                    while block_cursor is block |block_cursor, changed, builder|:
+                        changed <- changed + fold_block_conditional_doubling(block, builder)
+                        block_cursor <- LLVMGetNextBasicBlock(block)
+                function_cursor <- LLVMGetNextFunction(function)
+            LLVMDisposeBuilder(builder)
+            changed

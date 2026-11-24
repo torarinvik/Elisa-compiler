@@ -1,0 +1,210 @@
+# Versions a bounded unsigned quotient sum into independent constant divisions:
+#   guard: br (n >u bound), elsewhere, pre      ; bound <= 0x7fffffff
+#   pre:   br (n == 0), exit, body
+#   body:  word = phi [n, pre], [word / base, body]; sum = phi [0, pre], [sum + word / base, body]
+#          br (word <u base), exit, body
+#   exit:  phi [0, pre], [sum + word / base, body]; ret
+# is the sum of n / base^k for every power of the base up to the bound, so the loop becomes
+# a pairwise sum of those divisions on 32 bits, in a tier for inputs past base^6 and one with
+# the first five powers below it.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module QuotientSumLimit:
+    BODY_INSTRUCTIONS: u32 = 6
+    ENTRY_INSTRUCTIONS: u32 = 2
+    MINIMUM_BASE: u64 = 3
+    MAXIMUM_BASE: u64 = 16
+    MAXIMUM_BOUND: u64 = 2147483647
+    MINIMUM_POWERS: usize = 7
+    MAXIMUM_POWERS: usize = 12
+    SMALL_TIER_POWERS: usize = 5
+    MINIMUM_BLOCKS: u32 = 4
+    MAXIMUM_BLOCKS: u32 = 32
+    MAXIMUM_FUNCTIONS: u32 = 512
+
+# The self-loop dividing the word by the base and summing the quotients.
+struct QuotientSumLoop:
+    body: LLVMBasicBlockRef
+    word: LLVMValueRef
+    base: LLVMValueRef
+    sum: LLVMValueRef
+    add: LLVMValueRef
+    exit: LLVMBasicBlockRef
+    result: LLVMValueRef
+
+# The block entering the loop unless the input is zero, and the input's bound.
+struct QuotientSumEntry:
+    pre: LLVMBasicBlockRef
+    enter: LLVMValueRef
+    input: LLVMValueRef
+    bound: u64
+
+extend Backend:
+    private:
+        # `word / base` for the body's word phi, as the phi's value around the loop.
+        def quotient_sum_division(body: LLVMBasicBlockRef, word: LLVMValueRef, base: LLVMValueRef) -> bool:
+            division: LLVMValueRef = get phi_incoming_for_block(word, body) else return false
+            return false if not is_llvm_instruction_with_opcode(division, LLVMOpcode::UDIV) or LLVMGetInstructionParent(division) != body
+            LLVMGetExact(division) == 0 and LLVMGetOperand(division, 0) == word and LLVMGetOperand(division, 1) == base
+
+        # The body's other phi: its first instruction, or the one after the word phi.
+        def quotient_sum_phi(body: LLVMBasicBlockRef, word: LLVMValueRef) -> LLVMValueRef?:
+            first: LLVMValueRef = get LLVMGetFirstInstruction(body) else return null
+            return null if not is_llvm_instruction_with_opcode(first, LLVMOpcode::PHI)
+            return first if first != word
+            next: LLVMValueRef = get LLVMGetNextInstruction(word) else return null
+            next if is_llvm_instruction_with_opcode(next, LLVMOpcode::PHI) else null
+
+        # `phi; ret phi` heading the exit, with ADD as its value from the body.
+        def quotient_sum_result(exit: LLVMBasicBlockRef, body: LLVMBasicBlockRef, add: LLVMValueRef) -> LLVMValueRef?:
+            result: LLVMValueRef = get LLVMGetFirstInstruction(exit) else return null
+            return null if not is_llvm_instruction_with_opcode(result, LLVMOpcode::PHI)
+            ret: LLVMValueRef = get LLVMGetNextInstruction(result) else return null
+            return null if LLVMGetInstructionOpcode(ret) != LLVMOpcode::RET or LLVMGetNumOperands(ret) == 0 or LLVMGetOperand(ret, 0) != result
+            result if optional_equals(phi_incoming_for_block(result, body), add) else null
+
+        # Every use of a body instruction is in the body or is the exit's result phi.
+        def used_only_in_loop(body: LLVMBasicBlockRef, result: LLVMValueRef) -> bool:
+            instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(body)
+            while instruction_cursor is instruction |instruction_cursor, body, result|:
+                instruction_cursor <- LLVMGetNextInstruction(instruction)
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(instruction)
+                while use_cursor is use |use_cursor, body, result|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    return false if LLVMIsAInstruction(user) == null
+                    return false if user != result and LLVMGetInstructionParent(user) != body
+            true
+
+        def quotient_sum_loop(body: LLVMBasicBlockRef) -> QuotientSumLoop?:
+            return null if instruction_count(body) != QuotientSumLimit::BODY_INSTRUCTIONS or ElisaLLVMBlockHasAddressTaken(body) != 0
+            latch: LLVMValueRef = get conditional_terminator(body) else return null
+            done: LLVMValueRef = LLVMGetCondition(latch)
+            return null if not is_llvm_instruction_with_opcode(done, LLVMOpcode::ICMP) or LLVMGetInstructionParent(done) != body or LLVMGetICmpPredicate(done) != LLVMIntPredicate::ULT
+            return null if LLVMGetSuccessor(latch, 1) != body or LLVMGetSuccessor(latch, 0) == body
+            word: LLVMValueRef = LLVMGetOperand(done, 0)
+            base: LLVMValueRef = LLVMGetOperand(done, 1)
+            return null if not is_llvm_instruction_with_opcode(word, LLVMOpcode::PHI) or LLVMGetInstructionParent(word) != body or not is_llvm_integer_type(LLVMTypeOf(word), 64)
+            return null if LLVMIsAConstantInt(base) == null or LLVMConstIntGetZExtValue(base) < QuotientSumLimit::MINIMUM_BASE or LLVMConstIntGetZExtValue(base) > QuotientSumLimit::MAXIMUM_BASE
+            return null if LLVMCountIncoming(word) != 2 or phi_incoming_index(word, body) < 0 or not quotient_sum_division(body, word, base)
+            division: LLVMValueRef = get phi_incoming_for_block(word, body) else return null
+            sum: LLVMValueRef = get quotient_sum_phi(body, word) else return null
+            return null if LLVMCountIncoming(sum) != 2
+            add: LLVMValueRef = get phi_incoming_for_block(sum, body) else return null
+            return null if not is_llvm_instruction_with_opcode(add, LLVMOpcode::ADD) or LLVMGetInstructionParent(add) != body
+            summed: bool = (LLVMGetOperand(add, 0) == sum and LLVMGetOperand(add, 1) == division) or (LLVMGetOperand(add, 1) == sum and LLVMGetOperand(add, 0) == division)
+            return null if not summed
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(latch, 0)
+            result: LLVMValueRef = get quotient_sum_result(exit, body, add) else return null
+            return null if not used_only_in_loop(body, result)
+            QuotientSumLoop{body: body, word: word, base: base, sum: sum, add: add, exit: exit, result: result}
+
+        # `br (input == 0), exit, body` alone after the input's `input >u bound` guard.
+        def quotient_sum_entry(loop: QuotientSumLoop&) -> QuotientSumEntry?:
+            pre: LLVMBasicBlockRef = LLVMGetIncomingBlock(loop.word, 1 if LLVMGetIncomingBlock(loop.word, 0) == loop.body else 0)
+            return null if phi_incoming_index(loop.sum, pre) < 0 or block_has_phis(pre)
+            return null if not is_optional_constant_integer(phi_incoming_for_block(loop.sum, pre), 0)
+            input: LLVMValueRef = get phi_incoming_for_block(loop.word, pre) else return null
+            enter: LLVMValueRef = get conditional_terminator(pre) else return null
+            is_zero: LLVMValueRef = LLVMGetCondition(enter)
+            return null if instruction_count(pre) != QuotientSumLimit::ENTRY_INSTRUCTIONS or not is_llvm_instruction_with_opcode(is_zero, LLVMOpcode::ICMP)
+            return null if LLVMGetInstructionParent(is_zero) != pre or not is_constant_integer(LLVMGetOperand(is_zero, 1), 0)
+            return null if not is_optional_constant_integer(phi_incoming_for_block(loop.result, pre), 0)
+            return null if LLVMGetOperand(is_zero, 0) != input or LLVMGetICmpPredicate(is_zero) != LLVMIntPredicate::EQ
+            return null if LLVMGetSuccessor(enter, 0) != loop.exit or LLVMGetSuccessor(enter, 1) != loop.body
+            guard_block: LLVMBasicBlockRef = get single_predecessor(pre) else return null
+            bound_branch: LLVMValueRef = get conditional_terminator(guard_block) else return null
+            compare: LLVMValueRef = LLVMGetCondition(bound_branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            bound: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if LLVMIsAConstantInt(bound) == null or LLVMGetOperand(compare, 0) != input or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::UGT
+            return null if LLVMGetSuccessor(bound_branch, 0) == pre or LLVMGetSuccessor(bound_branch, 1) != pre
+            return null if LLVMConstIntGetZExtValue(bound) > QuotientSumLimit::MAXIMUM_BOUND
+            QuotientSumEntry{pre: pre, enter: enter, input: input, bound: LLVMConstIntGetZExtValue(bound)}
+
+        # The powers of RADIX up to BOUND; empty when there are fewer than seven or more
+        # than twelve.
+        def quotient_sum_powers(radix: u64, bound: u64) -> darray[u64] can[Memory.Allocate]:
+            powers: mutable darray[u64] = []
+            power: mutable u64 = radix
+            while power <= bound |powers, power, radix|:
+                return [] if powers.count == QuotientSumLimit::MAXIMUM_POWERS
+                powers.push(power)
+                power <- power * radix
+            return [] if powers.count < QuotientSumLimit::MINIMUM_POWERS
+            powers
+
+        # `zext(sum of trunc(input) / power)` over the first COUNT powers, added pairwise so
+        # the sum has no serial chain.
+        def build_quotient_sum(builder: LLVMBuilderRef, input: LLVMValueRef, powers: darray[u64]&, count: usize, context: LLVMContextRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            i32_type: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            narrow: LLVMValueRef = LLVMBuildTrunc(builder, input, i32_type, "")
+            terms: mutable darray[LLVMValueRef] = []
+            for index in 0..<count |terms, builder, narrow, powers, i32_type|:
+                terms.push(LLVMBuildUDiv(builder, narrow, LLVMConstInt(i32_type, powers[index], 0), ""))
+            stride: mutable usize = 1
+            while stride < terms.count |stride, terms, builder|:
+                index: mutable usize = 0
+                while index + stride < terms.count |index, stride, terms, builder|:
+                    terms[index] <- LLVMBuildAdd(builder, terms[index], terms[index + stride], "")
+                    index <- index + 2 * stride
+                stride <- stride * 2
+            LLVMBuildZExt(builder, terms[0], LLVMInt64TypeInContext(context), "")
+
+        # A tier block summing COUNT powers into the result phi and branching to the exit.
+        def fill_quotient_sum_tier(tier: LLVMBasicBlockRef, loop: QuotientSumLoop&, input: LLVMValueRef, powers: darray[u64]&, count: usize, builder: LLVMBuilderRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            LLVMPositionBuilderAtEnd(builder, tier)
+            values: mutable darray[LLVMValueRef] = [build_quotient_sum(builder, input, powers, count, context)]
+            blocks: mutable darray[LLVMBasicBlockRef] = [tier]
+            value_slots: void& = (&values[0]).cast[void&] can Unsafe.PointerCast
+            block_slots: void& = (&blocks[0]).cast[void&] can Unsafe.PointerCast
+            LLVMAddIncoming(loop.result, value_slots, block_slots, 1)
+            _ = LLVMBuildBr(builder, loop.exit)
+
+        def version_bounded_quotient_sum(body: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            loop: QuotientSumLoop = get quotient_sum_loop(body) else return false
+            entry: QuotientSumEntry = get quotient_sum_entry(&loop) else return false
+            powers: darray[u64] = quotient_sum_powers(LLVMConstIntGetZExtValue(loop.base), entry.bound)
+            return false if powers.count == 0
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(loop.word))
+            dispatch: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, body, "quotient.sum.dispatch")
+            parallel: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, body, "quotient.sum.parallel")
+            small: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, body, "quotient.sum.small")
+            # Every quotient is zero below the radix: return before choosing a tier.
+            position_builder_before(builder, entry.enter)
+            LLVMSetCondition(entry.enter, LLVMBuildICmp(builder, LLVMIntPredicate::ULT, entry.input, loop.base, ""))
+            LLVMSetSuccessor(entry.enter, 1, dispatch)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            LLVMPositionBuilderAtEnd(builder, dispatch)
+            sixth_power: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(context), powers[QuotientSumLimit::SMALL_TIER_POWERS], 0)
+            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, LLVMIntPredicate::UGE, entry.input, sixth_power, ""), parallel, small)
+            fill_quotient_sum_tier(parallel, &loop, entry.input, &powers, powers.count, builder, context)
+            # The small tier cannot reach the sixth power.
+            fill_quotient_sum_tier(small, &loop, entry.input, &powers, QuotientSumLimit::SMALL_TIER_POWERS, builder, context)
+            dead_blocks: mutable darray[LLVMBasicBlockRef] = [body]
+            dead_slots: void& = (&dead_blocks[0]).cast[void&] can Unsafe.PointerCast
+            ElisaLLVMDeleteDeadBlocks(dead_slots, 1)
+            true
+
+        def version_first_quotient_sum(function: LLVMValueRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, builder|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                return true if version_bounded_quotient_sum(block, builder)
+            false
+
+    public:
+        # The quotient-sum loops versioned, at most one per function, on AArch64.
+        def version_bounded_quotient_sums(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module) or module_function_count(module) > QuotientSumLimit::MAXIMUM_FUNCTIONS
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                blocks: u32 = function_block_count(function)
+                continue if blocks < QuotientSumLimit::MINIMUM_BLOCKS or blocks > QuotientSumLimit::MAXIMUM_BLOCKS or skipped_by_loop_pass_policy(function, module)
+                changed <- changed + 1 if version_first_quotient_sum(function, builder)
+            LLVMDisposeBuilder(builder)
+            changed

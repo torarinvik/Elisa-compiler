@@ -27,6 +27,10 @@ typedef struct ElisaOpaqueLoop *ElisaLoopRef;
 ElisaFunctionAnalysesRef ElisaLLVMCreateFunctionAnalyses(LLVMValueRef function);
 void ElisaLLVMDisposeFunctionAnalyses(ElisaFunctionAnalysesRef analyses);
 void ElisaLLVMInvalidateFunctionAnalyses(ElisaFunctionAnalysesRef analyses);
+/* Drops the lazy value info, scalar evolution and assumption cache, keeping the
+ * dominator tree and loop info: the next query builds them fresh, as a pass that
+ * constructs them per query sees the instructions it has rewritten since. */
+void ElisaLLVMForgetValueAnalyses(ElisaFunctionAnalysesRef analyses);
 
 /* --- dominance -------------------------------------------------------- */
 int ElisaLLVMBlockDominates(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef dominator,
@@ -70,6 +74,8 @@ int ElisaLLVMModuleTargetIsAArch64(LLVMModuleRef module);
 int ElisaLLVMModuleTargetArchIsAArch64(LLVMModuleRef module);
 /* Triple::isOSDarwin(). */
 int ElisaLLVMModuleTargetIsDarwin(LLVMModuleRef module);
+/* Triple::isOSLinux(). */
+int ElisaLLVMModuleTargetIsLinux(LLVMModuleRef module);
 /* Triple::isMacOSX(). */
 int ElisaLLVMModuleTargetIsMacOSX(LLVMModuleRef module);
 /* The same queries on a target machine's triple. */
@@ -121,6 +127,18 @@ unsigned ElisaLLVMFunctionMaxBlockNumber(LLVMValueRef function);
 int ElisaLLVMCallHasFunctionAttribute(LLVMValueRef call, unsigned kind);
 /* isa<MemIntrinsic>: a call of llvm.memcpy, memmove, memset or their inline forms. */
 int ElisaLLVMIsMemIntrinsic(LLVMValueRef value);
+/* isa<MemSetInst>: a call of llvm.memset or llvm.memset.inline. */
+int ElisaLLVMIsMemSet(LLVMValueRef value);
+/* Value::isUsedByMetadata. */
+int ElisaLLVMIsUsedByMetadata(LLVMValueRef value);
+/* DataLayout::getIndexSizeInBits of the module's layout for the address space. */
+uint32_t ElisaLLVMDataLayoutIndexSizeInBits(LLVMModuleRef module, uint32_t address_space);
+/* APInt::slt of two ConstantInt values of the same width. */
+int ElisaLLVMConstantIntSignedLess(LLVMValueRef first, LLVMValueRef second);
+/* containsIrreducibleCFG over a reverse post-order of the function and its loops. */
+int ElisaLLVMFunctionHasIrreducibleControlFlow(ElisaFunctionAnalysesRef analyses);
+/* llvm::getUnderlyingObject(value) with its default lookup limit of 6. */
+LLVMValueRef ElisaLLVMUnderlyingObject(LLVMValueRef value);
 /* BasicBlock::isEHPad. */
 int ElisaLLVMBlockIsEHPad(LLVMBasicBlockRef block);
 /* Use::getOperandNo: the use's operand index in its user. */
@@ -161,6 +179,19 @@ int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAt(ElisaFunctionAnalysesRef analyse
  * disposes the range with ElisaLLVMDisposeConstantRange. */
 ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
                                                       LLVMValueRef context, int undef_allowed);
+/* llvm::isGuaranteedNotToBeUndefOrPoison at the instruction `context`, with the
+ * analyses' assumption cache and dominator tree. */
+int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(ElisaFunctionAnalysesRef analyses,
+                                                      LLVMValueRef value, LLVMValueRef context);
+/* LazyValueInfo::getConstantRangeOnEdge of `value` on the edge from -> to, asked at the
+ * instruction `context`. */
+ElisaConstantRangeRef ElisaLLVMLazyValueConstantRangeOnEdge(ElisaFunctionAnalysesRef analyses,
+                                                            LLVMValueRef value, LLVMBasicBlockRef from,
+                                                            LLVMBasicBlockRef to, LLVMValueRef context);
+/* LazyValueInfo::getConstantRangeAtUse of operand `operand_index` of `user`. */
+ElisaConstantRangeRef ElisaLLVMLazyValueConstantRangeAtUse(ElisaFunctionAnalysesRef analyses,
+                                                           LLVMValueRef user, uint32_t operand_index,
+                                                           int undef_allowed);
 /* llvm::isImpliedCondition with the module's data layout: whether `condition` being
  * `condition_is_true` decides `implied`. 1 implied true, 0 implied false, -1 unknown. */
 int ElisaLLVMIsImpliedCondition(LLVMValueRef condition, LLVMValueRef implied, LLVMModuleRef module,
@@ -175,6 +206,15 @@ int ElisaLLVMConstantMaxBackedgeTakenCount(ElisaFunctionAnalysesRef analyses, El
  * integer value; 0 for a value scalar evolution cannot describe. */
 unsigned ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(ElisaFunctionAnalysesRef analyses,
                                                       LLVMValueRef value);
+/* ScalarEvolution::getSignedRange(getSCEV(value)) of an integer value. */
+ElisaConstantRangeRef ElisaLLVMScalarEvolutionSignedRange(ElisaFunctionAnalysesRef analyses,
+                                                          LLVMValueRef value);
+/* ScalarEvolution::getSmallConstantTripCount(loop, exiting): the exact trip count of the
+ * loop through the exiting block, 0 when unknown or wider than 32 bits. */
+uint32_t ElisaLLVMSmallConstantTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
+                                         LLVMBasicBlockRef exiting);
+/* ScalarEvolution::getSmallConstantMaxTripCount(loop): 0 when unknown. */
+uint32_t ElisaLLVMSmallConstantMaxTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop);
 
 #ifdef __cplusplus
 }

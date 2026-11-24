@@ -559,11 +559,7 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
   return Changed;
 }
 
-#include "llvm_shift_bit_reverse.cpp"
-#include "llvm_range_and.cpp"
-#include "llvm_shift_xor.cpp"
 #include "llvm_edge_division_reuse.cpp"
-#include "llvm_remainder_recurrence.cpp"
 #include "llvm_stack_view_inline.cpp"
 
 #else

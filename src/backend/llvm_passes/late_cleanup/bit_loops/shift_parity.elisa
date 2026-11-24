@@ -1,0 +1,161 @@
+# Folds a right-shift loop whose only observable result is the low bit of its accumulator.
+# Adding each shifted word, or its low bit, has the same parity as the population count of
+# the initial word, so the loop becomes `ctpop(word) & 1` and its block is deleted.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module ShiftParityLimit:
+    MINIMUM_BODY_INSTRUCTIONS: u32 = 6
+    MAXIMUM_BODY_INSTRUCTIONS: u32 = 7
+    FUNCTION_BLOCKS: u32 = 24
+
+# The loop `word = phi(input, word >> 1); count = phi(0, count + term)` exiting when the
+# shifted word is zero, where the term is the word or its low bit.
+struct ShiftParityLoop:
+    branch: LLVMValueRef
+    exit: LLVMBasicBlockRef
+    entry: LLVMBasicBlockRef
+    word: LLVMValueRef
+    count: LLVMValueRef
+    shift: LLVMValueRef
+    done: LLVMValueRef
+    sum: LLVMValueRef
+    low_bit: LLVMValueRef?
+
+# The loop's exit test and the blocks around it.
+struct ShiftParityExit:
+    branch: LLVMValueRef
+    done: LLVMValueRef
+    exit: LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        def is_parity_constant(value: LLVMValueRef, expected: u64) -> bool:
+            LLVMIsAConstantInt(value) != null and ElisaLLVMConstantIntEquals(value, expected) != 0
+
+        # A conditional self-loop on `== / !=` whose exit is reached only from the body and
+        # has no phis.
+        def shift_parity_exit(body: LLVMBasicBlockRef) -> ShiftParityExit? can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(body) else return null
+            done: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(done, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(done)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            return null if ElisaLLVMBlockHasAddressTaken(body) != 0 or has_loop_metadata(branch, LLVMGetTypeContext(LLVMTypeOf(done)))
+            size: u32 = instruction_count(body)
+            return null if size < ShiftParityLimit::MINIMUM_BODY_INSTRUCTIONS or size > ShiftParityLimit::MAXIMUM_BODY_INSTRUCTIONS
+            exit_index: u32 = 0 if predicate == LLVMIntPredicate::EQ else 1
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(branch, exit_index)
+            return null if exit == body or LLVMGetSuccessor(branch, 1 - exit_index) != body
+            return null if not same_optional_block(single_predecessor(exit), body) or block_has_phis(exit)
+            ShiftParityExit{branch: branch, done: done, exit: exit}
+
+        # The accumulated term `count + word` or `count + (word & 1)`, the term's low-bit
+        # instruction if it has one; none when SUM has another shape.
+        def shift_parity_term(sum: LLVMValueRef, count: LLVMValueRef, word: LLVMValueRef, body: LLVMBasicBlockRef) -> (valid: bool, low_bit: LLVMValueRef?):
+            term: mutable LLVMValueRef = LLVMGetOperand(sum, 0)
+            if term == count:
+                term <- LLVMGetOperand(sum, 1)
+            elif LLVMGetOperand(sum, 1) != count:
+                return (false, null)
+            return (true, null) if term == word
+            valid: bool = is_llvm_instruction_with_opcode(term, LLVMOpcode::AND) and LLVMGetInstructionParent(term) == body and LLVMGetOperand(term, 0) == word and is_parity_constant(LLVMGetOperand(term, 1), 1)
+            (valid, term)
+
+        # The counter phi: the instruction after the word phi, else the block's first.
+        def shift_parity_counter(body: LLVMBasicBlockRef, word: LLVMValueRef) -> LLVMValueRef?:
+            if LLVMGetNextInstruction(word) is next:
+                return next if is_llvm_instruction_with_opcode(next, LLVMOpcode::PHI)
+            first: LLVMValueRef = get LLVMGetFirstInstruction(body) else return null
+            first if is_llvm_instruction_with_opcode(first, LLVMOpcode::PHI) else null
+
+        def shift_parity_loop(body: LLVMBasicBlockRef) -> ShiftParityLoop? can[Abort.Panic, Memory.Allocate]:
+            exit: ShiftParityExit = get shift_parity_exit(body) else return null
+            shift: LLVMValueRef = LLVMGetOperand(exit.done, 0)
+            return null if not is_llvm_instruction_with_opcode(shift, LLVMOpcode::LSHR) or LLVMGetInstructionParent(shift) != body
+            return null if not is_parity_constant(LLVMGetOperand(shift, 1), 1) or not is_parity_constant(LLVMGetOperand(exit.done, 1), 0)
+            word: LLVMValueRef = LLVMGetOperand(shift, 0)
+            return null if not is_llvm_instruction_with_opcode(word, LLVMOpcode::PHI) or LLVMGetInstructionParent(word) != body or not is_llvm_integer_type(LLVMTypeOf(word), 64)
+            return null if LLVMCountIncoming(word) != 2 or not optional_equals(phi_incoming_for_block(word, body), shift)
+            entry: LLVMBasicBlockRef = LLVMGetIncomingBlock(word, 1 if LLVMGetIncomingBlock(word, 0) == body else 0)
+            return null if entry == exit.exit
+            count: LLVMValueRef = get shift_parity_counter(body, word) else return null
+            return null if count == word or LLVMCountIncoming(count) != 2
+            seed: LLVMValueRef = get phi_incoming_for_block(count, entry) else return null
+            return null if not is_parity_constant(seed, 0)
+            sum: LLVMValueRef = get phi_incoming_for_block(count, body) else return null
+            return null if not is_llvm_instruction_with_opcode(sum, LLVMOpcode::ADD) or LLVMGetInstructionParent(sum) != body
+            term: (valid: bool, low_bit: LLVMValueRef?) = shift_parity_term(sum, count, word, body)
+            return null if not term.valid
+            ShiftParityLoop{branch: exit.branch, exit: exit.exit, entry: entry, word: word, count: count, shift: shift, done: exit.done, sum: sum, low_bit: term.low_bit}
+
+        def is_shift_parity_member(loop: ShiftParityLoop&, instruction: LLVMValueRef) -> bool:
+            return true if instruction == loop.word or instruction == loop.count or instruction == loop.sum or instruction == loop.shift
+            return true if instruction == loop.done or instruction == loop.branch
+            optional_equals(loop.low_bit, instruction)
+
+        # Whether USER, outside the body, is the `sum & 1` in the exit that reads the parity.
+        def is_shift_parity_read(user: LLVMValueRef, loop: ShiftParityLoop&) -> bool:
+            is_llvm_instruction_with_opcode(user, LLVMOpcode::AND) and LLVMGetInstructionParent(user) == loop.exit and LLVMGetOperand(user, 0) == loop.sum and is_parity_constant(LLVMGetOperand(user, 1), 1)
+
+        # The exit's single `sum & 1`, when every body instruction is part of the loop and
+        # nothing else of the body is used outside it.
+        def shift_parity_read(body: LLVMBasicBlockRef, loop: ShiftParityLoop&) -> LLVMValueRef?:
+            parity: mutable LLVMValueRef? = null
+            instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(body)
+            while instruction_cursor is instruction |instruction_cursor, body, loop, parity|:
+                instruction_cursor <- LLVMGetNextInstruction(instruction)
+                return null if not is_shift_parity_member(loop, instruction)
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(instruction)
+                while use_cursor is use |use_cursor, body, loop, parity, instruction|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    continue if LLVMIsAInstruction(user) != null and LLVMGetInstructionParent(user) == body
+                    return null if instruction != loop.sum or not is_shift_parity_read(user, loop)
+                    if parity is earlier:
+                        return null if earlier != user
+                    parity <- user
+            parity
+
+        # Every edge from ENTRY to BODY goes to EXIT instead.
+        def redirect_successors(entry: LLVMBasicBlockRef, body: LLVMBasicBlockRef, exit: LLVMBasicBlockRef) -> void can[Abort.Panic]:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(entry) else return
+            for successor in 0..<LLVMGetNumSuccessors(terminator) |terminator, body, exit|:
+                LLVMSetSuccessor(terminator, successor, exit) if LLVMGetSuccessor(terminator, successor) == body
+
+        # The parity read becomes `ctpop(input) & 1`; the entry skips the deleted loop.
+        def fold_shift_parity(body: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            loop: ShiftParityLoop = get shift_parity_loop(body) else return false
+            parity: LLVMValueRef = get shift_parity_read(body, &loop) else return false
+            input: LLVMValueRef = LLVMGetIncomingValue(loop.word, 1 if LLVMGetIncomingBlock(loop.word, 0) == body else 0)
+            if LLVMIsAInstruction(input) != null:
+                return false if LLVMGetInstructionParent(input) == body or LLVMGetInstructionParent(input) == loop.exit
+            position_builder_before(builder, parity)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(body)
+            bits: LLVMValueRef = build_population_count(builder, LLVMGetGlobalParent(function), input)
+            LLVMReplaceAllUsesWith(parity, LLVMBuildAnd(builder, bits, LLVMConstInt(LLVMTypeOf(bits), 1, 0), "bit.parity"))
+            LLVMInstructionEraseFromParent(parity)
+            redirect_successors(loop.entry, body, loop.exit)
+            dead_blocks: mutable darray[LLVMBasicBlockRef] = [body]
+            dead_slots: void& = (&dead_blocks[0]).cast[void&] can Unsafe.PointerCast
+            ElisaLLVMDeleteDeadBlocks(dead_slots, 1)
+            true
+
+    public:
+        # The parity loops folded, at most one per function, on AArch64.
+        def fold_shift_parity_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_loop_pass_policy(function, module) or function_block_count(function) > ShiftParityLimit::FUNCTION_BLOCKS
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                folded: mutable bool = false
+                while block_cursor is block |block_cursor, folded, builder|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    folded <- fold_shift_parity(block, builder) if not folded
+                changed <- changed + 1 if folded
+            LLVMDisposeBuilder(builder)
+            changed

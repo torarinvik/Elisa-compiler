@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Check guarded divisor cloning, its rejection gates, and runtime behavior."""
+"""Check the loop-divisor versioning, its rejection gates, and runtime behavior.
+
+The versioned function must compute what the original did for every divisor, the
+specialized value 2 included.
+"""
 import os
 from pathlib import Path
-import shlex
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from elisa_llvm_pass import run_pass
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG = os.environ.get('LLVM_CONFIG', '/opt/homebrew/opt/llvm/bin/llvm-config')
@@ -12,29 +19,6 @@ CONFIG = os.environ.get('LLVM_CONFIG', '/opt/homebrew/opt/llvm/bin/llvm-config')
 def run(cmd):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=28)
 
-def flags(*args):
-    return shlex.split(run([CONFIG, *args]).stdout)
-
-DRIVER = r'''#include <llvm/IRReader/IRReader.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/IntrinsicInst.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/FileSystem.h>
-#include <llvm/Support/raw_ostream.h>
-#include "llvm_guarded_divisor.h"
-int main(int argc, char **argv) {
-  llvm::LLVMContext c; llvm::SMDiagnostic error;
-  auto m = llvm::parseIRFile(argv[1], error, c);
-  if (!m) { error.print(argv[0], llvm::errs()); return 1; }
-  if (llvm::verifyModule(*m, &llvm::errs())) return 2;
-  auto *f = m->getFunction("work");
-  bool changed = divisorSpecialize(*f);
-  llvm::outs() << changed << "\n";
-  if (llvm::verifyModule(*m, &llvm::errs())) return 3;
-  std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
-  m->print(out, nullptr); return !!ec;
-}
-'''
 HARNESS = r'''#include <stdint.h>
 #include <stdio.h>
 extern int64_t work(int64_t *, int64_t *, _Bool);
@@ -66,20 +50,16 @@ cases = {
 }
 with tempfile.TemporaryDirectory(prefix='guarded-divisor-') as temp:
     d = Path(temp)
-    (d/'driver.cpp').write_text(DRIVER)
     (d/'harness.c').write_text(HARNESS)
-    bindir = Path(run([CONFIG, '--bindir']).stdout.strip())
-    clang = str(bindir/'clang')
-    run([str(bindir/'clang++'), '-Wno-deprecated-declarations', *flags('--cxxflags'),
-         '-I'+str(ROOT/'src/backend'), str(d/'driver.cpp'),
-         *flags('--ldflags', '--libs', 'core', 'irreader', 'analysis', 'transformutils', '--system-libs'),
-         '-Wl,-rpath,'+run([CONFIG, '--libdir']).stdout.strip(), '-o', str(d/'driver')])
+    clang = str(Path(run([CONFIG, '--bindir']).stdout.strip())/'clang')
     for name, (ir, expected) in cases.items():
-        source, transformed = d/(name+'.ll'), d/(name+'-out.ll')
-        source.write_text(ir)
-        changed = int(run([str(d/'driver'), str(source), str(transformed)]).stdout.strip())
+        changed, module = run_pass('divisor-versioning', ir)
         assert changed == expected, (name, changed, expected)
+        assert ('.divisor2' in module) == bool(expected), (name, module)
         if name == 'covered':
+            source, transformed = d/(name+'.ll'), d/(name+'-out.ll')
+            source.write_text(ir)
+            transformed.write_text(module)
             for suffix, path in [('original', source), ('changed', transformed)]:
                 run([clang, '-O2', str(path), str(d/'harness.c'), '-o', str(d/suffix)])
             assert run([str(d/'original')]).stdout == run([str(d/'changed')]).stdout

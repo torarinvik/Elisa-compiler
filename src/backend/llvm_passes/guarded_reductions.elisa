@@ -1,0 +1,144 @@
+# Unrolls small guarded floating-point reductions by four, preserving their evaluation
+# order; LLVM's unroller handles the remainder iterations. A candidate is a single-block
+# innermost loop of two simple double loads, one fadd and one fmul (at most 20
+# instructions), whose equality exit compares against a loop-invariant N that a branch
+# proves to be 1..16: the edge taken when `N + -17 <u -16` fails dominates the preheader.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+include "../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module GuardedReductionLimit:
+    # -16 and -17 as unsigned 64-bit words.
+    BOUND_LIMIT: u64 = 18446744073709551600
+    BOUND_OFFSET: u64 = 18446744073709551599
+    FUNCTION_INSTRUCTIONS: u32 = 20000
+    BODY_INSTRUCTIONS: u32 = 20
+    ROUNDS: u32 = 12
+    UNROLL_COUNT: u32 = 4
+    EXPANSION_BUDGET: u32 = 1000
+
+extend Backend:
+    private:
+        # `icmp ult X, -16` on i64.
+        def is_small_bound_test(compare: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+            LLVMIsAConstantInt(limit) != null and is_llvm_integer_type(LLVMTypeOf(limit), 64) and LLVMConstIntGetZExtValue(limit) == GuardedReductionLimit::BOUND_LIMIT
+
+        # Whether FUNCTION has an fadd, an fmul and a small bound test within 20000
+        # instructions; larger functions are left alone.
+        def may_hold_guarded_reduction(function: LLVMValueRef) -> bool:
+            instructions: mutable u32 = 0
+            adds: mutable bool = false
+            multiplies: mutable bool = false
+            bounded: mutable bool = false
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, instructions, adds, multiplies, bounded|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, instructions, adds, multiplies, bounded|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    instructions <- instructions + 1
+                    return false if instructions > GuardedReductionLimit::FUNCTION_INSTRUCTIONS
+                    adds <- true if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::FADD)
+                    multiplies <- true if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::FMUL)
+                    bounded <- true if is_small_bound_test(instruction)
+            adds and multiplies and bounded
+
+        # A branch proves 1 <= N <= 16 on the edge into the loop: `N + -17 <u -16` fails
+        # on an edge that dominates the preheader.
+        def has_small_bound_guard(bound: LLVMValueRef, preheader: LLVMBasicBlockRef, function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, bound, preheader, analyses|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if conditional_terminator(block) is branch:
+                    taken: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+                    continue if LLVMGetSuccessor(branch, 0) == taken
+                    compare: LLVMValueRef = LLVMGetCondition(branch)
+                    continue if not is_small_bound_test(compare)
+                    sum: LLVMValueRef = LLVMGetOperand(compare, 0)
+                    continue if not is_llvm_instruction_with_opcode(sum, LLVMOpcode::ADD) or LLVMGetOperand(sum, 0) != bound
+                    offset: LLVMValueRef = LLVMGetOperand(sum, 1)
+                    continue if LLVMIsAConstantInt(offset) == null or LLVMConstIntGetZExtValue(offset) != GuardedReductionLimit::BOUND_OFFSET
+                    return true if ElisaLLVMEdgeDominates(analyses, block, taken, preheader) != 0
+            false
+
+        # Two simple double loads, one fadd, one fmul, nothing else with side effects, and
+        # at most 20 instructions in the loop's single block.
+        def is_reduction_body(body: LLVMBasicBlockRef) -> bool:
+            loads: mutable u32 = 0
+            adds: mutable u32 = 0
+            multiplies: mutable u32 = 0
+            count: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(body)
+            while cursor is instruction |cursor, loads, adds, multiplies, count|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                count <- count + 1
+                if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::LOAD):
+                    return false if LLVMGetVolatile(instruction) != 0 or LLVMGetOrdering(instruction) != 0 or LLVMGetTypeKind(LLVMTypeOf(instruction)) != LLVMTypeKindValue::DOUBLE
+                    loads <- loads + 1
+                elif ElisaLLVMMayHaveSideEffects(instruction) != 0:
+                    return false
+                adds <- adds + 1 if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::FADD)
+                multiplies <- multiplies + 1 if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::FMUL)
+            loads == 2 and adds == 1 and multiplies == 1 and count <= GuardedReductionLimit::BODY_INSTRUCTIONS
+
+        def is_guarded_reduction(loop: ElisaLoopRef, function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMLoopSubLoopCount(loop) != 0 or ElisaLLVMLoopBlockCount(loop) != 1 or ElisaLLVMLoopGetLoopID(loop) != null
+            return false if not is_reduction_body(ElisaLLVMLoopHeader(loop)) or ElisaLLVMLoopIsSimplifyForm(loop) == 0
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return false
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            branch: LLVMValueRef = get conditional_terminator(latch) else return false
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return false if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            bounded: mutable bool = false
+            for operand in 0..<2 |compare, loop, preheader, function, analyses, bounded|:
+                bound: LLVMValueRef = LLVMGetOperand(compare, operand.u32())
+                bounded <- true if ElisaLLVMLoopIsInvariant(loop, bound) != 0 and has_small_bound_guard(bound, preheader, function, analyses)
+            bounded
+
+        # The first candidate in LoopInfo's worklist order: top-level loops from the last,
+        # each loop's subloops pushed before it is examined.
+        def guarded_reduction_candidate(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> ElisaLoopRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            work: mutable darray[ElisaLoopRef] = []
+            for index in 0..<ElisaLLVMTopLevelLoopCount(analyses) |work, analyses|:
+                work.push(ElisaLLVMTopLevelLoopAt(analyses, index))
+            while work.count > 0 |work, function, analyses|:
+                loop: ElisaLoopRef = work[work.count - 1]
+                _ = work.pop()
+                for index in 0..<ElisaLLVMLoopSubLoopCount(loop) |work, loop|:
+                    work.push(ElisaLLVMLoopSubLoopAt(loop, index))
+                return loop if is_guarded_reduction(loop, function, analyses)
+            null
+
+        # Unrolls the next candidate; false when there is none or it did not unroll.
+        def unroll_next_guarded_reduction(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidate: ElisaLoopRef = get guarded_reduction_candidate(function, analyses) else return false
+            _ = ElisaLLVMFormLCSSA(analyses, candidate)
+            flags: u32 = ElisaUnrollFlag::FORCE + ElisaUnrollFlag::RUNTIME + ElisaUnrollFlag::UNROLL_REMAINDER + ElisaUnrollFlag::RUNTIME_MULTI_EXIT + ElisaUnrollFlag::PRESERVE_LCSSA
+            ElisaLLVMUnrollLoop(analyses, candidate, GuardedReductionLimit::UNROLL_COUNT, flags, GuardedReductionLimit::EXPANSION_BUDGET) != ElisaUnrollResult::UNMODIFIED
+
+        def unroll_function_guarded_reductions(function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = 0
+            for _ in 0..<GuardedReductionLimit::ROUNDS |function, analyses, changed|:
+                break if not unroll_next_guarded_reduction(function, analyses)
+                changed <- changed + 1
+                ElisaLLVMInvalidateFunctionAnalyses(analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # The guarded reductions unrolled in functions with optimization, no debug
+        # location and no sanitizer.
+        def unroll_guarded_reductions(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_scalar_pass_policy(function) or llvm_function_subprogram_or_null(function) != null
+                continue if not may_hold_guarded_reduction(function)
+                changed <- changed + unroll_function_guarded_reductions(function)
+            changed

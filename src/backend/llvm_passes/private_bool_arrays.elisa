@@ -1,0 +1,246 @@
+# Keeps small, nonescaping Boolean arrays in an integer register. A static entry-block
+# alloca of 2 to 128 `i1` used only through GEPs, simple `i1` loads and stores, zero
+# fills and lifetime markers becomes an i64 (or i128) word whose bit k is element k; the
+# byte addresses are never observable. SROA, instcombine and simplifycfg then promote
+# the word. AArch64 with 64-bit little-endian pointers, without debug information.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+include "./ir/llvm_c_extra.elisa"
+
+const module BoolArrayLimit:
+    MINIMUM_ELEMENTS: u64 = 2
+    MAXIMUM_ELEMENTS: u64 = 128
+    WORD_ELEMENTS: u64 = 64
+    CLEANUP: sview = "function(sroa,instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg)"
+    FAILED: u32 = 2
+
+const module BoolArrayUse:
+    REJECTED: u32 = 0
+    GEP: u32 = 1
+    ACCESS: u32 = 2
+
+# One array's packing plan: its GEPs and accesses in the order the use walk found them.
+struct BoolArrayPlan:
+    array: LLVMValueRef
+    length: u64
+    geps: mutable darray[LLVMValueRef]
+    accesses: mutable darray[LLVMValueRef]
+
+# The packed word replacing an array: its stack slot and integer type.
+struct PackedWord:
+    slot: LLVMValueRef
+    word: LLVMTypeRef
+
+extend Backend:
+    private:
+        # A static, single, address-space-0 alloca of 2..128 `i1` that metadata never names.
+        def is_packable_bool_array(alloca: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic]:
+            array_type: LLVMTypeRef = LLVMGetAllocatedType(alloca)
+            return false if LLVMGetTypeKind(array_type) != LLVMTypeKindValue::ARRAY or not is_constant_integer(LLVMGetOperand(alloca, 0), 1)
+            return false if ElisaLLVMIsStaticAlloca(alloca) == 0 or LLVMGetPointerAddressSpace(LLVMTypeOf(alloca)) != 0
+            length: u64 = LLVMGetArrayLength2(array_type)
+            return false if not is_llvm_integer_type(LLVMGetElementType(array_type), 1) or length < BoolArrayLimit::MINIMUM_ELEMENTS or length > BoolArrayLimit::MAXIMUM_ELEMENTS
+            return false if ElisaLLVMIsUsedByMetadata(alloca) != 0
+            LLVMABISizeOfType(LLVMGetModuleDataLayout(module), array_type) == length
+
+        # A zero fill of POINTER within the array: a constant length that ends inside it at
+        # a constant, nonnegative offset from the array.
+        def is_array_zero_fill(fill: LLVMValueRef, pointer: LLVMValueRef, plan: BoolArrayPlan&, module: LLVMModuleRef) -> bool can[Unsafe.PointerCast]:
+            value: LLVMValueRef = LLVMGetOperand(fill, 1)
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            return false if LLVMGetOperand(fill, 0) != pointer or LLVMConstIntGetZExtValue(LLVMGetOperand(fill, 3)) != 0 or LLVMGetNumOperandBundles(fill) != 0
+            return false if LLVMIsAConstantInt(value) == null or ElisaLLVMIsConstantZero(value) == 0 or LLVMIsAConstantInt(length) == null
+            offset: mutable i64 = 0
+            base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(pointer, module, (&offset).cast[void&])
+            return false if base != plan.array or offset < 0 or offset.u64() > plan.length
+            constant_length: u64 = LLVMConstIntGetZExtValue(length) if ElisaLLVMConstantIntActiveBits(length) <= 64 else 18446744073709551615
+            constant_length <= plan.length - offset.u64()
+
+        # What USER of POINTER is to the packing: a GEP to follow, an access to rewrite, or
+        # a use that rules the array out.
+        def bool_array_use_kind(user: LLVMValueRef, pointer: LLVMValueRef, plan: BoolArrayPlan&, module: LLVMModuleRef, lifetime: darray[u32]&) -> u32 can[Abort.Panic, Unsafe.PointerCast]:
+            return BoolArrayUse::REJECTED if LLVMIsAInstruction(user) == null or ElisaLLVMHasMetadataOtherThanDebugLoc(user) != 0
+            opcode: u32 = LLVMGetInstructionOpcode(user)
+            if opcode == LLVMOpcode::GET_ELEMENT_PTR:
+                return BoolArrayUse::GEP if LLVMGetOperand(user, 0) == pointer else BoolArrayUse::REJECTED
+            if opcode == LLVMOpcode::LOAD:
+                return BoolArrayUse::REJECTED if LLVMGetOperand(user, 0) != pointer or LLVMGetVolatile(user) != 0 or LLVMGetOrdering(user) != 0
+                return BoolArrayUse::ACCESS if is_llvm_integer_type(LLVMTypeOf(user), 1) else BoolArrayUse::REJECTED
+            if opcode == LLVMOpcode::STORE:
+                return BoolArrayUse::REJECTED if LLVMGetOperand(user, 1) != pointer or LLVMGetVolatile(user) != 0 or LLVMGetOrdering(user) != 0
+                stored: LLVMValueRef = LLVMGetOperand(user, 0)
+                return BoolArrayUse::ACCESS if is_llvm_integer_type(LLVMTypeOf(stored), 1)
+                # A whole-array zero store, as wide as the array.
+                return BoolArrayUse::REJECTED if pointer != plan.array or LLVMIsAConstantInt(stored) == null or ElisaLLVMIsConstantZero(stored) == 0
+                return BoolArrayUse::ACCESS if is_llvm_integer_type(LLVMTypeOf(stored), (plan.length * 8).u32()) else BoolArrayUse::REJECTED
+            if ElisaLLVMIsMemSet(user) != 0:
+                return BoolArrayUse::ACCESS if is_array_zero_fill(user, pointer, plan, module) else BoolArrayUse::REJECTED
+            return BoolArrayUse::REJECTED if LLVMIsAIntrinsicInst(user) == null or pointer != plan.array or LLVMGetNumOperandBundles(user) != 0
+            identifier: u32 = LLVMGetIntrinsicID(LLVMGetCalledValue(user))
+            lifetime_start: u32 = get lifetime[0] else return BoolArrayUse::REJECTED
+            lifetime_end: u32 = get lifetime[1] else return BoolArrayUse::REJECTED
+            BoolArrayUse::ACCESS if identifier == lifetime_start or identifier == lifetime_end else BoolArrayUse::REJECTED
+
+        # The array's packing plan, walking its pointer uses depth first; null when some use
+        # is not a plain access or there is no access at all.
+        def bool_array_plan(alloca: LLVMValueRef, module: LLVMModuleRef, lifetime: darray[u32]&) -> BoolArrayPlan? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if not is_packable_bool_array(alloca, module)
+            plan: mutable BoolArrayPlan = BoolArrayPlan{array: alloca, length: LLVMGetArrayLength2(LLVMGetAllocatedType(alloca)), geps: [], accesses: []}
+            work: mutable darray[LLVMValueRef] = [alloca]
+            seen: mutable darray[LLVMValueRef] = []
+            while work.count > 0 |work, seen, plan, module, lifetime|:
+                pointer: LLVMValueRef = work[work.count - 1]
+                _ = work.pop()
+                continue if any visited in seen where visited == pointer
+                seen.push(pointer)
+                return null if ElisaLLVMIsUsedByMetadata(pointer) != 0
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(pointer)
+                while use_cursor is use |use_cursor, pointer, plan, work, module, lifetime|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    kind: u32 = bool_array_use_kind(user, pointer, &plan, module, lifetime)
+                    return null if kind == BoolArrayUse::REJECTED
+                    if kind == BoolArrayUse::GEP:
+                        plan.geps.push(user)
+                        work.push(user)
+                    else:
+                        plan.accesses.push(user)
+            return null if plan.accesses.count == 0
+            plan
+
+        # The element offset of POINTER, an index-width integer, built before each GEP the
+        # first time it is needed and remembered by pointer. Offsets wrap at the index width,
+        # as chained GEPs do; only the final offset is widened for the shift.
+        def element_offset(pointer: LLVMValueRef, pointers: mutable darray[LLVMValueRef]&, offsets: mutable darray[LLVMValueRef]&, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<pointers.count |pointers, offsets, pointer|:
+                return offsets[index] if pointers[index] == pointer
+            base: LLVMValueRef = element_offset(LLVMGetOperand(pointer, 0), pointers, offsets, builder)
+            position_builder_before(builder, pointer)
+            delta: LLVMValueRef = ElisaLLVMEmitGEPOffset(builder, pointer)
+            name_storage: mutable darray[u8] = []
+            offset: LLVMValueRef = LLVMBuildAdd(builder, base, delta, sview_to_cstr("bool.index", name_storage))
+            pointers.push(pointer)
+            offsets.push(offset)
+            offset
+
+        # Bits LOW..HIGH - 1 of the 64-bit word at WORD_INDEX of a wider mask.
+        def bit_range_word(low: u64, high: u64, word_index: u64) -> u64:
+            first: u64 = word_index * 64
+            lower: u64 = 0 if low <= first else (64 if low - first >= 64 else low - first)
+            upper: u64 = 0 if high <= first else (64 if high - first >= 64 else high - first)
+            below_upper: u64 = 18446744073709551615 if upper == 64 else (1.u64() << upper) - 1
+            below_lower: u64 = 18446744073709551615 if lower == 64 else (1.u64() << lower) - 1
+            below_upper & ~below_lower
+
+        # `~APInt::getBitsSet(width, low, high)` as a constant of the packed word's type.
+        def cleared_bits_mask(word: LLVMTypeRef, low: u64, high: u64) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            word_count: u64 = LLVMGetIntTypeWidth(word).u64() / 64
+            words: mutable darray[u64] = []
+            for index in 0..<word_count |words, low, high|:
+                words.push(~bit_range_word(low, high, index))
+            LLVMConstIntOfArbitraryPrecision(word, word_count.u32(), (&words[0]).cast[void&])
+
+        # Rewrites one access of the array against the packed word, then erases it.
+        def pack_bool_access(access: LLVMValueRef, packed_word: PackedWord&, pointers: mutable darray[LLVMValueRef]&, offsets: mutable darray[LLVMValueRef]&, builder: LLVMBuilderRef, module: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            word: LLVMTypeRef = packed_word.word
+            position_builder_before(builder, access)
+            opcode: u32 = LLVMGetInstructionOpcode(access)
+            if opcode == LLVMOpcode::LOAD:
+                bits: LLVMValueRef = LLVMBuildLoad2(builder, word, packed_word.slot, "")
+                offset: LLVMValueRef = element_offset(LLVMGetOperand(access, 0), pointers, offsets, builder)
+                position_builder_before(builder, access)
+                bit: LLVMValueRef = LLVMBuildLShr(builder, bits, LLVMBuildZExt(builder, offset, word, ""), "")
+                LLVMReplaceAllUsesWith(access, LLVMBuildTrunc(builder, bit, LLVMTypeOf(access), ""))
+            elif opcode == LLVMOpcode::STORE:
+                stored: LLVMValueRef = LLVMGetOperand(access, 0)
+                if not is_llvm_integer_type(LLVMTypeOf(stored), 1):
+                    _ = LLVMBuildStore(builder, LLVMConstInt(word, 0, 0), packed_word.slot)
+                else:
+                    offset: LLVMValueRef = element_offset(LLVMGetOperand(access, 1), pointers, offsets, builder)
+                    position_builder_before(builder, access)
+                    index: LLVMValueRef = LLVMBuildZExt(builder, offset, word, "")
+                    bits: LLVMValueRef = LLVMBuildLoad2(builder, word, packed_word.slot, "")
+                    mask: LLVMValueRef = LLVMBuildShl(builder, LLVMConstInt(word, 1, 0), index, "")
+                    cleared: LLVMValueRef = LLVMBuildAnd(builder, bits, LLVMBuildNot(builder, mask, ""), "")
+                    # A poison stored in one element must not poison the others.
+                    value: LLVMValueRef = LLVMBuildFreeze(builder, stored, "")
+                    inserted: LLVMValueRef = LLVMBuildShl(builder, LLVMBuildZExt(builder, value, word, ""), index, "")
+                    _ = LLVMBuildStore(builder, LLVMBuildOr(builder, cleared, inserted, ""), packed_word.slot)
+            elif ElisaLLVMIsMemSet(access) != 0:
+                start: mutable i64 = 0
+                _ = ElisaLLVMPointerBaseWithConstantOffset(LLVMGetOperand(access, 0), module, (&start).cast[void&])
+                count: u64 = LLVMConstIntGetZExtValue(LLVMGetOperand(access, 2))
+                bits: LLVMValueRef = LLVMBuildLoad2(builder, word, packed_word.slot, "")
+                _ = LLVMBuildStore(builder, LLVMBuildAnd(builder, bits, cleared_bits_mask(word, start.u64(), start.u64() + count), ""), packed_word.slot)
+            # Lifetime markers described an unobservable stack allocation; the word that
+            # replaces it is promoted to SSA by the cleanup.
+            LLVMInstructionEraseFromParent(access)
+
+        # Erases the GEPs left without uses, leaves first, until only used ones remain.
+        def erase_unused_geps(geps: darray[LLVMValueRef]&) -> void can[Abort.Panic, Memory.Allocate]:
+            erased: mutable darray[bool] = []
+            for _ in geps |erased|:
+                erased.push(false)
+            progress: mutable bool = true
+            while progress |progress, erased, geps|:
+                progress <- false
+                for index in 0..<geps.count |geps, erased, progress|:
+                    continue if erased[index] or LLVMGetFirstUse(geps[index]) != null
+                    LLVMInstructionEraseFromParent(geps[index])
+                    erased[index] <- true
+                    progress <- true
+
+        # Replaces the array with an 8-byte-aligned word, zeroed first: choosing zero for an
+        # undefined bit is a refinement that keeps a partial initialization from spreading
+        # undef into other elements.
+        def pack_bool_array(plan: BoolArrayPlan&, module: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            array: LLVMValueRef = plan.array
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            position_builder_before(builder, array)
+            word: LLVMTypeRef = LLVMIntTypeInContext(context, 128 if plan.length > BoolArrayLimit::WORD_ELEMENTS else 64)
+            name: mutable darray[u8] = []
+            slot: LLVMValueRef = LLVMBuildAlloca(builder, word, global_rehome_symbol(array, ".bits", name))
+            LLVMSetAlignment(slot, 8)
+            _ = LLVMBuildStore(builder, LLVMConstInt(word, 0, 0), slot)
+            packed_word: PackedWord = PackedWord{slot: slot, word: word}
+            pointers: mutable darray[LLVMValueRef] = [array]
+            offsets: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt64TypeInContext(context), 0, 0)]
+            for access in plan.accesses |packed_word, pointers, offsets, builder, module|:
+                pack_bool_access(access, &packed_word, &pointers, &offsets, builder, module)
+            LLVMDisposeBuilder(builder)
+            erase_unused_geps(&plan.geps)
+            LLVMInstructionEraseFromParent(array) if LLVMGetFirstUse(array) == null
+
+        def pack_function_bool_arrays(function: LLVMValueRef, module: LLVMModuleRef, lifetime: darray[u32]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arrays: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while cursor is instruction |cursor, arrays|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                arrays.push(instruction) if LLVMIsAAllocaInst(instruction) != null
+            changed: mutable bool = false
+            for alloca in arrays |module, lifetime, changed|:
+                if bool_array_plan(alloca, module, lifetime) is plan:
+                    pack_bool_array(&plan, module)
+                    changed <- true
+            changed
+
+    public:
+        # 1 when some array was packed (then cleaned up), FAILED when the cleanup pipeline
+        # was rejected, else 0.
+        def pack_private_bool_arrays(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_debug_info(module) or ElisaLLVMModuleTargetArchIsAArch64(module) == 0
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            return 0 if LLVMPointerSize(layout) != 8 or ElisaLLVMDataLayoutIndexSizeInBits(module, 0) != 64 or LLVMByteOrder(layout) != LLVMByteOrdering::LITTLE_ENDIAN
+            start_storage: mutable darray[u8] = []
+            end_storage: mutable darray[u8] = []
+            lifetime: darray[u32] = [LLVMLookupIntrinsicID(sview_to_cstr("llvm.lifetime.start", start_storage), 19), LLVMLookupIntrinsicID(sview_to_cstr("llvm.lifetime.end", end_storage), 17)]
+            changed: mutable bool = false
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, module, lifetime, changed|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function) or llvm_function_subprogram_or_null(function) != null
+                changed <- true if pack_function_bool_arrays(function, module, &lifetime)
+            return 0 if not changed
+            return BoolArrayLimit::FAILED if not run_module_pipeline(module, target, BoolArrayLimit::CLEANUP)
+            1

@@ -1,0 +1,186 @@
+# Folds a loop that assembles `left ^ right` bit by bit. While both operands are nonzero
+# it adds `place` to `saved` when the low bits differ (the low bit of `left + right`),
+# shifts both right and doubles `place`; the exit then appends the rest of the operands,
+# `saved + place * (left_rest + right_rest)`, where at most one of them is still nonzero.
+# The whole computation is `left ^ right` of the initial operands.
+include "../../ir/scalar_loop_patterns.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module ShiftXorLimit:
+    FUNCTION_BLOCKS: u32 = 16
+    LOOP_INSTRUCTIONS: u32 = 15
+    EXIT_INSTRUCTIONS: u32 = 8
+
+# The exit: `sum = saved + place * rest`, `rest = left_rest + right_rest`, over four
+# tail phis.
+struct ShiftXorExit:
+    sum: LLVMValueRef
+    scaled: LLVMValueRef
+    rest: LLVMValueRef
+    saved: LLVMValueRef
+    place: LLVMValueRef
+    left_tail: LLVMValueRef
+    right_tail: LLVMValueRef
+
+# The loop's operand phis and the branches guarding entry and continuation.
+struct ShiftXorLoop:
+    loop: LLVMBasicBlockRef
+    preheader: LLVMBasicBlockRef
+    exit: LLVMBasicBlockRef
+    back: LLVMValueRef
+    entry_branch: LLVMValueRef
+    left: LLVMValueRef
+    right: LLVMValueRef
+
+extend Backend:
+    private:
+        # `operand != 0`.
+        def is_nonzero_test(value: LLVMValueRef, operand: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::ICMP) and LLVMGetICmpPredicate(value) == LLVMIntPredicate::NE and LLVMGetOperand(value, 0) == operand and is_constant_integer(LLVMGetOperand(value, 1), 0)
+
+        # `left != 0 && right != 0`, as a select or an `and`, in either order.
+        def is_both_nonzero_test(value: LLVMValueRef, left: LLVMValueRef, right: LLVMValueRef) -> bool:
+            is_select: bool = is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT) and is_constant_integer(LLVMGetOperand(value, 2), 0)
+            return false if not is_select and not is_llvm_instruction_with_opcode(value, LLVMOpcode::AND)
+            first: LLVMValueRef = LLVMGetOperand(value, 0)
+            second: LLVMValueRef = LLVMGetOperand(value, 1)
+            (is_nonzero_test(first, left) and is_nonzero_test(second, right)) or (is_nonzero_test(first, right) and is_nonzero_test(second, left))
+
+        # A two-entry phi of EXIT whose one use is the computation.
+        def shift_xor_tail_phi(value: LLVMValueRef, exit: LLVMBasicBlockRef) -> LLVMValueRef?:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI) or LLVMGetInstructionParent(value) != exit
+            return null if LLVMCountIncoming(value) != 2 or not has_one_use(value)
+            value
+
+        # The tail phi among BINARY's operands, the first one tried first.
+        def tail_phi_operand(binary: LLVMValueRef, exit: LLVMBasicBlockRef) -> LLVMValueRef?:
+            if shift_xor_tail_phi(LLVMGetOperand(binary, 0), exit) is first:
+                return first
+            shift_xor_tail_phi(LLVMGetOperand(binary, 1), exit)
+
+        # BINARY's operand other than KNOWN.
+        def other_operand(binary: LLVMValueRef, known: LLVMValueRef) -> LLVMValueRef:
+            LLVMGetOperand(binary, 1 if LLVMGetOperand(binary, 0) == known else 0)
+
+        # The loop phi CURRENT carrying NEXT around, entered with TAIL_PHI's entry value.
+        def shift_xor_input_phi(tail_phi: LLVMValueRef, next: LLVMValueRef, current: LLVMValueRef, loop: LLVMBasicBlockRef, preheader: LLVMBasicBlockRef) -> LLVMValueRef?:
+            return null if not is_llvm_instruction_with_opcode(current, LLVMOpcode::PHI) or LLVMGetInstructionParent(current) != loop or LLVMCountIncoming(current) != 2
+            return null if not is_optional_value(phi_incoming_for_block(current, loop), next)
+            return null if not same_optional_value(phi_incoming_for_block(current, preheader), phi_incoming_for_block(tail_phi, preheader))
+            current
+
+        # The loop phi TAIL_PHI's loop value shifts by one with OPCODE.
+        def shift_xor_shift_phi(tail_phi: LLVMValueRef, opcode: u32, loop: LLVMBasicBlockRef, preheader: LLVMBasicBlockRef) -> LLVMValueRef?:
+            shift: LLVMValueRef = get block_binary_operator(phi_incoming_for_block(tail_phi, loop), opcode, loop) else return null
+            return null if not is_constant_integer(LLVMGetOperand(shift, 1), 1)
+            shift_xor_input_phi(tail_phi, shift, LLVMGetOperand(shift, 0), loop, preheader)
+
+        def match_shift_xor_exit(exit: LLVMBasicBlockRef) -> ShiftXorExit?:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(exit) else return null
+            sum: LLVMValueRef = get block_binary_operator(LLVMGetPreviousInstruction(terminator), LLVMOpcode::ADD, exit) else return null
+            return null if not is_llvm_integer_type(LLVMTypeOf(sum), 0) or is_llvm_integer_type(LLVMTypeOf(sum), 1)
+            saved: LLVMValueRef = get tail_phi_operand(sum, exit) else return null
+            scaled: LLVMValueRef = get block_binary_operator(other_operand(sum, saved), LLVMOpcode::MUL, exit) else return null
+            return null if not has_one_use(scaled)
+            place: LLVMValueRef = get tail_phi_operand(scaled, exit) else return null
+            rest: LLVMValueRef = get block_binary_operator(other_operand(scaled, place), LLVMOpcode::ADD, exit) else return null
+            return null if not has_one_use(rest)
+            left_tail: LLVMValueRef = get shift_xor_tail_phi(LLVMGetOperand(rest, 0), exit) else return null
+            right_tail: LLVMValueRef = get shift_xor_tail_phi(LLVMGetOperand(rest, 1), exit) else return null
+            ShiftXorExit{sum: sum, scaled: scaled, rest: rest, saved: saved, place: place, left_tail: left_tail, right_tail: right_tail}
+
+        def match_shift_xor_loop(loop: LLVMBasicBlockRef) -> ShiftXorLoop?:
+            back: LLVMValueRef = get conditional_terminator(loop) else return null
+            return null if LLVMGetSuccessor(back, 0) != loop or ElisaLLVMHasMetadataOtherThanDebugLoc(back) != 0 or ElisaLLVMBlockHasAddressTaken(loop) != 0
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(back, 1)
+            return null if instruction_count(exit) != ShiftXorLimit::EXIT_INSTRUCTIONS or exit == loop
+            first: LLVMValueRef = get LLVMGetFirstInstruction(loop) else return null
+            return null if not is_llvm_instruction_with_opcode(first, LLVMOpcode::PHI) or LLVMCountIncoming(first) != 2
+            preheader: LLVMBasicBlockRef = LLVMGetIncomingBlock(first, 1 if LLVMGetIncomingBlock(first, 0) == loop else 0)
+            entry_branch: LLVMValueRef = get conditional_terminator(preheader) else return null
+            return null if preheader == loop or preheader == exit or LLVMGetSuccessor(entry_branch, 0) != loop or LLVMGetSuccessor(entry_branch, 1) != exit
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(entry_branch) != 0 or not has_one_use(LLVMGetCondition(entry_branch))
+            ShiftXorLoop{loop: loop, preheader: preheader, exit: exit, back: back, entry_branch: entry_branch, left: first, right: first}
+
+        # The loop body: shifted operand phis, a doubling place, and `saved += select(low
+        # bit of left + right, place, 0)`; the operands of the loop and its entry are both
+        # tested nonzero. Fills in the operand phis.
+        def match_shift_xor_body(shape: ShiftXorLoop&, tails: ShiftXorExit&) -> ShiftXorLoop?:
+            loop: LLVMBasicBlockRef = shape.loop
+            preheader: LLVMBasicBlockRef = shape.preheader
+            return null if not is_optional_constant_integer(phi_incoming_for_block(tails.saved, preheader), 0) or not is_optional_constant_integer(phi_incoming_for_block(tails.place, preheader), 1)
+            left: LLVMValueRef = get shift_xor_shift_phi(tails.left_tail, LLVMOpcode::LSHR, loop, preheader) else return null
+            right: LLVMValueRef = get shift_xor_shift_phi(tails.right_tail, LLVMOpcode::LSHR, loop, preheader) else return null
+            bit: LLVMValueRef = get shift_xor_shift_phi(tails.place, LLVMOpcode::SHL, loop, preheader) else return null
+            return null if left == right
+            accumulate: LLVMValueRef = get block_binary_operator(phi_incoming_for_block(tails.saved, loop), LLVMOpcode::ADD, loop) else return null
+            select_first: bool = is_llvm_instruction_with_opcode(LLVMGetOperand(accumulate, 0), LLVMOpcode::SELECT)
+            return null if not select_first and not is_llvm_instruction_with_opcode(LLVMGetOperand(accumulate, 1), LLVMOpcode::SELECT)
+            select: LLVMValueRef = LLVMGetOperand(accumulate, 0 if select_first else 1)
+            _ = get shift_xor_input_phi(tails.saved, accumulate, other_operand(accumulate, select), loop, preheader) else return null
+            return null if LLVMGetInstructionParent(select) != loop or LLVMGetOperand(select, 1) != bit or not is_constant_integer(LLVMGetOperand(select, 2), 0)
+            low_bit: LLVMValueRef = LLVMGetOperand(select, 0)
+            return null if not is_llvm_instruction_with_opcode(low_bit, LLVMOpcode::TRUNC)
+            combine: LLVMValueRef = get block_binary_operator(LLVMGetOperand(low_bit, 0), LLVMOpcode::ADD, loop) else return null
+            return null if LLVMGetInstructionParent(low_bit) != loop or not is_llvm_integer_type(LLVMTypeOf(low_bit), 1) or not has_operand_pair(combine, left, right)
+            initial_left: LLVMValueRef = get phi_incoming_for_block(left, preheader) else return null
+            initial_right: LLVMValueRef = get phi_incoming_for_block(right, preheader) else return null
+            return null if not is_both_nonzero_test(LLVMGetCondition(shape.entry_branch), initial_left, initial_right)
+            next_left: LLVMValueRef = get phi_incoming_for_block(left, loop) else return null
+            next_right: LLVMValueRef = get phi_incoming_for_block(right, loop) else return null
+            return null if not is_both_nonzero_test(LLVMGetCondition(shape.back), next_left, next_right)
+            ShiftXorLoop{loop: loop, preheader: preheader, exit: shape.exit, back: shape.back, entry_branch: shape.entry_branch, left: left, right: right}
+
+        # Every loop value is used only in the loop or by the four tail phis.
+        def is_closed_shift_xor_loop(loop: LLVMBasicBlockRef, tails: ShiftXorExit&) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(loop)
+            while cursor is instruction |cursor, loop, tails|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(instruction)
+                while use_cursor is use |use_cursor, loop, tails|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    return false if LLVMIsAInstruction(user) == null
+                    continue if LLVMGetInstructionParent(user) == loop
+                    return false if user != tails.left_tail and user != tails.right_tail and user != tails.saved and user != tails.place
+            true
+
+        def fold_shift_xor_loop(block: LLVMBasicBlockRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            shape: ShiftXorLoop = get match_shift_xor_loop(block) else return false
+            tails: ShiftXorExit = get match_shift_xor_exit(shape.exit) else return false
+            loop: ShiftXorLoop = get match_shift_xor_body(shape, tails) else return false
+            return false if not is_closed_shift_xor_loop(loop.loop, tails)
+            initial_left: LLVMValueRef = get phi_incoming_for_block(loop.left, loop.preheader) else return false
+            initial_right: LLVMValueRef = get phi_incoming_for_block(loop.right, loop.preheader) else return false
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            position_builder_before(builder, tails.sum)
+            left: LLVMValueRef = LLVMBuildFreeze(builder, initial_left, "")
+            right: LLVMValueRef = LLVMBuildFreeze(builder, initial_right, "")
+            name_storage: mutable darray[u8] = []
+            LLVMReplaceAllUsesWith(tails.sum, LLVMBuildXor(builder, left, right, sview_to_cstr("shift.xor", name_storage)))
+            LLVMInstructionEraseFromParent(tails.sum)
+            LLVMInstructionEraseFromParent(tails.scaled)
+            LLVMInstructionEraseFromParent(tails.rest)
+            position_builder_before(builder, loop.entry_branch)
+            _ = LLVMBuildBr(builder, loop.exit)
+            LLVMDisposeBuilder(builder)
+            LLVMInstructionEraseFromParent(loop.entry_branch)
+            dead: mutable darray[LLVMBasicBlockRef] = [loop.loop]
+            ElisaLLVMDeleteDeadBlocks((&dead[0]).cast[void&], 1)
+            true
+
+    public:
+        # The shift-xor loops folded on AArch64.
+        def fold_shift_xor_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if function_block_count(function) > ShiftXorLimit::FUNCTION_BLOCKS or skipped_by_loop_pass_policy(function, module)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, module|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    if instruction_count(block) == ShiftXorLimit::LOOP_INSTRUCTIONS and fold_shift_xor_loop(block, module):
+                        changed <- changed + 1
+            changed

@@ -17,13 +17,14 @@ sources=(
   "$backend/llvm_reverse_byte_fold.cpp"
   "$backend/llvm_constant_paths.cpp"
   "$backend/llvm_memory_and_call_passes.cpp"
-  "$backend/llvm_small_zero.cpp"
   "$backend/llvm_numeric_passes.cpp"
   "$backend/llvm_bounded_remainder.cpp"
   "$backend/llvm_signed_range_masks.cpp"
   "$backend/llvm_c_api/elisa_llvm_analysis.cpp"
   "$backend/llvm_c_api/elisa_llvm_ir_edits.cpp"
+  "$backend/llvm_c_api/elisa_llvm_loop_transforms.cpp"
   "$backend/llvm_c_api/elisa_llvm_constant_range.cpp"
+  "$backend/llvm_c_api/elisa_llvm_pass_pipelines.cpp"
 )
 export LC_ALL=C
 toolchain_inputs="$(

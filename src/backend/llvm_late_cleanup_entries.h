@@ -32,20 +32,6 @@ extern "C" unsigned elisacoreOptimizeOrderedConversionsEntry(LLVMModuleRef Modul
   return elisacoreOptimizeOrderedConversions(Module, Target);
 }
 
-// Writes the functions whose checked-counter exits were removed (the
-// reductions they may expose need the vectorizer again) to Functions.
-extern "C" unsigned elisacoreFoldGuardedCounters(LLVMModuleRef Module, LLVMValueRef *Functions,
-                                                 unsigned Capacity, unsigned *FunctionCount) {
-  SmallVector<Function *, 8> Vectorizable;
-  unsigned Changed = foldGuardedCounters(*unwrap(Module), Vectorizable);
-  // Kept in the pass's own order, repeats included, as the C++ loop ran.
-  unsigned Count = 0;
-  for (Function *F : Vectorizable)
-    if (Count < Capacity) Functions[Count++] = wrap(F);
-  *FunctionCount = Count;
-  return Changed;
-}
-
 ELISA_MODULE_PASS_ENTRY(elisacoreEliminateCopiedScratch, ElisaCopiedScratch::eliminate)
 ELISA_MODULE_PASS_ENTRY(elisacoreEliminateFullArrayInitializers,
                         ElisaCopiedScratch::eliminateFullArrayInitializers)
@@ -58,12 +44,8 @@ ELISA_MODULE_PASS_ENTRY(elisacoreRemoveIndexedPrefixFillsOnly,
 ELISA_MODULE_PASS_ENTRY(elisacoreShrinkViewFills, ElisaViewBounds::shrinkViewFills)
 ELISA_MODULE_PASS_ENTRY(elisacoreRemoveProvenChecksEntry, ElisaProvenChecks::removeProvenChecks)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldBoundedTripChecks, ElisaBoundedTripRanges::foldBoundedTripChecks)
-ELISA_MODULE_PASS_ENTRY(elisacoreFoldShiftBitReverseLoopsEntry, elisacoreFoldShiftBitReverseLoops)
-ELISA_MODULE_PASS_ENTRY(elisacoreFoldRangeAndLoopsEntry, elisacoreFoldRangeAndLoops)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldScalarLoopIdiomsEntry, elisacoreFoldScalarLoopIdioms)
-ELISA_MODULE_PASS_ENTRY(elisacoreFoldShiftXorLoopsEntry, elisacoreFoldShiftXorLoops)
 ELISA_MODULE_PASS_ENTRY(elisacoreReuseEdgeDivisionsEntry, elisacoreReuseEdgeDivisions)
-ELISA_MODULE_PASS_ENTRY(elisacoreSplitRemainderRecurrencesEntry, elisacoreSplitRemainderRecurrences)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldConstantIntegerPathsEntry, elisacoreFoldConstantIntegerPaths)
 ELISA_TARGET_PASS_ENTRY(elisacoreInlineStackViewHelpersEntry, elisacoreInlineStackViewHelpers)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldReverseByteReductionsEntry, elisacoreFoldReverseByteReductions)

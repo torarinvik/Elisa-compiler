@@ -1,0 +1,74 @@
+# Preserves the original vector when each halfword is stored low byte first. A store of
+# `trunc(shuffle(x, x >> 8, <0, n, 1, n+1, ...>))` -- each 16-bit lane's low byte, then its
+# high byte -- writes exactly the little-endian bytes of `x`, so it stores `bitcast x` to
+# the byte vector instead. Depending on the vector width, LLVM truncates before or after
+# interleaving, so both orders match.
+include "../../ir/ir_editing.elisa"
+
+extend Backend:
+    private:
+        # The lane count of a fixed-width vector type, or 0 for any other type.
+        def fixed_vector_lanes(type: LLVMTypeRef) -> u32:
+            return 0 if LLVMGetTypeKind(type) != LLVMTypeKindValue::VECTOR
+            LLVMGetVectorSize(type)
+
+        def is_fixed_vector_of_integers(type: LLVMTypeRef, width: u32) -> bool:
+            fixed_vector_lanes(type) != 0 and is_llvm_integer_type(LLVMGetElementType(type), width)
+
+        # `high` is `low >> 8`.
+        def is_byte_shift(high: LLVMValueRef, low: LLVMValueRef) -> bool can[Abort.Panic]:
+            is_llvm_instruction_with_opcode(high, LLVMOpcode::LSHR) and LLVMGetOperand(high, 0) == low and ElisaLLVMIsSpecificInt(LLVMGetOperand(high, 1), 8) != 0
+
+        # StoreInst::isSimple: neither atomic nor volatile.
+        def is_simple_store(instruction: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(instruction, LLVMOpcode::STORE) and LLVMIsAtomic(instruction) == 0 and LLVMGetVolatile(instruction) == 0
+
+        # The halfword vector whose interleaved low and high bytes `bytes` holds.
+        def interleaved_halfwords(bytes: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic]:
+            truncated: bool = is_llvm_instruction_with_opcode(bytes, LLVMOpcode::TRUNC)
+            shuffle: LLVMValueRef = LLVMGetOperand(bytes, 0) if truncated else bytes
+            return null if not is_llvm_instruction_with_opcode(shuffle, LLVMOpcode::SHUFFLE_VECTOR)
+            lanes: u32 = fixed_vector_lanes(LLVMTypeOf(LLVMGetOperand(shuffle, 0)))
+            return null if lanes == 0 or not is_fixed_vector_of_integers(LLVMTypeOf(bytes), 8) or fixed_vector_lanes(LLVMTypeOf(bytes)) != 2 * lanes
+            for lane in 0..<lanes |shuffle, lanes|:
+                return null if LLVMGetMaskValue(shuffle, 2 * lane) != lane.i32() or LLVMGetMaskValue(shuffle, 2 * lane + 1) != (lanes + lane).i32()
+            low: mutable LLVMValueRef = LLVMGetOperand(shuffle, 0)
+            high: mutable LLVMValueRef = LLVMGetOperand(shuffle, 1)
+            if not truncated:
+                return null if not is_llvm_instruction_with_opcode(low, LLVMOpcode::TRUNC) or not is_llvm_instruction_with_opcode(high, LLVMOpcode::TRUNC)
+                low <- LLVMGetOperand(low, 0)
+                high <- LLVMGetOperand(high, 0)
+            return null if not is_fixed_vector_of_integers(LLVMTypeOf(low), 16) or not is_byte_shift(high, low)
+            low
+
+        # Rewrites the interleaving stores of one block; the store itself, with its
+        # alignment, metadata and address, is kept.
+        def fold_interleaved_byte_stores_in(block: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            changed: mutable u32 = 0
+            instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while instruction_cursor is instruction |instruction_cursor, changed, builder|:
+                instruction_cursor <- LLVMGetNextInstruction(instruction)
+                continue if not is_simple_store(instruction)
+                bytes: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                if interleaved_halfwords(bytes) is halfwords:
+                    position_builder_before(builder, instruction)
+                    LLVMSetOperand(instruction, 0, LLVMBuildBitCast(builder, halfwords, LLVMTypeOf(bytes), ""))
+                    ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(bytes)
+                    changed <- changed + 1
+            changed
+
+    public:
+        # The interleaved halfword stores rewritten, on a little-endian target.
+        def fold_interleaved_byte_stores(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if LLVMGetDataLayoutStr(module).len == 0 or LLVMByteOrder(LLVMGetModuleDataLayout(module)) != 1
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, builder, changed|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    changed <- changed + fold_interleaved_byte_stores_in(block, builder)
+            LLVMDisposeBuilder(builder)
+            changed

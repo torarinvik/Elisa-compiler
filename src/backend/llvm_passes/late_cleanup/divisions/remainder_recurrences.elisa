@@ -1,0 +1,322 @@
+# Two remainder rewrites on AArch64.
+#
+# A Euclid loop `while (r = x % y) != 0` entered past a `y == 0` guard is split: two
+# unsigned remainder steps first establish x > y > 0, after which `x - y` is the
+# remainder whenever it is smaller than y, so the loop divides only otherwise.
+#
+# A 64-bit remainder by a value invariant in an innermost nested loop, of a dividend
+# LazyValueInfo bounds by 65535, becomes a multiply by a reciprocal hoisted to the
+# preheader: Magic = ceil(Unit / D) with Unit = Limit^2 and Limit the power of two
+# above the bound, so `N - ((N * Magic) >> 2 bits) * D` is N mod D for every N < Limit.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../ir/llvm_c_extra.elisa"
+include "../../../llvm_c_api/elisa_llvm_constant_range.elisa"
+
+const module RemainderRecurrenceLimit:
+    LOOP_INSTRUCTIONS: u32 = 5
+    EXIT_INSTRUCTIONS: u32 = 2
+    MAXIMUM_DIVIDEND: u64 = 65535
+    MINIMUM_BLOCKS: u32 = 5
+    MAXIMUM_BLOCKS: u32 = 32
+    MAXIMUM_INSTRUCTIONS: u32 = 384
+    MAXIMUM_CANDIDATES: usize = 4
+
+# The Euclid loop: `entry` branches on `entry_test` to `exit` or `loop_block`, whose
+# phis `dividend` and `divisor` start at the initial values and rotate through
+# `old_remainder` until it is zero.
+struct RemainderRecurrence:
+    entry: LLVMBasicBlockRef
+    guard_branch: LLVMValueRef
+    entry_test: LLVMValueRef
+    loop_block: LLVMBasicBlockRef
+    back_branch: LLVMValueRef
+    exit: LLVMBasicBlockRef
+    old_remainder: LLVMValueRef
+    dividend: LLVMValueRef
+    divisor: LLVMValueRef
+    initial_dividend: LLVMValueRef
+    initial_divisor: LLVMValueRef
+
+# The blocks the split adds: two leading remainder steps, then the slow division and the
+# new latch of the loop.
+struct RemainderSplitBlocks:
+    first: LLVMBasicBlockRef
+    second: LLVMBasicBlockRef
+    slow: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        # `icmp eq REMAINDER, 0` with one use.
+        def is_remainder_zero_test(value: LLVMValueRef, remainder: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::ICMP) or not is_constant_integer(LLVMGetOperand(value, 1), 0)
+            LLVMGetICmpPredicate(value) == LLVMIntPredicate::EQ and LLVMGetOperand(value, 0) == remainder and has_one_use(value)
+
+        # The `DIVISOR == 0` test the guard branches on, directly or as the second operand of
+        # a single-use short-circuit `select c, true, test`, whose false value proves it too.
+        def remainder_divisor_guard(guard_branch: LLVMValueRef, divisor: LLVMValueRef) -> LLVMValueRef?:
+            condition: mutable LLVMValueRef = LLVMGetCondition(guard_branch)
+            if is_llvm_instruction_with_opcode(condition, LLVMOpcode::SELECT):
+                return null if not has_one_use(condition) or not is_constant_integer(LLVMGetOperand(condition, 1), 1)
+                condition <- LLVMGetOperand(condition, 2)
+            return null if not is_remainder_zero_test(condition, divisor)
+            condition
+
+        # The two loop phis: `dividend` takes `divisor` round the loop and `divisor` takes the
+        # remainder, each with exactly one entry edge.
+        def has_rotating_phis(dividend: LLVMValueRef, divisor: LLVMValueRef, loop_block: LLVMBasicBlockRef, old_remainder: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(dividend, LLVMOpcode::PHI) or not is_llvm_instruction_with_opcode(divisor, LLVMOpcode::PHI)
+            return false if dividend == divisor or LLVMGetInstructionParent(dividend) != loop_block or LLVMGetInstructionParent(divisor) != loop_block
+            return false if not has_one_use(dividend) or LLVMCountIncoming(dividend) != 2 or LLVMCountIncoming(divisor) != 2
+            optional_equals(phi_incoming_for_block(dividend, loop_block), divisor) and optional_equals(phi_incoming_for_block(divisor, loop_block), old_remainder)
+
+        # The loop block's 5 instructions: the rotating phis, `urem i64`, its zero test and
+        # the back branch, which exits on a zero remainder.
+        def remainder_recurrence(function: LLVMValueRef) -> RemainderRecurrence? can[Abort.Panic]:
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            guard_branch: LLVMValueRef = get conditional_terminator(entry) else return null
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(guard_branch) != 0
+            loop_block: LLVMBasicBlockRef = LLVMGetSuccessor(guard_branch, 1)
+            back_branch: LLVMValueRef = get conditional_terminator(loop_block) else return null
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(back_branch, 0)
+            return null if exit == loop_block or exit == entry or loop_block == entry or instruction_count(loop_block) != RemainderRecurrenceLimit::LOOP_INSTRUCTIONS
+            return null if LLVMGetSuccessor(back_branch, 1) != loop_block or ElisaLLVMHasMetadataOtherThanDebugLoc(back_branch) != 0
+            return null if ElisaLLVMBlockHasAddressTaken(loop_block) != 0 or ElisaLLVMBlockHasAddressTaken(exit) != 0
+            old_remainder: LLVMValueRef = first_non_phi(loop_block)
+            return null if not is_llvm_instruction_with_opcode(old_remainder, LLVMOpcode::UREM) or not is_llvm_integer_type(LLVMTypeOf(old_remainder), 64)
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(old_remainder) != 0 or not is_remainder_zero_test(LLVMGetCondition(back_branch), old_remainder) or use_count(old_remainder) != 2
+            dividend: LLVMValueRef = LLVMGetOperand(old_remainder, 0)
+            divisor: LLVMValueRef = LLVMGetOperand(old_remainder, 1)
+            return null if not has_rotating_phis(dividend, divisor, loop_block, old_remainder)
+            initial_dividend: LLVMValueRef = get phi_incoming_for_block(dividend, entry) else return null
+            initial_divisor: LLVMValueRef = get phi_incoming_for_block(divisor, entry) else return null
+            entry_test: LLVMValueRef = get remainder_divisor_guard(guard_branch, initial_divisor) else return null
+            RemainderRecurrence{entry: entry, guard_branch: guard_branch, entry_test: entry_test, loop_block: loop_block, back_branch: back_branch, exit: exit, old_remainder: old_remainder, dividend: dividend, divisor: divisor, initial_dividend: initial_dividend, initial_divisor: initial_divisor}
+
+        # When the guard skips straight to the exit, the exit's `phi [initial dividend,
+        # entry], [divisor, loop]` returned at once.
+        def returned_remainder_result(recurrence: RemainderRecurrence&) -> LLVMValueRef?:
+            exit: LLVMBasicBlockRef = recurrence.exit
+            return null if instruction_count(exit) != RemainderRecurrenceLimit::EXIT_INSTRUCTIONS or use_count(recurrence.divisor) != 3
+            return_instruction: LLVMValueRef = get LLVMGetBasicBlockTerminator(exit) else return null
+            result: LLVMValueRef = get LLVMGetFirstInstruction(exit) else return null
+            return null if not is_llvm_instruction_with_opcode(return_instruction, LLVMOpcode::RET) or not is_llvm_instruction_with_opcode(result, LLVMOpcode::PHI)
+            return null if LLVMGetNumOperands(return_instruction) != 1 or LLVMGetOperand(return_instruction, 0) != result or LLVMCountIncoming(result) != 2
+            return null if not optional_equals(phi_incoming_for_block(result, recurrence.loop_block), recurrence.divisor)
+            return null if not optional_equals(phi_incoming_for_block(result, recurrence.entry), recurrence.initial_dividend)
+            result
+
+        # The phi receiving the loop's result. An inlined loop's exit, reached only from the
+        # loop, gets a new one, so the computation that follows keeps its value.
+        def remainder_result(recurrence: RemainderRecurrence&, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return returned_remainder_result(recurrence) if LLVMGetSuccessor(recurrence.guard_branch, 0) == recurrence.exit
+            return null if not same_optional_block(single_predecessor(recurrence.exit), recurrence.loop_block)
+            exit_front: LLVMValueRef = get LLVMGetFirstInstruction(recurrence.exit) else return null
+            return null if is_llvm_instruction_with_opcode(exit_front, LLVMOpcode::PHI)
+            # PHINode::Create carries no debug location.
+            LLVMPositionBuilderBefore(builder, exit_front)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            name_storage: mutable darray[u8] = []
+            result: LLVMValueRef = LLVMBuildPhi(builder, LLVMTypeOf(recurrence.divisor), sview_to_cstr("remainder.result", name_storage))
+            replace_uses_outside_block(recurrence.divisor, result, recurrence.loop_block)
+            add_phi_incoming(result, recurrence.divisor, recurrence.loop_block)
+            result
+
+        def remainder_split_blocks(recurrence: RemainderRecurrence&, context: LLVMContextRef) -> RemainderSplitBlocks can[Abort.Panic, Memory.Allocate]:
+            first_name: mutable darray[u8] = []
+            second_name: mutable darray[u8] = []
+            slow_name: mutable darray[u8] = []
+            latch_name: mutable darray[u8] = []
+            first: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, recurrence.loop_block, sview_to_cstr("remainder.first", first_name))
+            second: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, recurrence.loop_block, sview_to_cstr("remainder.second", second_name))
+            slow: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, recurrence.exit, sview_to_cstr("remainder.divide", slow_name))
+            latch: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, recurrence.exit, sview_to_cstr("remainder.next", latch_name))
+            RemainderSplitBlocks{first: first, second: second, slow: slow, latch: latch}
+
+        # Moves the phi's entry edge to `second` and its loop edge to `latch`.
+        def reroute_remainder_phi(phi: LLVMValueRef, recurrence: RemainderRecurrence&, blocks: RemainderSplitBlocks&) -> void:
+            ElisaLLVMSetIncomingBlock(phi, phi_incoming_index(phi, recurrence.entry).u32(), blocks.second)
+            ElisaLLVMSetIncomingBlock(phi, phi_incoming_index(phi, recurrence.loop_block).u32(), blocks.latch)
+
+        # Rewrites the matched loop. The new instructions carry the entry test's debug
+        # location, as an IRBuilder positioned there keeps it across blocks.
+        def split_remainder_recurrence(recurrence: RemainderRecurrence&, result: LLVMValueRef, builder: LLVMBuilderRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: RemainderSplitBlocks = remainder_split_blocks(recurrence, context)
+            words: LLVMTypeRef = LLVMInt64TypeInContext(context)
+            zero: LLVMValueRef = LLVMConstInt(words, 0, 0)
+            position_builder_before(builder, recurrence.entry_test)
+            # The zero check and the first division share one frozen divisor.
+            divisor: LLVMValueRef = LLVMBuildFreeze(builder, recurrence.initial_divisor, "")
+            LLVMSetOperand(recurrence.entry_test, 0, divisor)
+            LLVMSetSuccessor(recurrence.guard_branch, 1, blocks.first)
+            LLVMPositionBuilderAtEnd(builder, blocks.first)
+            first_remainder: LLVMValueRef = LLVMBuildURem(builder, LLVMBuildFreeze(builder, recurrence.initial_dividend, ""), divisor, "")
+            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, LLVMIntPredicate::EQ, first_remainder, zero, ""), recurrence.exit, blocks.second)
+            LLVMPositionBuilderAtEnd(builder, blocks.second)
+            second_remainder: LLVMValueRef = LLVMBuildURem(builder, divisor, first_remainder, "")
+            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, LLVMIntPredicate::EQ, second_remainder, zero, ""), recurrence.exit, recurrence.loop_block)
+            old_test: LLVMValueRef = LLVMGetCondition(recurrence.back_branch)
+            LLVMInstructionEraseFromParent(recurrence.back_branch)
+            LLVMInstructionEraseFromParent(old_test)
+            LLVMPositionBuilderAtEnd(builder, recurrence.loop_block)
+            difference: LLVMValueRef = LLVMBuildSub(builder, recurrence.dividend, recurrence.divisor, "")
+            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, LLVMIntPredicate::ULT, difference, recurrence.divisor, ""), blocks.latch, blocks.slow)
+            LLVMPositionBuilderAtEnd(builder, blocks.slow)
+            full_remainder: LLVMValueRef = LLVMBuildURem(builder, recurrence.dividend, recurrence.divisor, "")
+            _ = LLVMBuildBr(builder, blocks.latch)
+            LLVMPositionBuilderAtEnd(builder, blocks.latch)
+            remainder: LLVMValueRef = LLVMBuildPhi(builder, words, "")
+            add_phi_incoming(remainder, difference, recurrence.loop_block)
+            add_phi_incoming(remainder, full_remainder, blocks.slow)
+            _ = LLVMBuildCondBr(builder, LLVMBuildICmp(builder, LLVMIntPredicate::EQ, remainder, zero, ""), recurrence.exit, recurrence.loop_block)
+            set_phi_incoming_for_block(recurrence.dividend, recurrence.entry, first_remainder)
+            set_phi_incoming_for_block(recurrence.divisor, recurrence.entry, second_remainder)
+            set_phi_incoming_for_block(recurrence.divisor, recurrence.loop_block, remainder)
+            reroute_remainder_phi(recurrence.dividend, recurrence, &blocks)
+            reroute_remainder_phi(recurrence.divisor, recurrence, &blocks)
+            ElisaLLVMSetIncomingBlock(result, phi_incoming_index(result, recurrence.loop_block).u32(), blocks.latch)
+            add_phi_incoming(result, divisor, blocks.first)
+            add_phi_incoming(result, first_remainder, blocks.second)
+            LLVMInstructionEraseFromParent(recurrence.old_remainder)
+
+        def split_function_remainder_recurrence(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            recurrence: RemainderRecurrence = get remainder_recurrence(function) else return false
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            if remainder_result(&recurrence, builder) is result:
+                split_remainder_recurrence(&recurrence, result, builder, context)
+                LLVMDisposeBuilder(builder)
+                return true
+            LLVMDisposeBuilder(builder)
+            false
+
+        # LazyValueInfo's unsigned maximum of VALUE at CONTEXT; null for an empty range.
+        def lazy_unsigned_maximum(analyses: ElisaFunctionAnalysesRef, value: LLVMValueRef, context: LLVMValueRef) -> u64?:
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, value, context, 0)
+            empty: bool = ElisaLLVMConstantRangeIsEmpty(range) != 0
+            maximum: u64 = ElisaLLVMConstantRangeUnsignedMax(range)
+            ElisaLLVMDisposeConstantRange(range)
+            return null if empty
+            maximum
+
+        # Where LazyValueInfo bounds the dividend at the remainder by MAXIMUM_DIVIDEND, that
+        # bound; 0 otherwise. The guard may bound the input to `x * K` rather than its result.
+        def small_remainder_dividend(remainder: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> u64:
+            limit: u64 = RemainderRecurrenceLimit::MAXIMUM_DIVIDEND
+            dividend: LLVMValueRef = LLVMGetOperand(remainder, 0)
+            maximum: u64 = get lazy_unsigned_maximum(analyses, dividend, remainder) else return 0
+            return maximum if maximum <= limit
+            return 0 if not is_llvm_instruction_with_opcode(dividend, LLVMOpcode::MUL)
+            factor: LLVMValueRef = LLVMGetOperand(dividend, 1)
+            return 0 if LLVMIsAConstantInt(factor) == null or ElisaLLVMIsConstantZero(factor) != 0
+            scale: u64 = LLVMConstIntGetZExtValue(factor)
+            return 0 if scale > limit
+            input: u64 = get lazy_unsigned_maximum(analyses, LLVMGetOperand(dividend, 0), remainder) else return 0
+            return 0 if input > limit / scale
+            input * scale
+
+        # APInt::getActiveBits of a 64-bit value: the position above its highest set bit.
+        def active_bits(value: u64) -> u32:
+            bits: mutable u32 = 0
+            rest: mutable u64 = value
+            while rest != 0 |bits, rest|:
+                bits <- bits + 1
+                rest <- rest >> 1
+            bits
+
+        # The divisor clamped to at least 1 in the preheader, as an absolute value for
+        # `srem`, and Magic = (Unit - 1) / D + 1 there. Clamping zero keeps the hoisted
+        # division safe even when the original remainder would never execute.
+        def hoisted_reciprocal_divisor(remainder: LLVMValueRef, preheader_terminator: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position_builder_before(builder, preheader_terminator)
+            divisor: mutable LLVMValueRef = LLVMBuildFreeze(builder, LLVMGetOperand(remainder, 1), "")
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            if is_llvm_instruction_with_opcode(remainder, LLVMOpcode::SREM):
+                absolute_arguments: darray[LLVMValueRef] = [divisor, LLVMConstInt(LLVMInt1TypeInContext(context), 0, 0)]
+                divisor <- build_overloaded_intrinsic(builder, module, "llvm.abs", &absolute_arguments)
+            maximum_arguments: darray[LLVMValueRef] = [divisor, LLVMConstInt(LLVMInt64TypeInContext(context), 1, 0)]
+            build_overloaded_intrinsic(builder, module, "llvm.umax", &maximum_arguments)
+
+        # Rewrites the remainder by an invariant divisor of an innermost nested loop as a
+        # multiply by the reciprocal hoisted to the preheader.
+        def hoist_small_remainder(remainder: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(remainder)) else return false
+            return false if ElisaLLVMLoopParent(loop) == null or ElisaLLVMLoopSubLoopCount(loop) != 0
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return false
+            preheader_terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return false
+            return false if ElisaLLVMLoopIsInvariant(loop, LLVMGetOperand(remainder, 1)) == 0 or ElisaLLVMLoopIsInvariant(loop, LLVMGetOperand(remainder, 0)) != 0
+            maximum: u64 = small_remainder_dividend(remainder, analyses)
+            return false if maximum == 0
+            bits: u32 = active_bits(maximum)
+            limit: u64 = 1.u64() << bits.u64()
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            words: LLVMTypeRef = LLVMInt64TypeInContext(context)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            divisor: LLVMValueRef = hoisted_reciprocal_divisor(remainder, preheader_terminator, builder, module)
+            magic_name: mutable darray[u8] = []
+            result_name: mutable darray[u8] = []
+            quotient_of_unit: LLVMValueRef = LLVMBuildUDiv(builder, LLVMConstInt(words, limit * limit - 1, 0), divisor, "")
+            magic: LLVMValueRef = LLVMBuildAdd(builder, quotient_of_unit, LLVMConstInt(words, 1, 0), sview_to_cstr("remainder.reciprocal", magic_name))
+            # Magic = ceil(Unit / D). For D < Limit, N * D < Unit keeps the quotient's error
+            # below 1 / D; otherwise Magic <= Limit and the shifted product is zero, matching
+            # the quotient of N < Limit <= D.
+            position_builder_before(builder, remainder)
+            narrow: LLVMValueRef = LLVMBuildTrunc(builder, LLVMGetOperand(remainder, 0), LLVMIntTypeInContext(context, bits), "")
+            dividend: LLVMValueRef = LLVMBuildZExt(builder, LLVMBuildFreeze(builder, narrow, ""), LLVMTypeOf(remainder), "")
+            quotient: LLVMValueRef = LLVMBuildLShr(builder, LLVMBuildMul(builder, dividend, magic, ""), LLVMConstInt(words, (2 * bits).u64(), 0), "")
+            result: LLVMValueRef = LLVMBuildSub(builder, dividend, LLVMBuildMul(builder, quotient, divisor, ""), sview_to_cstr("remainder.with.reciprocal", result_name))
+            LLVMDisposeBuilder(builder)
+            LLVMReplaceAllUsesWith(remainder, result)
+            LLVMInstructionEraseFromParent(remainder)
+            true
+
+        # A 64-bit `srem` or `urem` by a non-constant, without metadata beyond a debug location.
+        def is_hoistable_remainder(instruction: LLVMValueRef) -> bool can[Abort.Panic]:
+            return false if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::SREM) and not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::UREM)
+            is_llvm_integer_type(LLVMTypeOf(instruction), 64) and LLVMIsAConstant(LLVMGetOperand(instruction, 1)) == null and ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) == 0
+
+        def hoistable_remainders(function: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            candidates: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, candidates|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    candidates.push(instruction) if is_hoistable_remainder(instruction)
+            candidates
+
+        # Hoists the first of at most 4 candidates that qualifies, in a function of 5 to 32
+        # blocks and at most 384 instructions.
+        def hoist_function_small_remainder(function: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: u32 = function_block_count(function)
+            return false if blocks < RemainderRecurrenceLimit::MINIMUM_BLOCKS or blocks > RemainderRecurrenceLimit::MAXIMUM_BLOCKS
+            return false if function_instruction_count(function) > RemainderRecurrenceLimit::MAXIMUM_INSTRUCTIONS
+            candidates: darray[LLVMValueRef] = hoistable_remainders(function)
+            return false if candidates.count == 0 or candidates.count > RemainderRecurrenceLimit::MAXIMUM_CANDIDATES
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            hoisted: mutable bool = false
+            for candidate in candidates |analyses, module, hoisted|:
+                if hoist_small_remainder(candidate, analyses, module):
+                    hoisted <- true
+                    break
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            hoisted
+
+    public:
+        # The Euclid loops split, in functions of 3 or 4 blocks, and the small remainders
+        # given hoisted reciprocals, at most one per other function; AArch64 only.
+        def split_remainder_recurrences(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetIsAArch64(module) == 0
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, module, changed|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_loop_pass_policy(function, module)
+                blocks: u32 = function_block_count(function)
+                if (blocks == 3 or blocks == 4) and split_function_remainder_recurrence(function):
+                    changed <- changed + 1
+                    continue
+                changed <- changed + 1 if hoist_function_small_remainder(function, module)
+            changed

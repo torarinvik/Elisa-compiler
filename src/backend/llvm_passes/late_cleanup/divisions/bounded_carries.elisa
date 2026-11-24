@@ -1,0 +1,141 @@
+# Narrows the division in a carry recurrence `carry' = (carry + product) / divisor`. When
+# scalar evolution bounds the product below 2^31 and the carry starts at most UINT32_MAX/2,
+# every sum stays below 2^32 (each is at most twice the larger bound, and dividing by at
+# least 2 restores it), so the 64-bit division becomes a 32-bit unsigned one. The product
+# is re-frozen at its proven width so every use sees the same narrowed value.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module BoundedCarryLimit:
+    MINIMUM_BLOCKS: u32 = 3
+    MAXIMUM_BLOCKS: u32 = 64
+    FUNCTION_INSTRUCTIONS: u32 = 512
+    MAXIMUM_CANDIDATES: usize = 16
+    MAXIMUM_DIVISOR: u64 = 4294967295
+    MAXIMUM_SEED: u64 = 2147483647
+    MAXIMUM_PRODUCT_BITS: u32 = 31
+
+# A carry recurrence found around one division: its sum, the frozen product added to the
+# carry, the product itself and the product's proven width in bits.
+struct BoundedCarry:
+    sum: LLVMValueRef
+    stable_product: LLVMValueRef
+    product: LLVMValueRef
+    product_bits: u32
+
+extend Backend:
+    private:
+        def is_phi(value: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+
+        # A 64-bit signed or unsigned division by a constant whose dividend adds a phi, with
+        # no metadata other than its debug location.
+        def is_carry_division_candidate(instruction: LLVMValueRef) -> bool can[Abort.Panic]:
+            return false if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::SDIV) and not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::UDIV)
+            return false if not is_llvm_integer_type(LLVMTypeOf(instruction), 64) or LLVMIsAConstantInt(LLVMGetOperand(instruction, 1)) == null
+            return false if ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+            sum: LLVMValueRef = LLVMGetOperand(instruction, 0)
+            is_llvm_instruction_with_opcode(sum, LLVMOpcode::ADD) and (is_phi(LLVMGetOperand(sum, 0)) or is_phi(LLVMGetOperand(sum, 1)))
+
+        def carry_division_candidates(function: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            candidates: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, candidates|:
+                    candidates.push(instruction) if is_carry_division_candidate(instruction)
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            candidates
+
+        # The division's divisor is a constant in [2, UINT32_MAX] and it is not exact.
+        def has_narrowable_divisor(division: LLVMValueRef) -> bool can[Abort.Panic]:
+            divisor: LLVMValueRef = LLVMGetOperand(division, 1)
+            return false if LLVMIsAConstantInt(divisor) == null or ElisaLLVMConstantIntIsNegative(divisor) != 0 or LLVMGetExact(division) != 0
+            value: u64 = LLVMConstIntGetZExtValue(divisor)
+            value >= 2 and value <= BoundedCarryLimit::MAXIMUM_DIVISOR
+
+        # SUM's operand SIDE is the loop-header carry phi fed back by DIVISION from LATCH
+        # and seeded by a constant from PREHEADER, and the other operand freezes a product
+        # scalar evolution keeps below 2^31.
+        def carry_on_side(division: LLVMValueRef, sum: LLVMValueRef, side: u32, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> BoundedCarry? can[Abort.Panic]:
+            carry: LLVMValueRef = LLVMGetOperand(sum, side)
+            stable_product: LLVMValueRef = LLVMGetOperand(sum, 1 - side)
+            return null if not is_phi(carry) or not is_llvm_instruction_with_opcode(stable_product, LLVMOpcode::FREEZE)
+            return null if LLVMGetInstructionParent(carry) != ElisaLLVMLoopHeader(loop) or LLVMCountIncoming(carry) != 2
+            return null if phi_incoming_index(carry, preheader) < 0 or not is_optional_value(phi_incoming_for_block(carry, latch), division)
+            seed: LLVMValueRef? = phi_incoming_for_block(carry, preheader)
+            product: LLVMValueRef = LLVMGetOperand(stable_product, 0)
+            if seed is seed_value:
+                return null if LLVMIsAConstantInt(seed_value) == null or LLVMConstIntGetZExtValue(seed_value) > BoundedCarryLimit::MAXIMUM_SEED
+            return null if not is_llvm_instruction_with_opcode(product, LLVMOpcode::MUL)
+            bits: u32 = ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(analyses, product)
+            return null if bits == 0 or bits > BoundedCarryLimit::MAXIMUM_PRODUCT_BITS
+            BoundedCarry{sum: sum, stable_product: stable_product, product: product, product_bits: bits}
+
+        # The carry recurrence around DIVISION, on whichever side of its sum it is found first.
+        def bounded_carry_of(division: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> BoundedCarry? can[Abort.Panic]:
+            sum: LLVMValueRef = LLVMGetOperand(division, 0)
+            return null if not has_narrowable_divisor(division) or not is_llvm_instruction_with_opcode(sum, LLVMOpcode::ADD)
+            if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(division)) is loop:
+                return null if ElisaLLVMLoopSubLoopCount(loop) != 0
+                if ElisaLLVMLoopPredecessor(loop) is preheader:
+                    if ElisaLLVMLoopLatch(loop) is latch:
+                        if carry_on_side(division, sum, 0, loop, preheader, latch, analyses) is carry:
+                            return carry
+                        return carry_on_side(division, sum, 1, loop, preheader, latch, analyses)
+            null
+
+        # Freezes the product at its proven width, then divides the 32-bit sum. If the
+        # original product is poison, a narrower choice is still a valid result of freeze;
+        # replacing every use keeps the quotient and remainder in agreement.
+        def narrow_bounded_carry(division: LLVMValueRef, carry: BoundedCarry, builder: LLVMBuilderRef) -> void can[Abort.Panic]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(division))
+            wide: LLVMTypeRef = LLVMTypeOf(division)
+            position_builder_before(builder, carry.stable_product)
+            set_builder_debug_location(builder, carry.stable_product)
+            narrow: LLVMValueRef = LLVMBuildTrunc(builder, carry.product, LLVMIntTypeInContext(context, carry.product_bits), "")
+            stable: LLVMValueRef = LLVMBuildZExt(builder, LLVMBuildFreeze(builder, narrow, ""), wide, "carry.product")
+            LLVMReplaceAllUsesWith(carry.stable_product, stable)
+            LLVMInstructionEraseFromParent(carry.stable_product)
+            position_builder_before(builder, division)
+            set_builder_debug_location(builder, division)
+            narrow_type: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            dividend: LLVMValueRef = LLVMBuildTrunc(builder, carry.sum, narrow_type, "")
+            divisor: LLVMValueRef = LLVMConstInt(narrow_type, LLVMConstIntGetZExtValue(LLVMGetOperand(division, 1)), 0)
+            quotient: LLVMValueRef = LLVMBuildUDiv(builder, dividend, divisor, "carry.quotient")
+            LLVMReplaceAllUsesWith(division, LLVMBuildZExt(builder, quotient, wide, ""))
+            LLVMInstructionEraseFromParent(division)
+
+        def skipped_by_bounded_carries(function: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            blocks: u32 = function_block_count(function)
+            return true if blocks < BoundedCarryLimit::MINIMUM_BLOCKS or blocks > BoundedCarryLimit::MAXIMUM_BLOCKS or skipped_by_loop_pass_policy(function, module)
+            function_instruction_count(function) > BoundedCarryLimit::FUNCTION_INSTRUCTIONS
+
+        # At most one carry narrowed in FUNCTION: the first candidate that qualifies.
+        def narrow_first_bounded_carry(function: LLVMValueRef, candidates: darray[LLVMValueRef]&, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            narrowed: mutable u32 = 0
+            if ElisaLLVMCreateFunctionAnalyses(function) is analyses:
+                for division in candidates |analyses, builder, narrowed|:
+                    if bounded_carry_of(division, analyses) is carry:
+                        narrow_bounded_carry(division, carry, builder)
+                        narrowed <- 1
+                        break
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+            narrowed
+
+    public:
+        # The bounded carry divisions narrowed to 32 bits, on AArch64.
+        def narrow_bounded_carries(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, builder, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_bounded_carries(function, module)
+                candidates: darray[LLVMValueRef] = carry_division_candidates(function)
+                continue if candidates.count == 0 or candidates.count > BoundedCarryLimit::MAXIMUM_CANDIDATES
+                changed <- changed + narrow_first_bounded_carry(function, &candidates, builder)
+            LLVMDisposeBuilder(builder)
+            changed

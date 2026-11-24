@@ -22,6 +22,21 @@ ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompare(LLVMIntPredicate pr
 /* ConstantRange::sub with the single value `constant`: `range - constant`. */
 ElisaConstantRangeRef ElisaLLVMConstantRangeSubtract(ElisaConstantRangeRef range,
                                                      LLVMValueRef constant);
+/* ConstantRange::getFull(width): every value of the width. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeFull(uint32_t width);
+/* ConstantRange(constant): the single value. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeOfConstant(LLVMValueRef constant);
+/* ConstantRange::makeExactICmpRegion(predicate, constant): every value `x` for which
+ * `x <predicate> constant` holds. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeExactByCompare(LLVMIntPredicate predicate,
+                                                           LLVMValueRef constant);
+/* ConstantRange::intersectWith(second), preferring the smallest range. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeIntersect(ElisaConstantRangeRef first,
+                                                      ElisaConstantRangeRef second);
+/* Whether getSignedMin() of the range is signed-less than the constant, of the same width. */
+int ElisaLLVMConstantRangeSignedMinBelow(ElisaConstantRangeRef range, LLVMValueRef constant);
+/* Whether getSignedMin() of the range is signed-at-most the constant, of the same width. */
+int ElisaLLVMConstantRangeSignedMinAtMost(ElisaConstantRangeRef range, LLVMValueRef constant);
 int ElisaLLVMConstantRangeIsEmpty(ElisaConstantRangeRef range);
 /* Whether getSignedMax() of the range is the width's signed maximum. */
 int ElisaLLVMConstantRangeReachesSignedMax(ElisaConstantRangeRef range);
@@ -31,6 +46,27 @@ int ElisaLLVMConstantRangeSignedMinIsNegative(ElisaConstantRangeRef range);
 int ElisaLLVMConstantRangeContains(ElisaConstantRangeRef range, uint64_t value);
 /* Whether getUnsignedMax() of the range is at most the constant, of the same width. */
 int ElisaLLVMConstantRangeUnsignedMaxAtMost(ElisaConstantRangeRef range, LLVMValueRef constant);
+/* getUnsignedMax() of the range as APInt::getLimitedValue: exact up to 64 bits, and
+ * UINT64_MAX for a wider maximum that does not fit. */
+uint64_t ElisaLLVMConstantRangeUnsignedMax(ElisaConstantRangeRef range);
+/* ConstantRange(lower, upper): the wrapping interval [lower, upper) of two constants of
+ * one width. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeFromBounds(LLVMValueRef lower, LLVMValueRef upper);
+/* ConstantRange::binaryOp for an integer binary opcode (add, sub, mul, the divisions and
+ * remainders, shifts and bitwise operators); the full range for any other opcode. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeBinaryOperation(LLVMOpcode opcode,
+                                                           ElisaConstantRangeRef left,
+                                                           ElisaConstantRangeRef right);
+/* ConstantRange::smul_fast: the signed product, cheaply over-approximated. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeSignedMultiplyFast(ElisaConstantRangeRef left,
+                                                              ElisaConstantRangeRef right);
+int ElisaLLVMConstantRangeIsFull(ElisaConstantRangeRef range);
+int ElisaLLVMConstantRangeIsAllNonNegative(ElisaConstantRangeRef range);
+/* getSignedMin() / getSignedMax() sign-extended; the range is at most 64 bits wide. */
+int64_t ElisaLLVMConstantRangeSignedMin(ElisaConstantRangeRef range);
+int64_t ElisaLLVMConstantRangeSignedMax(ElisaConstantRangeRef range);
+/* getUnsignedMin() as APInt::getLimitedValue. */
+uint64_t ElisaLLVMConstantRangeUnsignedMin(ElisaConstantRangeRef range);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus

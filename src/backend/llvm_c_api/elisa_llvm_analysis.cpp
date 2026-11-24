@@ -1,7 +1,10 @@
 // Implementation of elisa_llvm_analysis.h over LLVM's C++ analyses.
 #include "elisa_llvm_analysis.h"
+#include "elisa_llvm_function_analyses.h"
 
+#include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/LazyValueInfo.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/ScalarEvolution.h>
@@ -28,72 +31,7 @@
 
 using namespace llvm;
 
-namespace {
-// The analyses of one function. The dominator tree is built at once; loop
-// info and scalar evolution on first use, so a pass that only asks about
-// dominance pays for nothing else. Invalidation drops them all.
-struct FunctionAnalyses {
-  explicit FunctionAnalyses(Function &F) : function(F) { build(); }
-
-  void build() {
-    lazyValues.reset();
-    evolution.reset();
-    assumptions.reset();
-    libraryInfo.reset();
-    libraryInfoImpl.reset();
-    loopInfo.reset();
-    preorder.clear();
-    dominators = std::make_unique<DominatorTree>(function);
-  }
-
-  LoopInfo &loops() {
-    if (!loopInfo) {
-      loopInfo = std::make_unique<LoopInfo>(*dominators);
-      for (Loop *L : loopInfo->getLoopsInPreorder()) preorder.push_back(L);
-    }
-    return *loopInfo;
-  }
-
-  AssumptionCache &assumptionCache() {
-    if (!assumptions) assumptions = std::make_unique<AssumptionCache>(function);
-    return *assumptions;
-  }
-
-  ScalarEvolution &scalarEvolution() {
-    if (!evolution) {
-      libraryInfoImpl = std::make_unique<TargetLibraryInfoImpl>(function.getParent()->getTargetTriple());
-      libraryInfo = std::make_unique<TargetLibraryInfo>(*libraryInfoImpl);
-      evolution = std::make_unique<ScalarEvolution>(function, *libraryInfo, assumptionCache(),
-                                                    *dominators, loops());
-    }
-    return *evolution;
-  }
-
-  // As LazyValueAnalysis builds it: the function and its assumption cache.
-  LazyValueInfo &lazyValueInfo() {
-    if (!lazyValues) lazyValues = std::make_unique<LazyValueInfo>(&function, &assumptionCache());
-    return *lazyValues;
-  }
-
-  Function &function;
-  std::unique_ptr<DominatorTree> dominators;
-  std::unique_ptr<LoopInfo> loopInfo;
-  std::unique_ptr<TargetLibraryInfoImpl> libraryInfoImpl;
-  std::unique_ptr<TargetLibraryInfo> libraryInfo;
-  std::unique_ptr<AssumptionCache> assumptions;
-  std::unique_ptr<ScalarEvolution> evolution;
-  std::unique_ptr<LazyValueInfo> lazyValues;
-  std::vector<Loop *> preorder;
-};
-
-FunctionAnalyses *unwrapAnalyses(ElisaFunctionAnalysesRef analyses) {
-  return reinterpret_cast<FunctionAnalyses *>(analyses);
-}
-
-Loop *unwrapLoop(ElisaLoopRef loop) { return reinterpret_cast<Loop *>(loop); }
-
-ElisaLoopRef wrapLoop(Loop *loop) { return reinterpret_cast<ElisaLoopRef>(loop); }
-} // namespace
+using namespace elisa_llvm;
 
 extern "C" {
 
@@ -109,6 +47,13 @@ void ElisaLLVMDisposeFunctionAnalyses(ElisaFunctionAnalysesRef analyses) {
 
 void ElisaLLVMInvalidateFunctionAnalyses(ElisaFunctionAnalysesRef analyses) {
   unwrapAnalyses(analyses)->build();
+}
+
+void ElisaLLVMForgetValueAnalyses(ElisaFunctionAnalysesRef analyses) {
+  FunctionAnalyses *A = unwrapAnalyses(analyses);
+  A->lazyValues.reset();
+  A->evolution.reset();
+  A->assumptions.reset();
 }
 
 int ElisaLLVMBlockDominates(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef dominator,
@@ -243,6 +188,10 @@ int ElisaLLVMModuleTargetIsDarwin(LLVMModuleRef module) {
   return unwrap(module)->getTargetTriple().isOSDarwin();
 }
 
+int ElisaLLVMModuleTargetIsLinux(LLVMModuleRef module) {
+  return unwrap(module)->getTargetTriple().isOSLinux();
+}
+
 int ElisaLLVMBlockHasAddressTaken(LLVMBasicBlockRef block) {
   return unwrap(block)->hasAddressTaken();
 }
@@ -375,6 +324,28 @@ int ElisaLLVMCallHasFunctionAttribute(LLVMValueRef call, unsigned kind) {
 
 int ElisaLLVMIsMemIntrinsic(LLVMValueRef value) { return isa<MemIntrinsic>(unwrap(value)); }
 
+int ElisaLLVMIsMemSet(LLVMValueRef value) { return isa<MemSetInst>(unwrap(value)); }
+
+int ElisaLLVMIsUsedByMetadata(LLVMValueRef value) { return unwrap(value)->isUsedByMetadata(); }
+
+uint32_t ElisaLLVMDataLayoutIndexSizeInBits(LLVMModuleRef module, uint32_t address_space) {
+  return unwrap(module)->getDataLayout().getIndexSizeInBits(address_space);
+}
+
+int ElisaLLVMConstantIntSignedLess(LLVMValueRef first, LLVMValueRef second) {
+  return cast<ConstantInt>(unwrap(first))->getValue().slt(cast<ConstantInt>(unwrap(second))->getValue());
+}
+
+int ElisaLLVMFunctionHasIrreducibleControlFlow(ElisaFunctionAnalysesRef analyses) {
+  FunctionAnalyses *bundle = unwrapAnalyses(analyses);
+  ReversePostOrderTraversal<Function *> order(&bundle->function);
+  return containsIrreducibleCFG<BasicBlock *>(order, bundle->loops());
+}
+
+LLVMValueRef ElisaLLVMUnderlyingObject(LLVMValueRef value) {
+  return wrap(getUnderlyingObject(unwrap(value)));
+}
+
 int ElisaLLVMBlockIsEHPad(LLVMBasicBlockRef block) { return unwrap(block)->isEHPad(); }
 
 unsigned ElisaLLVMUseOperandNumber(LLVMUseRef use) { return unwrap(use)->getOperandNo(); }
@@ -401,6 +372,30 @@ ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef a
   return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
 }
 
+int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(ElisaFunctionAnalysesRef analyses,
+                                                      LLVMValueRef value, LLVMValueRef context) {
+  FunctionAnalyses *A = unwrapAnalyses(analyses);
+  return isGuaranteedNotToBeUndefOrPoison(unwrap(value), &A->assumptionCache(),
+                                          cast<Instruction>(unwrap(context)), A->dominators.get());
+}
+
+ElisaConstantRangeRef ElisaLLVMLazyValueConstantRangeOnEdge(ElisaFunctionAnalysesRef analyses,
+                                                            LLVMValueRef value, LLVMBasicBlockRef from,
+                                                            LLVMBasicBlockRef to, LLVMValueRef context) {
+  ConstantRange Range = unwrapAnalyses(analyses)->lazyValueInfo().getConstantRangeOnEdge(
+      unwrap(value), unwrap(from), unwrap(to), cast<Instruction>(unwrap(context)));
+  return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
+}
+
+ElisaConstantRangeRef ElisaLLVMLazyValueConstantRangeAtUse(ElisaFunctionAnalysesRef analyses,
+                                                           LLVMValueRef user, uint32_t operand_index,
+                                                           int undef_allowed) {
+  const Use &Operand = cast<User>(unwrap(user))->getOperandUse(operand_index);
+  ConstantRange Range =
+      unwrapAnalyses(analyses)->lazyValueInfo().getConstantRangeAtUse(Operand, undef_allowed != 0);
+  return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
+}
+
 int ElisaLLVMIsImpliedCondition(LLVMValueRef condition, LLVMValueRef implied, LLVMModuleRef module,
                                 int condition_is_true) {
   std::optional<bool> Known = isImpliedCondition(unwrap(condition), unwrap(implied),
@@ -423,6 +418,23 @@ unsigned ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(ElisaFunctionAnalysesRef 
   Value *V = unwrap(value);
   if (!SE.isSCEVable(V->getType())) return 0;
   return SE.getUnsignedRangeMax(SE.getSCEV(V)).getActiveBits();
+}
+
+ElisaConstantRangeRef ElisaLLVMScalarEvolutionSignedRange(ElisaFunctionAnalysesRef analyses,
+                                                          LLVMValueRef value) {
+  ScalarEvolution &SE = unwrapAnalyses(analyses)->scalarEvolution();
+  ConstantRange Range = SE.getSignedRange(SE.getSCEV(unwrap(value)));
+  return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
+}
+
+uint32_t ElisaLLVMSmallConstantTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
+                                         LLVMBasicBlockRef exiting) {
+  return unwrapAnalyses(analyses)->scalarEvolution().getSmallConstantTripCount(unwrapLoop(loop),
+                                                                               unwrap(exiting));
+}
+
+uint32_t ElisaLLVMSmallConstantMaxTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop) {
+  return unwrapAnalyses(analyses)->scalarEvolution().getSmallConstantMaxTripCount(unwrapLoop(loop));
 }
 
 } // extern "C"

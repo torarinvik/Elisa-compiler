@@ -1,0 +1,126 @@
+# Consolidates wide OR accumulators from a vectorized single-block loop. AArch64 splits a
+# vector of 512 bits or more across several registers per accumulator, so the four
+# `acc_k = phi(0, acc_k | x_k)` recurrences reduced by one `vector.reduce.or` become one
+# chained recurrence: each update ORs into the previous one.
+include "../../ir/ir_editing.elisa"
+
+const module VectorOrLimit:
+    ACCUMULATORS: usize = 4
+    MINIMUM_BITS: u32 = 512
+
+# One accumulator: its loop update `phi | x`, the phi, and the phi's operand index.
+struct OrAccumulator:
+    update: LLVMValueRef
+    phi: LLVMValueRef
+    phi_operand: u32
+
+# The loop the reduction's accumulators run in.
+struct OrReductionLoop:
+    exit: LLVMBasicBlockRef
+    loop: LLVMBasicBlockRef
+    preheader: LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        # The accumulator whose update is UPDATE (an `or` in the loop, used by its phi and the exit).
+        def or_accumulator(update: LLVMValueRef, blocks: OrReductionLoop&) -> OrAccumulator?:
+            for operand in 0..<2 |update, blocks|:
+                phi: LLVMValueRef = LLVMGetOperand(update, operand.u32())
+                continue if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI) or LLVMGetInstructionParent(phi) != blocks.loop
+                continue if not has_one_use(phi) or LLVMCountIncoming(phi) != 2 or not optional_equals(phi_incoming_for_block(phi, blocks.loop), update)
+                initial: LLVMValueRef = get phi_incoming_for_block(phi, blocks.preheader) else return null
+                return null if LLVMIsAConstant(initial) == null or LLVMIsNull(initial) == 0
+                return OrAccumulator{update: update, phi: phi, phi_operand: operand.u32()}
+            null
+
+        # Collects the accumulators the exit's OR tree over VALUE combines, at most four;
+        # false when the tree has any other shape.
+        def collect_or_accumulators(value: LLVMValueRef, blocks: OrReductionLoop&, accumulators: mutable darray[OrAccumulator]&) -> bool:
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::OR) or LLVMGetIsDisjoint(value) != 0 or accumulators.count == VectorOrLimit::ACCUMULATORS
+            parent: LLVMBasicBlockRef = LLVMGetInstructionParent(value)
+            if parent == blocks.exit:
+                return has_one_use(value) and collect_or_accumulators(LLVMGetOperand(value, 0), blocks, accumulators) and collect_or_accumulators(LLVMGetOperand(value, 1), blocks, accumulators)
+            return false if parent != blocks.loop or use_count(value) != 2
+            accumulator: OrAccumulator = get or_accumulator(value, blocks) else return false
+            accumulators.push(accumulator)
+            true
+
+        def instruction_position(instruction: LLVMValueRef) -> u32:
+            position: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetPreviousInstruction(instruction)
+            while cursor is previous |cursor, position|:
+                position <- position + 1
+                cursor <- LLVMGetPreviousInstruction(previous)
+            position
+
+        # The accumulators in program order of their updates (all in the loop block).
+        def sorted_by_update(accumulators: darray[OrAccumulator]&) -> darray[OrAccumulator] can[Abort.Panic, Memory.Allocate]:
+            sorted: mutable darray[OrAccumulator] = []
+            for accumulator in accumulators |sorted|:
+                slot: mutable usize = sorted.count
+                sorted.push(accumulator)
+                while slot > 0 and instruction_position(sorted[slot - 1].update) > instruction_position(accumulator.update) |slot, sorted, accumulator|:
+                    sorted[slot] <- sorted[slot - 1]
+                    slot <- slot - 1
+                sorted[slot] <- accumulator
+            sorted
+
+        # The single-block loop the exit's only predecessor is, with one preheader.
+        def or_reduction_loop(exit: LLVMBasicBlockRef) -> OrReductionLoop? can[Memory.Allocate]:
+            loop: LLVMBasicBlockRef = get single_predecessor(exit) else return null
+            return null if loop == exit
+            branch: LLVMValueRef = get conditional_terminator(loop) else return null
+            return null if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            return null if LLVMGetSuccessor(branch, 0) != loop and LLVMGetSuccessor(branch, 1) != loop
+            preheader: mutable LLVMBasicBlockRef? = null
+            for predecessor in predecessor_edges(loop) |loop, preheader|:
+                continue if predecessor == loop
+                return null if preheader != null
+                preheader <- predecessor
+            entry: LLVMBasicBlockRef = get preheader else return null
+            OrReductionLoop{exit: exit, loop: loop, preheader: entry}
+
+        def is_wide_integer_vector(type: LLVMTypeRef) -> bool:
+            return false if LLVMGetTypeKind(type) != LLVMTypeKindValue::VECTOR
+            element: LLVMTypeRef = LLVMGetElementType(type)
+            LLVMGetTypeKind(element) == LLVMTypeKindValue::INTEGER and LLVMGetVectorSize(type) * LLVMGetIntTypeWidth(element) >= VectorOrLimit::MINIMUM_BITS
+
+        def fold_vector_or_reduction(reduction: LLVMValueRef, reduce_or: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if called_intrinsic_id(reduction) != reduce_or
+            root: LLVMValueRef = LLVMGetOperand(reduction, 0)
+            return false if not is_wide_integer_vector(LLVMTypeOf(root))
+            blocks: OrReductionLoop = get or_reduction_loop(LLVMGetInstructionParent(reduction)) else return false
+            collected: mutable darray[OrAccumulator] = []
+            return false if not collect_or_accumulators(root, &blocks, collected) or collected.count != VectorOrLimit::ACCUMULATORS
+            accumulators: darray[OrAccumulator] = sorted_by_update(&collected)
+            # Keeping the updates in program order makes every replacement dominate its use;
+            # each original recurrence contributes once to the final OR.
+            combined: mutable LLVMValueRef = accumulators[0].phi
+            for accumulator in accumulators |combined|:
+                LLVMSetOperand(accumulator.update, accumulator.phi_operand, combined)
+                combined <- accumulator.update
+            set_phi_incoming_for_block(accumulators[0].phi, blocks.loop, combined)
+            LLVMSetOperand(reduction, 0, combined)
+            ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(root)
+            for index in 1..<accumulators.count |accumulators|:
+                LLVMInstructionEraseFromParent(accumulators[index].phi)
+            true
+
+    public:
+        # The wide OR reductions whose accumulators were chained, on AArch64.
+        def fold_wide_vector_or_accumulators(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not module_targets_aarch64(module)
+            name_storage: mutable darray[u8] = []
+            reduce_or: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.vector.reduce.or", name_storage), 21)
+            folded: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, folded, reduce_or|:
+                function_cursor <- LLVMGetNextFunction(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, folded, reduce_or|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while instruction_cursor is instruction |instruction_cursor, folded, reduce_or|:
+                        instruction_cursor <- LLVMGetNextInstruction(instruction)
+                        folded <- folded + 1 if fold_vector_or_reduction(instruction, reduce_or)
+            folded

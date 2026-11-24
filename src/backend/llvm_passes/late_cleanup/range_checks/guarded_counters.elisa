@@ -1,0 +1,281 @@
+# Folds a checked loop counter, `llvm.sadd.with.overflow(count, 1)` on a header phi that
+# starts at a constant in 0..signed max - 1, to `add nsw` when the counter provably stays
+# no larger than a synchronized induction variable that the latch bounds.
+#
+# Either the latch exits on `cursor + 1 <= limit` failing, the cursor starting at or
+# above the counter, and the dominating guards on the limit keep it below the signed
+# maximum (an equality latch also needs the limit at or above the first tested cursor);
+# or the latch continues on `cursor + 1 <=s bound` for a cursor that starts with the
+# counter and an invariant bound proven below the signed maximum. An argument limit that
+# may be undef is frozen first so every guard and latch reads one value.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../../llvm_c_api/elisa_llvm_constant_range.elisa"
+include "./guarded_increments.elisa"
+
+const module GuardedCounterFoldLimit:
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+    FUNCTION_BLOCKS: u32 = 128
+    CANDIDATES: usize = 32
+    UPDATE_DEPTH: u32 = 8
+
+# The checked counters folded in a module, and the functions with a newly bounded loop,
+# in module order, whose reductions the vectorizer should revisit.
+struct GuardedCounterFold:
+    changed: u32
+    vectorizable: darray[LLVMValueRef]
+
+# The loop of a checked counter: the latch's compare and the counter's constant seed.
+struct CounterLoop:
+    loop: ElisaLoopRef
+    header: LLVMBasicBlockRef
+    predecessor: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+    latch_branch: LLVMValueRef
+    compare: LLVMValueRef
+    seed: LLVMValueRef
+
+# A proven counter's overflow flag, the argument limit to freeze first, and whether the
+# proof came from a newly bounded loop.
+struct CounterProof:
+    flag: LLVMValueRef
+    freeze_limit: LLVMValueRef?
+    newly_bounded: bool
+
+# The cursor proof's verdict, and the argument limit to freeze when it holds.
+struct CursorProof:
+    proven: bool
+    freeze_limit: LLVMValueRef?
+
+# The function's folds, and whether one of its loops was newly bounded.
+struct FunctionCounterFold:
+    changed: u32
+    newly_bounded: bool
+
+extend Backend:
+    private:
+        # The counter's next value is the counter, the call's sum, or a loop phi or select
+        # of such values, at most 8 levels deep.
+        def counter_update_has_shape(value: LLVMValueRef, count: LLVMValueRef, call: LLVMValueRef, loop: ElisaLoopRef, depth: u32) -> bool can[Abort.Panic]:
+            return false if depth > GuardedCounterFoldLimit::UPDATE_DEPTH
+            return true if value == count
+            return LLVMGetOperand(value, 0) == call and is_extract_of_field(value, 0) if is_llvm_instruction_with_opcode(value, LLVMOpcode::EXTRACT_VALUE)
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI):
+                return false if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(value)) == 0
+                for incoming in 0..<LLVMCountIncoming(value) |value, count, call, loop, depth|:
+                    return false if not counter_update_has_shape(LLVMGetIncomingValue(value, incoming), count, call, loop, depth + 1)
+                return true
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT)
+            counter_update_has_shape(LLVMGetOperand(value, 1), count, call, loop, depth + 1) and counter_update_has_shape(LLVMGetOperand(value, 2), count, call, loop, depth + 1)
+
+        # The values the limit can take on entry to the header: the constant itself or
+        # every value, narrowed by each dominating guard `limit <predicate> K`.
+        def guarded_limit_range(limit: LLVMValueRef, header: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef:
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeOfConstant(limit) if LLVMIsAConstantInt(limit) != null else ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(limit)))
+            node: mutable LLVMBasicBlockRef? = ElisaLLVMImmediateDominator(analyses, header)
+            while node is block |node, range, limit, header, analyses|:
+                node <- ElisaLLVMImmediateDominator(analyses, block)
+                if conditional_terminator(block) is guard_branch:
+                    compare: LLVMValueRef = LLVMGetCondition(guard_branch)
+                    continue if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+                    constant: LLVMValueRef = LLVMGetOperand(compare, 1)
+                    continue if LLVMIsAConstantInt(constant) == null or LLVMGetOperand(compare, 0) != limit
+                    predicate: i32 = LLVMGetICmpPredicate(compare)
+                    for edge in 0..<2.u32() |range, guard_branch, header, analyses, predicate, constant|:
+                        continue if not guard_edge(analyses, guard_branch, edge, header)
+                        region: ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(predicate if edge == 0 else inverse_integer_predicate(predicate), constant)
+                        narrowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(range, region)
+                        ElisaLLVMDisposeConstantRange(region)
+                        ElisaLLVMDisposeConstantRange(range)
+                        range <- narrowed
+            range
+
+        # The guarded limit stays below the signed maximum and, for an equality latch, at
+        # or above the first cursor value tested.
+        def limit_admits_cursor(limit: LLVMValueRef, counter_loop: CounterLoop&, analyses: ElisaFunctionAnalysesRef, start: LLVMValueRef, tests_next: bool, equality: bool) -> bool:
+            range: ElisaConstantRangeRef = guarded_limit_range(limit, counter_loop.header, analyses)
+            if ElisaLLVMConstantRangeIsEmpty(range) != 0 or ElisaLLVMConstantRangeReachesSignedMax(range) != 0:
+                ElisaLLVMDisposeConstantRange(range)
+                return false
+            # First = start + 1 when the latch tests the incremented cursor; start is below
+            # the signed maximum, so `min < start + 1` is `min <= start`.
+            below_first: bool = (ElisaLLVMConstantRangeSignedMinAtMost(range, start) if tests_next else ElisaLLVMConstantRangeSignedMinBelow(range, start)) != 0
+            ElisaLLVMDisposeConstantRange(range)
+            not (equality and below_first)
+
+        # A header cursor starting at or above the seed below the signed maximum and stepping
+        # by 1 at an add that dominates the latch, which the latch tests.
+        def is_counter_cursor(cursor: LLVMValueRef, counter_loop: CounterLoop&, analyses: ElisaFunctionAnalysesRef, tested: LLVMValueRef, equality: bool, side: u32) -> bool can[Abort.Panic]:
+            seed: LLVMValueRef = counter_loop.seed
+            return false if LLVMTypeOf(cursor) != LLVMTypeOf(seed) or LLVMCountIncoming(cursor) != 2
+            return false if phi_incoming_index(cursor, counter_loop.predecessor) < 0 or phi_incoming_index(cursor, counter_loop.latch) < 0
+            start: LLVMValueRef = get phi_incoming_for_block(cursor, counter_loop.predecessor) else return false
+            next: LLVMValueRef = get phi_incoming_for_block(cursor, counter_loop.latch) else return false
+            return false if LLVMIsAConstantInt(start) == null or ElisaLLVMConstantIntSignedLess(start, seed) != 0 or is_signed_max_constant(start)
+            return false if not is_llvm_instruction_with_opcode(next, LLVMOpcode::ADD) or LLVMGetOperand(next, 0) != cursor
+            return false if ElisaLLVMLoopContainsBlock(counter_loop.loop, LLVMGetInstructionParent(next)) == 0 or ElisaLLVMInstructionDominates(analyses, next, counter_loop.latch_branch) == 0
+            return false if tested != next and (not equality or tested != cursor)
+            # The ordered-latch path below handles equal seeds.
+            return false if not equality and side == 0 and start == seed
+            step: LLVMValueRef = LLVMGetOperand(next, 1)
+            LLVMIsAConstantInt(step) != null and ElisaLLVMIsConstantOne(step) != 0
+
+        # Whether some header cursor proves the counter: the latch continues while the cursor
+        # (or its increment) is `!=` or `<=s` an invariant limit the guards keep bounded.
+        def counter_cursor_proof(counter_loop: CounterLoop&, continue_predicate: i32, analyses: ElisaFunctionAnalysesRef) -> CursorProof can[Abort.Panic]:
+            compare: LLVMValueRef = counter_loop.compare
+            for side in 0..<2.u32() |counter_loop, continue_predicate, analyses, compare|:
+                predicate: i32 = continue_predicate if side == 0 else swapped_integer_predicate(continue_predicate)
+                equality: bool = predicate == LLVMIntPredicate::NE
+                continue if not equality and predicate != LLVMIntPredicate::SLE
+                tested: LLVMValueRef = LLVMGetOperand(compare, side)
+                limit: LLVMValueRef = LLVMGetOperand(compare, 1 - side)
+                continue if LLVMTypeOf(limit) != LLVMTypeOf(counter_loop.seed) or ElisaLLVMLoopIsInvariant(counter_loop.loop, limit) == 0
+                cursor_slot: mutable LLVMValueRef? = LLVMGetFirstInstruction(counter_loop.header)
+                while cursor_slot is cursor |cursor_slot, counter_loop, analyses, tested, limit, equality, side|:
+                    break if not is_llvm_instruction_with_opcode(cursor, LLVMOpcode::PHI)
+                    cursor_slot <- LLVMGetNextInstruction(cursor)
+                    continue if not is_counter_cursor(cursor, counter_loop, analyses, tested, equality, side)
+                    if phi_incoming_for_block(cursor, counter_loop.predecessor) is start:
+                        continue if not limit_admits_cursor(limit, counter_loop, analyses, start, tested != cursor, equality)
+                        return CursorProof{proven: true, freeze_limit: null} if ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAt(analyses, limit, counter_loop.latch_branch) != 0
+                        # An undef argument is frozen so every guard and latch read agrees.
+                        return CursorProof{proven: true, freeze_limit: limit} if LLVMIsAArgument(limit) != null
+            CursorProof{proven: false, freeze_limit: null}
+
+        # The counter's loop when the counter is a two-entry phi of an innermost loop's
+        # header, seeded by a constant in 0..signed max - 1, the call is in the same loop,
+        # and the latch ends in a conditional branch on an `icmp`.
+        def counter_loop_of(call: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> CounterLoop? can[Abort.Panic]:
+            count: LLVMValueRef = LLVMGetOperand(call, 0)
+            header: LLVMBasicBlockRef = LLVMGetInstructionParent(count)
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, header) else return null
+            return null if ElisaLLVMLoopHeader(loop) != header or ElisaLLVMLoopSubLoopCount(loop) != 0
+            call_loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(call)) else return null
+            return null if call_loop != loop
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            return null if LLVMCountIncoming(count) != 2 or phi_incoming_index(count, predecessor) < 0 or phi_incoming_index(count, latch) < 0
+            seed: LLVMValueRef = LLVMGetIncomingValue(count, phi_incoming_index(count, predecessor).u32())
+            return null if LLVMIsAConstantInt(seed) == null or ElisaLLVMConstantIntIsNegative(seed) != 0 or is_signed_max_constant(seed)
+            update: LLVMValueRef = LLVMGetIncomingValue(count, phi_incoming_index(count, latch).u32())
+            return null if not counter_update_has_shape(update, count, call, loop, 0)
+            latch_branch: LLVMValueRef = get conditional_terminator(latch) else return null
+            compare: LLVMValueRef = LLVMGetCondition(latch_branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            CounterLoop{loop: loop, header: header, predecessor: predecessor, latch: latch, latch_branch: latch_branch, compare: compare, seed: seed}
+
+        # The ordered latch `cursor + 1 <=s bound` continuing the loop, for a cursor that
+        # starts with the counter, under an invariant bound proven below the signed maximum.
+        def ordered_latch_bounds_counter(function: LLVMValueRef, counter_loop: CounterLoop&, analyses: ElisaFunctionAnalysesRef, count: LLVMValueRef) -> bool can[Abort.Panic]:
+            next: LLVMValueRef = LLVMGetOperand(counter_loop.compare, 0)
+            bound: LLVMValueRef = LLVMGetOperand(counter_loop.compare, 1)
+            return false if not is_llvm_instruction_with_opcode(next, LLVMOpcode::ADD) or LLVMTypeOf(next) != LLVMTypeOf(count)
+            return false if ElisaLLVMLoopContainsBlock(counter_loop.loop, LLVMGetInstructionParent(next)) == 0
+            step: LLVMValueRef = LLVMGetOperand(next, 1)
+            cursor: LLVMValueRef = LLVMGetOperand(next, 0)
+            return false if LLVMIsAConstantInt(step) == null or ElisaLLVMIsConstantOne(step) == 0 or not is_llvm_instruction_with_opcode(cursor, LLVMOpcode::PHI)
+            return false if LLVMGetInstructionParent(cursor) != counter_loop.header or LLVMCountIncoming(cursor) != 2
+            return false if phi_incoming_index(cursor, counter_loop.predecessor) < 0 or not optional_equals(phi_incoming_for_block(cursor, counter_loop.latch), next)
+            return false if not optional_equals(phi_incoming_for_block(cursor, counter_loop.predecessor), counter_loop.seed)
+            return false if not bound_below_signed_max(function, analyses, bound, counter_loop.header)
+            # An invariant bound, and an increment reached at most once per iteration.
+            ElisaLLVMLoopIsInvariant(counter_loop.loop, bound) != 0 and ElisaLLVMInstructionDominates(analyses, next, counter_loop.latch_branch) != 0
+
+        # The proof for one checked counter whose overflow flag only feeds a branch.
+        def proven_counter(call: LLVMValueRef, function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> CounterProof? can[Abort.Panic]:
+            counter_loop: CounterLoop = get counter_loop_of(call, analyses) else return null
+            flag: LLVMValueRef = get overflow_flag(call) else return null
+            return null if not flag_only_branches(flag)
+            branch: LLVMValueRef = counter_loop.latch_branch
+            continues_on_true: bool = LLVMGetSuccessor(branch, 0) == counter_loop.header
+            continues_on_false: bool = LLVMGetSuccessor(branch, 1) == counter_loop.header
+            return null if continues_on_true == continues_on_false
+            predicate: i32 = LLVMGetICmpPredicate(counter_loop.compare)
+            continue_predicate: i32 = predicate if continues_on_true else inverse_integer_predicate(predicate)
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1 if continues_on_true else 0)
+            if ElisaLLVMLoopContainsBlock(counter_loop.loop, exit) == 0:
+                cursor_proof: CursorProof = counter_cursor_proof(&counter_loop, continue_predicate, analyses)
+                return CounterProof{flag: flag, freeze_limit: cursor_proof.freeze_limit, newly_bounded: true} if cursor_proof.proven
+            return null if continue_predicate != LLVMIntPredicate::SLE
+            return null if not ordered_latch_bounds_counter(function, &counter_loop, analyses, LLVMGetOperand(call, 0))
+            CounterProof{flag: flag, freeze_limit: null, newly_bounded: false}
+
+        # The function's checked counters: bundle-free `sadd.with.overflow(phi, 1)` calls
+        # without metadata beyond a debug location.
+        def checked_counter_calls(function: LLVMValueRef, sadd_id: u32) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            calls: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, calls, sadd_id|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, calls, sadd_id|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    continue if not is_checked_increment(instruction, sadd_id) or LLVMGetNumOperandBundles(instruction) != 0
+                    continue if ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0 or not is_llvm_instruction_with_opcode(LLVMGetOperand(instruction, 0), LLVMOpcode::PHI)
+                    calls.push(instruction)
+            calls
+
+        # Freezes the argument at the entry and points every other use at the frozen value.
+        def freeze_counter_limit(limit: LLVMValueRef, function: LLVMValueRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate]:
+            position_builder_before(builder, first_non_phi(LLVMGetEntryBasicBlock(function)))
+            name_storage: mutable darray[u8] = []
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, limit, sview_to_cstr("guarded.counter.limit", name_storage))
+            users: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(limit)
+            while use_cursor is use |use_cursor, users|:
+                users.push(LLVMGetUser(use))
+                use_cursor <- LLVMGetNextUse(use)
+            for user in users |limit, stable|:
+                continue if user == stable
+                for operand in 0..<LLVMGetNumOperands(user) |user, limit, stable|:
+                    LLVMSetOperand(user, operand, stable) if LLVMGetOperand(user, operand) == limit
+
+        def fold_function_guarded_counters(function: LLVMValueRef, sadd_id: u32) -> FunctionCounterFold can[Abort.Panic, Memory.Allocate]:
+            none: FunctionCounterFold = FunctionCounterFold{changed: 0, newly_bounded: false}
+            calls: darray[LLVMValueRef] = checked_counter_calls(function, sadd_id)
+            return none if calls.count == 0 or calls.count > GuardedCounterFoldLimit::CANDIDATES
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return none
+            if ElisaLLVMFunctionHasIrreducibleControlFlow(analyses) != 0:
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+                return none
+            proofs: mutable darray[CounterProof] = []
+            for call in calls |function, analyses, proofs|:
+                proofs.push(proof) if proven_counter(call, function, analyses) is proof
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetTypeContext(LLVMTypeOf(function)))
+            frozen: mutable darray[LLVMValueRef] = []
+            newly_bounded: mutable bool = false
+            for proof in proofs |function, builder, frozen, newly_bounded|:
+                newly_bounded <- true if proof.newly_bounded
+                if proof.freeze_limit is limit:
+                    if not (any done in frozen where done == limit):
+                        frozen.push(limit)
+                        freeze_counter_limit(limit, function, builder)
+            false_value: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(function))), 0, 0)
+            sum_name: mutable darray[u8] = []
+            sum_text: cstr = sview_to_cstr("guarded.counter", sum_name)
+            for proof in proofs |builder, false_value, sum_text|:
+                fold_guarded_increment(builder, proof.flag, false_value, sum_text)
+            LLVMDisposeBuilder(builder)
+            FunctionCounterFold{changed: proofs.count.u32(), newly_bounded: newly_bounded}
+
+    public:
+        # The checked loop counters folded to `add nsw`, on AArch64 modules without debug
+        # information.
+        def fold_guarded_counters(module: LLVMModuleRef) -> GuardedCounterFold can[Abort.Panic, Memory.Allocate]:
+            vectorizable: mutable darray[LLVMValueRef] = []
+            return GuardedCounterFold{changed: 0, vectorizable: vectorizable} if module_has_debug_info(module) or not module_targets_aarch64(module)
+            sadd_storage: mutable darray[u8] = []
+            sadd_name: sview = "llvm.sadd.with.overflow"
+            sadd_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr(sadd_name, sadd_storage), sadd_name.len.usize())
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, sadd_id, changed, vectorizable|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_scalar_pass_policy(function)
+                continue if function_instruction_count(function) > GuardedCounterFoldLimit::FUNCTION_INSTRUCTIONS or function_block_count(function) > GuardedCounterFoldLimit::FUNCTION_BLOCKS
+                result: FunctionCounterFold = fold_function_guarded_counters(function, sadd_id)
+                changed <- changed + result.changed
+                vectorizable.push(function) if result.newly_bounded
+            GuardedCounterFold{changed: changed, vectorizable: vectorizable}

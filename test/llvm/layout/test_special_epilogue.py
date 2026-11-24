@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Exercise both paths of the bounded validation epilogue specialization."""
+"""Exercise both paths of the bounded validation epilogue specialization (the
+`validation-epilogues` pass through `elisac llvm-pass`): applied once it specializes,
+applied again it leaves the module alone, and both builds return the same verdicts."""
 import ctypes
 import os
-import shlex
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / 'test' / 'llvm'))
+from elisa_llvm_pass import run_pass
 if os.uname().machine not in ("arm64", "aarch64"):
     print("SKIP: the pass targets AArch64")
     raise SystemExit(0)
@@ -20,9 +24,6 @@ def run(args):
         raise RuntimeError(f"{args}: {p.stderr}")
     return p.stdout.strip()
 
-def flags(*args):
-    return shlex.split(run([CONFIG, *args]))
-
 def fixture():
     triple = "arm64-apple-darwin" if os.uname().sysname == "Darwin" else "aarch64-unknown-linux-gnu"
     out = [f'target triple = "{triple}"', 'declare void @llvm.assume(i1)', 'define i64 @scan(ptr %p, i64 %n) {', 'entry:', '  %rem = and i64 %n, 15', '  %nz = icmp ne i64 %rem, 0', '  call void @llvm.assume(i1 %nz)', '  br label %load0']
@@ -30,29 +31,14 @@ def fixture():
         out += [f'load{i}:', f'  %p{i} = getelementptr i64, ptr %p, i64 {i}', f'  %v{i} = load i64, ptr %p{i}, align 8', f'  %bad{i} = icmp slt i64 %v{i}, 0', f'  br i1 %bad{i}, label %fail, label %check{i}', f'check{i}:', f'  %done{i} = icmp eq i64 %rem, {i+1}', f'  br i1 %done{i}, label %success, label %'+(f'load{i+1}' if i<14 else 'success')]
     return '\n'.join(out + ['fail:', '  ret i64 -1', 'success:', '  ret i64 0', '}', ''])
 
-DRIVER = r'''
-#include <llvm-c/Core.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/raw_ostream.h>
-extern "C" unsigned elisacoreSpecializeValidationEpilogues(LLVMModuleRef);
-int main(int argc, char **argv) {
- llvm::LLVMContext c; llvm::SMDiagnostic d; auto m=llvm::parseIRFile(argv[1],d,c);
- if(!m){d.print(argv[0],llvm::errs());return 2;}
- auto a=elisacoreSpecializeValidationEpilogues(llvm::wrap(m.get()));
- auto b=elisacoreSpecializeValidationEpilogues(llvm::wrap(m.get()));
- if(llvm::verifyModule(*m,&llvm::errs()))return 3;
- std::error_code e;llvm::raw_fd_ostream out(argv[2],e);m->print(out,nullptr);
- llvm::outs()<<a<<" "<<b;return e?4:0;
-}
-'''
+def specialize_twice(ir):
+    """The Elisa pass applied twice: both change counts and the final module."""
+    first, once = run_pass('validation-epilogues', ir)
+    second, twice = run_pass('validation-epilogues', once)
+    return f'{first} {second}', twice
+
 with tempfile.TemporaryDirectory(prefix="elisa-epilogue-") as tmp:
-    d=Path(tmp); bindir=Path(run([CONFIG,"--bindir"]));libdir=run([CONFIG,"--libdir"])
-    (d/'driver.cpp').write_text(DRIVER)
-    run([bindir/'clang++',*flags('--cxxflags'),d/'driver.cpp',ROOT/'src/backend/llvm_special_epilogue.cpp',*flags('--ldflags','--libs','--system-libs'),'-Wl,-rpath,'+libdir,'-o',d/'driver'])
+    d=Path(tmp); bindir=Path(run([CONFIG,"--bindir"]))
     source=fixture()
     negatives={
         'volatile':source.replace('%v3 = load i64','%v3 = load volatile i64'),
@@ -64,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix="elisa-epilogue-") as tmp:
     }
     for name,ir in [('eligible',source),*negatives.items()]:
         inp=d/(name.replace(' ','_')+'.ll');out=d/(name.replace(' ','_')+'.out.ll');inp.write_text(ir)
-        got=run([d/'driver',inp,out]);expected='1 0' if name=='eligible' else '0 0'
+        got,module=specialize_twice(ir);out.write_text(module);expected='1 0' if name=='eligible' else '0 0'
         assert got==expected,(name,got,expected)
         print('PASS',name,flush=True)
     libs=[]

@@ -1,0 +1,368 @@
+# Layout for short validation chains that share a negative failure return.
+# Every check and every value stays; the failure paths are only biased in
+# the branch weights, split so a low-bit test stays eligible for AArch64
+# `tbz`, or moved behind a cold helper call.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module ValidationLayoutLimits:
+    MAX_FUNCTION_INSTRUCTIONS: u32 = 256
+    MAX_GUARD_INSTRUCTIONS: u32 = 12
+    MIN_SENTINEL_BITS: u32 = 8
+    MIN_ANNOTATED_FAILURES: u32 = 4
+    MAX_ANNOTATED_FAILURES: u32 = 8
+    MIN_ANNOTATED_LOADS: u32 = 3
+    OUTLINED_GUARDS: u32 = 2
+    MIN_OUTLINED_LOADS: u32 = 2
+    UNLIKELY_WEIGHT: u64 = 1
+    LIKELY_WEIGHT: u64 = 31
+
+# A guard's conditional branch and which of its edges leads to the failure.
+struct ValidationGuard:
+    branch: LLVMValueRef
+    error_edge: u32
+
+# The guard chain from the entry, and the integer loads its blocks read.
+struct ValidationChain:
+    guards: darray[ValidationGuard]
+    loads: u32
+
+extend Backend:
+    private:
+        def integer_scalar_width(type: LLVMTypeRef) -> u32:
+            kind: u32 = LLVMGetTypeKind(type)
+            if kind == LLVMTypeKindValue::VECTOR or kind == LLVMTypeKindValue::SCALABLE_VECTOR:
+                return LLVMGetIntTypeWidth(LLVMGetElementType(type))
+            LLVMGetIntTypeWidth(type)
+
+        # A negative integer of at least eight bits, or a negative, finite,
+        # nonzero floating-point value: the failure result of a validation.
+        def is_negative_sentinel(value: LLVMValueRef) -> bool:
+            if LLVMIsAConstantInt(value) != null:
+                return integer_scalar_width(LLVMTypeOf(value)) >= ValidationLayoutLimits::MIN_SENTINEL_BITS and ElisaLLVMConstantIntIsNegative(value) != 0
+            LLVMIsAConstantFP(value) != null and ElisaLLVMConstantFloatIsNegativeFiniteNonzero(value) != 0
+
+        # The integer loads of a block of at most twelve instructions that
+        # computes without side effects, or null when it does anything else.
+        def plain_guard_loads(block: LLVMBasicBlockRef) -> u32?:
+            size: mutable u32 = 0
+            loads: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, size, loads|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                size <- size + 1
+                return null if size > ValidationLayoutLimits::MAX_GUARD_INSTRUCTIONS
+                if LLVMIsATerminatorInst(instruction) == null and LLVMIsADbgInfoIntrinsic(instruction) == null:
+                    if LLVMIsALoadInst(instruction) != null:
+                        return null if LLVMGetVolatile(instruction) != 0 or LLVMIsAtomic(instruction) != 0 or not is_llvm_integer_type(LLVMTypeOf(instruction), 0)
+                        loads <- loads + 1
+                    else:
+                        return null if ElisaLLVMMayHaveSideEffects(instruction) != 0 or is_call_base(instruction)
+                        return null if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI)
+            loads
+
+        # The guard ending `block`: a conditional branch with no metadata
+        # beyond its location, one edge to the exit and the other to a block
+        # entered only from here.
+        def validation_guard(block: LLVMBasicBlockRef, exit: LLVMBasicBlockRef) -> ValidationGuard?:
+            if conditional_terminator(block) is branch:
+                return null if ElisaLLVMHasMetadataOtherThanDebugLoc(branch) != 0
+                first_exits: bool = LLVMGetSuccessor(branch, 0) == exit
+                second_exits: bool = LLVMGetSuccessor(branch, 1) == exit
+                return null if first_exits == second_exits
+                error_edge: u32 = 0 if first_exits else 1
+                if single_predecessor(LLVMGetSuccessor(branch, 1 - error_edge)) is predecessor:
+                    return ValidationGuard{branch: branch, error_edge: error_edge} if predecessor == block
+            null
+
+        def guard_successor(guard: ValidationGuard) -> LLVMBasicBlockRef:
+            LLVMGetSuccessor(guard.branch, 1 - guard.error_edge)
+
+        def contains_validation_block(blocks: darray[LLVMBasicBlockRef], wanted: LLVMBasicBlockRef) -> bool:
+            for block in blocks |wanted|:
+                return true if block == wanted
+            false
+
+        # `!{"branch_weights", "expected", true_weight, false_weight}`.
+        def set_expected_branch_weights(branch: LLVMValueRef, true_weight: u64, false_weight: u64, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            kind_storage: mutable darray[u8] = []
+            weights_storage: mutable darray[u8] = []
+            expected_storage: mutable darray[u8] = []
+            i32_type: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            operands: mutable darray[LLVMMetadataRef] = [LLVMMDStringInContext2(context, sview_to_cstr("branch_weights", weights_storage), 14), LLVMMDStringInContext2(context, sview_to_cstr("expected", expected_storage), 8), LLVMValueAsMetadata(LLVMConstInt(i32_type, true_weight, 0)), LLVMValueAsMetadata(LLVMConstInt(i32_type, false_weight, 0))]
+            operand_slots: void& = (&operands[0]).cast[void&] can Unsafe.PointerCast
+            node: LLVMMetadataRef = LLVMMDNodeInContext2(context, operand_slots, 4)
+            kind: u32 = LLVMGetMDKindIDInContext(context, sview_to_cstr("prof", kind_storage), 4)
+            LLVMSetMetadata(branch, kind, LLVMMetadataAsValue(context, node))
+
+        # The guards from the entry up to `success`, each failing to the exit
+        # with `failure`; null when the chain has any other shape.
+        def annotated_guard_chain(function: LLVMValueRef, exit: LLVMBasicBlockRef, result: LLVMValueRef, failure: LLVMValueRef, success: LLVMBasicBlockRef) -> ValidationChain? can[Abort.Panic, Memory.Allocate]:
+            guards: mutable darray[ValidationGuard] = []
+            loads: mutable u32 = 0
+            seen: mutable darray[LLVMBasicBlockRef] = []
+            block: mutable LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            while block != success |guards, loads, seen, block, exit, result, failure, success|:
+                return null if guards.count >= ValidationLayoutLimits::MAX_ANNOTATED_FAILURES.usize() or contains_validation_block(seen, block)
+                seen.push(block)
+                if plain_guard_loads(block) is block_loads:
+                    if validation_guard(block, exit) is guard:
+                        return null if not is_optional_value(phi_incoming_for_block(result, block), failure)
+                        guards.push(guard)
+                        loads <- loads + block_loads
+                        block <- guard_successor(guard)
+                    else:
+                        return null
+                else:
+                    return null
+            ValidationChain{guards: guards, loads: loads}
+
+        # The one non-failure edge of the result, when every other edge brings
+        # the same negative sentinel.
+        def annotated_success_block(result: LLVMValueRef) -> LLVMBasicBlockRef?:
+            failure: mutable LLVMValueRef? = null
+            success: mutable LLVMBasicBlockRef? = null
+            failures: mutable u32 = 0
+            for edge in 0..<LLVMCountIncoming(result).usize() |result, failure, success, failures|:
+                value: LLVMValueRef = LLVMGetIncomingValue(result, edge.u32())
+                if is_negative_sentinel(value):
+                    return null if failure != null and not is_optional_value(failure, value)
+                    failure <- value
+                    failures <- failures + 1
+                else:
+                    return null if success != null or LLVMIsAConstant(value) != null
+                    success <- LLVMGetIncomingBlock(result, edge.u32())
+            return null if failures < ValidationLayoutLimits::MIN_ANNOTATED_FAILURES or failures > ValidationLayoutLimits::MAX_ANNOTATED_FAILURES
+            success
+
+        def failure_value(result: LLVMValueRef) -> LLVMValueRef?:
+            for edge in 0..<LLVMCountIncoming(result).usize() |result|:
+                value: LLVMValueRef = LLVMGetIncomingValue(result, edge.u32())
+                return value if is_negative_sentinel(value)
+            null
+
+        def failure_count(result: LLVMValueRef) -> usize:
+            count: mutable usize = 0
+            for edge in 0..<LLVMCountIncoming(result).usize() |result, count|:
+                count <- count + 1 if is_negative_sentinel(LLVMGetIncomingValue(result, edge.u32()))
+            count
+
+        # The success block only finishes: no memory access but through
+        # intrinsics that touch none, and no side effects.
+        def is_quiet_success(success: LLVMBasicBlockRef, exit: LLVMBasicBlockRef) -> bool:
+            return false if not is_unconditional_branch_to(LLVMGetBasicBlockTerminator(success), exit)
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(success)
+            while cursor is instruction |cursor|:
+                if is_call_base(instruction):
+                    return false if LLVMIsAIntrinsicInst(instruction) == null or ElisaLLVMCallDoesNotAccessMemory(instruction) == 0
+                return false if LLVMIsATerminatorInst(instruction) == null and ElisaLLVMMayHaveSideEffects(instruction) != 0
+                cursor <- LLVMGetNextInstruction(instruction)
+            true
+
+        # Weight every guard of a four-to-eight-guard chain toward success.
+        def annotate_validation_chain(function: LLVMValueRef, exit: LLVMBasicBlockRef, result: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if annotated_success_block(result) is success:
+                if failure_value(result) is failure:
+                    return 0 if not is_quiet_success(success, exit)
+                    if annotated_guard_chain(function, exit, result, failure, success) is chain:
+                        return 0 if chain.guards.count != failure_count(result) or chain.loads < ValidationLayoutLimits::MIN_ANNOTATED_LOADS
+                        context: LLVMContextRef = LLVMGetModuleContext(LLVMGetGlobalParent(function))
+                        for guard in chain.guards |context|:
+                            unlikely_first: bool = guard.error_edge == 0
+                            true_weight: u64 = ValidationLayoutLimits::UNLIKELY_WEIGHT if unlikely_first else ValidationLayoutLimits::LIKELY_WEIGHT
+                            false_weight: u64 = ValidationLayoutLimits::LIKELY_WEIGHT if unlikely_first else ValidationLayoutLimits::UNLIKELY_WEIGHT
+                            set_expected_branch_weights(guard.branch, true_weight, false_weight, context)
+                        return chain.guards.count.u32()
+            0
+
+        # The two guards from the entry, each failing to the exit from a block
+        # that is one of the failure edges, when they read at least two
+        # integers and lead to a block that branches between the successes.
+        def outlined_guard_chain(function: LLVMValueRef, exit: LLVMBasicBlockRef, errors: darray[LLVMBasicBlockRef], successes: darray[LLVMBasicBlockRef]) -> ValidationChain? can[Abort.Panic, Memory.Allocate]:
+            guards: mutable darray[ValidationGuard] = []
+            loads: mutable u32 = 0
+            block: mutable LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            for _ in 0..<ValidationLayoutLimits::OUTLINED_GUARDS |guards, loads, block, exit, errors|:
+                if plain_guard_loads(block) is block_loads:
+                    loads <- loads + block_loads
+                    return null if not contains_validation_block(errors, block)
+                    if validation_guard(block, exit) is guard:
+                        guards.push(guard)
+                        block <- guard_successor(guard)
+                    else:
+                        return null
+                else:
+                    return null
+            return null if loads < ValidationLayoutLimits::MIN_OUTLINED_LOADS
+            if conditional_terminator(block) is split:
+                return null if not contains_validation_block(successes, LLVMGetSuccessor(split, 0)) or not contains_validation_block(successes, LLVMGetSuccessor(split, 1))
+                return ValidationChain{guards: guards, loads: loads}
+            null
+
+        # Each success block only computes and jumps to the exit.
+        def are_pure_successes(successes: darray[LLVMBasicBlockRef], exit: LLVMBasicBlockRef) -> bool:
+            for success in successes |exit|:
+                return false if not is_unconditional_branch_to(LLVMGetBasicBlockTerminator(success), exit)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(success)
+                while cursor is instruction |cursor|:
+                    return false if LLVMIsATerminatorInst(instruction) == null and (ElisaLLVMMayHaveSideEffects(instruction) != 0 or is_call_base(instruction))
+                    cursor <- LLVMGetNextInstruction(instruction)
+            true
+
+        # `internal double @__elisa_cold_error() cold noinline nounwind
+        # willreturn memory(none)` returning the failure.
+        def cold_error_helper(module: LLVMModuleRef, function_type: LLVMTypeRef, failure: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            name_storage: mutable darray[u8] = []
+            helper: LLVMValueRef = LLVMAddFunction(module, sview_to_cstr("__elisa_cold_error", name_storage), function_type)
+            LLVMSetLinkage(helper, LLVMLinkageValue::INTERNAL)
+            attributes: darray[sview] = ["cold", "noinline", "nounwind", "willreturn", "memory"]
+            for attribute in attributes |helper, context|:
+                attribute_storage: mutable darray[u8] = []
+                kind: u32 = LLVMGetEnumAttributeKindForName(sview_to_cstr(attribute, attribute_storage), attribute.len.usize())
+                # `memory` takes 0, MemoryEffects::none(); the others take no value.
+                LLVMAddAttributeAtIndex(helper, LLVMAttributeIndexValue::FUNCTION, LLVMCreateEnumAttribute(context, kind, 0))
+            entry_storage: mutable darray[u8] = []
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            LLVMPositionBuilderAtEnd(builder, LLVMAppendBasicBlockInContext(context, helper, sview_to_cstr("entry", entry_storage)))
+            LLVMBuildRet(builder, failure)
+            LLVMDisposeBuilder(builder)
+            helper
+
+        # Move the shared failure of a two-guard, two-result calculation
+        # returning a double behind a cold helper; only the error edges change.
+        def outline_split_failure(function: LLVMValueRef, exit: LLVMBasicBlockRef, result: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            function_type: LLVMTypeRef = LLVMGlobalGetValueType(function)
+            return_type: LLVMTypeRef = LLVMGetReturnType(function_type)
+            return 0 if LLVMGetTypeKind(return_type) != LLVMTypeKindValue::DOUBLE or function_has_attribute(function, "strictfp")
+            failure: mutable LLVMValueRef? = null
+            errors: mutable darray[LLVMBasicBlockRef] = []
+            successes: mutable darray[LLVMBasicBlockRef] = []
+            for edge in 0..<LLVMCountIncoming(result).usize() |result, failure, errors, successes|:
+                value: LLVMValueRef = LLVMGetIncomingValue(result, edge.u32())
+                source: LLVMBasicBlockRef = LLVMGetIncomingBlock(result, edge.u32())
+                if is_negative_sentinel(value):
+                    return 0 if failure != null and not is_optional_value(failure, value)
+                    failure <- value
+                    errors.push(source)
+                else:
+                    return 0 if LLVMIsAConstant(value) != null
+                    successes.push(source)
+            return 0 if errors.count != 2 or successes.count != 2 or not are_pure_successes(successes, exit)
+            if outlined_guard_chain(function, exit, errors, successes) is chain:
+                if failure is failure_constant:
+                    module: LLVMModuleRef = LLVMGetGlobalParent(function)
+                    context: LLVMContextRef = LLVMGetModuleContext(module)
+                    helper_type: LLVMTypeRef = LLVMFunctionType(return_type, null, 0, 0)
+                    helper: LLVMValueRef = cold_error_helper(module, helper_type, failure_constant)
+                    block_storage: mutable darray[u8] = []
+                    failure_block: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, function, sview_to_cstr("validation.failure", block_storage))
+                    builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+                    LLVMPositionBuilderAtEnd(builder, failure_block)
+                    call: LLVMValueRef = LLVMBuildCall2(builder, helper_type, helper, null, 0, "")
+                    LLVMSetTailCallKind(call, LLVMTailCallKindValue::TAIL)
+                    LLVMBuildRet(builder, call)
+                    LLVMDisposeBuilder(builder)
+                    for guard in chain.guards |result, failure_block|:
+                        ElisaLLVMRemoveIncomingForBlock(result, LLVMGetInstructionParent(guard.branch))
+                        LLVMSetSuccessor(guard.branch, guard.error_edge, failure_block)
+                    return 1
+            0
+
+        # The entry guard `x > LIMIT or (x & 1) == 0 ? true : p == null` on an
+        # argument word `x`, failing to the exit.
+        def low_bit_guard_select(function: LLVMValueRef, exit: LLVMBasicBlockRef, result: LLVMValueRef) -> LLVMValueRef?:
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            if conditional_terminator(entry) is branch:
+                return null if LLVMGetSuccessor(branch, 0) != exit or LLVMGetSuccessor(branch, 1) == exit or ElisaLLVMHasMetadataOtherThanDebugLoc(branch) != 0
+                return null if not is_optional_negative_sentinel(phi_incoming_for_block(result, entry))
+                guard: LLVMValueRef = LLVMGetCondition(branch)
+                return null if not is_llvm_instruction_with_opcode(guard, LLVMOpcode::SELECT) or ElisaLLVMIsConstantOne(LLVMGetOperand(guard, 1)) == 0
+                either: LLVMValueRef = LLVMGetOperand(guard, 0)
+                null_test: LLVMValueRef = LLVMGetOperand(guard, 2)
+                return null if not is_llvm_instruction_with_opcode(either, LLVMOpcode::OR) or not is_compare_with(null_test, LLVMIntPredicate::EQ)
+                return null if LLVMIsAConstantPointerNull(LLVMGetOperand(null_test, 1)) == null or LLVMIsAArgument(LLVMGetOperand(null_test, 0)) == null
+                range: LLVMValueRef = LLVMGetOperand(either, 0)
+                bit: LLVMValueRef = LLVMGetOperand(either, 1)
+                return null if not is_compare_with(range, LLVMIntPredicate::UGT) or LLVMIsAConstantInt(LLVMGetOperand(range, 1)) == null
+                return null if not is_compare_with(bit, LLVMIntPredicate::EQ) or ElisaLLVMIsConstantZero(LLVMGetOperand(bit, 1)) == 0
+                mask: LLVMValueRef = LLVMGetOperand(bit, 0)
+                return null if not is_llvm_instruction_with_opcode(mask, LLVMOpcode::AND) or LLVMIsAArgument(LLVMGetOperand(mask, 0)) == null
+                return null if LLVMGetOperand(mask, 0) != LLVMGetOperand(range, 0) or ElisaLLVMIsConstantOne(LLVMGetOperand(mask, 1)) == 0
+                return guard
+            null
+
+        def is_compare_with(value: LLVMValueRef, predicate: i32) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::ICMP) and LLVMGetICmpPredicate(value) == predicate
+
+        # Keep a low-bit rejection eligible for `tbz`: the entry branches on
+        # the bit test alone, and a new block tests the range and the null
+        # pointer, still through a select that masks a poison null test.
+        def split_low_bit_guard(function: LLVMValueRef, exit: LLVMBasicBlockRef, result: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if low_bit_guard_select(function, exit, result) is guard:
+                entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+                if conditional_terminator(entry) is branch:
+                    if phi_incoming_for_block(result, entry) is entry_result:
+                        either: LLVMValueRef = LLVMGetOperand(guard, 0)
+                        continue_block: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+                        context: LLVMContextRef = LLVMGetModuleContext(LLVMGetGlobalParent(function))
+                        name_storage: mutable darray[u8] = []
+                        remaining: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, continue_block, sview_to_cstr("validation.remaining", name_storage))
+                        builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+                        LLVMPositionBuilderAtEnd(builder, remaining)
+                        invalid: LLVMValueRef = LLVMBuildSelect(builder, LLVMGetOperand(either, 0), LLVMGetOperand(guard, 1), LLVMGetOperand(guard, 2), "")
+                        LLVMBuildCondBr(builder, invalid, exit, continue_block)
+                        LLVMDisposeBuilder(builder)
+                        add_phi_incoming(result, entry_result, remaining)
+                        replace_phi_incoming_blocks(continue_block, entry, remaining)
+                        LLVMSetCondition(branch, LLVMGetOperand(either, 1))
+                        LLVMSetSuccessor(branch, 1, remaining)
+                        ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(guard)
+                        return 1
+            0
+
+        def is_optional_negative_sentinel(value: LLVMValueRef?) -> bool:
+            if value is present:
+                return is_negative_sentinel(present)
+            false
+
+        # The function returns a phi from a block holding only that phi, the
+        # return and debug intrinsics.
+        def validation_exit_result(block: LLVMBasicBlockRef) -> LLVMValueRef?:
+            if LLVMGetBasicBlockTerminator(block) is terminator:
+                return null if LLVMGetInstructionOpcode(terminator) != LLVMOpcode::RET or LLVMGetNumOperands(terminator) == 0
+                result: LLVMValueRef = LLVMGetOperand(terminator, 0)
+                return null if not is_llvm_instruction_with_opcode(result, LLVMOpcode::PHI) or LLVMGetInstructionParent(result) != block
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, result, terminator|:
+                    return null if instruction != result and instruction != terminator and LLVMIsADbgInfoIntrinsic(instruction) == null
+                    cursor <- LLVMGetNextInstruction(instruction)
+                return result
+            null
+
+        def is_validation_layout_candidate(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if skipped_by_scalar_pass_policy(function) or ElisaLLVMFunctionHasEntryCount(function) != 0
+            function_instruction_count(function) <= ValidationLayoutLimits::MAX_FUNCTION_INSTRUCTIONS
+
+        # The first block returning a phi it alone defines gets the three
+        # layouts, in order; later blocks are not considered.
+        def lay_out_validation_returns(function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while cursor is block |cursor, function|:
+                if validation_exit_result(block) is result:
+                    split: u32 = split_low_bit_guard(function, block, result)
+                    annotated: u32 = annotate_validation_chain(function, block, result)
+                    outlined: u32 = outline_split_failure(function, block, result)
+                    return split + annotated + outlined
+                cursor <- LLVMGetNextBasicBlock(block)
+            0
+
+    public:
+        def bias_validation_returns(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return 0 if not module_targets_aarch64_architecture(module) or module_has_debug_info(module) or module_has_flag(module, "ProfileSummary")
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed|:
+                changed <- changed + lay_out_validation_returns(function) if is_validation_layout_candidate(function)
+                function_cursor <- LLVMGetNextFunction(function)
+            changed

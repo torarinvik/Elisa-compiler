@@ -1,0 +1,214 @@
+# Versions a counted loop for exactly one iteration when LLVM proves that the
+# specialization removes substantial fixed stack initialization and leaves a tiny body.
+#
+# A candidate function has one top-level, innermost loop counting from 0 by 1 until it
+# equals an i32 or i64 argument N, 1 KiB to 8 KiB of constant-length zero fills of static
+# allocas, and only intrinsic calls of a fixed set. A copy with N = 1 is simplified; when it
+# has at most 64 instructions and at least 512 fewer zeroed bytes, the function branches to
+# an inlined copy when its frozen N is 1.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+include "./ir/llvm_c_extra.elisa"
+include "./ir/pass_pipelines.elisa"
+include "../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module ShortTripLimit:
+    FILL_BYTES: u64 = 8192
+    MINIMUM_ZEROED_BYTES: u64 = 1024
+    MAXIMUM_ZEROED_BYTES: u64 = 8192
+    REQUIRED_SAVING: u64 = 512
+    FUNCTION_INSTRUCTIONS: u32 = 350
+    SPECIALIZED_INSTRUCTIONS: u32 = 64
+    MAXIMUM_ARGUMENTS: u32 = 4
+    VERSIONED: sview = "elisa.short-trip-versioned"
+    SIMPLIFY: sview = "sroa,instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg,early-cse,loop-simplify,lcssa,loop-unroll,sroa,early-cse,gvn,instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg,dse,adce,simplifycfg"
+    FAILED: u32 = 2
+
+extend Backend:
+    private:
+        # The bytes zeroed by non-volatile, bundle-free memsets of at most 8 KiB with a
+        # constant length into static allocas.
+        def short_trip_zeroed_bytes(function: LLVMValueRef) -> u64:
+            total: mutable u64 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, total|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, total|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    continue if ElisaLLVMIsMemSet(instruction) == 0 or LLVMConstIntGetZExtValue(LLVMGetOperand(instruction, 3)) != 0 or LLVMGetNumOperandBundles(instruction) != 0
+                    value: LLVMValueRef = LLVMGetOperand(instruction, 1)
+                    length: LLVMValueRef = LLVMGetOperand(instruction, 2)
+                    continue if LLVMIsAConstantInt(value) == null or ElisaLLVMIsConstantZero(value) == 0 or LLVMIsAConstantInt(length) == null
+                    continue if ElisaLLVMConstantIntActiveBits(length) > 64 or LLVMConstIntGetZExtValue(length) > ShortTripLimit::FILL_BYTES
+                    object: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 0))
+                    continue if LLVMIsAAllocaInst(object) == null or ElisaLLVMIsStaticAlloca(object) == 0
+                    total <- total + LLVMConstIntGetZExtValue(length)
+            total
+
+        # `add PHI, 1` (either order) where PHI is a two-entry header phi starting at 0 from
+        # the preheader and taking the add from the latch.
+        def is_unit_counter(add: LLVMValueRef, header: LLVMBasicBlockRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef) -> bool:
+            for operand in 0..<2.u32() |add, header, preheader, latch|:
+                phi: LLVMValueRef = LLVMGetOperand(add, operand)
+                one: LLVMValueRef = LLVMGetOperand(add, 1 - operand)
+                continue if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI) or LLVMIsAConstantInt(one) == null or ElisaLLVMIsConstantOne(one) == 0
+                continue if LLVMGetInstructionParent(phi) != header or LLVMCountIncoming(phi) != 2 or not optional_equals(phi_incoming_for_block(phi, latch), add)
+                if phi_incoming_for_block(phi, preheader) is start:
+                    return true if LLVMIsAConstantInt(start) != null and ElisaLLVMIsConstantZero(start) != 0
+            false
+
+        # The i32 or i64 argument N of the function's only loop, an innermost loop whose
+        # latch continues while `counter + 1 != N`.
+        def short_trip_argument(analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic]:
+            return null if ElisaLLVMTopLevelLoopCount(analyses) != 1
+            loop: ElisaLoopRef = ElisaLLVMTopLevelLoopAt(analyses, 0)
+            return null if ElisaLLVMLoopSubLoopCount(loop) != 0
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            branch: LLVMValueRef = get conditional_terminator(latch) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            back_on_equal: bool = LLVMGetSuccessor(branch, 0) == header
+            back_on_not_equal: bool = LLVMGetSuccessor(branch, 1) == header
+            return null if not back_on_equal and not back_on_not_equal
+            return null if back_on_equal != (predicate == LLVMIntPredicate::NE)
+            for side in 0..<2.u32() |compare, header, preheader, latch|:
+                count: LLVMValueRef = LLVMGetOperand(compare, side)
+                add: LLVMValueRef = LLVMGetOperand(compare, 1 - side)
+                continue if LLVMIsAArgument(count) == null or not (is_llvm_integer_type(LLVMTypeOf(count), 32) or is_llvm_integer_type(LLVMTypeOf(count), 64))
+                continue if not is_llvm_instruction_with_opcode(add, LLVMOpcode::ADD)
+                return count if is_unit_counter(add, header, preheader, latch)
+            null
+
+        # Calls are only non-convergent, duplicable, bundle-free calls of memset, lifetime
+        # markers, trap, assume and the overflow-checked arithmetic intrinsics, which are
+        # cloned with their overflow bits and branches.
+        def is_short_trip_call(call: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAIntrinsicInst(call) == null or LLVMGetNumOperandBundles(call) != 0
+            return false if ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("convergent")) != 0 or ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("noduplicate")) != 0
+            allowed: darray[sview] = ["llvm.memset", "llvm.lifetime.start", "llvm.lifetime.end", "llvm.trap", "llvm.assume", "llvm.sadd.with.overflow", "llvm.ssub.with.overflow", "llvm.smul.with.overflow", "llvm.uadd.with.overflow", "llvm.usub.with.overflow", "llvm.umul.with.overflow"]
+            identifier: u32 = LLVMGetIntrinsicID(LLVMGetCalledValue(call))
+            any name in allowed where intrinsic_named(identifier, name)
+
+        def intrinsic_named(identifier: u32, name: sview) -> bool can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            LLVMLookupIntrinsicID(sview_to_cstr(name, name_storage), name.len.usize()) == identifier
+
+        def is_short_trip_signature(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsDeclaration(function) != 0 or LLVMIsFunctionVarArg(LLVMGlobalGetValueType(function)) != 0 or LLVMGetFunctionCallConv(function) != 0
+            return false if LLVMGetGC(function) != null or ElisaLLVMFunctionHasEntryCount(function) != 0 or function_is_size_optimized(function)
+            excluded: darray[sview] = ["naked", "convergent", "noduplicate"]
+            return false if any attribute in excluded where function_has_attribute(function, attribute)
+            return false if llvm_function_subprogram_or_null(function) != null or LLVMHasPersonalityFn(function) != 0
+            return false if function_has_string_attribute(function, ShortTripLimit::VERSIONED) or not function_has_attribute(function, "nounwind")
+            return_type: LLVMTypeRef = LLVMGetReturnType(LLVMGlobalGetValueType(function))
+            is_llvm_integer_type(return_type, 0) and LLVMCountParams(function) <= ShortTripLimit::MAXIMUM_ARGUMENTS and function_instruction_count(function) <= ShortTripLimit::FUNCTION_INSTRUCTIONS
+
+        def is_short_trip_candidate(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_short_trip_signature(function)
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                return false if ElisaLLVMBlockHasAddressTaken(block) != 0
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return false if LLVMIsAAllocaInst(instruction) != null and ElisaLLVMIsStaticAlloca(instruction) == 0
+                    return false if is_call_base(instruction) and not is_short_trip_call(instruction)
+            bytes: u64 = short_trip_zeroed_bytes(function)
+            bytes >= ShortTripLimit::MINIMUM_ZEROED_BYTES and bytes <= ShortTripLimit::MAXIMUM_ZEROED_BYTES
+
+        # The function's frozen N picks between an inlined copy specialized to N = 1 and the
+        # original body. Every static alloca stays in the new entry block, so the added
+        # predecessor does not make it dynamic.
+        def dispatch_short_trip(function: LLVMValueRef, count: LLVMValueRef, one_iteration: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+            original: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            dispatch_name: mutable darray[u8] = []
+            small_name: mutable darray[u8] = []
+            count_name: mutable darray[u8] = []
+            entry: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, original, sview_to_cstr("short_trip.dispatch", dispatch_name))
+            small: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, original, sview_to_cstr("short_trip.one", small_name))
+            allocas: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(original)
+            while cursor is instruction |cursor, allocas|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                allocas.push(instruction) if LLVMIsAAllocaInst(instruction) != null
+            for alloca in allocas |entry|:
+                ElisaLLVMMoveInstructionToBlockEnd(alloca, entry)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            LLVMPositionBuilderAtEnd(builder, entry)
+            # The original may return before observing a poison count; a frozen count picks
+            # a permissible specialization or keeps the original body.
+            frozen: LLVMValueRef = LLVMBuildFreeze(builder, count, sview_to_cstr("short_trip.count", count_name))
+            is_one: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::EQ, frozen, LLVMConstInt(LLVMTypeOf(count), 1, 0), "")
+            _ = LLVMBuildCondBr(builder, is_one, small, original)
+            LLVMPositionBuilderAtEnd(builder, small)
+            arguments: mutable darray[LLVMValueRef] = []
+            for index in 0..<LLVMCountParams(function) |function, count, arguments|:
+                argument: LLVMValueRef = LLVMGetParam(function, index)
+                arguments.push(argument) if argument != count
+            argument_slots: void&? = (&arguments[0]).cast[void&] if arguments.count > 0 else null
+            call: LLVMValueRef = LLVMBuildCall2(builder, LLVMGlobalGetValueType(one_iteration), one_iteration, argument_slots, arguments.count.u32(), "")
+            LLVMSetInstructionCallConv(call, LLVMGetFunctionCallConv(one_iteration))
+            ElisaLLVMSetCallAttributesFromFunction(call, one_iteration)
+            _ = LLVMBuildRet(builder, call)
+            LLVMDisposeBuilder(builder)
+            # The specialized body is small by construction: inline it so the fast path makes
+            # no call. The inliner keeps argument and return attributes.
+            inlined: bool = ElisaLLVMInlineCall(call) != 0
+            LLVMDeleteFunction(one_iteration) if inlined and LLVMGetFirstUse(one_iteration) == null
+
+        # A copy of FUNCTION with COUNT replaced by 1, internal, without a comdat, named
+        # `<name>.one_iteration`.
+        def one_iteration_copy(function: LLVMValueRef, count: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            map: ElisaValueMapRef = ElisaLLVMCreateValueMap()
+            ElisaLLVMValueMapSet(map, count, LLVMConstInt(LLVMTypeOf(count), 1, 0))
+            copy: LLVMValueRef = ElisaLLVMCloneFunctionWithMap(function, map)
+            ElisaLLVMDisposeValueMap(map)
+            name: mutable darray[u8] = []
+            name_text: cstr = global_rehome_symbol(function, ".one_iteration", name)
+            LLVMSetValueName2(copy, name_text, name.count - 1)
+            LLVMSetLinkage(copy, LLVMLinkageValue::INTERNAL)
+            LLVMSetComdat(copy, null)
+            copy
+
+        # Specializes one function; FAILED when the simplification pipeline is rejected.
+        def specialize_short_trip(function: LLVMValueRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            found: LLVMValueRef? = short_trip_argument(analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            count: LLVMValueRef = get found else return 0
+            one_iteration: LLVMValueRef = one_iteration_copy(function, count)
+            if not run_function_pipeline(one_iteration, target, ShortTripLimit::SIMPLIFY):
+                LLVMDeleteFunction(one_iteration)
+                return ShortTripLimit::FAILED
+            if function_instruction_count(one_iteration) > ShortTripLimit::SPECIALIZED_INSTRUCTIONS or short_trip_zeroed_bytes(one_iteration) + ShortTripLimit::REQUIRED_SAVING > short_trip_zeroed_bytes(function):
+                LLVMDeleteFunction(one_iteration)
+                return 0
+            dispatch_short_trip(function, count, one_iteration)
+            key_storage: mutable darray[u8] = []
+            versioned: LLVMAttributeRef = LLVMCreateStringAttribute(LLVMGetTypeContext(LLVMTypeOf(function)), sview_to_cstr(ShortTripLimit::VERSIONED, key_storage), ShortTripLimit::VERSIONED.len.u32(), "", 0)
+            LLVMAddAttributeAtIndex(function, LLVMAttributeIndexValue::FUNCTION, versioned)
+            1
+
+    public:
+        # 1 when some function was specialized, FAILED when a simplification pipeline was
+        # rejected, else 0. AArch64 modules without debug info only.
+        def specialize_short_trips(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetArchIsAArch64(module) == 0 or module_has_debug_info(module)
+            candidates: mutable darray[LLVMValueRef] = []
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, candidates|:
+                function_cursor <- LLVMGetNextFunction(function)
+                candidates.push(function) if is_short_trip_candidate(function)
+            changed: mutable bool = false
+            for function in candidates |target, changed|:
+                result: u32 = specialize_short_trip(function, target)
+                return ShortTripLimit::FAILED if result == ShortTripLimit::FAILED
+                changed <- true if result != 0
+            1 if changed else 0
