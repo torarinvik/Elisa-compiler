@@ -24,6 +24,7 @@ sources=(
   "$backend/llvm_signed_range_masks.cpp"
   "$backend/llvm_c_api/elisa_llvm_analysis.cpp"
   "$backend/llvm_c_api/elisa_llvm_ir_edits.cpp"
+  "$backend/llvm_c_api/elisa_llvm_constant_range.cpp"
 )
 export LC_ALL=C
 toolchain_inputs="$(

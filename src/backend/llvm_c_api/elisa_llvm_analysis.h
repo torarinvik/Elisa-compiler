@@ -1,15 +1,11 @@
 /* C API for the LLVM analyses the Elisa-hosted passes need and LLVM's own
  * C API does not offer: dominator trees, loop nests, scalar evolution and
- * lazy value ranges, plus the few IR edits that only exist in C++.
+ * the value facts of llvm/Analysis/ValueTracking.h.
  *
  * One `ElisaFunctionAnalysesRef` owns every analysis of one function. The
  * analyses describe the function as it was when they were built (or last
  * invalidated); a pass that edits the IR calls
  * `ElisaLLVMInvalidateFunctionAnalyses` before querying again.
- *
- * Ranges cross the boundary as `ElisaIntegerRange`, a value type holding
- * LLVM's half-open wrapping interval [lower, upper) of a type of at most 64
- * bits, so no range object is ever allocated or freed by the caller.
  */
 #ifndef ELISA_LLVM_ANALYSIS_H
 #define ELISA_LLVM_ANALYSIS_H
@@ -23,18 +19,6 @@ extern "C" {
 
 typedef struct ElisaOpaqueFunctionAnalyses *ElisaFunctionAnalysesRef;
 typedef struct ElisaOpaqueLoop *ElisaLoopRef;
-typedef struct ElisaOpaqueScev *ElisaScevRef;
-
-/* [lower, upper) modulo 2^bits; `is_full` and `is_empty` mark the two
- * ranges whose bounds are equal. `bits` is 0 when the range is unknown
- * (wider than 64 bits). */
-typedef struct {
-  uint64_t lower;
-  uint64_t upper;
-  uint32_t bits;
-  uint32_t is_full;
-  uint32_t is_empty;
-} ElisaIntegerRange;
 
 /* --- analysis lifetime ------------------------------------------------ */
 ElisaFunctionAnalysesRef ElisaLLVMCreateFunctionAnalyses(LLVMValueRef function);
@@ -48,6 +32,10 @@ int ElisaLLVMInstructionDominates(ElisaFunctionAnalysesRef analyses, LLVMValueRe
                                   LLVMValueRef user);
 LLVMBasicBlockRef ElisaLLVMImmediateDominator(ElisaFunctionAnalysesRef analyses,
                                               LLVMBasicBlockRef block);
+/* DominatorTree::dominates(BasicBlockEdge(from, to), use): every path to
+ * `use` takes the edge from `from` to its successor `to`. */
+int ElisaLLVMEdgeDominates(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef from,
+                           LLVMBasicBlockRef to, LLVMBasicBlockRef use);
 
 /* --- loops (preorder: every loop precedes the loops nested in it) ------ */
 uint32_t ElisaLLVMLoopCount(ElisaFunctionAnalysesRef analyses);
@@ -97,6 +85,12 @@ int ElisaLLVMCallDoesNotAccessMemory(LLVMValueRef call);
 int ElisaLLVMFunctionHasEntryCount(LLVMValueRef function);
 /* The sign bit of an integer constant of any width. */
 int ElisaLLVMConstantIntIsNegative(LLVMValueRef constant);
+/* A ConstantInt that is a positive power of two, at any width. */
+int ElisaLLVMConstantIntIsPositivePowerOfTwo(LLVMValueRef constant);
+/* ConstantInt::equalsInt: whether the constant's value, at any width, is `value`. */
+int ElisaLLVMConstantIntEquals(LLVMValueRef constant, uint64_t value);
+/* APInt::getActiveBits of a ConstantInt: the bits up to its highest set bit. */
+unsigned ElisaLLVMConstantIntActiveBits(LLVMValueRef constant);
 /* A floating-point constant that is negative, finite and not zero. */
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant);
 /* llvm::isGuaranteedNotToBeUndefOrPoison with no context instruction. */

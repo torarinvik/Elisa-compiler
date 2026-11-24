@@ -176,9 +176,7 @@ extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);
 extern "C" unsigned elisacoreOptimizeSqrtNonNaN(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreOptimizeBoundedSums(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreOptimizeIndexBounds(LLVMModuleRef, LLVMTargetMachineRef);
-#include "llvm_guarded_increment.cpp"
 #include "llvm_guarded_counter.cpp"
-#include "llvm_nonnegative_remainder.cpp"
 extern "C" unsigned elisacoreFoldBoundedRemainders(LLVMModuleRef);
 extern "C" unsigned elisacoreFoldSignedRangeMasks(LLVMModuleRef);
 #include "llvm_ordered_vector.cpp"

@@ -1,7 +1,9 @@
 # LLVM pass tests
 
-These standalone tests compile small C++ harnesses against the compiler's LLVM
-passes. They cover [loop rewrites](loops/), [recursive functions](recursion/),
+These standalone tests exercise the compiler's LLVM passes. Tests of the passes written
+in Elisa run them through `elisac llvm-pass` (see `elisa_llvm_pass.py`, which uses `$ELISAC`
+or `bin/elisac-stage1`); tests of the passes still in C++ compile small C++ harnesses.
+They cover [loop rewrites](loops/), [recursive functions](recursion/),
 and [layout and vector rewrites](layout/).
 
 To run a test, set `LLVM_CONFIG` to the `llvm-config` for the LLVM installation

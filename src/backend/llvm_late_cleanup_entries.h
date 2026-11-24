@@ -30,12 +30,10 @@ static unsigned writeFunctions(Module &Module, const Set &Selected, LLVMValueRef
 extern "C" unsigned elisacoreShouldRevisitNestedVectorLoops(LLVMModuleRef Module) {
   return shouldRevisitNestedVectorLoops(*unwrap(Module));
 }
-ELISA_MODULE_PASS_ENTRY(elisacoreFoldGuardedIncrements, foldGuardedIncrements)
 extern "C" unsigned elisacoreOptimizeOrderedConversionsEntry(LLVMModuleRef Module,
                                                             LLVMTargetMachineRef Target) {
   return elisacoreOptimizeOrderedConversions(Module, Target);
 }
-ELISA_MODULE_PASS_ENTRY(elisacoreFoldNonnegativeRemainders, foldNonnegativeRemainders)
 
 // Writes the functions whose checked-counter exits were removed (the
 // reductions they may expose need the vectorizer again) to Functions.
@@ -70,7 +68,6 @@ ELISA_MODULE_PASS_ENTRY(elisacoreFoldGuardedCounterBoundsEntry, elisacoreFoldGua
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldHalvingRunsEntry, elisacoreFoldHalvingRuns)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldRangeAndLoopsEntry, elisacoreFoldRangeAndLoops)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldScalarLoopIdiomsEntry, elisacoreFoldScalarLoopIdioms)
-ELISA_MODULE_PASS_ENTRY(elisacoreFoldMaskedSingleBitsEntry, elisacoreFoldMaskedSingleBits)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldShiftXorLoopsEntry, elisacoreFoldShiftXorLoops)
 ELISA_MODULE_PASS_ENTRY(elisacoreReuseEdgeDivisionsEntry, elisacoreReuseEdgeDivisions)
 ELISA_MODULE_PASS_ENTRY(elisacoreSplitFactoredDivisionsEntry, elisacoreSplitFactoredDivisions)

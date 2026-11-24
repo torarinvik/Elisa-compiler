@@ -3,9 +3,34 @@
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/ConstantRange.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Module.h>
 using namespace llvm;
 namespace {
+// Whether a dominating guard keeps Bound below the signed maximum. Moved here from
+// the guarded-increment pass, now written in Elisa (llvm_passes/guarded_increments.elisa).
+static bool guardEdge(DominatorTree &DT,CondBrInst *Br,unsigned Edge,BasicBlock *Use){
+ return Br->getSuccessor(0)!=Br->getSuccessor(1) && DT.dominates(BasicBlockEdge(Br->getParent(),Br->getSuccessor(Edge)),Use);
+}
+static bool boundBelowSignedMax(Function &F,DominatorTree &DT,Value *Bound,BasicBlock *Use){
+ auto *Ty=dyn_cast<IntegerType>(Bound->getType());if(!Ty)return false;unsigned W=Ty->getBitWidth(); if(W<2||W>128)return false;
+ if(auto *C=dyn_cast<ConstantInt>(Bound))return !C->getValue().isMaxSignedValue();
+ for(BasicBlock &B:F){auto *Br=dyn_cast<CondBrInst>(B.getTerminator());auto *Cmp=Br?dyn_cast<ICmpInst>(Br->getCondition()):nullptr;if(!Cmp)continue;
+  auto *K=dyn_cast<ConstantInt>(Cmp->getOperand(1));if(!K||K->getBitWidth()!=W)continue;
+  Value *Expr=Cmp->getOperand(0);APInt Shift(W,0);
+  if(Expr!=Bound){auto *Add=dyn_cast<BinaryOperator>(Expr);if(!Add||Add->getOpcode()!=Instruction::Add)continue;auto *Offset=dyn_cast<ConstantInt>(Add->getOperand(1));if(!Offset||Add->getOperand(0)!=Bound)continue;Shift=Offset->getValue();}
+  for(unsigned E=0;E<2;++E){if(!guardEdge(DT,Br,E,Use))continue;auto Pred=E==0?Cmp->getPredicate():Cmp->getInversePredicate();
+   ConstantRange R=ConstantRange::makeAllowedICmpRegion(Pred,ConstantRange(K->getValue())).sub(ConstantRange(Shift));
+   if(!R.isEmptySet()&&R.getSignedMax().slt(APInt::getSignedMaxValue(W)))return true;
+  }
+ }
+ return false;
+}
 static bool counterUpdateShape(Value *V, PHINode *Count, IntrinsicInst *Call, Loop *L, unsigned Depth=0) {
  if (Depth>8) return false;
  if (V==Count) return true;

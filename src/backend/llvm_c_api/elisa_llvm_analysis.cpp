@@ -109,6 +109,12 @@ LLVMBasicBlockRef ElisaLLVMImmediateDominator(ElisaFunctionAnalysesRef analyses,
   return Node && Node->getIDom() ? wrap(Node->getIDom()->getBlock()) : nullptr;
 }
 
+int ElisaLLVMEdgeDominates(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef from,
+                           LLVMBasicBlockRef to, LLVMBasicBlockRef use) {
+  return unwrapAnalyses(analyses)->dominators->dominates(
+      BasicBlockEdge(unwrap(from), unwrap(to)), unwrap(use));
+}
+
 uint32_t ElisaLLVMLoopCount(ElisaFunctionAnalysesRef analyses) {
   FunctionAnalyses *A = unwrapAnalyses(analyses);
   A->loops();
@@ -225,6 +231,19 @@ int ElisaLLVMFunctionHasEntryCount(LLVMValueRef function) {
 
 int ElisaLLVMConstantIntIsNegative(LLVMValueRef constant) {
   return cast<ConstantInt>(unwrap(constant))->isNegative();
+}
+
+int ElisaLLVMConstantIntIsPositivePowerOfTwo(LLVMValueRef constant) {
+  const APInt &value = cast<ConstantInt>(unwrap(constant))->getValue();
+  return value.isStrictlyPositive() && value.isPowerOf2();
+}
+
+int ElisaLLVMConstantIntEquals(LLVMValueRef constant, uint64_t value) {
+  return cast<ConstantInt>(unwrap(constant))->equalsInt(value);
+}
+
+unsigned ElisaLLVMConstantIntActiveBits(LLVMValueRef constant) {
+  return cast<ConstantInt>(unwrap(constant))->getValue().getActiveBits();
 }
 
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant) {

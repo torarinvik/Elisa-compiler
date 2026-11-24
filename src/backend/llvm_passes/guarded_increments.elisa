@@ -1,0 +1,190 @@
+# Folds a checked signed increment, `llvm.sadd.with.overflow(x, 1)` whose overflow flag
+# only feeds a branch, into `add nsw x, 1` where dominating control flow proves
+# `x <= bound` and `bound < signed maximum`. An offset guard (`bound + k < K`) is inverted
+# with ConstantRange arithmetic in the original width, so a wrapping guard stays
+# conservative. The no-signed-wrap flag holds only at that increment; nothing is assumed
+# anywhere else.
+include "./ir_editing.elisa"
+include "./loop_pass_policy.elisa"
+include "../llvm_c_api/elisa_llvm_constant_range.elisa"
+
+# The first of an extractvalue's indices (the C API returns the index array).
+extern LLVMGetIndices(instruction: LLVMValueRef) -> u32&
+extern LLVMBuildNSWAdd(builder: LLVMBuilderRef, left: LLVMValueRef, right: LLVMValueRef, name: cstr) -> LLVMValueRef
+
+const module GuardedIncrementLimit:
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+    FUNCTION_BLOCKS: u32 = 128
+    MINIMUM_WIDTH: u32 = 2
+    MAXIMUM_WIDTH: u32 = 128
+
+extend Backend:
+    private:
+        # The block's conditional branch, if it ends in one that tests an `icmp`.
+        def compare_branch(block: LLVMBasicBlockRef) -> LLVMValueRef? can[Abort.Panic]:
+            if conditional_terminator(block) is branch:
+                return branch if is_llvm_instruction_with_opcode(LLVMGetCondition(branch), LLVMOpcode::ICMP)
+            null
+
+        # Whether taking successor `edge` of `branch` is the only way to reach `use`.
+        def guard_edge(analyses: ElisaFunctionAnalysesRef, branch: LLVMValueRef, edge: u32, use: LLVMBasicBlockRef) -> bool:
+            return false if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            ElisaLLVMEdgeDominates(analyses, LLVMGetInstructionParent(branch), LLVMGetSuccessor(branch, edge), use) != 0
+
+        # Whether the constant is the signed maximum of its width.
+        def is_signed_max_constant(constant: LLVMValueRef) -> bool:
+            only_value: ElisaConstantRangeRef = ElisaLLVMConstantRangeAllowedByCompare(LLVMIntPredicate::EQ, constant)
+            reaches: bool = ElisaLLVMConstantRangeReachesSignedMax(only_value) != 0
+            ElisaLLVMDisposeConstantRange(only_value)
+            reaches
+
+        # Whether `value <predicate> limit` with `value = bound + shift` keeps `bound`
+        # strictly below the signed maximum.
+        def guard_keeps_below_signed_max(predicate: i32, limit: LLVMValueRef, shift: LLVMValueRef) -> bool:
+            allowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeAllowedByCompare(predicate, limit)
+            bound_range: ElisaConstantRangeRef = ElisaLLVMConstantRangeSubtract(allowed, shift)
+            below: bool = ElisaLLVMConstantRangeIsEmpty(bound_range) == 0 and ElisaLLVMConstantRangeReachesSignedMax(bound_range) == 0
+            ElisaLLVMDisposeConstantRange(bound_range)
+            ElisaLLVMDisposeConstantRange(allowed)
+            below
+
+        # The constant `k` when `expression` is `bound` itself (k = 0) or `add bound, k`.
+        def bound_offset(expression: LLVMValueRef, bound: LLVMValueRef, width_type: LLVMTypeRef) -> LLVMValueRef?:
+            return LLVMConstInt(width_type, 0, 0) if expression == bound
+            return null if not is_llvm_instruction_with_opcode(expression, LLVMOpcode::ADD) or LLVMGetOperand(expression, 0) != bound
+            offset: LLVMValueRef = LLVMGetOperand(expression, 1)
+            offset if LLVMIsAConstantInt(offset) != null else null
+
+        def bound_below_signed_max(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, bound: LLVMValueRef, use: LLVMBasicBlockRef) -> bool can[Abort.Panic]:
+            bound_type: LLVMTypeRef = LLVMTypeOf(bound)
+            return false if LLVMGetTypeKind(bound_type) != LLVMTypeKindValue::INTEGER
+            width: u32 = LLVMGetIntTypeWidth(bound_type)
+            return false if width < GuardedIncrementLimit::MINIMUM_WIDTH or width > GuardedIncrementLimit::MAXIMUM_WIDTH
+            return not is_signed_max_constant(bound) if LLVMIsAConstantInt(bound) != null
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, analyses, bound, use|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if compare_branch(block) is branch:
+                    compare: LLVMValueRef = LLVMGetCondition(branch)
+                    limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+                    continue if LLVMIsAConstantInt(limit) == null or LLVMGetIntTypeWidth(LLVMTypeOf(limit)) != width
+                    if bound_offset(LLVMGetOperand(compare, 0), bound, bound_type) is shift:
+                        predicate: i32 = LLVMGetICmpPredicate(compare)
+                        for edge in 0..<2.u32() |analyses, branch, use, predicate, limit, shift|:
+                            continue if not guard_edge(analyses, branch, edge, use)
+                            return true if guard_keeps_below_signed_max(predicate if edge == 0 else inverse_integer_predicate(predicate), limit, shift)
+            false
+
+        # A call to `llvm.sadd.with.overflow` adding the constant 1.
+        def is_checked_increment(instruction: LLVMValueRef, sadd_id: u32) -> bool can[Abort.Panic]:
+            return false if LLVMGetInstructionOpcode(instruction) != LLVMOpcode::CALL
+            callee: LLVMValueRef = LLVMGetCalledValue(instruction)
+            return false if LLVMIsAFunction(callee) == null or LLVMGetIntrinsicID(callee) != sadd_id
+            step: LLVMValueRef = LLVMGetOperand(instruction, 1)
+            LLVMIsAConstantInt(step) != null and ElisaLLVMIsConstantOne(step) != 0
+
+        def is_extract_of_field(user: LLVMValueRef, field: u32) -> bool can[Abort.Panic]:
+            return false if LLVMGetInstructionOpcode(user) != LLVMOpcode::EXTRACT_VALUE or LLVMGetNumIndices(user) != 1
+            first_index: u32 = LLVMGetIndices(user)
+            first_index == field
+
+        # The last `extractvalue ..., 1` user of the call (the overflow flag), as the
+        # C++ use-list walk found it.
+        def overflow_flag(call: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic]:
+            flag: mutable LLVMValueRef? = null
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(call)
+            while use_cursor is use |use_cursor, flag|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                flag <- user if is_extract_of_field(user, 1)
+                use_cursor <- LLVMGetNextUse(use)
+            flag
+
+        def flag_only_branches(flag: LLVMValueRef) -> bool can[Abort.Panic]:
+            return false if not has_one_use(flag)
+            if LLVMGetFirstUse(flag) is use:
+                return LLVMGetInstructionOpcode(LLVMGetUser(use)) == LLVMOpcode::CONDITIONAL_BR
+            false
+
+        # Whether a branch on `value <= bound` (or `value > bound`, on its false edge)
+        # guards the call's block with a bound below the signed maximum.
+        def increment_is_guarded(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, value: LLVMValueRef, use: LLVMBasicBlockRef) -> bool can[Abort.Panic]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, analyses, value, use|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if compare_branch(block) is branch:
+                    compare: LLVMValueRef = LLVMGetCondition(branch)
+                    continue if LLVMGetOperand(compare, 0) != value
+                    predicate: i32 = LLVMGetICmpPredicate(compare)
+                    continue if predicate != LLVMIntPredicate::SLE and predicate != LLVMIntPredicate::SGT
+                    continue if not guard_edge(analyses, branch, 0 if predicate == LLVMIntPredicate::SLE else 1, use)
+                    return true if bound_below_signed_max(function, analyses, LLVMGetOperand(compare, 1), use)
+            false
+
+        def has_checked_increment(function: LLVMValueRef, sadd_id: u32) -> bool can[Abort.Panic]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, sadd_id|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, sadd_id|:
+                    return true if is_checked_increment(instruction, sadd_id)
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            false
+
+        # The overflow flags of the function's provably guarded increments, in order.
+        def guarded_increment_flags(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, sadd_id: u32) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            flags: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, flags, analyses, sadd_id|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is call |instruction_cursor, flags, analyses, sadd_id|:
+                    instruction_cursor <- LLVMGetNextInstruction(call)
+                    continue if not is_checked_increment(call, sadd_id) or LLVMGetNumOperandBundles(call) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(call) != 0
+                    if overflow_flag(call) is flag:
+                        flags.push(flag) if flag_only_branches(flag) and increment_is_guarded(function, analyses, LLVMGetOperand(call, 0), block)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            flags
+
+        # `add nsw x, 1` replaces the call's sum, and `false` its overflow flag.
+        def fold_guarded_increment(builder: LLVMBuilderRef, flag: LLVMValueRef, false_value: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate]:
+            call: LLVMValueRef = LLVMGetOperand(flag, 0)
+            position_builder_before(builder, call)
+            sum: LLVMValueRef = LLVMBuildNSWAdd(builder, LLVMGetOperand(call, 0), LLVMGetOperand(call, 1), "guarded.increment")
+            values: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(call)
+            while use_cursor is use |use_cursor, values|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                values.push(user) if is_extract_of_field(user, 0)
+                use_cursor <- LLVMGetNextUse(use)
+            for value in values |sum|:
+                LLVMReplaceAllUsesWith(value, sum)
+            LLVMReplaceAllUsesWith(flag, false_value)
+
+        def skipped_by_guarded_increments(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function)
+            return true if function_instruction_count(function) > GuardedIncrementLimit::FUNCTION_INSTRUCTIONS or function_block_count(function) > GuardedIncrementLimit::FUNCTION_BLOCKS
+            function_has_attribute(function, "sanitize_address") or function_has_attribute(function, "sanitize_memory") or function_has_attribute(function, "sanitize_thread") or function_has_attribute(function, "sanitize_hwaddress")
+
+    public:
+        # The checked increments folded to `add nsw`.
+        def fold_guarded_increments(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if module_has_debug_info(module) or not module_targets_aarch64(module)
+            sadd_name: sview = "llvm.sadd.with.overflow"
+            name_storage: mutable darray[u8] = []
+            sadd_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr(sadd_name, name_storage), sadd_name.len.usize())
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            false_value: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(context), 0, 0)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, builder, sadd_id, false_value|:
+                function_cursor <- LLVMGetNextFunction(function)
+                # Most functions hold no checked increment; skip their dominator tree.
+                continue if skipped_by_guarded_increments(function) or not has_checked_increment(function, sadd_id)
+                if ElisaLLVMCreateFunctionAnalyses(function) is analyses:
+                    flags: darray[LLVMValueRef] = guarded_increment_flags(function, analyses, sadd_id)
+                    ElisaLLVMDisposeFunctionAnalyses(analyses)
+                    for flag in flags |builder, false_value, changed|:
+                        fold_guarded_increment(builder, flag, false_value)
+                        changed <- changed + 1
+            LLVMDisposeBuilder(builder)
+            changed
