@@ -27,9 +27,6 @@ static unsigned writeFunctions(Module &Module, const Set &Selected, LLVMValueRef
     return Pass(*unwrap(Module), Target);                                                 \
   }
 
-extern "C" unsigned elisacoreShouldRevisitNestedVectorLoops(LLVMModuleRef Module) {
-  return shouldRevisitNestedVectorLoops(*unwrap(Module));
-}
 extern "C" unsigned elisacoreOptimizeOrderedConversionsEntry(LLVMModuleRef Module,
                                                             LLVMTargetMachineRef Target) {
   return elisacoreOptimizeOrderedConversions(Module, Target);
@@ -68,18 +65,11 @@ ELISA_MODULE_PASS_ENTRY(elisacoreFoldShiftXorLoopsEntry, elisacoreFoldShiftXorLo
 ELISA_MODULE_PASS_ENTRY(elisacoreReuseEdgeDivisionsEntry, elisacoreReuseEdgeDivisions)
 ELISA_MODULE_PASS_ENTRY(elisacoreSplitRemainderRecurrencesEntry, elisacoreSplitRemainderRecurrences)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldConstantIntegerPathsEntry, elisacoreFoldConstantIntegerPaths)
-ELISA_TARGET_PASS_ENTRY(elisacoreSpecializeLiteralDivisorsEntry, elisacoreSpecializeLiteralDivisors)
 ELISA_TARGET_PASS_ENTRY(elisacoreInlineStackViewHelpersEntry, elisacoreInlineStackViewHelpers)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldReverseByteReductionsEntry, elisacoreFoldReverseByteReductions)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldOddTrailingZeroSelectsEntry, elisacoreFoldOddTrailingZeroSelects)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldRecursiveArgumentBounds, foldRecursiveArgumentBounds)
 
-extern "C" void elisacoreFoldGuardedUnsignedComparisons(LLVMModuleRef Module) {
-  foldGuardedUnsignedComparisons(*unwrap(Module));
-}
-extern "C" void elisacoreFoldWideVectorOrAccumulators(LLVMModuleRef Module) {
-  foldWideVectorOrAccumulators(*unwrap(Module));
-}
 
 // Folds proven signed checks across the module and writes the callers that
 // had checked helpers inlined into them, in module order.

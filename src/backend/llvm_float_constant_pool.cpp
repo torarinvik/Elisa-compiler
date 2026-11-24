@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <memory>
 
-#include "llvm_exit_dead_stores.h"
 
 namespace {
 using namespace llvm;
@@ -153,17 +152,9 @@ bool poolFunctionConstants(Function &function) {
 }
 } // namespace
 
-// Late, so the bounded length reaches the copy after every inlining. On
-// AArch64, stores that only the final cleanups sink into a shared exit block
-// die here, before the trap exit edges (trap_exit_edges.elisa) are added.
-extern "C" unsigned elisacoreExpandLateCopies(LLVMModuleRef module, LLVMTargetMachineRef machine) {
-  if (!module || !machine)
-    return 0;
-  auto &target = *reinterpret_cast<llvm::TargetMachine *>(machine);
-  unsigned expanded = ElisaBoundedCopies::expandBoundedCopies(*llvm::unwrap(module));
-  if (!target.getTargetTriple().isAArch64())
-    return expanded;
-  return expanded + ElisaExitDeadStores::removeExitDeadStores(*llvm::unwrap(module));
+// Late, so the bounded length reaches the copy after every inlining.
+extern "C" unsigned elisacoreExpandBoundedCopies(LLVMModuleRef module) {
+  return module ? ElisaBoundedCopies::expandBoundedCopies(*llvm::unwrap(module)) : 0;
 }
 
 extern "C" unsigned elisacorePoolFloatingConstants(LLVMModuleRef module,

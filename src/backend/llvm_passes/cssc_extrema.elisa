@@ -1,0 +1,116 @@
+# On Apple M5, compare-and-select is faster than CSSC's minimum and maximum instructions on
+# the dependency chains of running extrema that feed a clamp or paired conditional
+# differences. Functions with such loops get CSSC turned off.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+
+# The intrinsics the extrema test looks for.
+struct ExtremaIntrinsics:
+    unsigned_maximum: u32
+    unsigned_minimum: u32
+
+extend Backend:
+    private:
+        def extrema_intrinsics() -> ExtremaIntrinsics can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            maximum_storage: mutable darray[u8] = []
+            minimum_storage: mutable darray[u8] = []
+            maximum: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.umax", maximum_storage), 9)
+            minimum: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.umin", minimum_storage), 9)
+            ExtremaIntrinsics{unsigned_maximum: maximum, unsigned_minimum: minimum}
+
+        def targets_apple_m5(machine: void&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMTargetMachineIsMacOSX(machine) == 0
+            cpu: mutable darray[u8] = []
+            return false if not copy_owned_target_message(LLVMGetTargetMachineCPU(machine), &cpu)
+            cpu.as_sview() == "apple-m5"
+
+        def function_has_inline_assembly(function: LLVMValueRef) -> bool:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return true if is_call_base(instruction) and LLVMIsAInlineAsm(LLVMGetCalledValue(instruction)) != null
+            false
+
+        # A running maximum updated on one arm and passed through on the other, whose
+        # updated value `umax(previous, input)` also feeds `maximum - input` in its block.
+        def conditional_maximum_difference(previous: LLVMValueRef, latch: LLVMBasicBlockRef, extrema: ExtremaIntrinsics&) -> LLVMValueRef?:
+            merge: LLVMValueRef = get phi_incoming_for_block(previous, latch) else return null
+            return null if not is_llvm_instruction_with_opcode(merge, LLVMOpcode::PHI) or LLVMGetInstructionParent(merge) != latch or LLVMCountIncoming(merge) != 2
+            unchanged: u32 = 0 if LLVMGetIncomingValue(merge, 0) == previous else 1
+            return null if LLVMGetIncomingValue(merge, unchanged) != previous
+            maximum: LLVMValueRef = LLVMGetIncomingValue(merge, 1 - unchanged)
+            return null if called_intrinsic_id(maximum) != extrema.unsigned_maximum or LLVMGetInstructionParent(maximum) != LLVMGetIncomingBlock(merge, 1 - unchanged)
+            prior: u32 = 0 if LLVMGetOperand(maximum, 0) == previous else 1
+            return null if LLVMGetOperand(maximum, prior) != previous
+            input: LLVMValueRef = LLVMGetOperand(maximum, 1 - prior)
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(maximum)
+            while use_cursor is use |use_cursor, maximum, input|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                continue if not is_llvm_instruction_with_opcode(user, LLVMOpcode::SUB) or LLVMGetInstructionParent(user) != LLVMGetInstructionParent(maximum)
+                return maximum if LLVMGetOperand(user, 0) == maximum and LLVMGetOperand(user, 1) == input
+            null
+
+        # `running = umax(phi, x)` (or umin) in the loop, clamped by the opposite extremum in
+        # its own block.
+        def running_extremum_feeds_clamp(phi: LLVMValueRef, latch: LLVMBasicBlockRef, loop: ElisaLoopRef, extrema: ExtremaIntrinsics&) -> bool:
+            running: LLVMValueRef = get phi_incoming_for_block(phi, latch) else return false
+            intrinsic: u32 = called_intrinsic_id(running)
+            return false if intrinsic == 0 or ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(running)) == 0
+            return false if intrinsic != extrema.unsigned_maximum and intrinsic != extrema.unsigned_minimum
+            clamp: u32 = extrema.unsigned_minimum if intrinsic == extrema.unsigned_maximum else extrema.unsigned_maximum
+            return false if LLVMGetOperand(running, 0) != phi and LLVMGetOperand(running, 1) != phi
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(running)
+            while use_cursor is use |use_cursor, running, clamp|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return true if called_intrinsic_id(user) == clamp and LLVMGetInstructionParent(user) == LLVMGetInstructionParent(running)
+            false
+
+        # Whether the top-level LOOP keeps an i32 extremum chain: conditional maximum
+        # differences on two different arms, or a running extremum that feeds a clamp.
+        def loop_keeps_extrema_chain(loop: ElisaLoopRef, extrema: ExtremaIntrinsics&) -> bool:
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            first_arm: mutable LLVMBasicBlockRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopHeader(loop))
+            while cursor is phi |cursor, first_arm, latch, loop|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                continue if not is_llvm_integer_type(LLVMTypeOf(phi), 32)
+                if conditional_maximum_difference(phi, latch, extrema) is maximum:
+                    arm: LLVMBasicBlockRef = LLVMGetInstructionParent(maximum)
+                    if ElisaLLVMLoopContainsBlock(loop, arm) != 0:
+                        return true if first_arm != null and not same_optional_block(first_arm, arm)
+                        first_arm <- arm
+                return true if running_extremum_feeds_clamp(phi, latch, loop, extrema)
+            false
+
+        def prefers_compare_select_extrema(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, extrema: ExtremaIntrinsics&) -> bool:
+            return false if function_has_inline_assembly(function)
+            for index in 0..<ElisaLLVMLoopCount(analyses) |analyses, extrema|:
+                loop: ElisaLoopRef = ElisaLLVMLoopAt(analyses, index)
+                continue if ElisaLLVMLoopParent(loop) != null
+                return true if loop_keeps_extrema_chain(loop, extrema)
+            false
+
+        # Sets the function's target features to the machine's without CSSC.
+        def use_compare_select_extrema(function: LLVMValueRef, machine: void&, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            features: mutable darray[u8] = []
+            _ = copy_owned_target_message(LLVMGetTargetMachineFeatureString(machine), &features)
+            selected: mutable darray[u8] = []
+            start: mutable usize = 0
+            for position in 0..<features.count + 1 |features, selected, start|:
+                continue if position < features.count and features[position] != 44
+                feature: sview = bytes_view_range_ref(features, start, position - start)
+                start <- position + 1
+                continue if feature.len == 0 or feature == "+cssc" or feature == "-cssc"
+                for index in 0..<feature.len |selected, feature|:
+                    selected.push(feature[index])
+                selected.push(44)
+            disabled: sview = "-cssc"
+            for index in 0..<disabled.len |selected, disabled|:
+                selected.push(disabled[index])
+            add_function_string_attribute(function, "target-features", bytes_view_range_ref(selected, 0, selected.count), context)

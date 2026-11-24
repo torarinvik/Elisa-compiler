@@ -1,0 +1,158 @@
+# Decides whether the late cleanup reruns the full O3 pipeline for outer loops around an
+# already vectorized inner loop: small modules only, with a vector load inside a nested loop.
+# On macOS it first asks for a second vector iteration of small nested recurrences with four
+# adjacent two-lane loads and stores: the vectorizer normally suppresses runtime unrolling of
+# these loops, and the unroll reduces their loop overhead.
+include "../ir/ir_editing.elisa"
+include "../ir/loop_pass_policy.elisa"
+
+const module NestedVectorLimit:
+    FUNCTIONS: u32 = 4
+    INSTRUCTIONS: u32 = 2000
+    BODY_INSTRUCTIONS: u32 = 42
+    LOOP_ID_OPERANDS: u32 = 3
+    PAIR_ACCESSES: u32 = 4
+    UNROLL_COUNT: u64 = 2
+
+# The loop ID's `llvm.loop.isvectorized` property, when the ID is `!{self, a, b}` whose
+# properties are both named and include it and `llvm.loop.unroll.runtime.disable`.
+struct VectorizedLoopID:
+    vectorized: LLVMValueRef
+
+extend Backend:
+    private:
+        # The operands of the metadata node VALUE (a MetadataAsValue).
+        def metadata_node_operands(value: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            count: usize = LLVMGetMDNodeNumOperands(value).usize()
+            return [] if count == 0
+            # LLVM overwrites every slot; seed with a valid handle.
+            operands: mutable darray[LLVMValueRef] = [value for _ in 0..<count]
+            LLVMGetMDNodeOperands(value, (&operands[0]).cast[void&] can Unsafe.PointerCast)
+            operands
+
+        # The name a loop property node spells in its first operand; empty when the
+        # property is not a node or its first operand is not a string.
+        def loop_property_name(property: LLVMValueRef, name: mutable darray[u8]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAMDNode(property) == null
+            operands: darray[LLVMValueRef] = metadata_node_operands(property)
+            return false if operands.count == 0 or LLVMIsAMDString(operands[0]) == null
+            length: mutable u32 = 0
+            text: void& = get LLVMGetMDString(operands[0], (&length).cast[void&] can Unsafe.PointerCast) else return false
+            bytes: u8& = text.cast[u8&] can Unsafe.PointerCast
+            view: sview = unsafe_sview_bounded_bytes(bytes, length.usize())
+            for position in 0..<view.len |name, view|:
+                name.push(view[position])
+            true
+
+        def vectorized_loop_id(loop_id: LLVMValueRef) -> VectorizedLoopID? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            operands: darray[LLVMValueRef] = metadata_node_operands(loop_id)
+            return null if operands.count != NestedVectorLimit::LOOP_ID_OPERANDS.usize()
+            vectorized: mutable LLVMValueRef? = null
+            runtime_disabled: mutable bool = false
+            for index in 1..<operands.count |operands, vectorized, runtime_disabled|:
+                name: mutable darray[u8] = []
+                return null if not loop_property_name(operands[index], name)
+                text: sview = name.as_sview()
+                vectorized <- operands[index] if vectorized == null and text == "llvm.loop.isvectorized"
+                runtime_disabled <- true if text == "llvm.loop.unroll.runtime.disable"
+            property: LLVMValueRef = get vectorized else return null
+            return null if not runtime_disabled
+            VectorizedLoopID{vectorized: property}
+
+        # A two-lane i64 phi carried by a shuffle of a loaded vector in the body.
+        def has_pair_recurrence(body: LLVMBasicBlockRef, pair: LLVMTypeRef) -> bool:
+            recurrence: mutable bool = false
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(body)
+            while cursor is phi |cursor, recurrence, body, pair|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                continue if LLVMTypeOf(phi) != pair
+                if phi_incoming_for_block(phi, body) is shuffle:
+                    continue if not is_llvm_instruction_with_opcode(shuffle, LLVMOpcode::SHUFFLE_VECTOR)
+                    recurrence <- true if LLVMGetInstructionParent(shuffle) == body and LLVMIsALoadInst(LLVMGetOperand(shuffle, 0)) != null
+            recurrence
+
+        # Four simple two-lane loads, four such stores, and nothing else with side effects.
+        def has_four_pair_accesses(body: LLVMBasicBlockRef, pair: LLVMTypeRef) -> bool:
+            loads: mutable u32 = 0
+            stores: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(body)
+            while cursor is instruction |cursor, loads, stores, pair|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::LOAD):
+                    return false if LLVMGetVolatile(instruction) != 0 or LLVMGetOrdering(instruction) != 0 or LLVMTypeOf(instruction) != pair
+                    loads <- loads + 1
+                elif is_llvm_instruction_with_opcode(instruction, LLVMOpcode::STORE):
+                    return false if LLVMGetVolatile(instruction) != 0 or LLVMGetOrdering(instruction) != 0 or LLVMTypeOf(LLVMGetOperand(instruction, 0)) != pair
+                    stores <- stores + 1
+                elif ElisaLLVMMayHaveSideEffects(instruction) != 0:
+                    return false
+            loads == NestedVectorLimit::PAIR_ACCESSES and stores == NestedVectorLimit::PAIR_ACCESSES
+
+        # `!{self, isvectorized, !{"llvm.loop.unroll.count", i32 2}}` for a single-block
+        # vectorized recurrence over two-lane pairs.
+        def unroll_nested_vector_recurrence(loop: ElisaLoopRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            body: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            return if ElisaLLVMLoopBlockCount(loop) != 1 or not same_optional_block(ElisaLLVMLoopLatch(loop), body)
+            return if instruction_count(body) > NestedVectorLimit::BODY_INSTRUCTIONS or ElisaLLVMLoopPreheader(loop) == null
+            raw_id: void& = get ElisaLLVMLoopGetLoopID(loop) else return
+            loop_id: LLVMValueRef = LLVMMetadataAsValue(context, raw_id.cast[LLVMMetadataRef] can Unsafe.PointerCast)
+            found: VectorizedLoopID = get vectorized_loop_id(loop_id) else return
+            pair: LLVMTypeRef = LLVMVectorType(LLVMInt64TypeInContext(context), 2)
+            return if not has_pair_recurrence(body, pair) or not has_four_pair_accesses(body, pair)
+            name_storage: mutable darray[u8] = []
+            count_fields: mutable darray[LLVMMetadataRef] = [LLVMMDStringInContext2(context, sview_to_cstr("llvm.loop.unroll.count", name_storage), 22), LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(context), NestedVectorLimit::UNROLL_COUNT, 0))]
+            count_slots: void& = (&count_fields[0]).cast[void&] can Unsafe.PointerCast
+            properties: mutable darray[LLVMMetadataRef] = [LLVMValueAsMetadata(found.vectorized), LLVMMDNodeInContext2(context, count_slots, 2)]
+            property_slots: void& = (&properties[0]).cast[void&] can Unsafe.PointerCast
+            ElisaLLVMLoopSetLoopID(loop, ElisaLLVMCreateLoopID(context, property_slots, 2))
+
+        # Small, optimized, uninstrumented modules: at most four defined functions and 2000
+        # instructions.
+        def is_small_plain_module(module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            functions: mutable u32 = 0
+            instructions: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, functions, instructions|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0
+                functions <- functions + 1
+                return false if functions > NestedVectorLimit::FUNCTIONS
+                instructions <- instructions + function_instruction_count(function)
+                return false if instructions > NestedVectorLimit::INSTRUCTIONS or skipped_by_scalar_pass_policy(function)
+            true
+
+        def loop_has_vector_load(loop: ElisaLoopRef) -> bool:
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    continue if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::LOAD)
+                    kind: u32 = LLVMGetTypeKind(LLVMTypeOf(instruction))
+                    return true if kind == LLVMTypeKindValue::VECTOR or kind == LLVMTypeKindValue::SCALABLE_VECTOR
+            false
+
+        # Whether a nested loop of FUNCTION loads a vector, after marking its recurrences.
+        def revisit_nested_vector_function(function: LLVMValueRef, mac: bool, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            found: mutable bool = false
+            for index in 0..<ElisaLLVMLoopCount(analyses) |analyses, found, mac, context|:
+                loop: ElisaLoopRef = ElisaLLVMLoopAt(analyses, index)
+                continue if ElisaLLVMLoopParent(loop) == null
+                unroll_nested_vector_recurrence(loop, context) if mac
+                found <- true if loop_has_vector_load(loop)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            found
+
+    public:
+        def should_revisit_nested_vector_loops(module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if module_has_debug_info(module) or not module_targets_aarch64(module) or not is_small_plain_module(module)
+            mac: bool = ElisaLLVMModuleTargetIsMacOSX(module) != 0
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            found: mutable bool = false
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, found, mac, context|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0
+                found <- true if revisit_nested_vector_function(function, mac, context)
+            found

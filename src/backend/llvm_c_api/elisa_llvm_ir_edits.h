@@ -33,6 +33,14 @@ void ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(LLVMValueRef value);
  * cannot reach; whether any was deleted. */
 int ElisaLLVMRemoveUnreachableBlocks(LLVMValueRef function);
 
+/* llvm::CloneFunction with an empty value map: a copy of the function,
+ * appended to its module. */
+LLVMValueRef ElisaLLVMCloneFunction(LLVMValueRef function);
+
+/* llvm::InlineFunction of the call with default InlineFunctionInfo; whether
+ * the call was inlined. */
+int ElisaLLVMInlineCall(LLVMValueRef call);
+
 /* ICmpInst::setPredicate: `predicate` is an LLVMIntPredicate. */
 void ElisaLLVMSetICmpPredicate(LLVMValueRef compare, LLVMIntPredicate predicate);
 

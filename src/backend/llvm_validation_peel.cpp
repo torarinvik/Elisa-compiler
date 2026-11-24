@@ -97,8 +97,6 @@ unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldOddTrailingZeroSelects(llvm::Module &);
 unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
-#include "llvm_guarded_unsigned_compare.h"
-#include "llvm_vector_or_accumulators.h"
 #include "llvm_bisection_ranges.h"
 #include "llvm_checked_signed_ranges.h"
 #include "llvm_recursive_argument_bounds.h"
@@ -117,7 +115,6 @@ extern "C" unsigned elisacoreSinkPrivateInitializations(LLVMModuleRef) { return 
 extern "C" unsigned elisacoreInlineSmallRecursion(LLVMModuleRef) { return 0; }
 extern "C" unsigned elisacoreUnrollNestedScans(LLVMModuleRef) { return 0; }
 extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef) { return 0; }
-extern "C" unsigned elisacoreCsscAbsoluteRangeChecks(LLVMModuleRef, LLVMTargetMachineRef) { return 0; }
 #endif
 
 // Keep Apple ARM layout policy identical to Stage0's O3 emitter.
@@ -181,37 +178,6 @@ extern "C" unsigned elisacoreFoldSignedRangeMasks(LLVMModuleRef);
 #include "llvm_ordered_vector.cpp"
 #include "llvm_special_epilogue.cpp"
 #include "llvm_even_range.cpp"
-
-#include "llvm_nested_vector_unroll.h"
-
-static bool shouldRevisitNestedVectorLoops(Module &M) {
-  if (M.getNamedMetadata("llvm.dbg.cu") || !M.getTargetTriple().isAArch64())
-    return false;
-  unsigned Functions = 0, Instructions = 0;
-  for (Function &F : M) {
-    if (F.isDeclaration()) continue;
-    if (++Functions > 4 || (Instructions += F.getInstructionCount()) > 2000 ||
-        F.hasOptNone() || F.hasOptSize() || F.hasMinSize() ||
-        F.hasFnAttribute(Attribute::SanitizeAddress) ||
-        F.hasFnAttribute(Attribute::SanitizeMemory) ||
-        F.hasFnAttribute(Attribute::SanitizeThread) ||
-        F.hasFnAttribute(Attribute::SanitizeHWAddress)) return false;
-  }
-  bool Found = false;
-  for (Function &F : M) {
-    if (F.isDeclaration()) continue;
-    DominatorTree DT(F); LoopInfo LI(DT);
-    for (Loop *L : LI.getLoopsInPreorder()) {
-      if (!L->getParentLoop()) continue;
-      if (M.getTargetTriple().isMacOSX()) unrollNestedVectorRecurrence(*L);
-      for (BasicBlock *B : L->blocks())
-        for (Instruction &I : *B)
-          if (auto *Load = dyn_cast<LoadInst>(&I))
-            if (Load->getType()->isVectorTy()) Found = true;
-    }
-  }
-  return Found;
-}
 
 // The late scalar cleanup sequence lives in Elisa
 // (llvm_passes/late_cleanup/late_scalar_cleanup.elisa); these are its entries.

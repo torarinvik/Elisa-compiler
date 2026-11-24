@@ -12,10 +12,14 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/InstrTypes.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PatternMatch.h>
+#include <llvm/MC/MCSubtargetInfo.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Triple.h>
 
 #include <memory>
@@ -208,6 +212,29 @@ int ElisaLLVMModuleTargetIsAArch64(LLVMModuleRef module) {
   return unwrap(module)->getTargetTriple().isAArch64();
 }
 
+int ElisaLLVMModuleTargetIsMacOSX(LLVMModuleRef module) {
+  return unwrap(module)->getTargetTriple().isMacOSX();
+}
+
+static const TargetMachine &unwrapMachine(LLVMTargetMachineRef machine) {
+  return *reinterpret_cast<const TargetMachine *>(machine);
+}
+
+int ElisaLLVMTargetMachineIsAArch64(LLVMTargetMachineRef machine) {
+  return unwrapMachine(machine).getTargetTriple().isAArch64();
+}
+
+int ElisaLLVMTargetMachineIsMacOSX(LLVMTargetMachineRef machine) {
+  return unwrapMachine(machine).getTargetTriple().isMacOSX();
+}
+
+int ElisaLLVMTargetMachineChecksFeatures(LLVMTargetMachineRef machine, const char *features) {
+  const TargetMachine &TM = unwrapMachine(machine);
+  std::unique_ptr<MCSubtargetInfo> subtarget(TM.getTarget().createMCSubtargetInfo(
+      TM.getTargetTriple(), TM.getTargetCPU(), TM.getTargetFeatureString()));
+  return subtarget && subtarget->checkFeatures(features);
+}
+
 int ElisaLLVMModuleTargetArchIsAArch64(LLVMModuleRef module) {
   return unwrap(module)->getTargetTriple().getArch() == Triple::aarch64;
 }
@@ -302,6 +329,33 @@ int ElisaLLVMMayReadOrWriteMemory(LLVMValueRef instruction) {
 LLVMValueRef ElisaLLVMStripPointerCasts(LLVMValueRef value) {
   return wrap(unwrap(value)->stripPointerCasts());
 }
+
+int ElisaLLVMMayReadFromMemory(LLVMValueRef instruction) {
+  return cast<Instruction>(unwrap(instruction))->mayReadFromMemory();
+}
+
+int ElisaLLVMUnderlyingObjectsAreAllocas(LLVMValueRef pointer) {
+  SmallVector<const Value *, 8> Objects;
+  getUnderlyingObjects(unwrap(pointer), Objects, nullptr, 0);
+  return !Objects.empty() &&
+         llvm::all_of(Objects, [](const Value *Object) { return isa<AllocaInst>(Object); });
+}
+
+unsigned ElisaLLVMBlockNumber(LLVMBasicBlockRef block) { return unwrap(block)->getNumber(); }
+
+unsigned ElisaLLVMFunctionMaxBlockNumber(LLVMValueRef function) {
+  return cast<Function>(unwrap(function))->getMaxBlockNumber();
+}
+
+int ElisaLLVMCallHasFunctionAttribute(LLVMValueRef call, unsigned kind) {
+  return cast<CallBase>(unwrap(call))->hasFnAttr(static_cast<Attribute::AttrKind>(kind));
+}
+
+int ElisaLLVMIsMemIntrinsic(LLVMValueRef value) { return isa<MemIntrinsic>(unwrap(value)); }
+
+int ElisaLLVMBlockIsEHPad(LLVMBasicBlockRef block) { return unwrap(block)->isEHPad(); }
+
+unsigned ElisaLLVMUseOperandNumber(LLVMUseRef use) { return unwrap(use)->getOperandNo(); }
 
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant) {
   const APFloat &Value = cast<ConstantFP>(unwrap(constant))->getValueAPF();

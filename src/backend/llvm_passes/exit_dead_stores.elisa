@@ -1,0 +1,95 @@
+# Removes stores into local arrays that nothing reads before the function returns. A store
+# is dead when every object its address may point into is one of the function's allocas and
+# no instruction that may read memory can execute after it: the object dies at the return,
+# so the value is never observed, even through an address that escaped (a read of it after
+# the return, or racing with the store, is undefined). LLVM's dead-store elimination finds
+# the object through GEPs only; after full unrolling a backtracking search ends in a shared
+# `visited[position] = 0` whose address is a phi over every cell, and keeping that store
+# keeps one address per cell live and spilled.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+
+extend Backend:
+    private:
+        # Whether INSTRUCTION may read memory; lifetime markers read nothing a store could
+        # have written.
+        def reads_memory(instruction: LLVMValueRef, lifetime_start: u32, lifetime_end: u32) -> bool:
+            return false if ElisaLLVMMayReadFromMemory(instruction) == 0
+            intrinsic: u32 = called_intrinsic_id(instruction)
+            intrinsic == 0 or (intrinsic != lifetime_start and intrinsic != lifetime_end)
+
+        def block_reads_memory(block: LLVMBasicBlockRef, lifetime_start: u32, lifetime_end: u32) -> bool:
+            instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while instruction_cursor is instruction |instruction_cursor, lifetime_start, lifetime_end|:
+                return true if reads_memory(instruction, lifetime_start, lifetime_end)
+                instruction_cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+        # The blocks, by number, from whose start an instruction that may read memory can run.
+        def reading_blocks(function: LLVMValueRef, lifetime_start: u32, lifetime_end: u32) -> darray[bool] can[Abort.Panic, Memory.Allocate]:
+            reading: mutable darray[bool] = []
+            for _ in 0..<ElisaLLVMFunctionMaxBlockNumber(function) |reading|:
+                reading.push(false)
+            work: mutable darray[LLVMBasicBlockRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, reading, work, lifetime_start, lifetime_end|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if block_reads_memory(block, lifetime_start, lifetime_end):
+                    reading[ElisaLLVMBlockNumber(block).usize()] <- true
+                    work.push(block)
+            while work.count > 0 |work, reading|:
+                reached: LLVMBasicBlockRef = work[work.count - 1]
+                _ = work.pop()
+                for predecessor in predecessor_edges(reached) |reading, work|:
+                    number: usize = ElisaLLVMBlockNumber(predecessor).usize()
+                    continue if reading[number]
+                    reading[number] <- true
+                    work.push(predecessor)
+            reading
+
+        # No instruction after STORE, in its block or any block reachable from it, may read
+        # memory.
+        def is_last_write(store: LLVMValueRef, reading: darray[bool]&, lifetime_start: u32, lifetime_end: u32) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(store)
+            while cursor is next |cursor, lifetime_start, lifetime_end|:
+                return false if reads_memory(next, lifetime_start, lifetime_end)
+                cursor <- LLVMGetNextInstruction(next)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(LLVMGetInstructionParent(store)) else return true
+            for successor in 0..<LLVMGetNumSuccessors(terminator) |terminator, reading|:
+                return false if reading[ElisaLLVMBlockNumber(LLVMGetSuccessor(terminator, successor)).usize()]
+            true
+
+        def is_exit_dead_store(instruction: LLVMValueRef, reading: darray[bool]&, lifetime_start: u32, lifetime_end: u32) -> bool:
+            return false if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::STORE) or LLVMGetVolatile(instruction) != 0 or LLVMGetOrdering(instruction) != 0
+            is_last_write(instruction, reading, lifetime_start, lifetime_end) and ElisaLLVMUnderlyingObjectsAreAllocas(LLVMGetOperand(instruction, 1)) != 0
+
+        def remove_function_exit_dead_stores(function: LLVMValueRef, lifetime_start: u32, lifetime_end: u32) -> u32 can[Abort.Panic, Memory.Allocate]:
+            reading: darray[bool] = reading_blocks(function, lifetime_start, lifetime_end)
+            dead: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, dead, reading, lifetime_start, lifetime_end|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, dead, reading, lifetime_start, lifetime_end|:
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                    dead.push(instruction) if is_exit_dead_store(instruction, &reading, lifetime_start, lifetime_end)
+            for store in dead:
+                pointer: LLVMValueRef = LLVMGetOperand(store, 1)
+                LLVMInstructionEraseFromParent(store)
+                ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(pointer)
+            dead.count.u32()
+
+    public:
+        # The stores removed in every function with a body and optimization.
+        def remove_exit_dead_stores(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            start_storage: mutable darray[u8] = []
+            end_storage: mutable darray[u8] = []
+            lifetime_start: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.lifetime.start", start_storage), 19)
+            lifetime_end: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.lifetime.end", end_storage), 17)
+            removed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, removed, lifetime_start, lifetime_end|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+                removed <- removed + remove_function_exit_dead_stores(function, lifetime_start, lifetime_end)
+            removed

@@ -7,6 +7,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 
 using namespace llvm;
@@ -33,6 +34,16 @@ void ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(LLVMValueRef value) {
 
 int ElisaLLVMRemoveUnreachableBlocks(LLVMValueRef function) {
   return removeUnreachableBlocks(*cast<Function>(unwrap(function)));
+}
+
+LLVMValueRef ElisaLLVMCloneFunction(LLVMValueRef function) {
+  ValueToValueMapTy Map;
+  return wrap(CloneFunction(cast<Function>(unwrap(function)), Map));
+}
+
+int ElisaLLVMInlineCall(LLVMValueRef call) {
+  InlineFunctionInfo Info;
+  return InlineFunction(*cast<CallBase>(unwrap(call)), Info).isSuccess();
 }
 
 void ElisaLLVMSetICmpPredicate(LLVMValueRef compare, LLVMIntPredicate predicate) {

@@ -11,6 +11,7 @@
 #define ELISA_LLVM_ANALYSIS_H
 
 #include <llvm-c/Core.h>
+#include <llvm-c/TargetMachine.h>
 
 #include "elisa_llvm_constant_range.h"
 #include <stdint.h>
@@ -69,6 +70,13 @@ int ElisaLLVMModuleTargetIsAArch64(LLVMModuleRef module);
 int ElisaLLVMModuleTargetArchIsAArch64(LLVMModuleRef module);
 /* Triple::isOSDarwin(). */
 int ElisaLLVMModuleTargetIsDarwin(LLVMModuleRef module);
+/* Triple::isMacOSX(). */
+int ElisaLLVMModuleTargetIsMacOSX(LLVMModuleRef module);
+/* The same queries on a target machine's triple. */
+int ElisaLLVMTargetMachineIsAArch64(LLVMTargetMachineRef machine);
+int ElisaLLVMTargetMachineIsMacOSX(LLVMTargetMachineRef machine);
+/* MCSubtargetInfo::checkFeatures for the machine's CPU and features, for example "+cssc". */
+int ElisaLLVMTargetMachineChecksFeatures(LLVMTargetMachineRef machine, const char *features);
 
 /* --- IR facts the C API lacks ------------------------------------------ */
 /* Whether a `blockaddress` constant refers to the block. */
@@ -88,6 +96,25 @@ int ElisaLLVMMayHaveSideEffects(LLVMValueRef instruction);
 int ElisaLLVMMayReadOrWriteMemory(LLVMValueRef instruction);
 /* Value::stripPointerCasts: the value with pointer casts and zero GEPs removed. */
 LLVMValueRef ElisaLLVMStripPointerCasts(LLVMValueRef value);
+/* Instruction::mayReadFromMemory. */
+int ElisaLLVMMayReadFromMemory(LLVMValueRef instruction);
+/* llvm::getUnderlyingObjects(pointer, objects, no loop info, no lookup limit) found at
+ * least one object, and every one is an alloca. */
+int ElisaLLVMUnderlyingObjectsAreAllocas(LLVMValueRef pointer);
+/* BasicBlock::getNumber: the block's number, below its function's
+ * ElisaLLVMFunctionMaxBlockNumber, for indexing per-block arrays. */
+unsigned ElisaLLVMBlockNumber(LLVMBasicBlockRef block);
+/* Function::getMaxBlockNumber. */
+unsigned ElisaLLVMFunctionMaxBlockNumber(LLVMValueRef function);
+/* CallBase::hasFnAttr(kind): the call site or its callee has the function
+ * attribute; `kind` is an enum attribute kind (LLVMGetEnumAttributeKindForName). */
+int ElisaLLVMCallHasFunctionAttribute(LLVMValueRef call, unsigned kind);
+/* isa<MemIntrinsic>: a call of llvm.memcpy, memmove, memset or their inline forms. */
+int ElisaLLVMIsMemIntrinsic(LLVMValueRef value);
+/* BasicBlock::isEHPad. */
+int ElisaLLVMBlockIsEHPad(LLVMBasicBlockRef block);
+/* Use::getOperandNo: the use's operand index in its user. */
+unsigned ElisaLLVMUseOperandNumber(LLVMUseRef use);
 /* CallBase::doesNotAccessMemory. */
 int ElisaLLVMCallDoesNotAccessMemory(LLVMValueRef call);
 /* Whether Function::getEntryCount() has a value (a profile entry count). */

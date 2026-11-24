@@ -1,0 +1,196 @@
+# AArch64 range-check tuning, run after the O3 pipeline:
+#
+# - Recovers an immediate subtraction from InstCombine's wrapped range check. Rotating the
+#   interval turns `(x + bias) <u limit` into `(x + bias - limit) >u ~limit`, all modulo 2^64.
+# - With CSSC, maps the unsigned range check for [-B, B] to `llvm.abs` plus an unsigned
+#   comparison. The intrinsic wraps at INT_MIN, so the comparison still rejects INT_MIN
+#   without introducing poison or changing the input domain.
+# - On Apple M5, turns CSSC off for functions whose loops keep running extrema that feed a
+#   clamp or paired conditional differences: compare-and-select is faster on those chains.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+include "./cssc_extrema.elisa"
+
+const module CsscLimit:
+    ALL_ONES: u64 = 18446744073709551615
+    SIGN_BIT: u64 = 9223372036854775808
+    # APInt::getSignedMaxValue(64).lshr(1).
+    MAXIMUM_BOUND: u64 = 4611686018427387903
+    IMMEDIATE: u64 = 4095
+    SHIFTED_IMMEDIATE_LIMIT: u64 = 16777216
+    LOW_TWELVE_BITS: u64 = 4095
+    THIRTY_TWO_BIT_LIMIT: u64 = 4294967296
+    # Wide unrolled validation scans keep the original range arithmetic.
+    SCAN_RANGE_CHECKS: u32 = 4
+
+# `input + offset <u limit` accepting exactly [-bound, bound].
+struct SymmetricRangeCheck:
+    add: LLVMValueRef
+    input: LLVMValueRef
+    bound: u64
+
+# How many symmetric range checks a loop holds, computed when first asked.
+struct LoopRangeChecks:
+    loop: ElisaLoopRef
+    count: u32
+
+extend Backend:
+    private:
+        def is_negative_u64(value: u64) -> bool:
+            value >= CsscLimit::SIGN_BIT
+
+        def symmetric_range_check(compare: LLVMValueRef) -> SymmetricRangeCheck?:
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(compare) != 0
+            add: LLVMValueRef = LLVMGetOperand(compare, 0)
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if not is_llvm_instruction_with_opcode(add, LLVMOpcode::ADD) or LLVMGetNSW(add) != 0 or LLVMGetNUW(add) != 0
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(add) != 0 or LLVMIsAConstantInt(limit) == null
+            return null if not is_llvm_integer_type(LLVMTypeOf(add), 64) or LLVMTypeOf(limit) != LLVMTypeOf(add)
+            first_constant: bool = LLVMIsAConstantInt(LLVMGetOperand(add, 0)) != null
+            offset: LLVMValueRef = LLVMGetOperand(add, 0) if first_constant else LLVMGetOperand(add, 1)
+            return null if LLVMIsAConstantInt(offset) == null or not is_negative_u64(LLVMConstIntGetZExtValue(offset))
+            input: LLVMValueRef = LLVMGetOperand(add, 1) if first_constant else LLVMGetOperand(add, 0)
+            # bound = -offset - 1 = ~offset; the accepted limit is -(2 * bound + 1) = ~(2 * bound).
+            bound: u64 = LLVMConstIntGetZExtValue(offset) ^ CsscLimit::ALL_ONES
+            return null if bound > CsscLimit::MAXIMUM_BOUND
+            return null if LLVMConstIntGetZExtValue(limit) != (bound * 2) ^ CsscLimit::ALL_ONES
+            SymmetricRangeCheck{add: add, input: input, bound: bound}
+
+        # The conditions a branch tests: a `select c, true, d` guard's two, or its own.
+        def tested_conditions(branch: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            condition: LLVMValueRef = LLVMGetCondition(branch)
+            if is_llvm_instruction_with_opcode(condition, LLVMOpcode::SELECT) and has_one_use(condition):
+                reject: LLVMValueRef = LLVMGetOperand(condition, 1)
+                if LLVMIsAConstantInt(reject) != null and ElisaLLVMConstantIntEquals(reject, 1) != 0:
+                    return [LLVMGetOperand(condition, 0), LLVMGetOperand(condition, 2)]
+            [condition]
+
+        def prefer_immediate_bias(compare: LLVMValueRef, context: LLVMContextRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or not has_one_use(compare) or LLVMGetICmpSameSign(compare) != 0
+            return false if LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT or not is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(compare, 0)), 64)
+            add: LLVMValueRef = LLVMGetOperand(compare, 0)
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return false if not is_llvm_instruction_with_opcode(add, LLVMOpcode::ADD) or LLVMIsAConstantInt(limit) == null
+            return false if not is_negative_u64(LLVMConstIntGetZExtValue(limit)) or not has_one_use(add) or LLVMGetNUW(add) != 0 or LLVMGetNSW(add) != 0
+            bias_value: LLVMValueRef = LLVMGetOperand(add, 1)
+            return false if LLVMIsAConstantInt(bias_value) == null
+            bias: u64 = LLVMConstIntGetZExtValue(bias_value)
+            return false if not is_negative_u64(bias)
+            limit_bits: u64 = LLVMConstIntGetZExtValue(limit)
+            old_subtract: u64 = (bias ^ CsscLimit::ALL_ONES) + 1
+            # limit - bias modulo 2^64; both are negative, so neither sum overflows.
+            lower: u64 = limit_bits - bias if limit_bits >= bias else limit_bits + old_subtract
+            new_limit: u64 = limit_bits ^ CsscLimit::ALL_ONES
+            # The old subtraction needs a register. The replacement fits the unshifted 12-bit
+            # immediate, and the new limit is at most 32 bits.
+            return false if lower == 0 or lower > CsscLimit::IMMEDIATE or old_subtract <= CsscLimit::IMMEDIATE
+            return false if old_subtract < CsscLimit::SHIFTED_IMMEDIATE_LIMIT and (old_subtract & CsscLimit::LOW_TWELVE_BITS) == 0
+            return false if new_limit >= CsscLimit::THIRTY_TWO_BIT_LIMIT
+            word: LLVMTypeRef = LLVMInt64TypeInContext(context)
+            LLVMSetOperand(add, 1, LLVMConstInt(word, (lower ^ CsscLimit::ALL_ONES) + 1, 0))
+            ElisaLLVMSetICmpPredicate(compare, LLVMIntPredicate::UGT)
+            LLVMSetOperand(compare, 1, LLVMConstInt(word, new_limit, 0))
+            true
+
+        def prefer_immediate_range_bias(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if module_has_debug_info(module)
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, context|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if function_is_size_optimized(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, context|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    if conditional_terminator(block) is branch:
+                        for condition in tested_conditions(branch) |changed, context|:
+                            changed <- changed + 1 if prefer_immediate_bias(condition, context)
+            changed
+
+        def range_checks_in_loop(loop: ElisaLoopRef) -> u32:
+            count: mutable u32 = 0
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop, count|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor, count|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    count <- count + 1 if symmetric_range_check(instruction) != null
+            count
+
+        # Whether the compare sits in a loop with four or more range checks.
+        def in_wide_scan(compare: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, scans: mutable darray[LoopRangeChecks]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(compare)) else return false
+            for scan in scans |loop|:
+                return scan.count >= CsscLimit::SCAN_RANGE_CHECKS if scan.loop == loop
+            count: u32 = range_checks_in_loop(loop)
+            scans.push(LoopRangeChecks{loop: loop, count: count})
+            count >= CsscLimit::SCAN_RANGE_CHECKS
+
+        def fold_absolute_range_check(compare: LLVMValueRef, check: SymmetricRangeCheck&, builder: LLVMBuilderRef, module: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            position_builder_before(builder, compare)
+            LLVMSetCurrentDebugLocation2(builder, LLVMInstructionGetDebugLoc(compare))
+            name_storage: mutable darray[u8] = []
+            absolute_id: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.abs", name_storage), 8)
+            types: mutable darray[LLVMTypeRef] = [LLVMTypeOf(check.input)]
+            type_slots: void& = (&types[0]).cast[void&] can Unsafe.PointerCast
+            declaration: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, absolute_id, type_slots, 1)
+            arguments: mutable darray[LLVMValueRef] = [check.input, LLVMConstInt(LLVMInt1TypeInContext(context), 0, 0)]
+            argument_slots: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            absolute_storage: mutable darray[u8] = []
+            absolute: LLVMValueRef = LLVMBuildCall2(builder, LLVMIntrinsicGetType(context, absolute_id, type_slots, 1), declaration, argument_slots, 2, sview_to_cstr("range.abs", absolute_storage))
+            invalid_storage: mutable darray[u8] = []
+            invalid: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGT, absolute, LLVMConstInt(LLVMTypeOf(check.input), check.bound, 0), sview_to_cstr("range.invalid", invalid_storage))
+            LLVMReplaceAllUsesWith(compare, invalid)
+            LLVMInstructionEraseFromParent(compare)
+            LLVMInstructionEraseFromParent(check.add) if LLVMGetFirstUse(check.add) == null
+
+        def fold_function_absolute_range_checks(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidates: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, candidates|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    candidates.push(instruction) if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::ICMP)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            scans: mutable darray[LoopRangeChecks] = []
+            changed: mutable u32 = 0
+            for compare in candidates |analyses, scans, builder, module, changed|:
+                continue if in_wide_scan(compare, analyses, scans)
+                if symmetric_range_check(compare) is check:
+                    fold_absolute_range_check(compare, &check, builder, module)
+                    changed <- changed + 1
+            LLVMDisposeBuilder(builder)
+            changed
+
+        def tune_function_range_checks(function: LLVMValueRef, target: void&, tune_extrema: bool, extrema: ExtremaIntrinsics&, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function)
+            return 0 if function_has_string_attribute(function, "target-cpu") or function_has_string_attribute(function, "target-features")
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = 0
+            if tune_extrema and prefers_compare_select_extrema(function, analyses, extrema):
+                use_compare_select_extrema(function, target, LLVMGetModuleContext(module))
+                changed <- 1
+            else:
+                changed <- fold_function_absolute_range_checks(function, analyses, module)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # The range checks rewritten and functions retuned on AArch64 MACHINE.
+        def fold_cssc_absolute_range_checks(module: LLVMModuleRef, machine: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            target: void& = get machine else return 0
+            return 0 if ElisaLLVMTargetMachineIsAArch64(target) == 0
+            changed: mutable u32 = prefer_immediate_range_bias(module)
+            feature_storage: mutable darray[u8] = []
+            return changed if ElisaLLVMTargetMachineChecksFeatures(target, sview_to_cstr("+cssc", feature_storage)) == 0
+            tune_extrema: bool = targets_apple_m5(target)
+            extrema: ExtremaIntrinsics = extrema_intrinsics()
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, target, tune_extrema, extrema, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + tune_function_range_checks(function, target, tune_extrema, &extrema, module)
+            changed
