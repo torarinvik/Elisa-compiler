@@ -27,7 +27,8 @@ it. Exit codes: 1 for a usage error or an unknown pass, 2 for unreadable IR, 3 f
 after the pass.
 
 Registered names: `bit-tests`, `remainder-tests`, `remainder-tails`, `compact-shift-loops`,
-`conditional-doubling`, `decimal-digit-counts`, `power-positions`, `validation-returns`.
+`conditional-doubling`, `decimal-digit-counts`, `power-positions`, `validation-returns`,
+`shared-reciprocals`.
 
 The pass tests in `test/llvm/` and `test/parity/validation_layout_smoke.py` drive the passes
 through this command, using `test/llvm/elisa_llvm_pass.py`

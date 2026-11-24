@@ -171,7 +171,6 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 }
 #include "llvm_checked_mul.cpp"
 extern "C" unsigned elisacoreBoundedLoopUnswitch(LLVMModuleRef);
-#include "llvm_shared_reciprocal.cpp"
 #include "llvm_bounded_factorial.cpp"
 extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);
 extern "C" unsigned elisacoreOptimizeSqrtNonNaN(LLVMModuleRef, LLVMTargetMachineRef);

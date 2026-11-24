@@ -1,0 +1,125 @@
+# Shares one reciprocal between the `fdiv`s of a function that divide by the same
+# denominator, where every division explicitly allows a reciprocal (`arcp`):
+# `a / d`, `b / d`, `c / d` become `r = 1.0 / freeze(d)` and `a * r`, `b * r`, `c * r`.
+# At least three divisions must share the denominator to pay for the reciprocal and its
+# longer live range, and one of them must dominate the rest, so no division is
+# speculated onto a path that never divided.
+include "./ir_editing.elisa"
+include "./loop_pass_policy.elisa"
+
+const module SharedReciprocalLimit:
+    # Bounds compile time: larger functions are left alone.
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+    MINIMUM_DIVISIONS: usize = 3
+    MAXIMUM_DIVISIONS: usize = 64
+
+# `LLVMFastMathFlags` bits from llvm-c/Core.h.
+const module LLVMFastMathFlag:
+    ALLOW_RECIPROCAL: u32 = 16
+    ALLOW_CONTRACT: u32 = 32
+
+# The divisions of one function, grouped by denominator in first-seen order.
+struct ReciprocalGroups:
+    denominators: darray[LLVMValueRef]
+    divisions: darray[LLVMValueRef]
+    # The index in `denominators` of each entry of `divisions`.
+    division_groups: darray[usize]
+
+extend Backend:
+    private:
+        def is_reciprocal_candidate(instruction: LLVMValueRef) -> bool can[Abort.Panic]:
+            return false if LLVMGetInstructionOpcode(instruction) != LLVMOpcode::FDIV
+            type_kind: u32 = LLVMGetTypeKind(LLVMTypeOf(instruction))
+            return false if type_kind != LLVMTypeKindValue::FLOAT and type_kind != LLVMTypeKindValue::DOUBLE
+            return false if (LLVMGetFastMathFlags(instruction) & LLVMFastMathFlag::ALLOW_RECIPROCAL) == 0
+            return false if LLVMIsAConstant(LLVMGetOperand(instruction, 1)) != null
+            ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) == 0
+
+        def group_of_denominator(denominators: darray[LLVMValueRef]&, denominator: LLVMValueRef) -> i64 can[Abort.Panic]:
+            for index in 0..<denominators.count |denominators, denominator|:
+                return index.i64() if denominators[index] == denominator
+            -1
+
+        def collect_reciprocal_groups(function: LLVMValueRef) -> ReciprocalGroups can[Abort.Panic, Memory.Allocate]:
+            denominators: mutable darray[LLVMValueRef] = []
+            divisions: mutable darray[LLVMValueRef] = []
+            division_groups: mutable darray[usize] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, denominators, divisions, division_groups|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, denominators, divisions, division_groups|:
+                    if is_reciprocal_candidate(instruction):
+                        denominator: LLVMValueRef = LLVMGetOperand(instruction, 1)
+                        group: i64 = group_of_denominator(&denominators, denominator)
+                        if group < 0:
+                            denominators.push(denominator)
+                        divisions.push(instruction)
+                        division_groups.push(denominators.count - 1 if group < 0 else group.usize())
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            ReciprocalGroups{denominators: denominators, divisions: divisions, division_groups: division_groups}
+
+        def group_members(groups: ReciprocalGroups&, group: usize) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            members: mutable darray[LLVMValueRef] = []
+            for index in 0..<groups.divisions.count |members, groups, group|:
+                members.push(groups.divisions[index]) if groups.division_groups[index] == group
+            members
+
+        def any_group_shares(groups: ReciprocalGroups&) -> bool can[Abort.Panic, Memory.Allocate]:
+            for group in 0..<groups.denominators.count |groups|:
+                return true if group_members(groups, group).count >= SharedReciprocalLimit::MINIMUM_DIVISIONS
+            false
+
+        # The first division that dominates every other one, if any.
+        def dominating_division(analyses: ElisaFunctionAnalysesRef, members: darray[LLVMValueRef]&) -> LLVMValueRef? can[Abort.Panic]:
+            for candidate in members |analyses, members|:
+                dominates_all: bool = all other in members where other == candidate or ElisaLLVMInstructionDominates(analyses, candidate, other) != 0
+                return candidate if dominates_all
+            null
+
+        def contract_flag(instruction: LLVMValueRef) -> u32:
+            LLVMGetFastMathFlags(instruction) & LLVMFastMathFlag::ALLOW_CONTRACT
+
+        # Rewrites one group around its dominating division `first`; the divisions rewritten.
+        def share_group_reciprocal(builder: LLVMBuilderRef, first: LLVMValueRef, members: darray[LLVMValueRef]&) -> u32 can[Abort.Panic]:
+            position_builder_before(builder, first)
+            denominator: LLVMValueRef = LLVMBuildFreeze(builder, LLVMGetOperand(first, 1), "recip.denominator")
+            reciprocal: LLVMValueRef = LLVMBuildFDiv(builder, LLVMConstReal(LLVMTypeOf(first), 1.0), denominator, "shared.reciprocal")
+            LLVMSetFastMathFlags(reciprocal, LLVMFastMathFlag::ALLOW_RECIPROCAL | contract_flag(first))
+            for division in members |builder, reciprocal|:
+                position_builder_before(builder, division)
+                # No nnan/ninf on the product: a reciprocal can overflow even when the
+                # original quotient is finite.
+                product: LLVMValueRef = LLVMBuildFMul(builder, LLVMGetOperand(division, 0), reciprocal, "recip.product")
+                LLVMSetFastMathFlags(product, contract_flag(division))
+                LLVMReplaceAllUsesWith(division, product)
+                LLVMInstructionEraseFromParent(division)
+            members.count.u32()
+
+        def share_function_reciprocals(builder: LLVMBuilderRef, function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone") or function_has_attribute(function, "strictfp")
+            return 0 if function_instruction_count(function) > SharedReciprocalLimit::FUNCTION_INSTRUCTIONS
+            groups: ReciprocalGroups = collect_reciprocal_groups(function)
+            return 0 if not any_group_shares(&groups)
+            if ElisaLLVMCreateFunctionAnalyses(function) is analyses:
+                changed: mutable u32 = 0
+                for group in 0..<groups.denominators.count |changed, groups, analyses, builder|:
+                    members: darray[LLVMValueRef] = group_members(&groups, group)
+                    continue if members.count < SharedReciprocalLimit::MINIMUM_DIVISIONS or members.count > SharedReciprocalLimit::MAXIMUM_DIVISIONS
+                    if dominating_division(analyses, &members) is first:
+                        changed <- changed + share_group_reciprocal(builder, first, &members)
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+                return changed
+            0
+
+    public:
+        # The `fdiv`s rewritten to multiply by a shared reciprocal.
+        def share_reciprocals(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, builder|:
+                changed <- changed + share_function_reciprocals(builder, function)
+                function_cursor <- LLVMGetNextFunction(function)
+            LLVMDisposeBuilder(builder)
+            changed

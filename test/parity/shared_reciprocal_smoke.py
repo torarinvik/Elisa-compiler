@@ -3,25 +3,12 @@
 import argparse
 from pathlib import Path
 import os
-import shlex
 import subprocess
+import sys
 import tempfile
 
-DRIVER = r'''
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/raw_ostream.h>
-#include "llvm_shared_reciprocal.cpp"
-int main(int argc,char **argv){
- llvm::LLVMContext C;llvm::SMDiagnostic E;auto M=llvm::parseIRFile(argv[1],E,C);
- if(!M){E.print(argv[0],llvm::errs());return 1;}
- unsigned changed=elisacoreShareReciprocals(llvm::wrap(M.get()));
- if(llvm::verifyModule(*M,&llvm::errs()))return 2;
- if(elisacoreShareReciprocals(llvm::wrap(M.get())))return 3;
- llvm::errs()<<"changed "<<changed<<"\n";M->print(llvm::outs(),nullptr);
-}'''
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'llvm'))
+from elisa_llvm_pass import run_pass
 
 def three(name, ty='double', flags='arcp contract', attrs=''):
     return f'''define {ty} @{name}({ty} %a,{ty} %b,{ty} %c,{ty} %d) {attrs} {{
@@ -125,21 +112,20 @@ int main(void){
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--llvm-config',default='llvm-config')
-    args=p.parse_args();repo=Path(__file__).resolve().parents[2]
-    def config(*flags):return shlex.split(subprocess.check_output([args.llvm_config,*flags],text=True))
+    args=p.parse_args()
     bindir=Path(subprocess.check_output([args.llvm_config,'--bindir'],text=True).strip())
     prefix=['gtimeout' if os.uname().sysname=='Darwin' else 'timeout','-k','.1s','29s']
     def run(c,**kw):return subprocess.run(prefix+list(map(str,c)),check=True,**kw)
     with tempfile.TemporaryDirectory(prefix='elisa-reciprocal-') as tmp:
-        root=Path(tmp);cpp=root/'driver.cpp';cpp.write_text(DRIVER);driver=root/'driver'
-        run([bindir/'clang++',*config('--cxxflags'),'-O2','-I',repo/'src/backend',cpp,*config('--ldflags','--libs','core','irreader','analysis','--system-libs'),'-o',driver])
-        source=root/'input.ll';source.write_text(IR)
-        result=run([driver,source],capture_output=True,text=True)
-        if result.stderr.strip()!='changed 15':raise RuntimeError(result.stderr)
+        root=Path(tmp)
+        # `elisac llvm-pass` verifies the module after the pass (exit 3 when invalid).
+        changed,module=run_pass('shared-reciprocals',IR)
+        if changed!=15:raise RuntimeError('changed '+str(changed))
+        if run_pass('shared-reciprocals',module)[0]!=0:raise RuntimeError('not idempotent')
         for name,expected in [('shared',1),('shared32',1),('strict',3),('strict_attr',3),('two',2),('different',3),('siblings',3),('crossblock',1),('dependent',2)]:
-            body=result.stdout.split('@'+name+'(',1)[1].split('\n}',1)[0]
+            body=module.split('@'+name+'(',1)[1].split('\n}',1)[0]
             if body.count('fdiv ')!=expected:raise RuntimeError('unexpected division count: '+name)
-        out=root/'out.ll';out.write_text(result.stdout);obj=root/'out.o'
+        out=root/'out.ll';out.write_text(module);obj=root/'out.o'
         run([bindir/'llc','-O3','-filetype=obj',out,'-o',obj])
         c=root/'check.c';c.write_text(NATIVE);exe=root/'check'
         run([bindir/'clang','-O2','-ffp-contract=off',c,obj,'-o',exe,'-lm']);run([exe])

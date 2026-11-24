@@ -27,9 +27,6 @@ static unsigned writeFunctions(Module &Module, const Set &Selected, LLVMValueRef
     return Pass(*unwrap(Module), Target);                                                 \
   }
 
-extern "C" unsigned elisacoreShareReciprocalsEntry(LLVMModuleRef Module) {
-  return elisacoreShareReciprocals(Module);
-}
 extern "C" unsigned elisacoreShouldRevisitNestedVectorLoops(LLVMModuleRef Module) {
   return shouldRevisitNestedVectorLoops(*unwrap(Module));
 }
