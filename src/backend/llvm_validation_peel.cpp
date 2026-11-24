@@ -47,6 +47,7 @@
 #include "llvm_proven_checks.h"
 #include "llvm_validated_reads.h"
 #include "llvm_bounded_trip_ranges.h"
+#include "llvm_bisection_check_versioning.h"
 
 using namespace llvm;
 
@@ -57,6 +58,7 @@ extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
   if (!Module) return 0;
   unsigned Removed = ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(Module));
   Removed += ElisaValidatedReads::annotateValidatedReads(*unwrap(Module));
+  Removed += ElisaBisectionChecks::versionBisectionChecks(*unwrap(Module));
   return Removed + ElisaViewBounds::shrinkViewFills(*unwrap(Module));
 }
 
