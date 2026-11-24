@@ -9,9 +9,10 @@ one.
 
 | Directory | What it holds |
 |---|---|
-| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution (constant maximum backedge-taken counts, unsigned range maxima), value-tracking facts (including implied conditions and context-sensitive poison checks), lazy value ranges, PatternMatch constant tests (`m_One`, `m_Zero`, `m_SpecificInt`, which also accept splat vectors), constant-integer bit queries (`isMask` width, agreement in the low bits, trailing zeros, the odd part, `getLowBitsSet` constants, unsigned comparison), instruction memory queries (`mayHaveSideEffects`, `mayReadOrWriteMemory`), `stripPointerCasts`, target-triple queries (`isAArch64`, `isMacOSX`) on a module or a target machine, and subtarget feature checks (`checkFeatures`). `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows, subtraction, membership, and signed- and unsigned-maximum queries. `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks, dead-block deletion, unreachable-block removal, function cloning, call inlining and compare predicates. |
+| `src/backend/llvm_c_api/` | The C shims. Each area has a header (`.h`), a C++ file (`.cpp`) that wraps the LLVM C++ API in `extern "C"` functions, and the Elisa `extern` declarations (`.elisa`). `elisa_llvm_analysis` covers dominator trees and edge dominance, loops, scalar evolution (constant maximum backedge-taken counts, unsigned range maxima), value-tracking facts (including implied conditions and context-sensitive poison checks), lazy value ranges, PatternMatch constant tests (`m_One`, `m_Zero`, `m_SpecificInt`, which also accept splat vectors), constant-integer bit queries (`isMask` width, agreement in the low bits, trailing zeros, the odd part, `getLowBitsSet` constants, unsigned comparison), instruction memory queries (`mayHaveSideEffects`, `mayReadOrWriteMemory`), `stripPointerCasts`, `GetPointerBaseWithConstantOffset`, alloca queries (`isStaticAlloca`, `isUsedWithInAlloca`, `isSwiftError`), the bytes of a wide integer constant, target-triple queries (`isAArch64`, `isMacOSX`) on a module or a target machine, and subtarget feature checks (`checkFeatures`). `elisa_llvm_constant_range` exposes `llvm::ConstantRange` as an opaque handle: the range a compare allows, subtraction, membership, and signed- and unsigned-maximum queries. `elisa_llvm_ir_edits` covers IR edits the C API lacks, such as phi incoming blocks, dead-block deletion, unreachable-block removal, function cloning, call inlining and compare predicates. |
 | `src/backend/llvm_passes/` | The standalone passes. `llvm_passes.elisa` includes every pass. `llvm_pass_registry.elisa` maps a pass name to its entry point. |
 | `src/backend/llvm_passes/ir/` | The shared IR helpers. `ir_editing.elisa`, `llvm_ir_queries.elisa` and `llvm_ir_constants.elisa` hold the editing helpers, IR queries and the LLVM 23 enum values (for example, `br` is now opcode 70 unconditional and 71 conditional). `loop_pass_policy.elisa` decides which functions a pass skips. |
+| `src/backend/llvm_passes/small_fills/` | The small-fill expansion and the byte- and word-store merges it runs first. `linked_helpers.elisa` links a helper written in textual IR into the module and inlines it at each expanded site. |
 | `src/backend/llvm_passes/late_cleanup/` | The late scalar cleanup (`late_scalar_cleanup.elisa`) and the folds it runs, one file each. |
 | `src/backend/llvm_*.cpp` | The C++ passes not yet ported. `scripts/build_stage1_llvm_bridge.sh` lists the sources it compiles. |
 
@@ -40,7 +41,7 @@ Registered names: `bit-tests`, `remainder-tests`, `remainder-tails`, `compact-sh
 machine when given a CPU), `guarded-unsigned-compares`, `vector-or-accumulators`,
 `exit-dead-stores` (on any target; the pipeline runs it on AArch64),
 `nested-vector-loops` (prints 1 when the late cleanup would rerun O3 for the module),
-`cssc-range-checks` (needs a CPU; without one it changes nothing).
+`cssc-range-checks` (needs a CPU; without one it changes nothing), `small-fills`.
 
 The pass tests in `test/llvm/` and `test/parity/validation_layout_smoke.py` drive the passes
 through this command, using `test/llvm/elisa_llvm_pass.py`
@@ -69,3 +70,5 @@ Porting traps seen so far:
   `is_call_base` in `ir/ir_editing.elisa`, which tests the call, invoke and callbr opcodes.
 - Match the C++ predicate exactly. For example, `Triple::isAArch64()` is not a prefix test on
   the triple string, so it is a shim.
+- A string literal cannot span lines. Write a textual-IR helper as an array of lines, as
+  `small_fills/stack_word_pattern_fills.elisa` does; `link_internal_helper` joins them.

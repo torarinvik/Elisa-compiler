@@ -1,0 +1,116 @@
+# Keeps small constant word-pattern fills of fixed stack arrays in the generated function on
+# macOS, rather than calling the Darwin pattern-fill runtime: each function's single
+# `llvm.experimental.memset.pattern` of an i64 word into a `[N x i64]` alloca (N <= 64) is
+# replaced by an inlined two-lane loop.
+include "./fill_queries.elisa"
+include "./linked_helpers.elisa"
+include "../ir/loop_pass_policy.elisa"
+
+const module WordPatternLimit:
+    ALIGNMENT: u64 = 8
+    ELEMENTS: u64 = 64
+
+extend Backend:
+    private:
+        def stack_word_pattern_fill_ir() -> darray[sview] can[Abort.Panic, Memory.Allocate]:
+            lines: darray[sview] = [
+                "define void @__elisacore_fill_stack_words(ptr %base, i64 %n, i64 %word) alwaysinline {",
+                "entry:",
+                "  %lane = insertelement <2 x i64> poison, i64 %word, i32 0",
+                "  %pattern = shufflevector <2 x i64> %lane, <2 x i64> poison, <2 x i32> zeroinitializer",
+                "  %groups = lshr i64 %n, 2",
+                "  %more = icmp ne i64 %groups, 0",
+                "  br i1 %more, label %bulk, label %tail",
+                "bulk:",
+                "  %i = phi i64 [ 0, %entry ], [ %next, %bulk ]",
+                "  %offset = shl i64 %i, 2",
+                "  %p = getelementptr i64, ptr %base, i64 %offset",
+                "  %p2 = getelementptr i64, ptr %p, i64 2",
+                "  store <2 x i64> %pattern, ptr %p, align 8",
+                "  store <2 x i64> %pattern, ptr %p2, align 8",
+                "  %next = add i64 %i, 1",
+                "  %repeat = icmp ult i64 %next, %groups",
+                "  br i1 %repeat, label %bulk, label %tail",
+                "tail:",
+                "  %left = and i64 %n, 3",
+                "  %start = and i64 %n, -4",
+                "  %p3 = getelementptr i64, ptr %base, i64 %start",
+                "  %has_two = icmp uge i64 %left, 2",
+                "  br i1 %has_two, label %pair, label %single",
+                "pair:",
+                "  store <2 x i64> %pattern, ptr %p3, align 8",
+                "  br label %single",
+                "single:",
+                "  %odd = trunc i64 %n to i1",
+                "  br i1 %odd, label %last, label %exit",
+                "last:",
+                "  %last_index = sub i64 %n, 1",
+                "  %last_ptr = getelementptr i64, ptr %base, i64 %last_index",
+                "  store i64 %word, ptr %last_ptr, align 8",
+                "  br label %exit",
+                "exit:",
+                "  ret void",
+                "}"
+            ]
+            lines
+
+        # A fixed `[1..64 x i64]` stack array: a static, single, address-space-0 alloca.
+        def is_fixed_word_array(pointer: LLVMValueRef) -> bool:
+            return false if LLVMIsAAllocaInst(pointer) == null or ElisaLLVMIsStaticAlloca(pointer) == 0
+            size: LLVMValueRef = LLVMGetOperand(pointer, 0)
+            return false if LLVMIsAConstantInt(size) == null or ElisaLLVMConstantIntEquals(size, 1) == 0
+            return false if LLVMGetPointerAddressSpace(LLVMTypeOf(pointer)) != 0 or ElisaLLVMAllocaIsUsedWithInAlloca(pointer) != 0 or ElisaLLVMAllocaIsSwiftError(pointer) != 0
+            array: LLVMTypeRef = LLVMGetAllocatedType(pointer)
+            return false if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or not is_llvm_integer_type(LLVMGetElementType(array), 64)
+            LLVMGetArrayLength2(array) != 0 and LLVMGetArrayLength2(array) <= WordPatternLimit::ELEMENTS
+
+        # A plain constant i64 pattern fill of a fixed stack word array.
+        def is_stack_word_pattern_fill(instruction: LLVMValueRef, pattern_fill: u32, align_kind: u32) -> bool:
+            return false if called_intrinsic_id(instruction) != pattern_fill or call_is_volatile(instruction) or LLVMGetNumOperandBundles(instruction) != 0
+            return false if destination_alignment(instruction, align_kind) < WordPatternLimit::ALIGNMENT
+            value: LLVMValueRef = LLVMGetOperand(instruction, 1)
+            return false if LLVMIsAConstantInt(value) == null or not is_llvm_integer_type(LLVMTypeOf(value), 64)
+            return false if not is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(instruction, 2)), 64)
+            is_fixed_word_array(LLVMGetOperand(instruction, 0))
+
+        # The function's stack word pattern fill when it has exactly one.
+        def single_stack_word_pattern_fill(function: LLVMValueRef, pattern_fill: u32, align_kind: u32) -> LLVMValueRef?:
+            found: mutable LLVMValueRef? = null
+            count: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, found, count, pattern_fill, align_kind|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, found, count, pattern_fill, align_kind|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if is_stack_word_pattern_fill(instruction, pattern_fill, align_kind):
+                        found <- instruction
+                        count <- count + 1
+            return null if count != 1
+            found
+
+    public:
+        # The pattern fills inlined, on macOS.
+        def inline_stack_word_pattern_fills(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetIsMacOSX(module) == 0 or module_has_named_value(module, "__elisacore_fill_stack_words")
+            name_storage: mutable darray[u8] = []
+            pattern_fill: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.experimental.memset.pattern", name_storage), 32)
+            align_kind: u32 = attribute_kind("align")
+            work: mutable darray[LLVMValueRef] = []
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, work, pattern_fill, align_kind|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if function_is_size_optimized(function) or function_is_sanitized(function)
+                if single_stack_word_pattern_fill(function, pattern_fill, align_kind) is fill:
+                    work.push(fill)
+            return 0 if work.count == 0
+            helper_lines: darray[sview] = stack_word_pattern_fill_ir()
+            routine: LLVMValueRef = get link_internal_helper(module, &helper_lines, "__elisacore_fill_stack_words") else return 0
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            for fill in work |routine, builder, changed|:
+                arguments: darray[LLVMValueRef] = [LLVMGetOperand(fill, 0), LLVMGetOperand(fill, 2), LLVMGetOperand(fill, 1)]
+                changed <- changed + 1 if inline_helper_at(fill, routine, &arguments, builder)
+            LLVMDisposeBuilder(builder)
+            delete_unused_helper(routine)
+            changed

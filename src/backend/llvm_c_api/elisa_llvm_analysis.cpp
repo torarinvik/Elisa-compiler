@@ -341,6 +341,28 @@ int ElisaLLVMUnderlyingObjectsAreAllocas(LLVMValueRef pointer) {
          llvm::all_of(Objects, [](const Value *Object) { return isa<AllocaInst>(Object); });
 }
 
+LLVMValueRef ElisaLLVMPointerBaseWithConstantOffset(LLVMValueRef pointer, LLVMModuleRef module,
+                                                    int64_t *offset) {
+  return wrap(GetPointerBaseWithConstantOffset(unwrap(pointer), *offset,
+                                               unwrap(module)->getDataLayout()));
+}
+
+int ElisaLLVMIsStaticAlloca(LLVMValueRef alloca) {
+  return cast<AllocaInst>(unwrap(alloca))->isStaticAlloca();
+}
+
+int ElisaLLVMAllocaIsUsedWithInAlloca(LLVMValueRef alloca) {
+  return cast<AllocaInst>(unwrap(alloca))->isUsedWithInAlloca();
+}
+
+int ElisaLLVMAllocaIsSwiftError(LLVMValueRef alloca) {
+  return cast<AllocaInst>(unwrap(alloca))->isSwiftError();
+}
+
+unsigned ElisaLLVMConstantIntByte(LLVMValueRef constant, unsigned index) {
+  return cast<ConstantInt>(unwrap(constant))->getValue().extractBitsAsZExtValue(8, 8 * index);
+}
+
 unsigned ElisaLLVMBlockNumber(LLVMBasicBlockRef block) { return unwrap(block)->getNumber(); }
 
 unsigned ElisaLLVMFunctionMaxBlockNumber(LLVMValueRef function) {

@@ -101,6 +101,16 @@ int ElisaLLVMMayReadFromMemory(LLVMValueRef instruction);
 /* llvm::getUnderlyingObjects(pointer, objects, no loop info, no lookup limit) found at
  * least one object, and every one is an alloca. */
 int ElisaLLVMUnderlyingObjectsAreAllocas(LLVMValueRef pointer);
+/* GetPointerBaseWithConstantOffset under the module's data layout: the base, with the byte
+ * offset stored through `offset`. */
+LLVMValueRef ElisaLLVMPointerBaseWithConstantOffset(LLVMValueRef pointer, LLVMModuleRef module,
+                                                    int64_t *offset);
+/* AllocaInst::isStaticAlloca, isUsedWithInAlloca and isSwiftError. */
+int ElisaLLVMIsStaticAlloca(LLVMValueRef alloca);
+int ElisaLLVMAllocaIsUsedWithInAlloca(LLVMValueRef alloca);
+int ElisaLLVMAllocaIsSwiftError(LLVMValueRef alloca);
+/* Byte INDEX (little-endian order) of a ConstantInt of any width. */
+unsigned ElisaLLVMConstantIntByte(LLVMValueRef constant, unsigned index);
 /* BasicBlock::getNumber: the block's number, below its function's
  * ElisaLLVMFunctionMaxBlockNumber, for indexing per-block arrays. */
 unsigned ElisaLLVMBlockNumber(LLVMBasicBlockRef block);

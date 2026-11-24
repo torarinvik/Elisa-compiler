@@ -1,0 +1,149 @@
+# Word stores assembled from byte stores, in functions with optimization and no sanitizer:
+#
+# - A low byte followed by a 7-byte zero fill is one little-endian i64 store.
+# - Four stores of a 32-bit word's bytes, most significant first, are one byte-reversed
+#   unaligned i32 store (`rev` on AArch64).
+include "./fill_queries.elisa"
+include "../ir/loop_pass_policy.elisa"
+
+const module ByteStoreLimit:
+    ZERO_FILL_BYTES: u64 = 7
+    SCAN_STEPS: u32 = 8
+    WORD_BYTES: usize = 4
+    # INT64_MAX - 7 and INT64_MIN + 3.
+    MAXIMUM_STORE_OFFSET: i64 = 9223372036854775800
+    MINIMUM_LAST_OFFSET: i64 = -9223372036854775805
+
+extend Backend:
+    private:
+        # A simple, metadata-free store into address space 0.
+        def is_plain_store(store: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(store, LLVMOpcode::STORE) or LLVMGetVolatile(store) != 0 or LLVMGetOrdering(store) != 0
+            ElisaLLVMHasMetadataOtherThanDebugLoc(store) == 0 and LLVMGetPointerAddressSpace(LLVMTypeOf(LLVMGetOperand(store, 1))) == 0
+
+        # Whether INSTRUCTION can be stepped over while looking for an adjacent store.
+        def is_memory_inert(instruction: LLVMValueRef) -> bool:
+            ElisaLLVMMayReadOrWriteMemory(instruction) == 0 and ElisaLLVMMayHaveSideEffects(instruction) == 0 and not is_call_base(instruction)
+
+        # The plain i8 store before FILL, past at most eight instructions that touch no memory.
+        def store_before_zero_fill(fill: LLVMValueRef) -> LLVMValueRef?:
+            previous: mutable LLVMValueRef? = LLVMGetPreviousInstruction(fill)
+            for _ in 0..<ByteStoreLimit::SCAN_STEPS |previous|:
+                if previous is candidate:
+                    break if not is_memory_inert(candidate)
+                    previous <- LLVMGetPreviousInstruction(candidate)
+            store: LLVMValueRef = get previous else return null
+            return null if not is_plain_store(store) or not is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(store, 0)), 8)
+            store
+
+        def merge_zero_extended_byte_store(fill: LLVMValueRef, memset_ids: MemsetIntrinsics&, builder: LLVMBuilderRef, module: LLVMModuleRef) -> bool can[Unsafe.PointerCast]:
+            return false if not is_memset(fill, memset_ids) or call_is_volatile(fill) or LLVMGetNumOperandBundles(fill) != 0
+            return false if ElisaLLVMHasMetadataOtherThanDebugLoc(fill) != 0 or LLVMGetPointerAddressSpace(LLVMTypeOf(LLVMGetOperand(fill, 0))) != 0
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            byte: LLVMValueRef = LLVMGetOperand(fill, 1)
+            return false if LLVMIsAConstantInt(length) == null or ElisaLLVMConstantIntEquals(length, ByteStoreLimit::ZERO_FILL_BYTES) == 0
+            return false if LLVMIsAConstantInt(byte) == null or ElisaLLVMConstantIntEquals(byte, 0) == 0
+            store: LLVMValueRef = get store_before_zero_fill(fill) else return false
+            stored: PointerBase = pointer_base(LLVMGetOperand(store, 1), module)
+            filled: PointerBase = pointer_base(LLVMGetOperand(fill, 0), module)
+            return false if stored.base != filled.base or stored.offset > ByteStoreLimit::MAXIMUM_STORE_OFFSET or filled.offset != stored.offset + 1
+            position_builder_before(builder, fill)
+            name_storage: mutable darray[u8] = []
+            word: LLVMValueRef = LLVMBuildZExt(builder, LLVMGetOperand(store, 0), LLVMInt64TypeInContext(LLVMGetModuleContext(module)), sview_to_cstr("", name_storage))
+            merged: LLVMValueRef = LLVMBuildStore(builder, word, LLVMGetOperand(store, 1))
+            LLVMSetAlignment(merged, LLVMGetAlignment(store))
+            LLVMInstructionEraseFromParent(fill)
+            LLVMInstructionEraseFromParent(store)
+            true
+
+        # The 32-bit word whose byte at SHIFT bits a plain i8 store writes.
+        def stored_word_byte(store: LLVMValueRef, shift: u64) -> LLVMValueRef?:
+            return null if not is_plain_store(store)
+            byte: LLVMValueRef = LLVMGetOperand(store, 0)
+            return null if not is_llvm_instruction_with_opcode(byte, LLVMOpcode::TRUNC) or not is_llvm_integer_type(LLVMTypeOf(byte), 8)
+            word: LLVMValueRef = LLVMGetOperand(byte, 0)
+            return null if not is_llvm_integer_type(LLVMTypeOf(word), 32)
+            return word if shift == 0
+            return null if not is_llvm_instruction_with_opcode(word, LLVMOpcode::LSHR)
+            amount: LLVMValueRef = LLVMGetOperand(word, 1)
+            return null if LLVMIsAConstantInt(amount) == null or ElisaLLVMConstantIntEquals(amount, shift) == 0
+            LLVMGetOperand(word, 0)
+
+        # LAST and the stores of the word's higher bytes just before it, highest last.
+        def word_byte_stores(last: LLVMValueRef, word: LLVMValueRef, base: PointerBase, module: LLVMModuleRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            stores: mutable darray[LLVMValueRef] = [last]
+            earlier_cursor: mutable LLVMValueRef? = LLVMGetPreviousInstruction(last)
+            while earlier_cursor is earlier |earlier_cursor, stores, word, base, module|:
+                break if stores.count >= ByteStoreLimit::WORD_BYTES
+                earlier_cursor <- LLVMGetPreviousInstruction(earlier)
+                continue if is_memory_inert(earlier)
+                break if not optional_equals(stored_word_byte(earlier, 8 * stores.count.u64()), word)
+                placed: PointerBase = pointer_base(LLVMGetOperand(earlier, 1), module)
+                break if placed.base != base.base or placed.offset != base.offset - stores.count.i64()
+                stores.push(earlier)
+            stores
+
+        def merge_big_endian_word_store(last: LLVMValueRef, builder: LLVMBuilderRef, byte_swap: u32, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            word: LLVMValueRef = get stored_word_byte(last, 0) else return false
+            base: PointerBase = pointer_base(LLVMGetOperand(last, 1), module)
+            return false if base.offset < ByteStoreLimit::MINIMUM_LAST_OFFSET
+            stores: darray[LLVMValueRef] = word_byte_stores(last, word, base, module)
+            return false if stores.count != ByteStoreLimit::WORD_BYTES
+            position_builder_before(builder, last)
+            types: mutable darray[LLVMTypeRef] = [LLVMTypeOf(word)]
+            type_slots: void& = (&types[0]).cast[void&]
+            declaration: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, byte_swap, type_slots, 1)
+            arguments: mutable darray[LLVMValueRef] = [word]
+            name_storage: mutable darray[u8] = []
+            reversed: LLVMValueRef = LLVMBuildCall2(builder, LLVMIntrinsicGetType(LLVMGetModuleContext(module), byte_swap, type_slots, 1), declaration, (&arguments[0]).cast[void&], 1, sview_to_cstr("", name_storage))
+            highest: LLVMValueRef = stores[stores.count - 1]
+            merged: LLVMValueRef = LLVMBuildStore(builder, reversed, LLVMGetOperand(highest, 1))
+            LLVMSetAlignment(merged, LLVMGetAlignment(highest))
+            for store in stores:
+                LLVMInstructionEraseFromParent(store)
+            true
+
+        def merges_byte_stores_in(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            not function_is_size_optimized(function) and not function_is_sanitized(function)
+
+    public:
+        # The low-byte stores and zero fills merged into word stores.
+        def merge_zero_extended_byte_stores(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_debug_info(module)
+            memset_ids: MemsetIntrinsics = memset_intrinsics()
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, memset_ids, builder, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if not merges_byte_stores_in(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, memset_ids, builder, module|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while cursor is instruction |cursor, changed, memset_ids, builder, module|:
+                        cursor <- LLVMGetNextInstruction(instruction)
+                        changed <- changed + 1 if merge_zero_extended_byte_store(instruction, &memset_ids, builder, module)
+            LLVMDisposeBuilder(builder)
+            changed
+
+        # The big-endian word serializations merged into byte-reversed word stores.
+        def merge_big_endian_word_stores(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_debug_info(module)
+            name_storage: mutable darray[u8] = []
+            byte_swap: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.bswap", name_storage), 10)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, byte_swap, builder, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if not merges_byte_stores_in(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, byte_swap, builder, module|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while cursor is instruction |cursor, changed, byte_swap, builder, module|:
+                        cursor <- LLVMGetNextInstruction(instruction)
+                        changed <- changed + 1 if merge_big_endian_word_store(instruction, builder, byte_swap, module)
+            LLVMDisposeBuilder(builder)
+            changed

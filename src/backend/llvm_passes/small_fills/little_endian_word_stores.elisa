@@ -1,0 +1,193 @@
+# Merges a run of narrow stores that together write the little-endian bytes of one word.
+# Instruction combining rewrites `lshr (sext x), 32` into `ashr x, 31`, which hides the
+# upper bytes of a sign-extended serialization from the target's store merging, so
+# `store_i64_le(x.i64())` became one 32-bit store and four byte stores instead of one
+# 64-bit store.
+include "./fill_queries.elisa"
+include "../ir/loop_pass_policy.elisa"
+
+const module WordStoreLimit:
+    WORD_BYTES: i64 = 8
+    BYTE_DEPTH: u32 = 6
+    MAXIMUM_BITS: u32 = 64
+    SIGN_BYTE: i32 = -1
+
+# Byte INDEX of SOURCE, its sign byte when INDEX is -1, or a zero byte when SOURCE is null.
+struct ByteReference:
+    source: LLVMValueRef?
+    index: i32
+
+# A store of BYTES bytes at OFFSET from the run's base; null once merged away.
+struct StorePiece:
+    store: LLVMValueRef?
+    offset: i64
+    bytes: u32
+
+extend Backend:
+    private:
+        def zero_byte() -> ByteReference:
+            ByteReference{source: null, index: 0}
+
+        def byte_width(value: LLVMValueRef) -> u32:
+            LLVMGetIntTypeWidth(LLVMTypeOf(value)) / 8
+
+        def same_byte(reference: ByteReference&, source: LLVMValueRef, index: i32) -> bool:
+            optional_equals(reference.source, source) and reference.index == index
+
+        # A shift by whole bytes moves byte BYTE to BYTE + amount / 8 of the operand.
+        def shifted_byte(operation: LLVMValueRef, byte: u32, depth: u32, width: u32) -> ByteReference?:
+            operand: LLVMValueRef = LLVMGetOperand(operation, 0)
+            arithmetic: bool = LLVMGetInstructionOpcode(operation) == LLVMOpcode::ASHR
+            amount_value: LLVMValueRef = LLVMGetOperand(operation, 1)
+            if LLVMGetNumOperands(operation) != 2 or LLVMIsAConstantInt(amount_value) == null:
+                return ByteReference{source: operation, index: byte.i32()}
+            amount: u64 = LLVMConstIntGetZExtValue(amount_value)
+            if amount % 8 != 0:
+                # `ashr x, bits - 1` is the sign byte everywhere.
+                return ByteReference{source: operand, index: WordStoreLimit::SIGN_BYTE} if arithmetic and amount + 1 == width.u64()
+                return ByteReference{source: operation, index: byte.i32()}
+            source: u64 = byte.u64() + amount / 8
+            return byte_of(operand, source.u32(), depth + 1) if source < byte_width(operand).u64()
+            return zero_byte() if not arithmetic
+            ByteReference{source: operand, index: WordStoreLimit::SIGN_BYTE}
+
+        # Which byte of which value byte BYTE of CANDIDATE is, through truncations,
+        # extensions and whole-byte shifts.
+        def byte_of(candidate: LLVMValueRef, byte: u32, depth: u32) -> ByteReference?:
+            type: LLVMTypeRef = LLVMTypeOf(candidate)
+            return null if LLVMGetTypeKind(type) != LLVMTypeKindValue::INTEGER
+            width: u32 = LLVMGetIntTypeWidth(type)
+            return null if width % 8 != 0 or byte >= width / 8 or depth > WordStoreLimit::BYTE_DEPTH
+            return zero_byte() if LLVMIsAConstantInt(candidate) != null and ElisaLLVMConstantIntByte(candidate, byte) == 0
+            here: ByteReference = ByteReference{source: candidate, index: byte.i32()}
+            return here if LLVMIsAInstruction(candidate) == null
+            opcode: u32 = LLVMGetInstructionOpcode(candidate)
+            if opcode == LLVMOpcode::TRUNC:
+                return byte_of(LLVMGetOperand(candidate, 0), byte, depth + 1)
+            if opcode == LLVMOpcode::SEXT or opcode == LLVMOpcode::ZEXT:
+                operand: LLVMValueRef = LLVMGetOperand(candidate, 0)
+                return here if LLVMGetIntTypeWidth(LLVMTypeOf(operand)) % 8 != 0
+                return byte_of(operand, byte, depth + 1) if byte < byte_width(operand)
+                return zero_byte() if opcode == LLVMOpcode::ZEXT
+                return ByteReference{source: operand, index: WordStoreLimit::SIGN_BYTE}
+            return shifted_byte(candidate, byte, depth, width) if opcode == LLVMOpcode::LSHR or opcode == LLVMOpcode::ASHR
+            here
+
+        # A value whose bytes are BYTES, built at the builder from their common source.
+        def word_of(bytes: darray[ByteReference]&, builder: LLVMBuilderRef, context: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            source: LLVMValueRef = get bytes[0].source else return null
+            return null if bytes[0].index != 0
+            width: u32 = byte_width(source)
+            signed: mutable bool = false
+            zero: mutable bool = false
+            for byte in 0..<bytes.count |bytes, source, width, signed, zero|:
+                reference: ByteReference = bytes[byte]
+                if byte.u32() < width:
+                    return null if not same_byte(&reference, source, byte.i32())
+                elif same_byte(&reference, source, WordStoreLimit::SIGN_BYTE):
+                    signed <- true
+                elif reference.source == null:
+                    zero <- true
+                else:
+                    return null
+            return null if signed and zero
+            word: LLVMTypeRef = LLVMIntTypeInContext(context, 8 * bytes.count.u32())
+            return source if width.usize() == bytes.count
+            name_storage: mutable darray[u8] = []
+            name: cstr = sview_to_cstr("", name_storage)
+            return LLVMBuildTrunc(builder, source, word, name) if width.usize() > bytes.count
+            return LLVMBuildSExt(builder, source, word, name) if signed
+            LLVMBuildZExt(builder, source, word, name)
+
+        # Merges the eight-byte group starting at piece FIRST, when the run's stores cover
+        # it exactly, without partial overlap, and its bytes form one word.
+        def merge_word_group(run: mutable darray[StorePiece]&, first: usize, builder: LLVMBuilderRef, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            start: StorePiece = run[first]
+            start_store: LLVMValueRef = get start.store else return false
+            members: mutable darray[usize] = []
+            bytes: mutable darray[ByteReference] = [zero_byte() for _ in 0..<8]
+            written: mutable darray[bool] = [false for _ in 0..<8]
+            for other in 0..<run.count |run, start, members, bytes, written|:
+                candidate: StorePiece = run[other]
+                if candidate.store is store:
+                    begin: i64 = candidate.offset - start.offset
+                    end: i64 = begin + candidate.bytes.i64()
+                    continue if end <= 0 or begin >= WordStoreLimit::WORD_BYTES
+                    # A partial overlap, or a store before the group that a later member
+                    # would be moved over, cannot be merged.
+                    return false if begin < 0 or end > WordStoreLimit::WORD_BYTES
+                    for byte in 0..<candidate.bytes |store, begin, bytes, written|:
+                        reference: ByteReference = get byte_of(LLVMGetOperand(store, 0), byte, 0) else return false
+                        slot: usize = (begin + byte.i64()).usize()
+                        return false if written[slot]
+                        bytes[slot] <- reference
+                        written[slot] <- true
+                    members.push(other)
+            return false if members.count < 2 or any covered in written where not covered
+            last: LLVMValueRef = get run[members[members.count - 1]].store else return false
+            position_builder_before(builder, last)
+            word: LLVMValueRef = get word_of(&bytes, builder, context) else return false
+            merged: LLVMValueRef = LLVMBuildStore(builder, word, LLVMGetOperand(start_store, 1))
+            LLVMSetAlignment(merged, LLVMGetAlignment(start_store))
+            for member in members |run|:
+                if run[member].store is store:
+                    LLVMInstructionEraseFromParent(store)
+                run[member] <- StorePiece{store: null, offset: run[member].offset, bytes: run[member].bytes}
+            true
+
+        def merge_store_run(run: mutable darray[StorePiece]&, builder: LLVMBuilderRef, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if run.count <= 1
+            changed: mutable u32 = 0
+            for first in 0..<run.count |run, builder, context, changed|:
+                changed <- changed + 1 if merge_word_group(run, first, builder, context)
+            changed
+
+        # The stored integer's byte count when STORE can join a run: simple, into address
+        # space 0, of a whole number of bytes up to eight.
+        def mergeable_store_bytes(instruction: LLVMValueRef) -> u32:
+            return 0 if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::STORE) or LLVMGetVolatile(instruction) != 0 or LLVMGetOrdering(instruction) != 0
+            type: LLVMTypeRef = LLVMTypeOf(LLVMGetOperand(instruction, 0))
+            return 0 if LLVMGetTypeKind(type) != LLVMTypeKindValue::INTEGER or LLVMGetPointerAddressSpace(LLVMTypeOf(LLVMGetOperand(instruction, 1))) != 0
+            width: u32 = LLVMGetIntTypeWidth(type)
+            return 0 if width % 8 != 0 or width > WordStoreLimit::MAXIMUM_BITS
+            width / 8
+
+        def merge_block_word_stores(block: LLVMBasicBlockRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            changed: mutable u32 = 0
+            run: mutable darray[StorePiece] = []
+            base: mutable LLVMValueRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, changed, run, base, builder, module, context|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                bytes: u32 = mergeable_store_bytes(instruction)
+                if bytes == 0:
+                    if ElisaLLVMMayReadOrWriteMemory(instruction) != 0 or ElisaLLVMMayHaveSideEffects(instruction) != 0:
+                        changed <- changed + merge_store_run(run, builder, context)
+                        run.clear()
+                        base <- null
+                    continue
+                placed: PointerBase = pointer_base(LLVMGetOperand(instruction, 1), module)
+                if base != null and not optional_equals(base, placed.base):
+                    changed <- changed + merge_store_run(run, builder, context)
+                    run.clear()
+                base <- placed.base
+                run.push(StorePiece{store: instruction, offset: placed.offset, bytes: bytes})
+            changed + merge_store_run(run, builder, context)
+
+    public:
+        # The store runs merged into word stores, on little-endian targets.
+        def merge_little_endian_word_stores(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if LLVMByteOrder(LLVMGetModuleDataLayout(module)) != LLVMByteOrdering::LITTLE_ENDIAN
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, builder, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_scalar_pass_policy(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, builder, module|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    changed <- changed + merge_block_word_stores(block, builder, module)
+            LLVMDisposeBuilder(builder)
+            changed

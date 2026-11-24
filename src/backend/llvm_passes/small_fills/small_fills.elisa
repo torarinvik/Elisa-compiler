@@ -1,0 +1,244 @@
+# Expands small fills and byte stores on little-endian AArch64 after the O3 pipeline, where
+# LLVM would otherwise call the C library:
+#
+# - Fills whose length is a runtime value, with a constant byte, are inlined through the
+#   `__elisacore_smallzero_fill` helper: overlapping 1-, 2-, 4-, 8- and 16-byte stores up to
+#   64 bytes, and the library call above that. Nonzero fills are inlined only when a module
+#   has at most sixteen, which bounds the code growth.
+# - On macOS, a function's single aligned zero fill of 1024 to 2048 bytes (a multiple of
+#   128) becomes `llvm.memset.inline`.
+# - Stack word-pattern fills and byte stores that form words are merged first.
+#
+# Before that it runs the short-reduction unrolling and the covered-array revisit, which
+# are still C++.
+include "./fill_queries.elisa"
+include "./linked_helpers.elisa"
+include "./stack_word_pattern_fills.elisa"
+include "./byte_store_merges.elisa"
+include "./little_endian_word_stores.elisa"
+include "../ir/loop_pass_policy.elisa"
+
+extern elisacoreUnrollGuardedReductions(module: LLVMModuleRef) -> u32
+extern elisacoreRevisitCoveredArrays(module: LLVMModuleRef, unrolled: i32) -> u32
+
+const module SmallFillLimit:
+    FIXED_ALIGNMENT: u64 = 8
+    FIXED_MINIMUM_BYTES: u64 = 1024
+    FIXED_MAXIMUM_BYTES: u64 = 2048
+    FIXED_BYTE_MULTIPLE: u64 = 128
+    NONZERO_FILLS: usize = 16
+    BYTE_PATTERN: u64 = 72340172838076673
+
+extend Backend:
+    private:
+        def small_fill_ir() -> darray[sview] can[Abort.Panic, Memory.Allocate]:
+            lines: darray[sview] = [
+                "define void @__elisacore_smallzero_fill(ptr %p, i64 %n, i64 %pattern) alwaysinline {",
+                "entry:",
+                " %byte = trunc i64 %pattern to i8",
+                " %word = trunc i64 %pattern to i16",
+                " %dword = trunc i64 %pattern to i32",
+                " %half = zext i64 %pattern to i128",
+                " %high = shl i128 %half, 64",
+                " %vector = or i128 %high, %half",
+                " %empty = icmp eq i64 %n, 0",
+                " br i1 %empty, label %exit, label %choose",
+                "choose:",
+                " %small = icmp ule i64 %n, 64",
+                " br i1 %small, label %size8, label %large",
+                "large:",
+                " call void @llvm.memset.p0.i64(ptr %p, i8 %byte, i64 %n, i1 false), !elisa.smallzero.fallback !0",
+                " br label %exit",
+                "size8:",
+                " %eight = icmp uge i64 %n, 8",
+                " br i1 %eight, label %size16, label %size4",
+                "size16:",
+                " %sixteen = icmp uge i64 %n, 16",
+                " br i1 %sixteen, label %size32, label %fill8",
+                "fill8:",
+                " %off8 = sub i64 %n, 8",
+                " %end8 = getelementptr i8, ptr %p, i64 %off8",
+                " store i64 %pattern, ptr %p, align 1",
+                " store i64 %pattern, ptr %end8, align 1",
+                " br label %exit",
+                "size32:",
+                " %big = icmp ugt i64 %n, 32",
+                " br i1 %big, label %fill64, label %fill16",
+                "fill16:",
+                " %off16 = sub i64 %n, 16",
+                " %end16 = getelementptr i8, ptr %p, i64 %off16",
+                " store i128 %vector, ptr %p, align 1",
+                " store i128 %vector, ptr %end16, align 1",
+                " br label %exit",
+                "fill64:",
+                " %p16 = getelementptr i8, ptr %p, i64 16",
+                " %off32 = sub i64 %n, 32",
+                " %end32 = getelementptr i8, ptr %p, i64 %off32",
+                " %offlast = sub i64 %n, 16",
+                " %last = getelementptr i8, ptr %p, i64 %offlast",
+                " store i128 %vector, ptr %p, align 1",
+                " store i128 %vector, ptr %p16, align 1",
+                " store i128 %vector, ptr %end32, align 1",
+                " store i128 %vector, ptr %last, align 1",
+                " br label %exit",
+                "size4:",
+                " %four = icmp uge i64 %n, 4",
+                " br i1 %four, label %fill4, label %size2",
+                "fill4:",
+                " %off4 = sub i64 %n, 4",
+                " %end4 = getelementptr i8, ptr %p, i64 %off4",
+                " store i32 %dword, ptr %p, align 1",
+                " store i32 %dword, ptr %end4, align 1",
+                " br label %exit",
+                "size2:",
+                " %two = icmp uge i64 %n, 2",
+                " br i1 %two, label %fill2, label %fill1",
+                "fill2:",
+                " %off2 = sub i64 %n, 2",
+                " %end2 = getelementptr i8, ptr %p, i64 %off2",
+                " store i16 %word, ptr %p, align 1",
+                " store i16 %word, ptr %end2, align 1",
+                " br label %exit",
+                "fill1:",
+                " store i8 %byte, ptr %p, align 1",
+                " br label %exit",
+                "exit:",
+                " ret void",
+                "}",
+                "",
+                "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)",
+                "!0 = !{}"
+            ]
+            lines
+
+        # An aligned 1024..2048-byte zero `llvm.memset` that a multiple of 128 bytes sizes.
+        def is_fixed_zero_fill(fill: LLVMValueRef, memset_ids: MemsetIntrinsics&, align_kind: u32) -> bool:
+            return false if called_intrinsic_id(fill) != memset_ids.memset or call_is_volatile(fill)
+            return false if LLVMGetNumOperandBundles(fill) != 0 or destination_address_space(fill) != 0 or destination_alignment(fill, align_kind) < SmallFillLimit::FIXED_ALIGNMENT
+            size: LLVMValueRef = LLVMGetOperand(fill, 2)
+            value: LLVMValueRef = LLVMGetOperand(fill, 1)
+            return false if LLVMIsAConstantInt(size) == null or LLVMIsAConstantInt(value) == null or ElisaLLVMConstantIntEquals(value, 0) == 0
+            return false if not is_llvm_integer_type(LLVMTypeOf(size), 64)
+            bytes: u64 = LLVMConstIntGetZExtValue(size)
+            bytes >= SmallFillLimit::FIXED_MINIMUM_BYTES and bytes <= SmallFillLimit::FIXED_MAXIMUM_BYTES and bytes % SmallFillLimit::FIXED_BYTE_MULTIPLE == 0
+
+        # The function's fixed zero fill when it has exactly one.
+        def single_fixed_zero_fill(function: LLVMValueRef, memset_ids: MemsetIntrinsics&, align_kind: u32) -> LLVMValueRef?:
+            found: mutable LLVMValueRef? = null
+            count: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, found, count, memset_ids, align_kind|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, found, count, memset_ids, align_kind|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if is_fixed_zero_fill(instruction, memset_ids, align_kind):
+                        found <- instruction
+                        count <- count + 1
+            return null if count != 1
+            found
+
+        # `IRBuilder::CreateMemSetInline` of FILL's operands, taking its location and metadata.
+        def replace_with_inline_memset(fill: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef, memset_ids: MemsetIntrinsics&, align_kind: u32) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            position_builder_before(builder, fill)
+            destination: LLVMValueRef = ElisaLLVMStripPointerCasts(LLVMGetOperand(fill, 0))
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            types: mutable darray[LLVMTypeRef] = [LLVMTypeOf(destination), LLVMTypeOf(length)]
+            type_slots: void& = (&types[0]).cast[void&]
+            declaration: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, memset_ids.memset_inline, type_slots, 2)
+            arguments: mutable darray[LLVMValueRef] = [destination, LLVMGetOperand(fill, 1), length, LLVMConstInt(LLVMInt1TypeInContext(context), 0, 0)]
+            name_storage: mutable darray[u8] = []
+            replacement: LLVMValueRef = LLVMBuildCall2(builder, LLVMIntrinsicGetType(context, memset_ids.memset_inline, type_slots, 2), declaration, (&arguments[0]).cast[void&], 4, sview_to_cstr("", name_storage))
+            LLVMAddCallSiteAttribute(replacement, 1, LLVMCreateEnumAttribute(context, align_kind, destination_alignment(fill, align_kind)))
+            copy_instruction_metadata(replacement, fill)
+            LLVMInstructionEraseFromParent(fill)
+
+        def inline_fixed_zero_fills(module: LLVMModuleRef, memset_ids: MemsetIntrinsics&, align_kind: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fixed: mutable darray[LLVMValueRef] = []
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, fixed, memset_ids, align_kind|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if function_is_size_optimized(function)
+                if single_fixed_zero_fill(function, memset_ids, align_kind) is fill:
+                    fixed.push(fill)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            for fill in fixed |builder, module, memset_ids, align_kind|:
+                replace_with_inline_memset(fill, builder, module, memset_ids, align_kind)
+            LLVMDisposeBuilder(builder)
+            fixed.count.u32()
+
+        # A memset of a constant byte over a runtime i64 length, not the helper's own fallback.
+        def runtime_length_fill_byte(fill: LLVMValueRef, memset_ids: MemsetIntrinsics&, fallback_kind: u32) -> LLVMValueRef?:
+            return null if not is_memset(fill, memset_ids) or LLVMGetNumOperandBundles(fill) != 0 or LLVMGetMetadata(fill, fallback_kind) != null
+            return null if call_is_volatile(fill) or destination_address_space(fill) != 0
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            return null if not is_llvm_integer_type(LLVMTypeOf(length), 64) or LLVMIsAConstantInt(length) != null
+            value: LLVMValueRef = LLVMGetOperand(fill, 1)
+            return null if LLVMIsAConstantInt(value) == null
+            value
+
+        # The runtime-length fills to inline: every zero fill, and the nonzero ones when
+        # there are at most sixteen.
+        def runtime_length_fills(module: LLVMModuleRef, memset_ids: MemsetIntrinsics&) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            fallback_storage: mutable darray[u8] = []
+            nontemporal_storage: mutable darray[u8] = []
+            fallback_kind: u32 = LLVMGetMDKindIDInContext(context, sview_to_cstr("elisa.smallzero.fallback", fallback_storage), 24)
+            nontemporal_kind: u32 = LLVMGetMDKindIDInContext(context, sview_to_cstr("nontemporal", nontemporal_storage), 11)
+            work: mutable darray[LLVMValueRef] = []
+            nonzero: mutable darray[LLVMValueRef] = []
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, work, nonzero, memset_ids, fallback_kind, nontemporal_kind|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if function_is_size_optimized(function)
+                sanitized: bool = function_is_sanitized(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, work, nonzero, memset_ids, fallback_kind, nontemporal_kind, sanitized|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while cursor is fill |cursor, work, nonzero, memset_ids, fallback_kind, nontemporal_kind, sanitized|:
+                        cursor <- LLVMGetNextInstruction(fill)
+                        if runtime_length_fill_byte(fill, memset_ids, fallback_kind) is value:
+                            if ElisaLLVMConstantIntEquals(value, 0) != 0:
+                                work.push(fill)
+                            elif nonzero.count <= SmallFillLimit::NONZERO_FILLS and LLVMGetMetadata(fill, nontemporal_kind) == null and not sanitized:
+                                # Each inline expansion adds several branches.
+                                nonzero.push(fill)
+            if nonzero.count <= SmallFillLimit::NONZERO_FILLS:
+                for fill in nonzero |work|:
+                    work.push(fill)
+            work
+
+        def inline_runtime_length_fills(module: LLVMModuleRef, work: darray[LLVMValueRef]&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            helper_lines: darray[sview] = small_fill_ir()
+            routine: LLVMValueRef = get link_internal_helper(module, &helper_lines, "__elisacore_smallzero_fill") else return 0
+            word: LLVMTypeRef = LLVMInt64TypeInContext(LLVMGetModuleContext(module))
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            for fill in work |routine, word, builder, changed|:
+                byte: u64 = LLVMConstIntGetZExtValue(LLVMGetOperand(fill, 1))
+                arguments: darray[LLVMValueRef] = [ElisaLLVMStripPointerCasts(LLVMGetOperand(fill, 0)), LLVMGetOperand(fill, 2), LLVMConstInt(word, byte * SmallFillLimit::BYTE_PATTERN, 0)]
+                changed <- changed + 1 if inline_helper_at(fill, routine, &arguments, builder)
+            LLVMDisposeBuilder(builder)
+            delete_unused_helper(routine)
+            changed
+
+    public:
+        # The fills expanded and stores merged, on little-endian AArch64.
+        def expand_small_fills(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arm64: bool = ElisaLLVMModuleTargetArchIsAArch64(module) != 0
+            reductions: u32 = elisacoreUnrollGuardedReductions(module) if arm64 and not module_has_debug_info(module) else 0
+            _ = elisacoreRevisitCoveredArrays(module, 1 if reductions != 0 else 0)
+            return 0 if not arm64 or LLVMByteOrder(LLVMGetModuleDataLayout(module)) != LLVMByteOrdering::LITTLE_ENDIAN
+            return 0 if module_has_named_value(module, "__elisacore_smallzero_fill")
+            fixed: mutable u32 = inline_stack_word_pattern_fills(module)
+            fixed <- fixed + merge_zero_extended_byte_stores(module)
+            fixed <- fixed + merge_big_endian_word_stores(module)
+            fixed <- fixed + merge_little_endian_word_stores(module)
+            memset_ids: MemsetIntrinsics = memset_intrinsics()
+            if ElisaLLVMModuleTargetIsMacOSX(module) != 0:
+                fixed <- fixed + inline_fixed_zero_fills(module, &memset_ids, attribute_kind("align"))
+            work: darray[LLVMValueRef] = runtime_length_fills(module, &memset_ids)
+            return fixed if work.count == 0
+            fixed + inline_runtime_length_fills(module, &work)
