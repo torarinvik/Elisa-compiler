@@ -46,6 +46,7 @@
 #include "llvm_indexed_prefix.h"
 #include "llvm_proven_checks.h"
 #include "llvm_validated_reads.h"
+#include "llvm_bounded_trip_ranges.h"
 
 using namespace llvm;
 
@@ -353,6 +354,7 @@ extern "C" unsigned elisacoreLateScalarCleanup(LLVMModuleRef module,
   if (ElisaViewBounds::shrinkViewFills(*unwrap(module))) status = 1;
   if (ElisaProvenChecks::removeProvenChecks(*unwrap(module))) status = 1;
   unsigned finalSimplifications = elisacoreSpecializeValidationEpilogues(module);
+  finalSimplifications += ElisaBoundedTripRanges::foldBoundedTripChecks(*unwrap(module));
   finalSimplifications += elisacoreFoldShiftParityLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldShiftBitReverseLoops(*unwrap(module));
   finalSimplifications += elisacoreFoldPowerPosition(*unwrap(module));
