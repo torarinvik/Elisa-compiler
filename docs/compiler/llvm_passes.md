@@ -32,7 +32,7 @@ Registered names: `bit-tests`, `remainder-tests`, `remainder-tails`, `compact-sh
 `conditional-doubling`, `decimal-digit-counts`, `power-positions`, `validation-returns`,
 `shared-reciprocals`, `guarded-increments`, `nonnegative-remainders`,
 `masked-single-bits`, `interleaved-byte-stores`, `bounded-carries`, `implied-loop-exits`,
-`ring-index-bounds`.
+`ring-index-bounds`, `halving-runs`, `factored-divisions`.
 
 The pass tests in `test/llvm/` and `test/parity/validation_layout_smoke.py` drive the passes
 through this command, using `test/llvm/elisa_llvm_pass.py`

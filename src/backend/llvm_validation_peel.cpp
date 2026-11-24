@@ -183,7 +183,6 @@ extern "C" unsigned elisacoreFoldSignedRangeMasks(LLVMModuleRef);
 #include "llvm_even_range.cpp"
 #if LLVM_VERSION_MAJOR >= 23
 #include "llvm_guarded_counter_bounds.cpp"
-#include "llvm_halving_runs.cpp"
 #endif
 
 #include "llvm_nested_vector_unroll.h"

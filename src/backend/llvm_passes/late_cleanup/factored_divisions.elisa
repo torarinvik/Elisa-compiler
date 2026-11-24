@@ -1,0 +1,139 @@
+# Splits a loop's division by a factored divisor `(bit ? 3 : 1) * (1 + (x & 1))` (or
+# `2 - (x & 1)`) of a narrow dividend into a shift and a constant-divisor quotient. Unsigned
+# division rounds down, so floor(floor(n / 2^b) / k) equals floor(n / (k * 2^b)).
+include "../ir/ir_editing.elisa"
+include "../ir/loop_pass_policy.elisa"
+
+const module FactoredDivisionLimit:
+    FUNCTION_BLOCKS: u32 = 24
+    FUNCTION_INSTRUCTIONS: u32 = 256
+    DIVIDEND_BITS: u32 = 32
+    DIVISIONS: u32 = 2
+
+# The power-of-two factor's bit `x & 1`, and whether the factor is `2 - bit`.
+struct FactoredDivisorBit:
+    bit: LLVMValueRef
+    invert: bool
+
+# The two factors of the divisor product: the select choosing 3 or 1, and the power-of-two
+# bit with whether it is inverted (`2 - bit` rather than `bit + 1`).
+struct FactoredDivisor:
+    odd: LLVMValueRef
+    bit: LLVMValueRef
+    invert: bool
+
+extend Backend:
+    private:
+        def is_factored_constant(value: LLVMValueRef, expected: u64) -> bool:
+            LLVMIsAConstantInt(value) != null and ElisaLLVMConstantIntEquals(value, expected) != 0
+
+        # `x & 1` of `(x & 1) + 1` or `2 - (x & 1)`, with whether it is inverted.
+        def factored_divisor_bit(factor: LLVMValueRef) -> FactoredDivisorBit?:
+            bit: mutable LLVMValueRef = factor
+            invert: mutable bool = false
+            if is_llvm_instruction_with_opcode(factor, LLVMOpcode::ADD) and is_factored_constant(LLVMGetOperand(factor, 1), 1):
+                bit <- LLVMGetOperand(factor, 0)
+            elif is_llvm_instruction_with_opcode(factor, LLVMOpcode::SUB) and is_factored_constant(LLVMGetOperand(factor, 0), 2):
+                bit <- LLVMGetOperand(factor, 1)
+                invert <- true
+            else:
+                return null
+            return null if not is_llvm_instruction_with_opcode(bit, LLVMOpcode::AND) or not is_factored_constant(LLVMGetOperand(bit, 1), 1)
+            FactoredDivisorBit{bit: bit, invert: invert}
+
+        def is_three_or_one_select(value: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT) and is_factored_constant(LLVMGetOperand(value, 1), 3) and is_factored_constant(LLVMGetOperand(value, 2), 1)
+
+        # The divisor's factors when PRODUCT is `select * factor` in either operand order.
+        def factored_divisor(product: LLVMValueRef) -> FactoredDivisor?:
+            odd_first: bool = is_llvm_instruction_with_opcode(LLVMGetOperand(product, 0), LLVMOpcode::SELECT)
+            odd: LLVMValueRef = LLVMGetOperand(product, 0 if odd_first else 1)
+            even: LLVMValueRef = LLVMGetOperand(product, 1 if odd_first else 0)
+            return null if not is_three_or_one_select(odd)
+            factor: FactoredDivisorBit = get factored_divisor_bit(even) else return null
+            FactoredDivisor{odd: odd, bit: factor.bit, invert: factor.invert}
+
+        # Whether USER is an inexact `n udiv product` in the product's block.
+        def is_factored_division(user: LLVMValueRef, product: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(user, LLVMOpcode::UDIV)
+            return false if LLVMGetOperand(user, 1) != product or LLVMGetOperand(user, 0) == product
+            LLVMGetInstructionParent(user) == LLVMGetInstructionParent(product) and LLVMGetExact(user) == 0 and ElisaLLVMHasMetadataOtherThanDebugLoc(user) == 0
+
+        # The product's divisions, in use-list order, when exactly its two uses are factored
+        # divisions; otherwise none.
+        def factored_divisions_of(product: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            divisions: mutable darray[LLVMValueRef] = []
+            valid: mutable bool = true
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(product)
+            while use_cursor is use |use_cursor, divisions, valid, product|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                valid <- false if not is_factored_division(user, product)
+                divisions.push(user)
+            return [] if not valid or divisions.count != FactoredDivisionLimit::DIVISIONS.usize()
+            divisions
+
+        # The product is in a loop and every dividend has at most 32 active bits.
+        def factored_dividends_narrow(product: LLVMValueRef, divisions: darray[LLVMValueRef]&, function: LLVMValueRef) -> bool:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            narrow: mutable bool = ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(product)) != null
+            for division in divisions |analyses, narrow|:
+                narrow <- false if narrow and ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(analyses, LLVMGetOperand(division, 0)) > FactoredDivisionLimit::DIVIDEND_BITS
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            narrow
+
+        # Each division becomes `zext(select(odd, (n >> b) / 3, n >> b))` on 32 bits.
+        def split_factored_divisions(product: LLVMValueRef, divisor: FactoredDivisor&, divisions: darray[LLVMValueRef]&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(product))
+            word: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            position_builder_before(builder, product)
+            truncated_bit: LLVMValueRef = LLVMBuildTrunc(builder, divisor.bit, word, "")
+            shift: LLVMValueRef = LLVMBuildXor(builder, truncated_bit, LLVMConstInt(word, 1, 0), "") if divisor.invert else truncated_bit
+            for division in divisions |builder, divisor, shift, word|:
+                position_builder_before(builder, division)
+                narrow: LLVMValueRef = LLVMBuildTrunc(builder, LLVMGetOperand(division, 0), word, "")
+                shifted: LLVMValueRef = LLVMBuildLShr(builder, narrow, shift, "factored.div.half")
+                third: LLVMValueRef = LLVMBuildUDiv(builder, shifted, LLVMConstInt(word, 3, 0), "factored.div.third")
+                quotient: LLVMValueRef = LLVMBuildSelect(builder, LLVMGetOperand(divisor.odd, 0), third, shifted, "")
+                LLVMReplaceAllUsesWith(division, LLVMBuildZExt(builder, quotient, LLVMTypeOf(division), ""))
+                LLVMInstructionEraseFromParent(division)
+            LLVMInstructionEraseFromParent(product)
+
+        # Whether INSTRUCTION is a factored divisor product that was split.
+        def split_factored_divisor(instruction: LLVMValueRef, function: LLVMValueRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::MUL) or not is_llvm_integer_type(LLVMTypeOf(instruction), 64)
+            return false if ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+            divisions: darray[LLVMValueRef] = factored_divisions_of(instruction)
+            return false if divisions.count == 0
+            divisor: FactoredDivisor = get factored_divisor(instruction) else return false
+            return false if not factored_dividends_narrow(instruction, &divisions, function)
+            split_factored_divisions(instruction, &divisor, &divisions, builder)
+            true
+
+        def skipped_by_factored_divisions(function: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            skipped_by_loop_pass_policy(function, module) or function_block_count(function) > FactoredDivisionLimit::FUNCTION_BLOCKS or function_instruction_count(function) > FactoredDivisionLimit::FUNCTION_INSTRUCTIONS
+
+        # At most one product split in FUNCTION: the first that qualifies.
+        def split_first_factored_divisor(function: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, function, builder|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, function, builder|:
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                    return 1 if split_factored_divisor(instruction, function, builder)
+            0
+
+    public:
+        # The factored divisor products split, at most one per function, on AArch64.
+        def split_factored_divisions_in(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_factored_divisions(function, module)
+                changed <- changed + split_first_factored_divisor(function, builder)
+            LLVMDisposeBuilder(builder)
+            changed
