@@ -2,5 +2,4 @@
 #include "llvm_scratch_prefix.cpp"
 #include "llvm_bool_array_pack.cpp"
 #include "llvm_short_trip.cpp"
-#include "llvm_implied_exit_thread.cpp"
 #include "llvm_recursive_inline.cpp"

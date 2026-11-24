@@ -407,19 +407,13 @@ static unsigned inlineSmallRecursiveFunctions(Module &M, TargetMachine *TM) {
   return 1;
 }
 
-// This entry runs after the module's last O3 cleanup, so CFG threading that
-// a later loop canonicalization would undo is applied here as well.
 extern "C" unsigned
 elisacoreInlineSmallRecursiveFunctions(LLVMModuleRef Ref,
                                        LLVMTargetMachineRef TMRef) {
   if (!Ref || !TMRef)
     return 0;
   Module &M = *unwrap(Ref);
-  unsigned Changed =
-      inlineSmallRecursiveFunctions(M, reinterpret_cast<TargetMachine *>(TMRef));
-  if (M.getTargetTriple().isAArch64() && !M.getNamedMetadata("llvm.dbg.cu"))
-    Changed |= threadImpliedLoopExits(M) != 0;
-  return Changed;
+  return inlineSmallRecursiveFunctions(M, reinterpret_cast<TargetMachine *>(TMRef));
 }
 #else
 extern "C" unsigned

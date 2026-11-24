@@ -2,11 +2,13 @@
 #include "elisa_llvm_analysis.h"
 
 #include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/LazyValueInfo.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/InstrTypes.h>
@@ -17,6 +19,7 @@
 #include <llvm/TargetParser/Triple.h>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 using namespace llvm;
@@ -29,6 +32,7 @@ struct FunctionAnalyses {
   explicit FunctionAnalyses(Function &F) : function(F) { build(); }
 
   void build() {
+    lazyValues.reset();
     evolution.reset();
     assumptions.reset();
     libraryInfo.reset();
@@ -46,15 +50,25 @@ struct FunctionAnalyses {
     return *loopInfo;
   }
 
+  AssumptionCache &assumptionCache() {
+    if (!assumptions) assumptions = std::make_unique<AssumptionCache>(function);
+    return *assumptions;
+  }
+
   ScalarEvolution &scalarEvolution() {
     if (!evolution) {
       libraryInfoImpl = std::make_unique<TargetLibraryInfoImpl>(function.getParent()->getTargetTriple());
       libraryInfo = std::make_unique<TargetLibraryInfo>(*libraryInfoImpl);
-      assumptions = std::make_unique<AssumptionCache>(function);
-      evolution = std::make_unique<ScalarEvolution>(function, *libraryInfo, *assumptions,
+      evolution = std::make_unique<ScalarEvolution>(function, *libraryInfo, assumptionCache(),
                                                     *dominators, loops());
     }
     return *evolution;
+  }
+
+  // As LazyValueAnalysis builds it: the function and its assumption cache.
+  LazyValueInfo &lazyValueInfo() {
+    if (!lazyValues) lazyValues = std::make_unique<LazyValueInfo>(&function, &assumptionCache());
+    return *lazyValues;
   }
 
   Function &function;
@@ -64,6 +78,7 @@ struct FunctionAnalyses {
   std::unique_ptr<TargetLibraryInfo> libraryInfo;
   std::unique_ptr<AssumptionCache> assumptions;
   std::unique_ptr<ScalarEvolution> evolution;
+  std::unique_ptr<LazyValueInfo> lazyValues;
   std::vector<Loop *> preorder;
 };
 
@@ -259,6 +274,26 @@ int ElisaLLVMIsGuaranteedNotToBeUndefOrPoison(LLVMValueRef value) {
   return isGuaranteedNotToBeUndefOrPoison(unwrap(value));
 }
 
+int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAt(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
+                                                LLVMValueRef context) {
+  return isGuaranteedNotToBeUndefOrPoison(unwrap(value), nullptr, cast<Instruction>(unwrap(context)),
+                                          unwrapAnalyses(analyses)->dominators.get());
+}
+
+ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
+                                                      LLVMValueRef context, int undef_allowed) {
+  ConstantRange Range = unwrapAnalyses(analyses)->lazyValueInfo().getConstantRange(
+      unwrap(value), cast<Instruction>(unwrap(context)), undef_allowed != 0);
+  return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
+}
+
+int ElisaLLVMIsImpliedCondition(LLVMValueRef condition, LLVMValueRef implied, LLVMModuleRef module,
+                                int condition_is_true) {
+  std::optional<bool> Known = isImpliedCondition(unwrap(condition), unwrap(implied),
+                                                 unwrap(module)->getDataLayout(), condition_is_true != 0);
+  return Known ? (*Known ? 1 : 0) : -1;
+}
+
 int ElisaLLVMConstantMaxBackedgeTakenCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
                                            uint64_t *count) {
   auto *Max = dyn_cast<SCEVConstant>(
@@ -266,6 +301,14 @@ int ElisaLLVMConstantMaxBackedgeTakenCount(ElisaFunctionAnalysesRef analyses, El
   if (!Max || Max->getAPInt().getActiveBits() > 64) return 0;
   *count = Max->getAPInt().getZExtValue();
   return 1;
+}
+
+unsigned ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(ElisaFunctionAnalysesRef analyses,
+                                                      LLVMValueRef value) {
+  ScalarEvolution &SE = unwrapAnalyses(analyses)->scalarEvolution();
+  Value *V = unwrap(value);
+  if (!SE.isSCEVable(V->getType())) return 0;
+  return SE.getUnsignedRangeMax(SE.getSCEV(V)).getActiveBits();
 }
 
 } // extern "C"

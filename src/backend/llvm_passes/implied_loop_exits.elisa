@@ -1,0 +1,109 @@
+# Threads an edge past a side-effect-free branch block whose condition is already decided
+# on that edge. A latch `i.next == n` reached from a block guarded by `i.next < n` then
+# jumps straight back to the loop header. Runs after the module's last O3 cleanup, so CFG
+# threading that a later loop canonicalization would undo is applied here as well.
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+
+const module ImpliedLoopExitLimit:
+    BLOCK_INSTRUCTIONS: u32 = 8
+    GUARD_DEPTH: u32 = 4
+
+extend Backend:
+    private:
+        # Every phi user of VALUE outside BLOCK takes it only on edges leaving BLOCK.
+        def used_only_on_edges_from(value: LLVMValueRef, block: LLVMBasicBlockRef) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+            while use_cursor is use |use_cursor, value, block|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if not is_llvm_instruction_with_opcode(user, LLVMOpcode::PHI) or LLVMGetInstructionParent(user) == block
+                for incoming in 0..<LLVMCountIncoming(user) |user, value, block|:
+                    return false if LLVMGetIncomingValue(user, incoming) == value and LLVMGetIncomingBlock(user, incoming) != block
+            true
+
+        # Every value BLOCK defines is consumed by its own branch or by a phi edge leaving
+        # the block, so bypassing it needs no SSA repair.
+        def bypassable(block: LLVMBasicBlockRef, condition: LLVMValueRef) -> bool:
+            return false if LLVMGetInstructionParent(condition) != block or not has_one_use(condition)
+            for operand_index in 0..<LLVMGetNumOperands(condition) |condition, block|:
+                operand: LLVMValueRef = LLVMGetOperand(condition, operand_index)
+                return false if LLVMIsAInstruction(operand) != null and LLVMGetInstructionParent(operand) == block
+            instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while instruction_cursor is instruction |instruction_cursor, condition, block|:
+                instruction_cursor <- LLVMGetNextInstruction(instruction)
+                continue if instruction == condition or LLVMIsATerminatorInst(instruction) != null
+                return false if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI) or not used_only_on_edges_from(instruction, block)
+            true
+
+        # The branch value implied on entry to ENTRY by a short chain of single
+        # predecessors: 1 true, 0 false, -1 when no guard decides it.
+        def implied_on_entry(entry: LLVMBasicBlockRef, condition: LLVMValueRef, module: LLVMModuleRef) -> i32:
+            current: mutable LLVMBasicBlockRef = entry
+            for _ in 0..<ImpliedLoopExitLimit::GUARD_DEPTH |current, condition, module|:
+                predecessor: LLVMBasicBlockRef = get single_predecessor(current) else return -1
+                return -1 if predecessor == current
+                if conditional_terminator(predecessor) is branch:
+                    if LLVMGetSuccessor(branch, 0) != LLVMGetSuccessor(branch, 1):
+                        known: i32 = ElisaLLVMIsImpliedCondition(LLVMGetCondition(branch), condition, module, 1 if LLVMGetSuccessor(branch, 0) == current else 0)
+                        return known if known >= 0
+                current <- predecessor
+            -1
+
+        # Sends PREDECESSOR's jump straight to TARGET: TARGET's phis take, for the new
+        # edge, what they took from BLOCK (looked through BLOCK's own phis), and BLOCK's
+        # phis drop the old edge but are kept even with one input.
+        def thread_edge(block: LLVMBasicBlockRef, predecessor: LLVMBasicBlockRef, jump: LLVMValueRef, target: LLVMBasicBlockRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            phi_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(target)
+            while phi_cursor is phi |phi_cursor, block, predecessor|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                phi_cursor <- LLVMGetNextInstruction(phi)
+                if phi_incoming_for_block(phi, block) is from_block:
+                    local_phi: bool = is_llvm_instruction_with_opcode(from_block, LLVMOpcode::PHI) and LLVMGetInstructionParent(from_block) == block
+                    incoming: LLVMValueRef = (get phi_incoming_for_block(from_block, predecessor) else from_block) if local_phi else from_block
+                    add_phi_incoming(phi, incoming, predecessor)
+            local_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while local_cursor is local |local_cursor, predecessor|:
+                break if not is_llvm_instruction_with_opcode(local, LLVMOpcode::PHI)
+                local_cursor <- LLVMGetNextInstruction(local)
+                ElisaLLVMRemoveIncomingForBlock(local, predecessor)
+            LLVMSetSuccessor(jump, 0, target)
+
+        # The edges into BLOCK that thread past it.
+        def thread_block(block: LLVMBasicBlockRef, branch: LLVMValueRef, condition: LLVMValueRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            for predecessor in predecessor_edges(block) |block, branch, condition, module, changed|:
+                continue if predecessor == block
+                if LLVMGetBasicBlockTerminator(predecessor) is jump:
+                    continue if LLVMGetInstructionOpcode(jump) != LLVMOpcode::UNCONDITIONAL_BR
+                    known: i32 = implied_on_entry(predecessor, condition, module)
+                    continue if known < 0
+                    target: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0 if known == 1 else 1)
+                    continue if target == block
+                    thread_edge(block, predecessor, jump, target)
+                    changed <- changed + 1
+            changed
+
+        def thread_function_exits(function: LLVMValueRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, module, changed|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if conditional_terminator(block) is branch:
+                    condition: LLVMValueRef = LLVMGetCondition(branch)
+                    continue if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP) or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                    continue if instruction_count(block) > ImpliedLoopExitLimit::BLOCK_INSTRUCTIONS or not bypassable(block, condition)
+                    changed <- changed + thread_block(block, branch, condition, module)
+            changed
+
+    public:
+        # The implied loop exits threaded, on AArch64 modules without debug info.
+        def thread_implied_loop_exits(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module) or module_has_debug_info(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |changed, function_cursor, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function)
+                changed <- changed + thread_function_exits(function, module)
+            changed

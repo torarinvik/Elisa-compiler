@@ -11,6 +11,8 @@
 #define ELISA_LLVM_ANALYSIS_H
 
 #include <llvm-c/Core.h>
+
+#include "elisa_llvm_constant_range.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -98,12 +100,28 @@ unsigned ElisaLLVMConstantIntActiveBits(LLVMValueRef constant);
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant);
 /* llvm::isGuaranteedNotToBeUndefOrPoison with no context instruction. */
 int ElisaLLVMIsGuaranteedNotToBeUndefOrPoison(LLVMValueRef value);
+/* llvm::isGuaranteedNotToBeUndefOrPoison at the instruction `context`, with the dominator
+ * tree and no assumption cache. */
+int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAt(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
+                                                LLVMValueRef context);
+/* LazyValueInfo::getConstantRange of `value` at the instruction `context`. The caller
+ * disposes the range with ElisaLLVMDisposeConstantRange. */
+ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
+                                                      LLVMValueRef context, int undef_allowed);
+/* llvm::isImpliedCondition with the module's data layout: whether `condition` being
+ * `condition_is_true` decides `implied`. 1 implied true, 0 implied false, -1 unknown. */
+int ElisaLLVMIsImpliedCondition(LLVMValueRef condition, LLVMValueRef implied, LLVMModuleRef module,
+                                int condition_is_true);
 
 /* --- scalar evolution --------------------------------------------------- */
 /* The constant maximum backedge-taken count of the loop; returns 0 when it
  * is not a constant of at most 64 bits. */
 int ElisaLLVMConstantMaxBackedgeTakenCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
                                            uint64_t *count);
+/* APInt::getActiveBits of the unsigned range maximum scalar evolution proves for an
+ * integer value; 0 for a value scalar evolution cannot describe. */
+unsigned ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(ElisaFunctionAnalysesRef analyses,
+                                                      LLVMValueRef value);
 
 #ifdef __cplusplus
 }

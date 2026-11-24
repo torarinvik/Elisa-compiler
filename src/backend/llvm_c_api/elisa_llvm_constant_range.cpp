@@ -40,6 +40,14 @@ int ElisaLLVMConstantRangeSignedMinIsNegative(ElisaConstantRangeRef range) {
   return unwrap(range)->getSignedMin().isNegative();
 }
 
+int ElisaLLVMConstantRangeContains(ElisaConstantRangeRef range, uint64_t value) {
+  return unwrap(range)->contains(APInt(unwrap(range)->getBitWidth(), value));
+}
+
+int ElisaLLVMConstantRangeUnsignedMaxAtMost(ElisaConstantRangeRef range, LLVMValueRef constant) {
+  return unwrap(range)->getUnsignedMax().ule(constantValue(constant));
+}
+
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range) { delete unwrap(range); }
 
 } // extern "C"

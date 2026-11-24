@@ -27,6 +27,10 @@ int ElisaLLVMConstantRangeIsEmpty(ElisaConstantRangeRef range);
 int ElisaLLVMConstantRangeReachesSignedMax(ElisaConstantRangeRef range);
 /* Whether getSignedMin() of the range is negative. */
 int ElisaLLVMConstantRangeSignedMinIsNegative(ElisaConstantRangeRef range);
+/* ConstantRange::contains of `value` at the range's width. */
+int ElisaLLVMConstantRangeContains(ElisaConstantRangeRef range, uint64_t value);
+/* Whether getUnsignedMax() of the range is at most the constant, of the same width. */
+int ElisaLLVMConstantRangeUnsignedMaxAtMost(ElisaConstantRangeRef range, LLVMValueRef constant);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus
