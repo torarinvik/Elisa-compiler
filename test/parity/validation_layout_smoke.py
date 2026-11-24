@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Qualify validation-chain layout hints with independent linked results."""
-import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'test' / 'llvm'))
+from elisa_llvm_pass import run_pass
 
 def run(args):
     p = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=29)
@@ -26,26 +27,8 @@ def main():
         print('validation layout: requires LLVM 23; skipped')
         return
     bindir = Path(run([config, '--bindir']).stdout.strip())
-    flags = shlex.split(run([config, '--cxxflags']).stdout)
-    links = shlex.split(run([config, '--ldflags', '--libs', '--system-libs']).stdout)
-    libdir = run([config, '--libdir']).stdout.strip()
     with tempfile.TemporaryDirectory(prefix='elisa-validation-layout-') as tmp:
         work=Path(tmp)
-        driver=work/'driver.cpp'
-        driver.write_text('#include '+json.dumps(str(ROOT/'src/backend/llvm_validation_layout.cpp'))+r'''
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/Support/SourceMgr.h>
-int main(int argc,char **argv){using namespace llvm;if(argc!=3)return 2;
- LLVMContext C;SMDiagnostic E;auto M=parseIRFile(argv[1],E,C);if(!M){E.print(argv[0],errs());return 2;}
- if(verifyModule(*M,&errs()))return 2;
- unsigned N=argv[2][0]=='1'?elisacoreBiasValidationReturns(wrap(M.get())):0;
- errs()<<N<<"\n";
- if(verifyModule(*M,&errs()))return 2;M->print(outs(),nullptr);return 0;
-}
-''')
-        transform=work/'transform'
-        run([bindir/'clang++',*flags,'-O2',driver,*links,'-Wl,-rpath,'+libdir,'-o',transform])
         fixture=(ROOT/'test/parity/validation_layout_fixture.ll').read_text()
         cases={
           'shared-error':(fixture,5),
@@ -70,17 +53,18 @@ int main(void){unsigned count=0;int64_t v[4];
 ''')
         for name,(text,want) in cases.items():
             source=work/(name+'.ll');source.write_text(text)
-            result=run([transform,source,'1'])
-            if result.stderr.strip()!=str(want):raise RuntimeError(name+': wrong hint count '+result.stderr)
-            changed=work/(name+'-changed.ll');changed.write_text(result.stdout)
-            if run([transform,changed,'1']).stderr.strip()!='0':raise RuntimeError(name+': not idempotent')
+            count,module=run_pass('validation-returns',text)
+            if count!=want:raise RuntimeError(name+': wrong hint count '+str(count))
+            changed=work/(name+'-changed.ll');changed.write_text(module)
+            if run_pass('validation-returns',module)[0]!=0:raise RuntimeError(name+': not idempotent')
             if want:
                 import re
                 def without_hints(t):
-                    return '\n'.join(re.sub(r', !prof ![0-9]+','',l) for l in t.splitlines() if not re.match(r'^![0-9]+ =',l)).strip()
-                original=run([transform,source,'0']).stdout
-                if without_hints(original)!=without_hints(result.stdout):raise RuntimeError('instructions changed')
-                if '!"expected"' not in result.stdout:raise RuntimeError('hint presented as measured profile')
+                    return '\n'.join(re.sub(r', !prof ![0-9]+','',l) for l in t.splitlines() if not re.match(r'^(![0-9]+ =|; ModuleID|source_filename)',l)).strip()
+                bitcode=work/(name+'.bc');run([bindir/'llvm-as',source,'-o',bitcode])
+                original=run([bindir/'llvm-dis',bitcode,'-o','-']).stdout
+                if without_hints(original)!=without_hints(module):raise RuntimeError('instructions changed')
+                if '!"expected"' not in module:raise RuntimeError('hint presented as measured profile')
                 for label,ir in [('baseline',source),('candidate',changed)]:
                     binary=work/(name+'-'+label)
                     run([bindir/'clang','-O3',ir,harness,'-o',binary])

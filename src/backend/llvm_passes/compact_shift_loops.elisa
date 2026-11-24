@@ -1,0 +1,97 @@
+# Keep short fixed-trip bit-at-a-time recurrences compact. Unrolling dozens
+# of variable-shift iterations can overwhelm the hot instruction stream, so
+# such loops get `llvm.loop.unroll.disable`. This changes only LLVM's unroll
+# policy; all original checks and operations remain.
+include "./loop_pass_policy.elisa"
+include "../llvm_c_api/elisa_llvm_analysis.elisa"
+
+const module CompactShiftLimits:
+    MAX_FUNCTION_INSTRUCTIONS: u32 = 1000
+    MAX_LOOP_BLOCKS: u32 = 12
+    MAX_LOOP_INSTRUCTIONS: u32 = 80
+    MIN_TRIPS: u64 = 16
+    MAX_TRIPS: u64 = 64
+
+# Variable-amount shifts in a run of instructions.
+struct ShiftCounts:
+    left: u32
+    right: u32
+    instructions: u32
+
+extend Backend:
+    private:
+        def count_block_shifts(block: LLVMBasicBlockRef, counts: ShiftCounts) -> ShiftCounts:
+            result: mutable ShiftCounts = counts
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, result|:
+                opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                is_binary: bool = opcode >= LLVMOpcode::ADD and opcode <= LLVMOpcode::XOR
+                is_variable: bool = is_binary and LLVMIsAConstantInt(LLVMGetOperand(instruction, 1)) == null
+                left: u32 = 1 if is_variable and opcode == LLVMOpcode::SHL else 0
+                right: u32 = 1 if is_variable and (opcode == LLVMOpcode::LSHR or opcode == LLVMOpcode::ASHR) else 0
+                result <- ShiftCounts{left: result.left + left, right: result.right + right, instructions: result.instructions + 1}
+                cursor <- LLVMGetNextInstruction(instruction)
+            result
+
+        def count_function_shifts(function: LLVMValueRef) -> ShiftCounts:
+            counts: mutable ShiftCounts = ShiftCounts{left: 0, right: 0, instructions: 0}
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, counts|:
+                counts <- count_block_shifts(block, counts)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            counts
+
+        def count_loop_shifts(loop: ElisaLoopRef) -> ShiftCounts:
+            counts: mutable ShiftCounts = ShiftCounts{left: 0, right: 0, instructions: 0}
+            for index in 0..<ElisaLLVMLoopBlockCount(loop).usize() |loop, counts|:
+                counts <- count_block_shifts(ElisaLLVMLoopBlockAt(loop, index.u32()), counts)
+            counts
+
+        def compact_shift_candidate_function(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function)
+            sanitizers: darray[sview] = ["sanitize_address", "sanitize_memory", "sanitize_thread", "sanitize_hwaddress"]
+            for attribute in sanitizers |function|:
+                return false if function_has_attribute(function, attribute)
+            counts: ShiftCounts = count_function_shifts(function)
+            counts.instructions <= CompactShiftLimits::MAX_FUNCTION_INSTRUCTIONS and counts.left >= 2 and counts.right >= 1
+
+        def is_compact_shift_loop(analyses: ElisaFunctionAnalysesRef, loop: ElisaLoopRef) -> bool:
+            return false if ElisaLLVMLoopGetLoopID(loop) != null or ElisaLLVMLoopSubLoopCount(loop) != 0
+            return false if ElisaLLVMLoopLatch(loop) == null or ElisaLLVMLoopBlockCount(loop) > CompactShiftLimits::MAX_LOOP_BLOCKS
+            trips: mutable u64 = 0
+            return false if ElisaLLVMConstantMaxBackedgeTakenCount(analyses, loop, &trips) == 0
+            return false if trips < CompactShiftLimits::MIN_TRIPS or trips > CompactShiftLimits::MAX_TRIPS
+            counts: ShiftCounts = count_loop_shifts(loop)
+            counts.instructions <= CompactShiftLimits::MAX_LOOP_INSTRUCTIONS and counts.left >= 2 and counts.right >= 1
+
+        def disable_loop_unrolling(loop: ElisaLoopRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name_storage: mutable darray[u8] = []
+            name: sview = "llvm.loop.unroll.disable"
+            property_operands: mutable darray[LLVMMetadataRef] = [LLVMMDStringInContext2(context, sview_to_cstr(name, name_storage), name.len.usize())]
+            property_slots: void& = (&property_operands[0]).cast[void&] can Unsafe.PointerCast
+            properties: mutable darray[LLVMMetadataRef] = [LLVMMDNodeInContext2(context, property_slots, 1)]
+            properties_slots: void& = (&properties[0]).cast[void&] can Unsafe.PointerCast
+            ElisaLLVMLoopSetLoopID(loop, ElisaLLVMCreateLoopID(context, properties_slots, 1))
+
+        def mark_function_shift_loops(function: LLVMValueRef, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            if ElisaLLVMCreateFunctionAnalyses(function) is analyses:
+                for index in 0..<ElisaLLVMLoopCount(analyses).usize() |analyses, changed, context|:
+                    loop: ElisaLoopRef = ElisaLLVMLoopAt(analyses, index.u32())
+                    if is_compact_shift_loop(analyses, loop):
+                        disable_loop_unrolling(loop, context)
+                        changed <- changed + 1
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        def mark_compact_shift_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return 0 if not module_targets_aarch64(module) or module_has_debug_info(module)
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, context|:
+                if compact_shift_candidate_function(function):
+                    changed <- changed + mark_function_shift_loops(function, context)
+                function_cursor <- LLVMGetNextFunction(function)
+            changed

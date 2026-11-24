@@ -1,0 +1,297 @@
+# Peel the last visit of a digit-sum loop. When the quotient is below the
+# divisor, the next reduction contributes the quotient itself and its own
+# quotient is zero, so that visit is bypassed through a new tail block.
+#
+# Every carried value and user is checked before the CFG changes: the
+# skipped visit must have no observable work and no independent uses.
+# Wrapping adds and a non-exact unsigned divide keep the arithmetic and its
+# poison behaviour.
+include "./ir_editing.elisa"
+include "./loop_pass_policy.elisa"
+
+const module RemainderTailLimits:
+    HEADER_INSTRUCTIONS: u32 = 8
+    LATCH_INSTRUCTIONS: u32 = 3
+    LATCH_PHIS: u32 = 2
+
+# The header's exit test and the blocks around it.
+struct RemainderTailShape:
+    header: LLVMBasicBlockRef
+    branch: LLVMValueRef
+    compare: LLVMValueRef
+    branch_quotient: LLVMValueRef?
+    number: LLVMValueRef
+    divisor: LLVMValueRef
+    out: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+
+# The header's last `remainder + phi` and the phi the C++ scan kept.
+struct RemainderTailSum:
+    sum: LLVMValueRef
+    accumulator: LLVMValueRef
+
+# The reduction the header computes: `sum = accumulator + (n - q * d)`.
+struct RemainderTailReduction:
+    quotient: LLVMValueRef
+    product: LLVMValueRef
+    remainder: LLVMValueRef
+    sum: LLVMValueRef
+    accumulator: LLVMValueRef
+
+extend Backend:
+    private:
+        # Every user of the value is one of the allowed users, or an unused
+        # compare. Callers with fewer allowed users repeat one.
+        def has_only_users(value: LLVMValueRef, first_allowed: LLVMValueRef, second_allowed: LLVMValueRef, third_allowed: LLVMValueRef) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+            while use_cursor is use |use_cursor, first_allowed, second_allowed, third_allowed|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                listed: bool = user == first_allowed or user == second_allowed or user == third_allowed
+                unused_compare: bool = is_llvm_instruction_with_opcode(user, LLVMOpcode::ICMP) and LLVMGetFirstUse(user) == null
+                return false if not listed and not unused_compare
+                use_cursor <- LLVMGetNextUse(use)
+            true
+
+        def is_wrapping_add(value: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::ADD) and LLVMGetNSW(value) == 0 and LLVMGetNUW(value) == 0
+
+        def is_inexact_unsigned_division(value: LLVMValueRef) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::UDIV) and LLVMGetExact(value) == 0
+
+        # The blocks that branch to `block`, once per edge.
+        def predecessor_edges(block: LLVMBasicBlockRef) -> darray[LLVMBasicBlockRef] can[Abort.Panic, Memory.Allocate]:
+            sources: mutable darray[LLVMBasicBlockRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(LLVMBasicBlockAsValue(block))
+            while use_cursor is use |use_cursor, sources|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                sources.push(LLVMGetInstructionParent(user)) if LLVMIsATerminatorInst(user) != null
+                use_cursor <- LLVMGetNextUse(use)
+            sources
+
+        def contains_block(blocks: darray[LLVMBasicBlockRef], wanted: LLVMBasicBlockRef) -> bool:
+            for block in blocks |wanted|:
+                return true if block == wanted
+            false
+
+        # The test `n < d`, or `n / d == 0` where Linux already rewrote it, on
+        # a 64-bit phi of the header.
+        def remainder_tail_test(header: LLVMBasicBlockRef, branch: LLVMValueRef) -> RemainderTailShape?:
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or not has_one_use(compare)
+            tested: LLVMValueRef = LLVMGetOperand(compare, 0)
+            quotient_test: bool = LLVMGetICmpPredicate(compare) == LLVMIntPredicate::EQ and is_constant_integer(LLVMGetOperand(compare, 1), 0) and is_inexact_unsigned_division(tested)
+            return null if not quotient_test and LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT
+            number: mutable LLVMValueRef = tested
+            divisor: mutable LLVMValueRef = LLVMGetOperand(compare, 1)
+            if quotient_test:
+                number <- LLVMGetOperand(tested, 0)
+                divisor <- LLVMGetOperand(tested, 1)
+            return null if not is_llvm_instruction_with_opcode(number, LLVMOpcode::PHI) or LLVMGetInstructionParent(number) != header
+            return null if LLVMIsAConstantInt(divisor) == null or LLVMConstIntGetZExtValue(divisor) == 0
+            return null if not is_llvm_integer_type(LLVMTypeOf(number), 64)
+            branch_quotient: LLVMValueRef? = tested if quotient_test else null
+            RemainderTailShape{header: header, branch: branch, compare: compare, branch_quotient: branch_quotient, number: number, divisor: divisor, out: LLVMGetSuccessor(branch, 0), latch: LLVMGetSuccessor(branch, 1)}
+
+        # `out` leaves the loop or falls back to the latch; the latch only
+        # returns to the header, from `out` and the header.
+        def has_remainder_tail_blocks(shape: RemainderTailShape&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if shape.out == shape.latch or not is_optional_block(single_predecessor(shape.out), shape.header)
+            if conditional_terminator(shape.out) is out_branch:
+                return false if not is_unconditional_branch_to(LLVMGetBasicBlockTerminator(shape.latch), shape.header)
+                return false if LLVMGetSuccessor(out_branch, 0) != shape.latch and LLVMGetSuccessor(out_branch, 1) != shape.latch
+                return false if block_has_phis(shape.out)
+                sources: darray[LLVMBasicBlockRef] = predecessor_edges(shape.latch)
+                return sources.count == 2 and contains_block(sources, shape.out) and contains_block(sources, shape.header)
+            false
+
+        def is_optional_block(block: LLVMBasicBlockRef?, expected: LLVMBasicBlockRef) -> bool:
+            if block is present:
+                return present == expected
+            false
+
+        # The last instruction of the header the predicate accepts, as the
+        # C++ scan that kept overwriting its match.
+        def last_header_quotient(shape: RemainderTailShape&) -> LLVMValueRef?:
+            found: mutable LLVMValueRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is instruction |cursor, found, shape|:
+                if is_inexact_unsigned_division(instruction) and LLVMGetOperand(instruction, 0) == shape.number and LLVMGetOperand(instruction, 1) == shape.divisor:
+                    found <- instruction
+                cursor <- LLVMGetNextInstruction(instruction)
+            found
+
+        def last_header_product(shape: RemainderTailShape&, quotient: LLVMValueRef) -> LLVMValueRef?:
+            negated_divisor: LLVMValueRef = LLVMConstNeg(shape.divisor)
+            found: mutable LLVMValueRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is instruction |cursor, found, quotient, negated_divisor|:
+                if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::MUL) and LLVMGetOperand(instruction, 0) == quotient and LLVMGetOperand(instruction, 1) == negated_divisor:
+                    found <- instruction
+                cursor <- LLVMGetNextInstruction(instruction)
+            found
+
+        def last_header_remainder(shape: RemainderTailShape&, product: LLVMValueRef) -> LLVMValueRef?:
+            found: mutable LLVMValueRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is instruction |cursor, found, shape, product|:
+                if is_wrapping_add(instruction) and LLVMGetOperand(instruction, 0) == shape.number and LLVMGetOperand(instruction, 1) == product:
+                    found <- instruction
+                cursor <- LLVMGetNextInstruction(instruction)
+            found
+
+        # The sum is the last `remainder + phi` of the header; the accumulator
+        # is the second operand of the last `remainder + x`, which must be a
+        # header phi for the reduction to match.
+        def header_sum_and_accumulator(shape: RemainderTailShape&, remainder: LLVMValueRef) -> RemainderTailSum?:
+            sum: mutable LLVMValueRef? = null
+            accumulator: mutable LLVMValueRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is instruction |cursor, sum, accumulator, shape, remainder|:
+                if is_wrapping_add(instruction) and LLVMGetOperand(instruction, 0) == remainder:
+                    added: LLVMValueRef = LLVMGetOperand(instruction, 1)
+                    is_phi: bool = is_llvm_instruction_with_opcode(added, LLVMOpcode::PHI)
+                    accumulator <- added if is_phi else null
+                    sum <- instruction if is_phi and LLVMGetInstructionParent(added) == shape.header
+                cursor <- LLVMGetNextInstruction(instruction)
+            if sum is found_sum:
+                if accumulator is found_accumulator:
+                    return RemainderTailSum{sum: found_sum, accumulator: found_accumulator}
+            null
+
+        def match_remainder_reduction(shape: RemainderTailShape&) -> RemainderTailReduction? can[Abort.Panic, Memory.Allocate]:
+            if last_header_quotient(shape) is quotient:
+                if shape.branch_quotient is branch_quotient:
+                    return null if branch_quotient != quotient
+                if last_header_product(shape, quotient) is product:
+                    if last_header_remainder(shape, product) is remainder:
+                        if header_sum_and_accumulator(shape, remainder) is partial:
+                            reduction: RemainderTailReduction = RemainderTailReduction{quotient: quotient, product: product, remainder: remainder, sum: partial.sum, accumulator: partial.accumulator}
+                            return null if not has_only_users(shape.number, quotient, remainder, shape.compare)
+                            return null if not has_only_users(product, remainder, remainder, remainder) or not has_only_users(remainder, partial.sum, partial.sum, partial.sum)
+                            return reduction
+            null
+
+        def unused_compare_count(block: LLVMBasicBlockRef) -> u32:
+            count: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, count|:
+                count <- count + 1 if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::ICMP) and LLVMGetFirstUse(instruction) == null
+                cursor <- LLVMGetNextInstruction(instruction)
+            count
+
+        # The latch's two phis carry the quotient and the sum back to the
+        # header's number and accumulator, and nothing else uses them. Returns
+        # the phi carrying the sum.
+        def latch_sum_phi(shape: RemainderTailShape&, reduction: RemainderTailReduction&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            latch_quotient: mutable LLVMValueRef? = null
+            latch_sum: mutable LLVMValueRef? = null
+            phis: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.latch)
+            while cursor is phi |cursor, latch_quotient, latch_sum, phis, shape, reduction|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                phis <- phis + 1
+                carried: LLVMValueRef? = phi_incoming_for_block(phi, shape.header)
+                if is_optional_value(carried, reduction.quotient):
+                    latch_quotient <- phi
+                elif is_optional_value(carried, reduction.sum):
+                    latch_sum <- phi
+                else:
+                    return null
+                cursor <- LLVMGetNextInstruction(phi)
+            return null if phis != RemainderTailLimits::LATCH_PHIS or instruction_count(shape.latch) != RemainderTailLimits::LATCH_INSTRUCTIONS
+            if latch_quotient is quotient_phi:
+                if latch_sum is sum_phi:
+                    return sum_phi if carried_values_close_cycle(shape, reduction, quotient_phi, sum_phi)
+            null
+
+        def carried_values_close_cycle(shape: RemainderTailShape&, reduction: RemainderTailReduction&, quotient_phi: LLVMValueRef, sum_phi: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if not has_only_users(reduction.quotient, reduction.product, quotient_phi, shape.compare)
+            return false if not is_optional_value(phi_incoming_for_block(shape.number, shape.latch), quotient_phi)
+            return false if not is_optional_value(phi_incoming_for_block(reduction.accumulator, shape.latch), sum_phi)
+            return false if not has_only_users(reduction.accumulator, reduction.sum, reduction.sum, reduction.sum) or not has_only_users(quotient_phi, shape.number, shape.number, shape.number) or not has_only_users(sum_phi, reduction.accumulator, reduction.accumulator, reduction.accumulator)
+            # Every cycle carries exactly the proved values, and the entries
+            # from outside cannot bring undef choices that differ between uses.
+            return false if not is_optional_value(phi_incoming_for_block(quotient_phi, shape.out), reduction.sum)
+            return false if not is_optional_constant_integer(phi_incoming_for_block(sum_phi, shape.out), 0)
+            return false if not entries_are_well_defined(shape.number, shape.latch) or not entries_are_well_defined(reduction.accumulator, shape.latch)
+            sum_uses_stay_in_out_region(reduction.sum, sum_phi, shape.out)
+
+        def entries_are_well_defined(phi: LLVMValueRef, latch: LLVMBasicBlockRef) -> bool:
+            for edge in 0..<LLVMCountIncoming(phi).usize() |phi, latch|:
+                return false if LLVMGetIncomingBlock(phi, edge.u32()) != latch and ElisaLLVMIsGuaranteedNotToBeUndefOrPoison(LLVMGetIncomingValue(phi, edge.u32())) == 0
+            true
+
+        # The sum is used only by the latch phi, in `out`, or by phis on
+        # edges leaving `out`.
+        def sum_uses_stay_in_out_region(sum: LLVMValueRef, sum_phi: LLVMValueRef, out: LLVMBasicBlockRef) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(sum)
+            while use_cursor is use |use_cursor, sum, sum_phi, out|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if LLVMIsAInstruction(user) == null
+                if user != sum_phi and LLVMGetInstructionParent(user) != out:
+                    return false if not is_llvm_instruction_with_opcode(user, LLVMOpcode::PHI)
+                    for edge in 0..<LLVMCountIncoming(user).usize() |user, sum, out|:
+                        return false if LLVMGetIncomingValue(user, edge.u32()) == sum and LLVMGetIncomingBlock(user, edge.u32()) != out
+                use_cursor <- LLVMGetNextUse(use)
+            true
+
+        def peel_remainder_tail(header: LLVMBasicBlockRef, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if conditional_terminator(header) is branch:
+                if remainder_tail_test(header, branch) is shape:
+                    return false if not has_remainder_tail_blocks(&shape)
+                    if match_remainder_reduction(&shape) is reduction:
+                        expected_size: u32 = RemainderTailLimits::HEADER_INSTRUCTIONS + unused_compare_count(header)
+                        return false if instruction_count(header) != expected_size
+                        if latch_sum_phi(&shape, &reduction) is sum_phi:
+                            rewrite_remainder_tail(&shape, &reduction, sum_phi, context)
+                            return true
+            false
+
+        # A tail block between the header and `out` adds the last quotient,
+        # and the header now leaves once the quotient drops below the divisor.
+        def rewrite_remainder_tail(shape: RemainderTailShape&, reduction: RemainderTailReduction&, sum_phi: LLVMValueRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            tail_name: mutable darray[u8] = []
+            tail_block: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, shape.out, sview_to_cstr("elisa.tail", tail_name))
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            LLVMPositionBuilderAtEnd(builder, tail_block)
+            sum_name: mutable darray[u8] = []
+            combined: LLVMValueRef = LLVMBuildAdd(builder, reduction.sum, reduction.quotient, sview_to_cstr("elisa.tail.sum", sum_name))
+            LLVMBuildBr(builder, shape.out)
+            LLVMDisposeBuilder(builder)
+            replace_uses_except(reduction.sum, combined, sum_phi)
+            # `out` has no phis, so its edge from the header needs no update.
+            LLVMSetSuccessor(shape.branch, 0, tail_block)
+            LLVMSetOperand(shape.compare, 0, reduction.quotient)
+            LLVMSetOperand(shape.compare, 1, shape.divisor)
+            ElisaLLVMSetICmpPredicate(shape.compare, LLVMIntPredicate::ULT)
+            LLVMSetICmpSameSign(shape.compare, 0)
+
+        # Replaces every use of `original` with `replacement`, except in
+        # `replacement` itself and in `kept`.
+        def replace_uses_except(original: LLVMValueRef, replacement: LLVMValueRef, kept: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate]:
+            users: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(original)
+            while use_cursor is use |use_cursor, users|:
+                users.push(LLVMGetUser(use))
+                use_cursor <- LLVMGetNextUse(use)
+            for user in users |original, replacement, kept|:
+                if user != replacement and user != kept:
+                    for operand in 0..<LLVMGetNumOperands(user).usize() |user, original, replacement|:
+                        LLVMSetOperand(user, operand.u32(), replacement) if LLVMGetOperand(user, operand.u32()) == original
+
+    public:
+        def peel_remainder_tails(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return 0 if not module_targets_aarch64(module)
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, context|:
+                if not function_has_attribute(function, "optnone"):
+                    block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                    while block_cursor is block |block_cursor, changed, context|:
+                        # Step past the block first: a peel inserts its tail
+                        # before `out`, which this walk must not visit.
+                        block_cursor <- LLVMGetNextBasicBlock(block)
+                        changed <- changed + 1 if peel_remainder_tail(block, context)
+                function_cursor <- LLVMGetNextFunction(function)
+            changed

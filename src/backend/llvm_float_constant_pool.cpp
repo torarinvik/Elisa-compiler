@@ -167,8 +167,6 @@ extern "C" unsigned elisacorePoolFloatingConstants(LLVMModuleRef module,
   // only the final cleanups sink into a shared exit block die here first.
   unsigned changed = expanded + ElisaExitDeadStores::removeExitDeadStores(*llvm::unwrap(module));
   changed += ElisaTrapExits::connectTrapExits(*llvm::unwrap(module));
-  changed += ElisaBitTests::orderBitTestOperands(*llvm::unwrap(module));
-  changed += ElisaRemainderTests::subtractRemainderTests(*llvm::unwrap(module));
   const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
       target.getTarget().createMCSubtargetInfo(
           target.getTargetTriple(), target.getTargetCPU(), target.getTargetFeatureString()));

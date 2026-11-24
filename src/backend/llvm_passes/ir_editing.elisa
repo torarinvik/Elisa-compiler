@@ -1,0 +1,192 @@
+# IR inspection and editing helpers shared by the Elisa-hosted passes, over
+# the LLVM C API: phi incoming lookups, use rewriting and intrinsic calls.
+include "./llvm_ir_queries.elisa"
+include "../llvm_c_api/elisa_llvm_analysis.elisa"
+include "../llvm_c_api/elisa_llvm_ir_edits.elisa"
+include "./llvm_c_extra.elisa"
+
+extern LLVMGetExact(division_or_shift: LLVMValueRef) -> i32
+extern LLVMBuildFreeze(b: LLVMBuilderRef, value: LLVMValueRef, name: cstr) -> LLVMValueRef
+extern LLVMBuildInBoundsGEP2(b: LLVMBuilderRef, type: LLVMTypeRef, pointer: LLVMValueRef, indices: void&, count: u32, name: cstr) -> LLVMValueRef
+extern LLVMArrayType2(element: LLVMTypeRef, count: u64) -> LLVMTypeRef
+extern LLVMSetCondition(branch: LLVMValueRef, condition: LLVMValueRef) -> void
+extern LLVMInstructionGetDebugLoc(instruction: LLVMValueRef) -> LLVMMetadataRef?
+extern LLVMGetLastInstruction(block: LLVMBasicBlockRef) -> LLVMValueRef?
+
+extend Backend:
+    public:
+        def instruction_count(block: LLVMBasicBlockRef) -> u32:
+            count: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, count|:
+                count <- count + 1
+                cursor <- LLVMGetNextInstruction(instruction)
+            count
+
+        def function_block_count(function: LLVMValueRef) -> u32:
+            count: mutable u32 = 0
+            cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while cursor is block |cursor, count|:
+                count <- count + 1
+                cursor <- LLVMGetNextBasicBlock(block)
+            count
+
+        # The first incoming edge of the phi from the block, as
+        # PHINode::getBasicBlockIndex; -1 when there is none.
+        def phi_incoming_index(phi: LLVMValueRef, block: LLVMBasicBlockRef) -> i64:
+            for index in 0..<LLVMCountIncoming(phi).usize() |phi, block|:
+                return index.i64() if LLVMGetIncomingBlock(phi, index.u32()) == block
+            -1
+
+        def phi_incoming_for_block(phi: LLVMValueRef, block: LLVMBasicBlockRef) -> LLVMValueRef?:
+            index: i64 = phi_incoming_index(phi, block)
+            return null if index < 0
+            LLVMGetIncomingValue(phi, index.u32())
+
+        def set_phi_incoming_for_block(phi: LLVMValueRef, block: LLVMBasicBlockRef, value: LLVMValueRef) -> void:
+            index: i64 = phi_incoming_index(phi, block)
+            LLVMSetOperand(phi, index.u32(), value) if index >= 0
+
+        def is_constant_integer(value: LLVMValueRef, expected: u64) -> bool:
+            LLVMIsAConstantInt(value) != null and LLVMConstIntGetZExtValue(value) == expected
+
+        def is_optional_constant_integer(value: LLVMValueRef?, expected: u64) -> bool:
+            if value is present:
+                return is_constant_integer(present, expected)
+            false
+
+        def is_optional_value(value: LLVMValueRef?, expected: LLVMValueRef) -> bool:
+            if value is present:
+                return present == expected
+            false
+
+        # Whether two possibly missing values are the same, or both missing.
+        def same_optional_value(first: LLVMValueRef?, second: LLVMValueRef?) -> bool:
+            if first is first_value:
+                return is_optional_value(second, first_value)
+            second == null
+
+        # The first instruction of the block that is not a phi; every block
+        # this is asked of ends in a terminator, so one exists.
+        def first_non_phi(block: LLVMBasicBlockRef) -> LLVMValueRef can[Abort.Panic]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor|:
+                return instruction if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(instruction)
+            panic("block without a terminator")
+
+        # BasicBlock::getSinglePredecessor: the block's only incoming edge's
+        # source, when exactly one terminator branches to it.
+        def single_predecessor(block: LLVMBasicBlockRef) -> LLVMBasicBlockRef?:
+            predecessor: mutable LLVMBasicBlockRef? = null
+            edges: mutable u32 = 0
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(LLVMBasicBlockAsValue(block))
+            while use_cursor is use |use_cursor, predecessor, edges|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                if LLVMIsATerminatorInst(user) != null:
+                    edges <- edges + 1
+                    predecessor <- LLVMGetInstructionParent(user)
+                use_cursor <- LLVMGetNextUse(use)
+            predecessor if edges == 1 else null
+
+        def block_has_phis(block: LLVMBasicBlockRef) -> bool:
+            if LLVMGetFirstInstruction(block) is head:
+                return is_llvm_instruction_with_opcode(head, LLVMOpcode::PHI)
+            false
+
+        def has_loop_metadata(instruction: LLVMValueRef, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            name: sview = "llvm.loop"
+            kind: u32 = LLVMGetMDKindIDInContext(context, sview_to_cstr(name, name_storage), name.len.u32())
+            LLVMGetMetadata(instruction, kind) != null
+
+        def is_unconditional_branch_to(instruction: LLVMValueRef?, target: LLVMBasicBlockRef) -> bool:
+            if instruction is branch:
+                return LLVMGetInstructionOpcode(branch) == LLVMOpcode::UNCONDITIONAL_BR and LLVMGetSuccessor(branch, 0) == target
+            false
+
+        # Positions the builder before the instruction and takes its debug
+        # location, as `IRBuilder<>(instruction)` does.
+        def position_builder_before(builder: LLVMBuilderRef, instruction: LLVMValueRef) -> void:
+            LLVMPositionBuilderBefore(builder, instruction)
+            set_builder_debug_location(builder, instruction)
+
+        # A conditional branch terminating the block, if it has one.
+        def conditional_terminator(block: LLVMBasicBlockRef) -> LLVMValueRef?:
+            if LLVMGetLastInstruction(block) is last:
+                return last if LLVMGetInstructionOpcode(last) == LLVMOpcode::CONDITIONAL_BR
+            null
+
+        # The phi following `phi`, or else the block's first phi: where a
+        # loop keeps its second recurrence.
+        def neighbouring_phi(block: LLVMBasicBlockRef, phi: LLVMValueRef) -> LLVMValueRef?:
+            if LLVMGetNextInstruction(phi) is next:
+                return next if is_llvm_instruction_with_opcode(next, LLVMOpcode::PHI)
+            if LLVMGetFirstInstruction(block) is head:
+                return head if is_llvm_instruction_with_opcode(head, LLVMOpcode::PHI)
+            null
+
+        # `phi + 1` computed in the block: the phi's value on the edge from it.
+        def block_increment_of(block: LLVMBasicBlockRef, phi: LLVMValueRef) -> LLVMValueRef?:
+            if phi_incoming_for_block(phi, block) is next:
+                return null if not is_llvm_instruction_with_opcode(next, LLVMOpcode::ADD) or LLVMGetInstructionParent(next) != block
+                return null if LLVMGetOperand(next, 0) != phi or not is_constant_integer(LLVMGetOperand(next, 1), 1)
+                return next
+            null
+
+        # Replaces every use of `original` by an instruction outside `block`
+        # with `replacement`.
+        def replace_uses_outside_block(original: LLVMValueRef, replacement: LLVMValueRef, block: LLVMBasicBlockRef) -> void can[Abort.Panic, Memory.Allocate]:
+            users: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(original)
+            while use_cursor is use |use_cursor, users|:
+                users.push(LLVMGetUser(use))
+                use_cursor <- LLVMGetNextUse(use)
+            for user in users |original, replacement, block|:
+                if LLVMIsAInstruction(user) != null and LLVMGetInstructionParent(user) != block:
+                    for operand in 0..<LLVMGetNumOperands(user).usize() |user, original, replacement|:
+                        LLVMSetOperand(user, operand.u32(), replacement) if LLVMGetOperand(user, operand.u32()) == original
+
+        # Replaces every use of `original` by an instruction in `block`.
+        def replace_uses_in_block(original: LLVMValueRef, replacement: LLVMValueRef, block: LLVMBasicBlockRef) -> void can[Abort.Panic, Memory.Allocate]:
+            users: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(original)
+            while use_cursor is use |use_cursor, users|:
+                users.push(LLVMGetUser(use))
+                use_cursor <- LLVMGetNextUse(use)
+            for user in users |original, replacement, block|:
+                if LLVMIsAInstruction(user) != null and LLVMGetInstructionParent(user) == block:
+                    for operand in 0..<LLVMGetNumOperands(user).usize() |user, original, replacement|:
+                        LLVMSetOperand(user, operand.u32(), replacement) if LLVMGetOperand(user, operand.u32()) == original
+
+        def add_phi_incoming(phi: LLVMValueRef, value: LLVMValueRef, block: LLVMBasicBlockRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            values: mutable darray[LLVMValueRef] = [value]
+            blocks: mutable darray[LLVMBasicBlockRef] = [block]
+            value_slots: void& = (&values[0]).cast[void&] can Unsafe.PointerCast
+            block_slots: void& = (&blocks[0]).cast[void&] can Unsafe.PointerCast
+            LLVMAddIncoming(phi, value_slots, block_slots, 1)
+
+        # PHINode::replaceIncomingBlockWith for every phi of `block`.
+        def replace_phi_incoming_blocks(block: LLVMBasicBlockRef, original: LLVMBasicBlockRef, replacement: LLVMBasicBlockRef) -> void:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is phi |cursor, original, replacement|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                for edge in 0..<LLVMCountIncoming(phi).usize() |phi, original, replacement|:
+                    ElisaLLVMSetIncomingBlock(phi, edge.u32(), replacement) if LLVMGetIncomingBlock(phi, edge.u32()) == original
+                cursor <- LLVMGetNextInstruction(phi)
+
+        # `llvm.ctlz.i64(value, true)`.
+        def build_count_leading_zeros(builder: LLVMBuilderRef, module: LLVMModuleRef, value: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            name_storage: mutable darray[u8] = []
+            name: sview = "llvm.ctlz"
+            id: u32 = LLVMLookupIntrinsicID(sview_to_cstr(name, name_storage), name.len.usize())
+            overloads: mutable darray[LLVMTypeRef] = [LLVMInt64TypeInContext(context)]
+            overload_slots: void& = (&overloads[0]).cast[void&] can Unsafe.PointerCast
+            declaration: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, id, overload_slots, 1)
+            arguments: mutable darray[LLVMValueRef] = [value, LLVMConstInt(LLVMInt1TypeInContext(context), 1, 0)]
+            argument_slots: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            LLVMBuildCall2(builder, LLVMIntrinsicGetType(context, id, overload_slots, 1), declaration, argument_slots, 2, "")
+
+        def set_builder_debug_location(builder: LLVMBuilderRef, instruction: LLVMValueRef) -> void:
+            LLVMSetCurrentDebugLocation2(builder, LLVMInstructionGetDebugLoc(instruction))
