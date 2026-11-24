@@ -169,6 +169,11 @@ LLVMValueRef ElisaLLVMConstantIntLowBits(LLVMTypeRef type, unsigned bits);
 int ElisaLLVMConstantIntsAgreeInLowBits(LLVMValueRef first, LLVMValueRef second, unsigned bits);
 /* A floating-point constant that is negative, finite and not zero. */
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant);
+/* The IEEE bits of a `double` ConstantFP (APFloat::bitcastToAPInt). */
+uint64_t ElisaLLVMConstantDoubleBits(LLVMValueRef constant);
+/* Whether some strongly connected component of the function's control flow graph has a
+ * cycle (scc_iterator::hasCycle): a loop or a self-edge. */
+int ElisaLLVMFunctionHasCycle(LLVMValueRef function);
 /* llvm::isGuaranteedNotToBeUndefOrPoison with no context instruction. */
 int ElisaLLVMIsGuaranteedNotToBeUndefOrPoison(LLVMValueRef value);
 /* llvm::isGuaranteedNotToBeUndefOrPoison at the instruction `context`, with the dominator

@@ -73,6 +73,10 @@ void ElisaLLVMRemoveIncomingValue(LLVMValueRef phi, uint32_t index) {
   cast<PHINode>(unwrap(phi))->removeIncomingValue(index, false);
 }
 
+LLVMBasicBlockRef ElisaLLVMSplitEdge(LLVMBasicBlockRef from, LLVMBasicBlockRef to) {
+  return wrap(SplitEdge(unwrap(from), unwrap(to)));
+}
+
 LLVMBasicBlockRef ElisaLLVMSplitBlock(LLVMValueRef instruction) {
   Instruction *At = cast<Instruction>(unwrap(instruction));
   return wrap(SplitBlock(At->getParent(), At));

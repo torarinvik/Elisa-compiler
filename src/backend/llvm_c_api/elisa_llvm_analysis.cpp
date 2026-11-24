@@ -3,6 +3,7 @@
 #include "elisa_llvm_function_analyses.h"
 
 #include <llvm/ADT/PostOrderIterator.h>
+#include <llvm/ADT/SCCIterator.h>
 #include <llvm/Analysis/AssumptionCache.h>
 #include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/LazyValueInfo.h>
@@ -349,6 +350,17 @@ LLVMValueRef ElisaLLVMUnderlyingObject(LLVMValueRef value) {
 int ElisaLLVMBlockIsEHPad(LLVMBasicBlockRef block) { return unwrap(block)->isEHPad(); }
 
 unsigned ElisaLLVMUseOperandNumber(LLVMUseRef use) { return unwrap(use)->getOperandNo(); }
+
+uint64_t ElisaLLVMConstantDoubleBits(LLVMValueRef constant) {
+  return cast<ConstantFP>(unwrap(constant))->getValueAPF().bitcastToAPInt().getZExtValue();
+}
+
+int ElisaLLVMFunctionHasCycle(LLVMValueRef function) {
+  Function *F = cast<Function>(unwrap(function));
+  for (auto Component = scc_begin(F); !Component.isAtEnd(); ++Component)
+    if (Component.hasCycle()) return 1;
+  return 0;
+}
 
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant) {
   const APFloat &Value = cast<ConstantFP>(unwrap(constant))->getValueAPF();

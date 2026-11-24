@@ -1,0 +1,115 @@
+# What the checked-multiply folds share: the intrinsic, attribute and metadata identifiers
+# they test, header phi iteration, and the rewrite of a checked operation proven not to
+# overflow into `{result, false}`.
+include "../ir/ir_editing.elisa"
+include "../ir/llvm_c_extra.elisa"
+include "../../llvm_c_api/elisa_llvm_analysis.elisa"
+include "../../llvm_c_api/elisa_llvm_constant_range.elisa"
+
+const module CheckedLimit:
+    SIGNED_MAXIMUM: u64 = 9223372036854775807
+    SLOW_PATH: sview = "elisa.checkedmul.slow"
+    VERSIONED: sview = "elisa.checkedmul.versioned"
+
+# The identifiers the folds compare against, looked up once per module.
+struct CheckedIdentifiers:
+    signed_add: u32
+    signed_subtract: u32
+    signed_multiply: u32
+    trap: u32
+    convergent: u32
+    no_duplicate: u32
+    slow_path: u32
+
+extend Backend:
+    private:
+        def intrinsic_identifier(name: sview) -> u32 can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            LLVMLookupIntrinsicID(sview_to_cstr(name, name_storage), name.len.usize())
+
+        def checked_identifiers(context: LLVMContextRef) -> CheckedIdentifiers can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            name_storage: mutable darray[u8] = []
+            slow_path: u32 = LLVMGetMDKindIDInContext(context, sview_to_cstr(CheckedLimit::SLOW_PATH, name_storage), CheckedLimit::SLOW_PATH.len.u32())
+            CheckedIdentifiers{signed_add: intrinsic_identifier("llvm.sadd.with.overflow"), signed_subtract: intrinsic_identifier("llvm.ssub.with.overflow"), signed_multiply: intrinsic_identifier("llvm.smul.with.overflow"), trap: intrinsic_identifier("llvm.trap"), convergent: attribute_kind("convergent"), no_duplicate: attribute_kind("noduplicate"), slow_path: slow_path}
+
+        # The phis at the head of BLOCK, in order.
+        def block_phis(block: LLVMBasicBlockRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            phis: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, phis|:
+                break if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI)
+                phis.push(instruction)
+                cursor <- LLVMGetNextInstruction(instruction)
+            phis
+
+        # A direct call of intrinsic IDENTIFIER without operand bundles that is neither
+        # convergent nor carrying metadata other than its debug location.
+        def is_plain_checked_call(call: LLVMValueRef, identifier: u32, identifiers: CheckedIdentifiers&) -> bool:
+            return false if called_intrinsic_id(call) != identifier or LLVMGetNumOperandBundles(call) != 0
+            ElisaLLVMCallHasFunctionAttribute(call, identifiers.convergent) == 0 and ElisaLLVMHasMetadataOtherThanDebugLoc(call) == 0
+
+        # Replaces CALL, a `{iN, i1}` checked operation, with `{RESULT, false}` built before
+        # it, and erases it.
+        def replace_checked_result(call: LLVMValueRef, builder: LLVMBuilderRef, result: LLVMValueRef) -> void:
+            pair: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetPoison(LLVMTypeOf(call)), result, 0, "")
+            no_overflow: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(call))), 0, 0)
+            LLVMReplaceAllUsesWith(call, LLVMBuildInsertValue(builder, pair, no_overflow, 1, ""))
+            LLVMInstructionEraseFromParent(call)
+
+        # Rewrites the checked call as its `nsw` operation (multiply or add) on the same
+        # operands, built before it with its debug location.
+        def fold_checked_call(call: LLVMValueRef, builder: LLVMBuilderRef, multiply: bool) -> void:
+            position_builder_before(builder, call)
+            left: LLVMValueRef = LLVMGetOperand(call, 0)
+            right: LLVMValueRef = LLVMGetOperand(call, 1)
+            result: LLVMValueRef = LLVMBuildNSWMul(builder, left, right, "") if multiply else LLVMBuildNSWAdd(builder, left, right, "")
+            replace_checked_result(call, builder, result)
+
+        # Freezes VALUE at the function's first insertion point and points every other use
+        # at the frozen value, so the entry checks and the loop observe one input.
+        def freeze_at_entry(value: LLVMValueRef, function: LLVMValueRef, builder: LLVMBuilderRef, name: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            position_builder_before(builder, first_non_phi(LLVMGetEntryBasicBlock(function)))
+            name_storage: mutable darray[u8] = []
+            frozen: LLVMValueRef = LLVMBuildFreeze(builder, value, sview_to_cstr(name, name_storage))
+            replace_uses_except(value, frozen, frozen)
+
+        # The narrowest range of VALUE that the conditional branches dominating USE_BLOCK
+        # prove: each `icmp VALUE, constant` on the taken edge, and on a false edge also
+        # each side of an `or`, or of a `select c, true, x`.
+        def dominating_guard_range(value: LLVMValueRef, use_block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(value)))
+            node: mutable LLVMBasicBlockRef? = ElisaLLVMImmediateDominator(analyses, use_block)
+            while node is block |node, range, value, use_block, analyses|:
+                node <- ElisaLLVMImmediateDominator(analyses, block)
+                if conditional_terminator(block) is branch:
+                    for edge in 0..<2.u32() |range, value, block, branch, use_block, analyses|:
+                        if ElisaLLVMEdgeDominates(analyses, block, LLVMGetSuccessor(branch, edge), use_block) != 0:
+                            range <- narrow_by_terms(range, value, guard_terms(LLVMGetCondition(branch), edge), edge)
+            range
+
+        # The comparisons a branch condition decides on EDGE.
+        def guard_terms(condition: LLVMValueRef, edge: u32) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            return [condition] if edge == 0
+            if is_llvm_instruction_with_opcode(condition, LLVMOpcode::OR):
+                return [LLVMGetOperand(condition, 0), LLVMGetOperand(condition, 1)]
+            if is_llvm_instruction_with_opcode(condition, LLVMOpcode::SELECT):
+                true_value: LLVMValueRef = LLVMGetOperand(condition, 1)
+                if LLVMIsAConstantInt(true_value) != null and ElisaLLVMIsConstantOne(true_value) != 0:
+                    return [LLVMGetOperand(condition, 0), LLVMGetOperand(condition, 2)]
+            [condition]
+
+        # RANGE intersected with the region of each `icmp VALUE, constant` term, inverted on
+        # the false edge. Disposes RANGE.
+        def narrow_by_terms(range: ElisaConstantRangeRef, value: LLVMValueRef, terms: darray[LLVMValueRef], edge: u32) -> ElisaConstantRangeRef:
+            narrowed: mutable ElisaConstantRangeRef = range
+            for term in terms |narrowed, value, edge|:
+                continue if not is_llvm_instruction_with_opcode(term, LLVMOpcode::ICMP)
+                bound: LLVMValueRef = LLVMGetOperand(term, 1)
+                continue if LLVMIsAConstantInt(bound) == null or LLVMGetOperand(term, 0) != value
+                predicate: i32 = LLVMGetICmpPredicate(term) if edge == 0 else inverse_integer_predicate(LLVMGetICmpPredicate(term))
+                region: ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(predicate, bound)
+                intersection: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(narrowed, region)
+                ElisaLLVMDisposeConstantRange(region)
+                ElisaLLVMDisposeConstantRange(narrowed)
+                narrowed <- intersection
+            narrowed

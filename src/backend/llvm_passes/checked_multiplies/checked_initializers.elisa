@@ -1,0 +1,205 @@
+# Unrolls constant-trip private initializers so LLVM can propagate values across array
+# stores and fold their checked arithmetic.
+#
+# A top-level innermost loop that only loads and stores one static array alloca, does
+# checked add, sub or multiply, uses nothing defined outside it but allocas and
+# constants, and leaves early only to `llvm.trap` blocks, runs 2..64 times. It is fully
+# unrolled in a copy of the function, within a module-wide growth budget; the copy is
+# simplified and replaces the original only when it ends up smaller.
+include "./checked_results.elisa"
+include "../ir/pass_pipelines.elisa"
+include "../ir/loop_pass_policy.elisa"
+include "../../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module CheckedInitializerLimit:
+    MINIMUM_BLOCKS: u32 = 3
+    MAXIMUM_BLOCKS: u32 = 96
+    MINIMUM_TRIPS: u32 = 2
+    MAXIMUM_TRIPS: u32 = 64
+    LOOP_GROWTH: u32 = 1200
+    EXPANSION_BUDGET: u32 = 1000
+    CLEANUP: sview = "sroa,early-cse<memssa>,gvn,sccp,instcombine,simplifycfg,dse,sroa,early-cse<memssa>,gvn,sccp,instcombine,simplifycfg,dse,slp-vectorizer"
+    UNCHANGED: u32 = 0
+    REPLACED: u32 = 1
+    FAILED: u32 = 2
+
+# The result of one trial: UNCHANGED, REPLACED or FAILED, and the growth budget left.
+struct InitializerTrial:
+    status: u32
+    budget: u32
+
+# An initializer scan's verdict and the one array it touches.
+struct InitializerScan:
+    accepted: bool
+    storage: LLVMValueRef?
+    has_store: bool
+    has_checked_arithmetic: bool
+
+extend Backend:
+    private:
+        # A checked add, sub or multiply that may be duplicated.
+        def is_initializer_checked_arithmetic(instruction: LLVMValueRef, identifiers: CheckedIdentifiers&) -> bool:
+            identifier: u32 = called_intrinsic_id(instruction)
+            return false if identifier != identifiers.signed_add and identifier != identifiers.signed_subtract and identifier != identifiers.signed_multiply
+            return false if identifier == 0 or LLVMGetNumOperandBundles(instruction) != 0
+            ElisaLLVMCallHasFunctionAttribute(instruction, identifiers.convergent) == 0 and ElisaLLVMCallHasFunctionAttribute(instruction, identifiers.no_duplicate) == 0
+
+        def is_static_array_alloca(value: LLVMValueRef) -> bool:
+            LLVMIsAAllocaInst(value) != null and ElisaLLVMIsStaticAlloca(value) != 0 and LLVMGetTypeKind(LLVMGetAllocatedType(value)) == LLVMTypeKindValue::ARRAY
+
+        # A block holding only `call llvm.trap` and `unreachable`.
+        def is_trap_exit(block: LLVMBasicBlockRef, identifiers: CheckedIdentifiers&) -> bool:
+            return false if instruction_count(block) != 2
+            first: LLVMValueRef = get LLVMGetFirstInstruction(block) else return false
+            last: LLVMValueRef = get LLVMGetLastInstruction(block) else return false
+            called_intrinsic_id(first) == identifiers.trap and LLVMGetInstructionOpcode(last) == LLVMOpcode::UNREACHABLE
+
+        # Whether every exiting block but the latch ends in a conditional branch whose
+        # exits are trap blocks.
+        def exits_only_to_traps(loop: ElisaLoopRef, latch: LLVMBasicBlockRef, identifiers: CheckedIdentifiers&) -> bool:
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop, latch, identifiers|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, index)
+                continue if block == latch
+                terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return false
+                exiting: mutable bool = false
+                for successor in 0..<LLVMGetNumSuccessors(terminator) |exiting, terminator, loop|:
+                    exiting <- exiting or ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(terminator, successor)) == 0
+                continue if not exiting
+                branch: LLVMValueRef = get conditional_terminator(block) else return false
+                for successor in 0..<2.u32() |branch, loop, identifiers|:
+                    exit: LLVMBasicBlockRef = LLVMGetSuccessor(branch, successor)
+                    return false if ElisaLLVMLoopContainsBlock(loop, exit) == 0 and not is_trap_exit(exit, identifiers)
+            true
+
+        # Whether every operand of INSTRUCTION is a loop instruction, an alloca, a
+        # constant or a block.
+        def uses_only_loop_values(instruction: LLVMValueRef, loop: ElisaLoopRef) -> bool:
+            for operand_index in 0..<LLVMGetNumOperands(instruction).u32() |instruction, loop|:
+                operand: LLVMValueRef = LLVMGetOperand(instruction, operand_index)
+                if LLVMIsAInstruction(operand) != null:
+                    return false if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(operand)) == 0 and LLVMIsAAllocaInst(operand) == null
+                elif LLVMIsAConstant(operand) == null and LLVMValueIsBasicBlock(operand) == 0:
+                    return false
+            true
+
+        # SCAN after one loop instruction.
+        def scan_initializer_instruction(scan: InitializerScan, instruction: LLVMValueRef, loop: ElisaLoopRef, identifiers: CheckedIdentifiers&) -> InitializerScan:
+            rejected: InitializerScan = InitializerScan{accepted: false, storage: null, has_store: false, has_checked_arithmetic: false}
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            address: mutable LLVMValueRef? = null
+            has_store: mutable bool = scan.has_store
+            has_checked_arithmetic: mutable bool = scan.has_checked_arithmetic
+            if opcode == LLVMOpcode::STORE or opcode == LLVMOpcode::LOAD:
+                return rejected if LLVMGetVolatile(instruction) != 0 or LLVMGetOrdering(instruction) != 0
+                address <- LLVMGetOperand(instruction, 1) if opcode == LLVMOpcode::STORE else LLVMGetOperand(instruction, 0)
+                has_store <- has_store or opcode == LLVMOpcode::STORE
+            elif is_call_base(instruction):
+                return rejected if not is_initializer_checked_arithmetic(instruction, identifiers)
+                has_checked_arithmetic <- true
+            elif LLVMIsATerminatorInst(instruction) == null and (ElisaLLVMMayReadOrWriteMemory(instruction) != 0 or ElisaLLVMMayHaveSideEffects(instruction) != 0):
+                return rejected
+            storage: mutable LLVMValueRef? = scan.storage
+            if address is pointer:
+                object: LLVMValueRef = ElisaLLVMUnderlyingObject(pointer)
+                return rejected if not is_static_array_alloca(object)
+                if storage is earlier:
+                    return rejected if earlier != object
+                storage <- object
+            return rejected if not uses_only_loop_values(instruction, loop)
+            InitializerScan{accepted: true, storage: storage, has_store: has_store, has_checked_arithmetic: has_checked_arithmetic}
+
+        # Whether the loop is a checked initializer of one static array.
+        def is_checked_initializer(loop: ElisaLoopRef, latch: LLVMBasicBlockRef, identifiers: CheckedIdentifiers&) -> bool:
+            return false if not exits_only_to_traps(loop, latch, identifiers)
+            scan: mutable InitializerScan = InitializerScan{accepted: true, storage: null, has_store: false, has_checked_arithmetic: false}
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |scan, loop, identifiers|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor, scan, loop, identifiers|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    scan <- scan_initializer_instruction(scan, instruction, loop, identifiers)
+                    return false if not scan.accepted
+            scan.has_store and scan.has_checked_arithmetic
+
+        def loop_instruction_count(loop: ElisaLoopRef) -> u32:
+            total: mutable u32 = 0
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |total, loop|:
+                total <- total + instruction_count(ElisaLLVMLoopBlockAt(loop, index))
+            total
+
+        # Fully unrolls one candidate loop when it fits the budget; the unroll verdict and
+        # the budget left.
+        def unroll_checked_initializer(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, budget: u32, identifiers: CheckedIdentifiers&) -> InitializerTrial:
+            unchanged: InitializerTrial = InitializerTrial{status: CheckedInitializerLimit::UNCHANGED, budget: budget}
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return unchanged
+            return unchanged if ElisaLLVMLoopSubLoopCount(loop) != 0 or ElisaLLVMLoopGetLoopID(loop) != null or not is_checked_initializer(loop, latch, identifiers)
+            trips: u32 = ElisaLLVMSmallConstantTripCount(analyses, loop, latch)
+            return unchanged if trips < CheckedInitializerLimit::MINIMUM_TRIPS or trips > CheckedInitializerLimit::MAXIMUM_TRIPS or ElisaLLVMSmallConstantMaxTripCount(analyses, loop) != trips
+            growth: u64 = trips.u64() * loop_instruction_count(loop).u64()
+            return unchanged if growth > CheckedInitializerLimit::LOOP_GROWTH.u64() or growth > budget.u64()
+            left: u32 = budget - growth.u32()
+            _ = ElisaLLVMSimplifyLoop(analyses, loop, 0)
+            return InitializerTrial{status: CheckedInitializerLimit::UNCHANGED, budget: left} if ElisaLLVMLoopIsSimplifyForm(loop) == 0
+            _ = ElisaLLVMFormLCSSA(analyses, loop)
+            flags: u32 = ElisaUnrollFlag::FORCE + ElisaUnrollFlag::PRESERVE_LCSSA
+            unrolled: bool = ElisaLLVMUnrollLoop(analyses, loop, trips, flags, CheckedInitializerLimit::EXPANSION_BUDGET) != ElisaUnrollResult::UNMODIFIED
+            InitializerTrial{status: CheckedInitializerLimit::REPLACED if unrolled else CheckedInitializerLimit::UNCHANGED, budget: left}
+
+        # Unrolls the trial copy's candidate loops, top-level loops in LoopInfo order;
+        # REPLACED when any unrolled, with the budget left.
+        def unroll_checked_initializers(trial: LLVMValueRef, budget: u32, identifiers: CheckedIdentifiers&) -> InitializerTrial can[Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(trial) else return InitializerTrial{status: CheckedInitializerLimit::UNCHANGED, budget: budget}
+            loops: mutable darray[ElisaLoopRef] = []
+            for index in 0..<ElisaLLVMTopLevelLoopCount(analyses) |loops, analyses|:
+                loops.push(ElisaLLVMTopLevelLoopAt(analyses, index))
+            result: mutable InitializerTrial = InitializerTrial{status: CheckedInitializerLimit::UNCHANGED, budget: budget}
+            for loop in loops |result, analyses, identifiers|:
+                step: InitializerTrial = unroll_checked_initializer(loop, analyses, result.budget, identifiers)
+                result <- InitializerTrial{status: CheckedInitializerLimit::REPLACED if step.status == CheckedInitializerLimit::REPLACED else result.status, budget: step.budget}
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            result
+
+        # Tries the unrolled form on a copy and keeps it when simplification leaves fewer
+        # instructions and no more blocks.
+        def try_fold_checked_initializers(function: LLVMValueRef, target: void&?, budget: u32, identifiers: CheckedIdentifiers&) -> InitializerTrial can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            trial: LLVMValueRef = ElisaLLVMCloneFunction(function)
+            unrolled: InitializerTrial = unroll_checked_initializers(trial, budget, identifiers)
+            if unrolled.status != CheckedInitializerLimit::REPLACED:
+                LLVMDeleteFunction(trial)
+                return unrolled
+            if not run_function_pipeline(trial, target, CheckedInitializerLimit::CLEANUP):
+                LLVMDeleteFunction(trial)
+                return InitializerTrial{status: CheckedInitializerLimit::FAILED, budget: unrolled.budget}
+            if function_instruction_count(trial) >= function_instruction_count(function) or function_block_count(trial) > function_block_count(function):
+                LLVMDeleteFunction(trial)
+                return InitializerTrial{status: CheckedInitializerLimit::UNCHANGED, budget: unrolled.budget}
+            ElisaLLVMAdoptFunctionBody(function, trial)
+            unrolled
+
+        def has_metadata_attachment(function: LLVMValueRef) -> bool can[Unsafe.PointerCast]:
+            count: mutable usize = 0
+            entries: void&? = LLVMGlobalCopyAllMetadata(function, &count)
+            if entries is copied:
+                LLVMDisposeValueMetadataEntries(copied)
+            count > 0
+
+        # A cheap screen: a small, unannotated, unsanitized function with a static array
+        # alloca in its entry, no address-taken block and some checked arithmetic.
+        def may_fold_checked_initializers(function: LLVMValueRef, identifiers: CheckedIdentifiers&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: u32 = function_block_count(function)
+            return false if blocks < CheckedInitializerLimit::MINIMUM_BLOCKS or blocks > CheckedInitializerLimit::MAXIMUM_BLOCKS or has_metadata_attachment(function) or function_is_sanitized(function)
+            has_array: mutable bool = false
+            entry_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while entry_cursor is instruction |entry_cursor, has_array|:
+                entry_cursor <- LLVMGetNextInstruction(instruction)
+                has_array <- has_array or is_static_array_alloca(instruction)
+            return false if not has_array
+            checked: mutable bool = false
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, checked, identifiers|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                return false if ElisaLLVMBlockHasAddressTaken(block) != 0
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, checked, identifiers|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    checked <- checked or is_initializer_checked_arithmetic(instruction, identifiers)
+            checked

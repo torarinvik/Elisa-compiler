@@ -61,6 +61,8 @@ void ElisaLLVMRemoveIncomingValue(LLVMValueRef phi, uint32_t index);
  * instruction and everything after it into a new block named
  * "<parent>.split", placed after the parent, which now branches to it. */
 LLVMBasicBlockRef ElisaLLVMSplitBlock(LLVMValueRef instruction);
+/* llvm::SplitEdge(from, to) without analyses: the block placed on the edge. */
+LLVMBasicBlockRef ElisaLLVMSplitEdge(LLVMBasicBlockRef from, LLVMBasicBlockRef to);
 
 ElisaValueMapRef ElisaLLVMCreateValueMap(void);
 void ElisaLLVMDisposeValueMap(ElisaValueMapRef map);

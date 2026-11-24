@@ -1,0 +1,276 @@
+# Fast paths for checked i64 multiplies on AArch64.
+#
+# An `smul.with.overflow` in a loop whose overflow flag alone decides the branch ending
+# its block either is proven safe (cursor_products.elisa, checked_squares.elisa) or is
+# versioned: when the right operand is 0 or 1 the low product is the result and the
+# checked call moves to a `checkedmul.slow` block, tagged `elisa.checkedmul.slow`. After
+# a cleanup, checked powers on those slow paths are folded and short power loops
+# unrolled (checked_powers.elisa). Constant-trip initializers with checked arithmetic are
+# first tried unrolled (checked_initializers.elisa).
+include "./checked_results.elisa"
+include "./checked_powers.elisa"
+include "./checked_squares.elisa"
+include "./cursor_products.elisa"
+include "./checked_initializers.elisa"
+include "../ir/loop_pass_policy.elisa"
+include "../ir/pass_pipelines.elisa"
+
+const module CheckedMultiplyLimit:
+    INITIALIZER_BUDGET: u32 = 6000
+    INITIALIZER_TRIALS: u32 = 8
+    FUNCTION_INSTRUCTIONS: u32 = 5000
+    CANDIDATES: usize = 32
+    OUTER_SQUARES: usize = 8
+    CLEANUP: sview = "function(instcombine<no-verify-fixpoint>,simplifycfg)"
+    REVECTORIZE: sview = "loop-simplify,lcssa,loop-vectorize,instcombine<no-verify-fixpoint>,simplifycfg"
+    POWER_CLEANUP: sview = "instcombine<no-verify-fixpoint>,simplifycfg"
+    UNCHANGED: u32 = 0
+    CHANGED: u32 = 1
+    FAILED: u32 = 2
+
+# The module-wide state of one run after a function: whether anything changed or a
+# pipeline failed, the initializer budget and trials left, and whether that function's
+# folded reductions are worth revectorizing.
+struct CheckedMultiplyRun:
+    changed: bool
+    failed: bool
+    initializer_budget: u32
+    initializer_trials: u32
+    folded_reduction: bool
+
+# The proven folds of one function's innermost candidates: those left to version,
+# whether any folded, and whether a folded checked sum is worth revectorizing.
+struct ProvenMultiplies:
+    remaining: darray[LLVMValueRef]
+    changed: bool
+    folded_reduction: bool
+
+# One function's first-phase result.
+struct FunctionMultiplyFold:
+    changed: bool
+    folded_reduction: bool
+
+# One function's checked multiplies, snapshot before any rewrite: innermost-loop
+# candidates and outer-loop header counter squares.
+struct CheckedMultiplyCandidates:
+    innermost: mutable darray[LLVMValueRef]
+    outer_squares: mutable darray[LLVMValueRef]
+
+extend Backend:
+    private:
+        # The branch ending the call's block tests exactly its overflow flag, which has
+        # no other use, and only extracts of the call sit between them.
+        def has_flag_guard(call: LLVMValueRef) -> bool can[Abort.Panic]:
+            guard_branch: LLVMValueRef = get conditional_terminator(LLVMGetInstructionParent(call)) else return false
+            flag: LLVMValueRef = LLVMGetCondition(guard_branch)
+            return false if not is_extract_of_field(flag, 1) or LLVMGetOperand(flag, 0) != call or not has_one_use(flag)
+            return false if LLVMGetSuccessor(guard_branch, 0) == LLVMGetSuccessor(guard_branch, 1) or ElisaLLVMHasMetadataOtherThanDebugLoc(guard_branch) != 0
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(call)
+            while use_cursor is use |use_cursor, flag|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if not is_extract_of_field(user, 0) and not is_extract_of_field(user, 1)
+                return false if (is_extract_of_field(user, 1) and user != flag) or ElisaLLVMIsUsedByMetadata(user) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(user) != 0
+            cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(call)
+            while cursor is between |cursor, call, guard_branch|:
+                return true if between == guard_branch
+                return false if LLVMGetInstructionOpcode(between) != LLVMOpcode::EXTRACT_VALUE or LLVMGetOperand(between, 0) != call
+                cursor <- LLVMGetNextInstruction(between)
+            false
+
+        # A plain, duplicable, metadata-free `smul.with.overflow.i64` of two non-constants
+        # guarded by its own overflow flag.
+        def is_checked_multiply_candidate(call: LLVMValueRef, identifiers: CheckedIdentifiers&) -> bool can[Abort.Panic]:
+            return false if not is_plain_checked_call(call, identifiers.signed_multiply, identifiers) or not is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(call, 0)), 64)
+            return false if ElisaLLVMCallHasFunctionAttribute(call, identifiers.no_duplicate) != 0 or ElisaLLVMIsUsedByMetadata(call) != 0
+            return false if LLVMIsAConstant(LLVMGetOperand(call, 0)) != null or LLVMIsAConstant(LLVMGetOperand(call, 1)) != null
+            has_flag_guard(call)
+
+        # Moves the call, its flag and its branch to a new `checkedmul.slow` block taken
+        # unless the right operand is 0 or 1, where the low product is the result.
+        def version_checked_multiply(call: LLVMValueRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            prefix: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(prefix)
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(call))
+            guard_branch: LLVMValueRef = get conditional_terminator(prefix) else return
+            flag: LLVMValueRef = LLVMGetCondition(guard_branch)
+            overflow: LLVMBasicBlockRef = LLVMGetSuccessor(guard_branch, 0)
+            success: LLVMBasicBlockRef = LLVMGetSuccessor(guard_branch, 1)
+            position_builder_before(builder, call)
+            name_storage: mutable darray[u8] = []
+            left: LLVMValueRef = LLVMBuildFreeze(builder, LLVMGetOperand(call, 0), sview_to_cstr("checkedmul.a", name_storage))
+            right_storage: mutable darray[u8] = []
+            right: LLVMValueRef = LLVMBuildFreeze(builder, LLVMGetOperand(call, 1), sview_to_cstr("checkedmul.b", right_storage))
+            low_storage: mutable darray[u8] = []
+            low: LLVMValueRef = LLVMBuildMul(builder, left, right, sview_to_cstr("checkedmul.low", low_storage))
+            cheap_storage: mutable darray[u8] = []
+            cheap: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::ULE, right, LLVMConstInt(LLVMTypeOf(right), 1, 0), sview_to_cstr("checkedmul.cheap", cheap_storage))
+            values: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(call)
+            while use_cursor is use |use_cursor, values, flag|:
+                use_cursor <- LLVMGetNextUse(use)
+                values.push(LLVMGetUser(use)) if LLVMGetUser(use) != flag
+            for value in values |low|:
+                LLVMReplaceAllUsesWith(value, low)
+                LLVMInstructionEraseFromParent(value)
+            slow: LLVMBasicBlockRef = new_block_after(prefix, function, context)
+            ElisaLLVMMoveInstructionToBlockEnd(call, slow)
+            ElisaLLVMMoveInstructionToBlockEnd(flag, slow)
+            ElisaLLVMMoveInstructionToBlockEnd(guard_branch, slow)
+            LLVMSetOperand(call, 0, left)
+            LLVMSetOperand(call, 1, right)
+            LLVMSetMetadata(call, identifiers.slow_path, LLVMMetadataAsValue(context, llvm_metadata_node_with_optional_operands(context, null, 0)))
+            for phi in block_phis(success) |prefix, slow|:
+                if phi_incoming_for_block(phi, prefix) is incoming:
+                    add_phi_incoming(phi, incoming, slow)
+            replace_phi_incoming_blocks(overflow, prefix, slow)
+            LLVMPositionBuilderAtEnd(builder, prefix)
+            _ = LLVMBuildCondBr(builder, cheap, success, slow)
+
+        # An empty `checkedmul.slow` block placed right after PREFIX.
+        def new_block_after(prefix: LLVMBasicBlockRef, function: LLVMValueRef, context: LLVMContextRef) -> LLVMBasicBlockRef can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            name: cstr = sview_to_cstr("checkedmul.slow", name_storage)
+            if LLVMGetNextBasicBlock(prefix) is next:
+                return LLVMInsertBasicBlockInContext(context, next, name)
+            LLVMAppendBasicBlockInContext(context, function, name)
+
+        # Whether the function is one the multiply folds leave alone.
+        def skipped_by_checked_multiply_policy(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function)
+            return true if llvm_function_subprogram_or_null(function) != null or LLVMHasPersonalityFn(function) != 0 or LLVMGetGC(function) != null
+            function_has_attribute(function, "convergent") or ElisaLLVMFunctionHasEntryCount(function) != 0
+
+        def has_wide_checked_multiply(function: LLVMValueRef, identifiers: CheckedIdentifiers&) -> bool:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, identifiers|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, identifiers|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return true if called_intrinsic_id(instruction) == identifiers.signed_multiply and is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(instruction, 0)), 64)
+            false
+
+        # The function's checked multiplies in loops, in block order.
+        def checked_multiply_candidates(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, identifiers: CheckedIdentifiers&) -> CheckedMultiplyCandidates can[Abort.Panic, Memory.Allocate]:
+            found: mutable CheckedMultiplyCandidates = CheckedMultiplyCandidates{innermost: [], outer_squares: []}
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, found, analyses, identifiers|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if ElisaLLVMLoopForBlock(analyses, block) is loop:
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while cursor is call |cursor, found, block, loop, identifiers|:
+                        cursor <- LLVMGetNextInstruction(call)
+                        continue if called_intrinsic_id(call) != identifiers.signed_multiply
+                        if ElisaLLVMLoopSubLoopCount(loop) == 0:
+                            found.innermost.push(call) if is_checked_multiply_candidate(call, identifiers)
+                        elif is_outer_header_square(call, block, loop) and is_checked_multiply_candidate(call, identifiers):
+                            found.outer_squares.push(call)
+            found
+
+        # `smul(COUNTER, COUNTER)` of a header phi, in the header of an outer loop.
+        def is_outer_header_square(call: LLVMValueRef, block: LLVMBasicBlockRef, loop: ElisaLoopRef) -> bool:
+            counter: LLVMValueRef = LLVMGetOperand(call, 0)
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            is_llvm_instruction_with_opcode(counter, LLVMOpcode::PHI) and LLVMGetOperand(call, 1) == counter and LLVMGetInstructionParent(counter) == header and block == header
+
+        # Folds what the bounds prove among the innermost candidates, keeping the order of
+        # those left; whether any folded reduction is worth revectorizing.
+        def fold_proven_multiplies(candidates: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> ProvenMultiplies can[Abort.Panic, Memory.Allocate]:
+            remaining: mutable darray[LLVMValueRef] = []
+            changed: mutable bool = false
+            reduction: mutable bool = false
+            for call in candidates |remaining, changed, reduction, analyses, builder, identifiers|:
+                cursor: CursorProductFold = fold_cursor_checked_multiply(call, analyses, builder, identifiers)
+                reduction <- reduction or cursor.folded_reduction
+                if cursor.folded or fold_bounded_checked_square(call, analyses, builder, identifiers):
+                    changed <- true
+                else:
+                    remaining.push(call)
+            ProvenMultiplies{remaining: remaining, changed: changed, folded_reduction: reduction}
+
+        # Folds or versions one function's checked multiplies; whether anything changed.
+        def fold_function_checked_multiplies(function: LLVMValueRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> FunctionMultiplyFold can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            none: FunctionMultiplyFold = FunctionMultiplyFold{changed: false, folded_reduction: false}
+            return none if not has_wide_checked_multiply(function, identifiers)
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return none
+            candidates: CheckedMultiplyCandidates = checked_multiply_candidates(function, analyses, identifiers)
+            if candidates.innermost.count > CheckedMultiplyLimit::CANDIDATES:
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+                return none
+            squares: bool = candidates.outer_squares.count <= CheckedMultiplyLimit::OUTER_SQUARES and fold_range_proven_squares(&candidates.outer_squares, analyses, builder)
+            proven: ProvenMultiplies = fold_proven_multiplies(&candidates.innermost, analyses, builder, identifiers)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            for call in proven.remaining |builder, identifiers|:
+                version_checked_multiply(call, builder, identifiers)
+            if proven.remaining.count > 0:
+                add_valueless_function_attribute(function, CheckedLimit::VERSIONED)
+            FunctionMultiplyFold{changed: squares or proven.changed or proven.remaining.count > 0, folded_reduction: proven.folded_reduction}
+
+        def add_valueless_function_attribute(function: LLVMValueRef, key: sview) -> void can[Abort.Panic, Memory.Allocate]:
+            key_storage: mutable darray[u8] = []
+            value_storage: mutable darray[u8] = []
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+            attribute: LLVMAttributeRef = LLVMCreateStringAttribute(context, sview_to_cstr(key, key_storage), key.len.u32(), sview_to_cstr("", value_storage), 0)
+            LLVMAddAttributeAtIndex(function, LLVMAttributeIndexValue::FUNCTION, attribute)
+
+        # The first phase over one function: the initializer trial, then the multiply folds.
+        def fold_checked_function(run: CheckedMultiplyRun, function: LLVMValueRef, target: void&?, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> CheckedMultiplyRun can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            unchanged: CheckedMultiplyRun = CheckedMultiplyRun{changed: run.changed, failed: false, initializer_budget: run.initializer_budget, initializer_trials: run.initializer_trials, folded_reduction: false}
+            return unchanged if skipped_by_checked_multiply_policy(function) or function_has_string_attribute(function, CheckedLimit::VERSIONED) or function_instruction_count(function) > CheckedMultiplyLimit::FUNCTION_INSTRUCTIONS
+            tried: CheckedMultiplyRun = try_checked_initializers(unchanged, function, target, identifiers)
+            return tried if tried.failed
+            fold: FunctionMultiplyFold = fold_function_checked_multiplies(function, builder, identifiers)
+            CheckedMultiplyRun{changed: tried.changed or fold.changed, failed: false, initializer_budget: tried.initializer_budget, initializer_trials: tried.initializer_trials, folded_reduction: fold.folded_reduction}
+
+        # The initializer trial, while the module's budget and trials last.
+        def try_checked_initializers(run: CheckedMultiplyRun, function: LLVMValueRef, target: void&?, identifiers: CheckedIdentifiers&) -> CheckedMultiplyRun can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return run if run.initializer_budget == 0 or run.initializer_trials >= CheckedMultiplyLimit::INITIALIZER_TRIALS or not may_fold_checked_initializers(function, identifiers)
+            trial: InitializerTrial = try_fold_checked_initializers(function, target, run.initializer_budget, identifiers)
+            CheckedMultiplyRun{changed: run.changed or trial.status == CheckedInitializerLimit::REPLACED, failed: trial.status == CheckedInitializerLimit::FAILED, initializer_budget: trial.budget, initializer_trials: run.initializer_trials + 1, folded_reduction: false}
+
+        # The power phase over one function: whether it changed, or FAILED.
+        def fold_function_checked_powers(function: LLVMValueRef, target: void&?, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return CheckedMultiplyLimit::UNCHANGED if skipped_by_checked_multiply_policy(function) or function_is_sanitized(function)
+            status: mutable u32 = CheckedMultiplyLimit::UNCHANGED
+            if function_has_string_attribute(function, CheckedLimit::VERSIONED) and fold_checked_powers(function, builder, identifiers):
+                return CheckedMultiplyLimit::FAILED if not run_function_pipeline(function, target, CheckedMultiplyLimit::POWER_CLEANUP)
+                status <- CheckedMultiplyLimit::CHANGED
+            if unroll_short_power_loop(function):
+                return CheckedMultiplyLimit::FAILED if not run_function_pipeline(function, target, CheckedMultiplyLimit::POWER_CLEANUP)
+                status <- CheckedMultiplyLimit::CHANGED
+            status
+
+    public:
+        # Folds, versions and unrolls the module's checked i64 multiplies on AArch64
+        # without debug info: UNCHANGED, CHANGED, or FAILED when a pipeline failed.
+        def fold_checked_multiplies(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return CheckedMultiplyLimit::UNCHANGED if ElisaLLVMModuleTargetArchIsAArch64(module) == 0 or module_has_named_metadata(module, "llvm.dbg.cu")
+            identifiers: CheckedIdentifiers = checked_identifiers(LLVMGetModuleContext(module))
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            run: mutable CheckedMultiplyRun = CheckedMultiplyRun{changed: false, failed: false, initializer_budget: CheckedMultiplyLimit::INITIALIZER_BUDGET, initializer_trials: 0, folded_reduction: false}
+            vectorizable: mutable darray[LLVMValueRef] = []
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, run, vectorizable, target, builder, identifiers|:
+                run <- fold_checked_function(run, function, target, builder, &identifiers)
+                break if run.failed
+                vectorizable.push(function) if run.folded_reduction
+                function_cursor <- LLVMGetNextFunction(function)
+            status: u32 = CheckedMultiplyLimit::FAILED if run.failed else finish_checked_multiplies(module, target, run.changed, &vectorizable, builder, &identifiers)
+            LLVMDisposeBuilder(builder)
+            status
+
+        # The cleanup after the first phase, the revectorization of folded reductions,
+        # then the power phase over every function.
+        def finish_checked_multiplies(module: LLVMModuleRef, target: void&?, first_changed: bool, vectorizable: darray[LLVMValueRef]&, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return CheckedMultiplyLimit::FAILED if first_changed and not run_module_pipeline(module, target, CheckedMultiplyLimit::CLEANUP)
+            for function in vectorizable |target|:
+                return CheckedMultiplyLimit::FAILED if not run_function_pipeline(function, target, CheckedMultiplyLimit::REVECTORIZE)
+            changed: mutable bool = first_changed
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, target, builder, identifiers|:
+                function_cursor <- LLVMGetNextFunction(function)
+                status: u32 = fold_function_checked_powers(function, target, builder, identifiers)
+                return CheckedMultiplyLimit::FAILED if status == CheckedMultiplyLimit::FAILED
+                changed <- changed or status == CheckedMultiplyLimit::CHANGED
+            CheckedMultiplyLimit::CHANGED if changed else CheckedMultiplyLimit::UNCHANGED

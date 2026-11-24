@@ -1,0 +1,150 @@
+# Checked multiplies of a bounded cursor.
+#
+# An innermost loop's cursor counts from a nonnegative constant by 1 until it equals an
+# invariant, defined limit whose range on the entry edge is known. A checked multiply of
+# expressions built from the cursor and constants (add, sub, shl, lshr, at most four
+# deep) whose signed product range is not full cannot overflow: it becomes `nsw`. When
+# its product feeds a checked sum accumulated from a nonnegative seed that the trip count
+# keeps within i64, that sum becomes `nsw` too and the loop is worth revectorizing.
+include "./checked_results.elisa"
+
+const module CursorProductLimit:
+    EXPRESSION_DEPTH: u32 = 4
+    FROZEN_LIMIT: sview = "checkedmul.limit"
+
+# A cursor fold's verdict: whether the multiply was folded, and whether a checked sum of
+# its products was folded with it.
+struct CursorProductFold:
+    folded: bool
+    folded_reduction: bool
+
+# A cursor `phi [START, preheader], [add phi 1, latch]` and the largest value its limit
+# takes on the entry edge.
+struct BoundedCursor:
+    cursor: LLVMValueRef
+    limit: LLVMValueRef
+    start: i64
+    end_maximum: i64
+
+extend Backend:
+    private:
+        # The range of VALUE, an expression of the cursor (in BOUNDS) and constants.
+        def cursor_expression_range(value: LLVMValueRef, cursor: LLVMValueRef, bounds: ElisaConstantRangeRef, depth: u32) -> ElisaConstantRangeRef:
+            return ElisaLLVMConstantRangeCopy(bounds) if value == cursor
+            return ElisaLLVMConstantRangeOfConstant(value) if LLVMIsAConstantInt(value) != null
+            return ElisaLLVMConstantRangeFull(64) if LLVMIsABinaryOperator(value) == null or not is_llvm_integer_type(LLVMTypeOf(value), 64) or depth >= CursorProductLimit::EXPRESSION_DEPTH
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            return ElisaLLVMConstantRangeFull(64) if opcode != LLVMOpcode::ADD and opcode != LLVMOpcode::SUB and opcode != LLVMOpcode::SHL and opcode != LLVMOpcode::LSHR
+            left: ElisaConstantRangeRef = cursor_expression_range(LLVMGetOperand(value, 0), cursor, bounds, depth + 1)
+            right: ElisaConstantRangeRef = cursor_expression_range(LLVMGetOperand(value, 1), cursor, bounds, depth + 1)
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeBinaryOperation(opcode, left, right)
+            ElisaLLVMDisposeConstantRange(left)
+            ElisaLLVMDisposeConstantRange(right)
+            result
+
+        # The signed range of MULTIPLY's product over the cursor's bounds; null when an
+        # operand range is empty or the product range is full.
+        def cursor_product_range(multiply: LLVMValueRef, bounded: BoundedCursor&) -> ElisaConstantRangeRef?:
+            word: LLVMTypeRef = LLVMTypeOf(bounded.cursor)
+            bounds: ElisaConstantRangeRef = ElisaLLVMConstantRangeFromBounds(LLVMConstInt(word, bounded.start.u64(), 1), LLVMConstInt(word, (bounded.end_maximum + 1).u64(), 1))
+            left: ElisaConstantRangeRef = cursor_expression_range(LLVMGetOperand(multiply, 0), bounded.cursor, bounds, 0)
+            right: ElisaConstantRangeRef = cursor_expression_range(LLVMGetOperand(multiply, 1), bounded.cursor, bounds, 0)
+            empty: bool = ElisaLLVMConstantRangeIsEmpty(left) != 0 or ElisaLLVMConstantRangeIsEmpty(right) != 0
+            product: ElisaConstantRangeRef = ElisaLLVMConstantRangeSignedMultiplyFast(left, right)
+            ElisaLLVMDisposeConstantRange(bounds)
+            ElisaLLVMDisposeConstantRange(left)
+            ElisaLLVMDisposeConstantRange(right)
+            if empty or ElisaLLVMConstantRangeIsFull(product) != 0:
+                ElisaLLVMDisposeConstantRange(product)
+                return null
+            product
+
+        # Whether SEED + TRIPS * PRODUCT_MAXIMUM stays within i64, all three nonnegative.
+        def sum_stays_signed(seed: u64, trips: u64, product_maximum: u64) -> bool:
+            return true if product_maximum == 0
+            trips <= (CheckedLimit::SIGNED_MAXIMUM - seed) / product_maximum
+
+        # The checked sum `sadd.with.overflow(ACCUMULATOR, extractvalue MULTIPLY, 0)` (either
+        # order) a header accumulator takes from the latch, when it starts at a nonnegative
+        # seed; folds it when the trips keep it within i64. Null when there is none.
+        def fold_cursor_product_sum(multiply: LLVMValueRef, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, trips: u64, product: ElisaConstantRangeRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> bool can[Memory.Allocate]:
+            return false if ElisaLLVMConstantRangeSignedMinIsNegative(product) != 0
+            product_maximum: u64 = ElisaLLVMConstantRangeSignedMax(product).u64()
+            for accumulator in block_phis(ElisaLLVMLoopHeader(loop)) |multiply, loop, preheader, latch, trips, product_maximum, builder, identifiers|:
+                continue if LLVMCountIncoming(accumulator) != 2 or not is_llvm_integer_type(LLVMTypeOf(accumulator), 64)
+                continue if phi_incoming_index(accumulator, preheader) < 0 or phi_incoming_index(accumulator, latch) < 0
+                if accumulated_sum(accumulator, preheader, latch, loop, identifiers) is sum:
+                    for side in 0..<2.u32() |sum, accumulator, multiply, preheader, trips, product_maximum, builder|:
+                        term: LLVMValueRef = LLVMGetOperand(sum, 1 - side)
+                        continue if LLVMGetOperand(sum, side) != accumulator or not is_extract_of_field(term, 0) or LLVMGetOperand(term, 0) != multiply
+                        seed: LLVMValueRef = get phi_incoming_for_block(accumulator, preheader) else return false
+                        return false if not sum_stays_signed(LLVMConstIntGetZExtValue(seed), trips, product_maximum)
+                        fold_checked_call(sum, builder, false)
+                        return true
+            false
+
+        # The checked sum ACCUMULATOR takes from the latch, when it starts at a nonnegative
+        # constant seed.
+        def accumulated_sum(accumulator: LLVMValueRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, loop: ElisaLoopRef, identifiers: CheckedIdentifiers&) -> LLVMValueRef?:
+            seed: LLVMValueRef = get phi_incoming_for_block(accumulator, preheader) else return null
+            value: LLVMValueRef = get phi_incoming_for_block(accumulator, latch) else return null
+            return null if LLVMIsAConstantInt(seed) == null or ElisaLLVMConstantIntIsNegative(seed) != 0 or not is_extract_of_field(value, 0)
+            sum: LLVMValueRef = LLVMGetOperand(value, 0)
+            return null if not is_plain_checked_call(sum, identifiers.signed_add, identifiers) or ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(sum)) == 0
+            sum
+
+        # The cursor the latch's `icmp eq/ne CURSOR, LIMIT` operand SIDE names, when it
+        # counts by 1 from a nonnegative constant and the limit's entry-edge range starts
+        # at or above that and stops below INT64_MAX.
+        def bounded_cursor(compare: LLVMValueRef, side: u32, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> BoundedCursor?:
+            cursor: LLVMValueRef = LLVMGetOperand(compare, side)
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1 - side)
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            return null if not is_llvm_instruction_with_opcode(cursor, LLVMOpcode::PHI) or not is_llvm_integer_type(LLVMTypeOf(cursor), 64) or LLVMGetInstructionParent(cursor) != header
+            return null if LLVMCountIncoming(cursor) != 2 or phi_incoming_index(cursor, preheader) < 0 or phi_incoming_index(cursor, latch) < 0 or ElisaLLVMLoopIsInvariant(loop, limit) == 0
+            start: LLVMValueRef = get phi_incoming_for_block(cursor, preheader) else return null
+            next: LLVMValueRef = get phi_incoming_for_block(cursor, latch) else return null
+            return null if LLVMIsAConstantInt(start) == null or ElisaLLVMConstantIntIsNegative(start) != 0
+            return null if not is_llvm_instruction_with_opcode(next, LLVMOpcode::ADD) or LLVMGetOperand(next, 0) != cursor or ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(next)) == 0 or not is_constant_integer(LLVMGetOperand(next, 1), 1)
+            entry_branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return null
+            ElisaLLVMForgetValueAnalyses(analyses)
+            end: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, limit, preheader, header, entry_branch)
+            first: i64 = LLVMConstIntGetSExtValue(start)
+            usable: bool = ElisaLLVMConstantRangeIsEmpty(end) == 0 and ElisaLLVMConstantRangeSignedMin(end) >= first and ElisaLLVMConstantRangeReachesSignedMax(end) == 0
+            end_maximum: i64 = ElisaLLVMConstantRangeSignedMax(end)
+            ElisaLLVMDisposeConstantRange(end)
+            return null if not usable
+            BoundedCursor{cursor: cursor, limit: limit, start: first, end_maximum: end_maximum}
+
+        # Folds MULTIPLY when the latch's cursor bounds its product; with it, a checked sum
+        # of its products.
+        def fold_cursor_checked_multiply(multiply: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> CursorProductFold can[Abort.Panic, Memory.Allocate]:
+            none: CursorProductFold = CursorProductFold{folded: false, folded_reduction: false}
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(multiply)) else return none
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return none
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return none
+            branch: LLVMValueRef = get conditional_terminator(latch) else return none
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return none if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return none if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            continue_index: u32 = 1 if predicate == LLVMIntPredicate::EQ else 0
+            return none if LLVMGetSuccessor(branch, continue_index) != ElisaLLVMLoopHeader(loop) or ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1 - continue_index)) != 0
+            for side in 0..<2.u32() |multiply, analyses, builder, identifiers, compare, branch, loop, preheader, latch|:
+                if bounded_cursor(compare, side, loop, preheader, latch, analyses) is bounded:
+                    is_argument: bool = LLVMIsAArgument(bounded.limit) != null
+                    if is_argument or ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, bounded.limit, branch) != 0:
+                        if cursor_product_range(multiply, &bounded) is product:
+                            return fold_bounded_cursor_multiply(multiply, &bounded, product, is_argument, loop, preheader, latch, builder, identifiers)
+            none
+
+        # Freezes an argument limit, folds a checked sum of the products and the multiply
+        # itself. Disposes PRODUCT.
+        def fold_bounded_cursor_multiply(multiply: LLVMValueRef, bounded: BoundedCursor&, product: ElisaConstantRangeRef, is_argument: bool, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> CursorProductFold can[Abort.Panic, Memory.Allocate]:
+            function: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInstructionParent(multiply))
+            freeze_at_entry(bounded.limit, function, builder, CursorProductLimit::FROZEN_LIMIT) if is_argument
+            trips: u64 = (bounded.end_maximum - bounded.start + 1).u64()
+            reduction: bool = fold_cursor_product_sum(multiply, loop, preheader, latch, trips, product, builder, identifiers)
+            ElisaLLVMDisposeConstantRange(product)
+            fold_checked_call(multiply, builder, true)
+            CursorProductFold{folded: true, folded_reduction: reduction}

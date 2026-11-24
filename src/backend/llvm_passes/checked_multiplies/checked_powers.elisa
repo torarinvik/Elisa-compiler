@@ -1,0 +1,195 @@
+# A unit counter bounds the number of products in a checked accumulation.
+#
+# A loop counting from 0 by 1 until it equals an invariant LIMIT that dominating guards
+# keep in 1..16 runs at most 16 times. A header phi multiplied each iteration by an
+# invariant, defined BASE that guards keep nonnegative, from a nonnegative start, stays
+# within i64 when start * max(BASE)^16 does: its multiply gets `nsw` and the versioned
+# slow path's `smul.with.overflow` checks of the same operands become `{product, false}`.
+# A small function whose single-block loop multiplies by an invariant base 2 to 8 times
+# has that loop fully unrolled.
+include "./checked_results.elisa"
+include "../../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module CheckedPowerLimit:
+    FOLDED_TRIPS: u64 = 16
+    UNROLLED_TRIPS: u64 = 8
+    MINIMUM_UNROLLED_TRIPS: u32 = 2
+    MINIMUM_BLOCKS: u32 = 3
+    MAXIMUM_BLOCKS: u32 = 8
+    FUNCTION_INSTRUCTIONS: u32 = 64
+    HEADER_INSTRUCTIONS: u32 = 8
+    EXPANSION_BUDGET: u32 = 1000
+    FROZEN_LIMIT: sview = "checkedpower.limit"
+
+extend Backend:
+    private:
+        # The invariant limit of a latch `icmp eq/ne (add PHI, 1), LIMIT` (either order)
+        # that leaves the loop on equality, where PHI is an i64 header phi starting at 0.
+        def checked_power_trip_limit(loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(latch) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            exit: u32 = 0 if predicate == LLVMIntPredicate::EQ else 1
+            return null if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, exit)) != 0 or LLVMGetSuccessor(branch, 1 - exit) != ElisaLLVMLoopHeader(loop)
+            for phi in block_phis(ElisaLLVMLoopHeader(loop)) |loop, preheader, latch, compare|:
+                continue if not is_llvm_integer_type(LLVMTypeOf(phi), 64) or LLVMCountIncoming(phi) != 2
+                continue if not is_optional_constant_integer(phi_incoming_for_block(phi, preheader), 0)
+                if phi_incoming_for_block(phi, latch) is next:
+                    if is_llvm_instruction_with_opcode(next, LLVMOpcode::ADD) and LLVMGetOperand(next, 0) == phi and is_constant_integer(LLVMGetOperand(next, 1), 1):
+                        if operand_beside(compare, next) is limit:
+                            return limit if ElisaLLVMLoopIsInvariant(loop, limit) != 0
+            null
+
+        # The operand of a two-operand INSTRUCTION beside VALUE, when VALUE is one of them.
+        def operand_beside(instruction: LLVMValueRef, value: LLVMValueRef) -> LLVMValueRef?:
+            return LLVMGetOperand(instruction, 1) if LLVMGetOperand(instruction, 0) == value
+            return LLVMGetOperand(instruction, 0) if LLVMGetOperand(instruction, 1) == value
+            null
+
+        # Whether the guard range of a trip limit is nonempty, excludes 0 and is at most
+        # MAXIMUM. Disposes TRIPS.
+        def takes_bounded_trips(trips: ElisaConstantRangeRef, maximum: u64) -> bool:
+            bounded: bool = ElisaLLVMConstantRangeIsEmpty(trips) == 0 and ElisaLLVMConstantRangeUnsignedMin(trips) != 0 and ElisaLLVMConstantRangeUnsignedMax(trips) <= maximum
+            ElisaLLVMDisposeConstantRange(trips)
+            bounded
+
+        # Whether START * FACTOR^TRIPS stays within i64, for START and FACTOR in it.
+        def power_stays_signed(start: u64, factor: u64, trips: u64) -> bool:
+            maximum: mutable u64 = start
+            for iteration in 0..<trips |maximum, factor|:
+                return false if factor != 0 and maximum > CheckedLimit::SIGNED_MAXIMUM / factor
+                maximum <- maximum * factor
+            true
+
+        # The `smul.with.overflow(PRODUCT, BASE)` users (either order) on the slow path of
+        # an earlier versioning, inside the loop and after MULTIPLY.
+        def slow_power_checks(product: LLVMValueRef, base: LLVMValueRef, multiply: LLVMValueRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, identifiers: CheckedIdentifiers&) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            checks: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(product)
+            while use_cursor is use |use_cursor, checks, product, base, multiply, loop, analyses, identifiers|:
+                use_cursor <- LLVMGetNextUse(use)
+                call: LLVMValueRef = LLVMGetUser(use)
+                continue if called_intrinsic_id(call) != identifiers.signed_multiply or LLVMGetMetadata(call, identifiers.slow_path) == null
+                continue if LLVMGetNumOperandBundles(call) != 0 or ElisaLLVMCallHasFunctionAttribute(call, identifiers.convergent) != 0 or ElisaLLVMIsUsedByMetadata(call) != 0
+                continue if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(call)) == 0 or ElisaLLVMInstructionDominates(analyses, multiply, call) == 0
+                left: LLVMValueRef = LLVMGetOperand(call, 0)
+                right: LLVMValueRef = LLVMGetOperand(call, 1)
+                checks.push(call) if (left == product and right == base) or (right == product and left == base)
+            checks
+
+        # The invariant, defined base PRODUCT is multiplied by each iteration, when its
+        # guards keep it nonnegative and the product cannot leave i64 in TRIPS iterations.
+        def bounded_power_base(product: LLVMValueRef, multiply: LLVMValueRef, start: LLVMValueRef, trips: u64, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            base: LLVMValueRef = get operand_beside(multiply, product) else return null
+            return null if ElisaLLVMLoopIsInvariant(loop, base) == 0 or ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, base, multiply) == 0
+            bases: ElisaConstantRangeRef = dominating_guard_range(base, ElisaLLVMLoopHeader(loop), analyses)
+            nonnegative: bool = ElisaLLVMConstantRangeIsEmpty(bases) == 0 and ElisaLLVMConstantRangeIsAllNonNegative(bases) != 0
+            factor: u64 = ElisaLLVMConstantRangeUnsignedMax(bases)
+            ElisaLLVMDisposeConstantRange(bases)
+            return null if not nonnegative or not power_stays_signed(LLVMConstIntGetZExtValue(start), factor, trips)
+            base
+
+        # Marks one header product's multiply `nsw` and folds its slow-path checks; whether
+        # it did.
+        def fold_checked_power(product: LLVMValueRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, trips: u64, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if not is_llvm_integer_type(LLVMTypeOf(product), 64) or LLVMCountIncoming(product) != 2
+            start: LLVMValueRef = get phi_incoming_for_block(product, preheader) else return false
+            multiply: LLVMValueRef = get phi_incoming_for_block(product, latch) else return false
+            return false if LLVMIsAConstantInt(start) == null or ElisaLLVMConstantIntIsNegative(start) != 0
+            return false if not is_llvm_instruction_with_opcode(multiply, LLVMOpcode::MUL) or ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(multiply)) == 0 or LLVMGetNSW(multiply) != 0
+            base: LLVMValueRef = get bounded_power_base(product, multiply, start, trips, loop, analyses) else return false
+            checks: darray[LLVMValueRef] = slow_power_checks(product, base, multiply, loop, analyses, identifiers)
+            return false if checks.count == 0
+            LLVMSetNSW(multiply, 1)
+            for check in checks |multiply, builder|:
+                position_builder_before(builder, check)
+                replace_checked_result(check, builder, multiply)
+            true
+
+        # Folds the checked powers of one innermost loop; whether any changed.
+        def fold_loop_checked_powers(loop: ElisaLoopRef, function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> bool can[Abort.Panic, Memory.Allocate]:
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return false
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            return false if ElisaLLVMLoopSubLoopCount(loop) != 0
+            limit: LLVMValueRef = get checked_power_trip_limit(loop, preheader, latch) else return false
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(header) else return false
+            defined: bool = ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, limit, terminator) != 0
+            return false if not defined and LLVMIsAArgument(limit) == null
+            trips: ElisaConstantRangeRef = dominating_guard_range(limit, header, analyses)
+            maximum_trips: u64 = ElisaLLVMConstantRangeUnsignedMax(trips)
+            return false if not takes_bounded_trips(trips, CheckedPowerLimit::FOLDED_TRIPS)
+            changed: mutable bool = false
+            for product in block_phis(header) |changed, preheader, latch, maximum_trips, loop, analyses, builder, identifiers|:
+                changed <- fold_checked_power(product, preheader, latch, maximum_trips, loop, analyses, builder, identifiers) or changed
+            freeze_at_entry(limit, function, builder, CheckedPowerLimit::FROZEN_LIMIT) if changed and not defined
+            changed
+
+        # Folds the checked powers of every innermost loop, in preorder.
+        def fold_checked_powers(function: LLVMValueRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            changed: mutable bool = false
+            for index in 0..<ElisaLLVMLoopCount(analyses) |changed, function, analyses, builder, identifiers|:
+                changed <- fold_loop_checked_powers(ElisaLLVMLoopAt(analyses, index), function, analyses, builder, identifiers) or changed
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+        # Whether every instruction of BLOCK but its terminator is free of side effects.
+        def has_no_side_effects(block: LLVMBasicBlockRef) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor|:
+                return false if LLVMIsATerminatorInst(instruction) == null and ElisaLLVMMayHaveSideEffects(instruction) != 0
+                cursor <- LLVMGetNextInstruction(instruction)
+            true
+
+        # Whether a header phi of the single-block loop is multiplied by an invariant base.
+        def multiplies_invariant_base(header: LLVMBasicBlockRef, loop: ElisaLoopRef) -> bool can[Memory.Allocate]:
+            for phi in block_phis(header) |header, loop|:
+                if phi_incoming_for_block(phi, header) is multiply:
+                    if is_llvm_instruction_with_opcode(multiply, LLVMOpcode::MUL):
+                        if operand_beside(multiply, phi) is base:
+                            return true if ElisaLLVMLoopIsInvariant(loop, base) != 0
+            false
+
+        # The header of a single-block, metadata-free power loop of a small function whose
+        # guards bound its trips to 1..8.
+        def short_power_loop(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> ElisaLoopRef? can[Abort.Panic, Memory.Allocate]:
+            blocks: u32 = function_block_count(function)
+            return null if blocks < CheckedPowerLimit::MINIMUM_BLOCKS or blocks > CheckedPowerLimit::MAXIMUM_BLOCKS or function_instruction_count(function) > CheckedPowerLimit::FUNCTION_INSTRUCTIONS
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is header |block_cursor, analyses|:
+                block_cursor <- LLVMGetNextBasicBlock(header)
+                if conditional_terminator(header) is branch:
+                    if (LLVMGetSuccessor(branch, 0) == header or LLVMGetSuccessor(branch, 1) == header) and instruction_count(header) <= CheckedPowerLimit::HEADER_INSTRUCTIONS:
+                        if short_power_loop_at(header, analyses) is loop:
+                            return loop
+            null
+
+        def short_power_loop_at(header: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> ElisaLoopRef? can[Abort.Panic, Memory.Allocate]:
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, header) else return null
+            return null if ElisaLLVMLoopHeader(loop) != header or ElisaLLVMLoopBlockCount(loop) != 1 or ElisaLLVMLoopGetLoopID(loop) != null
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return null
+            limit: LLVMValueRef = get checked_power_trip_limit(loop, preheader, header) else return null
+            return null if not takes_bounded_trips(dominating_guard_range(limit, header, analyses), CheckedPowerLimit::UNROLLED_TRIPS)
+            return loop if multiplies_invariant_base(header, loop) and has_no_side_effects(header)
+            null
+
+        # Fully unrolls the function's short power loop; whether anything changed.
+        def unroll_short_power_loop(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            changed: bool = unroll_power_loop(function, analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+        def unroll_power_loop(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            loop: ElisaLoopRef = get short_power_loop(function, analyses) else return false
+            trips: u32 = ElisaLLVMSmallConstantMaxTripCount(analyses, loop)
+            return false if trips < CheckedPowerLimit::MINIMUM_UNROLLED_TRIPS or trips.u64() > CheckedPowerLimit::UNROLLED_TRIPS
+            simplified: bool = ElisaLLVMSimplifyLoop(analyses, loop, 0) != 0
+            return simplified if ElisaLLVMLoopIsSimplifyForm(loop) == 0
+            closed: bool = ElisaLLVMFormLCSSA(analyses, loop) != 0
+            flags: u32 = ElisaUnrollFlag::FORCE + ElisaUnrollFlag::PRESERVE_LCSSA
+            unrolled: bool = ElisaLLVMUnrollLoop(analyses, loop, trips, flags, CheckedPowerLimit::EXPANSION_BUDGET) != ElisaUnrollResult::UNMODIFIED
+            unrolled or simplified or closed

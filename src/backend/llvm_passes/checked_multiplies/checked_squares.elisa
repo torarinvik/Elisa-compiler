@@ -1,0 +1,125 @@
+# Checked squares a bounded counter makes safe.
+#
+# A square of an outer-loop header counter that scalar evolution keeps in
+# 0..floor(sqrt(INT64_MAX)) is `nsw`. In an innermost loop, a nonnegative unit counter
+# that enters the next iteration only when its square is within a signed limit keeps both
+# its checked square and checked increment in range when the limit leaves room for the
+# increment: both become `nsw`.
+include "./checked_results.elisa"
+
+const module CheckedSquareLimit:
+    MAXIMUM_ROOT: u64 = 3037000499
+    # (MAXIMUM_ROOT - 1)^2: the largest limit that leaves room for the next square.
+    MAXIMUM_PREVIOUS_SQUARE: i64 = 9223372024852248004
+
+extend Backend:
+    private:
+        # Whether scalar evolution keeps the square's factor in 0..MAXIMUM_ROOT.
+        def is_range_proven_square(square: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            bound: ElisaConstantRangeRef = ElisaLLVMScalarEvolutionSignedRange(analyses, LLVMGetOperand(square, 0))
+            proven: bool = ElisaLLVMConstantRangeIsEmpty(bound) == 0 and ElisaLLVMConstantRangeSignedMinIsNegative(bound) == 0 and ElisaLLVMConstantRangeSignedMax(bound) <= CheckedSquareLimit::MAXIMUM_ROOT.i64()
+            ElisaLLVMDisposeConstantRange(bound)
+            proven
+
+        # Folds the outer-loop counter squares scalar evolution bounds; whether any.
+        def fold_range_proven_squares(squares: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> bool can[Memory.Allocate]:
+            return false if squares.count == 0
+            ElisaLLVMForgetValueAnalyses(analyses)
+            proven: mutable darray[LLVMValueRef] = []
+            for square in squares |proven, analyses|:
+                proven.push(square) if is_range_proven_square(square, analyses)
+            for square in proven |builder|:
+                fold_checked_call(square, builder, true)
+            proven.count > 0
+
+        def has_safe_square_limit(range: ElisaConstantRangeRef) -> bool:
+            ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeSignedMax(range) <= CheckedSquareLimit::MAXIMUM_PREVIOUS_SQUARE
+
+        # RANGE narrowed by one `icmp (add LIMIT, offset), k` side of an `or` guard, false
+        # on the edge that reaches the loop. Disposes RANGE.
+        def narrow_by_biased_test(range: ElisaConstantRangeRef, test: LLVMValueRef, limit: LLVMValueRef) -> ElisaConstantRangeRef:
+            return range if not is_llvm_instruction_with_opcode(test, LLVMOpcode::ICMP)
+            bound: LLVMValueRef = LLVMGetOperand(test, 1)
+            biased: LLVMValueRef = LLVMGetOperand(test, 0)
+            return range if LLVMIsAConstantInt(bound) == null or not is_llvm_instruction_with_opcode(biased, LLVMOpcode::ADD) or LLVMGetOperand(biased, 0) != limit
+            offset: LLVMValueRef = LLVMGetOperand(biased, 1)
+            return range if LLVMIsAConstantInt(offset) == null
+            region: ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(inverse_integer_predicate(LLVMGetICmpPredicate(test)), bound)
+            unbiased: ElisaConstantRangeRef = ElisaLLVMConstantRangeSubtract(region, offset)
+            narrowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(range, unbiased)
+            ElisaLLVMDisposeConstantRange(region)
+            ElisaLLVMDisposeConstantRange(unbiased)
+            ElisaLLVMDisposeConstantRange(range)
+            narrowed
+
+        # The range of the square limit at COMPARE. LLVM can fold the source bounds into an
+        # `or` of unsigned interval tests on biased operands; each dominating `or` whose
+        # false edge reaches COMPARE narrows it until it is safe.
+        def checked_square_limit_range(limit: LLVMValueRef, compare: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef:
+            range: mutable ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeAtUse(analyses, compare, 1, 0)
+            return range if has_safe_square_limit(range) or ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, limit, compare) == 0
+            use_block: LLVMBasicBlockRef = LLVMGetInstructionParent(compare)
+            node: mutable LLVMBasicBlockRef? = ElisaLLVMImmediateDominator(analyses, use_block)
+            while node is block |node, range, limit, use_block, analyses|:
+                node <- ElisaLLVMImmediateDominator(analyses, block)
+                if conditional_terminator(block) is guard_branch:
+                    condition: LLVMValueRef = LLVMGetCondition(guard_branch)
+                    if is_llvm_instruction_with_opcode(condition, LLVMOpcode::OR) and ElisaLLVMEdgeDominates(analyses, block, LLVMGetSuccessor(guard_branch, 1), use_block) != 0:
+                        range <- narrow_by_biased_test(range, LLVMGetOperand(condition, 0), limit)
+                        range <- narrow_by_biased_test(range, LLVMGetOperand(condition, 1), limit)
+                        break if has_safe_square_limit(range)
+            range
+
+        # The checked unit increment `sadd.with.overflow(COUNTER, 1)` whose value the
+        # counter takes from the latch.
+        def counter_increment(counter: LLVMValueRef, latch: LLVMBasicBlockRef, identifiers: CheckedIdentifiers&) -> LLVMValueRef?:
+            next: LLVMValueRef = get phi_incoming_for_block(counter, latch) else return null
+            return null if not is_extract_of_field(next, 0)
+            increment: LLVMValueRef = LLVMGetOperand(next, 0)
+            return null if not is_plain_checked_call(increment, identifiers.signed_add, identifiers) or ElisaLLVMIsUsedByMetadata(increment) != 0
+            return null if LLVMGetOperand(increment, 0) != counter or not is_constant_integer(LLVMGetOperand(increment, 1), 1)
+            increment
+
+        # The loop test `icmp sgt/sle (extractvalue SQUARE, 0), LIMIT` in the header's
+        # no-overflow successor, when its continuing edge stays in the loop, leaves through
+        # the other and dominates the increment and the latch.
+        def square_limit_test(square: LLVMValueRef, increment: LLVMValueRef, loop: ElisaLoopRef, latch: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef?:
+            header_branch: LLVMValueRef = get conditional_terminator(ElisaLLVMLoopHeader(loop)) else return null
+            test: LLVMBasicBlockRef = LLVMGetSuccessor(header_branch, 1)
+            branch: LLVMValueRef = get conditional_terminator(test) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            product: LLVMValueRef = LLVMGetOperand(compare, 0)
+            return null if not is_extract_of_field(product, 0) or LLVMGetOperand(product, 0) != square
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return null if predicate != LLVMIntPredicate::SGT and predicate != LLVMIntPredicate::SLE
+            continue_index: u32 = 1 if predicate == LLVMIntPredicate::SGT else 0
+            continuing: LLVMBasicBlockRef = LLVMGetSuccessor(branch, continue_index)
+            return null if ElisaLLVMLoopContainsBlock(loop, continuing) == 0 or ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1 - continue_index)) != 0
+            increment_block: LLVMBasicBlockRef = LLVMGetInstructionParent(increment)
+            return null if ElisaLLVMLoopContainsBlock(loop, increment_block) == 0 or ElisaLLVMEdgeDominates(analyses, test, continuing, increment_block) == 0 or ElisaLLVMEdgeDominates(analyses, test, continuing, latch) == 0
+            return null if ElisaLLVMLoopIsInvariant(loop, LLVMGetOperand(compare, 1)) == 0
+            compare
+
+        # Folds a header counter's checked square and checked increment when the loop's
+        # square limit leaves room for the next square; whether it did.
+        def fold_bounded_checked_square(square: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, identifiers: CheckedIdentifiers&) -> bool:
+            counter: LLVMValueRef = LLVMGetOperand(square, 0)
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(square)) else return false
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return false
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            return false if not is_llvm_instruction_with_opcode(counter, LLVMOpcode::PHI) or LLVMGetOperand(square, 1) != counter
+            return false if LLVMGetInstructionParent(counter) != header or LLVMGetInstructionParent(square) != header or LLVMCountIncoming(counter) != 2
+            start: LLVMValueRef = get phi_incoming_for_block(counter, preheader) else return false
+            return false if LLVMIsAConstantInt(start) == null or ElisaLLVMConstantIntActiveBits(start) > 64 or LLVMConstIntGetZExtValue(start) > CheckedSquareLimit::MAXIMUM_ROOT
+            increment: LLVMValueRef = get counter_increment(counter, latch, identifiers) else return false
+            compare: LLVMValueRef = get square_limit_test(square, increment, loop, latch, analyses) else return false
+            ElisaLLVMForgetValueAnalyses(analyses)
+            bound: ElisaConstantRangeRef = checked_square_limit_range(LLVMGetOperand(compare, 1), compare, analyses)
+            safe: bool = has_safe_square_limit(bound)
+            ElisaLLVMDisposeConstantRange(bound)
+            return false if not safe
+            fold_checked_call(square, builder, true)
+            fold_checked_call(increment, builder, false)
+            true

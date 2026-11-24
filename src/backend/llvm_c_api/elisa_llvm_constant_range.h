@@ -49,6 +49,8 @@ int ElisaLLVMConstantRangeUnsignedMaxAtMost(ElisaConstantRangeRef range, LLVMVal
 /* getUnsignedMax() of the range as APInt::getLimitedValue: exact up to 64 bits, and
  * UINT64_MAX for a wider maximum that does not fit. */
 uint64_t ElisaLLVMConstantRangeUnsignedMax(ElisaConstantRangeRef range);
+/* A copy of the range, disposed separately. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeCopy(ElisaConstantRangeRef range);
 /* ConstantRange(lower, upper): the wrapping interval [lower, upper) of two constants of
  * one width. */
 ElisaConstantRangeRef ElisaLLVMConstantRangeFromBounds(LLVMValueRef lower, LLVMValueRef upper);

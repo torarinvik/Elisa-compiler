@@ -132,7 +132,6 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
   LLVMParseCommandLineOptions(3, args, nullptr);
 #endif
 }
-#include "llvm_checked_mul.cpp"
 extern "C" unsigned elisacoreBoundedLoopUnswitch(LLVMModuleRef);
 #include "llvm_bounded_factorial.cpp"
 extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);

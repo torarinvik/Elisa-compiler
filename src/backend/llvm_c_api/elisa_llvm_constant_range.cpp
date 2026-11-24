@@ -81,6 +81,10 @@ uint64_t ElisaLLVMConstantRangeUnsignedMax(ElisaConstantRangeRef range) {
   return unwrap(range)->getUnsignedMax().getLimitedValue();
 }
 
+ElisaConstantRangeRef ElisaLLVMConstantRangeCopy(ElisaConstantRangeRef range) {
+  return wrap(new ConstantRange(*unwrap(range)));
+}
+
 ElisaConstantRangeRef ElisaLLVMConstantRangeFromBounds(LLVMValueRef lower, LLVMValueRef upper) {
   return wrap(new ConstantRange(constantValue(lower), constantValue(upper)));
 }
