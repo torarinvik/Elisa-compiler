@@ -167,4 +167,23 @@ CASES = {
         "def main() -> i64:\n    return 0\n",
         None,
     ),
+    # An opaque extern handle comes back from C as a raw `void*`. Casting it to the handle
+    # type is a pointer reinterpret: valid, but only under Unsafe.PointerCast.
+    "opaque handle cast needs pointer capability": (
+        "# strict\n# unsafe\n"
+        "extern LLVMModuleRef\n"
+        "def bad(raw: mutable void&) -> LLVMModuleRef:\n"
+        "    raw.cast[LLVMModuleRef]\n"
+        "def main() -> i64:\n    return 0\n",
+        "pointer cast requires",
+    ),
+    "opaque handle cast under exact grant": (
+        "# strict\n# unsafe\n"
+        "extern LLVMModuleRef\n"
+        "def good(raw: mutable void&) -> LLVMModuleRef:\n"
+        "    can Unsafe.PointerCast:\n"
+        "        return raw.cast[LLVMModuleRef]\n"
+        "def main() -> i64:\n    return 0\n",
+        None,
+    ),
 }
