@@ -26,6 +26,10 @@ perr() { printf "$1" | "$RPT" | awk 'NR == 1 { print $2 }'; }
 # 4. loop header with a capture parses.
 [ "$(perr 'def f(xs: darray[i64]) -> i64:\n    t: mutable i64 = 0\n    r: i64 =\n        for x in xs |acc = 0, t| -> acc:\n            t <- t + x\n            acc <- acc + 1\n    return t + r\n')" = "0" ] || fail "capture header has parse errors"
 
+# 4b. a typed accumulator may carry a region suffix (`|last: sview @r = ""|`), as a declaration's
+# type may; stage0 parses it as part of the type. stage1 read the `@` as the header's end.
+[ "$(perr 'def f[@r](xs: darray[sview] @r) -> sview @r:\n    n, last =\n        while i < xs.count |n: u32 = 0, last: sview @r = "", i: usize = 0| -> n, last:\n            last <- xs[i]\n            i <- i + 1\n    return last\n')" = "0" ] || fail "region-annotated accumulator has parse errors"
+
 # 5. rebind parses.
 [ "$(perr 'def f(p: mutable i64, v: i64) -> i64:\n    rebind p, applied: i64 =\n        p + v, v\n    return p + applied\n')" = "0" ] || fail "rebind has parse errors"
 
