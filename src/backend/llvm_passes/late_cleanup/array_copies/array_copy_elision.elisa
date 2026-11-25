@@ -1,0 +1,67 @@
+# Private array copies removed before the main optimization pipeline.
+#
+# Per defined function without `optnone`: copy libcalls between private arrays become
+# `llvm.memcpy`; zero fills a reverse loop pair covers are removed; then, while some
+# round of the entry block's private blocks changes (at most four, since eliding an
+# inner round trip can expose the enclosing one), each block's copy temporary is
+# bypassed, its round trip elided or its forward copy taken over.
+include "../../ir/ir_editing.elisa"
+include "./private_blocks.elisa"
+include "./round_trips.elisa"
+include "./reverse_array_fills.elisa"
+
+const module ArrayCopyElisionLimit:
+    ROUNDS: u32 = 4
+
+extend Backend:
+    private:
+        # The entry block's private blocks, in instruction order.
+        def entry_private_blocks(function: LLVMValueRef, layout: LLVMTargetDataRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while cursor is instruction |cursor, blocks, layout|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                blocks.push(instruction) if private_block_size(instruction, layout) != null
+            blocks
+
+        # One round over the blocks not yet erased; the number it changed.
+        def elide_copies_round(blocks: darray[LLVMValueRef]&, erased: mutable darray[bool]&, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            for index in 0..<blocks.count |changed, blocks, erased, layout, analyses, builder|:
+                continue if erased[index]
+                block: LLVMValueRef = blocks[index]
+                if bypass_copy_temporary(block, layout, builder) or elide_round_trip(block, layout, analyses) or forward_private_copy(block, layout, analyses):
+                    erased[index] <- true
+                    changed <- changed + 1
+            changed
+
+        def elide_function_array_copies(function: LLVMValueRef, layout: LLVMTargetDataRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            promote_copy_calls(function, builder)
+            blocks: darray[LLVMValueRef] = entry_private_blocks(function, layout)
+            return 0 if blocks.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = remove_reverse_covered_fills(function, layout, analyses)
+            if blocks.count >= 2:
+                erased: mutable darray[bool] = []
+                while erased.count < blocks.count |erased, blocks|:
+                    erased.push(false)
+                round: mutable u32 = 0
+                while round < ArrayCopyElisionLimit::ROUNDS |round, changed, blocks, erased, layout, analyses, builder|:
+                    round_changes: u32 = elide_copies_round(&blocks, &erased, layout, analyses, builder)
+                    changed <- changed + round_changes
+                    round <- ArrayCopyElisionLimit::ROUNDS if round_changes == 0 else round + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        def elide_array_round_trips(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, layout, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+                changed <- changed + elide_function_array_copies(function, layout, builder)
+            LLVMDisposeBuilder(builder)
+            changed

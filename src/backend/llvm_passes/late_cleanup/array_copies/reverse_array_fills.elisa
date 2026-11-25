@@ -1,0 +1,130 @@
+# A private array's zero fill removed when a descending loop writes the prefix a later
+# ascending loop reads.
+#
+# The writer stores `a[i - 1]` for i from a bound down to 0 and the reader loads `a[j]`
+# for j from 0 up to that bound, each an innermost top-level loop counted by an equality
+# latch. The edge completing the writer must dominate the read, so no path (including the
+# writer's failure exits) reaches the read with the prefix unwritten.
+
+# The descending writer's index update and the ascending reader's index phi.
+struct ReverseCoverage:
+    step_down: LLVMValueRef
+    write_index: LLVMValueRef
+    read_index: LLVMValueRef
+
+extend Backend:
+    private:
+        # The i64 index of `gep ELEMENT-sized, ARRAY, index`.
+        def array_element_index(pointer: LLVMValueRef, array: LLVMValueRef, layout: LLVMTargetDataRef, element: LLVMTypeRef) -> LLVMValueRef?:
+            return null if LLVMIsAGetElementPtrInst(pointer) == null or LLVMGetOperand(pointer, 0) != array or LLVMGetNumIndices(pointer) != 1
+            return null if LLVMABISizeOfType(layout, LLVMGetGEPSourceElementType(pointer)) != LLVMStoreSizeOfType(layout, element)
+            index: LLVMValueRef = LLVMGetOperand(pointer, 1)
+            return null if not is_llvm_integer_type(LLVMTypeOf(index), 64)
+            index
+
+        # The loop's exit when its latch branches on `UPDATE == LIMIT` (either order, `eq` or
+        # `ne`) between an exit outside the loop and its header.
+        def counted_latch_exit(loop: ElisaLoopRef, update: LLVMValueRef, limit: LLVMValueRef) -> LLVMBasicBlockRef? can[Abort.Panic]:
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            branch: LLVMValueRef = get conditional_terminator(latch) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            left: LLVMValueRef = LLVMGetOperand(compare, 0)
+            right: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if not ((left == update and right == limit) or (right == update and left == limit))
+            exit_index: u32 = 0 if predicate == LLVMIntPredicate::EQ else 1
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(branch, exit_index)
+            return null if ElisaLLVMLoopContainsBlock(loop, exit) != 0 or LLVMGetSuccessor(branch, 1 - exit_index) != ElisaLLVMLoopHeader(loop)
+            exit
+
+        # The writer's `index - 1` and phi, and the reader's phi, over ARRAY.
+        def reverse_coverage_indices(write: LLVMValueRef, read: LLVMValueRef, array: LLVMValueRef, layout: LLVMTargetDataRef, writer: ElisaLoopRef, reader: ElisaLoopRef) -> ReverseCoverage? can[Abort.Panic]:
+            element: LLVMTypeRef = LLVMTypeOf(read)
+            step_down: LLVMValueRef = get array_element_index(LLVMGetOperand(write, 1), array, layout, element) else return null
+            read_index: LLVMValueRef = get array_element_index(LLVMGetOperand(read, 0), array, layout, element) else return null
+            return null if LLVMIsABinaryOperator(step_down) == null or not is_llvm_instruction_with_opcode(read_index, LLVMOpcode::PHI) or LLVMGetInstructionParent(read_index) != ElisaLLVMLoopHeader(reader)
+            write_index: LLVMValueRef = LLVMGetOperand(step_down, 0)
+            delta: LLVMValueRef = LLVMGetOperand(step_down, 1)
+            return null if not is_llvm_instruction_with_opcode(write_index, LLVMOpcode::PHI) or LLVMGetInstructionParent(write_index) != ElisaLLVMLoopHeader(writer) or LLVMIsAConstantInt(delta) == null
+            opcode: u32 = LLVMGetInstructionOpcode(step_down)
+            return null if not ((opcode == LLVMOpcode::ADD and is_all_ones_constant(delta)) or (opcode == LLVMOpcode::SUB and ElisaLLVMIsConstantOne(delta) != 0))
+            ReverseCoverage{step_down: step_down, write_index: write_index, read_index: read_index}
+
+        # The descending store and ascending load cover the same prefix, and the edge that
+        # completes the writer dominates the read.
+        def reverse_loops_cover(write: LLVMValueRef, read: LLVMValueRef, array: LLVMValueRef, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic]:
+            writer: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(write)) else return false
+            reader: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(read)) else return false
+            return false if writer == reader or ElisaLLVMLoopParent(writer) != null or ElisaLLVMLoopParent(reader) != null
+            indices: ReverseCoverage = get reverse_coverage_indices(write, read, array, layout, writer, reader) else return false
+            writer_entry: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(writer) else return false
+            reader_entry: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(reader) else return false
+            writer_latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(writer) else return false
+            reader_latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(reader) else return false
+            return false if LLVMCountIncoming(indices.write_index) != 2 or LLVMCountIncoming(indices.read_index) != 2
+            latch_update: LLVMValueRef = get incoming_value_for_block(indices.write_index, writer_latch) else return false
+            return false if latch_update != indices.step_down or ElisaLLVMBlockDominates(analyses, LLVMGetInstructionParent(write), writer_latch) == 0
+            bound: LLVMValueRef = get incoming_value_for_block(indices.write_index, writer_entry) else return false
+            zero: LLVMValueRef = get incoming_value_for_block(indices.read_index, reader_entry) else return false
+            step_up: LLVMValueRef = get incoming_value_for_block(indices.read_index, reader_latch) else return false
+            return false if LLVMIsAConstantInt(zero) == null or ElisaLLVMIsConstantZero(zero) == 0
+            return false if not is_llvm_instruction_with_opcode(step_up, LLVMOpcode::ADD) or LLVMGetOperand(step_up, 0) != indices.read_index
+            one: LLVMValueRef = LLVMGetOperand(step_up, 1)
+            return false if LLVMIsAConstantInt(one) == null or ElisaLLVMIsConstantOne(one) == 0
+            writer_exit: LLVMBasicBlockRef = get counted_latch_exit(writer, indices.step_down, zero) else return false
+            return false if counted_latch_exit(reader, step_up, bound) == null
+            ElisaLLVMEdgeDominates(analyses, writer_latch, writer_exit, LLVMGetInstructionParent(read)) != 0
+
+        # A static array's zero fill outside any loop whose only other uses are lifetime
+        # markers and one simple integer store and load through GEPs.
+        def removable_zero_fill(fill: LLVMValueRef, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            array: LLVMValueRef = LLVMGetOperand(fill, 0)
+            byte: LLVMValueRef = LLVMGetOperand(fill, 1)
+            return false if LLVMIsAAllocaInst(array) == null or ElisaLLVMIsStaticAlloca(array) == 0 or ElisaLLVMAllocaIsUsedWithInAlloca(array) != 0 or ElisaLLVMAllocaIsSwiftError(array) != 0
+            return false if is_volatile_memory_intrinsic(fill) or LLVMGetNumOperandBundles(fill) != 0 or LLVMIsAConstantInt(byte) == null or ElisaLLVMIsConstantZero(byte) == 0
+            return false if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(fill)) != null
+            write_access: mutable LLVMValueRef? = null
+            read_access: mutable LLVMValueRef? = null
+            lifetime_start: u32 = intrinsic_identifier("llvm.lifetime.start")
+            lifetime_end: u32 = intrinsic_identifier("llvm.lifetime.end")
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(array)
+            while use_cursor is use |use_cursor, write_access, read_access, fill, analyses, lifetime_start, lifetime_end|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                continue if user == fill
+                if LLVMIsAIntrinsicInst(user) != null:
+                    id: u32 = called_intrinsic_id(user)
+                    continue if id == lifetime_end or (id == lifetime_start and ElisaLLVMInstructionDominates(analyses, user, fill) != 0)
+                    return false
+                return false if LLVMIsAGetElementPtrInst(user) == null
+                access_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(user)
+                while access_cursor is access_use |access_cursor, write_access, read_access, user|:
+                    access_cursor <- LLVMGetNextUse(access_use)
+                    access: LLVMValueRef = LLVMGetUser(access_use)
+                    if LLVMIsALoadInst(access) != null and is_simple_access(access) and LLVMGetOperand(access, 0) == user and read_access == null:
+                        read_access <- access
+                    elif LLVMIsAStoreInst(access) != null and is_simple_access(access) and LLVMGetOperand(access, 1) == user and LLVMGetOperand(access, 0) != user and write_access == null:
+                        write_access <- access
+                    else:
+                        return false
+            read: LLVMValueRef = get read_access else return false
+            write: LLVMValueRef = get write_access else return false
+            return false if not is_llvm_integer_type(LLVMTypeOf(read), 0) or LLVMTypeOf(LLVMGetOperand(write, 0)) != LLVMTypeOf(read)
+            return false if ElisaLLVMInstructionDominates(analyses, fill, write) == 0 or ElisaLLVMInstructionDominates(analyses, fill, read) == 0
+            reverse_loops_cover(write, read, array, layout, analyses)
+
+    public:
+        # The zero fills of private arrays a descending loop then rewrites before an
+        # ascending loop reads them, removed; their count.
+        def remove_reverse_covered_fills(function: LLVMValueRef, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fills: mutable darray[LLVMValueRef] = []
+            for instruction in function_instructions(function) |fills|:
+                fills.push(instruction) if LLVMIsAMemSetInst(instruction) != null and LLVMIsAAllocaInst(LLVMGetOperand(instruction, 0)) != null
+            removed: mutable u32 = 0
+            for fill in fills |removed, layout, analyses|:
+                if removable_zero_fill(fill, layout, analyses):
+                    LLVMInstructionEraseFromParent(fill)
+                    removed <- removed + 1
+            removed

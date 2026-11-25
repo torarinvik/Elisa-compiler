@@ -1,0 +1,232 @@
+# Array round trips through a private copy.
+#
+# `memcpy(U, T); ...; memcpy(T, U)` lets U use T's storage when both are private blocks
+# of the same size, T is untouched between the copies, and every path from the first copy
+# reaches the second or ends in `unreachable` (after a trap the array is unobservable). A
+# copy `U = T` where T is never used again lets U take over T's storage outright.
+
+# A point a copy-elision walk resumes from, and the state it carries there.
+struct CopyWalkPoint:
+    start: LLVMValueRef
+    state: u32
+
+# A block a walk already entered in a given state.
+struct CopyWalkVisit:
+    block: LLVMBasicBlockRef
+    state: u32
+
+extend Backend:
+    private:
+        # USES without FIRST and SECOND, each once.
+        def block_use_set(uses: darray[LLVMValueRef]&, first: LLVMValueRef, second: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            set: mutable darray[LLVMValueRef] = []
+            for use in uses |set, first, second|:
+                if use != first and use != second and not contains_value(&set, use):
+                    set.push(use)
+            set
+
+        # Pushes the successors of TERMINATOR's block not yet entered in STATE; false when
+        # the terminator is not a branch or switch.
+        def push_walk_successors[@r](work: mutable darray[CopyWalkPoint] @r, seen: mutable darray[CopyWalkVisit]&, terminator: LLVMValueRef, state: u32) -> darray[CopyWalkPoint] @r can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<LLVMGetNumSuccessors(terminator) |work, seen, terminator, state|:
+                successor: LLVMBasicBlockRef = LLVMGetSuccessor(terminator, index)
+                if not any entered in seen where entered.block == successor and entered.state == state:
+                    seen.push(CopyWalkVisit{block: successor, state: state})
+                    if LLVMGetFirstInstruction(successor) is front:
+                        work.push(CopyWalkPoint{start: front, state: state})
+            work
+
+        def is_walkable_terminator(terminator: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(terminator)
+            opcode == LLVMOpcode::CONDITIONAL_BR or opcode == LLVMOpcode::UNCONDITIONAL_BR or opcode == LLVMOpcode::SWITCH
+
+        # Every path from FIRST, tracking whether U and T still agree. VISITED collects U's
+        # non-marker uses the walk reached.
+        def round_trip_paths_are_safe(first: LLVMValueRef, second: LLVMValueRef, u: LLVMValueRef, t: LLVMValueRef, u_set: darray[LLVMValueRef]&, t_set: darray[LLVMValueRef]&, visited: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            work: mutable darray[CopyWalkPoint] = []
+            seen: mutable darray[CopyWalkVisit] = []
+            start: LLVMValueRef = get LLVMGetNextInstruction(first) else return false
+            work.push(CopyWalkPoint{start: start, state: CopyWalkState::CLEAN})
+            while work.count != 0 |work, seen, first, second, u, t, u_set, t_set, visited|:
+                point: CopyWalkPoint = work[work.count - 1]
+                _ = work.pop()
+                state: mutable u32 = point.state
+                cursor: mutable LLVMValueRef? = point.start
+                while cursor is instruction |cursor, state, work, seen, first, second, u, t, u_set, t_set, visited|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if instruction == second:
+                        return false if state == CopyWalkState::TAINTED
+                        break
+                    if instruction == first:
+                        return false if state == CopyWalkState::DIRTY
+                        break
+                    if contains_value(u_set, instruction):
+                        if is_block_life_marker(instruction):
+                            return false if state == CopyWalkState::DIRTY
+                        else:
+                            return false if state == CopyWalkState::TAINTED
+                            visited.push(instruction) if not contains_value(visited, instruction)
+                            state <- CopyWalkState::DIRTY if writes_private_block(instruction, u)
+                    if contains_value(t_set, instruction):
+                        return false if state == CopyWalkState::DIRTY
+                        state <- CopyWalkState::TAINTED if writes_private_block(instruction, t)
+                    continue if LLVMIsATerminatorInst(instruction) == null
+                    opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                    if opcode == LLVMOpcode::UNREACHABLE:
+                        break
+                    if opcode == LLVMOpcode::RET:
+                        return false if state == CopyWalkState::DIRTY
+                        break
+                    return false if not is_walkable_terminator(instruction)
+                    work <- push_walk_successors(work, &seen, instruction, state)
+            true
+
+        # Every reached non-marker use of U dominated by COPY; U's markers then go with it.
+        def u_markers_if_dominated(u_set: darray[LLVMValueRef]&, visited: darray[LLVMValueRef]&, copy: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            markers: mutable darray[LLVMValueRef] = []
+            for use in u_set |markers, visited, copy, analyses|:
+                if is_block_life_marker(use):
+                    markers.push(use)
+                elif not contains_value(visited, use) or ElisaLLVMInstructionDominates(analyses, copy, use) == 0:
+                    return null
+            markers
+
+        # Replaces U by T after erasing U's markers and the copies.
+        def merge_private_blocks(u: LLVMValueRef, t: LLVMValueRef, markers: darray[LLVMValueRef]&, copies: darray[LLVMValueRef]&) -> void:
+            for marker in markers:
+                LLVMInstructionEraseFromParent(marker)
+            for copy in copies:
+                LLVMInstructionEraseFromParent(copy)
+            LLVMReplaceAllUsesWith(u, t)
+            LLVMInstructionEraseFromParent(u)
+
+        # A non-volatile `memcpy` of a constant LENGTH equal to SIZE.
+        def copies_whole_block(copy: LLVMValueRef, size: u64) -> bool:
+            length: LLVMValueRef = LLVMGetOperand(copy, 2)
+            not is_volatile_memory_intrinsic(copy) and LLVMIsAConstantInt(length) != null and LLVMConstIntGetZExtValue(length) == size
+
+        # T a private block like U (both allocas, T aligned at least as U, or both
+        # mallocs) of SIZE bytes.
+        def is_matching_partner(t: LLVMValueRef, u: LLVMValueRef, size: u64, layout: LLVMTargetDataRef) -> bool can[Unsafe.PointerCast]:
+            return false if t == u or (LLVMIsAAllocaInst(t) != null) != (LLVMIsAAllocaInst(u) != null)
+            return false if LLVMIsAAllocaInst(t) != null and LLVMGetAlignment(t) < LLVMGetAlignment(u)
+            if private_block_size(t, layout) is partner_size:
+                return partner_size == size
+            false
+
+        # `memcpy(U, T); ...; memcpy(T, U)`: U takes T's storage.
+        def elide_round_trip(u: LLVMValueRef, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            size: u64 = get private_block_size(u, layout) else return false
+            u_uses: darray[LLVMValueRef] = get private_block_uses(u) else return false
+            first_copy: mutable LLVMValueRef? = null
+            second_copy: mutable LLVMValueRef? = null
+            for use in u_uses |first_copy, second_copy, u|:
+                if LLVMIsAMemCpyInst(use) != null:
+                    if LLVMGetOperand(use, 0) == u and first_copy == null:
+                        first_copy <- use
+                    elif LLVMGetOperand(use, 1) == u and second_copy == null:
+                        second_copy <- use
+                    else:
+                        return false
+            first: LLVMValueRef = get first_copy else return false
+            second: LLVMValueRef = get second_copy else return false
+            t: LLVMValueRef = LLVMGetOperand(first, 1)
+            return false if LLVMIsAInstruction(t) == null or LLVMGetOperand(second, 0) != t
+            return false if not copies_whole_block(first, size) or not copies_whole_block(second, size) or not is_matching_partner(t, u, size, layout)
+            return false if ElisaLLVMInstructionDominates(analyses, first, second) == 0
+            t_uses: darray[LLVMValueRef] = get private_block_uses(t) else return false
+            u_set: darray[LLVMValueRef] = block_use_set(&u_uses, first, second)
+            t_set: darray[LLVMValueRef] = block_use_set(&t_uses, first, second)
+            visited: mutable darray[LLVMValueRef] = []
+            return false if not round_trip_paths_are_safe(first, second, u, t, &u_set, &t_set, &visited)
+            markers: darray[LLVMValueRef] = get u_markers_if_dominated(&u_set, &visited, first, analyses) else return false
+            copies: darray[LLVMValueRef] = [first, second]
+            merge_private_blocks(u, t, &markers, &copies)
+            true
+
+        # Every path from COPY avoids T's other uses (only its life may end, after which U
+        # must not be used) and never runs COPY again.
+        def forward_paths_are_safe(copy: LLVMValueRef, u_set: darray[LLVMValueRef]&, t_set: darray[LLVMValueRef]&, visited: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            work: mutable darray[CopyWalkPoint] = []
+            seen: mutable darray[CopyWalkVisit] = []
+            start: LLVMValueRef = get LLVMGetNextInstruction(copy) else return false
+            work.push(CopyWalkPoint{start: start, state: 0})
+            while work.count != 0 |work, seen, copy, u_set, t_set, visited|:
+                point: CopyWalkPoint = work[work.count - 1]
+                _ = work.pop()
+                ended: mutable u32 = point.state
+                cursor: mutable LLVMValueRef? = point.start
+                while cursor is instruction |cursor, ended, work, seen, copy, u_set, t_set, visited|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return false if instruction == copy
+                    if contains_value(t_set, instruction):
+                        return false if not is_block_life_marker(instruction)
+                        ended <- 1
+                    if contains_value(u_set, instruction) and not is_block_life_marker(instruction):
+                        return false if ended != 0
+                        visited.push(instruction) if not contains_value(visited, instruction)
+                    continue if LLVMIsATerminatorInst(instruction) == null
+                    opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                    if opcode == LLVMOpcode::UNREACHABLE or opcode == LLVMOpcode::RET:
+                        break
+                    return false if not is_walkable_terminator(instruction)
+                    work <- push_walk_successors(work, &seen, instruction, ended)
+            true
+
+        # `U = copy of T` where T is not used again: U takes T's storage.
+        def forward_private_copy(u: LLVMValueRef, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            size: u64 = get private_block_size(u, layout) else return false
+            u_uses: darray[LLVMValueRef] = get private_block_uses(u) else return false
+            only_copy: mutable LLVMValueRef? = null
+            for use in u_uses |only_copy, u|:
+                if LLVMIsAMemCpyInst(use) != null:
+                    return false if LLVMGetOperand(use, 0) != u or only_copy != null
+                    only_copy <- use
+                elif LLVMIsAMemMoveInst(use) != null:
+                    return false
+            copy: LLVMValueRef = get only_copy else return false
+            t: LLVMValueRef = LLVMGetOperand(copy, 1)
+            return false if LLVMIsAInstruction(t) == null or not copies_whole_block(copy, size) or not is_matching_partner(t, u, size, layout)
+            return false if ElisaLLVMInstructionDominates(analyses, t, copy) == 0
+            t_uses: darray[LLVMValueRef] = get private_block_uses(t) else return false
+            u_set: darray[LLVMValueRef] = block_use_set(&u_uses, copy, copy)
+            t_set: darray[LLVMValueRef] = block_use_set(&t_uses, copy, copy)
+            visited: mutable darray[LLVMValueRef] = []
+            return false if not forward_paths_are_safe(copy, &u_set, &t_set, &visited)
+            markers: darray[LLVMValueRef] = get u_markers_if_dominated(&u_set, &visited, copy, analyses) else return false
+            copies: darray[LLVMValueRef] = [copy]
+            merge_private_blocks(u, t, &markers, &copies)
+            true
+
+        # A loop result copied through a private temporary used only by the two adjacent
+        # copies is copied directly instead.
+        def bypass_copy_temporary(u: LLVMValueRef, layout: LLVMTargetDataRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAAllocaInst(u) == null or use_count(u) != 2
+            into_copy: mutable LLVMValueRef? = null
+            out_copy: mutable LLVMValueRef? = null
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(u)
+            while use_cursor is use |use_cursor, into_copy, out_copy, u|:
+                use_cursor <- LLVMGetNextUse(use)
+                copy: LLVMValueRef = LLVMGetUser(use)
+                return false if LLVMIsAMemCpyInst(copy) == null or is_volatile_memory_intrinsic(copy) or LLVMGetNumOperandBundles(copy) != 0
+                if LLVMGetOperand(copy, 0) == u:
+                    into_copy <- copy
+                elif LLVMGetOperand(copy, 1) == u:
+                    out_copy <- copy
+            into: LLVMValueRef = get into_copy else return false
+            out: LLVMValueRef = get out_copy else return false
+            next: LLVMValueRef = get LLVMGetNextInstruction(into) else return false
+            return false if next != out
+            source: LLVMValueRef = LLVMGetOperand(into, 1)
+            destination: LLVMValueRef = LLVMGetOperand(out, 0)
+            length: LLVMValueRef = LLVMGetOperand(into, 2)
+            return false if LLVMIsAAllocaInst(source) == null or LLVMIsAAllocaInst(destination) == null or source == destination or source == u or destination == u
+            return false if LLVMIsAConstantInt(length) == null or LLVMGetOperand(out, 2) != length
+            size: u64 = get private_block_size(u, layout) else return false
+            return false if ElisaLLVMConstantIntActiveBits(length) > 64 or LLVMConstIntGetZExtValue(length) != size
+            position_builder_before(builder, out)
+            _ = LLVMBuildMemCpy(builder, destination, argument_alignment(out, 0), source, argument_alignment(into, 1), length)
+            LLVMInstructionEraseFromParent(out)
+            LLVMInstructionEraseFromParent(into)
+            LLVMInstructionEraseFromParent(u)
+            true

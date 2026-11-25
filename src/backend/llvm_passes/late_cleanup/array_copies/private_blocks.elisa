@@ -1,0 +1,133 @@
+# Private memory blocks and the instructions that touch them.
+#
+# A private block is a static alloca of a known fixed size, or a `malloc` of a constant
+# size called in this function. Its uses are collected through GEPs; any other user
+# (a call, a cast, a GEP indexing from it as an offset) lets the address escape.
+
+# Where a copy-elision walk stands: U and T equal, U written (only the second copy may
+# restore equality, and T must not be observed), or T written while U is stale.
+const module CopyWalkState:
+    CLEAN: u32 = 0
+    DIRTY: u32 = 1
+    TAINTED: u32 = 2
+
+extend Backend:
+    private:
+        # `CallBase::getCalledFunction` named NAME with ARGUMENTS arguments.
+        def calls_function_named(call: LLVMValueRef, name: sview, arguments: u32) -> bool can[Unsafe.PointerCast]:
+            return false if LLVMIsACallInst(call) == null
+            callee: LLVMValueRef = LLVMGetCalledValue(call)
+            return false if LLVMIsAFunction(callee) == null or LLVMGlobalGetValueType(callee) != LLVMGetCalledFunctionType(call)
+            LLVMGetNumArgOperands(call) == arguments and has_value_name(callee, name)
+
+        # The byte size of a private block.
+        def private_block_size(value: LLVMValueRef, layout: LLVMTargetDataRef) -> u64? can[Unsafe.PointerCast]:
+            if LLVMIsAAllocaInst(value) != null:
+                return null if ElisaLLVMIsStaticAlloca(value) == 0
+                size: mutable u64 = 0
+                return null if ElisaLLVMAllocaFixedAllocationSize(value, layout, &size) == 0
+                return size
+            return null if not calls_function_named(value, "malloc", 1) or LLVMGetNumOperandBundles(value) != 0
+            count: LLVMValueRef = LLVMGetOperand(value, 0)
+            return null if LLVMIsAConstantInt(count) == null
+            LLVMConstIntGetZExtValue(count)
+
+        def is_free_call(instruction: LLVMValueRef) -> bool can[Unsafe.PointerCast]:
+            calls_function_named(instruction, "free", 1)
+
+        def is_lifetime_marker(instruction: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAIntrinsicInst(instruction) == null
+            id: u32 = called_intrinsic_id(instruction)
+            id == intrinsic_identifier("llvm.lifetime.start") or id == intrinsic_identifier("llvm.lifetime.end")
+
+        # A lifetime marker or a `free`: it ends (or begins) the block's life and goes away
+        # with the block.
+        def is_block_life_marker(instruction: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            is_lifetime_marker(instruction) or is_free_call(instruction)
+
+        def is_volatile_memory_intrinsic(intrinsic: LLVMValueRef) -> bool:
+            ElisaLLVMIsConstantZero(LLVMGetOperand(intrinsic, 3)) == 0
+
+        # Whether USER, reached through VALUE (BASE or a GEP from it), is a use the copy
+        # elision understands; GEPs join the work list.
+        def is_understood_block_use(user: LLVMValueRef, value: LLVMValueRef, base: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAInstruction(user) == null
+            return LLVMGetOperand(user, 0) == value if LLVMIsAGetElementPtrInst(user) != null
+            return is_simple_access(user) if LLVMIsALoadInst(user) != null
+            return LLVMGetOperand(user, 1) == value and is_simple_access(user) if LLVMIsAStoreInst(user) != null
+            return not is_volatile_memory_intrinsic(user) if LLVMIsAMemIntrinsic(user) != null
+            return value == base if is_lifetime_marker(user) or is_free_call(user)
+            false
+
+        # The instructions using BASE through GEPs, in work-list order; null when its
+        # address can escape.
+        def private_block_uses(base: LLVMValueRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            uses: mutable darray[LLVMValueRef] = []
+            work: mutable darray[LLVMValueRef] = [base]
+            while work.count != 0 |uses, work, base|:
+                value: LLVMValueRef = work[work.count - 1]
+                _ = work.pop()
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+                while use_cursor is use |use_cursor, uses, work, value, base|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    return null if not is_understood_block_use(user, value, base)
+                    if LLVMIsAGetElementPtrInst(user) != null:
+                        work.push(user)
+                    else:
+                        uses.push(user)
+            uses
+
+        # Every instruction of FUNCTION, in block and instruction order.
+        def function_instructions(function: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            instructions: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, instructions|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, instructions|:
+                    instructions.push(instruction)
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            instructions
+
+        # `MemIntrinsic::getRawDest` with the GEPs over it stripped.
+        def transfer_destination_base(transfer: LLVMValueRef) -> LLVMValueRef:
+            destination: mutable LLVMValueRef = LLVMGetOperand(transfer, 0)
+            while LLVMIsAGetElementPtrInst(destination) != null |destination|:
+                destination <- LLVMGetOperand(destination, 0)
+            destination
+
+        # Whether INSTRUCTION, a use of the block at BASE, writes it (or ends its life).
+        def writes_private_block(instruction: LLVMValueRef, base: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if LLVMIsAStoreInst(instruction) != null or LLVMIsAMemSetInst(instruction) != null
+            return transfer_destination_base(instruction) == base if LLVMIsAMemCpyInst(instruction) != null or LLVMIsAMemMoveInst(instruction) != null
+            is_block_life_marker(instruction)
+
+        # The `align` attribute of a memory intrinsic's argument at INDEX, 0 when absent.
+        def argument_alignment(call: LLVMValueRef, index: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            attribute: LLVMAttributeRef = get LLVMGetCallSiteEnumAttribute(call, index + 1, attribute_kind("align")) else return 0
+            LLVMGetEnumAttributeValue(attribute).u32()
+
+        # Frontends emit small copies as `memcpy` libcalls and stage1 copies arrays with
+        # `memmove`; only the intrinsic between distinct allocas is analyzable, so both
+        # become `llvm.memcpy`.
+        def promote_copy_calls(function: LLVMValueRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: mutable darray[LLVMValueRef] = []
+            for instruction in function_instructions(function) |calls|:
+                if calls_function_named(instruction, "memcpy", 3) and LLVMGetFirstUse(instruction) == null and LLVMIsAConstantInt(LLVMGetOperand(instruction, 2)) != null and LLVMGetNumOperandBundles(instruction) == 0:
+                    calls.push(instruction)
+            for call in calls |builder|:
+                position_builder_before(builder, call)
+                _ = LLVMBuildMemCpy(builder, LLVMGetOperand(call, 0), 1, LLVMGetOperand(call, 1), 1, LLVMGetOperand(call, 2))
+                LLVMInstructionEraseFromParent(call)
+            moves: mutable darray[LLVMValueRef] = []
+            for instruction in function_instructions(function) |moves|:
+                if LLVMIsAMemMoveInst(instruction) != null:
+                    destination: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 0))
+                    source: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 1))
+                    if LLVMIsAAllocaInst(destination) != null and LLVMIsAAllocaInst(source) != null and destination != source and not is_volatile_memory_intrinsic(instruction):
+                        moves.push(instruction)
+            for memory_move in moves |builder|:
+                position_builder_before(builder, memory_move)
+                _ = LLVMBuildMemCpy(builder, LLVMGetOperand(memory_move, 0), argument_alignment(memory_move, 0), LLVMGetOperand(memory_move, 1), argument_alignment(memory_move, 1), LLVMGetOperand(memory_move, 2))
+                LLVMInstructionEraseFromParent(memory_move)

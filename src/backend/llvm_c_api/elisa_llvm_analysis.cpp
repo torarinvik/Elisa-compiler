@@ -321,6 +321,13 @@ int ElisaLLVMAllocaIsSwiftError(LLVMValueRef alloca) {
   return cast<AllocaInst>(unwrap(alloca))->isSwiftError();
 }
 
+int ElisaLLVMAllocaFixedAllocationSize(LLVMValueRef alloca, LLVMTargetDataRef layout, uint64_t *size) {
+  std::optional<TypeSize> Size = cast<AllocaInst>(unwrap(alloca))->getAllocationSize(*unwrap(layout));
+  if (!Size || Size->isScalable()) return 0;
+  *size = Size->getFixedValue();
+  return 1;
+}
+
 unsigned ElisaLLVMConstantIntByte(LLVMValueRef constant, unsigned index) {
   return cast<ConstantInt>(unwrap(constant))->getValue().extractBitsAsZExtValue(8, 8 * index);
 }

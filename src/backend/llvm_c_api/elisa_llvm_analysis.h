@@ -120,6 +120,9 @@ LLVMValueRef ElisaLLVMPointerBaseWithConstantOffset(LLVMValueRef pointer, LLVMMo
 int ElisaLLVMIsStaticAlloca(LLVMValueRef alloca);
 int ElisaLLVMAllocaIsUsedWithInAlloca(LLVMValueRef alloca);
 int ElisaLLVMAllocaIsSwiftError(LLVMValueRef alloca);
+/* AllocaInst::getAllocationSize: whether the alloca's size is a known fixed byte count,
+ * stored in `size` (unknown for a variable array count or a scalable type). */
+int ElisaLLVMAllocaFixedAllocationSize(LLVMValueRef alloca, LLVMTargetDataRef layout, uint64_t *size);
 /* Byte INDEX (little-endian order) of a ConstantInt of any width. */
 unsigned ElisaLLVMConstantIntByte(LLVMValueRef constant, unsigned index);
 /* BasicBlock::getNumber: the block's number, below its function's
