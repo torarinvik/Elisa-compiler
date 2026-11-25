@@ -1,0 +1,210 @@
+# The recurrences `sum = sum + step` the bounded-sum proofs accept: one plain or
+# overflow-checked add of the header phi and an independent step, possibly skipped on
+# some paths through a latch phi or select, or lowered by a signed minimum with a
+# nonnegative cap. A checked add must trap on overflow before the latch.
+
+# The update a recurrence leaf search found: its step, and its one plain or checked add.
+struct UpdateLeaf:
+    step: LLVMValueRef?
+    plain_add: LLVMValueRef?
+    checked_add: LLVMValueRef?
+
+# A range already proved for a value: `ProvenRanges`' entries.
+struct ProvenRange:
+    value: LLVMValueRef
+    range: ElisaConstantRangeRef
+
+const module SumRecurrenceLimit:
+    LEAF_DEPTH: u32 = 8
+    WIDEST: u32 = 128
+    EXTRA_WIDTH: u32 = 32
+
+extend Backend:
+    private:
+        def same_optional(first: LLVMValueRef?, second: LLVMValueRef?) -> bool:
+            if first is present:
+                if second is other:
+                    return present == other
+                return false
+            second == null
+
+        # Whether SEARCH found anything beyond BEFORE.
+        def leaf_changed(search: UpdateLeaf&, before: UpdateLeaf&) -> bool:
+            not same_optional(search.step, before.step) or not same_optional(search.plain_add, before.plain_add) or not same_optional(search.checked_add, before.checked_add)
+
+        # The operand of a two-operand UPDATE that is not PHI, when the other one is.
+        def operand_beside_phi(update: LLVMValueRef, phi: LLVMValueRef) -> LLVMValueRef?:
+            return LLVMGetOperand(update, 1) if LLVMGetOperand(update, 0) == phi
+            return LLVMGetOperand(update, 0) if LLVMGetOperand(update, 1) == phi
+            null
+
+        # LEAF with STEP recorded, unless it already has a different step.
+        def with_step(leaf: UpdateLeaf&, step: LLVMValueRef?) -> LLVMValueRef?:
+            found: LLVMValueRef = get step else return null
+            if leaf.step is earlier:
+                return null if earlier != found
+            found
+
+        # An `extractvalue (sadd.with.overflow phi, step), 0` leaf.
+        def checked_leaf(value: LLVMValueRef, phi: LLVMValueRef, leaf: UpdateLeaf&) -> UpdateLeaf? can[Abort.Panic, Memory.Allocate]:
+            return null if LLVMGetNumIndices(value) != 1 or not is_extract_of_field(value, 0)
+            call: LLVMValueRef = LLVMGetOperand(value, 0)
+            return null if LLVMIsAIntrinsicInst(call) == null or called_intrinsic_id(call) != intrinsic_identifier("llvm.sadd.with.overflow")
+            return null if LLVMGetNumArgOperands(call) != 2 or leaf.plain_add != null
+            if leaf.checked_add is earlier:
+                return null if earlier != call
+            step: LLVMValueRef = get with_step(leaf, operand_beside_phi(call, phi)) else return null
+            UpdateLeaf{step: step, plain_add: leaf.plain_add, checked_add: call}
+
+        # A plain `add phi, step` leaf.
+        def plain_leaf(value: LLVMValueRef, phi: LLVMValueRef, leaf: UpdateLeaf&) -> UpdateLeaf?:
+            return null if LLVMGetInstructionOpcode(value) != LLVMOpcode::ADD or ElisaLLVMHasMetadataOtherThanDebugLoc(value) != 0
+            return null if leaf.checked_add != null
+            if leaf.plain_add is earlier:
+                return null if earlier != value
+            step: LLVMValueRef = get with_step(leaf, operand_beside_phi(value, phi)) else return null
+            UpdateLeaf{step: step, plain_add: value, checked_add: leaf.checked_add}
+
+        # A latch phi in LOOP whose every incoming value is a leaf, one at least an update.
+        def phi_leaf(value: LLVMValueRef, phi: LLVMValueRef, loop: ElisaLoopRef, leaf: UpdateLeaf&, depth: u32) -> UpdateLeaf? can[Abort.Panic, Memory.Allocate]:
+            return null if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(value)) == 0
+            current: mutable UpdateLeaf = UpdateLeaf{step: leaf.step, plain_add: leaf.plain_add, checked_add: leaf.checked_add}
+            saw_update: mutable bool = false
+            for incoming in 0..<LLVMCountIncoming(value) |current, saw_update, value, phi, loop, depth|:
+                before: UpdateLeaf = UpdateLeaf{step: current.step, plain_add: current.plain_add, checked_add: current.checked_add}
+                found: UpdateLeaf = get find_update_leaf(LLVMGetIncomingValue(value, incoming), phi, loop, &current, depth + 1) else return null
+                saw_update <- saw_update or leaf_changed(&found, &before)
+                current <- found
+            return null if not saw_update
+            current
+
+        # A select whose two values are leaves, one at least an update.
+        def select_leaf(value: LLVMValueRef, phi: LLVMValueRef, loop: ElisaLoopRef, leaf: UpdateLeaf&, depth: u32) -> UpdateLeaf? can[Abort.Panic, Memory.Allocate]:
+            chosen: UpdateLeaf = get find_update_leaf(LLVMGetOperand(value, 1), phi, loop, leaf, depth + 1) else return null
+            other: UpdateLeaf = get find_update_leaf(LLVMGetOperand(value, 2), phi, loop, &chosen, depth + 1) else return null
+            return null if not leaf_changed(&other, leaf)
+            other
+
+    public:
+        # `findUpdateLeaf`: LEAF extended by VALUE, when VALUE is PHI itself (a skipped
+        # update) or exactly one add of PHI and an independent step; none otherwise.
+        def find_update_leaf(value: LLVMValueRef, phi: LLVMValueRef, loop: ElisaLoopRef, leaf: UpdateLeaf&, depth: u32) -> UpdateLeaf? can[Abort.Panic, Memory.Allocate]:
+            return null if depth > SumRecurrenceLimit::LEAF_DEPTH
+            return UpdateLeaf{step: leaf.step, plain_add: leaf.plain_add, checked_add: leaf.checked_add} if value == phi
+            return null if LLVMIsAInstruction(value) == null
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            return checked_leaf(value, phi, leaf) if opcode == LLVMOpcode::EXTRACT_VALUE
+            return plain_leaf(value, phi, leaf) if LLVMIsABinaryOperator(value) != null
+            return phi_leaf(value, phi, loop, leaf, depth) if opcode == LLVMOpcode::PHI
+            return select_leaf(value, phi, loop, leaf, depth) if opcode == LLVMOpcode::SELECT
+            null
+
+        # `trapBlock`: the block's first instruction, debug intrinsics aside, is a
+        # bundle-free `llvm.trap`, and the next is `unreachable`.
+        def is_sum_trap_block(block: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            saw_trap: mutable bool = false
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, saw_trap|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                continue if LLVMIsADbgInfoIntrinsic(instruction) != null
+                if LLVMIsAIntrinsicInst(instruction) != null and not saw_trap:
+                    if called_intrinsic_id(instruction) == intrinsic_identifier("llvm.trap") and LLVMGetNumOperandBundles(instruction) == 0:
+                        saw_trap <- true
+                        continue
+                return saw_trap and LLVMGetInstructionOpcode(instruction) == LLVMOpcode::UNREACHABLE
+            false
+
+        # The overflow flag of CALL when every user extracts one field and exactly one,
+        # used once, extracts the flag.
+        def lone_overflow_flag(call: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            flag: mutable LLVMValueRef? = null
+            for user in value_users(call) |flag|:
+                return null if not is_llvm_instruction_with_opcode(user, LLVMOpcode::EXTRACT_VALUE) or LLVMGetNumIndices(user) != 1
+                continue if is_extract_of_field(user, 0)
+                return null if not is_extract_of_field(user, 1) or flag != null
+                flag <- user
+            found: LLVMValueRef = get flag else return null
+            return null if use_count(found) != 1
+            found
+
+        # The conditional branch on CALL's lone overflow flag whose true edge traps.
+        def trapping_flag_branch(call: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            flag: LLVMValueRef = get lone_overflow_flag(call) else return null
+            use: LLVMUseRef = get LLVMGetFirstUse(flag) else return null
+            branch: LLVMValueRef = LLVMGetUser(use)
+            return null if not is_llvm_instruction_with_opcode(branch, LLVMOpcode::CONDITIONAL_BR) or LLVMGetCondition(branch) != flag
+            return null if not is_sum_trap_block(LLVMGetSuccessor(branch, 0))
+            branch
+
+        # A bundle-free, metadata-free, non-convergent call of intrinsic NAME.
+        def is_plain_overflow_intrinsic(call: LLVMValueRef, name: sview) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAIntrinsicInst(call) == null or called_intrinsic_id(call) != intrinsic_identifier(name)
+            return false if LLVMGetNumArgOperands(call) != 2 or LLVMGetNumOperandBundles(call) != 0
+            ElisaLLVMHasMetadataOtherThanDebugLoc(call) == 0 and not call_has_attribute(call, "convergent")
+
+        # `checkedAddHasTrapGuard`: CALL traps on overflow, and its continue edge stays in
+        # LOOP and dominates USE_BLOCK.
+        def checked_add_has_trap_guard(call: LLVMValueRef, use_block: LLVMBasicBlockRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_plain_overflow_intrinsic(call, "llvm.sadd.with.overflow") or ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(call)) == 0
+            branch: LLVMValueRef = get trapping_flag_branch(call) else return false
+            continue_block: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            ElisaLLVMLoopContainsBlock(loop, continue_block) != 0 and ElisaLLVMBlockDominates(analyses, continue_block, use_block) != 0
+
+        # `checkedSubHasOnlyTrapFlag`: CALL's only observed overflow is a trap.
+        def checked_sub_has_only_trap_flag(call: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_plain_overflow_intrinsic(call, "llvm.ssub.with.overflow")
+            trapping_flag_branch(call) != null
+
+        # `rangeAt`: VALUE's proven range, else its lazy-value range at AT (the full range
+        # for a possibly undefined single value). The caller owns the range.
+        def range_at(value: LLVMValueRef, at: LLVMValueRef, proven: darray[ProvenRange]&, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            for known in proven:
+                return ElisaLLVMConstantRangeCopy(known.range) if known.value == value
+            return ElisaLLVMConstantRangeFull(1) if not is_llvm_integer_type(LLVMTypeOf(value), 0)
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, value, at, 0)
+            return range if ElisaLLVMConstantRangeIsSingleElement(range) == 0 or ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, value, at) != 0
+            ElisaLLVMDisposeConstantRange(range)
+            ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(value)))
+
+        # `findClampedUpdate`: a `smin` leaf with a nonnegative cap over an update leaf.
+        def find_clamped_update(minimum: LLVMValueRef, phi: LLVMValueRef, loop: ElisaLoopRef, proven: darray[ProvenRange]&, analyses: ElisaFunctionAnalysesRef) -> UpdateLeaf? can[Abort.Panic, Memory.Allocate]:
+            return null if LLVMGetNumOperandBundles(minimum) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(minimum) != 0
+            empty: UpdateLeaf = UpdateLeaf{step: null, plain_add: null, checked_add: null}
+            for index in 0..<2 |minimum, phi, loop, proven, analyses, empty|:
+                if find_update_leaf(LLVMGetOperand(minimum, index), phi, loop, &empty, 0) is candidate:
+                    if candidate.step != null:
+                        cap: ElisaConstantRangeRef = range_at(LLVMGetOperand(minimum, 1 - index), minimum, proven, analyses)
+                        negative: bool = ElisaLLVMConstantRangeIsEmpty(cap) != 0 or ElisaLLVMConstantRangeSignedMinIsNegative(cap) != 0
+                        ElisaLLVMDisposeConstantRange(cap)
+                        return candidate if not negative
+            null
+
+        # `boundedBackedges`: LOOP's maximum update count, when its maximum backedge
+        # count fits in 32 bits and is below `UINT32_MAX`.
+        def bounded_updates(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> u32?:
+            backedges: mutable u64 = 0
+            return null if ElisaLLVMConstantMaxBackedgeTakenCount(analyses, loop, &backedges) == 0 or backedges >= 4294967295
+            (backedges + 1).u32()
+
+        # `fitsSignedAccumulation`: the range [seed, seed + max step * updates] of PHI when
+        # the seed is a nonnegative constant, the step's range nonnegative and bounded,
+        # and the largest sum a signed value of PHI's width.
+        def accumulation_range(phi: LLVMValueRef, initial: LLVMValueRef, step: LLVMValueRef, at: LLVMValueRef, updates: u32, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            type: LLVMTypeRef = LLVMTypeOf(phi)
+            return null if not is_llvm_integer_type(type, 0) or LLVMGetIntTypeWidth(type) > SumRecurrenceLimit::WIDEST or LLVMIsAConstantInt(initial) == null
+            return null if ElisaLLVMConstantIntIsNegative(initial) != 0 or LLVMTypeOf(step) != type
+            return null if ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, initial, at) == 0
+            steps: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, step, at, 0)
+            rejected: bool = ElisaLLVMConstantRangeIsEmpty(steps) != 0 or ElisaLLVMConstantRangeIsFull(steps) != 0 or ElisaLLVMConstantRangeIsWrapped(steps) != 0 or ElisaLLVMConstantRangeSignedMinIsNegative(steps) != 0
+            undefined_single: bool = not rejected and ElisaLLVMConstantRangeIsSingleElement(steps) != 0 and ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, step, at) == 0
+            if rejected or undefined_single:
+                ElisaLLVMDisposeConstantRange(steps)
+                return null
+            largest_step: LLVMValueRef = ElisaLLVMConstantRangeSignedMaximum(steps, LLVMGetTypeContext(type))
+            ElisaLLVMDisposeConstantRange(steps)
+            width: u32 = LLVMGetIntTypeWidth(type)
+            wide: u32 = width + SumRecurrenceLimit::EXTRA_WIDTH
+            count: LLVMValueRef = LLVMConstInt(LLVMIntTypeInContext(LLVMGetTypeContext(type), wide), updates.u64(), 0)
+            total: LLVMValueRef = LLVMConstAdd(ElisaLLVMConstantIntZeroExtend(initial, wide), ElisaLLVMConstantIntMultiply(ElisaLLVMConstantIntSignExtend(largest_step, wide), count))
+            return null if ElisaLLVMConstantIntIsSignedIntN(total, width) == 0
+            ElisaLLVMConstantRangeNonEmpty(initial, LLVMConstAdd(ElisaLLVMConstantIntTruncate(total, width), LLVMConstInt(type, 1, 0)))

@@ -1,0 +1,304 @@
+# Proves a recurrence's prefix sums from its nonnegative seed and step range and its
+# loop's maximum iteration count, and reuses those bounds for nearby arithmetic: the
+# recurrence's checked add loses its overflow check (a plain add becomes `nuw nsw`),
+# and checked adds, checked subtractions and plain subtractions over a proven value
+# whose result provably fits follow. Every range is derived from the unmodified
+# function before anything is rewritten.
+include "../../ir/ir_editing.elisa"
+include "../../ir/llvm_ir_queries.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../ir/pass_pipelines.elisa"
+include "./sum_recurrences.elisa"
+
+const module BoundedSumLimit:
+    FUNCTIONS: u32 = 32
+    LOOPS: u32 = 64
+    INSTRUCTIONS: u32 = 10000
+    CLEANUP: sview = "function(instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg)"
+
+# A proved recurrence: its plain or checked add.
+struct SumFact:
+    plain_add: LLVMValueRef?
+    checked_add: LLVMValueRef?
+
+# A proved recurrence: its fact, its update from the latch, and their range.
+struct ProvedRecurrence:
+    fact: SumFact
+    update: LLVMValueRef
+    range: ElisaConstantRangeRef
+
+# How many functions and loops the module has examined so far.
+struct SumBudget:
+    functions: u32
+    loops: u32
+
+# A function's proved recurrences and the ranges proved for their values.
+struct SumProofs:
+    facts: darray[SumFact]
+    proven: darray[ProvenRange]
+    budget: SumBudget
+
+# The arithmetic a function's proven ranges make safe.
+struct SafeArithmetic:
+    checked: darray[LLVMValueRef]
+    subtractions: darray[LLVMValueRef]
+
+extend Backend:
+    private:
+        # Declarations, strict floating point, optnone, size-optimized or sanitized
+        # functions, and functions of more than 10000 instructions are left alone.
+        def is_sum_function(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "strictfp") or function_has_attribute(function, "optnone")
+            return false if function_has_attribute(function, "optsize") or function_has_attribute(function, "minsize")
+            return false if function_has_attribute(function, "sanitize_address") or function_has_attribute(function, "sanitize_memory")
+            return false if function_has_attribute(function, "sanitize_thread") or function_has_attribute(function, "sanitize_hwaddress")
+            function_instruction_count(function) <= BoundedSumLimit::INSTRUCTIONS
+
+        # A two-input integer phi with a constant zero input.
+        def is_zero_seeded_phi(instruction: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI) or not is_llvm_integer_type(LLVMTypeOf(instruction), 0)
+            return false if LLVMCountIncoming(instruction) != 2
+            for incoming in 0..<2 |instruction|:
+                value: LLVMValueRef = LLVMGetIncomingValue(instruction, incoming)
+                return true if LLVMIsAConstantInt(value) != null and ElisaLLVMIsConstantZero(value) != 0
+            false
+
+        # An add missing `nsw` or `nuw`, or a checked signed add.
+        def is_sum_update(instruction: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            if LLVMIsABinaryOperator(instruction) != null:
+                return LLVMGetInstructionOpcode(instruction) == LLVMOpcode::ADD and (LLVMGetNSW(instruction) == 0 or LLVMGetNUW(instruction) == 0)
+            LLVMIsAIntrinsicInst(instruction) != null and called_intrinsic_id(instruction) == intrinsic_identifier("llvm.sadd.with.overflow")
+
+        def has_sum_shapes(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            zero_phi: mutable bool = false
+            update: mutable bool = false
+            for instruction in function_instructions(function) |zero_phi, update|:
+                zero_phi <- zero_phi or is_zero_seeded_phi(instruction)
+                update <- update or is_sum_update(instruction)
+            zero_phi and update
+
+        # `getBasicBlockIndex`: the first incoming index of BLOCK in PHI, if any.
+        def incoming_index(phi: LLVMValueRef, block: LLVMBasicBlockRef) -> u32?:
+            for incoming in 0..<LLVMCountIncoming(phi) |phi, block|:
+                return incoming if LLVMGetIncomingBlock(phi, incoming) == block
+            null
+
+        # PROVEN with VALUE mapped to a copy of RANGE (`insert_or_assign`).
+        def assign_proven_range[@r](proven: mutable darray[ProvenRange] @r, value: LLVMValueRef, range: ElisaConstantRangeRef) -> darray[ProvenRange] @r can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<proven.count |proven, value, range|:
+                if proven[index].value == value:
+                    ElisaLLVMDisposeConstantRange(proven[index].range)
+                    proven[index] <- ProvenRange{value: value, range: ElisaLLVMConstantRangeCopy(range)}
+                    return proven
+            proven.push(ProvenRange{value: value, range: ElisaLLVMConstantRangeCopy(range)})
+            proven
+
+        # PHI's update leaf from the latch: through a zero-seeded `smin`, or directly.
+        def recurrence_leaf(phi: LLVMValueRef, update: LLVMValueRef, initial: LLVMValueRef, loop: ElisaLoopRef, proven: darray[ProvenRange]&, analyses: ElisaFunctionAnalysesRef) -> UpdateLeaf? can[Abort.Panic, Memory.Allocate]:
+            zero_seed: bool = LLVMIsAConstantInt(initial) != null and ElisaLLVMIsConstantZero(initial) != 0
+            if LLVMIsAIntrinsicInst(update) != null and called_intrinsic_id(update) == intrinsic_identifier("llvm.smin") and zero_seed:
+                return find_clamped_update(update, phi, loop, proven, analyses)
+            empty: UpdateLeaf = UpdateLeaf{step: null, plain_add: null, checked_add: null}
+            find_update_leaf(update, phi, loop, &empty, 0)
+
+        # PHI's recurrence proved in LOOP: its fact, the update it takes from the latch,
+        # and the range of both (owned by the caller). None when it is not proved.
+        def prove_recurrence(phi: LLVMValueRef, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, updates: u32, proven: darray[ProvenRange]&, analyses: ElisaFunctionAnalysesRef) -> ProvedRecurrence? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if LLVMCountIncoming(phi) != 2 or not is_llvm_integer_type(LLVMTypeOf(phi), 0)
+            entry_index: u32 = get incoming_index(phi, preheader) else return null
+            latch_index: u32 = get incoming_index(phi, latch) else return null
+            return null if entry_index == latch_index
+            update: LLVMValueRef = LLVMGetIncomingValue(phi, latch_index)
+            initial: LLVMValueRef = LLVMGetIncomingValue(phi, entry_index)
+            leaf: UpdateLeaf = get recurrence_leaf(phi, update, initial, loop, proven, analyses) else return null
+            site: mutable LLVMValueRef? = leaf.plain_add
+            if leaf.checked_add is checked_site:
+                site <- checked_site
+            at: LLVMValueRef = get site else return null
+            step: LLVMValueRef = get leaf.step else return null
+            return null if ElisaLLVMBlockDominates(analyses, ElisaLLVMLoopHeader(loop), LLVMGetInstructionParent(at)) == 0
+            if leaf.checked_add is checked:
+                return null if not checked_add_has_trap_guard(checked, latch, loop, analyses)
+            range: ElisaConstantRangeRef = get accumulation_range(phi, initial, step, at, updates, analyses) else return null
+            ProvedRecurrence{fact: SumFact{plain_add: leaf.plain_add, checked_add: leaf.checked_add}, update: update, range: range}
+
+        # PROVEN with RECURRENCE's range recorded for its phi, its update and its checked
+        # add's value (`insert_or_assign`).
+        def record_recurrence[@r](proven: mutable darray[ProvenRange] @r, phi: LLVMValueRef, recurrence: ProvedRecurrence&) -> darray[ProvenRange] @r can[Abort.Panic, Memory.Allocate]:
+            proven <- assign_proven_range(proven, phi, recurrence.range)
+            proven <- assign_proven_range(proven, recurrence.update, recurrence.range)
+            if recurrence.fact.checked_add is checked:
+                for user in value_users(checked) |proven, recurrence|:
+                    if is_llvm_instruction_with_opcode(user, LLVMOpcode::EXTRACT_VALUE) and is_extract_of_field(user, 0):
+                        proven <- assign_proven_range(proven, user, recurrence.range)
+            proven
+
+        # The recurrences of FUNCTION's innermost bounded loops, within the module budget.
+        def prove_function_recurrences(budget: SumBudget, analyses: ElisaFunctionAnalysesRef) -> SumProofs can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            facts: mutable darray[SumFact] = []
+            proven: mutable darray[ProvenRange] = []
+            loops: mutable u32 = budget.loops
+            for loop in loops_in_program_preorder(analyses) |facts, proven, loops, analyses|:
+                loops <- loops + 1
+                break if loops > BoundedSumLimit::LOOPS
+                continue if ElisaLLVMLoopSubLoopCount(loop) != 0
+                preheader: LLVMBasicBlockRef? = ElisaLLVMLoopPredecessor(loop)
+                latch: LLVMBasicBlockRef? = ElisaLLVMLoopLatch(loop)
+                updates: u32? = bounded_updates(loop, analyses)
+                if preheader is entry:
+                    if latch is back:
+                        if updates is count:
+                            for phi in block_phis(ElisaLLVMLoopHeader(loop)) |facts, proven, loop, entry, back, count, analyses|:
+                                if prove_recurrence(phi, loop, entry, back, count, &proven, analyses) is recurrence:
+                                    facts.push(recurrence.fact)
+                                    proven <- record_recurrence(proven, phi, &recurrence)
+                                    ElisaLLVMDisposeConstantRange(recurrence.range)
+            SumProofs{facts: facts, proven: proven, budget: SumBudget{functions: budget.functions, loops: loops}}
+
+        def is_proven(proven: darray[ProvenRange]&, value: LLVMValueRef) -> bool:
+            for known in proven:
+                return true if known.value == value
+            false
+
+        def is_fact_checked_add(facts: darray[SumFact]&, call: LLVMValueRef) -> bool:
+            for fact in facts:
+                if fact.checked_add is checked:
+                    return true if checked == call
+            false
+
+        # Whether `first - second` provably fits OPERAND's signed width, from ranges that
+        # are neither empty, full nor wrapped. Consumes both ranges.
+        def difference_fits(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef, operand: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            usable: bool = is_bounded_range(first) and is_bounded_range(second)
+            fits: bool = usable and signed_difference_fits(first, second, LLVMGetIntTypeWidth(LLVMTypeOf(operand)), LLVMGetTypeContext(LLVMTypeOf(operand)))
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            fits
+
+        def is_bounded_range(range: ElisaConstantRangeRef) -> bool:
+            ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0 and ElisaLLVMConstantRangeIsWrapped(range) == 0
+
+        def signed_difference_fits(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef, width: u32, context: LLVMContextRef) -> bool:
+            wide: u32 = width + 1
+            low: LLVMValueRef = LLVMConstSub(ElisaLLVMConstantIntSignExtend(ElisaLLVMConstantRangeSignedMinimum(first, context), wide), ElisaLLVMConstantIntSignExtend(ElisaLLVMConstantRangeSignedMaximum(second, context), wide))
+            high: LLVMValueRef = LLVMConstSub(ElisaLLVMConstantIntSignExtend(ElisaLLVMConstantRangeSignedMaximum(first, context), wide), ElisaLLVMConstantIntSignExtend(ElisaLLVMConstantRangeSignedMinimum(second, context), wide))
+            ElisaLLVMConstantIntIsSignedIntN(low, width) != 0 and ElisaLLVMConstantIntIsSignedIntN(high, width) != 0
+
+        def operand_ranges_fit(instruction: LLVMValueRef, proven: darray[ProvenRange]&, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            first: ElisaConstantRangeRef = range_at(LLVMGetOperand(instruction, 0), instruction, proven, analyses)
+            second: ElisaConstantRangeRef = range_at(LLVMGetOperand(instruction, 1), instruction, proven, analyses)
+            difference_fits(first, second, LLVMGetOperand(instruction, 0))
+
+        # A wrapping, metadata-free `sub` whose difference provably fits.
+        def is_safe_subtraction(instruction: LLVMValueRef, proven: darray[ProvenRange]&, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMGetInstructionOpcode(instruction) != LLVMOpcode::SUB or LLVMGetNSW(instruction) != 0 or LLVMGetNUW(instruction) != 0
+            return false if ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+            operand_ranges_fit(instruction, proven, analyses)
+
+        # A checked add over a proven value, not a recurrence's own, that never overflows.
+        def is_safe_checked_add(call: LLVMValueRef, proofs: SumProofs&, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_plain_overflow_intrinsic(call, "llvm.sadd.with.overflow")
+            return false if not is_proven(&proofs.proven, LLVMGetOperand(call, 0)) and not is_proven(&proofs.proven, LLVMGetOperand(call, 1))
+            return false if is_fact_checked_add(&proofs.facts, call)
+            first: ElisaConstantRangeRef = range_at(LLVMGetOperand(call, 0), call, &proofs.proven, analyses)
+            second: ElisaConstantRangeRef = range_at(LLVMGetOperand(call, 1), call, &proofs.proven, analyses)
+            safe: bool = ElisaLLVMConstantRangeIsEmpty(first) == 0 and ElisaLLVMConstantRangeIsEmpty(second) == 0 and ElisaLLVMConstantRangeSignedAddNeverOverflows(first, second) != 0
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            safe
+
+        # The checked arithmetic and subtractions of FUNCTION the proofs make safe.
+        def safe_arithmetic(function: LLVMValueRef, proofs: SumProofs&, analyses: ElisaFunctionAnalysesRef) -> SafeArithmetic can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            checked: mutable darray[LLVMValueRef] = []
+            subtractions: mutable darray[LLVMValueRef] = []
+            for instruction in function_instructions(function) |checked, subtractions, proofs, analyses|:
+                if LLVMIsABinaryOperator(instruction) != null:
+                    subtractions.push(instruction) if is_safe_subtraction(instruction, &proofs.proven, analyses)
+                    continue
+                continue if LLVMIsAIntrinsicInst(instruction) == null
+                if called_intrinsic_id(instruction) == intrinsic_identifier("llvm.sadd.with.overflow") and is_safe_checked_add(instruction, proofs, analyses):
+                    checked.push(instruction)
+                    continue
+                continue if not checked_sub_has_only_trap_flag(instruction)
+                checked.push(instruction) if operand_ranges_fit(instruction, &proofs.proven, analyses)
+            SafeArithmetic{checked: checked, subtractions: subtractions}
+
+        # `CreateNSWSub`, `CreateNSWAdd`, or `CreateAdd` with `nuw nsw` when UNSIGNED_TOO.
+        def build_plain_operation(builder: LLVMBuilderRef, first: LLVMValueRef, second: LLVMValueRef, subtract: bool, unsigned_too: bool) -> LLVMValueRef:
+            return LLVMBuildNSWSub(builder, first, second, "") if subtract
+            return LLVMBuildNSWAdd(builder, first, second, "") if not unsigned_too
+            sum: LLVMValueRef = LLVMBuildAdd(builder, first, second, "")
+            if LLVMIsAInstruction(sum) != null:
+                LLVMSetNUW(sum, 1)
+                LLVMSetNSW(sum, 1)
+            sum
+
+        # CALL replaced by its plain operation and a false overflow flag.
+        def replace_checked_call(call: LLVMValueRef, subtract: bool, unsigned_too: bool, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate]:
+            LLVMPositionBuilderBefore(builder, call)
+            first: LLVMValueRef = LLVMGetOperand(call, 0)
+            second: LLVMValueRef = LLVMGetOperand(call, 1)
+            plain: LLVMValueRef = build_plain_operation(builder, first, second, subtract, unsigned_too)
+            type: LLVMTypeRef = LLVMTypeOf(call)
+            pair: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetPoison(type), plain, 0, "")
+            flagged: LLVMValueRef = LLVMBuildInsertValue(builder, pair, LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(type)), 0, 0), 1, "")
+            LLVMReplaceAllUsesWith(call, flagged)
+            LLVMInstructionEraseFromParent(call)
+
+        # The proofs applied; how many instructions changed.
+        def apply_sum_proofs(facts: darray[SumFact]&, safe: SafeArithmetic&, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            changed: mutable u32 = 0
+            rewritten: mutable darray[LLVMValueRef] = []
+            for fact in facts |changed, rewritten, builder|:
+                if fact.plain_add is plain:
+                    if LLVMGetNSW(plain) == 0 or LLVMGetNUW(plain) == 0:
+                        LLVMSetNSW(plain, 1)
+                        LLVMSetNUW(plain, 1)
+                        changed <- changed + 1
+                if fact.checked_add is call:
+                    if not contains_value(&rewritten, call):
+                        rewritten.push(call)
+                        replace_checked_call(call, false, true, builder)
+                        changed <- changed + 1
+            for call in safe.checked |changed, builder|:
+                replace_checked_call(call, called_intrinsic_id(call) != intrinsic_identifier("llvm.sadd.with.overflow"), false, builder)
+                changed <- changed + 1
+            for subtraction in safe.subtractions |changed|:
+                LLVMSetNSW(subtraction, 1)
+                changed <- changed + 1
+            LLVMDisposeBuilder(builder)
+            changed
+
+        def dispose_proven_ranges(proven: darray[ProvenRange]&) -> void:
+            for known in proven:
+                ElisaLLVMDisposeConstantRange(known.range)
+
+    public:
+        # `elisacoreBoundedCheckedSums`: how many instructions the proofs changed.
+        def prove_bounded_sums(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_debug_info(module)
+            changed: mutable u32 = 0
+            budget: mutable SumBudget = SumBudget{functions: 0, loops: 0}
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, budget|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if not is_sum_function(function) or not has_sum_shapes(function)
+                budget <- SumBudget{functions: budget.functions + 1, loops: budget.loops}
+                break if budget.functions > BoundedSumLimit::FUNCTIONS
+                analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return changed
+                if ElisaLLVMFunctionHasIrreducibleControlFlow(analyses) == 0:
+                    proofs: SumProofs = prove_function_recurrences(budget, analyses)
+                    budget <- proofs.budget
+                    safe: SafeArithmetic = safe_arithmetic(function, &proofs, analyses)
+                    changed <- changed + apply_sum_proofs(&proofs.facts, &safe, LLVMGetModuleContext(module))
+                    dispose_proven_ranges(&proofs.proven)
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+        # `elisacoreOptimizeBoundedSums`: 1 when the proofs changed the module and its
+        # cleanup ran, 2 when the cleanup failed, 0 otherwise.
+        def optimize_bounded_sums(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if prove_bounded_sums(module) == 0
+            return 2 if not run_module_pipeline(module, target, BoundedSumLimit::CLEANUP)
+            1

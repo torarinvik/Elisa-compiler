@@ -227,6 +227,22 @@ int ElisaLLVMConstantIntMultiplyOverflows(LLVMValueRef first, LLVMValueRef secon
   return Overflow;
 }
 
+int ElisaLLVMConstantRangeSignedAddNeverOverflows(ElisaConstantRangeRef first, ElisaConstantRangeRef second) {
+  return unwrap(first)->signedAddMayOverflow(*unwrap(second)) == ConstantRange::OverflowResult::NeverOverflows;
+}
+
+LLVMValueRef ElisaLLVMConstantIntSignExtend(LLVMValueRef constant, uint32_t width) {
+  return constantOf(constant, constantValue(constant).sext(width));
+}
+
+LLVMValueRef ElisaLLVMConstantIntTruncate(LLVMValueRef constant, uint32_t width) {
+  return constantOf(constant, constantValue(constant).trunc(width));
+}
+
+int ElisaLLVMConstantIntIsSignedIntN(LLVMValueRef constant, uint32_t bits) {
+  return constantValue(constant).isSignedIntN(bits);
+}
+
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range) { delete unwrap(range); }
 
 } // extern "C"

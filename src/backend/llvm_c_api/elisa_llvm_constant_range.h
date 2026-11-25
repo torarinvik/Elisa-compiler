@@ -100,6 +100,12 @@ LLVMValueRef ElisaLLVMConstantIntAnd(LLVMValueRef first, LLVMValueRef second);
 LLVMValueRef ElisaLLVMConstantIntOr(LLVMValueRef first, LLVMValueRef second);
 int ElisaLLVMConstantIntShiftLeftOverflows(LLVMValueRef constant, uint32_t amount);
 int ElisaLLVMConstantIntMultiplyOverflows(LLVMValueRef first, LLVMValueRef second);
+/* signedAddMayOverflow(second) == NeverOverflows. */
+int ElisaLLVMConstantRangeSignedAddNeverOverflows(ElisaConstantRangeRef first, ElisaConstantRangeRef second);
+/* APInt sext / trunc to WIDTH, and isSignedIntN(bits), on ConstantInts. */
+LLVMValueRef ElisaLLVMConstantIntSignExtend(LLVMValueRef constant, uint32_t width);
+LLVMValueRef ElisaLLVMConstantIntTruncate(LLVMValueRef constant, uint32_t width);
+int ElisaLLVMConstantIntIsSignedIntN(LLVMValueRef constant, uint32_t bits);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus
