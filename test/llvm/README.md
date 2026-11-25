@@ -11,7 +11,7 @@ To run a test, set `LLVM_CONFIG` to the `llvm-config` for the LLVM installation
 used by the compiler:
 
 ```sh
-LLVM_CONFIG="$(command -v llvm-config)" python3 test/llvm/loops/test_even_range.py
+LLVM_CONFIG="$(command -v llvm-config)" python3 test/llvm/loops/range_checks/test_even_range.py
 ```
 
 Some tests also require Z3 or an AArch64 host. Tests look for their SMT inputs
