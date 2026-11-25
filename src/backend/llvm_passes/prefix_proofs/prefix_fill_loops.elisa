@@ -1,0 +1,194 @@
+# The written prefix of a local array (`ElisaIndexedPrefix::Prover::fillLoop`,
+# `fillCopy` and `cover`). A fill loop stores element i in every iteration i = 0, 1, ...;
+# once it leaves through its counted exit, elements [0, n) hold stored values, as they do
+# after a copy or a pattern fill of n elements. Stores of the next elements that run
+# after the fill and before every read extend the prefix.
+include "./watermark_reads.elisa"
+
+const module PrefixLimit:
+    COVER_EXTRA: u32 = 4
+    WALK_BLOCKS: usize = 4096
+    SHORT_FILL_BYTES: u64 = 256
+
+extend Backend:
+    private:
+        # INSTRUCTION would dominate a use anywhere in BLOCK (`dominates(Instruction *,
+        # BasicBlock *)`): its own block strictly dominates BLOCK.
+        def instruction_dominates_block(analyses: ElisaFunctionAnalysesRef, instruction: LLVMValueRef, block: LLVMBasicBlockRef) -> bool:
+            home: LLVMBasicBlockRef = LLVMGetInstructionParent(instruction)
+            home != block and ElisaLLVMBlockDominates(analyses, home, block) != 0
+
+        # The blocks of LOOP with a successor outside it, in the loop's block order
+        # (`getExitingBlocks`).
+        def exiting_blocks(loop: ElisaLoopRef) -> darray[LLVMBasicBlockRef] can[Abort.Panic, Memory.Allocate]:
+            exiting: mutable darray[LLVMBasicBlockRef] = []
+            for position in 0..<ElisaLLVMLoopBlockCount(loop) |exiting, loop|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, position)
+                terminator: LLVMValueRef = terminator_of(block)
+                leaves: mutable bool = false
+                for successor in 0..<LLVMGetNumSuccessors(terminator) |leaves, loop, terminator|:
+                    leaves <- leaves or ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(terminator, successor)) == 0
+                exiting.push(block) if leaves
+            exiting
+
+        # BLOCK, in LOOP, branches back to its header (`isLoopLatch`).
+        def is_loop_latch(loop: ElisaLoopRef, block: LLVMBasicBlockRef) -> bool can[Abort.Panic]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            terminator: LLVMValueRef = terminator_of(block)
+            for successor in 0..<LLVMGetNumSuccessors(terminator) |header, terminator|:
+                return true if LLVMGetSuccessor(terminator, successor) == header
+            false
+
+        # Some path through an iteration of LOOP, from its header to GOAL (to a latch when
+        # GOAL is null), passes none of the STORING blocks (`unstoredPath`).
+        def unstored_path(loop: ElisaLoopRef, storing: darray[LLVMValueRef]&, goal: LLVMBasicBlockRef?) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            work: mutable darray[LLVMBasicBlockRef] = [header]
+            seen: mutable KeyTable = new_key_table()
+            while work.count > 0 |work, seen, loop, storing, goal, header|:
+                block: LLVMBasicBlockRef = work[work.count - 1]
+                work.truncate(work.count - 1)
+                continue if contains_value(storing, LLVMBasicBlockAsValue(block))
+                key: TableKey = TableKey{first: block_key(block), second: 0, third: 0}
+                continue if key_table_find(&seen, key) != null
+                seen <- key_table_insert(seen, key, 0)
+                if goal is wanted:
+                    return true if block == wanted
+                else:
+                    return true if is_loop_latch(loop, block)
+                terminator: LLVMValueRef = terminator_of(block)
+                for successor in 0..<LLVMGetNumSuccessors(terminator) |work, loop, header, terminator|:
+                    next: LLVMBasicBlockRef = LLVMGetSuccessor(terminator, successor)
+                    work.push(next) if next != header and ElisaLLVMLoopContainsBlock(loop, next) != 0
+            false
+
+        # STORE, in LOOP itself, writes element INDEX.
+        def stores_index_in(prover: IndexProver&, target: usize, store: LLVMValueRef, loop: ElisaLoopRef, index: ElisaScalarEvolutionExpressionRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            owner: ElisaLoopRef = get ElisaLLVMLoopForBlock(prover.analyses, LLVMGetInstructionParent(store)) else return false
+            return false if owner != loop
+            stored: ElisaScalarEvolutionExpressionRef = get prefix_index_of(prover, target, store) else return false
+            stored == index
+
+        # The blocks of LOOP that store element i (INDEX) in iteration i (`storing`).
+        def storing_blocks(prover: IndexProver&, target: usize, loop: ElisaLoopRef, index: ElisaScalarEvolutionExpressionRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMValueRef] = []
+            for store in prover.prefix.arrays[target].accesses.stores |blocks, prover, target, loop, index|:
+                continue if not stores_index_in(prover, target, store, loop, index)
+                block: LLVMValueRef = LLVMBasicBlockAsValue(LLVMGetInstructionParent(store))
+                blocks.push(block) if not contains_value(&blocks, block)
+            blocks
+
+        # The bytes BUFFER, a static alloca, allocates (`getAllocationSize`).
+        def allocation_bytes(buffer: LLVMValueRef) -> u64:
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInstructionParent(buffer))))
+            LLVMABISizeOfType(layout, LLVMGetAllocatedType(buffer)) * LLVMConstIntGetZExtValue(LLVMGetOperand(buffer, 0))
+
+        # The elements BLOCK's counted exit from LOOP leaves written: [0, COUNT + 1) when
+        # every path from the header to BLOCK stores, [0, COUNT) for a header exit when
+        # every path to a latch stores.
+        def written_at_exit(analyses: ElisaFunctionAnalysesRef, loop: ElisaLoopRef, storing: darray[LLVMValueRef]&, block: LLVMBasicBlockRef, count: ElisaScalarEvolutionExpressionRef) -> ElisaScalarEvolutionExpressionRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return term_sum(analyses, count, term_constant_like(analyses, count, 1)) if not unstored_path(loop, storing, block)
+            return count if block == ElisaLLVMLoopHeader(loop) and not unstored_path(loop, storing, null)
+            null
+
+        # The read instructions of TARGET: its loads, vector loads, copies and the calls
+        # handed a view of it.
+        def prefix_reads(prover: IndexProver&, target: usize) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            reads: mutable darray[LLVMValueRef] = []
+            for load in prover.prefix.arrays[target].accesses.loads |reads|:
+                reads.push(load)
+            for load in prover.prefix.arrays[target].accesses.vector_loads |reads|:
+                reads.push(load)
+            for copy in prover.prefix.arrays[target].accesses.copies |reads|:
+                reads.push(copy)
+            for view in prover.prefix.arrays[target].accesses.views |reads|:
+                for call in use_list_users(view) |reads|:
+                    reads.push(call)
+            reads
+
+        # STORE runs after TARGET's prefix was written.
+        def after_prefix(prover: IndexProver&, target: usize, store: LLVMValueRef) -> bool can[Abort.Panic]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            if prover.prefix.arrays[target].copied is copy:
+                return ElisaLLVMInstructionDominates(analyses, copy, store) != 0
+            from: LLVMBasicBlockRef = get prover.prefix.arrays[target].from else return false
+            exit: LLVMBasicBlockRef = get prover.prefix.arrays[target].target else return false
+            ElisaLLVMEdgeDominates(analyses, from, exit, LLVMGetInstructionParent(store)) != 0
+
+        # STORE writes element COVERED after the prefix and before every one of READS.
+        def extends_prefix(prover: IndexProver&, target: usize, store: LLVMValueRef, covered: ElisaScalarEvolutionExpressionRef, reads: darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            index: ElisaScalarEvolutionExpressionRef = get prefix_index_of(prover, target, store) else return false
+            return false if index != covered or not after_prefix(prover, target, store)
+            for read in reads |prover, store|:
+                return false if ElisaLLVMInstructionDominates(prover.analyses, store, read) == 0
+            true
+
+    public:
+        # The element a load or store of TARGET accesses, at a field of it for a struct
+        # (`indexOf`).
+        def prefix_index_of(prover: IndexProver&, target: usize, access: LLVMValueRef) -> ElisaScalarEvolutionExpressionRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            pointer: ElisaScalarEvolutionExpressionRef = term_of(analyses, accessed_pointer(access))
+            offset: ElisaScalarEvolutionExpressionRef = term_difference(analyses, pointer, term_of(analyses, prover.prefix.arrays[target].buffer))
+            return null if term_kind(offset) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            residue: u64 = get field_residue(&prover.prefix.arrays[target].accesses, access) else 0
+            shifted: ElisaScalarEvolutionExpressionRef = term_difference(analyses, offset, term_constant_like(analyses, offset, residue))
+            element_offset_quotient(analyses, shifted, prover.prefix.arrays[target].element_size)
+
+        # STORE writes element i of iteration i of its loop and the fill runs before the
+        # loop; the loop's first counted exit that leaves a prefix written is TARGET's
+        # (`fillLoop`).
+        def fill_loop(prover: mutable IndexProver&, target: usize, store: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            index: ElisaScalarEvolutionExpressionRef = get prefix_index_of(prover, target, store) else return false
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(store)) else return false
+            return false if term_kind(index) != ElisaScalarEvolutionKind::ADD_RECURRENCE or term_operand_count(index) != 2
+            counted: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(index) else return false
+            return false if counted != loop or not is_term_constant(term_operand(index, 0), 0)
+            return false if not is_term_constant(ElisaLLVMScalarEvolutionStepRecurrence(analyses, index), 1)
+            return false if not instruction_dominates_block(analyses, prover.prefix.arrays[target].accesses.fills[0], ElisaLLVMLoopHeader(loop))
+            storing: darray[LLVMValueRef] = storing_blocks(prover, target, loop, index)
+            short_fill: bool = allocation_bytes(prover.prefix.arrays[target].buffer) <= PrefixLimit::SHORT_FILL_BYTES
+            for block in exiting_blocks(loop) |prover, target, analyses, loop, storing, short_fill|:
+                count: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionExitCount(analyses, loop, block)
+                branch: LLVMValueRef = terminator_of(block)
+                continue if term_kind(count) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE or LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+                # An exit into a trap (a capacity check) reaches no read. Only a fill that
+                # calls memset is worth proving past one: a short fill is a few stores whose
+                # zeros later folding still uses.
+                exit: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1) if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 0)) != 0 else LLVMGetSuccessor(branch, 0)
+                continue if LLVMGetInstructionOpcode(terminator_of(exit)) == LLVMOpcode::UNREACHABLE and not short_fill
+                if written_at_exit(analyses, loop, &storing, block, count) is written:
+                    prover.prefix.arrays[target].from <- block
+                    prover.prefix.arrays[target].target <- exit
+                    prover.prefix.arrays[target].copied <- null
+                    prover.prefix.arrays[target].length <- written
+                    return true
+            false
+
+        # COPY (or a fill of another byte), outside any loop and after the zero fill,
+        # writes the elements [0, bytes / element size) (`fillCopy`).
+        def fill_copy(prover: mutable IndexProver&, target: usize, copy: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            return false if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(copy)) != null
+            return false if ElisaLLVMInstructionDominates(analyses, prover.prefix.arrays[target].accesses.fills[0], copy) == 0
+            bytes: ElisaScalarEvolutionExpressionRef = term_of(analyses, LLVMGetOperand(copy, 2))
+            length: ElisaScalarEvolutionExpressionRef = get element_offset_quotient(analyses, bytes, prover.prefix.arrays[target].element_size) else return false
+            prover.prefix.arrays[target].copied <- copy
+            prover.prefix.arrays[target].length <- length
+            true
+
+        # TARGET's written prefix extended by stores to its next element that run after
+        # the fill and before every read (`cover`).
+        def cover_prefix(prover: mutable IndexProver&, target: usize) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            covered: mutable ElisaScalarEvolutionExpressionRef = get prover.prefix.arrays[target].length else return
+            reads: darray[LLVMValueRef] = prefix_reads(prover, target)
+            for extra in 0..<PrefixLimit::COVER_EXTRA |covered, prover, target, analyses, reads|:
+                next: mutable bool = false
+                for store in prover.prefix.arrays[target].accesses.stores |next, prover, target, covered, reads|:
+                    continue if next
+                    next <- extends_prefix(prover, target, store, covered, &reads)
+                break if not next
+                covered <- term_sum(analyses, covered, term_constant_like(analyses, covered, 1))
+            prover.prefix.arrays[target].covered <- covered

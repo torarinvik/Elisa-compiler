@@ -5,6 +5,7 @@
 #define ELISA_LLVM_INSTRUCTION_QUERIES_H
 
 #include <llvm-c/Core.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,10 @@ int ElisaLLVMCallOnlyReadsMemory(LLVMValueRef call);
 int ElisaLLVMCallOnlyAccessesInaccessibleMemory(LLVMValueRef call);
 /* MemIntrinsic::getDestAlign in bytes, or 0 when the destination carries no alignment. */
 unsigned ElisaLLVMMemoryIntrinsicDestinationAlignment(LLVMValueRef intrinsic);
+/* GEPOperator::accumulateConstantOffset of one GEP under its data layout: nonzero, with the
+ * byte offset (at the index width, sign-extended to 64 bits) in *offset, when every index is
+ * constant. */
+int ElisaLLVMGEPConstantOffset(LLVMValueRef gep, int64_t *offset);
 
 #ifdef __cplusplus
 }

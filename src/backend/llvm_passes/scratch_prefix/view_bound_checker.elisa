@@ -24,6 +24,13 @@ struct ViewChecker:
     copies: mutable darray[LLVMValueRef]
     copy_analyses: mutable darray[ElisaFunctionAnalysesRef]
 
+# The bounds a call's callee may keep a view below, and the parameter of the callee's
+# cleaned COPY that bounds each.
+struct ViewCallBounds:
+    copy: LLVMValueRef
+    bounds: mutable darray[LLVMValueRef]
+    limits: mutable darray[u32]
+
 # What a bound passed beside a view must satisfy: at most LENGTH where AT runs, in
 # FUNCTION (the C++ `Accept` predicate).
 struct BoundAcceptance:
@@ -145,28 +152,6 @@ extend Backend:
             dispose_index_prover(&prover)
             holds
 
-        # CALLEE's view parameter INDEX stays below parameter LIMIT (its own length when
-        # LIMIT is INDEX); a claim being checked is assumed (`argumentBounded`). A
-        # position past the parameters (a variadic callee) is not bounded.
-        def view_argument_bounded(checker: mutable ViewChecker&, callee: LLVMValueRef, index: u32, limit: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
-            return false if index >= LLVMCountParams(callee) or limit >= LLVMCountParams(callee)
-            parameter: LLVMValueRef = LLVMGetParam(callee, index)
-            bound: LLVMValueRef = LLVMGetParam(callee, limit)
-            for claim in 0..<checker.checking_parameters.count |checker, parameter, bound|:
-                return true if checker.checking_parameters[claim] == parameter and checker.checking_bounds[claim] == bound
-            return false if checker.budget == 0
-            checker.budget <- checker.budget - 1
-            length: mutable LLVMValueRef? = bound
-            if limit == index:
-                length <- view_length(parameter, callee)
-            real_length: LLVMValueRef = get length else return false
-            checker.checking_parameters.push(parameter)
-            checker.checking_bounds.push(bound)
-            holds: bool = view_users_bounded(checker, parameter, real_length, callee)
-            checker.checking_parameters.truncate(checker.checking_parameters.count - 1)
-            checker.checking_bounds.truncate(checker.checking_bounds.count - 1)
-            holds
-
         # Every access through VIEW's data pointer, in FUNCTION, stays below LENGTH; a
         # call may take the view whole when its callee keeps below a bound the caller
         # shows is at most LENGTH (`bounded`).
@@ -189,6 +174,28 @@ extend Backend:
             true
 
     public:
+        # CALLEE's view parameter INDEX stays below parameter LIMIT (its own length when
+        # LIMIT is INDEX); a claim being checked is assumed (`argumentBounded`). A
+        # position past the parameters (a variadic callee) is not bounded.
+        def view_argument_bounded(checker: mutable ViewChecker&, callee: LLVMValueRef, index: u32, limit: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if index >= LLVMCountParams(callee) or limit >= LLVMCountParams(callee)
+            parameter: LLVMValueRef = LLVMGetParam(callee, index)
+            bound: LLVMValueRef = LLVMGetParam(callee, limit)
+            for claim in 0..<checker.checking_parameters.count |checker, parameter, bound|:
+                return true if checker.checking_parameters[claim] == parameter and checker.checking_bounds[claim] == bound
+            return false if checker.budget == 0
+            checker.budget <- checker.budget - 1
+            length: mutable LLVMValueRef? = bound
+            if limit == index:
+                length <- view_length(parameter, callee)
+            real_length: LLVMValueRef = get length else return false
+            checker.checking_parameters.push(parameter)
+            checker.checking_bounds.push(bound)
+            holds: bool = view_users_bounded(checker, parameter, real_length, callee)
+            checker.checking_parameters.truncate(checker.checking_parameters.count - 1)
+            checker.checking_bounds.truncate(checker.checking_bounds.count - 1)
+            holds
+
         def new_view_checker(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, element_size: u64) -> ViewChecker:
             ViewChecker{function: function, analyses: analyses, element_size: element_size, budget: ViewCheckLimit::BUDGET, checking_parameters: [], checking_bounds: [], originals: [], copies: [], copy_analyses: []}
 
@@ -198,20 +205,31 @@ extend Backend:
                 ElisaLLVMDisposeFunctionAnalyses(checker.copy_analyses[index])
                 LLVMDeleteFunction(checker.copies[index])
 
-        # A value, in CALLER, below which the callee accesses the view passed at
-        # POSITION and that ACCEPTANCE takes: that view's length, else an integer
-        # argument the callee's indices stay below (a count passed beside a whole
-        # buffer, `sort(items[0:capacity], count)`); null when none is (`callBound`).
-        def view_call_bound(checker: mutable ViewChecker&, call: LLVMValueRef, position: u32, caller: LLVMValueRef, acceptance: BoundAcceptance&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+        # The values, in CALLER, below which the callee may access the view passed at
+        # POSITION, each with the callee parameter that bounds it: that view's length,
+        # then the 64-bit integer arguments (a count passed beside a whole buffer,
+        # `sort(items[0:capacity], count)`); null for a callee with no body.
+        def view_call_bounds(checker: mutable ViewChecker&, call: LLVMValueRef, position: u32, caller: LLVMValueRef) -> ViewCallBounds? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             callee: LLVMValueRef = get direct_callee(call) else return null
             return null if LLVMIsDeclaration(callee) != 0
-            copy: LLVMValueRef = cleaned_callee(checker, callee)
+            candidates: mutable ViewCallBounds = ViewCallBounds{copy: cleaned_callee(checker, callee), bounds: [], limits: []}
             if view_length(LLVMGetOperand(call, position), caller) is length:
-                return length if view_bound_at_most(checker, length, acceptance) and view_argument_bounded(checker, copy, position, position)
-            for count in 0..<LLVMGetNumArgOperands(call) |checker, call, position, acceptance, copy|:
+                candidates.bounds.push(length)
+                candidates.limits.push(position)
+            for count in 0..<LLVMGetNumArgOperands(call) |candidates, call, position|:
                 bound: LLVMValueRef = LLVMGetOperand(call, count)
                 continue if count == position or not is_llvm_integer_type(LLVMTypeOf(bound), 64)
-                return bound if view_bound_at_most(checker, bound, acceptance) and view_argument_bounded(checker, copy, position, count)
+                candidates.bounds.push(bound)
+                candidates.limits.push(count)
+            candidates
+
+        # A value, in CALLER, below which the callee accesses the view passed at
+        # POSITION and that ACCEPTANCE takes; null when none is (`callBound`).
+        def view_call_bound(checker: mutable ViewChecker&, call: LLVMValueRef, position: u32, caller: LLVMValueRef, acceptance: BoundAcceptance&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidates: ViewCallBounds = get view_call_bounds(checker, call, position, caller) else return null
+            for index in 0..<candidates.bounds.count |checker, position, acceptance, candidates|:
+                bound: LLVMValueRef = candidates.bounds[index]
+                return bound if view_bound_at_most(checker, bound, acceptance) and view_argument_bounded(checker, candidates.copy, position, candidates.limits[index])
             null
 
         # Every access through VIEW's data pointer stays below VIEW's length (`bounded`).

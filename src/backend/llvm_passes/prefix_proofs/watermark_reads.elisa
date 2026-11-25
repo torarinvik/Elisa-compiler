@@ -1,0 +1,241 @@
+# Reads below a watermark (`ElisaStackWatermark::Watermark::readsBelow`, `copiesBelow`
+# and `marks`). A load of element X - 1 for a nonzero watermark X reads a stored value; so
+# does a peek addressed as `&buffer[X] - 1`, a scan of element I with I <u X proved at the
+# load, and a read at most X where a push of element X reaches it. A copy out of elements
+# [0, X) of a watermark X reads only stored values too.
+include "./watermark_loop_pushes.elisa"
+
+extend Backend:
+    private:
+        # A sum `X + C` with a constant C.
+        def adds_constant(value: LLVMValueRef) -> bool:
+            LLVMGetInstructionOpcode(value) == LLVMOpcode::ADD and LLVMIsAConstantInt(LLVMGetOperand(value, 1)) != null
+
+        # The operand of COMPARE that is not VALUE.
+        def compared_with(compare: LLVMValueRef, value: LLVMValueRef) -> LLVMValueRef:
+            return LLVMGetOperand(compare, 1) if LLVMGetOperand(compare, 0) == value
+            LLVMGetOperand(compare, 0)
+
+        # VALUE joins the read candidates of LOAD: a few non-constant integers defined
+        # before it.
+        def consider_read_candidate(marks: StackWatermark&, found: mutable darray[LLVMValueRef]&, value: LLVMValueRef, load: LLVMValueRef):
+            return if found.count >= WatermarkLimit::READ_CANDIDATES
+            return if not is_llvm_integer_type(LLVMTypeOf(value), 0) or LLVMIsAConstant(value) != null
+            return if not defined_before(marks.analyses, defining_instruction(value), load)
+            found.push(value) if not contains_value(found, value)
+
+        # The non-constant indices of LOAD's address, through its chain of GEPs.
+        def address_indices(load: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            indices: mutable darray[LLVMValueRef] = []
+            pointer: mutable LLVMValueRef = LLVMGetOperand(load, 0)
+            while LLVMIsAGetElementPtrInst(pointer) != null |pointer, indices|:
+                for operand in 1..<LLVMGetNumOperands(pointer) |pointer, indices|:
+                    index: LLVMValueRef = LLVMGetOperand(pointer, operand)
+                    indices.push(index) if LLVMIsAConstant(index) == null
+                pointer <- LLVMGetOperand(pointer, 0)
+            indices
+
+        # STORE's element index joins the read candidates of LOAD, with the bound it is
+        # compared with before a push (`at == count`) and its pushes, which leave their
+        # loop through a phi (`phi [0, n + 1]`).
+        def consider_pushed_candidates(marks: StackWatermark&, found: mutable darray[LLVMValueRef]&, store: LLVMValueRef, load: LLVMValueRef) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            index: LLVMValueRef = get accessed_element(marks, store) else return
+            return if LLVMIsAConstant(index) != null
+            consider_read_candidate(marks, found, index, load)
+            for user in use_list_users(index) |found, marks, load, index|:
+                if LLVMGetInstructionOpcode(user) == LLVMOpcode::ICMP:
+                    consider_read_candidate(marks, found, compared_with(user, index), load)
+                elif adds_constant(user):
+                    consider_read_candidate(marks, found, user, load)
+                    for exit in use_list_users(user) |found, marks, load|:
+                        consider_read_candidate(marks, found, exit, load) if LLVMGetInstructionOpcode(exit) == LLVMOpcode::PHI
+
+        # STORE's element index and its small pushes join the candidates for COPY.
+        def consider_stored_lengths(marks: StackWatermark&, found: mutable darray[LLVMValueRef]&, store: LLVMValueRef, copy: LLVMValueRef, bytes: ElisaScalarEvolutionExpressionRef) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            index: LLVMValueRef = get accessed_element(marks, store) else return
+            return if LLVMIsAConstant(index) != null
+            consider_copy_candidate(marks, found, index, copy, bytes)
+            for user in use_list_users(index) |found, marks, copy, bytes|:
+                consider_copy_candidate(marks, found, user, copy, bytes) if adds_constant(user)
+
+        # Watermarks a read may be below: the indices in its address, the indices stores
+        # write and their pushes, and the bounds its index is compared with
+        # (`readCandidates`).
+        def read_candidates(marks: StackWatermark&, load: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            found: mutable darray[LLVMValueRef] = []
+            for index in address_indices(load) |found, marks, load|:
+                consider_read_candidate(marks, &found, index, load)
+                for user in use_list_users(index) |found, marks, load, index|:
+                    if adds_constant(user):
+                        for next in use_list_users(user) |found, marks, load, user|:
+                            consider_read_candidate(marks, &found, compared_with(next, user), load) if LLVMGetInstructionOpcode(next) == LLVMOpcode::ICMP
+                    consider_read_candidate(marks, &found, compared_with(user, index), load) if LLVMGetInstructionOpcode(user) == LLVMOpcode::ICMP
+            # A push's count leaves its loop through a phi (`phi [0, n + 1]`).
+            for store in marks.accesses.stores |found, marks, load|:
+                consider_pushed_candidates(marks, &found, store, load)
+            found
+
+        # VALUE joins the candidates for COPY's watermark: an integer of its length's type
+        # defined before it whose scaled value is the length BYTES.
+        def consider_copy_candidate(marks: StackWatermark&, found: mutable darray[LLVMValueRef]&, value: LLVMValueRef, copy: LLVMValueRef, bytes: ElisaScalarEvolutionExpressionRef):
+            type: LLVMTypeRef = LLVMTypeOf(value)
+            return if not is_llvm_integer_type(type, 0) or type != LLVMTypeOf(LLVMGetOperand(copy, 2))
+            return if not defined_before(marks.analyses, defining_instruction(value), copy) or contains_value(found, value)
+            scaled: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionMultiply(marks.analyses, term_of(marks.analyses, value), ElisaLLVMScalarEvolutionConstantOf(marks.analyses, type, marks.element_size))
+            found.push(value) if scaled == bytes
+
+        # Values defined before COPY whose scaled value is its length: the indices stores
+        # write and those indices plus a small push (`candidates`).
+        def copy_candidates(marks: StackWatermark&, copy: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            found: mutable darray[LLVMValueRef] = []
+            length: LLVMValueRef = LLVMGetOperand(copy, 2)
+            return found if ElisaLLVMScalarEvolutionIsSCEVable(marks.analyses, LLVMTypeOf(length)) == 0
+            bytes: ElisaScalarEvolutionExpressionRef = term_of(marks.analyses, length)
+            for store in marks.accesses.stores |found, marks, copy, bytes|:
+                consider_stored_lengths(marks, &found, store, copy, bytes)
+                break if found.count >= WatermarkLimit::COPY_CANDIDATES
+            found
+
+        # A counter 0, 1, ... in a loop around LOAD.
+        def unit_counter_loop(analyses: ElisaFunctionAnalysesRef, element: ElisaScalarEvolutionExpressionRef, load: LLVMValueRef) -> ElisaLoopRef?:
+            return null if term_kind(element) != ElisaScalarEvolutionKind::ADD_RECURRENCE or term_operand_count(element) != 2
+            return null if not is_term_constant(term_operand(element, 0), 0)
+            return null if not is_term_constant(ElisaLLVMScalarEvolutionStepRecurrence(analyses, element), 1)
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(element) else return null
+            return null if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(load)) == 0
+            loop
+
+        # Element counts 0, 1, ... in a loop around LOAD that takes at most TOP - 1 back
+        # edges, TOP nonzero there: a scan `while i < top` whose exit test became
+        # `i + 1 == top` (`countsBelow`).
+        def counts_below(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, element: ElisaScalarEvolutionExpressionRef, top: ElisaScalarEvolutionExpressionRef, load: LLVMValueRef, mark: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = marks.analyses
+            loop: ElisaLoopRef = get unit_counter_loop(analyses, element, load) else return false
+            return false if term_type(top) != term_type(element)
+            return false if not taken_at_most(analyses, loop, term_difference(analyses, top, term_constant_like(analyses, top, 1)))
+            nonzero(marks, induction, prover, mark, load, 0)
+
+        # The element LOAD reads: its address's own index when of TYPE, else its byte
+        # offset BYTES divided.
+        def read_element(marks: StackWatermark&, load: LLVMValueRef, bytes: ElisaScalarEvolutionExpressionRef, type: LLVMTypeRef) -> ElisaScalarEvolutionExpressionRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if accessed_element(marks, load) is index:
+                return term_of(marks.analyses, index) if LLVMTypeOf(index) == type
+            watermark_quotient(marks.analyses, bytes, marks.element_size)
+
+        # LOAD reads element X - 1 (X = MARK nonzero) or an element proved below X, and X
+        # is a watermark at the load (`readBelow`).
+        def read_below(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, load: LLVMValueRef, mark: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = marks.analyses
+            bytes: ElisaScalarEvolutionExpressionRef = get access_offset(marks, load) else return false
+            return false if LLVMTypeOf(mark) != term_type(bytes)
+            size: ElisaScalarEvolutionExpressionRef = term_constant_like(analyses, bytes, marks.element_size)
+            top: ElisaScalarEvolutionExpressionRef = term_of(analyses, mark)
+            below_top: ElisaScalarEvolutionExpressionRef = term_difference(analyses, top, term_constant_like(analyses, top, 1))
+            peek: bool = bytes == ElisaLLVMScalarEvolutionMultiply(analyses, below_top, size) and nonzero(marks, induction, prover, mark, load, 0)
+            if not peek:
+                element: ElisaScalarEvolutionExpressionRef = read_element(marks, load, bytes, term_type(top))
+                return false if ElisaLLVMScalarEvolutionMultiply(analyses, element, size) != bytes
+                return false if not (counts_below(marks, induction, prover, element, top, load, mark) or prove_below(prover, element, top, load))
+            before: usize = induction.assumed.count
+            return true if watermark_holds(marks, induction, prover, mark, load, 0)
+            forget_assumed(induction, before)
+            false
+
+        # LOAD reads an element at most LAST, and a push of element LAST after [0, LAST)
+        # held reaches LOAD: a scan `while i <= top` whose exit compares i with top, or
+        # one proved below LAST + 1 (`readThrough`).
+        def read_through(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, load: LLVMValueRef, last: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = marks.analyses
+            bytes: ElisaScalarEvolutionExpressionRef = get access_offset(marks, load) else return false
+            return false if LLVMTypeOf(last) != term_type(bytes)
+            size: ElisaScalarEvolutionExpressionRef = term_constant_like(analyses, bytes, marks.element_size)
+            final: ElisaScalarEvolutionExpressionRef = term_of(analyses, last)
+            element: ElisaScalarEvolutionExpressionRef = read_element(marks, load, bytes, term_type(final))
+            counted: mutable bool = false
+            if unit_counter_loop(analyses, element, load) is loop:
+                counted <- taken_at_most(analyses, loop, final)
+            past: ElisaScalarEvolutionExpressionRef = term_sum(analyses, final, term_constant_like(analyses, final, 1))
+            return false if ElisaLLVMScalarEvolutionMultiply(analyses, element, size) != bytes
+            return false if not (counted or prove_below(prover, element, past, load))
+            before: usize = induction.assumed.count
+            return true if element_pushed(marks, induction, prover, last, 0, load, 0)
+            forget_assumed(induction, before)
+            false
+
+        # LOAD reads a popped element: its index is X - 1 for a nonzero watermark X.
+        def reads_popped(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, load: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            pop: LLVMValueRef = get accessed_element(marks, load) else return false
+            return false if LLVMIsAInstruction(pop) == null
+            mark: LLVMValueRef = get popped(pop) else return false
+            return false if not nonzero(marks, induction, prover, mark, pop, 0)
+            before: usize = induction.assumed.count
+            return true if watermark_holds(marks, induction, prover, mark, load, 0)
+            forget_assumed(induction, before)
+            false
+
+        # The watermark a copy's LENGTH scales: `X << k` or `X * size`, or X itself for
+        # bytes.
+        def scaled_copy_length(length: LLVMValueRef, element_size: u64) -> LLVMValueRef?:
+            opcode: u32 = LLVMGetInstructionOpcode(length)
+            factor: LLVMValueRef = LLVMGetOperand(length, 1) if opcode == LLVMOpcode::SHL or opcode == LLVMOpcode::MUL else length
+            if (opcode == LLVMOpcode::SHL or opcode == LLVMOpcode::MUL) and LLVMIsAConstantInt(factor) != null:
+                one: u64 = 1
+                if opcode == LLVMOpcode::SHL and ElisaLLVMConstantIntUnsignedGreater(LLVMConstInt(LLVMTypeOf(factor), 64, 0), factor) != 0:
+                    return LLVMGetOperand(length, 0) if (one << LLVMConstIntGetZExtValue(factor)) == element_size
+                if opcode == LLVMOpcode::MUL and ElisaLLVMConstantIntEquals(factor, element_size) != 0:
+                    return LLVMGetOperand(length, 0)
+            return length if element_size == 1
+            null
+
+        # COPY reads below a watermark: its scaled length, or a candidate (`copiesBelow`
+        # for one copy).
+        def copy_below(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, copy: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMGetOperand(copy, 1) != marks.buffer or ElisaLLVMInstructionDominates(marks.analyses, marks.fill, copy) == 0
+            before: usize = induction.assumed.count
+            if scaled_copy_length(LLVMGetOperand(copy, 2), marks.element_size) is mark:
+                return true if watermark_holds(marks, induction, prover, mark, copy, 0)
+                forget_assumed(induction, before)
+            for candidate in copy_candidates(marks, copy) |marks, induction, prover, copy, before|:
+                return true if watermark_holds(marks, induction, prover, candidate, copy, 0)
+                forget_assumed(induction, before)
+            false
+
+    public:
+        # The users of VALUE, in use-list order: LLVM's `users()`.
+        def use_list_users(value: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            users: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+            while cursor is use |cursor, users|:
+                users.push(LLVMGetUser(use))
+                cursor <- LLVMGetNextUse(use)
+            users
+
+        # Every load reads element X - 1 of a nonzero watermark X, or is below a
+        # watermark another way (`readsBelow`).
+        def reads_below(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for position in 0..<marks.accesses.loads.count |marks, induction, prover|:
+                load: LLVMValueRef = marks.accesses.loads[position]
+                return false if ElisaLLVMInstructionDominates(marks.analyses, marks.fill, load) == 0
+                continue if reads_popped(marks, induction, prover, load)
+                below: mutable bool = false
+                for candidate in read_candidates(marks, load) |below, marks, induction, prover, load|:
+                    continue if below
+                    below <- read_below(marks, induction, prover, load, candidate) or read_through(marks, induction, prover, load, candidate)
+                return false if not below
+            true
+
+        # Every copy out of the buffer reads elements [0, X) of a watermark X: its length
+        # is X scaled by the element size, or found among the stored indices and their
+        # pushes (`copiesBelow`).
+        def copies_below(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for position in 0..<marks.accesses.copies.count |marks, induction, prover|:
+                return false if not copy_below(marks, induction, prover, marks.accesses.copies[position])
+            true
+
+        # Elements [0, BOUND) were stored after the fill when AT executes (`marks`).
+        def watermark_marks(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, bound: LLVMValueRef, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMInstructionDominates(marks.analyses, marks.fill, at) == 0
+            before: usize = induction.assumed.count
+            return true if watermark_holds(marks, induction, prover, bound, at, 0)
+            forget_assumed(induction, before)
+            false

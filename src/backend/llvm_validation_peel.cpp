@@ -37,12 +37,6 @@
 #include <llvm/Transforms/Utils/LoopUtils.h>
 #include <llvm/Transforms/Utils/UnrollLoop.h>
 #include <llvm/Transforms/Utils/Local.h>
-#include "llvm_array_value_ranges.h"
-#include "llvm_dead_trap_exits.h"
-#include "llvm_path_ranges.h"
-#include "llvm_index_bounds.h"
-#include "llvm_view_bounded_fills.h"
-#include "llvm_indexed_prefix.h"
 
 using namespace llvm;
 
@@ -126,6 +120,3 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include <llvm/ADT/SmallPtrSet.h>
 using namespace llvm;
 
-// The late scalar cleanup sequence lives in Elisa
-// (llvm_passes/late_cleanup/late_scalar_cleanup.elisa); these are its entries.
-#include "llvm_late_cleanup_entries.h"

@@ -1,0 +1,200 @@
+# Helpers of the stack proof (`ElisaWatermarkLoops`) that need no proof state: the bytes
+# each iteration of a single-block push loop stores and the count at which it leaves, the
+# element an address names, and the shapes of pops, clamps and trip-count bounds.
+include "../index_proofs/element_offsets.elisa"
+
+const module WatermarkShapeLimit:
+    LOOP_STEP: u64 = 1024
+
+# The two operands of an unsigned minimum.
+struct MinimumOperands:
+    first: LLVMValueRef
+    second: LLVMValueRef
+
+# Where a counted push loop leaves: its limit and the counter's step.
+struct CountedLimit:
+    limit: ElisaScalarEvolutionExpressionRef
+    stride: u64
+
+# One store's piece of an iteration's block: its byte offset and size.
+struct StoredPiece:
+    shift: i64
+    size: i64
+
+extend Backend:
+    private:
+        # `select (icmp p a, b), x, y` as an unsigned minimum of a and b, as PatternMatch's
+        # `m_UMin` reads it: the select returns the compared values, and the comparison
+        # read for the true value is `ult` or `ule`.
+        def selected_minimum(choice: LLVMValueRef) -> MinimumOperands?:
+            test: LLVMValueRef = LLVMGetOperand(choice, 0)
+            return null if LLVMGetInstructionOpcode(test) != LLVMOpcode::ICMP
+            chosen: LLVMValueRef = LLVMGetOperand(choice, 1)
+            other: LLVMValueRef = LLVMGetOperand(choice, 2)
+            left: LLVMValueRef = LLVMGetOperand(test, 0)
+            right: LLVMValueRef = LLVMGetOperand(test, 1)
+            return null if (chosen != left or other != right) and (chosen != right or other != left)
+            predicate: i32 = LLVMGetICmpPredicate(test) if left == chosen else inverse_predicate(LLVMGetICmpPredicate(test))
+            return null if predicate != LLVMIntPredicate::ULT and predicate != LLVMIntPredicate::ULE
+            MinimumOperands{first: left, second: right}
+
+        # The pieces sorted by offset, then size.
+        def sorted_pieces(pieces: darray[StoredPiece]&) -> darray[StoredPiece] can[Abort.Panic, Memory.Allocate]:
+            sorted: mutable darray[StoredPiece] = []
+            for piece in pieces |sorted|:
+                sorted.push(piece)
+                slot: mutable usize = sorted.count - 1
+                while slot > 0 |slot, sorted|:
+                    earlier: StoredPiece = sorted[slot - 1]
+                    current: StoredPiece = sorted[slot]
+                    break if earlier.shift < current.shift or (earlier.shift == current.shift and earlier.size <= current.size)
+                    sorted[slot - 1] <- current
+                    sorted[slot] <- earlier
+                    slot <- slot - 1
+            sorted
+
+    public:
+        # VALUE is the unsigned minimum of two values: the intrinsic, or a select on their
+        # comparison (a slice end clamped to the capacity, before instcombine)
+        # (`unsignedMinimum`).
+        def unsigned_minimum(value: LLVMValueRef) -> MinimumOperands? can[Abort.Panic, Memory.Allocate]:
+            if called_intrinsic_id(value) == intrinsic_identifier("llvm.umin"):
+                return MinimumOperands{first: LLVMGetOperand(value, 0), second: LLVMGetOperand(value, 1)}
+            return null if LLVMGetInstructionOpcode(value) != LLVMOpcode::SELECT
+            selected_minimum(value)
+
+        # The value VALUE is one less than (a pop: `add X, -1`, or `sub X, 1` before
+        # instcombine), or null (`popped`).
+        def popped(value: LLVMValueRef) -> LLVMValueRef?:
+            opcode: u32 = value_opcode(value)
+            return null if opcode != LLVMOpcode::ADD and opcode != LLVMOpcode::SUB
+            step: LLVMValueRef = LLVMGetOperand(value, 1)
+            return null if LLVMIsAConstantInt(step) == null
+            if opcode == LLVMOpcode::ADD:
+                return LLVMGetOperand(value, 0) if has_every_bit_set(step)
+                return null
+            return LLVMGetOperand(value, 0) if ElisaLLVMConstantIntEquals(step, 1) != 0
+            null
+
+        # TERM is a recurrence of LOOP.
+        def recurs_in(term: ElisaScalarEvolutionExpressionRef, loop: ElisaLoopRef) -> bool:
+            owner: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(term) else return false
+            owner == loop
+
+        # The first byte offset of the STEP-byte block every iteration of LOOP, a single
+        # block BODY, stores completely; null when the stores leave a gap (`coveredStart`).
+        def covered_start(analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, groups: darray[LLVMValueRef]&, body: LLVMBasicBlockRef, loop: ElisaLoopRef, step: ElisaScalarEvolutionExpressionRef) -> ElisaScalarEvolutionExpressionRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            stride: LLVMValueRef = get term_constant(step) else return null
+            return null if is_zero_constant(stride) or LLVMConstIntGetZExtValue(stride) > WatermarkShapeLimit::LOOP_STEP
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(LLVMGetGlobalParent(LLVMGetBasicBlockParent(body)))
+            base: ElisaScalarEvolutionExpressionRef = term_of(analyses, buffer)
+            start: mutable ElisaScalarEvolutionExpressionRef? = null
+            pieces: mutable darray[StoredPiece] = []
+            for store in groups |start, pieces, analyses, body, loop, step, layout, base|:
+                continue if LLVMGetInstructionParent(store) != body
+                address: ElisaScalarEvolutionExpressionRef = term_difference(analyses, term_of(analyses, LLVMGetOperand(store, 1)), base)
+                continue if term_kind(address) != ElisaScalarEvolutionKind::ADD_RECURRENCE
+                continue if not recurs_in(address, loop) or ElisaLLVMScalarEvolutionStepRecurrence(analyses, address) != step
+                if start == null:
+                    start <- term_operand(address, 0)
+                first: ElisaScalarEvolutionExpressionRef = get start else return null
+                if term_constant(term_difference(analyses, term_operand(address, 0), first)) is shift:
+                    size: u64 = LLVMStoreSizeOfType(layout, LLVMTypeOf(LLVMGetOperand(store, 0)))
+                    pieces.push(StoredPiece{shift: LLVMConstIntGetSExtValue(shift), size: size.i64()})
+            first: ElisaScalarEvolutionExpressionRef = get start else return null
+            sorted: darray[StoredPiece] = sorted_pieces(&pieces)
+            low: i64 = sorted[0].shift
+            reached: mutable i64 = low
+            for piece in sorted |reached|:
+                return null if piece.shift > reached
+                reached <- reached if reached > piece.shift + piece.size else piece.shift + piece.size
+            return null if reached - low != LLVMConstIntGetZExtValue(stride).i64()
+            term_sum(analyses, first, ElisaLLVMScalarEvolutionConstantOf(analyses, term_type(first), low.u64()))
+
+        # The N at which BODY's loop exits through LATCH, with its counter's step: the
+        # counter is a phi starting at zero, stepped by C without unsigned wrap, and the
+        # exit is taken when the next value equals a loop-invariant N, after N / C
+        # iterations (`counted`).
+        def counted_latch(analyses: ElisaFunctionAnalysesRef, latch: LLVMValueRef, body: LLVMBasicBlockRef) -> CountedLimit? can[Abort.Panic, Memory.Allocate]:
+            condition: LLVMValueRef = LLVMGetCondition(latch)
+            return null if LLVMGetInstructionOpcode(condition) != LLVMOpcode::ICMP
+            next: LLVMValueRef = LLVMGetOperand(condition, 0)
+            limit: LLVMValueRef = LLVMGetOperand(condition, 1)
+            predicate: i32 = LLVMGetICmpPredicate(condition)
+            exits_on_true: bool = LLVMGetSuccessor(latch, 0) != body
+            return null if not ((predicate == LLVMIntPredicate::EQ and exits_on_true) or (predicate == LLVMIntPredicate::NE and not exits_on_true))
+            return null if LLVMGetInstructionOpcode(next) != LLVMOpcode::ADD
+            step: LLVMValueRef = LLVMGetOperand(next, 1)
+            counter: LLVMValueRef = LLVMGetOperand(next, 0)
+            return null if LLVMIsAConstantInt(step) == null or LLVMGetInstructionOpcode(counter) != LLVMOpcode::PHI
+            return null if LLVMGetInstructionParent(counter) != body or LLVMGetNUW(next) == 0 or is_zero_constant(step)
+            return null if ElisaLLVMConstantIntUnsignedGreater(step, LLVMConstInt(LLVMTypeOf(step), WatermarkShapeLimit::LOOP_STEP, 0)) != 0
+            return null if LLVMCountIncoming(counter) != 2
+            if LLVMIsAInstruction(limit) != null:
+                return null if LLVMGetInstructionParent(limit) == body
+            for edge in 0..<2 |counter, body, next|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(counter, edge.u32())
+                if LLVMGetIncomingBlock(counter, edge.u32()) == body:
+                    return null if incoming != next
+                else:
+                    return null if not (LLVMIsAConstant(incoming) != null and LLVMIsNull(incoming) != 0)
+            return null if ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(limit)) == 0
+            CountedLimit{limit: term_of(analyses, limit), stride: LLVMConstIntGetZExtValue(step)}
+
+        # The element index POINTER addresses in BUFFER, of elements ELEMENT_SIZE bytes
+        # long (`element`).
+        def watermark_element(buffer: LLVMValueRef, element_size: u64, pointer: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Unsafe.PointerCast]:
+            index_type: LLVMTypeRef = LLVMInt64TypeInContext(LLVMGetTypeContext(LLVMTypeOf(buffer)))
+            return LLVMConstInt(index_type, 0, 0) if pointer == buffer
+            return null if LLVMGetInstructionOpcode(pointer) != LLVMOpcode::GET_ELEMENT_PTR or LLVMGetOperand(pointer, 0) != buffer
+            offset: mutable i64 = 0
+            if ElisaLLVMGEPConstantOffset(pointer, (&offset).cast[void&]) != 0:
+                bytes: u64 = offset.u64()
+                return null if bytes % element_size != 0
+                return LLVMConstInt(index_type, bytes / element_size, 0)
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInstructionParent(pointer))))
+            stride: u64 = LLVMABISizeOfType(layout, LLVMGetGEPSourceElementType(pointer))
+            indices: u32 = LLVMGetNumOperands(pointer) - 1
+            return LLVMGetOperand(pointer, 1) if indices == 1 and stride == element_size
+            if indices == 1 and stride == 1:
+                if scaled_element(LLVMGetOperand(pointer, 1), element_size) is scaled:
+                    return scaled
+            first: LLVMValueRef = LLVMGetOperand(pointer, 1)
+            if indices == 2 and LLVMIsAConstantInt(first) != null and is_zero_constant(first) and LLVMGetGEPSourceElementType(pointer) == LLVMGetAllocatedType(buffer):
+                return LLVMGetOperand(pointer, 2)
+            null
+
+        # A byte offset `X << k` or `X * size` of element X, without wrapping.
+        def scaled_element(offset: LLVMValueRef, element_size: u64) -> LLVMValueRef?:
+            opcode: u32 = LLVMGetInstructionOpcode(offset)
+            return null if (opcode != LLVMOpcode::SHL and opcode != LLVMOpcode::MUL) or LLVMGetNUW(offset) == 0
+            factor: LLVMValueRef = LLVMGetOperand(offset, 1)
+            return null if LLVMIsAConstantInt(factor) == null or LLVMGetIntTypeWidth(LLVMTypeOf(factor)) > 64
+            amount: u64 = LLVMConstIntGetZExtValue(factor)
+            if opcode == LLVMOpcode::SHL:
+                one: u64 = 1
+                return LLVMGetOperand(offset, 0) if amount < 64 and (one << amount) == element_size
+                return null
+            return LLVMGetOperand(offset, 0) if amount == element_size
+            null
+
+        # LOOP takes at most BOUND back edges: its count is BOUND, or a minimum with BOUND
+        # among its operands (a bounds check's exit at the capacity) (`takenAtMost`).
+        def taken_at_most(analyses: ElisaFunctionAnalysesRef, loop: ElisaLoopRef, bound: ElisaScalarEvolutionExpressionRef) -> bool:
+            taken: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionSymbolicMaxBackedgeTakenCount(analyses, loop)
+            kind: u32 = term_kind(taken)
+            return false if kind == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE or term_type(taken) != term_type(bound)
+            return true if taken == bound
+            # The sequential minimum is the only n-ary node the kinds leave as other.
+            return false if kind != ElisaScalarEvolutionKind::UNSIGNED_MINIMUM and kind != ElisaScalarEvolutionKind::OTHER_OPERATION
+            for index in 0..<term_operand_count(taken) |taken, bound|:
+                return true if term_operand(taken, index) == bound
+            false
+
+        # The element at byte offset BYTES: scalar evolution's exact division leaves an
+        # unrolled recurrence ({48,+,64} /u 16) undivided where its start and step both
+        # divide (`quotient`).
+        def watermark_quotient(analyses: ElisaFunctionAnalysesRef, bytes: ElisaScalarEvolutionExpressionRef, size: u64) -> ElisaScalarEvolutionExpressionRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if element_offset_quotient(analyses, bytes, size) is divided:
+                return divided
+            ElisaLLVMScalarEvolutionUnsignedDivideExact(analyses, bytes, ElisaLLVMScalarEvolutionConstantOf(analyses, term_type(bytes), size))

@@ -38,11 +38,13 @@ ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionAddTerms(ElisaFunction
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionMultiplyTerms(ElisaFunctionAnalysesRef analyses,
                                                                         ElisaScalarEvolutionExpressionRef *factors,
                                                                         uint32_t count);
-/* getUDivExactExpr(dividend, divisor), or null when scalar evolution leaves it a udiv
- * node (the division does not simplify away). */
+/* getUDivExactExpr(dividend, divisor): a udiv node when the division does not simplify. */
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionUnsignedDivideExact(
     ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef dividend,
     ElisaScalarEvolutionExpressionRef divisor);
+/* getTruncateOrZeroExtend(expression, type). */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionTruncateOrZeroExtend(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression, LLVMTypeRef type);
 /* getAddRecExpr(start, step, loop, FlagNUW when no_unsigned_wrap is nonzero). */
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionAddRecurrence(
     ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef start,

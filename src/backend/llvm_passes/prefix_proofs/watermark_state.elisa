@@ -1,0 +1,161 @@
+# The stack proof's state and its questions about single stores (`ElisaStackWatermark::
+# Watermark`): which element a load or store accesses, whether a store wrote element
+# X + k, whether the stores below a small constant ran, and whether a watermark is
+# nonzero. The proof itself is in watermark_holds.elisa and watermark_reads.elisa.
+include "./edge_exclusion.elisa"
+include "./watermark_shapes.elisa"
+include "../late_cleanup/array_values/array_accesses.elisa"
+
+const module WatermarkLimit:
+    HOLDS_DEPTH: u32 = 16
+    NONZERO_DEPTH: u32 = 4
+    EQUALS_DEPTH: u32 = 4
+    SMALL_PUSH: u64 = 8
+    READ_CANDIDATES: usize = 8
+    COPY_CANDIDATES: usize = 4
+    COVERED_BLOCKS: usize = 2048
+
+# One array's stack proof: its fill and accesses, the phis assumed by induction and those
+# proved with an edge excluded, and the leading elements the fill must still zero.
+struct StackWatermark:
+    analyses: ElisaFunctionAnalysesRef
+    buffer: LLVMValueRef
+    element_size: u64
+    fill: LLVMValueRef
+    accesses: ArrayAccesses
+    composite: bool
+    fill_repeats: bool
+    kept_elements: mutable u64
+
+# The watermark induction's phis: those assumed while proved, and those proved with an
+# edge excluded, being proved now. Kept apart from the proof's state so lists drawn
+# from that state stay valid while the induction grows.
+struct WatermarkInduction:
+    assumed: mutable darray[LLVMValueRef]
+    guarded: mutable darray[LLVMValueRef]
+
+extend Backend:
+    public:
+        def empty_watermark_induction() -> WatermarkInduction:
+            WatermarkInduction{assumed: [], guarded: []}
+
+        def new_stack_watermark(analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, element_size: u64, fill: LLVMValueRef, accesses: ArrayAccesses, composite: bool, fill_repeats: bool) -> StackWatermark:
+            StackWatermark{analyses: analyses, buffer: buffer, element_size: element_size, fill: fill, accesses: accesses, composite: composite, fill_repeats: fill_repeats, kept_elements: 0}
+
+        # The phis assumed after a failed alternative, back to the first COUNT: an
+        # alternative only ever adds to them (`attempt`).
+        def forget_assumed(induction: mutable WatermarkInduction&, count: usize):
+            induction.assumed.truncate(count)
+
+        # The pointer a load or store accesses.
+        def accessed_pointer(access: LLVMValueRef) -> LLVMValueRef:
+            return LLVMGetOperand(access, 1) if LLVMIsAStoreInst(access) != null
+            LLVMGetOperand(access, 0)
+
+        # A store of a whole element, or a struct's field store completing one (`whole`).
+        def whole_store(marks: StackWatermark&, store: LLVMValueRef) -> bool:
+            marks.composite or LLVMTypeOf(LLVMGetOperand(store, 0)) == LLVMGetElementType(LLVMGetAllocatedType(marks.buffer))
+
+        # The element a load or store accesses: a field's address, a constant step past
+        # the element's own, gives way to that address (`element`).
+        def accessed_element(marks: StackWatermark&, access: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Unsafe.PointerCast]:
+            pointer: mutable LLVMValueRef = accessed_pointer(access)
+            residue: u64 = get field_residue(&marks.accesses, access) else 0
+            if residue != 0:
+                return null if LLVMGetInstructionOpcode(pointer) != LLVMOpcode::GET_ELEMENT_PTR
+                offset: mutable i64 = 0
+                return null if ElisaLLVMGEPConstantOffset(pointer, (&offset).cast[void&]) == 0 or offset.u64() != residue
+                pointer <- LLVMGetOperand(pointer, 0)
+            watermark_element(marks.buffer, marks.element_size, pointer)
+
+        # The byte offset of an address in the buffer (`offset`).
+        def buffer_offset(marks: StackWatermark&, pointer: LLVMValueRef) -> ElisaScalarEvolutionExpressionRef?:
+            bytes: ElisaScalarEvolutionExpressionRef = term_difference(marks.analyses, term_of(marks.analyses, pointer), term_of(marks.analyses, marks.buffer))
+            return null if term_kind(bytes) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            bytes
+
+        # The byte offset of the element a load or store accesses, at a field of it for
+        # a struct (`offset`).
+        def access_offset(marks: StackWatermark&, access: LLVMValueRef) -> ElisaScalarEvolutionExpressionRef?:
+            bytes: ElisaScalarEvolutionExpressionRef = get buffer_offset(marks, accessed_pointer(access)) else return null
+            residue: u64 = get field_residue(&marks.accesses, access) else 0
+            return bytes if residue == 0
+            term_difference(marks.analyses, bytes, ElisaLLVMScalarEvolutionConstantOf(marks.analyses, term_type(bytes), residue))
+
+        # VALUE has the value EXPECTED: directly, or as a join of such values (two paths
+        # that each computed `Inner + 1`) (`equals`).
+        def equals_term(marks: StackWatermark&, value: LLVMValueRef, expected: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool:
+            return true if term_of(marks.analyses, value) == expected
+            return false if LLVMGetInstructionOpcode(value) != LLVMOpcode::PHI or depth >= WatermarkLimit::EQUALS_DEPTH
+            for edge in 0..<LLVMCountIncoming(value) |marks, value, expected, depth|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(value, edge)
+                return false if incoming == value or not equals_term(marks, incoming, expected, depth + 1)
+            true
+
+        # STORE writes element INNER + OFFSET: by index, or by address offset
+        # (`writesElement`).
+        def writes_element(marks: StackWatermark&, store: LLVMValueRef, inner: LLVMValueRef, offset: u64) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = marks.analyses
+            index: LLVMValueRef? = accessed_element(marks, store)
+            if index is found:
+                return true if offset == 0 and found == inner
+            return false if ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(inner)) == 0
+            inner_type: LLVMTypeRef = LLVMTypeOf(inner)
+            if index is element:
+                if LLVMTypeOf(element) == inner_type:
+                    expected: ElisaScalarEvolutionExpressionRef = term_sum(analyses, term_of(analyses, inner), ElisaLLVMScalarEvolutionConstantOf(analyses, inner_type, offset))
+                    return true if equals_term(marks, element, expected, 0)
+            bytes: ElisaScalarEvolutionExpressionRef = get access_offset(marks, store) else return false
+            byte_type: LLVMTypeRef = term_type(bytes)
+            scaled: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionTruncateOrZeroExtend(analyses, term_of(analyses, inner), byte_type)
+            shifted: ElisaScalarEvolutionExpressionRef = term_sum(analyses, scaled, ElisaLLVMScalarEvolutionConstantOf(analyses, byte_type, offset))
+            bytes == ElisaLLVMScalarEvolutionMultiply(analyses, shifted, ElisaLLVMScalarEvolutionConstantOf(analyses, byte_type, marks.element_size))
+
+        # STORE writes a whole element after the fill, before AT (`stored`).
+        def stored_before(marks: StackWatermark&, store: LLVMValueRef, at: LLVMValueRef) -> bool:
+            return false if not whole_store(marks, store)
+            ElisaLLVMInstructionDominates(marks.analyses, marks.fill, store) != 0 and ElisaLLVMInstructionDominates(marks.analyses, store, at) != 0
+
+        # Stores to each element below a small constant COUNT dominate AT; an element the
+        # fill zeroes is kept in a shortened fill instead (`storedBelow`).
+        def stored_below(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, count: LLVMValueRef, at: LLVMValueRef) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            return false if ElisaLLVMConstantIntUnsignedGreater(count, LLVMConstInt(LLVMTypeOf(count), WatermarkLimit::SMALL_PUSH, 0)) != 0
+            for element in 0..<LLVMConstIntGetZExtValue(count) |marks, induction, at|:
+                stored: mutable bool = false
+                for position in 0..<marks.accesses.stores.count |stored, marks, induction, at, element|:
+                    continue if stored
+                    store: LLVMValueRef = marks.accesses.stores[position]
+                    if accessed_element(marks, store) is index:
+                        stored <- LLVMIsAConstantInt(index) != null and ElisaLLVMConstantIntEquals(index, element) != 0 and stored_before(marks, store, at)
+                if not stored and ElisaLLVMIsMemSet(marks.fill) != 0 and LLVMGetOperand(marks.fill, 0) == marks.buffer and ElisaLLVMInstructionDominates(marks.analyses, marks.fill, at) != 0:
+                    if marks.kept_elements < element + 1:
+                        marks.kept_elements <- element + 1
+                    stored <- true
+                return false if not stored
+            true
+
+        # VALUE != 0 when the edge FROM -> TARGET is taken: the edge's own comparison, or for
+        # a count clamped by `umin`, both operands (`nonzeroAcross`).
+        def nonzero_across(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, value: LLVMValueRef, from: LLVMBasicBlockRef, target: LLVMBasicBlockRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if excludes_on_edge(value, LLVMConstInt(LLVMTypeOf(value), 0, 0), from, target)
+            if unsigned_minimum(value) is operands:
+                return nonzero_across(marks, induction, prover, operands.first, from, target, depth) and nonzero_across(marks, induction, prover, operands.second, from, target, depth)
+            nonzero(marks, induction, prover, value, terminator_of(from), depth + 1)
+
+        # VALUE != 0 wherever AT, which VALUE's definition dominates, executes
+        # (`nonzero`).
+        def nonzero(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, value: LLVMValueRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return not is_zero_constant(value) if LLVMIsAConstantInt(value) != null
+            if LLVMGetInstructionOpcode(value) == LLVMOpcode::ADD and LLVMGetNUW(value) != 0:
+                step: LLVMValueRef = LLVMGetOperand(value, 1)
+                return true if LLVMIsAConstantInt(step) != null and ElisaLLVMConstantIntEquals(step, 1) != 0
+            if LLVMGetInstructionOpcode(value) == LLVMOpcode::PHI and depth < WatermarkLimit::NONZERO_DEPTH:
+                every: mutable bool = true
+                for edge in 0..<LLVMCountIncoming(value) |every, marks, induction, prover, value, depth|:
+                    continue if not every
+                    every <- nonzero_across(marks, induction, prover, LLVMGetIncomingValue(value, edge), LLVMGetIncomingBlock(value, edge), LLVMGetInstructionParent(value), depth)
+                return true if every
+            analyses: ElisaFunctionAnalysesRef = marks.analyses
+            return false if ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(value)) == 0
+            term: ElisaScalarEvolutionExpressionRef = term_of(analyses, value)
+            prove_below(prover, term_constant_like(analyses, term, 0), term, at)

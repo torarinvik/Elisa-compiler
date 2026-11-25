@@ -1,0 +1,264 @@
+# Reads inside a written prefix (`ElisaIndexedPrefix::Prover::prefixRead` and the
+# prover's `loadBelow` hooks). Every later read of an array must index below the length
+# its fill loop or copy wrote: a direct comparison, the extreme of an affine recurrence,
+# or a load from another such array whose every stored value is below the length (an
+# order or permutation array indexing a value array is the common case); a vector load
+# needs its last lane below it, and a call handed a view needs a bound the callee keeps
+# below. A stack needs no fill loop: its reads stay below the pushes (stack watermark).
+include "./prefix_completion.elisa"
+include "../scratch_prefix/view_bound_checker.elisa"
+
+extend Backend:
+    private:
+        # VALUES with VALUE, once (`SmallPtrSet::insert`).
+        def insert_value(values: mutable darray[LLVMValueRef]&, value: LLVMValueRef):
+            values.push(value) if not contains_value(values, value)
+
+        # VALUES without VALUE (`SmallPtrSet::erase`).
+        def erase_value(values: mutable darray[LLVMValueRef]&, value: LLVMValueRef) can[Abort.Panic]:
+            for position in 0..<values.count |values, value|:
+                if values[position] == value:
+                    values[position] <- values[values.count - 1]
+                    values.truncate(values.count - 1)
+                    return
+
+        # The operand position of USE in its user (`getArgOperandNo`).
+        def use_position(user: LLVMValueRef, use: LLVMUseRef) -> u32 can[Abort.Panic]:
+            for position in 0..<LLVMGetNumOperands(user) |user, use|:
+                return position if LLVMGetOperandUse(user, position) == use
+            panic("prefix proof: a use missing from its user")
+
+        # A call bound BOUND covers a view of TARGET at CALL: CALL runs after the prefix,
+        # and BOUND is at most the covered length there.
+        def inside_bound(prover: mutable IndexProver&, target: usize, call: LLVMValueRef, bound: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            return false if ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(bound)) == 0
+            covered: ElisaScalarEvolutionExpressionRef = get prover.prefix.arrays[target].covered else return false
+            return false if not prefix_completed(prover, target, call)
+            return false if ElisaLLVMScalarEvolutionTypeSizeInBits(analyses, LLVMTypeOf(bound)) != ElisaLLVMScalarEvolutionTypeSizeInBits(analyses, term_type(covered))
+            prove_at_most(prover, term_of(analyses, bound), covered, call)
+
+        # The call that USE of a view passes it to, with its own checker: a bound below
+        # which its callee reads the view and that the prefix covers (`viewBounds`).
+        def call_bound_inside(prover: mutable IndexProver&, target: usize, use: LLVMUseRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            call: LLVMValueRef = LLVMGetUser(use)
+            position: u32 = use_position(call, use)
+            checker: mutable ViewChecker = new_view_checker(prover.function, prover.analyses, prover.prefix.arrays[target].element_size)
+            accepted: mutable bool = false
+            if view_call_bounds(&checker, call, position, prover.function) is candidates:
+                for index in 0..<candidates.bounds.count |accepted, checker, prover, target, call, position, candidates|:
+                    continue if accepted
+                    continue if not inside_bound(prover, target, call, candidates.bounds[index])
+                    accepted <- view_argument_bounded(&checker, candidates.copy, position, candidates.limits[index])
+            dispose_view_checker(&checker)
+            accepted
+
+        # The same with a stack's watermark: the bound marks stored elements at the call.
+        def call_bound_marked(prover: mutable IndexProver&, marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, use: LLVMUseRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            call: LLVMValueRef = LLVMGetUser(use)
+            position: u32 = use_position(call, use)
+            checker: mutable ViewChecker = new_view_checker(prover.function, prover.analyses, marks.element_size)
+            accepted: mutable bool = false
+            if view_call_bounds(&checker, call, position, prover.function) is candidates:
+                for index in 0..<candidates.bounds.count |accepted, checker, prover, marks, induction, call, position, candidates|:
+                    continue if accepted
+                    bound: LLVMValueRef = candidates.bounds[index]
+                    continue if ElisaLLVMScalarEvolutionIsSCEVable(prover.analyses, LLVMTypeOf(bound)) == 0
+                    continue if not watermark_marks(marks, induction, prover, bound, call)
+                    accepted <- view_argument_bounded(&checker, candidates.copy, position, candidates.limits[index])
+            dispose_view_checker(&checker)
+            accepted
+
+        # Every call handed a view of TARGET has a bound the prefix covers.
+        def views_inside(prover: mutable IndexProver&, target: usize) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for position in 0..<prover.prefix.arrays[target].accesses.views.count |prover, target|:
+                cursor: mutable LLVMUseRef? = LLVMGetFirstUse(prover.prefix.arrays[target].accesses.views[position])
+                while cursor is use |cursor, prover, target|:
+                    cursor <- LLVMGetNextUse(use)
+                    return false if not call_bound_inside(prover, target, use)
+            true
+
+        # Every call handed a view of the stack has a bound its watermark marks.
+        def views_marked(prover: mutable IndexProver&, target: usize, marks: mutable StackWatermark&, induction: mutable WatermarkInduction&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for position in 0..<prover.prefix.arrays[target].accesses.views.count |prover, target, marks, induction|:
+                cursor: mutable LLVMUseRef? = LLVMGetFirstUse(prover.prefix.arrays[target].accesses.views[position])
+                while cursor is use |cursor, prover, marks, induction|:
+                    cursor <- LLVMGetNextUse(use)
+                    return false if not call_bound_marked(prover, marks, induction, use)
+            true
+
+        # LOAD, of TARGET, runs after the prefix and indexes below the covered length; a
+        # vector load's last lane does (LANES is 1 for a scalar).
+        def load_inside(prover: mutable IndexProver&, target: usize, load: LLVMValueRef, lanes: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            return false if not prefix_completed(prover, target, load)
+            index: ElisaScalarEvolutionExpressionRef = get prefix_index_of(prover, target, load) else return false
+            covered: ElisaScalarEvolutionExpressionRef = get prover.prefix.arrays[target].covered else return false
+            last: ElisaScalarEvolutionExpressionRef = index if lanes == 1 else term_sum(analyses, index, term_constant_like(analyses, index, (lanes - 1).u64()))
+            prove_below(prover, last, covered, load)
+
+        # COPY, out of TARGET after the prefix, reads at most the covered elements.
+        def copy_inside(prover: mutable IndexProver&, target: usize, copy: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            covered: ElisaScalarEvolutionExpressionRef = get prover.prefix.arrays[target].covered else return false
+            bytes: ElisaScalarEvolutionExpressionRef = term_of(analyses, LLVMGetOperand(copy, 2))
+            limit: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionMultiply(analyses, covered, term_constant_like(analyses, covered, prover.prefix.arrays[target].element_size))
+            return false if not prefix_completed(prover, target, copy) or LLVMGetOperand(copy, 1) != prover.prefix.arrays[target].buffer
+            return false if term_type(bytes) != term_type(limit)
+            ElisaLLVMScalarEvolutionIsKnownPredicateAt(analyses, LLVMIntPredicate::ULE, bytes, limit, copy) != 0
+
+        # Every read of TARGET lies below its covered length (`readsInsideCovered`).
+        def reads_inside_covered(prover: mutable IndexProver&, target: usize) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for position in 0..<prover.prefix.arrays[target].accesses.loads.count |prover, target|:
+                return false if not load_inside(prover, target, prover.prefix.arrays[target].accesses.loads[position], 1)
+            # Every lane of a vector load must lie in the prefix.
+            for position in 0..<prover.prefix.arrays[target].accesses.vector_loads.count |prover, target|:
+                load: LLVMValueRef = prover.prefix.arrays[target].accesses.vector_loads[position]
+                return false if not load_inside(prover, target, load, LLVMGetVectorSize(LLVMTypeOf(load)))
+            # A callee reaches the elements below its call's bound and no others.
+            return false if not views_inside(prover, target)
+            for position in 0..<prover.prefix.arrays[target].accesses.copies.count |prover, target|:
+                return false if not copy_inside(prover, target, prover.prefix.arrays[target].accesses.copies[position])
+            true
+
+        # Every read of TARGET lies below its covered length. A read whose index was
+        # loaded from TARGET itself may assume the earlier reads were inside: a load's
+        # value is used only after it ran (`readsInside`).
+        def reads_inside(prover: mutable IndexProver&, target: usize) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            cover_prefix(prover, target)
+            buffer: LLVMValueRef = prover.prefix.arrays[target].buffer
+            insert_value(&prover.prefix.proving, buffer)
+            inside: bool = reads_inside_covered(prover, target)
+            erase_value(&prover.prefix.proving, buffer)
+            inside
+
+        # A vector load of a stack reads below the limit its last lane is below, which
+        # must be a watermark.
+        def vector_loads_marked(prover: mutable IndexProver&, target: usize, marks: mutable StackWatermark&, induction: mutable WatermarkInduction&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            for position in 0..<prover.prefix.arrays[target].accesses.vector_loads.count |prover, target, marks, induction, analyses|:
+                load: LLVMValueRef = prover.prefix.arrays[target].accesses.vector_loads[position]
+                index: ElisaScalarEvolutionExpressionRef = get prefix_index_of(prover, target, load) else return false
+                lanes: u32 = LLVMGetVectorSize(LLVMTypeOf(load))
+                last: ElisaScalarEvolutionExpressionRef = term_sum(analyses, index, term_constant_like(analyses, index, (lanes - 1).u64()))
+                return false if term_kind(last) != ElisaScalarEvolutionKind::ADD_RECURRENCE
+                limit: LLVMValueRef = get rounded_limit(last, analyses) else return false
+                return false if not watermark_marks(marks, induction, prover, limit, load)
+            true
+
+        # TARGET is used as a stack: every read is below a watermark of pushes
+        # (`stackRead`).
+        def stack_read(prover: mutable IndexProver&, target: usize, fill_repeats: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if prover.prefix.arrays[target].accesses.writes.count != 0
+            reads: usize = prover.prefix.arrays[target].accesses.loads.count + prover.prefix.arrays[target].accesses.vector_loads.count + prover.prefix.arrays[target].accesses.copies.count + prover.prefix.arrays[target].accesses.views.count
+            return false if reads == 0
+            accesses: ArrayAccesses = copied_array_accesses(&prover.prefix.arrays[target].accesses)
+            induction: mutable WatermarkInduction = empty_watermark_induction()
+            marks: mutable StackWatermark = new_stack_watermark(prover.analyses, prover.prefix.arrays[target].buffer, prover.prefix.arrays[target].element_size, prover.prefix.arrays[target].accesses.fills[0], accesses, prover.prefix.arrays[target].composite, fill_repeats)
+            return false if not vector_loads_marked(prover, target, &marks, &induction)
+            return false if not reads_below(&marks, &induction, prover) or not copies_below(&marks, &induction, prover)
+            return false if not views_marked(prover, target, &marks, &induction)
+            prover.prefix.arrays[target].kept_elements <- marks.kept_elements
+            true
+
+        # The last searchable array LOAD reads, unless it is composite or its loads are
+        # being bounded already.
+        def load_source(prover: IndexProver&, load: LLVMValueRef) -> usize? can[Abort.Panic]:
+            source: mutable usize? = null
+            for position in 0..<prover.prefix.arrays.count |source, prover, load|:
+                continue if not prover.prefix.arrays[position].searchable
+                source <- position if contains_value(&prover.prefix.arrays[position].accesses.loads, load)
+            found: usize = get source else return null
+            # A struct's grouped stores leave out the values its fields hold.
+            return null if prover.prefix.arrays[found].composite or contains_value(&prover.prefix.visiting, prover.prefix.arrays[found].buffer)
+            found
+
+        # A byte fill of SOURCE's whole elements writes the byte repeated in each one (all
+        # ones: -1), below LENGTH or at least FLOOR.
+        def filled_below_or_from(prover: mutable IndexProver&, source: usize, write: LLVMValueRef, load: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, floor: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            return false if ElisaLLVMIsMemSet(write) == 0
+            byte: LLVMValueRef = LLVMGetOperand(write, 1)
+            return false if LLVMIsAConstantInt(byte) == null or LLVMGetOperand(write, 0) != prover.prefix.arrays[source].buffer
+            bytes: ElisaScalarEvolutionExpressionRef = term_of(analyses, LLVMGetOperand(write, 2))
+            return false if element_offset_quotient(analyses, bytes, prover.prefix.arrays[source].element_size) == null
+            type: LLVMTypeRef = LLVMTypeOf(load)
+            return false if not is_llvm_integer_type(type, 0) or LLVMGetIntTypeWidth(type) % 8 != 0
+            element: LLVMValueRef = byte_splat(type, LLVMConstIntGetZExtValue(byte))
+            value_below_or_from(prover, element, length, floor, write, depth)
+
+        # The integer of TYPE with BYTE in every byte (`APInt::getSplat`).
+        def byte_splat(type: LLVMTypeRef, byte: u64) -> LLVMValueRef can[Memory.Allocate, Unsafe.PointerCast]:
+            word: mutable u64 = 0
+            for shift in 0..<8 |word, byte|:
+                word <- word | ((byte & 255) << (shift * 8).u64())
+            words: mutable darray[u64] = []
+            for count in 0..<(LLVMGetIntTypeWidth(type) + 63) / 64 |words, word|:
+                words.push(word)
+            LLVMConstIntOfArbitraryPrecision(type, words.count.u32(), (&words[0]).cast[void&])
+
+        # Every store of SOURCE writes a value loaded from SOURCE itself or one below
+        # LENGTH (or at least FLOOR, with FROM set).
+        def stores_bounded(prover: mutable IndexProver&, source: usize, length: ElisaScalarEvolutionExpressionRef, floor: LLVMValueRef?, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            for position in 0..<prover.prefix.arrays[source].accesses.stores.count |prover, source, length, floor, depth, analyses|:
+                store: LLVMValueRef = prover.prefix.arrays[source].accesses.stores[position]
+                stored: LLVMValueRef = LLVMGetOperand(store, 0)
+                continue if contains_value(&prover.prefix.arrays[source].accesses.loads, stored)
+                if floor is lowest:
+                    return false if not value_below_or_from(prover, stored, length, lowest, store, depth)
+                else:
+                    return false if ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(stored)) == 0
+                    return false if not proof_below(prover, term_of(analyses, stored), length, store, depth)
+            true
+
+    public:
+        # Every read of TARGET lies in a completely written prefix (`prefixRead`). A fill a
+        # loop repeats is proved by its fill loop only for reads in the fill's own trip,
+        # else by the stack proof, which checks each step against the latest fill.
+        def prefix_read(prover: mutable IndexProver&, target: usize) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            prover.prefix.arrays[target].kept_elements <- 0
+            return false if prover.prefix.arrays[target].accesses.fills.count != 1
+            fill: LLVMValueRef = prover.prefix.arrays[target].accesses.fills[0]
+            repeated: bool = ElisaLLVMLoopForBlock(prover.analyses, LLVMGetInstructionParent(fill)) != null
+            for position in 0..<prover.prefix.arrays[target].accesses.stores.count |prover, target|:
+                return true if fill_loop(prover, target, prover.prefix.arrays[target].accesses.stores[position]) and reads_inside(prover, target)
+            return stack_read(prover, target, true) if repeated
+            for position in 0..<prover.prefix.arrays[target].accesses.writes.count |prover, target|:
+                return true if fill_copy(prover, target, prover.prefix.arrays[target].accesses.writes[position]) and reads_inside(prover, target)
+            stack_read(prover, target, false)
+
+        # LOAD reads an array whose reads stay in its written prefix and whose every
+        # stored value is below LENGTH or copied from the array itself (`loadBelow`).
+        def prefix_load_below(prover: mutable IndexProver&, load: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            source: usize = get load_source(prover, load) else return false
+            buffer: LLVMValueRef = prover.prefix.arrays[source].buffer
+            insert_value(&prover.prefix.visiting, buffer)
+            # Copied values are unknown, and so are zeros a kept fill provides and values
+            # a view's callees store.
+            bounded: mutable bool = prover.prefix.arrays[source].accesses.writes.count == 0 and prover.prefix.arrays[source].accesses.vector_stores.count == 0 and prover.prefix.arrays[source].accesses.views.count == 0
+            if bounded and not prover.prefix.arrays[source].proved:
+                bounded <- prefix_read(prover, source)
+            bounded <- bounded and prover.prefix.arrays[source].kept_elements == 0 and stores_bounded(prover, source, length, null, depth)
+            erase_value(&prover.prefix.visiting, buffer)
+            bounded
+
+        # LOAD reads an array whose every stored value is below LENGTH or at least FLOOR.
+        # Its reads stay in its written prefix, or are being proved to: by induction over
+        # the reads in program order, each one's index came from an earlier read, which
+        # was inside, so it read a stored value (`loadBelowOrFrom`).
+        def prefix_load_below_or_from(prover: mutable IndexProver&, load: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, floor: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            source: usize = get load_source(prover, load) else return false
+            buffer: LLVMValueRef = prover.prefix.arrays[source].buffer
+            assumed: bool = contains_value(&prover.prefix.proving, buffer)
+            insert_value(&prover.prefix.visiting, buffer)
+            bounded: mutable bool = true
+            for position in 0..<prover.prefix.arrays[source].accesses.writes.count |bounded, prover, source, load, length, floor, depth|:
+                continue if not bounded
+                bounded <- filled_below_or_from(prover, source, prover.prefix.arrays[source].accesses.writes[position], load, length, floor, depth)
+            bounded <- bounded and prover.prefix.arrays[source].accesses.vector_stores.count == 0 and prover.prefix.arrays[source].accesses.views.count == 0
+            if bounded and not assumed and not prover.prefix.arrays[source].proved:
+                bounded <- prefix_read(prover, source) and prover.prefix.arrays[source].kept_elements == 0
+            bounded <- bounded and stores_bounded(prover, source, length, floor, depth)
+            erase_value(&prover.prefix.visiting, buffer)
+            bounded

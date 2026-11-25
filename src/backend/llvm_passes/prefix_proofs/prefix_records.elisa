@@ -1,0 +1,118 @@
+# Arrays of records for the prefix proof (`ElisaIndexedPrefix::denseStruct`,
+# `wholeElementStores` and `regrouped`). A struct element counts as stored once field
+# stores that dominate each other cover all its bytes; an integer array accessed in
+# records of a few elements (`records[3 * i + 1]`) is seen as an array of such records.
+include "./prefix_reads.elisa"
+
+const module PrefixRecordLimit:
+    FIELD_STORES: usize = 256
+    RECORD_BYTES: u64 = 64
+
+# A field store after the fill, the address of its element and the bytes it covers.
+struct FieldStore:
+    store: LLVMValueRef
+    start: ElisaScalarEvolutionExpressionRef
+    mask: u64
+
+extend Backend:
+    private:
+        # `Type::isFloatingPointTy` for a type of KIND.
+        def is_floating_point_kind(kind: u32) -> bool:
+            kind == LLVMTypeKindValue::HALF or kind == LLVMTypeKindValue::BFLOAT or kind == LLVMTypeKindValue::FLOAT or kind == LLVMTypeKindValue::DOUBLE or kind == LLVMTypeKindValue::X86_FP80 or kind == LLVMTypeKindValue::FP128 or kind == LLVMTypeKindValue::PPC_FP128
+
+        # The low COUNT bits set, COUNT at most 64.
+        def low_bits(count: u64) -> u64:
+            one: u64 = 1
+            return ~(0.u64()) if count >= 64
+            (one << count) - 1
+
+        # ACCESS of an integer array placed in records of SIZE bytes: the offset of its
+        # first element in its record, when some offset makes it a whole record plus that
+        # constant (`Place`).
+        def record_residue(analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, access: LLVMValueRef, accessed: LLVMTypeRef, element_size: u64, record_size: u64) -> u64? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            offset: ElisaScalarEvolutionExpressionRef = term_difference(analyses, term_of(analyses, accessed_pointer(access)), term_of(analyses, buffer))
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInstructionParent(buffer))))
+            bytes: u64 = LLVMStoreSizeOfType(layout, accessed)
+            return null if term_kind(offset) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            residue: mutable u64 = 0
+            while residue + bytes <= record_size |residue, analyses, offset, element_size, record_size|:
+                shifted: ElisaScalarEvolutionExpressionRef = term_difference(analyses, offset, term_constant_like(analyses, offset, residue))
+                return residue if element_offset_quotient(analyses, shifted, record_size) != null
+                residue <- residue + element_size
+            null
+
+    public:
+        # A struct of scalar fields with no padding: every byte belongs to a field
+        # (`denseStruct`).
+        def dense_struct(element: LLVMTypeRef, layout: LLVMTargetDataRef) -> bool:
+            return false if LLVMGetTypeKind(element) != LLVMTypeKindValue::STRUCT or LLVMIsOpaqueStruct(element) != 0
+            count: u32 = LLVMCountStructElementTypes(element)
+            return false if count == 0
+            fields: mutable u64 = 0
+            for index in 0..<count |fields, element, layout|:
+                field: LLVMTypeRef = LLVMStructGetTypeAtIndex(element, index)
+                kind: u32 = LLVMGetTypeKind(field)
+                return false if not is_llvm_integer_type(field, 0) and not is_floating_point_kind(kind) and kind != LLVMTypeKindValue::POINTER
+                fields <- fields + LLVMStoreSizeOfType(layout, field)
+            size: u64 = LLVMABISizeOfType(layout, element)
+            fields == size and size <= PrefixRecordLimit::RECORD_BYTES
+
+        # The stores of ARRAY that complete an element: a field store after the fill
+        # counts as a store of the whole element when it and the field stores to the same
+        # element that dominate it cover every byte (`wholeElementStores`).
+        def whole_element_stores(analyses: ElisaFunctionAnalysesRef, array: PrefixArray&) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInstructionParent(array.buffer))))
+            index_type: LLVMTypeRef = LLVMInt64TypeInContext(LLVMGetTypeContext(LLVMTypeOf(array.buffer)))
+            fill: LLVMValueRef = array.accesses.fills[0]
+            fields: mutable darray[FieldStore] = []
+            for store in array.accesses.stores |fields, analyses, array, layout, index_type, fill|:
+                continue if ElisaLLVMInstructionDominates(analyses, fill, store) == 0 or fields.count >= PrefixRecordLimit::FIELD_STORES
+                residue: u64 = get field_residue(&array.accesses, store) else 0
+                bytes: u64 = LLVMStoreSizeOfType(layout, LLVMTypeOf(LLVMGetOperand(store, 0)))
+                start: ElisaScalarEvolutionExpressionRef = term_difference(analyses, term_of(analyses, LLVMGetOperand(store, 1)), ElisaLLVMScalarEvolutionConstantOf(analyses, index_type, residue))
+                fields.push(FieldStore{store: store, start: start, mask: low_bits(bytes) << residue})
+            full: u64 = low_bits(array.element_size)
+            whole: mutable darray[LLVMValueRef] = []
+            for field in fields |whole, fields, analyses, full|:
+                covered: mutable u64 = field.mask
+                for earlier in fields |covered, field, analyses|:
+                    if earlier.start == field.start and earlier.store != field.store and ElisaLLVMInstructionDominates(analyses, earlier.store, field.store) != 0:
+                        covered <- covered | earlier.mask
+                whole.push(field.store) if covered == full
+            whole
+
+        # TARGET, an integer array, seen as an array of records of GROUP elements, each
+        # access split into a whole record and a constant offset inside it; null when an
+        # access does not split (`regrouped`).
+        def regrouped(analyses: ElisaFunctionAnalysesRef, target: PrefixArray&, group: u64) -> PrefixArray? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A view's callees are checked against the plain element size.
+            return null if target.accesses.views.count != 0
+            accesses: mutable ArrayAccesses = empty_array_accesses()
+            for fill in target.accesses.fills |accesses|:
+                accesses.fills.push(fill)
+            for copy in target.accesses.copies |accesses|:
+                accesses.copies.push(copy)
+            for write in target.accesses.writes |accesses|:
+                accesses.writes.push(write)
+            records: mutable PrefixArray = new_prefix_array(target.buffer, target.element_size * group, accesses, true, false)
+            records.searchable <- false
+            size: u64 = target.element_size
+            for load in target.accesses.loads |records, analyses, size|:
+                residue: u64 = get record_residue(analyses, records.buffer, load, LLVMTypeOf(load), size, records.element_size) else return null
+                records.accesses.residues.push(FieldResidue{access: load, residue: residue}) if residue != 0
+                records.accesses.loads.push(load)
+            for load in target.accesses.vector_loads |records, analyses, size|:
+                residue: u64 = get record_residue(analyses, records.buffer, load, LLVMTypeOf(load), size, records.element_size) else return null
+                records.accesses.residues.push(FieldResidue{access: load, residue: residue}) if residue != 0
+                records.accesses.loads.push(load)
+            for store in target.accesses.stores |records, analyses, size|:
+                residue: u64 = get record_residue(analyses, records.buffer, store, LLVMTypeOf(LLVMGetOperand(store, 0)), size, records.element_size) else return null
+                records.accesses.residues.push(FieldResidue{access: store, residue: residue}) if residue != 0
+                records.accesses.stores.push(store)
+            for store in target.accesses.vector_stores |records, analyses, size|:
+                residue: u64 = get record_residue(analyses, records.buffer, store, LLVMTypeOf(LLVMGetOperand(store, 0)), size, records.element_size) else return null
+                records.accesses.residues.push(FieldResidue{access: store, residue: residue}) if residue != 0
+                records.accesses.stores.push(store)
+            whole: darray[LLVMValueRef] = whole_element_stores(analyses, &records)
+            records.accesses.stores <- whole
+            records

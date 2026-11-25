@@ -1,0 +1,251 @@
+# The watermark induction (`ElisaStackWatermark::Watermark::holds` and its pushes):
+# elements [0, X) were stored after the fill wherever a point executes. Watermarks are 0;
+# small constants whose elements were stored; phis whose incoming values are watermarks
+# on their edges (assumed while proved, an induction over the order the phis execute);
+# pops of nonzero watermarks; and X + k where stores of elements X .. X + k - 1 reach the
+# point. Every alternative that fails forgets the phis it assumed (`attempt`).
+include "./watermark_state.elisa"
+include "../ir/ir_editing.elisa"
+
+# One incoming value a phi watermark needs, the value its edge proves it equal to, and
+# the end of that edge.
+struct WatermarkObligation:
+    mark: LLVMValueRef
+    equal: LLVMValueRef?
+    end: LLVMValueRef
+
+extend Backend:
+    private:
+        # The instruction VALUE is, when it is one.
+        def defining_instruction(value: LLVMValueRef) -> LLVMValueRef?:
+            return null if LLVMIsAInstruction(value) == null
+            value
+
+        # DEFINITION, when there is one, dominates AT.
+        def defined_before(analyses: ElisaFunctionAnalysesRef, definition: LLVMValueRef?, at: LLVMValueRef) -> bool:
+            if definition is instruction:
+                return ElisaLLVMInstructionDominates(analyses, instruction, at) != 0
+            true
+
+        # The obligations PHI's incoming values carry: a few constants are proved value by
+        # value, and one too large to be a watermark that AT never sees needs no proof
+        # (then GUARDED is set).
+        def phi_obligations(analyses: ElisaFunctionAnalysesRef, phi: LLVMValueRef, at: LLVMValueRef, guarded: mutable bool&) -> darray[WatermarkObligation] can[Abort.Panic, Memory.Allocate]:
+            obligations: mutable darray[WatermarkObligation] = []
+            for edge in 0..<LLVMCountIncoming(phi) |obligations, guarded, analyses, phi, at|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(phi, edge)
+                from: LLVMBasicBlockRef = LLVMGetIncomingBlock(phi, edge)
+                end: LLVMValueRef = terminator_of(from)
+                choices: darray[LLVMValueRef] = constant_choices(incoming)
+                if choices.count == 0:
+                    obligations.push(WatermarkObligation{mark: incoming, equal: equal_on_edge(incoming, from, LLVMGetInstructionParent(phi)), end: end})
+                for choice in choices |obligations, guarded, analyses, phi, at, end|:
+                    large: bool = ElisaLLVMConstantIntUnsignedGreater(choice, LLVMConstInt(LLVMTypeOf(choice), WatermarkLimit::SMALL_PUSH, 0)) != 0
+                    if large and excluded_at(analyses, phi, choice, at):
+                        guarded <- true
+                    else:
+                        obligations.push(WatermarkObligation{mark: choice, equal: null, end: end})
+            obligations
+
+        # PHI is a watermark at AT: each incoming value is one at the end of its edge,
+        # or equals one there (`holds` for phis).
+        def phi_watermark_holds(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, phi: LLVMValueRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # A fill inside a loop zeroes the buffer on every trip. Below the fill no back
+            # edge to the phi passes it, so the induction holds there.
+            fill_block: LLVMBasicBlockRef = LLVMGetInstructionParent(marks.fill)
+            home: LLVMBasicBlockRef = LLVMGetInstructionParent(phi)
+            if marks.fill_repeats:
+                return false if home == fill_block or ElisaLLVMBlockDominates(marks.analyses, fill_block, home) == 0
+            return false if contains_value(&induction.guarded, phi)
+            return true if contains_value(&induction.assumed, phi)
+            guarded: mutable bool = false
+            obligations: darray[WatermarkObligation] = phi_obligations(marks.analyses, phi, at, &guarded)
+            if guarded:
+                induction.guarded.push(phi)
+            else:
+                induction.assumed.push(phi)
+            every: mutable bool = true
+            for next in obligations |every, marks, induction, prover, depth|:
+                continue if not every
+                before: usize = induction.assumed.count
+                proved: mutable bool = watermark_holds(marks, induction, prover, next.mark, next.end, depth + 1)
+                if not proved:
+                    forget_assumed(induction, before)
+                    if next.equal is equal:
+                        if LLVMTypeOf(equal) == LLVMTypeOf(next.mark):
+                            proved <- watermark_holds(marks, induction, prover, equal, next.end, depth + 1)
+                            forget_assumed(induction, before) if not proved
+                every <- proved
+            if guarded:
+                induction.guarded.truncate(induction.guarded.count - 1)
+            every
+
+        # MARK = INNER + OTHER, a sum of two values: an equality flag, a branch count, or
+        # a loop's pushes added to INNER, either way round.
+        def sum_holds(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, mark: LLVMValueRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            inner: LLVMValueRef = LLVMGetOperand(mark, 0)
+            other: LLVMValueRef = LLVMGetOperand(mark, 1)
+            before: usize = induction.assumed.count
+            return true if equal_pushed(marks, induction, prover, inner, other, mark, depth)
+            forget_assumed(induction, before)
+            return true if equal_pushed(marks, induction, prover, other, inner, mark, depth)
+            forget_assumed(induction, before)
+            return true if branch_pushed(marks, induction, prover, inner, other, mark, depth)
+            forget_assumed(induction, before)
+            return true if branch_pushed(marks, induction, prover, other, inner, mark, depth)
+            forget_assumed(induction, before)
+            return true if loop_pushed(marks, induction, prover, inner, mark, at, depth)
+            forget_assumed(induction, before)
+            return true if loop_pushed(marks, induction, prover, other, mark, at, depth)
+            forget_assumed(induction, before)
+            false
+
+        # MARK equals a watermark on an edge below the fill that AT's latest run took (a
+        # loop left when its counter reached the limit MARK).
+        def equal_watermark_holds(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, mark: LLVMValueRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            equality: EdgeEquality = get equal_above(marks.analyses, mark, at, LLVMGetInstructionParent(marks.fill)) else return false
+            return false if LLVMTypeOf(equality.equal) != LLVMTypeOf(mark)
+            before: usize = induction.assumed.count
+            return true if watermark_holds(marks, induction, prover, equality.equal, equality.end, depth + 1)
+            forget_assumed(induction, before)
+            false
+
+        # MARK = INNER + COUNT where COUNT is a phi, in MARK's block, of small constants
+        # (branches that pushed different numbers of elements, their increments sunk into
+        # the join): each branch pushed its own count by the end of its incoming block
+        # (`branchPushed`).
+        def branch_pushed(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, inner: LLVMValueRef, count: LLVMValueRef, mark: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMGetInstructionOpcode(count) != LLVMOpcode::PHI or LLVMGetInstructionParent(count) != LLVMGetInstructionParent(mark)
+            for edge in 0..<LLVMCountIncoming(count) |marks, induction, prover, inner, count, depth|:
+                pushed: LLVMValueRef = LLVMGetIncomingValue(count, edge)
+                end: LLVMValueRef = terminator_of(LLVMGetIncomingBlock(count, edge))
+                return false if LLVMIsAConstantInt(pushed) == null
+                return false if ElisaLLVMConstantIntUnsignedGreater(pushed, LLVMConstInt(LLVMTypeOf(pushed), WatermarkLimit::SMALL_PUSH, 0)) != 0
+                if is_zero_constant(pushed):
+                    return false if not watermark_holds(marks, induction, prover, inner, end, depth + 1)
+                for offset in 0..<LLVMConstIntGetZExtValue(pushed) |marks, induction, prover, inner, end, depth|:
+                    return false if not element_pushed(marks, induction, prover, inner, offset, end, depth)
+            true
+
+        # MARK = INNER + [X == INNER] after a store of element X at a point where [0, INNER)
+        # holds: the store pushed element INNER exactly when X is INNER (`equalPushed`).
+        def equal_pushed(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, inner: LLVMValueRef, flag: LLVMValueRef, mark: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMGetInstructionOpcode(flag) != LLVMOpcode::ZEXT
+            compare: LLVMValueRef = LLVMGetOperand(flag, 0)
+            return false if LLVMGetInstructionOpcode(compare) != LLVMOpcode::ICMP or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::EQ
+            index: mutable LLVMValueRef = LLVMGetOperand(compare, 0)
+            if LLVMGetOperand(compare, 1) != inner:
+                return false if index != inner
+                index <- LLVMGetOperand(compare, 1)
+            definition: LLVMValueRef? = defining_instruction(inner)
+            for position in 0..<marks.accesses.stores.count |marks, induction, prover, inner, mark, depth, index, definition|:
+                store: LLVMValueRef = marks.accesses.stores[position]
+                continue if not writes_element(marks, store, index, 0) or not stored_before(marks, store, mark)
+                continue if not defined_before(marks.analyses, definition, store)
+                before: usize = induction.assumed.count
+                return true if watermark_holds(marks, induction, prover, inner, store, depth + 1)
+                forget_assumed(induction, before)
+            false
+
+        # The blocks of stores that write element INNER + OFFSET after the fill and after
+        # INNER's definition.
+        def writing_blocks(marks: StackWatermark&, inner: LLVMValueRef, offset: u64, definition: LLVMValueRef?) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMValueRef] = []
+            for store in marks.accesses.stores |blocks, marks, inner, offset, definition|:
+                continue if not covering_store(marks, store, inner, offset, definition)
+                block: LLVMValueRef = LLVMBasicBlockAsValue(LLVMGetInstructionParent(store))
+                blocks.push(block) if not contains_value(&blocks, block)
+            blocks
+
+        def covering_store(marks: StackWatermark&, store: LLVMValueRef, inner: LLVMValueRef, offset: u64, definition: LLVMValueRef?) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            return false if not whole_store(marks, store) or not writes_element(marks, store, inner, offset)
+            ElisaLLVMInstructionDominates(marks.analyses, marks.fill, store) != 0 and defined_before(marks.analyses, definition, store)
+
+        # A covering store runs in AT's own block before AT.
+        def covered_in_block(marks: StackWatermark&, inner: LLVMValueRef, offset: u64, definition: LLVMValueRef?, at: LLVMValueRef) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetInstructionParent(at))
+            while cursor is instruction |cursor, marks, inner, offset, definition, at|:
+                break if instruction == at
+                if LLVMIsAStoreInst(instruction) != null and contains_value(&marks.accesses.stores, instruction):
+                    return true if covering_store(marks, instruction, inner, offset, definition)
+                cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+    public:
+        # Elements [0, MARK) were stored after the fill wherever AT executes (`holds`).
+        def watermark_holds(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, mark: LLVMValueRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if LLVMIsAConstant(mark) != null and LLVMIsNull(mark) != 0
+            return stored_below(marks, induction, mark, at) if LLVMIsAConstantInt(mark) != null
+            return false if depth > WatermarkLimit::HOLDS_DEPTH
+            return phi_watermark_holds(marks, induction, prover, mark, at, depth) if LLVMGetInstructionOpcode(mark) == LLVMOpcode::PHI
+            # A count clamped to the capacity is at most the count.
+            if unsigned_minimum(mark) is operands:
+                before: usize = induction.assumed.count
+                return true if watermark_holds(marks, induction, prover, operands.first, at, depth + 1)
+                forget_assumed(induction, before)
+                return true if watermark_holds(marks, induction, prover, operands.second, at, depth + 1)
+                forget_assumed(induction, before)
+                return false
+            return equal_watermark_holds(marks, induction, prover, mark, at, depth) if LLVMIsAInstruction(mark) == null
+            if popped(mark) is inner:
+                return nonzero(marks, induction, prover, inner, mark, 0) and watermark_holds(marks, induction, prover, inner, at, depth + 1)
+            return equal_watermark_holds(marks, induction, prover, mark, at, depth) if LLVMGetInstructionOpcode(mark) != LLVMOpcode::ADD
+            pushed: LLVMValueRef = LLVMGetOperand(mark, 1)
+            return sum_holds(marks, induction, prover, mark, at, depth) if LLVMIsAConstant(pushed) == null
+            if LLVMIsAConstantInt(pushed) == null or is_zero_constant(pushed):
+                return equal_watermark_holds(marks, induction, prover, mark, at, depth)
+            if ElisaLLVMConstantIntUnsignedGreater(pushed, LLVMConstInt(LLVMTypeOf(pushed), WatermarkLimit::SMALL_PUSH, 0)) != 0:
+                return equal_watermark_holds(marks, induction, prover, mark, at, depth)
+            inner: LLVMValueRef = LLVMGetOperand(mark, 0)
+            for offset in 0..<LLVMConstIntGetZExtValue(pushed) |marks, induction, prover, inner, at, depth|:
+                return false if not element_pushed(marks, induction, prover, inner, offset, at, depth)
+            true
+
+        # A store of element INNER + OFFSET, executed after INNER's definition and at a
+        # point where [0, INNER) holds, dominates AT, or stores of it cover every path
+        # to AT (`pushed`).
+        def element_pushed(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, inner: LLVMValueRef, offset: u64, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            definition: LLVMValueRef? = defining_instruction(inner)
+            for position in 0..<marks.accesses.stores.count |marks, induction, prover, inner, offset, at, depth, definition|:
+                store: LLVMValueRef = marks.accesses.stores[position]
+                continue if not writes_element(marks, store, inner, offset) or not stored_before(marks, store, at)
+                continue if not defined_before(marks.analyses, definition, store)
+                before: usize = induction.assumed.count
+                return true if watermark_holds(marks, induction, prover, inner, store, depth + 1)
+                forget_assumed(induction, before)
+            return false if not covered_on_every_path(marks, inner, offset, at)
+            before: usize = induction.assumed.count
+            return true if watermark_holds(marks, induction, prover, inner, at, depth + 1)
+            forget_assumed(induction, before)
+            false
+
+        # Every path from INNER's definition (or from the fill) to AT passes a store of
+        # element INNER + OFFSET: no single store dominates AT when the branches that
+        # each pushed were threaded apart (`coveredOnEveryPath`).
+        def covered_on_every_path(marks: StackWatermark&, inner: LLVMValueRef, offset: u64, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            definition: LLVMValueRef? = defining_instruction(inner)
+            writing: darray[LLVMValueRef] = writing_blocks(marks, inner, offset, definition)
+            return false if writing.count == 0
+            start: LLVMBasicBlockRef = LLVMGetInstructionParent(at)
+            return true if covered_in_block(marks, inner, offset, definition, at)
+            fill_block: LLVMBasicBlockRef = LLVMGetInstructionParent(marks.fill)
+            origin: mutable LLVMBasicBlockRef = fill_block
+            if definition is instruction:
+                origin <- LLVMGetInstructionParent(instruction)
+            return false if start == origin or start == fill_block
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(start))
+            work: mutable darray[LLVMBasicBlockRef] = predecessor_edges(start)
+            seen: mutable KeyTable = new_key_table()
+            seen_count: mutable usize = 0
+            while work.count > 0 |work, seen, seen_count, writing, origin, fill_block, entry|:
+                block: LLVMBasicBlockRef = work[work.count - 1]
+                work.truncate(work.count - 1)
+                key: TableKey = TableKey{first: object_key(block.cast[void&]), second: 0, third: 0}
+                continue if key_table_find(&seen, key) != null
+                seen <- key_table_insert(seen, key, 0)
+                seen_count <- seen_count + 1
+                continue if contains_value(&writing, LLVMBasicBlockAsValue(block))
+                return false if block == origin or block == fill_block or block == entry or seen_count > WatermarkLimit::COVERED_BLOCKS
+                for predecessor in predecessor_edges(block) |work|:
+                    work.push(predecessor)
+            true

@@ -1,0 +1,78 @@
+# Pushes a loop made (`ElisaStackWatermark::Watermark::loopPushed`): MARK = INNER + K
+# where a single-block loop, exited before AT, stored elements [INNER, MARK) after
+# [0, INNER) held. Each iteration's stores cover one block of STEP bytes, consecutive
+# iterations' blocks follow each other from element INNER, and the loop leaves when a
+# counter stepping by C from zero without wrapping reaches N (a vectorized push loop), so
+# it ran N / C iterations and MARK = INNER + STEP * N / (C * size). INNER and N are
+# defined before the loop and the exit edge dominates MARK, so the run that stored them
+# is the latest one before MARK.
+include "./watermark_holds.elisa"
+
+extend Backend:
+    private:
+        # The stores and vector stores of the buffer, in that order.
+        def every_store(marks: StackWatermark&) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            stores: mutable darray[LLVMValueRef] = []
+            for store in marks.accesses.stores |stores|:
+                stores.push(store)
+            for store in marks.accesses.vector_stores |stores|:
+                stores.push(store)
+            stores
+
+        # FIRST's loop, a single block whose conditional branch is its latch, entered
+        # after the fill from a preheader INNER's definition dominates: the preheader's
+        # end, where [0, INNER) must hold.
+        def push_loop_entry(marks: StackWatermark&, first: LLVMValueRef, block: ElisaScalarEvolutionExpressionRef, inner: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic]:
+            return null if term_kind(block) != ElisaScalarEvolutionKind::ADD_RECURRENCE or term_operand_count(block) != 2
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(block) else return null
+            return null if ElisaLLVMLoopBlockCount(loop) != 1
+            body: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return null
+            return null if LLVMGetInstructionOpcode(terminator_of(body)) != LLVMOpcode::CONDITIONAL_BR
+            return null if ElisaLLVMInstructionDominates(marks.analyses, marks.fill, first) == 0
+            return null if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(marks.fill)) != 0
+            entry_end: LLVMValueRef = terminator_of(preheader)
+            return null if not defined_before(marks.analyses, defining_instruction(inner), entry_end)
+            entry_end
+
+        # The loop of FIRST's stores pushed elements [INNER, MARK) by the time AT runs;
+        # the point where [0, INNER) must hold (`loopPushed` for one store).
+        def pushing_loop_entry(marks: StackWatermark&, groups: darray[LLVMValueRef]&, first: LLVMValueRef, inner: LLVMValueRef, mark: LLVMValueRef, at: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = marks.analyses
+            block: ElisaScalarEvolutionExpressionRef = get access_offset(marks, first) else return null
+            entry_end: LLVMValueRef = get push_loop_entry(marks, first, block, inner) else return null
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(block) else return null
+            body: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            latch: LLVMValueRef = terminator_of(body)
+            step: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionStepRecurrence(analyses, block)
+            start: ElisaScalarEvolutionExpressionRef = get covered_start(analyses, marks.buffer, groups, body, loop, step) else return null
+            counted: CountedLimit = get counted_latch(analyses, latch, body) else return null
+            step_constant: LLVMValueRef = get term_constant(step) else return null
+            step_bytes: u64 = LLVMConstIntGetZExtValue(step_constant)
+            per_step: u64 = counted.stride * marks.element_size
+            return null if term_type(counted.limit) != LLVMTypeOf(inner) or LLVMTypeOf(mark) != LLVMTypeOf(inner) or step_bytes % per_step != 0
+            limit_type: LLVMTypeRef = term_type(counted.limit)
+            bytes_type: LLVMTypeRef = term_type(start)
+            elements: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionMultiply(analyses, counted.limit, ElisaLLVMScalarEvolutionConstantOf(analyses, limit_type, step_bytes / per_step))
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(latch, 1) if LLVMGetSuccessor(latch, 0) == body else LLVMGetSuccessor(latch, 0)
+            # Compared in elements: scalar evolution keeps `size * (a + b + c)` undistributed.
+            widened: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionTruncateOrZeroExtend(analyses, term_of(analyses, inner), bytes_type)
+            return null if start != ElisaLLVMScalarEvolutionMultiply(analyses, widened, ElisaLLVMScalarEvolutionConstantOf(analyses, bytes_type, marks.element_size))
+            return null if term_sum(analyses, term_of(analyses, inner), elements) != term_of(analyses, mark)
+            return null if ElisaLLVMEdgeDominates(analyses, body, exit, LLVMGetInstructionParent(mark)) == 0
+            return null if ElisaLLVMEdgeDominates(analyses, body, exit, LLVMGetInstructionParent(at)) == 0
+            entry_end
+
+    public:
+        def loop_pushed(marks: mutable StackWatermark&, induction: mutable WatermarkInduction&, prover: mutable IndexProver&, inner: LLVMValueRef, mark: LLVMValueRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = marks.analyses
+            # A struct's grouped stores do not show the bytes each iteration covers.
+            return false if marks.composite or ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(inner)) == 0
+            return false if ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(mark)) == 0
+            groups: darray[LLVMValueRef] = every_store(marks)
+            for first in groups |marks, induction, prover, inner, mark, at, depth, groups|:
+                if pushing_loop_entry(marks, &groups, first, inner, mark, at) is entry_end:
+                    before: usize = induction.assumed.count
+                    return true if watermark_holds(marks, induction, prover, inner, entry_end, depth + 1)
+                    forget_assumed(induction, before)
+            false

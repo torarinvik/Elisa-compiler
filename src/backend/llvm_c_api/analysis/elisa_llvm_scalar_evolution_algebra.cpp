@@ -66,9 +66,13 @@ ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionMultiplyTerms(ElisaFun
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionUnsignedDivideExact(
     ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef dividend,
     ElisaScalarEvolutionExpressionRef divisor) {
-  const SCEV *Quotient =
-      evolutionOf(analyses).getUDivExactExpr(unwrapExpression(dividend), unwrapExpression(divisor));
-  return isa<SCEVUDivExpr>(Quotient) ? nullptr : wrapExpression(Quotient);
+  return wrapExpression(
+      evolutionOf(analyses).getUDivExactExpr(unwrapExpression(dividend), unwrapExpression(divisor)));
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionTruncateOrZeroExtend(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression, LLVMTypeRef type) {
+  return wrapExpression(evolutionOf(analyses).getTruncateOrZeroExtend(unwrapExpression(expression), unwrap(type)));
 }
 
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionAddRecurrence(

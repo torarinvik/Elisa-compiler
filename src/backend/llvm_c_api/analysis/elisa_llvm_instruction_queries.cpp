@@ -5,6 +5,7 @@
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/Support/CBindingWrapping.h>
 
 using namespace llvm;
@@ -41,6 +42,15 @@ int ElisaLLVMCallOnlyAccessesInaccessibleMemory(LLVMValueRef call) {
 unsigned ElisaLLVMMemoryIntrinsicDestinationAlignment(LLVMValueRef intrinsic) {
   MaybeAlign Alignment = cast<MemIntrinsic>(unwrap(intrinsic))->getDestAlign();
   return Alignment ? static_cast<unsigned>(Alignment->value()) : 0;
+}
+
+int ElisaLLVMGEPConstantOffset(LLVMValueRef gep, int64_t *offset) {
+  auto *Address = cast<GEPOperator>(unwrap(gep));
+  const DataLayout &Layout = cast<Instruction>(Address)->getDataLayout();
+  APInt Offset(Layout.getIndexTypeSizeInBits(Address->getType()), 0);
+  if (!Address->accumulateConstantOffset(Layout, Offset)) return 0;
+  *offset = Offset.getSExtValue();
+  return 1;
 }
 
 } // extern "C"

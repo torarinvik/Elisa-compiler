@@ -1,0 +1,115 @@
+# Elide the zero fill of local arrays that are read only inside a prefix a loop or a copy
+# wrote completely (`ElisaIndexedPrefix::removeIndexedPrefixFills`). If every later read
+# indexes below the written length, no read observes the fill (prefix_reads.elisa); a
+# stack's reads stay below its pushes, which also covers arrays of structs and fills a
+# loop repeats. An array whose proof needs only the leading elements the fill zeroes
+# keeps a shortened fill; otherwise the fill goes and the array is marked as read only
+# inside its written prefix, so it keeps the value ranges of its stores.
+include "./prefix_records.elisa"
+
+# A removed or shortened fill: the fill, the bytes it must still zero, and its array.
+struct DeadPrefixFill:
+    fill: LLVMValueRef
+    kept: u64
+    buffer: LLVMValueRef
+
+extend Backend:
+    private:
+        # The prefix proof's array for BUFFER, a local of FUNCTION's entry block: a static
+        # array of integers or dense structs, zero filled once (or proved to read only its
+        # written prefix), and written (`removeIndexedPrefixFills`'s collection).
+        def prefix_candidate(buffer: LLVMValueRef, module: LLVMModuleRef, written_kind: u32) -> PrefixArray? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if LLVMIsAAllocaInst(buffer) == null or LLVMGetTypeKind(LLVMGetAllocatedType(buffer)) != LLVMTypeKindValue::ARRAY
+            return null if ElisaLLVMIsStaticAlloca(buffer) == 0
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            element_type: LLVMTypeRef = LLVMGetElementType(LLVMGetAllocatedType(buffer))
+            return null if not is_llvm_integer_type(element_type, 0) and not dense_struct(element_type, layout)
+            composite: bool = LLVMGetTypeKind(element_type) == LLVMTypeKindValue::STRUCT
+            # Vector stores only ever add written elements to a proof.
+            element: ArrayElement = array_element(element_type, true, module)
+            accesses: mutable ArrayAccesses = empty_array_accesses()
+            return null if not collect_array_accesses(buffer, &element, &accesses, 0, 0)
+            fills: usize = accesses.fills.count
+            proved: bool = fills == 0 and not composite and LLVMGetMetadata(buffer, written_kind) != null
+            return null if fills != 1 and not proved
+            return null if accesses.stores.count == 0 and accesses.vector_stores.count == 0 and accesses.writes.count == 0
+            new_prefix_array(buffer, element.size, accesses, composite, fills == 0)
+
+        # The arrays of FUNCTION's entry block the prefix proof is about.
+        def prefix_candidates(function: LLVMValueRef, module: LLVMModuleRef, written_kind: u32) -> darray[PrefixArray] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arrays: mutable darray[PrefixArray] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while cursor is instruction |cursor, arrays, module, written_kind|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if prefix_candidate(instruction, module, written_kind) is candidate:
+                    arrays.push(candidate)
+            arrays
+
+        # TARGET's proof, or that of TARGET regrouped into records of 2, 3, ... elements:
+        # the index of the proved array, a regrouping appended to the prover's arrays.
+        def proved_prefix(prover: mutable IndexProver&, target: usize) -> usize? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return target if prefix_read(prover, target)
+            return null if prover.prefix.arrays[target].composite or prover.prefix.arrays[target].accesses.stores.count == 0
+            group: mutable u64 = 2
+            while prover.prefix.arrays[target].element_size * group <= PrefixRecordLimit::RECORD_BYTES |group, prover, target|:
+                if regrouped(prover.analyses, &prover.prefix.arrays[target], group) is records:
+                    prover.prefix.arrays.push(records)
+                    records_index: usize = prover.prefix.arrays.count - 1
+                    return records_index if prefix_read(prover, records_index)
+                    prover.prefix.arrays.truncate(records_index)
+                group <- group + 1
+            null
+
+        # DEAD applied: a memset keeping seeds is shortened to them; any other fill goes,
+        # its array marked as read only inside its written prefix.
+        def apply_dead_fill(dead: DeadPrefixFill, written_kind: u32, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if ElisaLLVMIsMemSet(dead.fill) != 0 and dead.kept != 0:
+                # Seeds of a record past a short array's end are not the fill's to keep.
+                length: LLVMValueRef = LLVMGetOperand(dead.fill, 2)
+                if LLVMIsAConstantInt(length) != null and LLVMConstIntGetZExtValue(length) > dead.kept:
+                    LLVMSetOperand(dead.fill, 2, LLVMConstInt(LLVMTypeOf(length), dead.kept, 0))
+                return
+            # An empty node: the slot only gives the operand pointer somewhere to point.
+            slots: mutable darray[LLVMMetadataRef] = [LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(context), 0, 0))]
+            node: LLVMMetadataRef = LLVMMDNodeInContext2(context, (&slots[0]).cast[void&], 0)
+            LLVMSetMetadata(dead.buffer, written_kind, LLVMMetadataAsValue(context, node))
+            LLVMInstructionEraseFromParent(dead.fill)
+
+        # FUNCTION's prefix-read fills removed or shortened; how many.
+        def remove_function_prefix_fills(function: LLVMValueRef, module: LLVMModuleRef, written_kind: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arrays: darray[PrefixArray] = prefix_candidates(function, module, written_kind)
+            return 0 if arrays.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            prover: mutable IndexProver = new_index_prover(function, analyses)
+            prover.prefix.arrays <- arrays
+            count: usize = prover.prefix.arrays.count
+            for target in 0..<count |prover, analyses|:
+                if prover.prefix.arrays[target].composite:
+                    whole: darray[LLVMValueRef] = whole_element_stores(analyses, &prover.prefix.arrays[target])
+                    prover.prefix.arrays[target].accesses.stores <- whole
+            dead: mutable darray[DeadPrefixFill] = []
+            for target in 0..<count |prover, dead, count|:
+                continue if prover.prefix.arrays[target].proved
+                restart_index_prover(&prover)
+                if proved_prefix(&prover, target) is proved:
+                    kept: u64 = prover.prefix.arrays[proved].kept_elements * prover.prefix.arrays[proved].element_size
+                    dead.push(DeadPrefixFill{fill: prover.prefix.arrays[target].accesses.fills[0], kept: kept, buffer: prover.prefix.arrays[target].buffer})
+                prover.prefix.arrays.truncate(count)
+            dispose_index_prover(&prover)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            for fill in dead |written_kind, context|:
+                apply_dead_fill(fill, written_kind, context)
+            dead.count.u32()
+
+    public:
+        # Every prefix-read fill of MODULE removed or shortened; how many were.
+        def remove_indexed_prefix_fills(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            written_kind: u32 = LLVMGetMDKindIDInContext(LLVMGetModuleContext(module), "elisa.written.prefix", 20)
+            removed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, removed, module, written_kind|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+                removed <- removed + remove_function_prefix_fills(function, module, written_kind)
+            removed

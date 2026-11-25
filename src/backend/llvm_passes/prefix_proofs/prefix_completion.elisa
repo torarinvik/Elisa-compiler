@@ -1,0 +1,128 @@
+# A read happens after the prefix was written (`ElisaIndexedPrefix::Prover::completed`,
+# `sameTrip` and `emptyOn`). Every path to the read leaves the fill loop through its
+# counted exit, or takes an edge on which the loop wrote nothing because the length is
+# zero there (a zero-trip guard). Walking back from the read, a path into the loop's
+# body or the function entry that avoids both fails. A fill a loop repeats must reach the
+# read in the same trip of every loop around it.
+include "./prefix_fill_loops.elisa"
+
+extend Backend:
+    private:
+        # FROM -> TARGET is taken only when LENGTH is zero (`emptyOn`).
+        def empty_on(analyses: ElisaFunctionAnalysesRef, length: ElisaScalarEvolutionExpressionRef, from: LLVMBasicBlockRef, target: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            for fact in edge_compares(from, target) |analyses, length|:
+                return true if fact_empties(analyses, fact, length)
+            false
+
+        # FACT holds only when LENGTH is zero.
+        def fact_empties(analyses: ElisaFunctionAnalysesRef, fact: CompareFact, length: ElisaScalarEvolutionExpressionRef) -> bool can[Abort.Panic]:
+            predicate: mutable i32 = fact_predicate(fact)
+            left: mutable LLVMValueRef = LLVMGetOperand(fact.compare, 0)
+            right: mutable LLVMValueRef = LLVMGetOperand(fact.compare, 1)
+            if LLVMIsAConstant(left) != null:
+                left <- right
+                right <- LLVMGetOperand(fact.compare, 0)
+                predicate <- swapped_predicate(predicate)
+            return false if LLVMIsAConstantInt(right) == null or ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(left)) == 0
+            return false if term_of(analyses, left) != length
+            region: ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(predicate, right)
+            zero: bool = ElisaLLVMConstantRangeIsSingleElement(region) != 0 and ElisaLLVMConstantRangeLower(region) == 0
+            ElisaLLVMDisposeConstantRange(region)
+            zero
+
+        # TERM contains a recurrence, or a value not defined before FILL: LENGTH may change
+        # between the guard and the read (`SCEVExprContains`).
+        def length_may_change(analyses: ElisaFunctionAnalysesRef, length: ElisaScalarEvolutionExpressionRef, fill: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            work: mutable darray[ElisaScalarEvolutionExpressionRef] = [length]
+            seen: mutable KeyTable = new_key_table()
+            while work.count > 0 |work, seen, analyses, fill|:
+                term: ElisaScalarEvolutionExpressionRef = work[work.count - 1]
+                work.truncate(work.count - 1)
+                key: TableKey = TableKey{first: expression_key(term), second: 0, third: 0}
+                continue if key_table_find(&seen, key) != null
+                seen <- key_table_insert(seen, key, 0)
+                return true if term_kind(term) == ElisaScalarEvolutionKind::ADD_RECURRENCE
+                if term_value(term) is value:
+                    return true if LLVMIsAInstruction(value) != null and ElisaLLVMInstructionDominates(analyses, value, fill) == 0
+                for operand in 0..<term_operand_count(term) |work, term|:
+                    work.push(term_operand(term, operand))
+            false
+
+        # The edge FROM -> BLOCK is TARGET's counted exit edge.
+        def is_prefix_exit(prover: IndexProver&, target: usize, from: LLVMBasicBlockRef, block: LLVMBasicBlockRef) -> bool:
+            exit_from: LLVMBasicBlockRef = get prover.prefix.arrays[target].from else return false
+            exit_to: LLVMBasicBlockRef = get prover.prefix.arrays[target].target else return false
+            from == exit_from and block == exit_to
+
+        # BLOCK is the header of LOOP or of a loop around it.
+        def heads_loop_around(loop: ElisaLoopRef?, block: LLVMBasicBlockRef) -> bool:
+            outer: mutable ElisaLoopRef? = loop
+            while outer is around |outer, block|:
+                return true if block == ElisaLLVMLoopHeader(around)
+                outer <- ElisaLLVMLoopParent(around)
+            false
+
+        # Every path from the repeated fill to READ leaves the fill loop through its
+        # counted exit in the same trip of every loop around the fill (`sameTrip`).
+        def same_trip(prover: IndexProver&, target: usize, read: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            filling: LLVMBasicBlockRef = LLVMGetInstructionParent(prover.prefix.arrays[target].accesses.fills[0])
+            around: ElisaLoopRef? = ElisaLLVMLoopForBlock(prover.analyses, filling)
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(filling))
+            work: mutable darray[LLVMBasicBlockRef] = [LLVMGetInstructionParent(read)]
+            seen: mutable KeyTable = new_key_table()
+            seen_count: mutable usize = 0
+            while work.count > 0 |work, seen, seen_count, prover, target, filling, around, entry|:
+                block: LLVMBasicBlockRef = work[work.count - 1]
+                work.truncate(work.count - 1)
+                key: TableKey = TableKey{first: block_key(block), second: 0, third: 0}
+                continue if key_table_find(&seen, key) != null
+                seen <- key_table_insert(seen, key, 0)
+                seen_count <- seen_count + 1
+                return false if block == filling or block == entry or seen_count > PrefixLimit::WALK_BLOCKS
+                return false if heads_loop_around(around, block)
+                for from in predecessor_edges(block) |work, prover, target, block|:
+                    work.push(from) if not is_prefix_exit(prover, target, from, block)
+            true
+
+        # Every path to READ passes the counted exit or an edge on which the length is
+        # zero, the length keeping its value from the guard to the read.
+        def guarded_walk(prover: IndexProver&, target: usize, read: LLVMValueRef, loop: ElisaLoopRef, length: ElisaScalarEvolutionExpressionRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            start: LLVMBasicBlockRef = LLVMGetInstructionParent(read)
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(start))
+            work: mutable darray[LLVMBasicBlockRef] = [start]
+            seen: mutable KeyTable = new_key_table()
+            seen_count: mutable usize = 0
+            while work.count > 0 |work, seen, seen_count, prover, target, analyses, loop, length, entry|:
+                block: LLVMBasicBlockRef = work[work.count - 1]
+                work.truncate(work.count - 1)
+                key: TableKey = TableKey{first: block_key(block), second: 0, third: 0}
+                continue if key_table_find(&seen, key) != null
+                seen <- key_table_insert(seen, key, 0)
+                seen_count <- seen_count + 1
+                return false if ElisaLLVMLoopContainsBlock(loop, block) != 0 or block == entry or seen_count > PrefixLimit::WALK_BLOCKS
+                for from in predecessor_edges(block) |work, prover, target, analyses, length, block|:
+                    continue if is_prefix_exit(prover, target, from, block)
+                    work.push(from) if not empty_on(analyses, length, from, block)
+            true
+
+    public:
+        # READ runs after TARGET's prefix was written in full (`completed`).
+        def prefix_completed(prover: IndexProver&, target: usize, read: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            fill: LLVMValueRef = prover.prefix.arrays[target].accesses.fills[0]
+            if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(fill)) != null:
+                if prover.prefix.arrays[target].copied is copied:
+                    return false
+                return same_trip(prover, target, read)
+            if prover.prefix.arrays[target].copied is copy:
+                return ElisaLLVMInstructionDominates(analyses, copy, read) != 0
+            from: LLVMBasicBlockRef = get prover.prefix.arrays[target].from else return false
+            exit: LLVMBasicBlockRef = get prover.prefix.arrays[target].target else return false
+            return true if ElisaLLVMEdgeDominates(analyses, from, exit, LLVMGetInstructionParent(read)) != 0
+            # The length must keep its value from the guard to the read: every value in it
+            # is defined before the fill, which runs once.
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, from) else return false
+            length: ElisaScalarEvolutionExpressionRef = get prover.prefix.arrays[target].length else return false
+            return false if length_may_change(analyses, length, fill)
+            guarded_walk(prover, target, read, loop, length)
