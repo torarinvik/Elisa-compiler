@@ -1,0 +1,173 @@
+# Narrow unsigned representations of guarded signed values on AArch64.
+#
+# `x + ((x >> 31) & 2^32)` turns a loaded i64 holding a signed 32-bit value into its
+# unsigned 32-bit representation by adding the modulus on the negative path. When a
+# dominating range check keeps the value inside the signed 32-bit range, the sum inside a
+# loop is the same as `x & 0xFFFFFFFF`, with the loaded value frozen so the check and the
+# mask observe one choice for undef.
+include "../../ir/loop_pass_policy.elisa"
+
+const module SignedRangeMaskLimit:
+    WIDTH: u32 = 32
+    MODULUS: u64 = 4294967296
+    SIGN_SHIFT: u64 = 31
+    LOW_BITS: u64 = 4294967295
+    SIGNED_MINIMUM: i64 = -2147483648
+    SIGNED_MAXIMUM: i64 = 2147483647
+    CANDIDATES: usize = 64
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+
+# `sum = input + ((input >> 31) & 2^32)` and the parts it is built from.
+struct SignedNormalization:
+    sum: LLVMValueRef
+    sign_mask: LLVMValueRef
+    sign_shift: LLVMValueRef
+    input: LLVMValueRef
+
+# A load and its frozen value.
+struct FrozenInput:
+    input: LLVMValueRef
+    frozen: LLVMValueRef
+
+extend Backend:
+    private:
+        # The users of VALUE, in use-list order.
+        def value_users(value: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            users: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+            while cursor is use |cursor, users|:
+                users.push(LLVMGetUser(use))
+                cursor <- LLVMGetNextUse(use)
+            users
+
+        # Whether the region the check's EDGE allows for `input + offset` keeps INPUT in
+        # the signed 32-bit range.
+        def bounds_signed_word(compare: LLVMValueRef, offset: LLVMValueRef, edge: u32) -> bool:
+            predicate: i32 = LLVMGetICmpPredicate(compare) if edge == 0 else inverse_integer_predicate(LLVMGetICmpPredicate(compare))
+            region: ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(predicate, LLVMGetOperand(compare, 1))
+            range: ElisaConstantRangeRef = ElisaLLVMConstantRangeSubtract(region, offset)
+            bounded: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeSignedMin(range) >= SignedRangeMaskLimit::SIGNED_MINIMUM and ElisaLLVMConstantRangeSignedMax(range) <= SignedRangeMaskLimit::SIGNED_MAXIMUM
+            ElisaLLVMDisposeConstantRange(region)
+            ElisaLLVMDisposeConstantRange(range)
+            bounded
+
+        # Whether a branch on COMPARE has an edge dominating USE_BLOCK that keeps the
+        # value in the signed 32-bit range.
+        def compare_guards_signed_word(compare: LLVMValueRef, offset: LLVMValueRef, use_block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Memory.Allocate]:
+            for user in value_users(compare) |compare, offset, use_block, analyses|:
+                if is_llvm_instruction_with_opcode(user, LLVMOpcode::CONDITIONAL_BR):
+                    if LLVMGetSuccessor(user, 0) != LLVMGetSuccessor(user, 1):
+                        for edge in 0..<2.u32() |compare, offset, use_block, analyses, user|:
+                            if ElisaLLVMEdgeDominates(analyses, LLVMGetInstructionParent(user), LLVMGetSuccessor(user, edge), use_block) != 0:
+                                return true if bounds_signed_word(compare, offset, edge)
+            false
+
+        # Whether a check `(input + offset) <pred> limit` guards AT's block so that INPUT
+        # stays in the signed 32-bit range.
+        def guards_signed_word(input: LLVMValueRef, at: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Memory.Allocate]:
+            use_block: LLVMBasicBlockRef = LLVMGetInstructionParent(at)
+            for bias in value_users(input) |input, use_block, analyses|:
+                if is_llvm_instruction_with_opcode(bias, LLVMOpcode::ADD):
+                    offset: LLVMValueRef = LLVMGetOperand(bias, 1) if LLVMGetOperand(bias, 0) == input else LLVMGetOperand(bias, 0)
+                    if LLVMIsAConstantInt(offset) != null:
+                        for compare in value_users(bias) |bias, offset, use_block, analyses|:
+                            if is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) and LLVMGetOperand(compare, 0) == bias and LLVMIsAConstantInt(LLVMGetOperand(compare, 1)) != null:
+                                return true if compare_guards_signed_word(compare, offset, use_block, analyses)
+            false
+
+        # SUM as `input + ((input >> 31) & 2^32)` over a simple i64 load, in either order.
+        def signed_normalization(sum: LLVMValueRef) -> SignedNormalization?:
+            return null if not is_llvm_instruction_with_opcode(sum, LLVMOpcode::ADD) or not is_llvm_integer_type(LLVMTypeOf(sum), 64) or ElisaLLVMHasMetadataOtherThanDebugLoc(sum) != 0
+            for side in 0..<2.u32() |sum|:
+                input: LLVMValueRef = LLVMGetOperand(sum, side)
+                mask: LLVMValueRef = LLVMGetOperand(sum, 1 - side)
+                if is_llvm_instruction_with_opcode(input, LLVMOpcode::LOAD) and LLVMGetVolatile(input) == 0 and LLVMGetOrdering(input) == 0 and is_llvm_instruction_with_opcode(mask, LLVMOpcode::AND):
+                    shift: LLVMValueRef = LLVMGetOperand(mask, 0)
+                    if is_constant_integer(LLVMGetOperand(mask, 1), SignedRangeMaskLimit::MODULUS) and is_llvm_instruction_with_opcode(shift, LLVMOpcode::LSHR):
+                        if LLVMGetOperand(shift, 0) == input and is_constant_integer(LLVMGetOperand(shift, 1), SignedRangeMaskLimit::SIGN_SHIFT):
+                            return SignedNormalization{sum: sum, sign_mask: mask, sign_shift: shift, input: input}
+            null
+
+        def function_signed_normalizations(function: LLVMValueRef) -> darray[SignedNormalization] can[Memory.Allocate]:
+            found: mutable darray[SignedNormalization] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, found|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, found|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if signed_normalization(instruction) is normalization:
+                        found.push(normalization)
+            found
+
+        # The candidates inside loops whose input a range check bounds.
+        def proven_normalizations(candidates: darray[SignedNormalization]&, function: LLVMValueRef) -> darray[SignedNormalization] can[Memory.Allocate]:
+            proven: mutable darray[SignedNormalization] = []
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return proven
+            for normalization in candidates |proven, analyses|:
+                if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(normalization.sum)) != null:
+                    proven.push(normalization) if guards_signed_word(normalization.input, normalization.sum, analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            proven
+
+        # The frozen INPUT, freezing it right after the load on first use so the range
+        # check and the mask observe one value.
+        def frozen_input[@r](frozen: mutable darray[FrozenInput] @r, input: LLVMValueRef, builder: LLVMBuilderRef) -> darray[FrozenInput] @r can[Abort.Panic, Memory.Allocate]:
+            return frozen if any entry in frozen where entry.input == input
+            next: LLVMValueRef = get LLVMGetNextInstruction(input) else return frozen
+            position_builder_before(builder, next)
+            name_storage: mutable darray[u8] = []
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, input, sview_to_cstr("signed.range.value", name_storage))
+            replace_uses_except(input, stable, stable)
+            frozen.push(FrozenInput{input: input, frozen: stable})
+            frozen
+
+        def frozen_value(frozen: darray[FrozenInput]&, input: LLVMValueRef) -> LLVMValueRef:
+            for entry in frozen |input|:
+                return entry.frozen if entry.input == input
+            input
+
+        # Replaces each proven sum by the frozen input's low 32 bits, then drops the sign
+        # masks and shifts left without uses.
+        def mask_signed_normalizations(proven: darray[SignedNormalization]&, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            frozen: mutable darray[FrozenInput] = []
+            for normalization in proven |frozen, builder|:
+                frozen <- frozen_input(frozen, normalization.input, builder)
+                position_builder_before(builder, normalization.sum)
+                name_storage: mutable darray[u8] = []
+                low_bits: LLVMValueRef = LLVMConstInt(LLVMTypeOf(normalization.sum), SignedRangeMaskLimit::LOW_BITS, 0)
+                masked: LLVMValueRef = LLVMBuildAnd(builder, frozen_value(&frozen, normalization.input), low_bits, sview_to_cstr("signed.range.mask", name_storage))
+                LLVMReplaceAllUsesWith(normalization.sum, masked)
+                LLVMInstructionEraseFromParent(normalization.sum)
+            erase_unused_parts([normalization.sign_mask for normalization in proven])
+            erase_unused_parts([normalization.sign_shift for normalization in proven])
+            proven.count.u32()
+
+        # Erases each distinct instruction of PARTS that has no uses.
+        def erase_unused_parts(parts: darray[LLVMValueRef]) -> void can[Memory.Allocate]:
+            erased: mutable darray[LLVMValueRef] = []
+            for part in parts |erased|:
+                if not (any done in erased where done == part):
+                    erased.push(part)
+                    LLVMInstructionEraseFromParent(part) if LLVMGetFirstUse(part) == null
+
+        def fold_function_signed_range_masks(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if skipped_by_loop_pass_policy(function, module) or function_instruction_count(function) > SignedRangeMaskLimit::FUNCTION_INSTRUCTIONS
+            candidates: darray[SignedNormalization] = function_signed_normalizations(function)
+            return 0 if candidates.count == 0 or candidates.count > SignedRangeMaskLimit::CANDIDATES
+            proven: darray[SignedNormalization] = proven_normalizations(&candidates, function)
+            mask_signed_normalizations(&proven, builder)
+
+    public:
+        # The sums rewritten as masks in AArch64 modules; the loop-pass policy skips debug
+        # info and sanitizers.
+        def fold_signed_range_masks(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + fold_function_signed_range_masks(function, module, builder)
+            LLVMDisposeBuilder(builder)
+            changed

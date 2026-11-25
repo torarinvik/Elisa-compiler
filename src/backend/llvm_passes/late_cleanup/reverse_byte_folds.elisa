@@ -1,0 +1,251 @@
+# Reverse polynomial reductions over a privately stored byte prefix, on AArch64.
+#
+# A loop `hash = hash * radix + zext(bytes[i - 1])` running i from a prefix length down to
+# 1, over a static byte array whose every byte is stored by a chain of blocks that each
+# store one more byte and set the length, evaluates Horner's rule from the end. That equals
+# the sum of each byte times its index power modulo 2^64, so each storing block adds its
+# term to a running sum, a phi at the loop's entry picks the sum for the length, and the
+# loop and the stores go away.
+include "../ir/loop_pass_policy.elisa"
+
+const module ReverseByteLimit:
+    BODY_INSTRUCTIONS: u32 = 10
+    MINIMUM_LENGTHS: u32 = 4
+    MAXIMUM_LENGTHS: u32 = 12
+    FUNCTION_BLOCKS: u32 = 32
+    MODULE_FUNCTIONS: u32 = 512
+    ALL_ONES: u64 = 18446744073709551615
+
+# The matched loop: its body, the block entering it, its exit, the byte read, the hash
+# update, the prefix length phi, the radix and the byte array.
+struct ReverseByteFold:
+    body: LLVMBasicBlockRef
+    entry: LLVMBasicBlockRef
+    exit: LLVMBasicBlockRef
+    read: LLVMValueRef
+    result: LLVMValueRef
+    length: LLVMValueRef
+    radix: LLVMValueRef
+    array: LLVMValueRef
+
+# The stores of each prefix byte, by offset, and the memset clearing the array first.
+struct ReverseByteStores:
+    stores: darray[LLVMValueRef]
+    fill: LLVMValueRef?
+
+extend Backend:
+    private:
+        def is_instruction_in(value: LLVMValueRef, opcode: u32, block: LLVMBasicBlockRef) -> bool:
+            is_llvm_instruction_with_opcode(value, opcode) and LLVMGetInstructionParent(value) == block
+
+        # The loop's counter phi `i` with `i - 1` (as `i + -1`) tested against zero by
+        # the body's back edge, and the block entering the loop.
+        def reverse_counter(body: LLVMBasicBlockRef) -> LLVMValueRef?:
+            back: LLVMValueRef = get conditional_terminator(body) else return null
+            test: LLVMValueRef = LLVMGetCondition(back)
+            return null if not is_instruction_in(test, LLVMOpcode::ICMP, body) or LLVMGetICmpPredicate(test) != LLVMIntPredicate::EQ
+            return null if LLVMGetSuccessor(back, 1) != body or LLVMGetSuccessor(back, 0) == body or not is_constant_integer(LLVMGetOperand(test, 1), 0)
+            step: LLVMValueRef = LLVMGetOperand(test, 0)
+            return null if not is_instruction_in(step, LLVMOpcode::ADD, body)
+            index: LLVMValueRef = LLVMGetOperand(step, 0)
+            return null if not is_instruction_in(index, LLVMOpcode::PHI, body) or not is_constant_integer(LLVMGetOperand(step, 1), ReverseByteLimit::ALL_ONES)
+            return null if not is_llvm_integer_type(LLVMTypeOf(index), 64) or LLVMCountIncoming(index) != 2
+            continued: LLVMValueRef = get phi_incoming_for_block(index, body) else return null
+            return null if continued != step
+            index
+
+        # The hash phi beside the counter, starting at 0 on entry.
+        def hash_phi(body: LLVMBasicBlockRef, index: LLVMValueRef, entry: LLVMBasicBlockRef) -> LLVMValueRef?:
+            first: LLVMValueRef = get LLVMGetFirstInstruction(body) else return null
+            hash: mutable LLVMValueRef = first
+            if first == index:
+                hash <- get LLVMGetNextInstruction(first) else return null
+            return null if not is_llvm_instruction_with_opcode(hash, LLVMOpcode::PHI) or LLVMCountIncoming(hash) != 2
+            return null if phi_incoming_for_block(hash, body) == null
+            initial: LLVMValueRef = get phi_incoming_for_block(hash, entry) else return null
+            return null if not is_constant_integer(initial, 0)
+            hash
+
+        # Whether every instruction of BODY other than RESULT is used only inside it.
+        def body_is_closed(body: LLVMBasicBlockRef, result: LLVMValueRef) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(body)
+            while cursor is instruction |cursor, body, result|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if instruction != result:
+                    use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(instruction)
+                    while use_cursor is use |use_cursor, body|:
+                        user: LLVMValueRef = LLVMGetUser(use)
+                        return false if LLVMIsAInstruction(user) == null or LLVMGetInstructionParent(user) != body
+                        use_cursor <- LLVMGetNextUse(use)
+            true
+
+        # BODY as `hash = hash * radix + zext(array[i - 1])` counting i down to zero.
+        def match_reverse_byte_fold(body: LLVMBasicBlockRef) -> ReverseByteFold? can[Abort.Panic]:
+            return null if instruction_count(body) != ReverseByteLimit::BODY_INSTRUCTIONS or ElisaLLVMBlockHasAddressTaken(body) != 0
+            index: LLVMValueRef = get reverse_counter(body) else return null
+            step: LLVMValueRef = get phi_incoming_for_block(index, body) else return null
+            entry: LLVMBasicBlockRef = LLVMGetIncomingBlock(index, 1) if LLVMGetIncomingBlock(index, 0) == body else LLVMGetIncomingBlock(index, 0)
+            length: LLVMValueRef = get phi_incoming_for_block(index, entry) else return null
+            return null if not is_llvm_instruction_with_opcode(length, LLVMOpcode::PHI) or LLVMGetInstructionParent(length) != entry
+            enter: LLVMValueRef = get LLVMGetBasicBlockTerminator(entry) else return null
+            return null if LLVMGetInstructionOpcode(enter) != LLVMOpcode::UNCONDITIONAL_BR or LLVMGetSuccessor(enter, 0) != body
+            hash: LLVMValueRef = get hash_phi(body, index, entry) else return null
+            add: LLVMValueRef = get phi_incoming_for_block(hash, body) else return null
+            return null if not is_instruction_in(add, LLVMOpcode::ADD, body)
+            multiply: LLVMValueRef = LLVMGetOperand(add, 0)
+            extend: LLVMValueRef = LLVMGetOperand(add, 1)
+            return null if not is_instruction_in(multiply, LLVMOpcode::MUL, body) or LLVMGetOperand(multiply, 0) != hash or not is_instruction_in(extend, LLVMOpcode::ZEXT, body)
+            radix: LLVMValueRef = LLVMGetOperand(multiply, 1)
+            read: LLVMValueRef = LLVMGetOperand(extend, 0)
+            return null if LLVMIsAConstantInt(radix) == null or not is_instruction_in(read, LLVMOpcode::LOAD, body) or LLVMGetVolatile(read) != 0 or LLVMGetOrdering(read) != 0
+            element: LLVMValueRef = LLVMGetOperand(read, 0)
+            return null if not is_instruction_in(element, LLVMOpcode::GET_ELEMENT_PTR, body) or not is_llvm_integer_type(LLVMTypeOf(read), 8) or not is_llvm_integer_type(LLVMTypeOf(hash), 64)
+            array: LLVMValueRef = LLVMGetOperand(element, 0)
+            return null if not is_llvm_integer_type(LLVMGetGEPSourceElementType(element), 8) or LLVMGetNumIndices(element) != 1 or LLVMGetOperand(element, 1) != step
+            return null if not is_llvm_instruction_with_opcode(array, LLVMOpcode::ALLOCA) or ElisaLLVMIsStaticAlloca(array) == 0 or ElisaLLVMAllocaIsUsedWithInAlloca(array) != 0 or ElisaLLVMAllocaIsSwiftError(array) != 0
+            return null if not body_is_closed(body, add)
+            back: LLVMValueRef = get conditional_terminator(body) else return null
+            ReverseByteFold{body: body, entry: entry, exit: LLVMGetSuccessor(back, 0), read: read, result: add, length: length, radix: radix, array: array}
+
+        # The array and the GEPs that address into it, or none when the array is used as
+        # an index.
+        def array_pointers(array: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            pointers: mutable darray[LLVMValueRef] = [array]
+            cursor: mutable LLVMUseRef? = LLVMGetFirstUse(array)
+            while cursor is use |cursor, pointers, array|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                cursor <- LLVMGetNextUse(use)
+                if is_llvm_instruction_with_opcode(user, LLVMOpcode::GET_ELEMENT_PTR):
+                    return [] if LLVMGetOperand(user, 0) != array
+                    pointers.push(user)
+            pointers
+
+        def is_clearing_memset(user: LLVMValueRef, pointer: LLVMValueRef) -> bool:
+            ElisaLLVMIsMemSet(user) != 0 and is_constant_integer(LLVMGetOperand(user, 3), 0) and LLVMGetNumOperandBundles(user) == 0 and LLVMGetOperand(user, 0) == pointer
+
+        # The byte offset a simple i8 store through POINTER writes into the array, when
+        # it is one of the COUNT prefix bytes.
+        def prefix_store_offset(store: LLVMValueRef, pointer: LLVMValueRef, fold: ReverseByteFold&, module: LLVMModuleRef, count: u32) -> u32? can[Unsafe.PointerCast]:
+            return null if LLVMGetVolatile(store) != 0 or LLVMGetOrdering(store) != 0 or LLVMGetOperand(store, 1) != pointer
+            return null if not is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(store, 0)), 8)
+            offset: mutable i64 = 0
+            base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(pointer, module, (&offset).cast[void&])
+            return null if base != fold.array or offset < 0 or offset >= count.i64()
+            offset.u32()
+
+        # Every user of the array's pointers sorted into the prefix stores (by offset) and
+        # one clearing memset; none when another user or a repeated offset appears.
+        def collect_prefix_stores(fold: ReverseByteFold&, module: LLVMModuleRef, count: u32) -> ReverseByteStores? can[Memory.Allocate, Unsafe.PointerCast]:
+            pointers: darray[LLVMValueRef] = array_pointers(fold.array)
+            return null if pointers.count == 0
+            stores: mutable darray[LLVMValueRef] = [fold.read for _ in 0..<count]
+            filled: mutable darray[bool] = [false for _ in 0..<count]
+            fill: mutable LLVMValueRef? = null
+            for pointer in pointers |stores, filled, fill, pointers, fold, module, count|:
+                cursor: mutable LLVMUseRef? = LLVMGetFirstUse(pointer)
+                while cursor is use |cursor, stores, filled, fill, pointers, pointer, fold, module, count|:
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    cursor <- LLVMGetNextUse(use)
+                    skipped: bool = user == fold.read or (pointer == fold.array and (any known in pointers where known == user))
+                    if not skipped:
+                        if is_llvm_instruction_with_opcode(user, LLVMOpcode::STORE):
+                            offset: u32 = get prefix_store_offset(user, pointer, fold, module, count) else return null
+                            taken: bool = get filled[offset] else return null
+                            return null if taken
+                            stores[offset] <- user
+                            filled[offset] <- true
+                        elif fill == null and is_clearing_memset(user, pointer):
+                            fill <- user
+                        else:
+                            return null
+            return null if any taken in filled where not taken
+            ReverseByteStores{stores: stores, fill: fill}
+
+        # Whether the store of byte I sits in the block setting the length to I + 1, each
+        # block entered only from the one storing the byte before, and the memset (if any)
+        # clears the array before the first store in its block.
+        def prefix_stores_chain(fold: ReverseByteFold&, found: ReverseByteStores&) -> bool:
+            for index in 0..<found.stores.count.u32() |fold, found|:
+                store: LLVMValueRef = get found.stores[index] else return false
+                block: LLVMBasicBlockRef = LLVMGetInstructionParent(store)
+                length: LLVMValueRef = get phi_incoming_for_block(fold.length, block) else return false
+                return false if not is_constant_integer(length, index.u64() + 1)
+                if index != 0:
+                    previous: LLVMValueRef = get found.stores[index - 1] else return false
+                    predecessor: LLVMBasicBlockRef = get single_predecessor(block) else return false
+                    return false if predecessor != LLVMGetInstructionParent(previous)
+            first: LLVMValueRef = get found.stores[0] else return false
+            if found.fill is fill:
+                return LLVMGetInstructionParent(fill) == LLVMGetInstructionParent(first) and comes_before(fill, first)
+            true
+
+        # Replaces the loop by the sum phi `byte.prefix.sum` in the entry block, built from
+        # each storing block's running sum of byte * radix^offset, and erases the stores,
+        # the memset and the loop body, which then branches straight to the exit.
+        def fold_prefix_sum(fold: ReverseByteFold&, found: ReverseByteStores&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            sum_type: LLVMTypeRef = LLVMTypeOf(fold.result)
+            name_storage: mutable darray[u8] = []
+            position_builder_before(builder, first_non_phi(fold.entry))
+            LLVMSetCurrentDebugLocation2(builder, null)
+            sum: LLVMValueRef = LLVMBuildPhi(builder, sum_type, sview_to_cstr("byte.prefix.sum", name_storage))
+            prefix: mutable LLVMValueRef = LLVMConstInt(sum_type, 0, 0)
+            power: mutable LLVMValueRef = LLVMConstInt(sum_type, 1, 0)
+            for store in found.stores |prefix, power, sum, sum_type, fold, builder|:
+                position_builder_before(builder, store)
+                widened: LLVMValueRef = LLVMBuildZExt(builder, LLVMGetOperand(store, 0), sum_type, "")
+                prefix <- LLVMBuildAdd(builder, prefix, LLVMBuildMul(builder, widened, power, ""), "")
+                add_phi_incoming(sum, prefix, LLVMGetInstructionParent(store))
+                power <- ElisaLLVMConstantIntMultiply(power, fold.radix)
+                LLVMInstructionEraseFromParent(store)
+            if found.fill is fill:
+                LLVMInstructionEraseFromParent(fill)
+            LLVMReplaceAllUsesWith(fold.result, sum)
+            clear_block(fold.body)
+            LLVMPositionBuilderAtEnd(builder, fold.body)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            _ = LLVMBuildBr(builder, fold.exit)
+
+        # Erases every instruction of BLOCK, whose values are used only inside it.
+        def clear_block(block: LLVMBasicBlockRef) -> void can[Memory.Allocate]:
+            instructions: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, instructions|:
+                instructions.push(instruction)
+                cursor <- LLVMGetNextInstruction(instruction)
+            for instruction in instructions:
+                LLVMReplaceAllUsesWith(instruction, LLVMGetPoison(LLVMTypeOf(instruction))) if LLVMGetTypeKind(LLVMTypeOf(instruction)) != 0
+            for offset in 0..<instructions.count |instructions|:
+                last: LLVMValueRef = get instructions[instructions.count - 1 - offset] else return
+                LLVMInstructionEraseFromParent(last)
+
+        def fold_reverse_byte_reduction(body: LLVMBasicBlockRef, module: LLVMModuleRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fold: ReverseByteFold = get match_reverse_byte_fold(body) else return false
+            return false if ElisaLLVMDataLayoutIndexSizeInBits(module, LLVMGetPointerAddressSpace(LLVMTypeOf(fold.array))) != 64
+            count: u32 = LLVMCountIncoming(fold.length)
+            return false if count < ReverseByteLimit::MINIMUM_LENGTHS or count > ReverseByteLimit::MAXIMUM_LENGTHS
+            found: ReverseByteStores = get collect_prefix_stores(&fold, module, count) else return false
+            return false if not prefix_stores_chain(&fold, &found)
+            fold_prefix_sum(&fold, &found, builder)
+            true
+
+        def fold_function_reverse_bytes(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if LLVMCountBasicBlocks(function) > ReverseByteLimit::FUNCTION_BLOCKS or skipped_by_loop_pass_policy(function, module)
+            changed: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, changed, module, builder|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                changed <- changed + 1 if fold_reverse_byte_reduction(block, module, builder)
+            changed
+
+    public:
+        # The byte-prefix reductions folded in an AArch64 module of at most 512 functions.
+        def fold_reverse_byte_reductions(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module) or module_function_count(module) > ReverseByteLimit::MODULE_FUNCTIONS
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + fold_function_reverse_bytes(function, module, builder)
+            LLVMDisposeBuilder(builder)
+            changed

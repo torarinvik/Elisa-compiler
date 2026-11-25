@@ -64,7 +64,6 @@ extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
 unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
 unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
 unsigned elisacoreFoldOddTrailingZeroSelects(llvm::Module &);
-unsigned elisacoreFoldReverseByteReductions(llvm::Module &);
 #include "llvm_bisection_ranges.h"
 #include "llvm_checked_signed_ranges.h"
 #include "llvm_recursive_argument_bounds.h"
@@ -137,7 +136,6 @@ extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);
 extern "C" unsigned elisacoreOptimizeBoundedSums(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreOptimizeIndexBounds(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreFoldBoundedRemainders(LLVMModuleRef);
-extern "C" unsigned elisacoreFoldSignedRangeMasks(LLVMModuleRef);
 #include "llvm_ordered_vector.cpp"
 
 // The late scalar cleanup sequence lives in Elisa

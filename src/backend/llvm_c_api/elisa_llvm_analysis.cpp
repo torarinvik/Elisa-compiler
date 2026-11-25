@@ -352,6 +352,12 @@ int ElisaLLVMBlockIsEHPad(LLVMBasicBlockRef block) { return unwrap(block)->isEHP
 
 unsigned ElisaLLVMUseOperandNumber(LLVMUseRef use) { return unwrap(use)->getOperandNo(); }
 
+LLVMValueRef ElisaLLVMConstantIntMultiply(LLVMValueRef left, LLVMValueRef right) {
+  ConstantInt *Left = cast<ConstantInt>(unwrap(left));
+  return wrap(ConstantInt::get(Left->getContext(),
+                               Left->getValue() * cast<ConstantInt>(unwrap(right))->getValue()));
+}
+
 uint64_t ElisaLLVMConstantDoubleBits(LLVMValueRef constant) {
   return cast<ConstantFP>(unwrap(constant))->getValueAPF().bitcastToAPInt().getZExtValue();
 }

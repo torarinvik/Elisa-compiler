@@ -40,8 +40,8 @@ for part in \
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
 mkdir -p "$WORK/src/backend"
-for source in llvm_validation_peel llvm_scalar_loop_idioms llvm_reverse_byte_fold llvm_constant_paths llvm_memory_and_call_passes \
-  llvm_numeric_passes llvm_bounded_remainder llvm_signed_range_masks; do
+for source in llvm_validation_peel llvm_scalar_loop_idioms llvm_constant_paths llvm_memory_and_call_passes \
+  llvm_numeric_passes llvm_bounded_remainder; do
   printf '%s\n' '// LLVM bridge fixture' > "$WORK/src/backend/$source.cpp"
 done
 # The seed builds the runtime object after the product (70589584), and that helper
