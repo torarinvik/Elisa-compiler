@@ -6,6 +6,7 @@
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/Support/CBindingWrapping.h>
 
 #include <optional>
@@ -353,6 +354,11 @@ ElisaConstantRangeRef ElisaLLVMConstantRangeExtremum(uint32_t extremum, ElisaCon
 
 LLVMValueRef ElisaLLVMConstantIntUnsignedDivideRoundingUp(LLVMValueRef first, LLVMValueRef second) {
   return constantOf(first, APIntOps::RoundingUDiv(constantValue(first), constantValue(second), APInt::Rounding::UP));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeAddNoUnsignedWrap(ElisaConstantRangeRef range, LLVMValueRef constant) {
+  return wrap(new ConstantRange(
+      unwrap(range)->addWithNoWrap(ConstantRange(constantValue(constant)), OverflowingBinaryOperator::NoUnsignedWrap)));
 }
 
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range) { delete unwrap(range); }

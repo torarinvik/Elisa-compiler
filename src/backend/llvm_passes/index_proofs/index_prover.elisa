@@ -1,0 +1,197 @@
+# Prove Index <u Length for integer values at a program point (`ElisaIndexBounds::
+# Prover`). The proof combines scalar evolution with facts it does not chain on its
+# own: comparisons decided on dominating branch edges (transitively), lower bounds read
+# from those edges, the extremes of affine recurrences, and induction over loop-header
+# phis. A header phi is below a loop-invariant Length when every incoming value is,
+# assuming the phi itself is below it on the back edges; several such assumptions are
+# discharged together, as one induction over their headers. Comparisons between header
+# phis holding on every incoming edge (`left <u right`) are facts the header dominates.
+#
+# Every rule spends one unit of a fixed budget where the C++ prover does, so both give up
+# on the same questions.
+include "./index_value_ranges.elisa"
+include "./index_prover_bounds.elisa"
+include "./index_prover_facts.elisa"
+include "./element_bounds.elisa"
+
+const module IndexProofDepth:
+    BELOW: u32 = 9
+    SENTINEL: u32 = 6
+
+extend Backend:
+    private:
+        # Whether FUNCTION writes an all-ones value (a -1 meaning "none"): a constant store
+        # of at least 16 bits or a 0xFF byte fill (`writesAllOnes`).
+        def writes_all_ones(function: LLVMValueRef) -> bool:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return true if writes_all_ones_value(instruction)
+            false
+
+        def writes_all_ones_value(instruction: LLVMValueRef) -> bool:
+            if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::STORE):
+                stored: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                return LLVMIsAConstantInt(stored) != null and has_every_bit_set(stored) and LLVMGetIntTypeWidth(LLVMTypeOf(stored)) >= 16
+            return false if ElisaLLVMIsMemSet(instruction) == 0
+            byte: LLVMValueRef = LLVMGetOperand(instruction, 1)
+            LLVMIsAConstantInt(byte) != null and has_every_bit_set(byte)
+
+        # Whether the function writes an all-ones value, looked at once.
+        def function_writes_all_ones(prover: mutable IndexProver&) -> bool:
+            if prover.sentinels.all_ones == AllOnesWrites::UNKNOWN:
+                prover.sentinels.all_ones <- AllOnesWrites::PRESENT if writes_all_ones(prover.function) else AllOnesWrites::ABSENT
+            prover.sentinels.all_ones == AllOnesWrites::PRESENT
+
+        # INDEX, an unknown term, is below LENGTH or at least a floor everywhere, and a fact
+        # where AT runs keeps it below the floor (a bounds check of `parent[current]`
+        # passing on a parent array holding -1 or a node below the count): below LENGTH.
+        def sentinel_below(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, value: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            # One at a time: a nested proof would restart the budget, unbounded.
+            return false if prover.inside_sentinel or depth > IndexProofDepth::SENTINEL or prover.budget == 0
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI) and LLVMIsALoadInst(value) == null
+            return false if not function_writes_all_ones(prover)
+            key: TableKey = TableKey{first: expression_key(index), second: expression_key(length), third: value_key(at)}
+            if key_table_find(&prover.sentinels.table, key) is known:
+                return prover.sentinels.results[known]
+            entry: u32 = prover.sentinels.results.count.u32()
+            prover.sentinels.results.push(false)
+            prover.sentinels.table <- key_table_insert(prover.sentinels.table, key, entry)
+            top: LLVMValueRef = highest(prover, index, at)
+            return false if has_every_bit_set(top)
+            # A fixed budget and depth, so the result depends on its key alone.
+            rest: u32 = prover.budget
+            prover.budget <- IndexProofLimit::SENTINEL_BUDGET
+            prover.inside_sentinel <- true
+            holds: bool = below_or_from(prover, value, length, LLVMConstAdd(top, LLVMConstInt(LLVMTypeOf(top), 1, 0)), at, 0)
+            prover.inside_sentinel <- false
+            prover.budget <- rest
+            prover.sentinels.results[entry] <- holds
+            holds
+
+        # Every incoming value of MERGE is below LENGTH or at least FLOOR at its edge.
+        def incoming_below_or_from(prover: mutable IndexProver&, merge: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, floor: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<LLVMCountIncoming(merge) |prover, merge, length, floor, depth|:
+                at: LLVMValueRef = terminator_of(LLVMGetIncomingBlock(merge, index))
+                return false if not below_or_from(prover, LLVMGetIncomingValue(merge, index), length, floor, at, depth + 1)
+            true
+
+        # VALUE is below LENGTH or at least FLOOR wherever it is defined (`belowOrFrom`):
+        # a constant at least FLOOR, a value below LENGTH, or a phi of them (a header phi by
+        # induction).
+        def below_or_from(prover: mutable IndexProver&, value: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, floor: LLVMValueRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > IndexProofDepth::BELOW or prover.budget == 0 or not has_term(prover.analyses, value) or LLVMTypeOf(value) != term_type(length)
+            prover.budget <- prover.budget - 1
+            if LLVMIsAConstantInt(value) != null:
+                return constants_compare(LLVMIntPredicate::UGE, value, floor) or value_below(prover, value, length, at, depth)
+            return true if value_below(prover, value, length, at, depth)
+            # Reads whose values another analysis bounds (`loadBelowOrFrom`): none here.
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+            loop: ElisaLoopRef? = ElisaLLVMLoopForBlock(prover.analyses, LLVMGetInstructionParent(value))
+            if loop is owner:
+                if ElisaLLVMLoopHeader(owner) == LLVMGetInstructionParent(value):
+                    return true if assumption_holds(&prover.assumptions.from_phis, &prover.assumptions.from_bounds, 0, value, length)
+                    return false if not is_term_invariant(prover.analyses, length, owner)
+            prover.assumptions.from_phis.push(value)
+            prover.assumptions.from_bounds.push(length)
+            holds: bool = incoming_below_or_from(prover, value, length, floor, depth)
+            last: u64 = prover.assumptions.from_phis.count - 1
+            prover.assumptions.from_phis <- prover.assumptions.from_phis.truncate(last)
+            prover.assumptions.from_bounds <- prover.assumptions.from_bounds.truncate(last)
+            holds
+
+        # Below each operand of an unsigned minimum LENGTH.
+        def below_every_operand(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for operand in 0..<term_operand_count(length) |prover, index, length, at, depth|:
+                return false if not proof_below(prover, index, term_operand(length, operand), at, depth + 1)
+            true
+
+        # Some operand of the unsigned minimum INDEX is below LENGTH.
+        def some_operand_below(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for operand in 0..<term_operand_count(index) |prover, index, length, at, depth|:
+                return true if proof_below(prover, term_operand(index, operand), length, at, depth + 1)
+            false
+
+        # The rules of `below` before the shapes of INDEX itself.
+        def below_by_bounds(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            # Index = Length - c is below Length exactly when Length >= c.
+            if term_constant(term_difference(analyses, length, index)) is gap:
+                return true if not is_zero_constant(gap) and proof_at_most(prover, index, length, at, depth + 1)
+            return true if guarded(prover, index, length, at, depth, true) or scaled_below(prover, index, length, at, depth) or difference_below(prover, index, length, at, depth)
+            # Index = X - c with X >= c > 0 is below X.
+            if is_term_of(index, ElisaScalarEvolutionKind::ADD, 2) and is_term_negative(term_operand(index, 0)):
+                rest: ElisaScalarEvolutionExpressionRef = term_operand(index, 1)
+                if gap_fits(prover, term_negation(analyses, term_operand(index, 0)), rest, at, 0):
+                    return true if proof_below(prover, rest, length, at, depth + 1) or proof_at_most(prover, rest, length, at, depth + 1)
+            # Index + 1, nonzero where At runs, is at most Length (`items[position - 1]`
+            # under `position > 0`).
+            next: ElisaScalarEvolutionExpressionRef = term_sum(analyses, index, term_constant_like(analyses, index, 1))
+            return true if not is_zero_constant(lowest(prover, next, at)) and proof_at_most(prover, next, length, at, depth + 1)
+            # a /u c with c > 1 is below a whenever a is nonzero.
+            if term_kind(index) == ElisaScalarEvolutionKind::UNSIGNED_DIVIDE:
+                if term_constant(term_operand(index, 1)) is divisor:
+                    dividend: ElisaScalarEvolutionExpressionRef = term_operand(index, 0)
+                    if constants_compare(LLVMIntPredicate::UGT, divisor, LLVMConstInt(LLVMTypeOf(divisor), 1, 0)) and not is_zero_constant(lowest(prover, dividend, at)):
+                        return true if proof_at_most(prover, dividend, length, at, depth + 1)
+            if index_limit(index, analyses) is limit:
+                if limit.strict:
+                    return true if proof_at_most(prover, limit.limit, length, at, depth + 1)
+                else:
+                    return true if proof_below(prover, limit.limit, length, at, depth + 1)
+            if index_midpoint(index, analyses) is midpoint:
+                return true if proof_below(prover, midpoint.low, midpoint.high, at, depth + 1) and proof_at_most(prover, midpoint.high, length, at, depth + 1)
+            false
+
+        # The rules of `below` for an unknown INDEX standing for VALUE.
+        def unknown_below(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, value: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI):
+                return true if phi_below(prover, value, length, depth)
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT):
+                return value_below(prover, LLVMGetOperand(value, 1), length, at, depth) and value_below(prover, LLVMGetOperand(value, 2), length, at, depth)
+            # Reads whose values another analysis bounds (`loadBelow`): none here.
+            sentinel_below(prover, index, value, length, at, depth)
+
+    public:
+        # INDEX <u LENGTH wherever AT runs, within a fixed proof budget; queries nested in
+        # a sentinel proof share its budget (`proveBelow`).
+        def prove_below(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            prover.budget <- IndexProofLimit::BUDGET if not prover.inside_sentinel
+            proof_below(prover, index, length, at, 0)
+
+        # LOW <=u HIGH wherever AT runs, within the same budget (`proveAtMost`).
+        def prove_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            prover.budget <- IndexProofLimit::BUDGET if not prover.inside_sentinel
+            proof_at_most(prover, low, high, at, 0)
+
+        # INDEX <u LENGTH wherever AT runs (`below`).
+        def proof_below(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > IndexProofDepth::BELOW or prover.budget == 0 or term_type(index) != term_type(length)
+            prover.budget <- prover.budget - 1
+            return true if ElisaLLVMScalarEvolutionIsKnownPredicateAt(prover.analyses, LLVMIntPredicate::ULT, index, length, at) != 0
+            return true if constants_compare(LLVMIntPredicate::ULT, highest(prover, index, at), lowest(prover, length, at))
+            # Below each operand of an unsigned minimum is below the minimum.
+            if term_kind(length) == ElisaScalarEvolutionKind::UNSIGNED_MINIMUM:
+                return true if below_every_operand(prover, index, length, at, depth)
+            # An unsigned minimum is at most each of its operands.
+            return some_operand_below(prover, index, length, at, depth) if term_kind(index) == ElisaScalarEvolutionKind::UNSIGNED_MINIMUM
+            return true if below_by_bounds(prover, index, length, at, depth)
+            if term_kind(index) == ElisaScalarEvolutionKind::ADD_RECURRENCE:
+                return recurrence_below(prover, index, length, depth) or exit_bound_at(prover, index, length, at, depth)
+            value: LLVMValueRef = get term_value(index) else return false
+            unknown_below(prover, index, value, length, at, depth)
+
+        # LOW <=u HIGH wherever AT runs (`atMost`): known outright, or LOW = HIGH - Gap for
+        # a Gap that never exceeds HIGH, so the subtraction does not wrap, or by a rule.
+        def proof_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if low == high or ElisaLLVMScalarEvolutionIsKnownPredicateAt(prover.analyses, LLVMIntPredicate::ULE, low, high, at) != 0
+            if term_type(low) == term_type(high):
+                return true if constants_compare(LLVMIntPredicate::ULE, highest(prover, low, at), lowest(prover, high, at))
+            return true if gap_fits(prover, term_difference(prover.analyses, high, low), high, at, 0)
+            return true if guarded(prover, low, high, at, depth, false) or successor_at_most(prover, low, high, at, depth)
+            return true if recurrence_at_most(prover, low, high, depth) or rounded_at_most(prover, low, high, at, depth)
+            return true if phi_at_most(prover, low, high, depth) or part_at_most(prover, low, high, at, depth)
+            counted_at_most(prover, low, high, at, depth) or element_at_most(prover, low, high, depth)

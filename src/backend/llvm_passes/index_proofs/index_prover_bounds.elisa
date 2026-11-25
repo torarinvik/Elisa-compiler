@@ -1,0 +1,178 @@
+# The index prover's rules over the shape of the smaller side: recurrences bounded by
+# their largest value, counts bounded by their loop's iterations, minimums, maximums,
+# selects, midpoints and quotients bounded by their parts.
+include "./index_value_ranges.elisa"
+
+const module IndexBoundDepth:
+    PART: u32 = 6
+    COUNT: u32 = 8
+    RECURRENCE: u32 = 9
+
+extend Backend:
+    private:
+        # TOP is below BOUND (STRICT) or at most it where ENTRY runs: the question a
+        # recurrence's largest value answers for `recurrenceWithin`'s callers.
+        def top_within(prover: mutable IndexProver&, top: ElisaScalarEvolutionExpressionRef, bound: ElisaScalarEvolutionExpressionRef, entry: LLVMValueRef, depth: u32, strict: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return proof_below(prover, top, bound, entry, depth + 1) if strict
+            proof_at_most(prover, top, bound, entry, depth + 1)
+
+        # The back edge LATCH takes only when RECURRENCE's value is above another
+        # (`while left > target: left <- left - 1` tests the decremented value).
+        def positive_on_back_edge(prover: mutable IndexProver&, recurrence: ElisaScalarEvolutionExpressionRef, latch: LLVMBasicBlockRef, header: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            for fact in edge_compares(latch, header) |prover, recurrence|:
+                predicate: mutable i32 = fact_predicate(fact)
+                left: mutable LLVMValueRef = LLVMGetOperand(fact.compare, 0)
+                right: mutable LLVMValueRef = LLVMGetOperand(fact.compare, 1)
+                continue if not has_term(prover.analyses, left)
+                if term_of(prover.analyses, right) == recurrence:
+                    swapped: LLVMValueRef = left
+                    left <- right
+                    right <- swapped
+                    predicate <- swapped_integer_predicate(predicate)
+                continue if term_of(prover.analyses, left) != recurrence
+                return true if predicate == LLVMIntPredicate::UGT
+                return true if predicate == LLVMIntPredicate::NE and LLVMIsAConstantInt(right) != null and is_zero_constant(right)
+            false
+
+        # START + STEP * COUNT for a constant nonnegative STEP does not overflow even at
+        # the largest values of COUNT and START where ENTRY runs. Both the product and the
+        # sum must not overflow (the C++ prover let the sum's flag replace the product's).
+        def stride_fits(prover: mutable IndexProver&, start: ElisaScalarEvolutionExpressionRef, stride: LLVMValueRef, count: ElisaScalarEvolutionExpressionRef, entry: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            largest_count: LLVMValueRef = highest(prover, count, entry)
+            largest_start: LLVMValueRef = highest(prover, start, entry)
+            return false if ElisaLLVMConstantIntMultiplyOverflows(largest_count, stride) != 0
+            sum: LLVMValueRef = LLVMConstAdd(ElisaLLVMConstantIntMultiply(largest_count, stride), largest_start)
+            not constants_compare(LLVMIntPredicate::ULT, sum, largest_start)
+
+        # Some bound B of COUNT (COUNT itself, or each operand of a minimum) has
+        # START <=u START + B and START + B within BOUND.
+        def unit_step_within(prover: mutable IndexProver&, start: ElisaScalarEvolutionExpressionRef, count: ElisaScalarEvolutionExpressionRef, bound: ElisaScalarEvolutionExpressionRef, entry: LLVMValueRef, depth: u32, strict: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            minimum: bool = term_kind(count) == ElisaScalarEvolutionKind::UNSIGNED_MINIMUM
+            limits: u32 = term_operand_count(count) if minimum else 1
+            for index in 0..<limits |prover, start, count, bound, entry, depth, strict, minimum|:
+                limit: ElisaScalarEvolutionExpressionRef = term_operand(count, index) if minimum else count
+                last: ElisaScalarEvolutionExpressionRef = term_sum(prover.analyses, start, limit)
+                return true if proof_at_most(prover, start, last, entry, depth + 1) and top_within(prover, last, bound, entry, depth, strict)
+            false
+
+    public:
+        # Whether every value of RECURRENCE's loop is at most its largest, and that
+        # largest is below BOUND (STRICT) or at most it at the loop's entry
+        # (`recurrenceWithin`).
+        def recurrence_within(prover: mutable IndexProver&, recurrence: ElisaScalarEvolutionExpressionRef, bound: ElisaScalarEvolutionExpressionRef, depth: u32, strict: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > IndexBoundDepth::RECURRENCE
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(recurrence) else return false
+            count: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionSymbolicMaxBackedgeTakenCount(analyses, loop)
+            start: ElisaScalarEvolutionExpressionRef = term_operand(recurrence, 0)
+            affine: bool = term_operand_count(recurrence) == 2
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            entry: LLVMValueRef = get first_insertion_point(header) else return false
+            step: ElisaScalarEvolutionExpressionRef? = ElisaLLVMScalarEvolutionStepRecurrence(analyses, recurrence) if affine else null
+            # A countdown whose back edge runs only while it is nonzero never wraps.
+            if step is countdown:
+                if is_term_all_ones(countdown):
+                    if ElisaLLVMLoopLatch(loop) is latch:
+                        if not is_zero_constant(lowest(prover, recurrence, terminator_of(latch))) or positive_on_back_edge(prover, recurrence, latch, header):
+                            return top_within(prover, start, bound, entry, depth, strict)
+            stepped: ElisaScalarEvolutionExpressionRef = get step else return false
+            return false if term_kind(count) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE or term_type(count) != term_type(start)
+            settled: ElisaScalarEvolutionExpressionRef = settle(prover, count, entry, depth)
+            # Values Start + k for k <= Count, none wrapping past Start + Count.
+            return unit_step_within(prover, start, settled, bound, entry, depth, strict) if is_term_constant(stepped, 1)
+            # Start + Step * Count does not overflow, so no value wraps and the last is the largest.
+            if term_constant(stepped) is stride:
+                if not is_term_negative(stepped):
+                    return false if not stride_fits(prover, start, stride, settled, entry)
+                    return top_within(prover, term_sum(analyses, start, ElisaLLVMScalarEvolutionMultiply(analyses, stepped, settled)), bound, entry, depth, strict)
+            # Values Start - k for k <= Count <= Start never wrap below zero.
+            return proof_at_most(prover, settled, start, entry, depth + 1) and top_within(prover, start, bound, entry, depth, strict) if is_term_all_ones(stepped)
+            false
+
+        # By the recurrence's largest value, else by induction over its header phi
+        # (`recurrenceBelow`).
+        def recurrence_below(prover: mutable IndexProver&, recurrence: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            merge: LLVMValueRef? = recurrence_header_phi(recurrence, prover.analyses)
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(recurrence) else return false
+            if is_term_invariant(prover.analyses, length, loop):
+                return true if recurrence_within(prover, recurrence, length, depth, true)
+            phi: LLVMValueRef = get merge else return false
+            phi_below(prover, phi, length, depth + 1)
+
+        # A recurrence over a loop HIGH does not change is at most HIGH when its largest
+        # value is (`recurrenceAtMost`).
+        def recurrence_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if term_kind(low) != ElisaScalarEvolutionKind::ADD_RECURRENCE
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(low) else return false
+            is_term_invariant(prover.analyses, high, loop) and recurrence_within(prover, low, high, depth, false)
+
+        # k * (a /u k) <=u a: rounding down to a multiple never exceeds a (`roundedAtMost`).
+        def rounded_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_term_of(low, ElisaScalarEvolutionKind::MULTIPLY, 2)
+            quotient: ElisaScalarEvolutionExpressionRef = get quotient_term(term_operand(low, 1)) else return false
+            term_operand(quotient, 1) == term_operand(low, 0) and depth <= IndexBoundDepth::RECURRENCE and proof_at_most(prover, term_operand(quotient, 0), high, at, depth + 1)
+
+        # X + 1 <=u HIGH when X <u HIGH: the increment cannot wrap. A recurrence is a
+        # header phi's successor (`successorAtMost`).
+        def successor_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            incremented: bool = is_term_of(low, ElisaScalarEvolutionKind::ADD, 2) and is_term_constant(term_operand(low, 0), 1)
+            return false if not incremented and term_kind(low) != ElisaScalarEvolutionKind::ADD_RECURRENCE
+            proof_below(prover, term_difference(prover.analyses, low, term_constant_like(prover.analyses, low, 1)), high, at, depth + 1)
+
+        # A count rising by at most one per iteration from zero is at most the iterations
+        # run: k (plus one after the increment) in iteration k (`countedAtMost`).
+        def counted_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth >= IndexBoundDepth::COUNT
+            value: LLVMValueRef = get term_value(low) else return false
+            count: RisingCount = get rising_count(value, prover.analyses) else return false
+            return false if not has_term(prover.analyses, count.header)
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(count.header)) else return false
+            type: LLVMTypeRef = LLVMTypeOf(count.header)
+            extra: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionConstantOf(analyses, type, count.extra)
+            bound: mutable ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionAddRecurrence(analyses, extra, ElisaLLVMScalarEvolutionConstantOf(analyses, type, 1), loop, 1)
+            # After the loop, the latest iteration is at most the largest back-edge count
+            # (exits that trap count too, so it bounds the normal ones).
+            if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(at)) == 0:
+                taken: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionSymbolicMaxBackedgeTakenCount(analyses, loop)
+                return false if term_kind(taken) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE or term_type(taken) != type
+                bound <- term_sum(analyses, taken, extra)
+            proof_at_most(prover, bound, high, at, depth + 1)
+
+        # An unsigned minimum is at most each operand, a maximum at most what all its
+        # operands are, a select at most its two values' bound, and a quotient (half of a
+        # prefix) at most its dividend (`partAtMost`).
+        def part_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > IndexBoundDepth::PART or prover.budget == 0
+            prover.budget <- prover.budget - 1
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            kind: u32 = term_kind(low)
+            return some_part_at_most(prover, low, high, at, depth) if kind == ElisaScalarEvolutionKind::UNSIGNED_MINIMUM
+            # Y + 1 is at most a bound Y is below (one past an accessed element).
+            if kind == ElisaScalarEvolutionKind::ADD and term_operand_count(low) >= 2 and is_term_constant(term_operand(low, 0), 1):
+                return true if proof_below(prover, term_difference(analyses, low, term_operand(low, 0)), high, at, depth + 1)
+            return every_part_at_most(prover, low, high, at, depth) if kind == ElisaScalarEvolutionKind::UNSIGNED_MAXIMUM
+            if term_instruction(low, LLVMOpcode::SELECT) is choice:
+                # A minimum is at most either value; any other choice needs both.
+                minimum: bool = chooses_minimum(choice)
+                chosen: bool = proof_at_most(prover, term_of(analyses, LLVMGetOperand(choice, 1)), high, at, depth + 1)
+                return chosen if chosen == minimum
+                return proof_at_most(prover, term_of(analyses, LLVMGetOperand(choice, 2)), high, at, depth + 1)
+            if index_midpoint(low, analyses) is midpoint:
+                return proof_at_most(prover, midpoint.low, midpoint.high, at, depth + 1) and proof_at_most(prover, midpoint.high, high, at, depth + 1)
+            return false if kind != ElisaScalarEvolutionKind::UNSIGNED_DIVIDE
+            ElisaLLVMScalarEvolutionIsKnownNonZero(analyses, term_operand(low, 1)) != 0 and proof_at_most(prover, term_operand(low, 0), high, at, depth + 1)
+
+        def some_part_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<term_operand_count(low) |prover, low, high, at, depth|:
+                return true if proof_at_most(prover, term_operand(low, index), high, at, depth + 1)
+            false
+
+        def every_part_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<term_operand_count(low) |prover, low, high, at, depth|:
+                return false if not proof_at_most(prover, term_operand(low, index), high, at, depth + 1)
+            true
+
+        # Scalar evolution describes VALUE, and VALUE is below LENGTH (`valueBelow`).
+        def value_below(prover: mutable IndexProver&, value: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            has_term(prover.analyses, value) and proof_below(prover, term_of(prover.analyses, value), length, at, depth + 1)

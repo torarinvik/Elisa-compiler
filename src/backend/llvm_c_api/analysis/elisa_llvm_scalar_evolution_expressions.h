@@ -19,8 +19,7 @@ extern "C" {
 typedef struct ElisaOpaqueScalarEvolutionExpression *ElisaScalarEvolutionExpressionRef;
 
 /* The kinds of node a pass distinguishes; the rest are OTHER_CAST (a pointer-to-integer
- * cast), OTHER_OPERATION (add recurrences, sequential umin) and OTHER (unsigned division,
- * vscale). */
+ * cast), OTHER_OPERATION (sequential umin) and OTHER (vscale). */
 enum ElisaScalarEvolutionKind {
   ELISA_SCEV_COULD_NOT_COMPUTE = 0,
   ELISA_SCEV_CONSTANT = 1,
@@ -36,7 +35,9 @@ enum ElisaScalarEvolutionKind {
   ELISA_SCEV_SIGNED_MINIMUM = 11,
   ELISA_SCEV_SIGNED_MAXIMUM = 12,
   ELISA_SCEV_OTHER_OPERATION = 13,
-  ELISA_SCEV_OTHER = 14
+  ELISA_SCEV_OTHER = 14,
+  ELISA_SCEV_ADD_RECURRENCE = 15,
+  ELISA_SCEV_UNSIGNED_DIVIDE = 16
 };
 
 /* ScalarEvolution::getExitCount(loop, exiting_block): the backedges taken before the

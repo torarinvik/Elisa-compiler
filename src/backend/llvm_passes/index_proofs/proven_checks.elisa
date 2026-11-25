@@ -1,0 +1,75 @@
+# Remove checks that branch to a trap when the comparison on the other edge always
+# holds (`ElisaProvenChecks`). The proofs are the index prover's (index_prover.elisa):
+# guards on dominating edges, ranges along every path, recurrences, and induction over
+# loop headers, which covers the cursors of heap sifts and two-pointer scans that scalar
+# evolution alone cannot bound. A proof may use another check's passing edge: it
+# executed earlier, so removing both is an induction over execution order. All proofs
+# finish before any branch changes, so no proof reads a branch an earlier removal
+# already folded.
+include "./index_prover.elisa"
+
+# A conditional branch with a trap on one side, and the index of its other, safe
+# successor.
+struct TrapCheck:
+    branch: LLVMValueRef
+    safe: u32
+
+extend Backend:
+    private:
+        # FUNCTION's branches that trap on exactly one side.
+        def trap_checks(function: LLVMValueRef) -> darray[TrapCheck] can[Memory.Allocate]:
+            checks: mutable darray[TrapCheck] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, checks|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if conditional_terminator(block) is branch:
+                    for side in 0..<2 |checks, branch|:
+                        trapping: bool = ends_in_unreachable(LLVMGetSuccessor(branch, side.u32()))
+                        if trapping and not ends_in_unreachable(LLVMGetSuccessor(branch, 1 - side.u32())):
+                            checks.push(TrapCheck{branch: branch, safe: 1 - side.u32()})
+            checks
+
+        # Whether the comparison deciding CHECK's branch holds whenever the branch takes
+        # its safe side, so the trapping side is never taken (`proved`).
+        def check_proved(prover: mutable IndexProver&, check: TrapCheck) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            compare: LLVMValueRef = LLVMGetCondition(check.branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or not has_term(prover.analyses, LLVMGetOperand(compare, 0))
+            predicate: i32 = LLVMGetICmpPredicate(compare) if check.safe == 0 else inverse_integer_predicate(LLVMGetICmpPredicate(compare))
+            first: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, LLVMGetOperand(compare, 0))
+            second: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, LLVMGetOperand(compare, 1))
+            swap: bool = predicate == LLVMIntPredicate::UGT or predicate == LLVMIntPredicate::UGE
+            left: ElisaScalarEvolutionExpressionRef = second if swap else first
+            right: ElisaScalarEvolutionExpressionRef = first if swap else second
+            oriented: i32 = swapped_integer_predicate(predicate) if swap else predicate
+            when oriented:
+                LLVMIntPredicate::ULT -> prove_below(prover, left, right, check.branch)
+                LLVMIntPredicate::ULE -> prove_at_most(prover, left, right, check.branch)
+                LLVMIntPredicate::NE -> prove_below(prover, left, right, check.branch) or prove_below(prover, right, left, check.branch)
+                _ -> false
+
+        def remove_function_proven_checks(function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            checks: darray[TrapCheck] = trap_checks(function)
+            return 0 if checks.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            prover: mutable IndexProver = new_index_prover(function, analyses)
+            proven: mutable darray[TrapCheck] = []
+            for check in checks |prover, proven|:
+                proven.push(check) if check_proved(&prover, check)
+            dispose_index_prover(&prover)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            boolean: LLVMTypeRef = LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(function)))
+            for check in proven |boolean|:
+                LLVMSetCondition(check.branch, LLVMConstInt(boolean, 1 if check.safe == 0 else 0, 0))
+            proven.count.u32()
+
+    public:
+        # The checks of MODULE's functions that a proof shows never trap, folded to their
+        # safe side; returns how many.
+        def remove_proven_checks(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            removed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, removed|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+                removed <- removed + remove_function_proven_checks(function)
+            removed

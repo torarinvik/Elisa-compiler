@@ -151,6 +151,8 @@ ElisaConstantRangeRef ElisaLLVMConstantRangeExtremum(uint32_t extremum, ElisaCon
                                                      ElisaConstantRangeRef right);
 /* APIntOps::RoundingUDiv(first, second, Rounding::UP) on ConstantInts of one width. */
 LLVMValueRef ElisaLLVMConstantIntUnsignedDivideRoundingUp(LLVMValueRef first, LLVMValueRef second);
+/* range.addWithNoWrap(ConstantRange(constant), NoUnsignedWrap): the sums that do not wrap. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeAddNoUnsignedWrap(ElisaConstantRangeRef range, LLVMValueRef constant);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus

@@ -1,0 +1,272 @@
+# Value shapes the index prover reads beyond scalar evolution's own algebra
+# (`ElisaIndexShapes`).
+#
+# The vectorizer's main loop runs Index = c, c + k, ... (c <u k, k a power of two) and
+# leaves when Index - c + k, computed with `add nuw`, equals N = A - R, where
+# R = A & (k - 1), or that remainder with zero replaced by k so a scalar tail always
+# runs, or N = A & M with M's low bits clear. N is a multiple of k at most A, so every
+# iteration has Index - c + k <=u N and Index <u A. Other exits (an early-exit search)
+# only end the loop sooner. The replaced form needs A nonzero: A = 0 would make N wrap.
+#
+# A binary search's midpoint L + (H - L) /u 2 lies below H when L <u H, and a select is
+# at most a bound when both its values are.
+include "./proof_terms.elisa"
+
+# How a value is A's remainder modulo k: not at all, A & (k - 1), or that remainder with
+# zero replaced by k.
+const module RemainderForm:
+    NONE: u32 = 0
+    MASKED: u32 = 1
+    REPLACED: u32 = 2
+
+# A bound on an index: above it when STRICT, else at least it.
+struct IndexLimit:
+    limit: ElisaScalarEvolutionExpressionRef
+    strict: bool
+
+# A midpoint L + (H - L) /u 2: its high end H and low end L.
+struct Midpoint:
+    high: ElisaScalarEvolutionExpressionRef
+    low: ElisaScalarEvolutionExpressionRef
+
+# A count rising by at most one per iteration from zero: its loop's header phi, and one
+# when the value is the count after an iteration's increment (zero for the phi itself).
+struct RisingCount:
+    header: LLVMValueRef
+    extra: u64
+
+# An `add nuw base, step` with a constant step.
+struct NoWrapIncrement:
+    base: LLVMValueRef
+    step: LLVMValueRef
+
+extend Backend:
+    private:
+        # `m_And(m_Specific(operand), m_SpecificInt(mask))`.
+        def is_masked_by(value: LLVMValueRef, operand: LLVMValueRef, mask: u64) -> bool:
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::AND) or LLVMGetOperand(value, 0) != operand
+            constant: LLVMValueRef = LLVMGetOperand(value, 1)
+            LLVMIsAConstantInt(constant) != null and ElisaLLVMConstantIntEquals(constant, mask) != 0
+
+        # `select (icmp eq Low, 0), mask + 1, Low`: the Low it replaces zero in.
+        def zero_replaced(value: LLVMValueRef, mask: u64) -> LLVMValueRef?:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT)
+            test: LLVMValueRef = LLVMGetOperand(value, 0)
+            return null if not is_llvm_instruction_with_opcode(test, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(test) != LLVMIntPredicate::EQ
+            low: LLVMValueRef = LLVMGetOperand(test, 0)
+            zero: LLVMValueRef = LLVMGetOperand(test, 1)
+            return null if LLVMIsAConstantInt(zero) == null or not is_zero_constant(zero)
+            multiple: LLVMValueRef = LLVMGetOperand(value, 1)
+            return null if LLVMIsAConstantInt(multiple) == null or ElisaLLVMConstantIntEquals(multiple, mask + 1) == 0
+            return null if LLVMGetOperand(value, 2) != low
+            low
+
+        # Whether STEPPED is PHI or PHI + 1 (`add nuw`).
+        def steps_from(stepped: LLVMValueRef, phi: LLVMValueRef) -> bool:
+            return true if stepped == phi
+            increment: NoWrapIncrement = get no_wrap_increment(stepped) else return false
+            increment.base == phi and ElisaLLVMConstantIntEquals(increment.step, 1) != 0
+
+        # Whether CANDIDATE steps from PHI, or is a join inside LOOP (not its header) of
+        # values that each do.
+        def joins_count(candidate: LLVMValueRef, phi: LLVMValueRef, loop: ElisaLoopRef) -> bool:
+            return true if steps_from(candidate, phi)
+            return false if not is_llvm_instruction_with_opcode(candidate, LLVMOpcode::PHI)
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(candidate)
+            return false if block == ElisaLLVMLoopHeader(loop) or ElisaLLVMLoopContainsBlock(loop, block) == 0
+            for index in 0..<LLVMCountIncoming(candidate) |candidate, phi|:
+                return false if not steps_from(LLVMGetIncomingValue(candidate, index), phi)
+            true
+
+        # The header phi of LOOP_HEADER that VALUE, a join's incoming value, is or steps
+        # from, else CURRENT.
+        def counted_header(value: LLVMValueRef, merge: LLVMValueRef, loop_header: LLVMBasicBlockRef, current: LLVMValueRef?) -> LLVMValueRef?:
+            if value != merge and is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI):
+                return value if LLVMGetInstructionParent(value) == loop_header
+                return current
+            increment: NoWrapIncrement = get no_wrap_increment(value) else return current
+            return increment.base if is_llvm_instruction_with_opcode(increment.base, LLVMOpcode::PHI) and LLVMGetInstructionParent(increment.base) == loop_header
+            current
+
+        # The A of the exit test COMPARE whose side SIDE is the increment: the other side
+        # is A - R for a remainder R of A, or A & M with M's low bits (MASK) clear.
+        def rounded_side(compare: LLVMValueRef, side: u32, mask: u64, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic]:
+            other: LLVMValueRef = LLVMGetOperand(compare, 1 - side)
+            if is_llvm_instruction_with_opcode(other, LLVMOpcode::AND) and LLVMIsAConstantInt(LLVMGetOperand(other, 1)) != null:
+                kept: LLVMValueRef = LLVMGetOperand(other, 1)
+                low_bits: LLVMValueRef = ElisaLLVMConstantIntAnd(kept, LLVMConstInt(LLVMTypeOf(kept), mask, 0))
+                return LLVMGetOperand(other, 0) if is_zero_constant(low_bits)
+                return null
+            return null if not is_llvm_instruction_with_opcode(other, LLVMOpcode::SUB)
+            limit: LLVMValueRef = LLVMGetOperand(other, 0)
+            return limit if remainder_form(LLVMGetOperand(other, 1), limit, mask, analyses) != RemainderForm::NONE
+            null
+
+        # The rounded limit A of a vectorized main loop's index (`roundedLimit`).
+        def rounded_limit(recurrence: ElisaScalarEvolutionExpressionRef, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(recurrence) else return null
+            start: LLVMValueRef = get term_constant(term_operand(recurrence, 0)) else return null
+            return null if term_operand_count(recurrence) != 2
+            step: LLVMValueRef = get term_constant(ElisaLLVMScalarEvolutionStepRecurrence(analyses, recurrence)) else return null
+            return null if not is_power_of_two(step) or not constants_compare(LLVMIntPredicate::ULT, start, step)
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            return null if not leaves_loop(latch, loop)
+            branch: LLVMValueRef = get conditional_terminator(latch) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            exit_side: u32 = 0 if predicate == LLVMIntPredicate::EQ else 1
+            return null if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, exit_side)) != 0
+            next: ElisaScalarEvolutionExpressionRef = term_sum(analyses, recurrence, term_of(analyses, LLVMConstSub(step, start)))
+            mask: u64 = LLVMConstIntGetZExtValue(step) - 1
+            for side in 0..<2 |compare, next, mask, analyses|:
+                increment: LLVMValueRef = LLVMGetOperand(compare, side.u32())
+                continue if not is_llvm_instruction_with_opcode(increment, LLVMOpcode::ADD) or LLVMGetNUW(increment) == 0
+                continue if term_of(analyses, increment) != next
+                return rounded_side(compare, side.u32(), mask, analyses)
+            null
+
+    public:
+        # How REMAINDER is LIMIT's remainder modulo MASK + 1 (`remainder`): the replaced
+        # form counts only when LIMIT is known nonzero.
+        def remainder_form(remainder: LLVMValueRef, limit: LLVMValueRef, mask: u64, analyses: ElisaFunctionAnalysesRef) -> u32:
+            return RemainderForm::MASKED if is_masked_by(remainder, limit, mask)
+            low: LLVMValueRef = get zero_replaced(remainder, mask) else return RemainderForm::NONE
+            return RemainderForm::NONE if not is_masked_by(low, limit, mask)
+            return RemainderForm::NONE if ElisaLLVMScalarEvolutionIsKnownNonZero(analyses, term_of(analyses, limit)) == 0
+            RemainderForm::REPLACED
+
+        # The constant step of `add nuw base, step` (`nuwIncrement`).
+        def no_wrap_increment(value: LLVMValueRef) -> NoWrapIncrement?:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::ADD) or LLVMGetNUW(value) == 0
+            step: LLVMValueRef = LLVMGetOperand(value, 1)
+            return null if LLVMIsAConstantInt(step) == null
+            NoWrapIncrement{base: LLVMGetOperand(value, 0), step: step}
+
+        # The quotient a /u k in TERM, also seen through a truncation and zero extension
+        # back that can only make it smaller (`quotient`).
+        def quotient_term(term: ElisaScalarEvolutionExpressionRef) -> ElisaScalarEvolutionExpressionRef?:
+            current: mutable ElisaScalarEvolutionExpressionRef = term
+            if term_kind(term) == ElisaScalarEvolutionKind::ZERO_EXTEND:
+                truncated: ElisaScalarEvolutionExpressionRef = term_operand(term, 0)
+                if term_kind(truncated) == ElisaScalarEvolutionKind::TRUNCATE and term_type(term_operand(truncated, 0)) == term_type(term):
+                    current <- term_operand(truncated, 0)
+            return current if term_kind(current) == ElisaScalarEvolutionKind::UNSIGNED_DIVIDE
+            null
+
+        # A value above INDEX: the A of a rounded loop's index, or of the rounded count
+        # A - R itself in the replaced form. Not strict: the a of a count k * (a /u k)
+        # rounded down (`limit`).
+        def index_limit(index: ElisaScalarEvolutionExpressionRef, analyses: ElisaFunctionAnalysesRef) -> IndexLimit? can[Abort.Panic, Memory.Allocate]:
+            if is_term_of(index, ElisaScalarEvolutionKind::MULTIPLY, 2):
+                if quotient_term(term_operand(index, 1)) is quotient:
+                    return IndexLimit{limit: term_operand(quotient, 0), strict: false} if term_operand(quotient, 1) == term_operand(index, 0)
+            if term_kind(index) == ElisaScalarEvolutionKind::ADD_RECURRENCE:
+                limit: LLVMValueRef = get rounded_limit(index, analyses) else return null
+                return IndexLimit{limit: term_of(analyses, limit), strict: true}
+            return null if term_kind(index) != ElisaScalarEvolutionKind::ADD
+            # Sums flatten, so A's own terms sit beside -R: A = Index + R.
+            for position in 0..<term_operand_count(index) |index, analyses|:
+                if replaced_limit(index, term_operand(index, position), analyses) is limit:
+                    return IndexLimit{limit: limit, strict: true}
+            null
+
+        # The A of a sum term -R, R the replaced remainder select of A.
+        def replaced_limit(index: ElisaScalarEvolutionExpressionRef, term: ElisaScalarEvolutionExpressionRef, analyses: ElisaFunctionAnalysesRef) -> ElisaScalarEvolutionExpressionRef?:
+            return null if not is_term_of(term, ElisaScalarEvolutionKind::MULTIPLY, 2) or not is_term_all_ones(term_operand(term, 0))
+            unknown: ElisaScalarEvolutionExpressionRef = term_operand(term, 1)
+            choice: LLVMValueRef = get term_instruction(unknown, LLVMOpcode::SELECT) else return null
+            multiple: LLVMValueRef = LLVMGetOperand(choice, 1)
+            return null if LLVMIsAConstantInt(multiple) == null or not is_power_of_two(multiple)
+            masked: LLVMValueRef = LLVMGetOperand(choice, 2)
+            return null if not is_llvm_instruction_with_opcode(masked, LLVMOpcode::AND)
+            limit: LLVMValueRef = LLVMGetOperand(masked, 0)
+            limit_term: ElisaScalarEvolutionExpressionRef = term_of(analyses, limit)
+            return null if limit_term != term_sum(analyses, index, unknown)
+            return null if remainder_form(choice, limit, LLVMConstIntGetZExtValue(multiple) - 1, analyses) != RemainderForm::REPLACED
+            limit_term
+
+        # The phi of RECURRENCE's loop header that RECURRENCE describes (`headerPhi`).
+        def recurrence_header_phi(recurrence: ElisaScalarEvolutionExpressionRef, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Memory.Allocate]:
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(recurrence) else return null
+            for phi in block_phis(ElisaLLVMLoopHeader(loop)) |recurrence, analyses|:
+                return phi if has_term(analyses, phi) and term_of(analyses, phi) == recurrence
+            null
+
+        # H and L for a midpoint L + (H - L) /u 2 (`midpoint`).
+        def index_midpoint(index: ElisaScalarEvolutionExpressionRef, analyses: ElisaFunctionAnalysesRef) -> Midpoint?:
+            return null if not is_term_of(index, ElisaScalarEvolutionKind::ADD, 2)
+            for position in 0..<2 |index, analyses|:
+                half: ElisaScalarEvolutionExpressionRef = term_operand(index, position.u32())
+                if term_kind(half) == ElisaScalarEvolutionKind::UNSIGNED_DIVIDE and is_term_constant(term_operand(half, 1), 2):
+                    low: ElisaScalarEvolutionExpressionRef = term_operand(index, 1 - position.u32())
+                    return Midpoint{high: term_sum(analyses, term_operand(half, 0), low), low: low}
+            null
+
+        # The values VALUE can have on an edge whose decided comparisons FACTS compare it
+        # with a constant (`edgeRange`).
+        def edge_value_range(facts: darray[CompareFact]&, value: LLVMValueRef) -> ElisaConstantRangeRef can[Abort.Panic]:
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(value)))
+            for fact in facts |range, value|:
+                predicate: i32 = fact_predicate(fact)
+                left: LLVMValueRef = LLVMGetOperand(fact.compare, 0)
+                right: LLVMValueRef = LLVMGetOperand(fact.compare, 1)
+                if right != value:
+                    if left == value and LLVMIsAConstantInt(right) != null:
+                        range <- intersect_smallest_ranges(range, ElisaLLVMConstantRangeExactByCompare(predicate, right))
+                elif LLVMIsAConstantInt(left) != null:
+                    range <- intersect_smallest_ranges(range, ElisaLLVMConstantRangeExactByCompare(swapped_integer_predicate(predicate), left))
+            range
+
+        # `intersectWith(second)` (the smallest result), consuming both ranges.
+        def intersect_smallest_ranges(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef) -> ElisaConstantRangeRef:
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(first, second)
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            result
+
+        # `unionWith(second)` (the smallest result), consuming both ranges.
+        def unite_smallest_ranges(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef) -> ElisaConstantRangeRef:
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeUnion(first, second)
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            result
+
+        # A count that starts at zero and rises by at most one per iteration of its loop
+        # (`risingCount`): VALUE is the loop's header phi, or a join after it of the phi
+        # and the phi plus one, and the phi's back edge brings such a value.
+        def rising_count(value: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> RisingCount? can[Abort.Panic]:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(value)
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, block) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            # The loop's one outside predecessor, which need not be a dedicated preheader.
+            entry: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return null
+            loop_header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            found: mutable LLVMValueRef? = value if block == loop_header else null
+            if block != loop_header:
+                for index in 0..<LLVMCountIncoming(value) |found, value, loop_header|:
+                    found <- counted_header(LLVMGetIncomingValue(value, index), value, loop_header, found)
+            header: LLVMValueRef = get found else return null
+            start: LLVMValueRef = get phi_incoming_for_block(header, entry) else return null
+            return null if LLVMIsAConstantInt(start) == null or not is_zero_constant(start)
+            back: LLVMValueRef = get phi_incoming_for_block(header, latch) else return null
+            return null if not joins_count(back, header, loop)
+            return null if value != header and not joins_count(value, header, loop)
+            RisingCount{header: header, extra: 0 if value == header else 1}
+
+        # Whether CHOICE picks the unsigned minimum of its two values by comparing them
+        # (`chooseMinimum`).
+        def chooses_minimum(choice: LLVMValueRef) -> bool:
+            test: LLVMValueRef = LLVMGetOperand(choice, 0)
+            return false if not is_llvm_instruction_with_opcode(test, LLVMOpcode::ICMP)
+            chosen: LLVMValueRef = LLVMGetOperand(choice, 1)
+            other: LLVMValueRef = LLVMGetOperand(choice, 2)
+            predicate: mutable i32 = LLVMGetICmpPredicate(test)
+            if LLVMGetOperand(test, 0) == other and LLVMGetOperand(test, 1) == chosen:
+                predicate <- swapped_integer_predicate(predicate)
+            elif LLVMGetOperand(test, 0) != chosen or LLVMGetOperand(test, 1) != other:
+                return false
+            # Now the test reads `chosen predicate other`, and chosen must be the smaller.
+            predicate == LLVMIntPredicate::ULT or predicate == LLVMIntPredicate::ULE

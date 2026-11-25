@@ -1,0 +1,120 @@
+# Bound the values a load from a local integer array reads by checks made after each
+# store (`ElisaElementBounds::Checker`): validation code often stores an input value
+# first and tests it afterwards (`right[k] <- input[off]; return -1 if right[k] > n`).
+# A load of such an array is at most H when the array starts from a zero fill and, for
+# every store of a value V into it, either V is at most H, or every path from the store
+# returns, or decides V <=u H, before it reads the array anywhere else or stores V's
+# element again. Along a path, loads of one address with no store to that object between
+# them are one value, so a test that reloads the element (and a neighbour it is compared
+# with) decides the stored value itself. Signed tests count when they also show V >=s 0:
+# `0 <=s left <=s V <=s n` puts V in [0, n] unsigned.
+include "./index_value_ranges.elisa"
+include "./element_paths.elisa"
+include "../late_cleanup/array_values/array_accesses.elisa"
+
+const module ElementBoundLimit:
+    DEPTH: u32 = 6
+    CHECKS_BEFORE_STORE: u32 = 8
+    WALK_BUDGET: u32 = 2000
+
+extend Backend:
+    private:
+        # TERM names a value that may differ between AT and elsewhere: a recurrence, or an
+        # unknown other than an argument or constant that is defined in a loop or does
+        # not dominate AT (`SCEVExprContains` in `fixedEverywhere`).
+        def unfixed_term(prover: IndexProver&, term: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef) -> bool:
+            kind: u32 = term_kind(term)
+            return true if kind == ElisaScalarEvolutionKind::ADD_RECURRENCE
+            if term_value(term) is value:
+                return false if LLVMIsAArgument(value) != null or LLVMIsAConstant(value) != null
+                return true if LLVMIsAInstruction(value) == null
+                return true if ElisaLLVMLoopForBlock(prover.analyses, LLVMGetInstructionParent(value)) != null
+                return ElisaLLVMInstructionDominates(prover.analyses, value, at) == 0
+            return false if kind == ElisaScalarEvolutionKind::CONSTANT or kind == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            for index in 0..<term_operand_count(term) |prover, term, at|:
+                return true if unfixed_term(prover, term_operand(term, index), at)
+            false
+
+        # HIGH names one value everywhere: each value in it is an argument or is defined
+        # outside every loop, before AT (`fixedEverywhere`).
+        def fixed_everywhere(prover: IndexProver&, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef) -> bool:
+            not unfixed_term(prover, high, at)
+
+        # The fill ARRAY's analysis found dominates LOAD (`filledBefore`).
+        def filled_before(prover: IndexProver&, load: LLVMValueRef, array: LLVMValueRef) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            entry: u32 = get key_table_find(&prover.elements.fill_table, TableKey{first: value_key(array), second: 0, third: 0}) else return false
+            if prover.elements.fills[entry] is fill:
+                return ElisaLLVMInstructionDominates(prover.analyses, fill, load) != 0
+            false
+
+        # Every path from STORE returns, or decides the stored value at most HIGH, before
+        # it touches ARRAY again (`checked`), with the tests of the single-predecessor
+        # chain before the store counted too.
+        def store_checked(prover: mutable IndexProver&, store: LLVMValueRef, array: LLVMValueRef, high: ElisaScalarEvolutionExpressionRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            facts: mutable darray[CompareFact] = []
+            block: mutable LLVMBasicBlockRef = LLVMGetInstructionParent(store)
+            for step in 0..<ElementBoundLimit::CHECKS_BEFORE_STORE |facts, block|:
+                if single_predecessor(block) is before:
+                    if conditional_terminator(before) is branch:
+                        facts <- decided_compares(LLVMGetCondition(branch), LLVMGetSuccessor(branch, 0) == block, facts, 0)
+                    block <- before
+                else:
+                    break
+            start: mutable ElementPath = ElementPath{facts: facts, read_addresses: [term_of(prover.analyses, LLVMGetOperand(store, 1))], read_values: [LLVMGetOperand(store, 0)], blocks: [], from: null}
+            return true if path_decides(prover, &start, high)
+            budget: mutable u32 = ElementBoundLimit::WALK_BUDGET
+            walk: ElementWalk = ElementWalk{store: store, array: array, high: high}
+            walk_element_path(prover, &start, LLVMGetInstructionParent(store), LLVMGetNextInstruction(store), &walk, &budget)
+
+        # STORE into ARRAY keeps the array's values at most HIGH: a value moved within the
+        # array after its fill, a stored value at most HIGH, or a checked one.
+        def store_within(prover: mutable IndexProver&, store: LLVMValueRef, array: LLVMValueRef, fill: LLVMValueRef, high: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            value: LLVMValueRef = LLVMGetOperand(store, 0)
+            # A value moved within the array (an insertion sort's shift) was already one
+            # of its values.
+            if LLVMIsALoadInst(value) != null:
+                if ElisaLLVMUnderlyingObject(LLVMGetOperand(value, 0)) == array and ElisaLLVMInstructionDominates(prover.analyses, fill, value) != 0:
+                    return true
+            return false if not fixed_everywhere(prover, high, store)
+            stored: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, value)
+            return true if term_type(stored) == term_type(high) and proof_at_most(prover, stored, high, store, depth + 1)
+            store_checked(prover, store, array, high)
+
+        # ARRAY's uses keep every value it holds at most HIGH: a single zero fill, element
+        # stores that each keep the bound, and nothing that writes it otherwise.
+        def array_values_within(prover: mutable IndexProver&, array: LLVMValueRef, accesses: ArrayAccesses&, high: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not accesses.filled or accesses.writes.count != 0 or accesses.views.count != 0
+            return false if accesses.vector_stores.count != 0 or accesses.vector_loads.count != 0
+            return false if accesses.fills.count != 1 or accesses.stores.count == 0
+            fill: LLVMValueRef = accesses.fills[0]
+            for store in accesses.stores |prover, array, high, depth, fill|:
+                return false if not store_within(prover, store, array, fill, high, depth)
+            true
+
+    public:
+        # A value read from a local array is at most HIGH when every stored value is at
+        # most HIGH or is checked against it after its store (`elementAtMost`).
+        def element_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            load: LLVMValueRef = get term_instruction(low, LLVMOpcode::LOAD) else return false
+            return false if depth > ElementBoundLimit::DEPTH or prover.budget == 0
+            prover.budget <- prover.budget - 1
+            array: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(load, 0))
+            return false if LLVMIsAAllocaInst(array) == null or LLVMGetTypeKind(LLVMGetAllocatedType(array)) != LLVMTypeKindValue::ARRAY
+            element_type: LLVMTypeRef = LLVMTypeOf(load)
+            return false if LLVMGetElementType(LLVMGetAllocatedType(array)) != element_type or LLVMGetTypeKind(element_type) != LLVMTypeKindValue::INTEGER
+            return false if not fixed_everywhere(prover, high, load)
+            key: TableKey = TableKey{first: value_key(array), second: expression_key(high), third: 0}
+            if key_table_find(&prover.elements.proved_table, key) is known:
+                return prover.elements.proved[known] and filled_before(prover, load, array)
+            entry: u32 = prover.elements.proved.count.u32()
+            prover.elements.proved.push(false)
+            prover.elements.proved_table <- key_table_insert(prover.elements.proved_table, key, entry)
+            element: ArrayElement = array_element(element_type, false, LLVMGetGlobalParent(prover.function))
+            accesses: mutable ArrayAccesses = empty_array_accesses()
+            bounded: bool = collect_array_accesses(array, &element, &accesses, 0, 0) and array_values_within(prover, array, &accesses, high, depth)
+            fill: LLVMValueRef? = accesses.fills[0] if accesses.fills.count != 0 else null
+            fill_key: TableKey = TableKey{first: value_key(array), second: 0, third: 0}
+            prover.elements.fills.push(fill)
+            prover.elements.fill_table <- key_table_insert(prover.elements.fill_table, fill_key, prover.elements.fills.count.u32() - 1)
+            prover.elements.proved[entry] <- bounded
+            bounded and filled_before(prover, load, array)

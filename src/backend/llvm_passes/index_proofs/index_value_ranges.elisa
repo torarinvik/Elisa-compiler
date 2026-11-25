@@ -1,0 +1,179 @@
+# The values a term can have where an instruction runs (`Ranges::within` and
+# `Ranges::decided`). Every function returns a new range and consumes the ranges it is
+# given.
+include "./index_ranges.elisa"
+
+extend Backend:
+    private:
+        # Whether the walk of EXPRESSION at BLOCK is under way.
+        def is_deciding(prover: IndexProver&, expression: ElisaScalarEvolutionExpressionRef, block: LLVMBasicBlockRef) -> bool can[Abort.Panic]:
+            for index in 0..<prover.decided.deciding_expressions.count |prover, expression, block|:
+                return true if prover.decided.deciding_expressions[index] == expression and prover.decided.deciding_blocks[index] == block
+            false
+
+        # The decided walk of EXPRESSION at BLOCK finished.
+        def finish_deciding(prover: mutable IndexProver&) -> void:
+            last: u64 = prover.decided.deciding_expressions.count - 1
+            prover.decided.deciding_expressions <- prover.decided.deciding_expressions.truncate(last)
+            prover.decided.deciding_blocks <- prover.decided.deciding_blocks.truncate(last)
+
+        # What `left predicate right` on a dominating edge holds the values of LEFT in,
+        # or null when it says nothing: a constant bound, or another value's largest (or
+        # smallest) value where BLOCK ends.
+        def decided_holds(prover: mutable IndexProver&, predicate: i32, left: LLVMValueRef, right: LLVMValueRef, block: LLVMBasicBlockRef, width: u32, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return ElisaLLVMConstantRangeExactByCompare(predicate, right) if LLVMIsAConstantInt(right) != null
+            return null if depth >= IndexRangeLimit::DECIDED_DEPTH or LLVMIsAConstant(left) != null
+            type: LLVMTypeRef = bound_type(prover, width)
+            upper: bool = predicate == LLVMIntPredicate::ULT or predicate == LLVMIntPredicate::ULE
+            lower: bool = predicate == LLVMIntPredicate::UGT or predicate == LLVMIntPredicate::UGE
+            return null if not upper and not lower
+            other: ElisaConstantRangeRef = range_within(prover, term_of(prover.analyses, right), terminator_of(block), depth + 1)
+            if ElisaLLVMConstantRangeIsEmpty(other) != 0:
+                ElisaLLVMDisposeConstantRange(other)
+                return null
+            one: LLVMValueRef = LLVMConstInt(type, 1, 0)
+            zero: LLVMValueRef = LLVMConstInt(type, 0, 0)
+            if upper:
+                # Below another value: at most its largest.
+                high: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMaximum(other, prover.context)
+                ElisaLLVMDisposeConstantRange(other)
+                return ElisaLLVMConstantRangeEmpty(width) if predicate == LLVMIntPredicate::ULT and is_zero_constant(high)
+                return ElisaLLVMConstantRangeNonEmpty(zero, high if predicate == LLVMIntPredicate::ULT else LLVMConstAdd(high, one))
+            # Above another value: at least its smallest (`left > target` makes left nonzero).
+            low: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMinimum(other, prover.context)
+            ElisaLLVMDisposeConstantRange(other)
+            return ElisaLLVMConstantRangeEmpty(width) if predicate == LLVMIntPredicate::UGT and has_every_bit_set(low)
+            ElisaLLVMConstantRangeNonEmpty(LLVMConstAdd(low, one) if predicate == LLVMIntPredicate::UGT else low, zero)
+
+        # RANGE narrowed by `left predicate right` when LEFT is EXPRESSION plus a constant.
+        def narrow_decided(prover: mutable IndexProver&, range: ElisaConstantRangeRef, expression: ElisaScalarEvolutionExpressionRef, predicate: i32, left: LLVMValueRef, right: LLVMValueRef, block: LLVMBasicBlockRef, width: u32, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return range if not has_term(prover.analyses, left) or ElisaLLVMScalarEvolutionTypeSizeInBits(prover.analyses, LLVMTypeOf(left)) != width
+            offset: LLVMValueRef = get term_constant(term_difference(prover.analyses, term_of(prover.analyses, left), expression)) else return range
+            holds: ElisaConstantRangeRef = get decided_holds(prover, predicate, left, right, block, width, depth) else return range
+            shifted: ElisaConstantRangeRef = ElisaLLVMConstantRangeSubtract(holds, offset)
+            ElisaLLVMDisposeConstantRange(holds)
+            intersect_ranges(range, shifted)
+
+        # RANGE narrowed by the comparisons decided on the edges into DOMINATOR that
+        # dominate BLOCK.
+        def narrow_by_dominator(prover: mutable IndexProver&, range: ElisaConstantRangeRef, expression: ElisaScalarEvolutionExpressionRef, dominator: LLVMBasicBlockRef, block: LLVMBasicBlockRef, width: u32, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            narrowed: mutable ElisaConstantRangeRef = range
+            for predecessor in predecessor_edges(dominator) |prover, narrowed, expression, dominator, block, width, depth|:
+                continue if ElisaLLVMEdgeDominates(prover.analyses, predecessor, dominator, block) == 0
+                for fact in edge_compares(predecessor, dominator) |prover, narrowed, expression, block, width, depth|:
+                    predicate: i32 = fact_predicate(fact)
+                    first: LLVMValueRef = LLVMGetOperand(fact.compare, 0)
+                    second: LLVMValueRef = LLVMGetOperand(fact.compare, 1)
+                    narrowed <- narrow_decided(prover, narrowed, expression, predicate, first, second, block, width, depth)
+                    narrowed <- narrow_decided(prover, narrowed, expression, swapped_integer_predicate(predicate), second, first, block, width, depth)
+            narrowed
+
+        # The values EXPRESSION can have after the dominating edges that compared it plus
+        # a constant with a constant, or bounded it by another value (`decided`).
+        def decided_range(prover: mutable IndexProver&, expression: ElisaScalarEvolutionExpressionRef, block: LLVMBasicBlockRef, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            width: u32 = ElisaLLVMScalarEvolutionTypeSizeInBits(prover.analyses, term_type(expression))
+            return ElisaLLVMConstantRangeFull(width) if term_kind(expression) == ElisaScalarEvolutionKind::CONSTANT or is_deciding(prover, expression, block)
+            prover.decided.deciding_expressions.push(expression)
+            prover.decided.deciding_blocks.push(block)
+            key: TableKey = TableKey{first: expression_key(expression), second: block_key(block), third: 0}
+            if depth == 0:
+                if key_table_find(&prover.decided.table, key) is known:
+                    finish_deciding(prover)
+                    return ElisaLLVMConstantRangeCopy(prover.decided.ranges[known])
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(width)
+            node: mutable LLVMBasicBlockRef? = block if ElisaLLVMIsReachableFromEntry(prover.analyses, block) != 0 else null
+            while node is dominator |prover, node, range, expression, block, width, depth|:
+                range <- narrow_by_dominator(prover, range, expression, dominator, block, width, depth)
+                node <- ElisaLLVMImmediateDominator(prover.analyses, dominator)
+            finish_deciding(prover)
+            if depth == 0:
+                prover.decided.ranges.push(ElisaLLVMConstantRangeCopy(range))
+                prover.decided.table <- key_table_insert(prover.decided.table, key, prover.decided.ranges.count.u32() - 1)
+            range
+
+        # RANGE intersected with OPERATION (udiv, add or mul) of the range of OPERAND
+        # where AT runs and CONSTANT.
+        def operated_within(prover: mutable IndexProver&, range: ElisaConstantRangeRef, opcode: u32, operand: ElisaScalarEvolutionExpressionRef, constant: LLVMValueRef, at: LLVMValueRef, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            inner: ElisaConstantRangeRef = range_within(prover, operand, at, depth + 1)
+            single: ElisaConstantRangeRef = ElisaLLVMConstantRangeOfConstant(constant)
+            operated: ElisaConstantRangeRef = ElisaLLVMConstantRangeBinaryOperation(opcode, inner, single)
+            ElisaLLVMDisposeConstantRange(inner)
+            ElisaLLVMDisposeConstantRange(single)
+            intersect_ranges(range, operated)
+
+        # The range a join (not a loop header) takes: each incoming value's range where
+        # its edge leaves, within what the edge decided about it.
+        def joined_range_within(prover: mutable IndexProver&, merge: LLVMValueRef, width: u32, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            joined: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeEmpty(width)
+            for edge in 0..<LLVMCountIncoming(merge) |prover, joined, merge, depth|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(merge, edge)
+                from: LLVMBasicBlockRef = LLVMGetIncomingBlock(merge, edge)
+                # Scalar evolution drops an increment's `nuw` it cannot prove from context.
+                increment: NoWrapIncrement? = no_wrap_increment(incoming)
+                base: mutable LLVMValueRef = incoming
+                if increment is found:
+                    base <- found.base
+                own: mutable ElisaConstantRangeRef = range_within(prover, term_of(prover.analyses, base), terminator_of(from), depth + 1)
+                if increment is found:
+                    stepped: ElisaConstantRangeRef = ElisaLLVMConstantRangeAddNoUnsignedWrap(own, found.step)
+                    ElisaLLVMDisposeConstantRange(own)
+                    own <- stepped
+                facts: darray[CompareFact] = edge_compares(from, LLVMGetInstructionParent(merge))
+                joined <- unite_smallest_ranges(joined, intersect_smallest_ranges(own, edge_value_range(&facts, incoming)))
+            joined
+
+        # ON_PATHS narrowed by the orders of MERGE's loop header: a phi above another is
+        # at least one, and one below another is at most that one's largest less one.
+        def ordered_within(prover: mutable IndexProver&, on_paths: ElisaConstantRangeRef, merge: LLVMValueRef, at: LLVMValueRef, width: u32, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            narrowed: mutable ElisaConstantRangeRef = on_paths
+            orders: HeaderOrders = header_orders(prover, LLVMGetInstructionParent(merge))
+            type: LLVMTypeRef = bound_type(prover, width)
+            for index in orders.start..<orders.start + orders.count |prover, narrowed, merge, at, depth, type|:
+                low: LLVMValueRef = prover.orders.lows[index]
+                high: LLVMValueRef = prover.orders.highs[index]
+                if high == merge:
+                    narrowed <- intersect_ranges(narrowed, ElisaLLVMConstantRangeNonEmpty(LLVMConstInt(type, 1, 0), LLVMConstInt(type, 0, 0)))
+                if low == merge and depth < IndexRangeLimit::WITHIN_DEPTH and has_term(prover.analyses, high):
+                    above: ElisaConstantRangeRef = range_within(prover, term_of(prover.analyses, high), at, depth + 1)
+                    if ElisaLLVMConstantRangeIsEmpty(above) == 0:
+                        largest: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMaximum(above, prover.context)
+                        if not is_zero_constant(largest):
+                            narrowed <- intersect_ranges(narrowed, ElisaLLVMConstantRangeNonEmpty(LLVMConstInt(type, 0, 0), largest))
+                    ElisaLLVMDisposeConstantRange(above)
+            narrowed
+
+    public:
+        # The values TERM can have where AT runs (`within`): its range, comparisons on
+        # the paths to AT, and header orders that place another value below it, through
+        # sums, products and quotients with a constant.
+        def range_within(prover: mutable IndexProver&, term: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(at)
+            range: ElisaConstantRangeRef = intersect_ranges(ElisaLLVMScalarEvolutionExpressionUnsignedRange(prover.analyses, term), decided_range(prover, term, block, depth))
+            kind: u32 = term_kind(term)
+            if kind == ElisaScalarEvolutionKind::UNSIGNED_DIVIDE and depth < IndexRangeLimit::WITHIN_DEPTH:
+                if term_constant(term_operand(term, 1)) is divisor:
+                    return operated_within(prover, range, LLVMOpcode::UDIV, term_operand(term, 0), divisor, at, depth) if not is_zero_constant(divisor)
+            if (kind == ElisaScalarEvolutionKind::ADD or kind == ElisaScalarEvolutionKind::MULTIPLY) and term_operand_count(term) == 2 and depth < IndexRangeLimit::WITHIN_DEPTH:
+                if term_constant(term_operand(term, 0)) is constant:
+                    opcode: u32 = LLVMOpcode::ADD if kind == ElisaScalarEvolutionKind::ADD else LLVMOpcode::MUL
+                    return operated_within(prover, range, opcode, term_operand(term, 1), constant, at, depth)
+            # Path comparisons bound integers; a pointer keeps its scalar evolution range.
+            value: LLVMValueRef = get term_value(term) else return range
+            return range if LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMTypeKindValue::INTEGER
+            width: u32 = ElisaLLVMConstantRangeBitWidth(range)
+            # Paths whose comparisons contradict each other never reach AT.
+            found: PathRangeLookup = path_range_at(prover.paths, value, block, 0, prover.analyses)
+            prover.paths <- found.memo
+            on_paths: mutable ElisaConstantRangeRef = found.range
+            if ElisaLLVMConstantRangeIsEmpty(on_paths) != 0:
+                ElisaLLVMDisposeConstantRange(range)
+                ElisaLLVMDisposeConstantRange(on_paths)
+                return ElisaLLVMConstantRangeEmpty(width)
+            return intersect_ranges(range, on_paths) if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+            header: bool = is_loop_header(LLVMGetInstructionParent(value), prover.analyses)
+            # A join takes one of its incoming values, each within what its edge decided.
+            if not header and depth < IndexRangeLimit::JOIN_DEPTH and LLVMCountIncoming(value) <= IndexRangeLimit::JOIN_EDGES:
+                on_paths <- intersect_ranges(on_paths, joined_range_within(prover, value, width, depth))
+            if not header or ElisaLLVMBlockDominates(prover.analyses, LLVMGetInstructionParent(value), block) == 0:
+                return intersect_ranges(range, on_paths)
+            intersect_ranges(range, ordered_within(prover, on_paths, value, at, width, depth))

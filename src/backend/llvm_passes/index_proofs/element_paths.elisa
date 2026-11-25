@@ -1,0 +1,233 @@
+# The path walk of the element bounds (`Checker::walk`): every continuation of a path
+# from a store returns, traps, or decides the stored value at most a bound before it
+# reads the array anywhere else or stores to it again.
+include "./index_value_ranges.elisa"
+
+const module ElementPathLimit:
+    BLOCKS: u64 = 48
+    RELATION_DEPTH: u32 = 3
+
+# What one instruction does to a walk: nothing it cares about, end it proved (a trap),
+# or end it unproved (it touches the array).
+const module ElementStep:
+    CONTINUES: u32 = 0
+    HOLDS: u32 = 1
+    FAILS: u32 = 2
+
+# A path from the store (`Checker::Path`): the facts its edges decided, the load that
+# stands for each address read since the last store to its object (the stored value
+# first, for the stored address), the blocks it entered, and the block it came from,
+# which picks each phi's value.
+struct ElementPath:
+    facts: mutable darray[CompareFact]
+    read_addresses: mutable darray[ElisaScalarEvolutionExpressionRef]
+    read_values: mutable darray[LLVMValueRef]
+    blocks: mutable darray[LLVMBasicBlockRef]
+    from: mutable LLVMBasicBlockRef?
+
+# A decided comparison `left predicate right`, each read replaced by the value that
+# stands for its address.
+struct ElementRelation:
+    left: LLVMValueRef
+    predicate: i32
+    right: LLVMValueRef
+
+# What a walk checks: the store, the array it writes, and the bound.
+struct ElementWalk:
+    store: LLVMValueRef
+    array: LLVMValueRef
+    high: ElisaScalarEvolutionExpressionRef
+
+extend Backend:
+    private:
+        # A copy of PATH's facts.
+        def copied_facts(path: ElementPath&) -> darray[CompareFact] can[Memory.Allocate]:
+            facts: mutable darray[CompareFact] = []
+            for fact in path.facts |facts|:
+                facts.push(fact)
+            facts
+
+        # An independent copy of PATH with FACTS in place of its own.
+        def copy_element_path(path: ElementPath&, facts: darray[CompareFact]) -> ElementPath can[Memory.Allocate]:
+            addresses: mutable darray[ElisaScalarEvolutionExpressionRef] = []
+            values: mutable darray[LLVMValueRef] = []
+            blocks: mutable darray[LLVMBasicBlockRef] = []
+            for address in path.read_addresses |addresses|:
+                addresses.push(address)
+            for value in path.read_values |values|:
+                values.push(value)
+            for block in path.blocks |blocks|:
+                blocks.push(block)
+            ElementPath{facts: facts, read_addresses: addresses, read_values: values, blocks: blocks, from: path.from}
+
+        # PATH with only the stored value's read left.
+        def keep_stored_read(path: mutable ElementPath&) -> void:
+            path.read_addresses <- path.read_addresses.truncate(1)
+            path.read_values <- path.read_values.truncate(1)
+
+        # A store to OBJECT makes PATH's reads of it stale; the stored value stays
+        # (`forget`).
+        def forget_reads(path: mutable ElementPath&, object: LLVMValueRef) -> void can[Abort.Panic]:
+            kept: mutable u64 = 0
+            for index in 0..<path.read_values.count |path, object, kept|:
+                read: LLVMValueRef = path.read_values[index]
+                stale: bool = index > 0 and LLVMIsALoadInst(read) != null and ElisaLLVMUnderlyingObject(LLVMGetOperand(read, 0)) == object
+                if not stale:
+                    path.read_addresses[kept] <- path.read_addresses[index]
+                    path.read_values[kept] <- read
+                    kept <- kept + 1
+            path.read_addresses <- path.read_addresses.truncate(kept)
+            path.read_values <- path.read_values.truncate(kept)
+
+        # The value that stands for READ on PATH: the first load of its address, if it is
+        # a load whose address was read before (`standing`).
+        def standing_value(prover: IndexProver&, path: ElementPath&, read: LLVMValueRef) -> LLVMValueRef can[Abort.Panic]:
+            return read if LLVMIsALoadInst(read) == null
+            address: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, LLVMGetOperand(read, 0))
+            for index in 0..<path.read_addresses.count |path, address|:
+                return path.read_values[index] if path.read_addresses[index] == address
+            read
+
+        # Every decided comparison of PATH both ways round, reads replaced (`relations`).
+        def element_relations(prover: IndexProver&, path: ElementPath&) -> darray[ElementRelation] can[Abort.Panic, Memory.Allocate]:
+            relations: mutable darray[ElementRelation] = []
+            for fact in path.facts |prover, path, relations|:
+                predicate: i32 = fact_predicate(fact)
+                left: LLVMValueRef = standing_value(prover, path, LLVMGetOperand(fact.compare, 0))
+                right: LLVMValueRef = standing_value(prover, path, LLVMGetOperand(fact.compare, 1))
+                relations.push(ElementRelation{left: left, predicate: predicate, right: right})
+                relations.push(ElementRelation{left: right, predicate: swapped_integer_predicate(predicate), right: left})
+            relations
+
+        # A chain of upper bounds, unsigned or SIGNED, leads from TERM to HIGH (`bounded`).
+        def bounded_chain(prover: IndexProver&, relations: darray[ElementRelation]&, term: LLVMValueRef, high: ElisaScalarEvolutionExpressionRef, signed: bool, depth: u32) -> bool can[Abort.Panic]:
+            return false if depth > ElementPathLimit::RELATION_DEPTH
+            for relation in relations |prover, relations, term, high, signed, depth|:
+                continue if relation.left != term or relation.right == term
+                upper: bool = (relation.predicate == LLVMIntPredicate::SLE or relation.predicate == LLVMIntPredicate::SLT) if signed else (relation.predicate == LLVMIntPredicate::ULE or relation.predicate == LLVMIntPredicate::ULT)
+                continue if not upper
+                return true if term_of(prover.analyses, relation.right) == high or bounded_chain(prover, relations, relation.right, high, signed, depth + 1)
+            false
+
+        # PATH's facts show TERM >=s 0 (`nonnegative`).
+        def nonnegative_on_path(prover: IndexProver&, path: ElementPath&, term: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if depth > ElementPathLimit::RELATION_DEPTH
+            for relation in element_relations(prover, path) |prover, path, term, depth|:
+                continue if relation.left != term or relation.right == term
+                constant: bool = LLVMIsAConstantInt(relation.right) != null
+                if relation.predicate == LLVMIntPredicate::SGE:
+                    if constant:
+                        return true if ElisaLLVMConstantIntIsNegative(relation.right) == 0
+                    elif nonnegative_on_path(prover, path, relation.right, depth + 1):
+                        return true
+                if relation.predicate == LLVMIntPredicate::SGT:
+                    if constant:
+                        return true if constants_compare(LLVMIntPredicate::SGE, relation.right, LLVMConstAllOnes(LLVMTypeOf(relation.right)))
+                    elif nonnegative_on_path(prover, path, relation.right, depth + 1):
+                        return true
+            false
+
+        # The intrinsic a call, invoke or callbr calls, or 0.
+        def call_site_intrinsic(call: LLVMValueRef) -> u32:
+            callee: LLVMValueRef = LLVMGetCalledValue(call)
+            return 0 if LLVMIsAFunction(callee) == null
+            LLVMGetIntrinsicID(callee)
+
+        def is_call_site(instruction: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            opcode == LLVMOpcode::CALL or opcode == LLVMOpcode::INVOKE or opcode == LLVMOpcode::CALL_BR
+
+        # What INSTRUCTION does to a walk: ends it well (a trap), ends it badly (it
+        # touches the array), or updates PATH's reads.
+        def walk_instruction(prover: IndexProver&, path: mutable ElementPath&, instruction: LLVMValueRef, walk: ElementWalk&) -> u32 can[Abort.Panic, Memory.Allocate]:
+            if LLVMIsALoadInst(instruction) != null:
+                pointer: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                address: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, pointer)
+                same: mutable bool = false
+                for present in path.read_addresses |same, address|:
+                    same <- same or present == address
+                return ElementStep::FAILS if ElisaLLVMUnderlyingObject(pointer) == walk.array and address != path.read_addresses[0]
+                if not same:
+                    path.read_addresses.push(address)
+                    path.read_values.push(instruction)
+                return ElementStep::CONTINUES
+            if LLVMIsAStoreInst(instruction) != null:
+                object: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 1))
+                return ElementStep::FAILS if object == walk.array
+                forget_reads(path, object)
+                return ElementStep::CONTINUES
+            return ElementStep::CONTINUES if not is_call_site(instruction)
+            return ElementStep::HOLDS if call_site_intrinsic(instruction) == prover.trap_intrinsic
+            if ElisaLLVMIsMemIntrinsic(instruction) != 0:
+                return ElementStep::FAILS if ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 0)) == walk.array
+                if ElisaLLVMIsMemSet(instruction) == 0:
+                    return ElementStep::FAILS if ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 1)) == walk.array
+            keep_stored_read(path) if ElisaLLVMCallOnlyReadsMemory(instruction) == 0
+            ElementStep::CONTINUES
+
+        # The walk continues from BLOCK into NEXT on a copy of PATH, with CONDITION
+        # decided TAKEN when it is not known.
+        def walk_successor(prover: mutable IndexProver&, path: ElementPath&, block: LLVMBasicBlockRef, next: LLVMBasicBlockRef, condition: LLVMValueRef?, taken: bool, walk: ElementWalk&, budget: mutable u32&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            stored_block: LLVMBasicBlockRef? = LLVMGetInstructionParent(LLVMGetOperand(walk.store, 0)) if LLVMIsAInstruction(LLVMGetOperand(walk.store, 0)) != null else null
+            return false if next == LLVMGetInstructionParent(walk.store)
+            if stored_block is defined:
+                return false if next == defined
+            for present in path.blocks |next|:
+                return false if present == next
+            facts: mutable darray[CompareFact] = copied_facts(path)
+            if condition is decided:
+                facts <- decided_compares(decided, taken, facts, 0)
+            branch: mutable ElementPath = copy_element_path(path, facts)
+            return true if path_decides(prover, &branch, walk.high)
+            # Past a loop header the same address or value may name another iteration's:
+            # the store's own loop ends the proof, and an inner loop keeps only the stored
+            # value.
+            if ElisaLLVMLoopForBlock(prover.analyses, next) is around:
+                if ElisaLLVMLoopHeader(around) == next:
+                    return false if ElisaLLVMLoopContainsBlock(around, LLVMGetInstructionParent(walk.store)) != 0
+                    keep_stored_read(&branch)
+                    branch.facts <- branch.facts.truncate(0)
+            branch.blocks.push(next)
+            branch.from <- block
+            walk_element_path(prover, &branch, next, LLVMGetFirstInstruction(next), walk, budget)
+
+    public:
+        # PATH's facts hold the stored value at most HIGH: a chain of unsigned bounds up
+        # to HIGH, or of signed ones with the value nonnegative (`decides`).
+        def path_decides(prover: IndexProver&, path: ElementPath&, high: ElisaScalarEvolutionExpressionRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            stored: LLVMValueRef = path.read_values[0]
+            relations: darray[ElementRelation] = element_relations(prover, path)
+            return true if bounded_chain(prover, &relations, stored, high, false, 0)
+            bounded_chain(prover, &relations, stored, high, true, 0) and nonnegative_on_path(prover, path, stored, 0)
+
+        # Every continuation of PATH from POSITION in BLOCK returns or decides the stored
+        # value at most the bound before it touches the array again (`walk`).
+        def walk_element_path(prover: mutable IndexProver&, path: mutable ElementPath&, block: LLVMBasicBlockRef, position: LLVMValueRef?, walk: ElementWalk&, budget: mutable u32&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if budget == 0 or path.blocks.count > ElementPathLimit::BLOCKS
+            budget <- budget - 1
+            cursor: mutable LLVMValueRef? = position
+            while cursor is instruction |cursor, path, prover, walk|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                step: u32 = walk_instruction(prover, path, instruction, walk)
+                return true if step == ElementStep::HOLDS
+                return false if step == ElementStep::FAILS
+            exit: LLVMValueRef = terminator_of(block)
+            opcode: u32 = LLVMGetInstructionOpcode(exit)
+            return true if opcode == LLVMOpcode::RET or opcode == LLVMOpcode::UNREACHABLE
+            return false if opcode != LLVMOpcode::CONDITIONAL_BR and opcode != LLVMOpcode::UNCONDITIONAL_BR
+            # A short-circuit result is the phi's value on the edge the path took; a
+            # constant one leaves a single successor.
+            condition: mutable LLVMValueRef? = LLVMGetCondition(exit) if opcode == LLVMOpcode::CONDITIONAL_BR else null
+            if condition is test:
+                if path.from is from:
+                    if is_llvm_instruction_with_opcode(test, LLVMOpcode::PHI) and LLVMGetInstructionParent(test) == block:
+                        condition <- phi_incoming_for_block(test, from)
+            known: mutable LLVMValueRef? = null
+            if condition is decided:
+                known <- decided if LLVMIsAConstantInt(decided) != null else null
+            for index in 0..<LLVMGetNumSuccessors(exit) |prover, path, block, exit, condition, known, walk, budget|:
+                if known is constant:
+                    continue if (ElisaLLVMConstantIntEquals(constant, 1) != 0) != (index == 0)
+                open_condition: LLVMValueRef? = condition if known == null else null
+                return false if not walk_successor(prover, path, block, LLVMGetSuccessor(exit, index), open_condition, index == 0, walk, budget)
+            true

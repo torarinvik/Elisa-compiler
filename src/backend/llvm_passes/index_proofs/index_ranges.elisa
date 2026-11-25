@@ -1,0 +1,160 @@
+# Value ranges for the index prover (`ElisaIndexBounds::Ranges`): what a value can be
+# where an instruction runs, from scalar evolution's range, the comparisons decided on
+# dominating branch edges (transitively, through other values' largest values), the
+# paths reaching the point (path_ranges.elisa), joins whose edges each decided their
+# incoming value, and comparisons between loop-header phis that hold every time the
+# header runs (`left <u right` in a two-pointer scan). Header orders are settled on
+# entry by the prover's own proof.
+#
+# Ranges are owned handles: each function here returns a new one and consumes the
+# ranges it is given.
+include "./index_shapes.elisa"
+
+const module IndexRangeLimit:
+    DECIDED_DEPTH: u32 = 3
+    WITHIN_DEPTH: u32 = 8
+    JOIN_DEPTH: u32 = 6
+    JOIN_EDGES: u32 = 4
+    GAP_DEPTH: u32 = 4
+
+# The run of a header's orders in the prover's order arrays.
+struct HeaderOrders:
+    start: u32
+    count: u32
+
+extend Backend:
+    private:
+        # The integer type of WIDTH bits, for a range's bounds.
+        def bound_type(prover: IndexProver&, width: u32) -> LLVMTypeRef:
+            LLVMIntTypeInContext(prover.context, width)
+
+        # The phi of HEADER whose incoming value from LATCH is VALUE.
+        def header_phi_from(header: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, value: LLVMValueRef) -> LLVMValueRef? can[Memory.Allocate]:
+            for phi in block_phis(header) |latch, value|:
+                if phi_incoming_for_block(phi, latch) is incoming:
+                    return phi if incoming == value
+            null
+
+        # The edges into HEADER from inside LOOP, once per edge (`getLoopLatches`).
+        def loop_latch_edges(header: LLVMBasicBlockRef, loop: ElisaLoopRef) -> darray[LLVMBasicBlockRef] can[Memory.Allocate]:
+            latches: mutable darray[LLVMBasicBlockRef] = []
+            for predecessor in predecessor_edges(header) |latches, loop|:
+                latches.push(predecessor) if ElisaLLVMLoopContainsBlock(loop, predecessor) != 0
+            latches
+
+        # BLOCKS without BLOCK.
+        def without_block(blocks: darray[LLVMBasicBlockRef]&, block: LLVMBasicBlockRef) -> darray[LLVMBasicBlockRef] can[Memory.Allocate]:
+            kept: mutable darray[LLVMBasicBlockRef] = []
+            for present in blocks |kept, block|:
+                kept.push(present) if present != block
+            kept
+
+        # The value header phi PHI takes on the edge from ENTRY, one of its blocks.
+        def entry_value(phi: LLVMValueRef, entry: LLVMBasicBlockRef) -> LLVMValueRef can[Abort.Panic]:
+            if phi_incoming_for_block(phi, entry) is value:
+                return value
+            panic("header phi without a value for its entry edge")
+
+        # The first instruction of loop header HEADER after its phis.
+        def header_insertion_point(header: LLVMBasicBlockRef) -> LLVMValueRef can[Abort.Panic]:
+            if first_insertion_point(header) is point:
+                return point
+            panic("loop header without an insertion point")
+
+        # Whether LOW <u HIGH holds on every entry edge of HEADER, proved without the
+        # below assumptions and with a fixed budget, since the result is cached.
+        def holds_on_entry(prover: mutable IndexProver&, header: LLVMBasicBlockRef, loop: ElisaLoopRef, low: LLVMValueRef, high: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            floor: u32 = prover.assumptions.below_floor
+            remaining: u32 = prover.budget
+            prover.assumptions.below_floor <- prover.assumptions.below_phis.count.u32()
+            prover.budget <- IndexProofLimit::BUDGET
+            outside: LLVMBasicBlockRef? = ElisaLLVMLoopPredecessor(loop)
+            high_is_header_phi: bool = is_llvm_instruction_with_opcode(high, LLVMOpcode::PHI) and LLVMGetInstructionParent(high) == header
+            holds: mutable bool = true
+            for entry in predecessor_edges(header) |prover, holds, header, loop, low, high, outside, high_is_header_phi|:
+                continue if ElisaLLVMLoopContainsBlock(loop, entry) != 0
+                low_in: LLVMValueRef = entry_value(low, entry)
+                high_in: LLVMValueRef = entry_value(high, entry) if high_is_header_phi else high
+                # With a single entry, the entry edge's own comparisons hold at the header.
+                at: mutable LLVMValueRef = terminator_of(entry)
+                if outside is single:
+                    if single == entry:
+                        at <- header_insertion_point(header)
+                if not has_term(prover.analyses, low_in) or not proof_below(prover, term_of(prover.analyses, low_in), term_of(prover.analyses, high_in), at, 0):
+                    holds <- false
+                    break
+            prover.assumptions.below_floor <- floor
+            prover.budget <- remaining
+            holds
+
+        # The header orders of LATCH's edge back to HEADER.
+        def latch_orders(prover: mutable IndexProver&, header: LLVMBasicBlockRef, loop: ElisaLoopRef, latch: LLVMBasicBlockRef, lows: mutable darray[LLVMValueRef]&, highs: mutable darray[LLVMValueRef]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for fact in edge_compares(latch, header) |prover, header, loop, latch, lows, highs|:
+                predicate: i32 = fact_predicate(fact)
+                swap: bool = predicate == LLVMIntPredicate::UGT
+                low: LLVMValueRef = LLVMGetOperand(fact.compare, 1 if swap else 0)
+                high: LLVMValueRef = LLVMGetOperand(fact.compare, 0 if swap else 1)
+                continue if predicate != LLVMIntPredicate::ULT and predicate != LLVMIntPredicate::UGT
+                if header_phi_from(header, latch, low) is low_phi:
+                    high_at_header: mutable LLVMValueRef? = header_phi_from(header, latch, high)
+                    if high_at_header == null and ElisaLLVMLoopIsInvariant(loop, high) != 0:
+                        high_at_header <- high
+                    if high_at_header is settled:
+                        if holds_on_entry(prover, header, loop, low_phi, settled):
+                            lows.push(low_phi)
+                            highs.push(settled)
+
+    public:
+        # The comparisons `low <u high` between values at loop header HEADER that hold
+        # every time it runs (`orders`): decided on its one back edge for the incoming
+        # values and proved on the entry edges.
+        def header_orders(prover: mutable IndexProver&, header: LLVMBasicBlockRef) -> HeaderOrders can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            key: TableKey = TableKey{first: block_key(header), second: 0, third: 0}
+            if key_table_find(&prover.orders.table, key) is entry:
+                return HeaderOrders{start: prover.orders.starts[entry], count: prover.orders.counts[entry]}
+            for present in prover.orders.ordering |header|:
+                return HeaderOrders{start: 0, count: 0} if present == header
+            prover.orders.ordering.push(header)
+            lows: mutable darray[LLVMValueRef] = []
+            highs: mutable darray[LLVMValueRef] = []
+            if ElisaLLVMLoopForBlock(prover.analyses, header) is loop:
+                latches: darray[LLVMBasicBlockRef] = loop_latch_edges(header, loop)
+                if latches.count == 1:
+                    latch_orders(prover, header, loop, latches[0], &lows, &highs)
+            prover.orders.ordering <- without_block(&prover.orders.ordering, header)
+            start: u32 = prover.orders.lows.count.u32()
+            for index in 0..<lows.count |prover, lows, highs|:
+                prover.orders.lows.push(lows[index])
+                prover.orders.highs.push(highs[index])
+            prover.orders.starts.push(start)
+            prover.orders.counts.push(lows.count.u32())
+            prover.orders.table <- key_table_insert(prover.orders.table, key, prover.orders.starts.count.u32() - 1)
+            HeaderOrders{start: start, count: lows.count.u32()}
+
+        # GAP <=u HIGH: a constant HIGH is known to reach, or an unsigned minimum one of
+        # whose operands is HIGH itself or such a gap (`gapFits`).
+        def gap_fits(prover: mutable IndexProver&, gap: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if gap == high
+            if term_constant(gap) is constant:
+                return not is_term_negative(gap) and constants_compare(LLVMIntPredicate::UGE, lowest(prover, high, at), constant)
+            return false if term_kind(gap) != ElisaScalarEvolutionKind::UNSIGNED_MINIMUM or depth >= IndexRangeLimit::GAP_DEPTH
+            for index in 0..<term_operand_count(gap) |prover, gap, high, at, depth|:
+                return true if gap_fits(prover, term_operand(gap, index), high, at, depth + 1)
+            false
+
+        # The smallest value TERM can have where AT runs; the largest unsigned value when
+        # AT never runs, so that every bound holds there.
+        def lowest(prover: mutable IndexProver&, term: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            range: ElisaConstantRangeRef = range_within(prover, term, at, 0)
+            type: LLVMTypeRef = bound_type(prover, ElisaLLVMConstantRangeBitWidth(range))
+            bound: LLVMValueRef = LLVMConstAllOnes(type) if ElisaLLVMConstantRangeIsEmpty(range) != 0 else ElisaLLVMConstantRangeUnsignedMinimum(range, prover.context)
+            ElisaLLVMDisposeConstantRange(range)
+            bound
+
+        # The largest value TERM can have where AT runs; zero when AT never runs.
+        def highest(prover: mutable IndexProver&, term: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            range: ElisaConstantRangeRef = range_within(prover, term, at, 0)
+            type: LLVMTypeRef = bound_type(prover, ElisaLLVMConstantRangeBitWidth(range))
+            bound: LLVMValueRef = LLVMConstInt(type, 0, 0) if ElisaLLVMConstantRangeIsEmpty(range) != 0 else ElisaLLVMConstantRangeUnsignedMaximum(range, prover.context)
+            ElisaLLVMDisposeConstantRange(range)
+            bound

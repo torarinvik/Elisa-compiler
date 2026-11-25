@@ -43,7 +43,6 @@
 #include "llvm_index_bounds.h"
 #include "llvm_view_bounded_fills.h"
 #include "llvm_indexed_prefix.h"
-#include "llvm_proven_checks.h"
 #include "llvm_validated_reads.h"
 
 using namespace llvm;

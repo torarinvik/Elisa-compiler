@@ -2,6 +2,7 @@
 #include "elisa_llvm_instruction_queries.h"
 
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/Support/CBindingWrapping.h>
 
@@ -29,5 +30,7 @@ int ElisaLLVMIsSafeToSpeculativelyExecuteAt(LLVMValueRef instruction, LLVMValueR
   return isSafeToSpeculativelyExecute(cast<Instruction>(unwrap(instruction)),
                                       cast<Instruction>(unwrap(context)));
 }
+
+int ElisaLLVMCallOnlyReadsMemory(LLVMValueRef call) { return cast<CallBase>(unwrap(call))->onlyReadsMemory(); }
 
 } // extern "C"

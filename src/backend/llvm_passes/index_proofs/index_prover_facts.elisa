@@ -1,0 +1,288 @@
+# The index prover's rules over facts: comparisons decided on dominating edges and loop
+# header orders (`guarded`, `scaledBelow`, `boundedBy`), induction over header phis
+# (`phiBelow`, `phiAtMost`), loop exits that test an index against a bound, and
+# differences X - K with K at most X.
+include "./index_value_ranges.elisa"
+
+const module IndexFactDepth:
+    FACT: u32 = 9
+    DIFFERS: u32 = 8
+    EXIT: u32 = 6
+
+# The question `anyFact` asks of each known comparison: whether it bounds INDEX below
+# (STRICT) or at most LENGTH (`guarded`), or whether it bounds MULTIPLIED, the X of
+# Index = c + k * X, below a /u k for an a at most LENGTH (`scaledBelow`, with FACTOR k).
+const module FactQuestion:
+    GUARDED: u32 = 0
+    SCALED: u32 = 1
+
+struct FactRequest:
+    question: u32
+    index: ElisaScalarEvolutionExpressionRef
+    length: ElisaScalarEvolutionExpressionRef
+    factor: ElisaScalarEvolutionExpressionRef
+    depth: u32
+    strict: bool
+
+extend Backend:
+    private:
+        # Whether `left predicate right`, known where AT runs, answers REQUEST.
+        def fact_answers(prover: mutable IndexProver&, request: FactRequest&, predicate: i32, left: LLVMValueRef, right: LLVMValueRef, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return bounded_by(prover, predicate, left, right, request.index, request.length, at, request.depth, request.strict) if request.question == FactQuestion::GUARDED
+            swap: bool = predicate == LLVMIntPredicate::UGT
+            smaller: LLVMValueRef = right if swap else left
+            larger: LLVMValueRef = left if swap else right
+            return false if predicate != LLVMIntPredicate::ULT and predicate != LLVMIntPredicate::UGT
+            return false if not has_term(prover.analyses, smaller) or term_of(prover.analyses, smaller) != request.index
+            quotient: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, larger)
+            return false if term_kind(quotient) != ElisaScalarEvolutionKind::UNSIGNED_DIVIDE or term_operand(quotient, 1) != request.factor
+            proof_at_most(prover, term_operand(quotient, 0), request.length, at, request.depth + 1)
+
+        # Whether a comparison known where AT runs answers REQUEST (`anyFact`): an order at
+        # a dominating loop header or a comparison decided on a dominating edge.
+        def any_fact(prover: mutable IndexProver&, at: LLVMValueRef, request: FactRequest&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(at)
+            node: mutable LLVMBasicBlockRef? = block if ElisaLLVMIsReachableFromEntry(prover.analyses, block) != 0 else null
+            while node is dominator |prover, node, at, request, block|:
+                if is_loop_header(dominator, prover.analyses):
+                    orders: HeaderOrders = header_orders(prover, dominator)
+                    for index in orders.start..<orders.start + orders.count |prover, at, request|:
+                        return true if fact_answers(prover, request, LLVMIntPredicate::ULT, prover.orders.lows[index], prover.orders.highs[index], at)
+                for predecessor in predecessor_edges(dominator) |prover, at, request, block, dominator|:
+                    continue if ElisaLLVMEdgeDominates(prover.analyses, predecessor, dominator, block) == 0
+                    for fact in edge_compares(predecessor, dominator) |prover, at, request|:
+                        return true if fact_answers(prover, request, fact_predicate(fact), LLVMGetOperand(fact.compare, 0), LLVMGetOperand(fact.compare, 1), at)
+                node <- ElisaLLVMImmediateDominator(prover.analyses, dominator)
+            false
+
+        # VALUE's sign bit is clear where AT runs.
+        def non_negative(prover: mutable IndexProver&, value: LLVMValueRef, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not has_term(prover.analyses, value)
+            term: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, value)
+            ElisaLLVMScalarEvolutionIsKnownNonNegative(prover.analyses, term) != 0 or ElisaLLVMConstantIntIsNegative(highest(prover, term, at)) == 0
+
+        # INDEX != the value `right` settles to, LENGTH, on a dominating edge, with
+        # INDEX <=u LENGTH: then INDEX <u LENGTH (`differsBelow`). Adding a constant is a
+        # bijection, so `Index + c != Other` is exactly `Index != Other - c`.
+        def differs_below(prover: mutable IndexProver&, left: LLVMValueRef, right: LLVMValueRef, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32, strict: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not strict or depth > IndexFactDepth::DIFFERS
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            first: ElisaScalarEvolutionExpressionRef = term_of(analyses, left)
+            second: ElisaScalarEvolutionExpressionRef = term_of(analyses, right)
+            other: mutable ElisaScalarEvolutionExpressionRef? = null
+            first_shift: ElisaScalarEvolutionExpressionRef = term_difference(analyses, first, index)
+            if term_kind(first_shift) == ElisaScalarEvolutionKind::CONSTANT:
+                other <- term_difference(analyses, second, first_shift)
+            else:
+                second_shift: ElisaScalarEvolutionExpressionRef = term_difference(analyses, second, index)
+                if term_kind(second_shift) == ElisaScalarEvolutionKind::CONSTANT:
+                    other <- term_difference(analyses, first, second_shift)
+            settled: ElisaScalarEvolutionExpressionRef = get other else return false
+            settle(prover, settled, at, depth + 1) == length and proof_at_most(prover, index, length, at, depth + 1)
+
+        # The incoming value INCOMING of a phi, arriving from FROM, is below LENGTH by a
+        # comparison FROM's edge into TARGET decided.
+        def edge_bounds_incoming(prover: mutable IndexProver&, incoming: LLVMValueRef, from: LLVMBasicBlockRef, target: LLVMBasicBlockRef, length: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not has_term(prover.analyses, incoming)
+            at: LLVMValueRef = terminator_of(from)
+            for fact in edge_compares(from, target) |prover, incoming, length, depth, at|:
+                return true if bounded_by(prover, fact_predicate(fact), LLVMGetOperand(fact.compare, 0), LLVMGetOperand(fact.compare, 1), term_of(prover.analyses, incoming), length, at, depth + 1, true)
+            false
+
+        # Every incoming value of MERGE is below LENGTH at the end of its edge.
+        def incoming_below(prover: mutable IndexProver&, merge: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(merge)
+            for index in 0..<LLVMCountIncoming(merge) |prover, merge, length, depth, block|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(merge, index)
+                from: LLVMBasicBlockRef = LLVMGetIncomingBlock(merge, index)
+                continue if value_below(prover, incoming, length, terminator_of(from), depth)
+                return false if not edge_bounds_incoming(prover, incoming, from, block, length, depth)
+            true
+
+        # The loop-invariant values one of LOOP's exits tests MERGE, or its increment,
+        # against (`exitBounds`: `i + 1 == right[k]`).
+        def exit_bounds(prover: mutable IndexProver&, merge: LLVMValueRef, loop: ElisaLoopRef, length: ElisaScalarEvolutionExpressionRef) -> darray[ElisaScalarEvolutionExpressionRef] can[Abort.Panic, Memory.Allocate]:
+            bounds: mutable darray[ElisaScalarEvolutionExpressionRef] = []
+            for block in loop_exiting_blocks(loop) |prover, bounds, merge, loop, length|:
+                if conditional_terminator(block) is branch:
+                    compare: LLVMValueRef = LLVMGetCondition(branch)
+                    if is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) and has_term(prover.analyses, LLVMGetOperand(compare, 0)):
+                        for side in 0..<2 |prover, bounds, merge, loop, length, compare|:
+                            tested: LLVMValueRef = LLVMGetOperand(compare, side.u32())
+                            stepped: bool = is_llvm_instruction_with_opcode(tested, LLVMOpcode::ADD) and LLVMGetOperand(tested, 0) == merge
+                            continue if tested != merge and not stepped
+                            bound: ElisaScalarEvolutionExpressionRef = term_of(prover.analyses, LLVMGetOperand(compare, 1 - side.u32()))
+                            continue if bound == length or term_type(bound) != term_type(length) or not is_term_invariant(prover.analyses, bound, loop)
+                            bounds.push(bound) if not contains_term(&bounds, bound)
+            bounds
+
+        def contains_term(terms: darray[ElisaScalarEvolutionExpressionRef]&, term: ElisaScalarEvolutionExpressionRef) -> bool:
+            for present in terms |term|:
+                return true if present == term
+            false
+
+        # A header phi below the loop-invariant X one of its loop's exits tests it
+        # against, with X at most LENGTH, is below LENGTH (`exitBoundBelow`).
+        def exit_bound_below(prover: mutable IndexProver&, merge: LLVMValueRef, loop: ElisaLoopRef, length: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > IndexFactDepth::EXIT or prover.budget == 0
+            entry: LLVMValueRef = get first_insertion_point(ElisaLLVMLoopHeader(loop)) else return false
+            for bound in exit_bounds(prover, merge, loop, length) |prover, merge, length, depth, entry|:
+                return true if proof_at_most(prover, bound, length, entry, depth + 1) and phi_below(prover, merge, bound, depth + 1)
+            false
+
+        # The difference INDEX = X - K is below LENGTH when 1 <=u K <=u X <=u LENGTH.
+        def difference_holds(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, subtracted: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            minuend: ElisaScalarEvolutionExpressionRef = term_sum(prover.analyses, index, subtracted)
+            not is_zero_constant(lowest(prover, subtracted, at)) and proof_at_most(prover, subtracted, minuend, at, depth + 1) and proof_at_most(prover, minuend, length, at, depth + 1)
+
+    public:
+        # INDEX <u LENGTH (STRICT) or INDEX <=u LENGTH by a fact dominating AT that
+        # bounds INDEX by a value in turn below or at most LENGTH (`guarded`).
+        def guarded(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32, strict: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > IndexFactDepth::FACT or prover.budget == 0
+            request: FactRequest = FactRequest{question: FactQuestion::GUARDED, index: index, length: length, factor: index, depth: depth, strict: strict}
+            any_fact(prover, at, &request)
+
+        # INDEX = c + k * X with c <u k and X <u a /u k is below any LENGTH >= a:
+        # k * X + c < k * (a /u k) <= a, so nothing wraps (`scaledBelow`).
+        def scaled_below(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            offset: mutable LLVMValueRef? = null
+            scaled: mutable ElisaScalarEvolutionExpressionRef = index
+            if is_term_of(index, ElisaScalarEvolutionKind::ADD, 2):
+                if term_constant(term_operand(index, 0)) is constant:
+                    offset <- constant
+                    scaled <- term_operand(index, 1)
+            return false if not is_term_of(scaled, ElisaScalarEvolutionKind::MULTIPLY, 2)
+            factor_term: ElisaScalarEvolutionExpressionRef = term_operand(scaled, 0)
+            factor: LLVMValueRef = get term_constant(factor_term) else return false
+            above_offset: mutable bool = not is_zero_constant(factor)
+            if offset is start:
+                above_offset <- constants_compare(LLVMIntPredicate::UGT, factor, start)
+            return false if not above_offset or depth > IndexFactDepth::FACT
+            request: FactRequest = FactRequest{question: FactQuestion::SCALED, index: term_operand(scaled, 1), length: length, factor: factor_term, depth: depth, strict: true}
+            any_fact(prover, at, &request)
+
+        # `left predicate right` bounds INDEX by RIGHT, and RIGHT is in turn at most or
+        # below LENGTH: INDEX <u LENGTH when STRICT, else INDEX <=u LENGTH (`boundedBy`).
+        def bounded_by(prover: mutable IndexProver&, predicate: i32, left: LLVMValueRef, right: LLVMValueRef, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32, strict: bool) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            relation: mutable i32 = predicate
+            # A signed comparison of values whose sign bits are clear is unsigned.
+            if is_signed_integer_predicate(relation):
+                return false if not non_negative(prover, left, at) or not non_negative(prover, right, at)
+                relation <- unsigned_of_signed_predicate(relation)
+            swap: bool = relation == LLVMIntPredicate::UGT or relation == LLVMIntPredicate::UGE
+            smaller: LLVMValueRef = right if swap else left
+            larger: LLVMValueRef = left if swap else right
+            relation <- swapped_integer_predicate(relation) if swap else relation
+            return false if not has_term(prover.analyses, smaller) or LLVMTypeOf(smaller) != term_type(index)
+            return differs_below(prover, smaller, larger, index, length, at, depth, strict) if relation == LLVMIntPredicate::NE
+            return false if relation != LLVMIntPredicate::ULT and relation != LLVMIntPredicate::ULE
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            guarded_term: ElisaScalarEvolutionExpressionRef = term_of(analyses, smaller)
+            bound: ElisaScalarEvolutionExpressionRef = term_of(analyses, larger)
+            excess: ElisaScalarEvolutionExpressionRef = term_difference(analyses, index, guarded_term)
+            # INDEX may be the guarded value minus a constant that does not wrap, so
+            # INDEX <u guarded <=u bound, or one more than a strictly guarded value: then
+            # INDEX <=u bound.
+            if index != guarded_term:
+                if relation == LLVMIntPredicate::ULT and is_term_constant(excess, 1):
+                    relation <- LLVMIntPredicate::ULE
+                elif term_kind(excess) != ElisaScalarEvolutionKind::CONSTANT or not gap_fits(prover, term_negation(analyses, excess), guarded_term, at, 0):
+                    return false
+                else:
+                    relation <- LLVMIntPredicate::ULT
+            if relation == LLVMIntPredicate::ULE:
+                return proof_below(prover, bound, length, at, depth + 1) if strict
+                return proof_at_most(prover, bound, length, at, depth + 1)
+            # INDEX <u bound also puts INDEX at most bound - 1, which cannot wrap.
+            return true if proof_at_most(prover, bound, length, at, depth + 1)
+            not strict and proof_at_most(prover, term_difference(analyses, bound, term_constant_like(analyses, bound, 1)), length, at, depth + 1)
+
+        # TERM with each two-operand unsigned maximum, also inside sums, replaced by its
+        # larger operand where one is known at most the other at AT (`settle`).
+        def settle(prover: mutable IndexProver&, term: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> ElisaScalarEvolutionExpressionRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if is_term_of(term, ElisaScalarEvolutionKind::UNSIGNED_MAXIMUM, 2):
+                first: ElisaScalarEvolutionExpressionRef = term_operand(term, 0)
+                second: ElisaScalarEvolutionExpressionRef = term_operand(term, 1)
+                return second if proof_at_most(prover, first, second, at, depth + 1)
+                return first if proof_at_most(prover, second, first, at, depth + 1)
+                return term
+            return term if term_kind(term) != ElisaScalarEvolutionKind::ADD
+            terms: mutable darray[ElisaScalarEvolutionExpressionRef] = []
+            changed: mutable bool = false
+            for index in 0..<term_operand_count(term) |prover, terms, changed, term, at, depth|:
+                operand: ElisaScalarEvolutionExpressionRef = term_operand(term, index)
+                settled: ElisaScalarEvolutionExpressionRef = settle(prover, operand, at, depth)
+                changed <- changed or settled != operand
+                terms.push(settled)
+            return term if not changed
+            ElisaLLVMScalarEvolutionAddTerms(prover.analyses, (&terms[0]).cast[void&], terms.count.u32())
+
+        # Every incoming value of MERGE is below LENGTH on its edge; a loop-header phi may
+        # assume its own bound on the back edges when LENGTH is loop-invariant (`phiBelow`).
+        def phi_below(prover: mutable IndexProver&, merge: LLVMValueRef, length: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            header_loop: mutable ElisaLoopRef? = null
+            if ElisaLLVMLoopForBlock(prover.analyses, LLVMGetInstructionParent(merge)) is loop:
+                header_loop <- loop if ElisaLLVMLoopHeader(loop) == LLVMGetInstructionParent(merge) else null
+            if header_loop is loop:
+                return true if assumption_holds(&prover.assumptions.below_phis, &prover.assumptions.below_bounds, prover.assumptions.below_floor, merge, length)
+                return false if not is_term_invariant(prover.analyses, length, loop)
+                prover.assumptions.below_phis.push(merge)
+                prover.assumptions.below_bounds.push(length)
+            holds: bool = incoming_below(prover, merge, length, depth)
+            if header_loop is loop:
+                last: u64 = prover.assumptions.below_phis.count - 1
+                prover.assumptions.below_phis <- prover.assumptions.below_phis.truncate(last)
+                prover.assumptions.below_bounds <- prover.assumptions.below_bounds.truncate(last)
+                return holds or exit_bound_below(prover, merge, loop, length, depth)
+            holds
+
+        # INDEX, a recurrence of a loop that leaves when it reaches X, is below LENGTH
+        # where AT reads it when it is below X there and X is at most LENGTH
+        # (`exitBoundAt`).
+        def exit_bound_at(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            merge: LLVMValueRef = get recurrence_header_phi(index, prover.analyses) else return false
+            return false if depth > IndexFactDepth::EXIT or prover.budget == 0
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(index) else return false
+            for bound in exit_bounds(prover, merge, loop, length) |prover, index, length, at, depth|:
+                return true if proof_at_most(prover, bound, length, at, depth + 1) and proof_below(prover, index, bound, at, depth + 1)
+            false
+
+        # A phi is at most a HIGH defined outside it when each incoming value is at most
+        # HIGH at the end of its edge; header phis by induction (`phiAtMost`).
+        def phi_at_most(prover: mutable IndexProver&, low: ElisaScalarEvolutionExpressionRef, high: ElisaScalarEvolutionExpressionRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            merge: LLVMValueRef = get term_instruction(low, LLVMOpcode::PHI) else return false
+            return false if depth > IndexFactDepth::FACT or prover.budget == 0
+            if ElisaLLVMLoopForBlock(prover.analyses, LLVMGetInstructionParent(merge)) is loop:
+                if ElisaLLVMLoopHeader(loop) == LLVMGetInstructionParent(merge):
+                    return true if assumption_holds(&prover.assumptions.at_most_phis, &prover.assumptions.at_most_bounds, 0, merge, high)
+                    return false if not is_term_invariant(prover.analyses, high, loop)
+            prover.assumptions.at_most_phis.push(merge)
+            prover.assumptions.at_most_bounds.push(high)
+            holds: mutable bool = true
+            for index in 0..<LLVMCountIncoming(merge) |prover, holds, merge, high, depth|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(merge, index)
+                at: LLVMValueRef = terminator_of(LLVMGetIncomingBlock(merge, index))
+                if not has_term(prover.analyses, incoming) or not proof_at_most(prover, term_of(prover.analyses, incoming), high, at, depth + 1):
+                    holds <- false
+                    break
+            last: u64 = prover.assumptions.at_most_phis.count - 1
+            prover.assumptions.at_most_phis <- prover.assumptions.at_most_phis.truncate(last)
+            prover.assumptions.at_most_bounds <- prover.assumptions.at_most_bounds.truncate(last)
+            holds
+
+        # INDEX = X - K with 1 <=u K <=u X lies in [0, X), below any LENGTH >= X; K is a
+        # negated term, or one plus the negated constant of the sum (`differenceBelow`).
+        def difference_below(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, length: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if term_kind(index) != ElisaScalarEvolutionKind::ADD or depth > IndexFactDepth::FACT
+            constant_term: ElisaScalarEvolutionExpressionRef = term_operand(index, 0)
+            negative_constant: bool = is_term_negative(constant_term)
+            for position in 0..<term_operand_count(index) |prover, index, length, at, depth, constant_term, negative_constant|:
+                negated: ElisaScalarEvolutionExpressionRef = term_operand(index, position)
+                continue if not is_term_of(negated, ElisaScalarEvolutionKind::MULTIPLY, 2) or not is_term_all_ones(term_operand(negated, 0))
+                subtracted: ElisaScalarEvolutionExpressionRef = term_operand(negated, 1)
+                widened: ElisaScalarEvolutionExpressionRef? = term_difference(prover.analyses, subtracted, constant_term) if negative_constant else null
+                return true if difference_holds(prover, index, subtracted, length, at, depth)
+                if widened is other:
+                    return true if difference_holds(prover, index, other, length, at, depth)
+            false

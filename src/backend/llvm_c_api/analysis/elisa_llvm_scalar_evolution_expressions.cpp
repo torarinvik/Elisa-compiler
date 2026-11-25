@@ -42,6 +42,8 @@ uint32_t ElisaLLVMScalarEvolutionExpressionKind(ElisaScalarEvolutionExpressionRe
   case scUMaxExpr: return ELISA_SCEV_UNSIGNED_MAXIMUM;
   case scSMinExpr: return ELISA_SCEV_SIGNED_MINIMUM;
   case scSMaxExpr: return ELISA_SCEV_SIGNED_MAXIMUM;
+  case scAddRecExpr: return ELISA_SCEV_ADD_RECURRENCE;
+  case scUDivExpr: return ELISA_SCEV_UNSIGNED_DIVIDE;
   default: break;
   }
   if (isa<SCEVCastExpr>(unwrapExpression(expression))) return ELISA_SCEV_OTHER_CAST;

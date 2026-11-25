@@ -12,6 +12,5 @@ ELISA_MODULE_PASS_ENTRY(elisacoreRemoveIndexedPrefixFillsOnly,
                         ElisaIndexedPrefix::removeIndexedPrefixFills)
 ELISA_MODULE_PASS_ENTRY(elisacoreAnnotateValidatedReads, ElisaValidatedReads::annotateValidatedReads)
 ELISA_MODULE_PASS_ENTRY(elisacoreShrinkViewFills, ElisaViewBounds::shrinkViewFills)
-ELISA_MODULE_PASS_ENTRY(elisacoreRemoveProvenChecksEntry, ElisaProvenChecks::removeProvenChecks)
 
 #undef ELISA_MODULE_PASS_ENTRY

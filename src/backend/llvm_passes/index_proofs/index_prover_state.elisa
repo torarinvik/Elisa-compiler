@@ -1,0 +1,118 @@
+# The index prover's state (`ElisaIndexBounds::Prover` and its `Ranges` base): the
+# function's analyses, the proof budget, the header phis an induction assumes, and the
+# memos that keep repeated questions cheap. One prover serves one function; every
+# proof threads it by reference.
+#
+# Scalar evolution expressions are uniqued, so an expression's identity is its address,
+# and the memos key on addresses (key_table.elisa).
+include "../ir/key_table.elisa"
+include "../ir/path_ranges.elisa"
+include "../../llvm_c_api/analysis/elisa_llvm_scalar_evolution_algebra.elisa"
+
+const module IndexProofLimit:
+    # The work one top-level proof may do, and the fixed work of a header order's entry
+    # proof and of a sentinel proof (whose results are cached, so they must not depend
+    # on the budget the asking proof has left).
+    BUDGET: u32 = 4000
+    SENTINEL_BUDGET: u32 = 256
+
+# What the prover knows about all-ones stores in its function: not yet looked at, none,
+# or at least one (a -1 meaning "none" that a sentinel proof can exclude).
+const module AllOnesWrites:
+    UNKNOWN: u32 = 0
+    ABSENT: u32 = 1
+    PRESENT: u32 = 2
+
+# The header phis an induction assumes below (or at most, or below-or-from) a bound on
+# their back edges, as parallel stacks of phi and bound. A header order's entry proof
+# runs without the below assumptions: it sees only those from BELOW_FLOOR on.
+struct ProofAssumptions:
+    below_floor: mutable u32
+    below_phis: mutable darray[LLVMValueRef]
+    below_bounds: mutable darray[ElisaScalarEvolutionExpressionRef]
+    from_phis: mutable darray[LLVMValueRef]
+    from_bounds: mutable darray[ElisaScalarEvolutionExpressionRef]
+    at_most_phis: mutable darray[LLVMValueRef]
+    at_most_bounds: mutable darray[ElisaScalarEvolutionExpressionRef]
+
+# `headerOrders` and `ordering`: per loop header, the comparisons `low <u high` between
+# its values that hold every time it runs, stored as runs of the flat arrays.
+struct HeaderOrderMemo:
+    table: mutable KeyTable
+    starts: mutable darray[u32]
+    counts: mutable darray[u32]
+    lows: mutable darray[LLVMValueRef]
+    highs: mutable darray[LLVMValueRef]
+    ordering: mutable darray[LLVMBasicBlockRef]
+
+# `decidedRanges` (owned ranges, by expression and block) and the `deciding` pairs whose
+# walk is under way.
+struct DecidedRangeMemo:
+    table: mutable KeyTable
+    ranges: mutable darray[ElisaConstantRangeRef]
+    deciding_expressions: mutable darray[ElisaScalarEvolutionExpressionRef]
+    deciding_blocks: mutable darray[LLVMBasicBlockRef]
+
+# `allOnesWriters` for the prover's function and `sentinelResults`, by index, length and
+# instruction.
+struct SentinelMemo:
+    all_ones: mutable u32
+    table: mutable KeyTable
+    results: mutable darray[bool]
+
+# `ElisaElementBounds::Checker`'s memos: whether an array's loads are at most a bound,
+# and the fill each analyzed array starts from.
+struct ElementBoundMemo:
+    proved_table: mutable KeyTable
+    proved: mutable darray[bool]
+    fill_table: mutable KeyTable
+    fills: mutable darray[LLVMValueRef?]
+
+struct IndexProver:
+    analyses: ElisaFunctionAnalysesRef
+    function: LLVMValueRef
+    context: LLVMContextRef
+    trap_intrinsic: u32
+    budget: mutable u32
+    inside_sentinel: mutable bool
+    assumptions: mutable ProofAssumptions
+    orders: mutable HeaderOrderMemo
+    decided: mutable DecidedRangeMemo
+    paths: mutable PathRangeMemo
+    sentinels: mutable SentinelMemo
+    elements: mutable ElementBoundMemo
+
+extend Backend:
+    public:
+        # A prover for FUNCTION over its ANALYSES.
+        def new_index_prover(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> IndexProver can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            trap: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.trap", name_storage), 9)
+            assumptions: ProofAssumptions = ProofAssumptions{below_floor: 0, below_phis: [], below_bounds: [], from_phis: [], from_bounds: [], at_most_phis: [], at_most_bounds: []}
+            orders: HeaderOrderMemo = HeaderOrderMemo{table: new_key_table(), starts: [], counts: [], lows: [], highs: [], ordering: []}
+            decided: DecidedRangeMemo = DecidedRangeMemo{table: new_key_table(), ranges: [], deciding_expressions: [], deciding_blocks: []}
+            sentinels: SentinelMemo = SentinelMemo{all_ones: AllOnesWrites::UNKNOWN, table: new_key_table(), results: []}
+            elements: ElementBoundMemo = ElementBoundMemo{proved_table: new_key_table(), proved: [], fill_table: new_key_table(), fills: []}
+            IndexProver{analyses: analyses, function: function, context: LLVMGetTypeContext(LLVMTypeOf(function)), trap_intrinsic: trap, budget: 0, inside_sentinel: false, assumptions: assumptions, orders: orders, decided: decided, paths: new_path_range_memo(), sentinels: sentinels, elements: elements}
+
+        # Every range PROVER owns, disposed.
+        def dispose_index_prover(prover: IndexProver&) -> void:
+            for range in prover.decided.ranges:
+                ElisaLLVMDisposeConstantRange(range)
+            dispose_path_range_memo(&prover.paths)
+
+        # The key parts of an expression, a value and a block.
+        def expression_key(expression: ElisaScalarEvolutionExpressionRef) -> u64 can[Unsafe.PointerCast]:
+            object_key(expression.cast[void&])
+
+        def value_key(value: LLVMValueRef) -> u64 can[Unsafe.PointerCast]:
+            object_key(value.cast[void&])
+
+        def block_key(block: LLVMBasicBlockRef) -> u64 can[Unsafe.PointerCast]:
+            object_key(block.cast[void&])
+
+        # Whether PHIS[k] is PHI and BOUNDS[k] is BOUND for some k from FLOOR on.
+        def assumption_holds(phis: darray[LLVMValueRef]&, bounds: darray[ElisaScalarEvolutionExpressionRef]&, floor: u32, phi: LLVMValueRef, bound: ElisaScalarEvolutionExpressionRef) -> bool can[Abort.Panic]:
+            for index in floor.u64()..<phis.count |phis, bounds, phi, bound|:
+                return true if phis[index] == phi and bounds[index] == bound
+            false

@@ -22,6 +22,8 @@ int ElisaLLVMMayWriteToMemory(LLVMValueRef instruction);
  * dominator tree or library info: the instruction cannot trap or have side effects when it
  * runs before `context`, a terminator or other instruction. */
 int ElisaLLVMIsSafeToSpeculativelyExecuteAt(LLVMValueRef instruction, LLVMValueRef context);
+/* CallBase::onlyReadsMemory: the call, by its own or its callee's attributes, at most reads memory. */
+int ElisaLLVMCallOnlyReadsMemory(LLVMValueRef call);
 
 #ifdef __cplusplus
 }
