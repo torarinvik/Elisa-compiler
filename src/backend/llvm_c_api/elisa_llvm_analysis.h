@@ -89,6 +89,9 @@ int ElisaLLVMTargetMachineChecksFeatures(LLVMTargetMachineRef machine, const cha
 int ElisaLLVMBlockHasAddressTaken(LLVMBasicBlockRef block);
 /* Whether the instruction carries metadata other than its debug location. */
 int ElisaLLVMHasMetadataOtherThanDebugLoc(LLVMValueRef instruction);
+/* llvm::FindInsertedValue(aggregate, {index}): the value inserted at the top-level
+ * index, or null when it is not known (or the value is not a struct or array). */
+LLVMValueRef ElisaLLVMFindInsertedValue(LLVMValueRef aggregate, uint32_t index);
 /* GlobalVariable::hasDefinitiveInitializer: an initializer no other definition can replace. */
 int ElisaLLVMGlobalHasDefinitiveInitializer(LLVMValueRef global);
 /* PatternMatch's m_One() and m_Zero(): an integer constant, or a vector

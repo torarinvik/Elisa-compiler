@@ -22,10 +22,6 @@ static unsigned writeFunctions(Module &Module, const Set &Selected, LLVMValueRef
 
 #define ELISA_MODULE_PASS_ENTRY(EntryName, Pass)                                          \
   extern "C" unsigned EntryName(LLVMModuleRef Module) { return Pass(*unwrap(Module)); }
-#define ELISA_TARGET_PASS_ENTRY(EntryName, Pass)                                          \
-  extern "C" unsigned EntryName(LLVMModuleRef Module, LLVMTargetMachineRef Target) {      \
-    return Pass(*unwrap(Module), Target);                                                 \
-  }
 
 extern "C" unsigned elisacoreOptimizeOrderedConversionsEntry(LLVMModuleRef Module,
                                                             LLVMTargetMachineRef Target) {
@@ -45,7 +41,6 @@ ELISA_MODULE_PASS_ENTRY(elisacoreShrinkViewFills, ElisaViewBounds::shrinkViewFil
 ELISA_MODULE_PASS_ENTRY(elisacoreRemoveProvenChecksEntry, ElisaProvenChecks::removeProvenChecks)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldBoundedTripChecks, ElisaBoundedTripRanges::foldBoundedTripChecks)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldConstantIntegerPathsEntry, elisacoreFoldConstantIntegerPaths)
-ELISA_TARGET_PASS_ENTRY(elisacoreInlineStackViewHelpersEntry, elisacoreInlineStackViewHelpers)
 ELISA_MODULE_PASS_ENTRY(elisacoreFoldRecursiveArgumentBounds, foldRecursiveArgumentBounds)
 
 
@@ -72,4 +67,3 @@ extern "C" void elisacoreRefoldProvenSignedChecks(LLVMModuleRef Module, LLVMTarg
 }
 
 #undef ELISA_MODULE_PASS_ENTRY
-#undef ELISA_TARGET_PASS_ENTRY

@@ -202,6 +202,13 @@ int ElisaLLVMHasMetadataOtherThanDebugLoc(LLVMValueRef instruction) {
   return cast<Instruction>(unwrap(instruction))->hasMetadataOtherThanDebugLoc();
 }
 
+LLVMValueRef ElisaLLVMFindInsertedValue(LLVMValueRef aggregate, uint32_t index) {
+  Value *Aggregate = unwrap(aggregate);
+  if (!Aggregate->getType()->isAggregateType()) return nullptr;
+  unsigned Indices[] = {index};
+  return wrap(FindInsertedValue(Aggregate, Indices));
+}
+
 int ElisaLLVMGlobalHasDefinitiveInitializer(LLVMValueRef global) {
   return cast<GlobalVariable>(unwrap(global))->hasDefinitiveInitializer();
 }

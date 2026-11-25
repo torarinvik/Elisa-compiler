@@ -1,0 +1,204 @@
+# Scalar replacement for small local arrays passed through view aggregates, on AArch64.
+#
+# A view `{ptr, len}` built over a small static stack array hides the array from SROA in
+# the callee. Small internal helpers whose calls each pass two different such arrays and
+# a constant `i1` flag are inlined, within a module budget of 1200 instructions; a
+# three-argument helper whose every call passes two separate arrays assumes their
+# storage separate instead. Each changed function then reruns SROA and its cleanups.
+include "../ir/loop_pass_policy.elisa"
+include "../ir/pass_pipelines.elisa"
+
+const module StackViewLimit:
+    MODULE_FUNCTIONS: u32 = 512
+    INLINE_BUDGET: u32 = 1200
+    VIEW_ELEMENTS: u64 = 32
+    HELPER_INSTRUCTIONS_LOW: u32 = 40
+    HELPER_INSTRUCTIONS_HIGH: u32 = 360
+    CALLER_INSTRUCTIONS: u32 = 1200
+
+const module StackViewPipeline:
+    DISJOINT: sview = "sroa,instcombine,simplifycfg,gvn,slp-vectorizer,instcombine,simplifycfg"
+    INLINED: sview = "sroa,early-cse,instcombine,simplifycfg,gvn,slp-vectorizer,instcombine,simplifycfg,loop-simplify,lcssa,loop-unroll<O3>,sroa,instcombine,simplifycfg,gvn,slp-vectorizer"
+
+# A function the rewrite changed, and whether only the separate-storage assumption did.
+struct ChangedFunction:
+    function: LLVMValueRef
+    disjoint_views: bool
+
+extend Backend:
+    private:
+        # `GlobalValue::hasLocalLinkage`: internal or private.
+        def has_local_linkage(function: LLVMValueRef) -> bool:
+            linkage: u32 = LLVMGetLinkage(function)
+            linkage == LLVMLinkageValue::INTERNAL or linkage == LLVMLinkageValue::PRIVATE
+
+        # `Type::isFloatingPointTy`.
+        def is_floating_point_type(type: LLVMTypeRef) -> bool:
+            kind: u32 = LLVMGetTypeKind(type)
+            (kind >= LLVMTypeKindValue::HALF and kind <= LLVMTypeKindValue::PPC_FP128) or kind == LLVMTypeKindValue::BFLOAT
+
+        # The static stack array behind a `{ptr, iN}` view of a constant length from 1 to
+        # 32 over an alloca of at most 32 integer or floating-point elements.
+        def stack_view_storage(view: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic]:
+            type: LLVMTypeRef = LLVMTypeOf(view)
+            return null if LLVMGetTypeKind(type) != LLVMTypeKindValue::STRUCT or LLVMCountStructElementTypes(type) != 2
+            return null if LLVMGetTypeKind(LLVMStructGetTypeAtIndex(type, 0)) != LLVMTypeKindValue::POINTER or not is_llvm_integer_type(LLVMStructGetTypeAtIndex(type, 1), 0)
+            length: LLVMValueRef = get ElisaLLVMFindInsertedValue(view, 1) else return null
+            return null if LLVMIsAConstantInt(length) == null
+            active: u32 = ElisaLLVMConstantIntActiveBits(length)
+            return null if active == 0 or active > 6 or LLVMConstIntGetZExtValue(length) > StackViewLimit::VIEW_ELEMENTS
+            data: LLVMValueRef = get ElisaLLVMFindInsertedValue(view, 0) else return null
+            storage: LLVMValueRef = ElisaLLVMUnderlyingObject(data)
+            return null if LLVMIsAAllocaInst(storage) == null or ElisaLLVMIsStaticAlloca(storage) == 0 or is_array_allocation(storage)
+            array: LLVMTypeRef = LLVMGetAllocatedType(storage)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or LLVMGetArrayLength2(array) > StackViewLimit::VIEW_ELEMENTS
+            element: LLVMTypeRef = LLVMGetElementType(array)
+            return null if not is_llvm_integer_type(element, 0) and not is_floating_point_type(element)
+            storage
+
+        # `AllocaInst::isArrayAllocation`: a size operand other than the constant 1.
+        def is_array_allocation(alloca: LLVMValueRef) -> bool:
+            size: LLVMValueRef = LLVMGetOperand(alloca, 0)
+            LLVMIsAConstantInt(size) == null or ElisaLLVMConstantIntActiveBits(size) != 1 or LLVMConstIntGetZExtValue(size) != 1
+
+        # Every argument a constant integer or a stack view, the views over at least two
+        # different arrays, and one of the constants an `i1` flag.
+        def has_stack_view_arguments(call: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            storage: mutable darray[LLVMValueRef] = []
+            constant_flag: mutable bool = false
+            for index in 0..<LLVMGetNumArgOperands(call) |storage, constant_flag, call|:
+                argument: LLVMValueRef = LLVMGetOperand(call, index)
+                if LLVMIsAConstantInt(argument) != null:
+                    constant_flag <- constant_flag or is_llvm_integer_type(LLVMTypeOf(argument), 1)
+                else:
+                    array: LLVMValueRef = get stack_view_storage(argument) else return false
+                    return false if any seen in storage where seen == array
+                    storage.push(array)
+            storage.count >= 2 and constant_flag
+
+        # A direct call of FUNCTION through USE, with the function's own type.
+        def direct_call_through(use: LLVMUseRef, function: LLVMValueRef) -> LLVMValueRef?:
+            call: LLVMValueRef = LLVMGetUser(use)
+            return null if LLVMIsACallInst(call) == null
+            return null if LLVMGetOperandUse(call, LLVMGetNumOperands(call) - 1) != use
+            return null if LLVMGetCalledFunctionType(call) != LLVMGlobalGetValueType(function)
+            call
+
+        # A view argument whose data is the alloca itself and whose array holds the length.
+        def view_fits_its_array(view: LLVMValueRef) -> bool:
+            storage: LLVMValueRef = get ElisaLLVMFindInsertedValue(view, 0) else return false
+            return false if LLVMIsAAllocaInst(storage) == null
+            array: LLVMTypeRef = LLVMGetAllocatedType(storage)
+            length: LLVMValueRef = get ElisaLLVMFindInsertedValue(view, 1) else return false
+            return false if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or LLVMIsAConstantInt(length) == null
+            LLVMGetArrayLength2(array) >= LLVMConstIntGetZExtValue(length)
+
+        def disjoint_views_candidate(function: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not has_local_linkage(function) or LLVMIsFunctionVarArg(LLVMGlobalGetValueType(function)) != 0 or LLVMCountParams(function) != 3
+            return false if LLVMGetTypeKind(LLVMGetReturnType(LLVMGlobalGetValueType(function))) != LLVMTypeKindValue::VOID
+            uses: u32 = use_count(function)
+            return false if uses < 2 or uses > 4 or not is_llvm_integer_type(LLVMTypeOf(LLVMGetParam(function, 2)), 1)
+            return false if function_has_string_attribute(function, "elisa.disjoint-stack-views") or skipped_by_loop_pass_policy(function, module)
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(function)
+            while use_cursor is use |use_cursor, function|:
+                use_cursor <- LLVMGetNextUse(use)
+                call: LLVMValueRef = get direct_call_through(use, function) else return false
+                return false if not has_stack_view_arguments(call)
+                return false if not view_fits_its_array(LLVMGetOperand(call, 0)) or not view_fits_its_array(LLVMGetOperand(call, 1))
+            true
+
+        # View aggregates cannot carry pointer parameter attributes, so a helper whose
+        # every call passes two different stack arrays assumes their storage separate.
+        def assume_disjoint_stack_views(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not disjoint_views_candidate(function, module)
+            first: LLVMValueRef = get LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function)) else return false
+            position_builder_before(builder, first)
+            pointers: darray[LLVMValueRef] = [LLVMBuildExtractValue(builder, LLVMGetParam(function, 0), 0, ""), LLVMBuildExtractValue(builder, LLVMGetParam(function, 1), 0, "")]
+            build_separate_storage_assumption(builder, module, &pointers)
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            key_storage: mutable darray[u8] = []
+            value_storage: mutable darray[u8] = []
+            marker: LLVMAttributeRef = LLVMCreateStringAttribute(context, sview_to_cstr("elisa.disjoint-stack-views", key_storage), 26, sview_to_cstr("", value_storage), 0)
+            LLVMAddAttributeAtIndex(function, LLVMAttributeIndexValue::FUNCTION, marker)
+            true
+
+        # `IRBuilder::CreateAssumption({OperandBundleDef("separate_storage", pointers)})`.
+        def build_separate_storage_assumption(builder: LLVMBuilderRef, module: LLVMModuleRef, pointers: darray[LLVMValueRef]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            id: u32 = intrinsic_identifier("llvm.assume")
+            declaration: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, id, null, 0)
+            tag_storage: mutable darray[u8] = []
+            pointer_slots: void& = (&pointers[0]).cast[void&] can Unsafe.PointerCast
+            bundles: mutable darray[LLVMOperandBundleRef] = [LLVMCreateOperandBundle(sview_to_cstr("separate_storage", tag_storage), 16, pointer_slots, pointers.count.u32())]
+            arguments: mutable darray[LLVMValueRef] = [LLVMConstInt(LLVMInt1TypeInContext(context), 1, 0)]
+            argument_slots: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            bundle_slots: void& = (&bundles[0]).cast[void&] can Unsafe.PointerCast
+            LLVMBuildCallWithOperandBundles(builder, LLVMIntrinsicGetType(context, id, null, 0), declaration, argument_slots, 1, bundle_slots, 1, "")
+            LLVMDisposeOperandBundle(bundles[0])
+
+        # A small internal helper that may be inlined at its stack-view calls.
+        def is_stack_view_helper(function: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            type: LLVMTypeRef = LLVMGlobalGetValueType(function)
+            return false if not has_local_linkage(function) or LLVMGetTypeKind(LLVMGetReturnType(type)) != LLVMTypeKindValue::VOID or LLVMIsFunctionVarArg(type) != 0
+            parameters: u32 = LLVMCountParams(function)
+            return false if parameters < 3 or parameters > 6 or not function_has_attribute(function, "nounwind") or not function_has_attribute(function, "norecurse")
+            return false if function_has_attribute(function, "noinline") or function_has_attribute(function, "convergent") or function_has_attribute(function, "noduplicate")
+            uses: u32 = use_count(function)
+            uses >= 2 and uses < 5 and not skipped_by_loop_pass_policy(function, module)
+
+        # A call of HELPER from another function, with no bundles, that may be inlined.
+        def is_inlinable_stack_view_call(call: LLVMValueRef, helper: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsACallInst(call) == null or LLVMGetCalledValue(call) != helper or LLVMGetCalledFunctionType(call) != LLVMGlobalGetValueType(helper)
+            caller: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInstructionParent(call))
+            return false if caller == helper or LLVMGetNumOperandBundles(call) != 0 or LLVMGetTailCallKind(call) == LLVMTailCallKindValue::MUST_TAIL
+            return false if ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("noinline")) != 0 or ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("convergent")) != 0
+            return false if skipped_by_loop_pass_policy(caller, module) or not has_stack_view_arguments(call)
+            function_instruction_count(caller) <= StackViewLimit::CALLER_INSTRUCTIONS
+
+        # The calls to inline, in module order, while their helpers' sizes fit the budget.
+        def stack_view_inline_candidates(module: LLVMModuleRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidates: mutable darray[LLVMValueRef] = []
+            budget: mutable u32 = StackViewLimit::INLINE_BUDGET
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is helper |function_cursor, candidates, budget, module|:
+                function_cursor <- LLVMGetNextFunction(helper)
+                if is_stack_view_helper(helper, module):
+                    cost: u32 = function_instruction_count(helper)
+                    if cost >= StackViewLimit::HELPER_INSTRUCTIONS_LOW and cost <= StackViewLimit::HELPER_INSTRUCTIONS_HIGH:
+                        use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(helper)
+                        while use_cursor is use |use_cursor, candidates, budget, helper, cost, module|:
+                            use_cursor <- LLVMGetNextUse(use)
+                            call: LLVMValueRef = LLVMGetUser(use)
+                            if cost <= budget and is_inlinable_stack_view_call(call, helper, module):
+                                budget <- budget - cost
+                                candidates.push(call)
+            candidates
+
+        def remember_changed[@r](changed: mutable darray[ChangedFunction] @r, function: LLVMValueRef, disjoint_views: bool) -> darray[ChangedFunction] @r can[Abort.Panic, Memory.Allocate]:
+            if not any entry in changed where entry.function == function:
+                changed.push(ChangedFunction{function: function, disjoint_views: disjoint_views})
+            changed
+
+    public:
+        # 0 when nothing changed, 1 when a helper was inlined or assumed separate, 2 when a
+        # cleanup pipeline failed.
+        def inline_stack_view_helpers(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module) or module_function_count(module) > StackViewLimit::MODULE_FUNCTIONS
+            changed: mutable darray[ChangedFunction] = []
+            candidates: darray[LLVMValueRef] = stack_view_inline_candidates(module)
+            for call in candidates |changed|:
+                caller: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInstructionParent(call))
+                if ElisaLLVMInlineCall(call) != 0:
+                    changed <- remember_changed(changed, caller, false)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                if assume_disjoint_stack_views(function, module, builder):
+                    changed <- remember_changed(changed, function, true)
+            LLVMDisposeBuilder(builder)
+            return 0 if changed.count == 0
+            for entry in changed |target|:
+                pipeline: sview = StackViewPipeline::DISJOINT if entry.disjoint_views else StackViewPipeline::INLINED
+                return 2 if not run_function_pipeline(entry.function, target, pipeline)
+            1
