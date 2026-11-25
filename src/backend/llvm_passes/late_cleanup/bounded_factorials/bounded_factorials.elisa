@@ -1,0 +1,237 @@
+# Removes signed overflow checks from constant-start running products whose multiplier is
+# a unit-step counter under a small constant loop bound. The product sequence is then
+# fully determined, so it is simulated exactly: range multiplication cannot prove this
+# shape, since 20^20 overflows while 20! fits. The same loops' division sums, Horner
+# recurrences (factorial_recurrences.elisa) and every checked call the bounded interval
+# simulation keeps in range (interval_simulation.elisa) lose their checks too.
+include "./factorial_recurrences.elisa"
+include "./interval_simulation.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module FactorialProductLimit:
+    SPAN: i64 = 64
+
+# A checked multiply of a product phi by its counter, and the product's multiply that
+# replaces it.
+struct ProvenMultiply:
+    multiply: LLVMValueRef
+    call: LLVMValueRef
+
+# The checked calls one loop's proofs settled, in the order the proofs found them.
+struct LoopProofs:
+    multiplies: darray[ProvenMultiply]
+    calls: darray[LLVMValueRef]
+
+extend Backend:
+    private:
+        def has_checked_arithmetic(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            identifiers: darray[u32] = [intrinsic_identifier("llvm.smul.with.overflow"), intrinsic_identifier("llvm.ssub.with.overflow"), intrinsic_identifier("llvm.sadd.with.overflow")]
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, identifiers|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, identifiers|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if LLVMIsAIntrinsicInst(instruction) != null:
+                        identifier: u32 = called_intrinsic_id(instruction)
+                        for wanted in identifiers |identifier|:
+                            return true if wanted == identifier
+            false
+
+        def loop_blocks_in_reverse_postorder(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMBasicBlockRef] can[Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMBasicBlockRef] = []
+            count: u32 = ElisaLLVMLoopBlockCount(loop)
+            while blocks.count < count.usize() |blocks, loop|:
+                blocks.push(ElisaLLVMLoopHeader(loop))
+            written: u32 = ElisaLLVMLoopBlocksInReversePostorder(analyses, loop, (&blocks[0]).cast[void&], count)
+            while blocks.count > written.usize() |blocks, written|:
+                _ = blocks.pop()
+            blocks
+
+        # The loop's plain checked calls (no bundles, not convergent, no metadata but the
+        # slow-multiply marker) in block order, and how many instructions the loop has.
+        def plain_checked_calls(loop: ElisaLoopRef, context: LLVMContextRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            marker: u32 = LLVMGetMDKindIDInContext(context, "elisa.checkedmul.slow", 21)
+            convergent: u32 = attribute_kind("convergent")
+            calls: mutable darray[LLVMValueRef] = []
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |calls, loop, marker, convergent|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is call |cursor, calls, marker, convergent|:
+                    cursor <- LLVMGetNextInstruction(call)
+                    if checked_step_kind(call) != IntervalStepKind::SKIP and LLVMGetNumOperandBundles(call) == 0 and ElisaLLVMCallHasFunctionAttribute(call, convergent) == 0:
+                        calls.push(call) if has_only_slow_marker(call, marker)
+            calls
+
+        # The plain checked calls the bounded interval simulation keeps in range. When it
+        # keeps any, the unit step that bounded the loop cannot overflow either and gains
+        # `nsw` at once.
+        def interval_calls(shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            proven: mutable darray[LLVMValueRef] = []
+            calls: darray[LLVMValueRef] = plain_checked_calls(shape.loop, context)
+            size: u64 = loop_instruction_count(shape.loop).u64()
+            return proven if calls.count == 0 or size > IntervalLimit::LOOP_INSTRUCTIONS.u64()
+            bound: IterationBound = iteration_bound(shape, analyses, IntervalLimit::ITERATIONS)
+            # Larger trip bounds help small recurrence bodies; the work per loop stays capped.
+            return proven if bound.iterations == 0 or size * bound.iterations > IntervalLimit::WORK
+            blocks: darray[LLVMBasicBlockRef] = loop_blocks_in_reverse_postorder(shape.loop, analyses)
+            program: IntervalProgram = interval_program(shape, &blocks, analyses)
+            bad: darray[bool] = simulate_intervals(&program, bound.iterations)
+            for call in calls |proven, program, bad|:
+                position: i64 = value_position(&program.table, call)
+                proven.push(call) if position < 0 or not bad[position]
+            if bound.unit_step is step:
+                LLVMSetNSW(step, 1) if proven.count > 0
+            proven
+
+        # Whether START times each counter value from FIRST to LAST stays a signed word.
+        def factorial_fits(start: LLVMValueRef, first: i64, last: i64) -> bool:
+            value: mutable WideInteger = wide_from_signed(LLVMConstIntGetSExtValue(start))
+            counter: mutable i64 = first
+            while counter <= last |value, counter, last|:
+                value <- wide_multiply(value, wide_from_signed(counter))
+                return false if not wide_fits_signed(value, 64)
+                counter <- counter + 1
+            true
+
+        # The counter phi a product's multiply takes beside the product, looking through
+        # freezes.
+        def product_counter(product: LLVMValueRef, multiply: LLVMValueRef, header: LLVMBasicBlockRef) -> LLVMValueRef?:
+            first: LLVMValueRef = without_freeze(LLVMGetOperand(multiply, 0))
+            second: LLVMValueRef = without_freeze(LLVMGetOperand(multiply, 1))
+            counter: mutable LLVMValueRef? = null
+            if first == product:
+                counter <- second
+            elif second == product:
+                counter <- first
+            found: LLVMValueRef = get counter else return null
+            return null if found == product or not is_llvm_instruction_with_opcode(found, LLVMOpcode::PHI)
+            return null if LLVMGetInstructionParent(found) != header or LLVMCountIncoming(found) != 2
+            found
+
+        # The multiply of a constant-started word phi by a unit counter from a constant
+        # start, under an upper limit known on the entry edge, when the whole product
+        # sequence fits a signed word.
+        def proven_product(product: LLVMValueRef, shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            return null if not is_header_word_phi(product)
+            start: LLVMValueRef = get phi_incoming_for_block(product, shape.predecessor) else return null
+            multiply: LLVMValueRef = get phi_incoming_for_block(product, shape.latch) else return null
+            return null if LLVMIsAConstantInt(start) == null or LLVMIsABinaryOperator(multiply) == null or LLVMGetInstructionOpcode(multiply) != LLVMOpcode::MUL or LLVMGetNUW(multiply) != 0
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(multiply)
+            return null if not same_loop(ElisaLLVMLoopForBlock(analyses, block), shape.loop) or ElisaLLVMBlockDominates(analyses, block, shape.latch) == 0
+            counter: LLVMValueRef = get product_counter(product, multiply, shape.header) else return null
+            counter_start: LLVMValueRef = get phi_incoming_for_block(counter, shape.predecessor) else return null
+            step: LLVMValueRef = get phi_incoming_for_block(counter, shape.latch) else return null
+            return null if LLVMIsAConstantInt(counter_start) == null or not is_unit_counter_step(step, counter)
+            test: LatchTest = get latch_test(shape.latch) else return null
+            limit: LLVMValueRef = get upper_limit(shape, &test, step) else return null
+            edge: LLVMValueRef = get LLVMGetBasicBlockTerminator(shape.predecessor) else return null
+            # Without undef allowed, a possibly-undef limit gives the full range.
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, limit, shape.predecessor, shape.header, edge)
+            usable: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0
+            highest: i64 = ElisaLLVMConstantRangeSignedMax(range) if usable else 0
+            ElisaLLVMDisposeConstantRange(range)
+            return null if not usable
+            first: i64 = LLVMConstIntGetSExtValue(counter_start)
+            # A first trip may precede the test.
+            last: i64 = first if highest < first else highest
+            return null if first < -FactorialBoundLimit::COUNTER_SPAN or last > FactorialBoundLimit::COUNTER_SPAN or last - first >= FactorialProductLimit::SPAN
+            # The first trip runs unconditionally in rotated form; later counters are
+            # bounded by the backedge test.
+            return null if not factorial_fits(start, first, last)
+            multiply
+
+        # The loop's checked multiplies of PRODUCT by COUNTER that MULTIPLY dominates.
+        def product_checks[@r](found: mutable darray[ProvenMultiply] @r, product: LLVMValueRef, multiply: LLVMValueRef, shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> darray[ProvenMultiply] @r can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            counter: LLVMValueRef = get product_counter(product, multiply, shape.header) else return found
+            multiply_id: u32 = intrinsic_identifier("llvm.smul.with.overflow")
+            convergent: u32 = attribute_kind("convergent")
+            for index in 0..<ElisaLLVMLoopBlockCount(shape.loop) |found, product, multiply, counter, shape, analyses, multiply_id, convergent|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(shape.loop, index))
+                while cursor is call |cursor, found, product, multiply, counter, analyses, multiply_id, convergent|:
+                    cursor <- LLVMGetNextInstruction(call)
+                    if LLVMIsAIntrinsicInst(call) != null and called_intrinsic_id(call) == multiply_id and LLVMGetNumOperandBundles(call) == 0:
+                        if ElisaLLVMCallHasFunctionAttribute(call, convergent) == 0 and ElisaLLVMInstructionDominates(analyses, multiply, call) != 0:
+                            first: LLVMValueRef = without_freeze(LLVMGetOperand(call, 0))
+                            second: LLVMValueRef = without_freeze(LLVMGetOperand(call, 1))
+                            found.push(ProvenMultiply{multiply: multiply, call: call}) if (first == product and second == counter) or (first == counter and second == product)
+            found
+
+        # Every proof over one innermost loop, in the order they run.
+        def loop_proofs(shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef) -> LoopProofs can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: mutable darray[LLVMValueRef] = division_sum_calls(shape, analyses)
+            calls.extend(horner_calls(shape, analyses))
+            calls.extend(interval_calls(shape, analyses, context))
+            multiplies: mutable darray[ProvenMultiply] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is product |cursor, multiplies, shape, analyses|:
+                break if not is_llvm_instruction_with_opcode(product, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(product)
+                if proven_product(product, shape, analyses) is multiply:
+                    multiplies <- product_checks(multiplies, product, multiply, shape, analyses)
+            LoopProofs{multiplies: multiplies, calls: calls}
+
+        def fold_proven_call(call: LLVMValueRef, result: LLVMValueRef, builder: LLVMBuilderRef, context: LLVMContextRef) -> void:
+            pair: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetPoison(LLVMTypeOf(call)), result, 0, "")
+            flagged: LLVMValueRef = LLVMBuildInsertValue(builder, pair, LLVMConstInt(LLVMInt1TypeInContext(context), 0, 0), 1, "")
+            LLVMReplaceAllUsesWith(call, flagged)
+            LLVMInstructionEraseFromParent(call)
+
+        # The proven calls of one function rewritten, each once: product checks become the
+        # product's multiply (now `nsw`), other checked calls their `nsw` operation.
+        def apply_factorial_proofs(multiplies: darray[ProvenMultiply]&, calls: darray[LLVMValueRef]&, builder: LLVMBuilderRef, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            seen: mutable darray[LLVMValueRef] = []
+            changed: mutable u32 = 0
+            for proven in multiplies |seen, changed, builder, context|:
+                if not contains_value(&seen, proven.call):
+                    seen.push(proven.call)
+                    LLVMSetNSW(proven.multiply, 1)
+                    position_builder_before(builder, proven.call)
+                    fold_proven_call(proven.call, proven.multiply, builder, context)
+                    changed <- changed + 1
+            add_id: u32 = intrinsic_identifier("llvm.sadd.with.overflow")
+            subtract_id: u32 = intrinsic_identifier("llvm.ssub.with.overflow")
+            for call in calls |seen, changed, builder, context, add_id, subtract_id|:
+                if not contains_value(&seen, call):
+                    seen.push(call)
+                    position_builder_before(builder, call)
+                    identifier: u32 = called_intrinsic_id(call)
+                    first: LLVMValueRef = LLVMGetOperand(call, 0)
+                    second: LLVMValueRef = LLVMGetOperand(call, 1)
+                    result: mutable LLVMValueRef = first
+                    if identifier == add_id:
+                        result <- LLVMBuildNSWAdd(builder, first, second, "")
+                    elif identifier == subtract_id:
+                        result <- LLVMBuildNSWSub(builder, first, second, "")
+                    else:
+                        result <- LLVMBuildNSWMul(builder, first, second, "")
+                    fold_proven_call(call, result, builder, context)
+                    changed <- changed + 1
+            changed
+
+        def prove_function_factorials(function: LLVMValueRef, builder: LLVMBuilderRef, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            multiplies: mutable darray[ProvenMultiply] = []
+            calls: mutable darray[LLVMValueRef] = []
+            for index in 0..<ElisaLLVMLoopCount(analyses) |multiplies, calls, analyses, context|:
+                if factorial_loop(ElisaLLVMLoopAt(analyses, index)) is shape:
+                    proofs: LoopProofs = loop_proofs(&shape, analyses, context)
+                    multiplies.extend(proofs.multiplies)
+                    calls.extend(proofs.calls)
+            changed: u32 = apply_factorial_proofs(&multiplies, &calls, builder, context)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # The bounded-factorial proofs over every function the loop policy allows that has
+        # a checked add, subtraction or multiply; the number of calls rewritten.
+        def prove_bounded_factorials(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, module, builder, context|:
+                cursor <- LLVMGetNextFunction(function)
+                if not skipped_by_loop_pass_policy(function, module) and has_checked_arithmetic(function):
+                    changed <- changed + prove_function_factorials(function, builder, context)
+            LLVMDisposeBuilder(builder)
+            changed

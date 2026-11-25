@@ -1,0 +1,200 @@
+# Runs an interval program (interval_program.elisa) for a loop's bounded trips. Intervals
+# live in the environment at each value's position; anything unmodeled is the full range of
+# its width, every result that leaves its width becomes that full range, and a checked
+# call loses its proof once any trip's interval can leave its type (past a kept check the
+# value still fits, so the simulation goes on with the full range). Each trip's header
+# values come only from the previous latch, so resets need no widening. The backedge runs
+# only while the latch test holds, so a tested phi, or a constant offset of it, inherits
+# that signed limit on the next trip.
+include "./interval_program.elisa"
+
+const module IntervalLimit:
+    LOOP_INSTRUCTIONS: u32 = 512
+    ITERATIONS: u64 = 192
+    WORK: u64 = 32768
+
+# A signed interval of a value at most a word wide.
+struct Interval:
+    low: i64
+    high: i64
+
+# Interval endpoints wider than a word, before they are checked against the result width.
+struct WideInterval:
+    low: WideInteger
+    high: WideInteger
+
+extend Backend:
+    private:
+        def full_interval(width: u32) -> Interval:
+            return Interval{low: -9223372036854775807 - 1, high: 9223372036854775807} if width >= 64
+            half: i64 = (1).i64() << (width - 1).i64()
+            Interval{low: -half, high: half - 1}
+
+        def widened(interval: Interval) -> WideInterval:
+            WideInterval{low: wide_from_signed(interval.low), high: wide_from_signed(interval.high)}
+
+        # RESULT when both endpoints fit WIDTH, else the full range of WIDTH.
+        def fitted(result: WideInterval, width: u32) -> Interval:
+            return full_interval(width) if not wide_fits_signed(result.low, width) or not wide_fits_signed(result.high, width)
+            Interval{low: wide_to_signed(result.low), high: wide_to_signed(result.high)}
+
+        # The products of the endpoints, from smallest to largest.
+        def corner_products(first_low: WideInteger, first_high: WideInteger, second_low: WideInteger, second_high: WideInteger) -> WideInterval can[Memory.Allocate]:
+            products: darray[WideInteger] = [wide_multiply(first_low, second_low), wide_multiply(first_low, second_high), wide_multiply(first_high, second_low), wide_multiply(first_high, second_high)]
+            low: mutable WideInteger = products[0]
+            high: mutable WideInteger = products[0]
+            for product in products |low, high|:
+                low <- wide_minimum(low, product)
+                high <- wide_maximum(high, product)
+            WideInterval{low: low, high: high}
+
+        def read_interval(read: IntervalRead&, intervals: darray[Interval]&, present: darray[bool]&) -> Interval can[Abort.Panic]:
+            return full_interval(64) if read.width == 0
+            return Interval{low: read.value, high: read.value} if read.constant
+            current: mutable Interval = full_interval(read.width)
+            if read.position >= 0 and present[read.position]:
+                current <- intervals[read.position]
+            return current if not read.fact
+            low: i64 = current.low if current.low > read.fact_low else read.fact_low
+            high: i64 = current.high if current.high < read.fact_high else read.fact_high
+            return Interval{low: read.fact_low, high: read.fact_high} if low > high
+            Interval{low: low, high: high}
+
+        def step_read(program: IntervalProgram&, step: IntervalStep&, index: u32, intervals: darray[Interval]&, present: darray[bool]&) -> Interval can[Abort.Panic]:
+            read_interval(&program.reads[step.first_read + index], intervals, present)
+
+        # A binary operator over the intervals of its operands; the full range for any
+        # operator or operand shape the proof does not model.
+        def binary_interval(opcode: u32, first: Interval, second: Interval, width: u32) -> WideInterval can[Memory.Allocate]:
+            full: WideInterval = widened(full_interval(width))
+            nonnegative: bool = first.low >= 0 and second.low >= 0
+            constant: bool = second.low == second.high
+            if opcode == LLVMOpcode::ADD:
+                return WideInterval{low: wide_add(wide_from_signed(first.low), wide_from_signed(second.low)), high: wide_add(wide_from_signed(first.high), wide_from_signed(second.high))}
+            if opcode == LLVMOpcode::SUB:
+                return WideInterval{low: wide_subtract(wide_from_signed(first.low), wide_from_signed(second.high)), high: wide_subtract(wide_from_signed(first.high), wide_from_signed(second.low))}
+            if opcode == LLVMOpcode::MUL:
+                return corner_products(wide_from_signed(first.low), wide_from_signed(first.high), wide_from_signed(second.low), wide_from_signed(second.high))
+            if opcode == LLVMOpcode::SHL:
+                return full if second.low < 0 or second.high >= width.i64()
+                return corner_products(wide_from_signed(first.low), wide_from_signed(first.high), wide_shift_left(wide_from_signed(1), second.low.u32()), wide_shift_left(wide_from_signed(1), second.high.u32()))
+            if opcode == LLVMOpcode::LSHR or opcode == LLVMOpcode::ASHR:
+                return full if not nonnegative or second.high >= width.i64()
+                return widened(Interval{low: first.low >> second.high, high: first.high >> second.low})
+            if opcode == LLVMOpcode::UDIV or opcode == LLVMOpcode::SDIV:
+                return full if not nonnegative or not constant or second.low == 0
+                return widened(Interval{low: first.low / second.low, high: first.high / second.low})
+            if opcode == LLVMOpcode::UREM:
+                return full if not nonnegative or not constant or second.low == 0
+                return widened(Interval{low: 0, high: first.high if first.high < second.low - 1 else second.low - 1})
+            if opcode == LLVMOpcode::AND:
+                if second.low >= 0:
+                    return widened(Interval{low: 0, high: second.high if first.low < 0 else (first.high if first.high < second.high else second.high)})
+                return widened(Interval{low: 0, high: first.high}) if first.low >= 0
+            full
+
+        def merged(first: Interval, second: Interval) -> Interval:
+            Interval{low: first.low if first.low < second.low else second.low, high: first.high if first.high > second.high else second.high}
+
+        # The interval of a word-sized instruction from the environment.
+        def evaluate_step(program: IntervalProgram&, step: IntervalStep&, intervals: darray[Interval]&, present: darray[bool]&) -> Interval can[Abort.Panic, Memory.Allocate]:
+            width: u32 = step.width
+            kind: u32 = step.kind
+            if kind == IntervalStepKind::BINARY:
+                return fitted(binary_interval(step.opcode, step_read(program, step, 0, intervals, present), step_read(program, step, 1, intervals, present), width), width)
+            if kind == IntervalStepKind::SIGN_EXTEND or kind == IntervalStepKind::TRUNCATE or kind == IntervalStepKind::FREEZE:
+                return fitted(widened(step_read(program, step, 0, intervals, present)), width)
+            if kind == IntervalStepKind::ZERO_EXTEND:
+                source: Interval = step_read(program, step, 0, intervals, present)
+                return fitted(widened(source), width) if source.low >= 0
+                return fitted(widened(Interval{low: 0, high: ((1).i64() << step.source_width.i64()) - 1}), width)
+            if kind == IntervalStepKind::SELECT:
+                return fitted(widened(merged(step_read(program, step, 0, intervals, present), step_read(program, step, 1, intervals, present))), width)
+            if kind == IntervalStepKind::EXTRACT:
+                return full_interval(width) if step.aggregate < 0 or not present[step.aggregate]
+                return fitted(widened(intervals[step.aggregate]), width)
+            if kind == IntervalStepKind::PHI:
+                result: mutable Interval = step_read(program, step, 0, intervals, present)
+                for index in 1..<step.reads |result, program, step, intervals, present|:
+                    result <- merged(result, step_read(program, step, index, intervals, present))
+                return fitted(widened(result), width)
+            full_interval(width)
+
+        # The interval a checked call's operands give its result, if it fits.
+        def checked_interval(program: IntervalProgram&, step: IntervalStep&, intervals: darray[Interval]&, present: darray[bool]&) -> Interval? can[Abort.Panic, Memory.Allocate]:
+            first: Interval = step_read(program, step, 0, intervals, present)
+            second: Interval = step_read(program, step, 1, intervals, present)
+            opcode: u32 = LLVMOpcode::ADD if step.kind == IntervalStepKind::CHECKED_ADD else (LLVMOpcode::SUB if step.kind == IntervalStepKind::CHECKED_SUBTRACT else LLVMOpcode::MUL)
+            result: WideInterval = binary_interval(opcode, first, second, step.width)
+            return null if not wide_fits_signed(result.low, step.width) or not wide_fits_signed(result.high, step.width)
+            Interval{low: wide_to_signed(result.low), high: wide_to_signed(result.high)}
+
+        def stored[@r](intervals: mutable darray[Interval] @r, position: u32, value: Interval) -> darray[Interval] @r:
+            intervals[position] <- value
+            intervals
+
+        def marked[@r](flags: mutable darray[bool] @r, position: u32) -> darray[bool] @r:
+            flags[position] <- true
+            flags
+
+        # The next trip's interval of a header phi: its latch value's, narrowed by the latch
+        # limit when the phi is the tested value or a constant offset of it.
+        def carried_interval(carry: PhiCarry&, next: Interval, latch: LatchLimit&, intervals: darray[Interval]&, present: darray[bool]&) -> Interval can[Abort.Panic]:
+            return next if not latch.active or (not carry.related and not carry.offset_related)
+            offset: mutable WideInteger = wide_from_signed(0)
+            if carry.offset_related:
+                tested: Interval = read_interval(&latch.tested, intervals, present)
+                moved_low: WideInteger = wide_add(wide_from_signed(tested.low), wide_from_signed(carry.offset))
+                moved_high: WideInteger = wide_add(wide_from_signed(tested.high), wide_from_signed(carry.offset))
+                # Only a non-wrapping offset preserves order; the tested interval shows that.
+                return next if not wide_fits_signed(moved_low, carry.offset_width) or not wide_fits_signed(moved_high, carry.offset_width)
+                offset <- wide_from_signed(carry.offset)
+            moved: WideInteger = wide_add(latch.limit, offset)
+            low: WideInteger = wide_from_signed(next.low)
+            high: WideInteger = wide_from_signed(next.high)
+            if latch.lower:
+                return Interval{low: wide_to_signed(moved), high: next.high} if wide_less(low, moved) and wide_less_or_equal(moved, high)
+                return next
+            return Interval{low: next.low, high: wide_to_signed(moved)} if wide_less(moved, high) and wide_less_or_equal(low, moved)
+            next
+
+    public:
+        # The positions of the checked calls whose intervals left their type on some trip
+        # of ITERATIONS, flagged.
+        def simulate_intervals(program: IntervalProgram&, iterations: u64) -> darray[bool] can[Abort.Panic, Memory.Allocate]:
+            intervals: mutable darray[Interval] = []
+            present: mutable darray[bool] = []
+            bad: mutable darray[bool] = []
+            while intervals.count < program.table.keys.count |intervals, present, bad, program|:
+                intervals.push(Interval{low: 0, high: 0})
+                present.push(false)
+                bad.push(false)
+            for carry in program.carries |intervals, present|:
+                value: Interval = read_interval(&carry.entry, &intervals, &present)
+                intervals <- stored(intervals, carry.position, value)
+                present <- marked(present, carry.position)
+            for _ in 0..<iterations |intervals, present, bad, program|:
+                for step in program.steps |intervals, present, bad, program|:
+                    if step.kind == IntervalStepKind::CHECKED_ADD or step.kind == IntervalStepKind::CHECKED_SUBTRACT or step.kind == IntervalStepKind::CHECKED_MULTIPLY:
+                        result: Interval? = checked_interval(program, &step, &intervals, &present)
+                        if result is fits:
+                            intervals <- stored(intervals, step.position, fits)
+                        else:
+                            # Past a kept check the value still fits its type.
+                            bad <- marked(bad, step.position)
+                            intervals <- stored(intervals, step.position, full_interval(step.width))
+                        present <- marked(present, step.position)
+                    elif step.kind == IntervalStepKind::CHECKED_WIDE:
+                        bad <- marked(bad, step.position)
+                        intervals <- stored(intervals, step.position, full_interval(64))
+                        present <- marked(present, step.position)
+                    elif step.kind != IntervalStepKind::SKIP:
+                        value: Interval = evaluate_step(program, &step, &intervals, &present)
+                        intervals <- stored(intervals, step.position, value)
+                        present <- marked(present, step.position)
+                nexts: mutable darray[Interval] = []
+                for carry in program.carries |nexts, intervals, present, program|:
+                    nexts.push(carried_interval(&carry, read_interval(&carry.next, &intervals, &present), &program.latch, &intervals, &present))
+                for index in 0..<program.carries.count |intervals, nexts, program|:
+                    intervals <- stored(intervals, program.carries[index].position, nexts[index])
+            bad

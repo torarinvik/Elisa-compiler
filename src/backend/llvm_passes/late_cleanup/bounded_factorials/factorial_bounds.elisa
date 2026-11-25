@@ -1,0 +1,237 @@
+# Iteration bounds for the bounded-factorial proofs: how many times an innermost loop's
+# header can run, from a unit-step counter under an invariant upper limit (or an
+# equality exit the limit starts above), or from a counter stepping down to a constant
+# floor. Counts beyond the caller's maximum read as unbounded.
+include "../../ir/ir_editing.elisa"
+include "../../ir/llvm_ir_queries.elisa"
+include "../../ir/wide_integers.elisa"
+
+const module FactorialBoundLimit:
+    ITERATIONS: u64 = 64
+    COUNTER_SPAN: i64 = 1024
+    DOWN_START: i64 = 1048576
+
+# An innermost loop's predecessor, latch and header.
+struct FactorialLoop:
+    loop: ElisaLoopRef
+    predecessor: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+    header: LLVMBasicBlockRef
+
+# The latch's conditional branch and the integer compare it tests.
+struct LatchTest:
+    branch: LLVMValueRef
+    compare: LLVMValueRef
+
+# The most times the header runs, and the plain unit step whose counter that bound keeps
+# in range, if the bound came from one.
+struct IterationBound:
+    iterations: u64
+    unit_step: LLVMValueRef?
+
+# What a down-counting update subtracts each trip, as a signed amount.
+struct DownStep:
+    base: LLVMValueRef
+    decrement: WideInteger
+
+extend Backend:
+    private:
+        def is_integer_of_width(value: LLVMValueRef, width: u32) -> bool:
+            type: LLVMTypeRef = LLVMTypeOf(value)
+            LLVMGetTypeKind(type) == LLVMTypeKindValue::INTEGER and LLVMGetIntTypeWidth(type) == width
+
+        def is_header_word_phi(phi: LLVMValueRef) -> bool:
+            is_integer_of_width(phi, 64) and LLVMCountIncoming(phi) == 2
+
+        # The plain field-0 extract of an intrinsic call, and that call.
+        def extracted_call(value: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic]:
+            return null if not is_extract_of_field(value, 0)
+            call: LLVMValueRef = LLVMGetOperand(value, 0)
+            return null if LLVMIsAIntrinsicInst(call) == null
+            call
+
+        def without_freeze(value: LLVMValueRef) -> LLVMValueRef:
+            return LLVMGetOperand(value, 0) if is_llvm_instruction_with_opcode(value, LLVMOpcode::FREEZE)
+            value
+
+        def is_constant_one(value: LLVMValueRef) -> bool:
+            LLVMIsAConstantInt(value) != null and ElisaLLVMIsConstantOne(value) != 0
+
+        # Whether VALUE is COUNTER plus one, as a plain add or a checked add.
+        def is_unit_counter_step(value: LLVMValueRef, counter: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            if LLVMIsABinaryOperator(value) != null:
+                return LLVMGetInstructionOpcode(value) == LLVMOpcode::ADD and LLVMGetOperand(value, 0) == counter and is_constant_one(LLVMGetOperand(value, 1))
+            call: LLVMValueRef = get extracted_call(value) else return false
+            called_intrinsic_id(call) == intrinsic_identifier("llvm.sadd.with.overflow") and LLVMGetOperand(call, 0) == counter and is_constant_one(LLVMGetOperand(call, 1))
+
+        def stays_on_true(shape: FactorialLoop&, test: LatchTest&) -> bool:
+            LLVMGetSuccessor(test.branch, 0) == shape.header and ElisaLLVMLoopContainsBlock(shape.loop, LLVMGetSuccessor(test.branch, 1)) == 0
+
+        def exits_on_true(shape: FactorialLoop&, test: LatchTest&) -> bool:
+            LLVMGetSuccessor(test.branch, 1) == shape.header and ElisaLLVMLoopContainsBlock(shape.loop, LLVMGetSuccessor(test.branch, 0)) == 0
+
+        # The largest counter value that re-enters the header: the backedge runs only
+        # while STEP <= limit (or < limit) for an invariant signed limit.
+        def upper_limit(shape: FactorialLoop&, test: LatchTest&, step: LLVMValueRef) -> LLVMValueRef?:
+            predicate: mutable i32 = LLVMGetICmpPredicate(test.compare)
+            limit: mutable LLVMValueRef = LLVMGetOperand(test.compare, 1)
+            if LLVMGetOperand(test.compare, 0) != step:
+                return null if LLVMGetOperand(test.compare, 1) != step
+                predicate <- swapped_integer_predicate(predicate)
+                limit <- LLVMGetOperand(test.compare, 0)
+            return null if ElisaLLVMLoopIsInvariant(shape.loop, limit) == 0
+            upper_stay: bool = predicate == LLVMIntPredicate::SLE or predicate == LLVMIntPredicate::SLT
+            upper_exit: bool = predicate == LLVMIntPredicate::SGT or predicate == LLVMIntPredicate::SGE
+            return limit if (stays_on_true(shape, test) and upper_stay) or (exits_on_true(shape, test) and upper_exit)
+            null
+
+        # The base and decrement of a counter update that adds or subtracts a constant,
+        # plainly or checked.
+        def down_step(step: LLVMValueRef) -> DownStep? can[Abort.Panic, Memory.Allocate]:
+            base: mutable LLVMValueRef? = null
+            amount: mutable LLVMValueRef? = null
+            subtract: mutable bool = false
+            if LLVMIsABinaryOperator(step) != null:
+                opcode: u32 = LLVMGetInstructionOpcode(step)
+                return null if opcode != LLVMOpcode::ADD and opcode != LLVMOpcode::SUB
+                base <- LLVMGetOperand(step, 0)
+                amount <- LLVMGetOperand(step, 1)
+                subtract <- opcode == LLVMOpcode::SUB
+            else:
+                call: LLVMValueRef = get extracted_call(step) else return null
+                identifier: u32 = called_intrinsic_id(call)
+                subtracting: u32 = intrinsic_identifier("llvm.ssub.with.overflow")
+                return null if identifier != intrinsic_identifier("llvm.sadd.with.overflow") and identifier != subtracting
+                base <- LLVMGetOperand(call, 0)
+                amount <- LLVMGetOperand(call, 1)
+                subtract <- identifier == subtracting
+            counter: LLVMValueRef = get base else return null
+            increment: LLVMValueRef = get amount else return null
+            return null if LLVMIsAConstantInt(increment) == null
+            value: WideInteger = wide_from_signed(LLVMConstIntGetSExtValue(increment))
+            DownStep{base: counter, decrement: value if subtract else wide_negate(value)}
+
+        # Trips of a counter X stepping down by a positive K from a start range on the
+        # entry edge, while the tested value stays above FLOOR.
+        def down_counter_trips(counter: LLVMValueRef, tested: LLVMValueRef, floor: WideInteger, shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef, maximum: u64) -> u64 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not is_header_word_phi(counter)
+            step: LLVMValueRef = get phi_incoming_for_block(counter, shape.latch) else return 0
+            return 0 if tested != counter and tested != step
+            update: DownStep = get down_step(step) else return 0
+            return 0 if update.base != counter or not wide_less(wide_from_signed(0), update.decrement)
+            start: LLVMValueRef = get phi_incoming_for_block(counter, shape.predecessor) else return 0
+            edge: LLVMValueRef = get LLVMGetBasicBlockTerminator(shape.predecessor) else return 0
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, start, shape.predecessor, shape.header, edge)
+            usable: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0
+            low: WideInteger = wide_from_signed(ElisaLLVMConstantRangeSignedMin(range) if usable else 0)
+            high: WideInteger = wide_from_signed(ElisaLLVMConstantRangeSignedMax(range) if usable else 0)
+            ElisaLLVMDisposeConstantRange(range)
+            return 0 if not usable
+            # The first decrement must not wrap, or a low start could re-enter high.
+            return 0 if not wide_fits_signed(wide_subtract(low, update.decrement), 64) or wide_less(wide_from_signed(FactorialBoundLimit::DOWN_START), high)
+            return 1 if wide_less_or_equal(high, floor)
+            # The smallest j with high - K * j <= floor; the gap and K both fit a word.
+            gap: u64 = wide_subtract(high, floor).low
+            steps: u64 = (gap - 1) / update.decrement.low + 1
+            count: u64 = steps + 1 if tested == counter else (steps if steps > 1 else 1)
+            return count if count <= maximum
+            0
+
+        # Trips of a counter stepping down to a constant floor tested at the latch.
+        def down_bound(shape: FactorialLoop&, test: LatchTest&, analyses: ElisaFunctionAnalysesRef, maximum: u64) -> u64 can[Abort.Panic, Memory.Allocate]:
+            bound: mutable LLVMValueRef = LLVMGetOperand(test.compare, 1)
+            tested: mutable LLVMValueRef = LLVMGetOperand(test.compare, 0)
+            predicate: mutable i32 = LLVMGetICmpPredicate(test.compare)
+            if LLVMIsAConstantInt(bound) == null:
+                bound <- LLVMGetOperand(test.compare, 0)
+                tested <- LLVMGetOperand(test.compare, 1)
+                predicate <- swapped_integer_predicate(predicate)
+            return 0 if LLVMIsAConstantInt(bound) == null or not is_integer_of_width(bound, 64)
+            if exits_on_true(shape, test):
+                predicate <- inverse_integer_predicate(predicate)
+            elif LLVMGetSuccessor(test.branch, 0) != shape.header or ElisaLLVMLoopContainsBlock(shape.loop, LLVMGetSuccessor(test.branch, 1)) != 0:
+                return 0
+            # Stay while the tested value is above the floor.
+            return 0 if predicate != LLVMIntPredicate::SGT and predicate != LLVMIntPredicate::SGE
+            constant: WideInteger = wide_from_signed(LLVMConstIntGetSExtValue(bound))
+            floor: WideInteger = wide_subtract(constant, wide_from_signed(1)) if predicate == LLVMIntPredicate::SGE else constant
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is counter |cursor, tested, floor, shape, analyses, maximum|:
+                break if not is_llvm_instruction_with_opcode(counter, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(counter)
+                trips: u64 = down_counter_trips(counter, tested, floor, shape, analyses, maximum)
+                return trips if trips != 0
+            0
+
+        # The invariant other side of an equality exit, which bounds a unit counter only
+        # when the limit starts above it.
+        def equality_exit_limit(step: LLVMValueRef, shape: FactorialLoop&, test: LatchTest&) -> LLVMValueRef?:
+            other: LLVMValueRef = get operand_beside(test.compare, step) else return null
+            predicate: i32 = LLVMGetICmpPredicate(test.compare)
+            taken: LLVMBasicBlockRef = LLVMGetSuccessor(test.branch, 0)
+            fallthrough: LLVMBasicBlockRef = LLVMGetSuccessor(test.branch, 1)
+            equal_exit: bool = predicate == LLVMIntPredicate::EQ and ElisaLLVMLoopContainsBlock(shape.loop, taken) == 0 and fallthrough == shape.header
+            unequal_exit: bool = predicate == LLVMIntPredicate::NE and ElisaLLVMLoopContainsBlock(shape.loop, fallthrough) == 0 and taken == shape.header
+            return null if (not equal_exit and not unequal_exit) or ElisaLLVMLoopIsInvariant(shape.loop, other) == 0
+            other
+
+        # The trips of a unit counter from a constant start of at least -1024 to a limit of
+        # at most 1024 known on the entry edge, or 0.
+        def unit_counter_trips(counter: LLVMValueRef, shape: FactorialLoop&, test: LatchTest&, analyses: ElisaFunctionAnalysesRef, maximum: u64) -> u64 can[Abort.Panic, Memory.Allocate]:
+            return 0 if not is_header_word_phi(counter)
+            start: LLVMValueRef = get phi_incoming_for_block(counter, shape.predecessor) else return 0
+            step: LLVMValueRef = get phi_incoming_for_block(counter, shape.latch) else return 0
+            return 0 if LLVMIsAConstantInt(start) == null or not is_unit_counter_step(step, counter)
+            equality: mutable bool = false
+            limit: mutable LLVMValueRef? = upper_limit(shape, test, step)
+            if limit == null:
+                limit <- equality_exit_limit(step, shape, test)
+                equality <- true
+            bound: LLVMValueRef = get limit else return 0
+            edge: LLVMValueRef = get LLVMGetBasicBlockTerminator(shape.predecessor) else return 0
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, bound, shape.predecessor, shape.header, edge)
+            usable: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0
+            first: i64 = LLVMConstIntGetSExtValue(start)
+            lowest: i64 = ElisaLLVMConstantRangeSignedMin(range) if usable else 0
+            highest: i64 = ElisaLLVMConstantRangeSignedMax(range) if usable else 0
+            ElisaLLVMDisposeConstantRange(range)
+            return 0 if not usable or (equality and lowest <= first)
+            last: i64 = first if highest < first else highest
+            return 0 if first < -FactorialBoundLimit::COUNTER_SPAN or last > FactorialBoundLimit::COUNTER_SPAN
+            count: u64 = (last - first + 1).u64()
+            return count if count <= maximum
+            0
+
+    public:
+        # The most times the loop's header runs, at most MAXIMUM, or 0 when unproved.
+        def iteration_bound(shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef, maximum: u64) -> IterationBound can[Abort.Panic, Memory.Allocate]:
+            test: LatchTest = get latch_test(shape.latch) else return IterationBound{iterations: 0, unit_step: null}
+            down: u64 = down_bound(shape, &test, analyses, maximum)
+            return IterationBound{iterations: down, unit_step: null} if down != 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is counter |cursor, shape, test, analyses, maximum|:
+                break if not is_llvm_instruction_with_opcode(counter, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(counter)
+                trips: u64 = unit_counter_trips(counter, shape, &test, analyses, maximum)
+                if trips != 0:
+                    step: LLVMValueRef = get phi_incoming_for_block(counter, shape.latch) else return IterationBound{iterations: trips, unit_step: null}
+                    plain: mutable LLVMValueRef? = null
+                    if LLVMIsABinaryOperator(step) != null:
+                        plain <- step
+                    return IterationBound{iterations: trips, unit_step: plain}
+            IterationBound{iterations: 0, unit_step: null}
+
+        # The latch's conditional branch on an integer compare, if it ends in one.
+        def latch_test(latch: LLVMBasicBlockRef) -> LatchTest?:
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(latch) else return null
+            return null if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            LatchTest{branch: branch, compare: compare}
+
+        # The loop's shape when it is innermost with a predecessor and a latch.
+        def factorial_loop(loop: ElisaLoopRef) -> FactorialLoop?:
+            return null if ElisaLLVMLoopSubLoopCount(loop) != 0
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            FactorialLoop{loop: loop, predecessor: predecessor, latch: latch, header: ElisaLLVMLoopHeader(loop)}

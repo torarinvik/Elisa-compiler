@@ -1,0 +1,264 @@
+# The general bounded-loop proof of the bounded-factorial pass, compiled. A header runs at
+# most N times, so every integer value of the loop is evaluated once per trip over signed
+# intervals. This file turns the loop into a program the simulation (interval_simulation)
+# runs N times: its instructions in reverse postorder, each with the reads of its operands.
+# A read is a constant, the full word (for wider values), or a loop value's interval,
+# narrowed by the range lazy value info gives at the read. Those ranges never change
+# during the simulation, so they are found here once, in the order the simulation reads.
+include "./factorial_bounds.elisa"
+include "../../ir/value_table.elisa"
+
+const module IntervalStepKind:
+    SKIP: u32 = 0
+    CHECKED_ADD: u32 = 1
+    CHECKED_SUBTRACT: u32 = 2
+    CHECKED_MULTIPLY: u32 = 3
+    CHECKED_WIDE: u32 = 4
+    BINARY: u32 = 5
+    SIGN_EXTEND: u32 = 6
+    ZERO_EXTEND: u32 = 7
+    TRUNCATE: u32 = 8
+    FREEZE: u32 = 9
+    SELECT: u32 = 10
+    EXTRACT: u32 = 11
+    PHI: u32 = 12
+    FULL: u32 = 13
+
+# How to read one operand: a constant, the full word (width 0), or the interval at an
+# environment position (-1 when the value is outside the loop), narrowed by a fact.
+struct IntervalRead:
+    position: i64
+    width: u32
+    constant: bool
+    value: i64
+    fact: bool
+    fact_low: i64
+    fact_high: i64
+
+# One instruction: how it evaluates, where its interval goes, and its reads.
+struct IntervalStep:
+    instruction: LLVMValueRef
+    kind: u32
+    opcode: u32
+    position: u32
+    width: u32
+    source_width: u32
+    aggregate: i64
+    first_read: u32
+    reads: u32
+
+# A header phi: where it lives, how its entry and latch values read, and how the latch
+# test's limit carries over to it (directly, or through a constant offset whose sum with
+# the tested value must fit `offset_width`).
+struct PhiCarry:
+    position: u32
+    entry: IntervalRead
+    next: IntervalRead
+    related: bool
+    offset_related: bool
+    offset: i64
+    offset_width: u32
+
+# The latch test's signed constant limit, when the backedge runs only while it holds.
+struct LatchLimit:
+    active: bool
+    lower: bool
+    limit: WideInteger
+    tested: IntervalRead
+
+struct IntervalProgram:
+    steps: darray[IntervalStep]
+    reads: darray[IntervalRead]
+    carries: darray[PhiCarry]
+    latch: LatchLimit
+    table: ValueTable
+
+extend Backend:
+    private:
+        # Every instruction of BLOCKS, as a table of itself (its slot is its position).
+        def loop_value_table(blocks: darray[LLVMBasicBlockRef]&) -> ValueTable can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            table: mutable ValueTable = new_value_table()
+            for block in blocks |table|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, table|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    table <- value_table_set(table, instruction, instruction)
+            table
+
+        def value_position(table: ValueTable&, value: LLVMValueRef) -> i64 can[Abort.Panic, Unsafe.PointerCast]:
+            slot: u32 = value_table_slot(table, value)
+            return -1 if table.keys[slot] == null
+            slot.i64()
+
+        def integer_width(value: LLVMValueRef) -> u32:
+            LLVMGetIntTypeWidth(LLVMTypeOf(value))
+
+        def is_word_integer(value: LLVMValueRef) -> bool:
+            type: LLVMTypeRef = LLVMTypeOf(value)
+            LLVMGetTypeKind(type) == LLVMTypeKindValue::INTEGER and LLVMGetIntTypeWidth(type) <= 64
+
+        # How VALUE reads at CONTEXT. Without undef allowed, a possibly-undef value's fact
+        # is the full range, which narrows nothing.
+        def interval_read(value: LLVMValueRef, context: LLVMValueRef, table: ValueTable&, analyses: ElisaFunctionAnalysesRef) -> IntervalRead can[Abort.Panic, Unsafe.PointerCast]:
+            width: u32 = integer_width(value)
+            return IntervalRead{position: -1, width: 0, constant: false, value: 0, fact: false, fact_low: 0, fact_high: 0} if width > 64
+            if LLVMIsAConstantInt(value) != null:
+                return IntervalRead{position: -1, width: width, constant: true, value: LLVMConstIntGetSExtValue(value), fact: false, fact_low: 0, fact_high: 0}
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, value, context, 0)
+            fact: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0
+            low: i64 = ElisaLLVMConstantRangeSignedMin(range) if fact else 0
+            high: i64 = ElisaLLVMConstantRangeSignedMax(range) if fact else 0
+            ElisaLLVMDisposeConstantRange(range)
+            IntervalRead{position: value_position(table, value), width: width, constant: false, value: 0, fact: fact, fact_low: low, fact_high: high}
+
+        def terminator_of(block: LLVMBasicBlockRef) -> LLVMValueRef can[Abort.Panic]:
+            if LLVMGetBasicBlockTerminator(block) is terminator:
+                return terminator
+            panic("a loop block without a terminator")
+
+        # A header phi's value from BLOCK, one of the loop's predecessor and latch.
+        def required_incoming(phi: LLVMValueRef, block: LLVMBasicBlockRef) -> LLVMValueRef can[Abort.Panic]:
+            if phi_incoming_for_block(phi, block) is value:
+                return value
+            panic("a header phi without a value from the loop's predecessor or latch")
+
+        def checked_step_kind(instruction: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return IntervalStepKind::SKIP if LLVMIsAIntrinsicInst(instruction) == null
+            identifier: u32 = called_intrinsic_id(instruction)
+            return IntervalStepKind::CHECKED_ADD if identifier == intrinsic_identifier("llvm.sadd.with.overflow")
+            return IntervalStepKind::CHECKED_SUBTRACT if identifier == intrinsic_identifier("llvm.ssub.with.overflow")
+            return IntervalStepKind::CHECKED_MULTIPLY if identifier == intrinsic_identifier("llvm.smul.with.overflow")
+            IntervalStepKind::SKIP
+
+        # How a word-sized integer instruction evaluates.
+        def value_step_kind(instruction: LLVMValueRef) -> u32 can[Abort.Panic]:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            return IntervalStepKind::BINARY if LLVMIsABinaryOperator(instruction) != null
+            if LLVMIsACastInst(instruction) != null:
+                source: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                return IntervalStepKind::FULL if not is_word_integer(source)
+                return IntervalStepKind::SIGN_EXTEND if opcode == LLVMOpcode::SEXT
+                return IntervalStepKind::ZERO_EXTEND if opcode == LLVMOpcode::ZEXT
+                return IntervalStepKind::TRUNCATE if opcode == LLVMOpcode::TRUNC
+                return IntervalStepKind::FULL
+            return IntervalStepKind::FREEZE if opcode == LLVMOpcode::FREEZE
+            return IntervalStepKind::SELECT if opcode == LLVMOpcode::SELECT
+            return IntervalStepKind::EXTRACT if opcode == LLVMOpcode::EXTRACT_VALUE
+            return IntervalStepKind::PHI if opcode == LLVMOpcode::PHI
+            IntervalStepKind::FULL
+
+        # The values a step reads, with their contexts, in the order the proof reads them.
+        def step_reads[@r](reads: mutable darray[IntervalRead] @r, instruction: LLVMValueRef, kind: u32, table: ValueTable&, analyses: ElisaFunctionAnalysesRef) -> darray[IntervalRead] @r can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if kind == IntervalStepKind::CHECKED_ADD or kind == IntervalStepKind::CHECKED_SUBTRACT or kind == IntervalStepKind::CHECKED_MULTIPLY or kind == IntervalStepKind::BINARY:
+                reads.push(interval_read(LLVMGetOperand(instruction, 0), instruction, table, analyses))
+                reads.push(interval_read(LLVMGetOperand(instruction, 1), instruction, table, analyses))
+            elif kind == IntervalStepKind::SIGN_EXTEND or kind == IntervalStepKind::ZERO_EXTEND or kind == IntervalStepKind::TRUNCATE or kind == IntervalStepKind::FREEZE:
+                reads.push(interval_read(LLVMGetOperand(instruction, 0), instruction, table, analyses))
+            elif kind == IntervalStepKind::SELECT:
+                reads.push(interval_read(LLVMGetOperand(instruction, 1), instruction, table, analyses))
+                reads.push(interval_read(LLVMGetOperand(instruction, 2), instruction, table, analyses))
+            elif kind == IntervalStepKind::PHI:
+                for index in 0..<LLVMCountIncoming(instruction) |reads, instruction, table, analyses|:
+                    reads.push(interval_read(LLVMGetIncomingValue(instruction, index), terminator_of(LLVMGetIncomingBlock(instruction, index)), table, analyses))
+            reads
+
+        def instruction_step(instruction: LLVMValueRef, first_read: u32, table: ValueTable&) -> IntervalStep can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: u32 = value_position(table, instruction).u32()
+            checked: u32 = checked_step_kind(instruction)
+            if checked != IntervalStepKind::SKIP:
+                width: u32 = integer_width(LLVMGetOperand(instruction, 0))
+                kind: u32 = checked if width <= 64 else IntervalStepKind::CHECKED_WIDE
+                return IntervalStep{instruction: instruction, kind: kind, opcode: 0, position: position, width: width, source_width: 0, aggregate: -1, first_read: first_read, reads: 0}
+            return IntervalStep{instruction: instruction, kind: IntervalStepKind::SKIP, opcode: 0, position: position, width: 0, source_width: 0, aggregate: -1, first_read: first_read, reads: 0} if not is_word_integer(instruction)
+            kind: u32 = value_step_kind(instruction)
+            source_width: u32 = integer_width(LLVMGetOperand(instruction, 0)) if kind == IntervalStepKind::ZERO_EXTEND else 0
+            aggregate: mutable i64 = -1
+            if kind == IntervalStepKind::EXTRACT and is_extract_of_field(instruction, 0):
+                aggregate <- value_position(table, LLVMGetOperand(instruction, 0))
+            IntervalStep{instruction: instruction, kind: kind, opcode: LLVMGetInstructionOpcode(instruction), position: position, width: integer_width(instruction), source_width: source_width, aggregate: aggregate, first_read: first_read, reads: 0}
+
+        def with_read_count(step: IntervalStep&, count: u32) -> IntervalStep:
+            IntervalStep{instruction: step.instruction, kind: step.kind, opcode: step.opcode, position: step.position, width: step.width, source_width: step.source_width, aggregate: step.aggregate, first_read: step.first_read, reads: count}
+
+        def word_phis(header: LLVMBasicBlockRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            phis: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(header)
+            while cursor is phi |cursor, phis|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                phis.push(phi) if is_word_integer(phi)
+            phis
+
+        # The latch test's limit when the latch compares a value against a constant of at
+        # most a word with a signed predicate and one successor re-enters the header.
+        def latch_limit(shape: FactorialLoop&) -> LatchLimit? can[Abort.Panic]:
+            test: LatchTest = get latch_test(shape.latch) else return null
+            bound: LLVMValueRef = LLVMGetOperand(test.compare, 1)
+            taken: LLVMBasicBlockRef = LLVMGetSuccessor(test.branch, 0)
+            fallthrough: LLVMBasicBlockRef = LLVMGetSuccessor(test.branch, 1)
+            predicate: mutable i32 = LLVMGetICmpPredicate(test.compare)
+            if fallthrough == shape.header and taken != shape.header:
+                predicate <- inverse_integer_predicate(predicate)
+            return null if LLVMIsAConstantInt(bound) == null or (taken != shape.header and fallthrough != shape.header) or integer_width(bound) > 64
+            lower: bool = predicate == LLVMIntPredicate::SGT or predicate == LLVMIntPredicate::SGE
+            return null if not lower and predicate != LLVMIntPredicate::SLT and predicate != LLVMIntPredicate::SLE
+            constant: WideInteger = wide_from_signed(LLVMConstIntGetSExtValue(bound))
+            limit: mutable WideInteger = constant
+            if predicate == LLVMIntPredicate::SGT:
+                limit <- wide_add(constant, wide_from_signed(1))
+            elif predicate == LLVMIntPredicate::SLT:
+                limit <- wide_subtract(constant, wide_from_signed(1))
+            unread: IntervalRead = IntervalRead{position: -1, width: 0, constant: false, value: 0, fact: false, fact_low: 0, fact_high: 0}
+            LatchLimit{active: true, lower: lower, limit: limit, tested: unread}
+
+        # How the latch limit carries over to PHI, whose latch value is the tested value or
+        # the tested value plus a constant.
+        def phi_carry(phi: LLVMValueRef, entry: IntervalRead, next: IntervalRead, position: u32, limit: LatchLimit?, shape: FactorialLoop&) -> PhiCarry can[Abort.Panic]:
+            carry: PhiCarry = PhiCarry{position: position, entry: entry, next: next, related: false, offset_related: false, offset: 0, offset_width: 0}
+            return carry if limit == null
+            test: LatchTest = get latch_test(shape.latch) else return carry
+            tested: LLVMValueRef = LLVMGetOperand(test.compare, 0)
+            incoming: LLVMValueRef = get phi_incoming_for_block(phi, shape.latch) else return carry
+            return PhiCarry{position: position, entry: entry, next: next, related: true, offset_related: false, offset: 0, offset_width: 0} if incoming == tested
+            return carry if LLVMIsABinaryOperator(incoming) == null or LLVMGetInstructionOpcode(incoming) != LLVMOpcode::ADD or LLVMGetOperand(incoming, 0) != tested
+            offset: LLVMValueRef = LLVMGetOperand(incoming, 1)
+            return carry if LLVMIsAConstantInt(offset) == null
+            PhiCarry{position: position, entry: entry, next: next, related: false, offset_related: true, offset: LLVMConstIntGetSExtValue(offset), offset_width: integer_width(offset)}
+
+    public:
+        # The loop over BLOCKS (its blocks in reverse postorder) as an interval program.
+        def interval_program(shape: FactorialLoop&, blocks: darray[LLVMBasicBlockRef]&, analyses: ElisaFunctionAnalysesRef) -> IntervalProgram can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            table: ValueTable = loop_value_table(blocks)
+            phis: darray[LLVMValueRef] = word_phis(shape.header)
+            entry_edge: LLVMValueRef = terminator_of(shape.predecessor)
+            entries: mutable darray[IntervalRead] = []
+            for phi in phis |entries, entry_edge, table, analyses, shape|:
+                entry_value: LLVMValueRef = required_incoming(phi, shape.predecessor)
+                entries.push(interval_read(entry_value, entry_edge, &table, analyses))
+            reads: mutable darray[IntervalRead] = []
+            steps: mutable darray[IntervalStep] = []
+            for block in blocks |reads, steps, table, analyses, shape|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, reads, steps, table, analyses, shape, block|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if block != shape.header or not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI):
+                        first: u32 = reads.count.u32()
+                        step: IntervalStep = instruction_step(instruction, first, &table)
+                        reads <- step_reads(reads, instruction, step.kind, &table, analyses)
+                        steps.push(with_read_count(&step, reads.count.u32() - first))
+            latch_edge: LLVMValueRef = terminator_of(shape.latch)
+            limit: mutable LatchLimit? = latch_limit(shape)
+            carries: mutable darray[PhiCarry] = []
+            needs_tested: mutable bool = false
+            for index in 0..<phis.count |carries, needs_tested, phis, entries, latch_edge, limit, table, analyses, shape|:
+                latch_value: LLVMValueRef = required_incoming(phis[index], shape.latch)
+                next: IntervalRead = interval_read(latch_value, latch_edge, &table, analyses)
+                carry: PhiCarry = phi_carry(phis[index], entries[index], next, value_position(&table, phis[index]).u32(), limit, shape)
+                needs_tested <- needs_tested or carry.offset_related
+                carries.push(carry)
+            if limit is active:
+                if needs_tested and latch_test(shape.latch) is test:
+                    limit <- LatchLimit{active: true, lower: active.lower, limit: active.limit, tested: interval_read(LLVMGetOperand(test.compare, 0), latch_edge, &table, analyses)}
+            inactive: LatchLimit = LatchLimit{active: false, lower: false, limit: wide_from_signed(0), tested: IntervalRead{position: -1, width: 0, constant: false, value: 0, fact: false, fact_low: 0, fact_high: 0}}
+            final_limit: LatchLimit = get limit else inactive
+            IntervalProgram{steps: steps, reads: reads, carries: carries, latch: final_limit, table: table}

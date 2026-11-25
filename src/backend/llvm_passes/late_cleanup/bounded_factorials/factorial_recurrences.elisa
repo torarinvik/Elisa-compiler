@@ -1,0 +1,171 @@
+# Two recurrence shapes the bounded-factorial proofs settle exactly.
+#
+# Division sums: `sum += r / C` or `sum += r % C` while `r = r / C`. For r0 <= M the
+# k-th r is at most M / C^k and every addend after r reaches zero is zero, so the total
+# is bounded whatever the loop's exit test; the addends are nonnegative, so only the
+# upper end can overflow.
+#
+# Horner recurrences: `x = x * K + d` from a constant start, with K positive and d in a
+# range known at the add, over a loop of bounded trips. Each trip's interval, widened
+# with the previous one to cover runs that stop early, must fit a signed word.
+include "./factorial_bounds.elisa"
+
+# A Horner recurrence `x = x * factor + d`: its constant start, its checked multiply and
+# add, and the signed range of d at the add.
+struct HornerStep:
+    start: LLVMValueRef
+    factor: LLVMValueRef
+    multiply: LLVMValueRef
+    add: LLVMValueRef
+    lowest: i64
+    highest: i64
+
+extend Backend:
+    private:
+        # A checked call of ID on the field-0 extract VALUE: plain, without metadata, and in
+        # the loop itself.
+        def loop_checked_call(value: LLVMValueRef, identifier: u32, shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            call: LLVMValueRef = get extracted_call(value) else return null
+            return null if called_intrinsic_id(call) != identifier or LLVMGetNumOperandBundles(call) != 0
+            return null if ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("convergent")) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(call) != 0
+            return null if not same_loop(ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(call)), shape.loop)
+            call
+
+        # The worst-case total of SEED plus every addend while REST is divided down to zero.
+        def division_sum_fits(seed: LLVMValueRef, maximum: u64, divisor: u64, quotient: bool) -> bool:
+            total: mutable WideInteger = wide_from_signed(LLVMConstIntGetSExtValue(seed))
+            rest: mutable u64 = maximum
+            while rest != 0 |total, rest, divisor, quotient|:
+                next: u64 = rest / divisor
+                addend: u64 = next if quotient else (rest if rest < divisor else divisor - 1)
+                total <- wide_add(total, wide_from_unsigned(addend))
+                rest <- next
+            wide_fits_signed(total, 64)
+
+        # The checked add of a constant-seeded SUM phi whose addend is the quotient DIVISION
+        # or the remainder of DIVIDED by the same constant, when its total fits.
+        def division_sum_call(sum: LLVMValueRef, divided: LLVMValueRef, division: LLVMValueRef, maximum: u64, shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if sum == divided or not is_header_word_phi(sum)
+            seed: LLVMValueRef = get phi_incoming_for_block(sum, shape.predecessor) else return null
+            update: LLVMValueRef = get phi_incoming_for_block(sum, shape.latch) else return null
+            return null if LLVMIsAConstantInt(seed) == null
+            call: LLVMValueRef = get loop_checked_call(update, intrinsic_identifier("llvm.sadd.with.overflow"), shape, analyses) else return null
+            first: LLVMValueRef = without_freeze(LLVMGetOperand(call, 0))
+            second: LLVMValueRef = without_freeze(LLVMGetOperand(call, 1))
+            addend: mutable LLVMValueRef? = null
+            if first == sum:
+                addend <- second
+            elif second == sum:
+                addend <- first
+            term: LLVMValueRef = get addend else return null
+            return null if LLVMIsABinaryOperator(term) == null
+            divisor: LLVMValueRef = LLVMGetOperand(division, 1)
+            quotient: bool = term == division
+            remainder: bool = LLVMGetInstructionOpcode(term) == LLVMOpcode::UREM and LLVMGetOperand(term, 0) == divided and LLVMGetOperand(term, 1) == divisor
+            return null if not quotient and not remainder
+            return null if not division_sum_fits(seed, maximum, LLVMConstIntGetZExtValue(divisor), quotient)
+            call
+
+        # The entry maximum of a header phi an inexact `udiv` by a constant of at least 2
+        # shrinks each trip, when it is below 2^63.
+        def divided_word_maximum(divided: LLVMValueRef, shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> u64? can[Abort.Panic]:
+            return null if not is_header_word_phi(divided)
+            division: LLVMValueRef = get phi_incoming_for_block(divided, shape.latch) else return null
+            return null if LLVMIsABinaryOperator(division) == null or LLVMGetInstructionOpcode(division) != LLVMOpcode::UDIV
+            return null if LLVMGetExact(division) != 0 or LLVMGetOperand(division, 0) != divided
+            divisor: LLVMValueRef = LLVMGetOperand(division, 1)
+            return null if LLVMIsAConstantInt(divisor) == null or LLVMConstIntGetZExtValue(divisor) < 2
+            initial: LLVMValueRef = get phi_incoming_for_block(divided, shape.predecessor) else return null
+            edge: LLVMValueRef = get LLVMGetBasicBlockTerminator(shape.predecessor) else return null
+            # Without undef allowed, a possibly-undef start gives the full range.
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, initial, shape.predecessor, shape.header, edge)
+            usable: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0
+            maximum: u64 = ElisaLLVMConstantRangeUnsignedMax(range) if usable else 0
+            ElisaLLVMDisposeConstantRange(range)
+            return null if not usable or maximum >= 9223372036854775808
+            maximum
+
+        # Whether X0 multiplied by FACTOR and offset by [lowest, highest] for ITERATIONS trips
+        # keeps every interval endpoint inside a signed word.
+        def horner_fits(start: LLVMValueRef, factor: LLVMValueRef, lowest: i64, highest: i64, iterations: u64) -> bool:
+            low: mutable WideInteger = wide_from_signed(LLVMConstIntGetSExtValue(start))
+            high: mutable WideInteger = low
+            scale: WideInteger = wide_from_signed(LLVMConstIntGetSExtValue(factor))
+            smallest: WideInteger = wide_from_signed(lowest)
+            largest: WideInteger = wide_from_signed(highest)
+            safe: mutable bool = true
+            trip: mutable u64 = 0
+            while trip < iterations and safe |trip, safe, low, high, scale, smallest, largest, iterations|:
+                scaled_low: WideInteger = wide_multiply(low, scale)
+                scaled_high: WideInteger = wide_multiply(high, scale)
+                next_low: WideInteger = wide_add(scaled_low, smallest)
+                next_high: WideInteger = wide_add(scaled_high, largest)
+                safe <- wide_fits_signed(scaled_low, 64) and wide_fits_signed(scaled_high, 64) and wide_fits_signed(next_low, 64) and wide_fits_signed(next_high, 64)
+                low <- wide_minimum(low, next_low)
+                high <- wide_maximum(high, next_high)
+                trip <- trip + 1
+            safe
+
+        # The recurrence of a constant-started word phi whose latch value is a checked add
+        # of a checked multiply of the phi by a positive constant and an addend with a
+        # bounded range at the add.
+        def horner_step(phi: LLVMValueRef, add_id: u32, shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> HornerStep? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if not is_header_word_phi(phi)
+            start: LLVMValueRef = get phi_incoming_for_block(phi, shape.predecessor) else return null
+            update: LLVMValueRef = get phi_incoming_for_block(phi, shape.latch) else return null
+            return null if LLVMIsAConstantInt(start) == null
+            add: LLVMValueRef = get loop_checked_call(update, add_id, shape, analyses) else return null
+            multiply_id: u32 = intrinsic_identifier("llvm.smul.with.overflow")
+            addend_index: mutable u32 = 1
+            found: mutable LLVMValueRef? = loop_checked_call(LLVMGetOperand(add, 0), multiply_id, shape, analyses)
+            if found == null:
+                found <- loop_checked_call(LLVMGetOperand(add, 1), multiply_id, shape, analyses)
+                addend_index <- 0
+            multiply: LLVMValueRef = get found else return null
+            factor: LLVMValueRef = get operand_beside(multiply, phi) else return null
+            return null if LLVMIsAConstantInt(factor) == null or LLVMConstIntGetSExtValue(factor) <= 0
+            # Without undef allowed, a possibly-undef addend gives the full range.
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, LLVMGetOperand(add, addend_index), add, 0)
+            usable: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0
+            lowest: i64 = ElisaLLVMConstantRangeSignedMin(range) if usable else 0
+            highest: i64 = ElisaLLVMConstantRangeSignedMax(range) if usable else 0
+            ElisaLLVMDisposeConstantRange(range)
+            return null if not usable
+            HornerStep{start: start, factor: factor, multiply: multiply, add: add, lowest: lowest, highest: highest}
+
+    public:
+        # The checked adds of the loop's division sums whose totals fit.
+        def division_sum_calls(shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is divided |cursor, calls, shape, analyses|:
+                break if not is_llvm_instruction_with_opcode(divided, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(divided)
+                if divided_word_maximum(divided, shape, analyses) is maximum:
+                    division: LLVMValueRef = LLVMGetIncomingValue(divided, phi_incoming_index(divided, shape.latch).u32())
+                    sums: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+                    while sums is sum |sums, calls, divided, division, maximum, shape, analyses|:
+                        break if not is_llvm_instruction_with_opcode(sum, LLVMOpcode::PHI)
+                        sums <- LLVMGetNextInstruction(sum)
+                        if division_sum_call(sum, divided, division, maximum, shape, analyses) is call:
+                            calls.push(call)
+            calls
+
+        # The checked multiplies and adds of the loop's Horner recurrences that fit, in
+        # pairs; the loop's iteration bound is found once, when the first shape needs it.
+        def horner_calls(shape: FactorialLoop&, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: mutable darray[LLVMValueRef] = []
+            iterations: mutable u64 = 0
+            add_id: u32 = intrinsic_identifier("llvm.sadd.with.overflow")
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(shape.header)
+            while cursor is phi |cursor, calls, iterations, add_id, shape, analyses|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                if horner_step(phi, add_id, shape, analyses) is step:
+                    if iterations == 0:
+                        iterations <- iteration_bound(shape, analyses, FactorialBoundLimit::ITERATIONS).iterations
+                    return calls if iterations == 0
+                    if horner_fits(step.start, step.factor, step.lowest, step.highest, iterations):
+                        calls.push(step.multiply)
+                        calls.push(step.add)
+            calls

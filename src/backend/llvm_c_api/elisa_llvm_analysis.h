@@ -53,6 +53,10 @@ uint32_t ElisaLLVMLoopDepth(ElisaLoopRef loop);
 uint32_t ElisaLLVMLoopSubLoopCount(ElisaLoopRef loop);
 uint32_t ElisaLLVMLoopBlockCount(ElisaLoopRef loop);
 LLVMBasicBlockRef ElisaLLVMLoopBlockAt(ElisaLoopRef loop, uint32_t index);
+// The loop's blocks in reverse postorder (LoopBlocksRPO), at most CAPACITY of them; the
+// number written.
+uint32_t ElisaLLVMLoopBlocksInReversePostorder(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
+                                               LLVMBasicBlockRef *blocks, uint32_t capacity);
 int ElisaLLVMLoopContainsBlock(ElisaLoopRef loop, LLVMBasicBlockRef block);
 LLVMBasicBlockRef ElisaLLVMLoopHeader(ElisaLoopRef loop);
 LLVMBasicBlockRef ElisaLLVMLoopLatch(ElisaLoopRef loop);

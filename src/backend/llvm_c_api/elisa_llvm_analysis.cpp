@@ -8,6 +8,7 @@
 #include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/LazyValueInfo.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/LoopIterator.h>
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
@@ -112,6 +113,18 @@ uint32_t ElisaLLVMLoopBlockCount(ElisaLoopRef loop) { return unwrapLoop(loop)->g
 LLVMBasicBlockRef ElisaLLVMLoopBlockAt(ElisaLoopRef loop, uint32_t index) {
   auto Blocks = unwrapLoop(loop)->getBlocks();
   return index < Blocks.size() ? wrap(Blocks[index]) : nullptr;
+}
+
+uint32_t ElisaLLVMLoopBlocksInReversePostorder(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
+                                               LLVMBasicBlockRef *blocks, uint32_t capacity) {
+  LoopBlocksRPO Order(unwrapLoop(loop));
+  Order.perform(&unwrapAnalyses(analyses)->loops());
+  uint32_t Count = 0;
+  for (BasicBlock *Block : Order) {
+    if (Count == capacity) break;
+    blocks[Count++] = wrap(Block);
+  }
+  return Count;
 }
 
 int ElisaLLVMLoopContainsBlock(ElisaLoopRef loop, LLVMBasicBlockRef block) {
