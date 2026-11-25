@@ -73,6 +73,9 @@ int64_t ElisaLLVMConstantRangeSignedMin(ElisaConstantRangeRef range);
 int64_t ElisaLLVMConstantRangeSignedMax(ElisaConstantRangeRef range);
 /* getUnsignedMin() as APInt::getLimitedValue. */
 uint64_t ElisaLLVMConstantRangeUnsignedMin(ElisaConstantRangeRef range);
+/* getLower() and getUpper() of a range at most 64 bits wide, zero-extended. */
+uint64_t ElisaLLVMConstantRangeLower(ElisaConstantRangeRef range);
+uint64_t ElisaLLVMConstantRangeUpper(ElisaConstantRangeRef range);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus

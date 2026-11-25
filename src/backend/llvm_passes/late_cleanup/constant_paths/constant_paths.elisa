@@ -1,0 +1,104 @@
+# Bounded, deterministic integer paths reached from a function's entry branch, evaluated.
+#
+# This runs after LLVM has inlined callees and exposed the scalar recurrence. For each
+# AArch64 function of 3 to 128 blocks returning an integer: zero-product bypasses, then
+# one Boolean table lookup and one state-table bounds check, are folded; then an entry
+# branch testing the argument either gets a lookup for a small accepted domain or, for an
+# equality test, a constant return on the first edge whose path evaluates. All paths share
+# one budget of 48000 instructions.
+include "../../../llvm_c_api/elisa_llvm_constant_folding.elisa"
+include "../../ir/value_table.elisa"
+include "./path_evaluation.elisa"
+include "./integer_domains.elisa"
+include "./checked_tables.elisa"
+
+const module ConstantPathLimit:
+    BUDGET: u32 = 48000
+    MINIMUM_BLOCKS: u32 = 3
+    MAXIMUM_BLOCKS: u32 = 128
+    BYPASS_BLOCKS: u32 = 32
+
+extend Backend:
+    private:
+        # The table and bypass folds over FUNCTION's blocks; their count.
+        def fold_function_table_checks(function: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            if LLVMCountBasicBlocks(function) <= ConstantPathLimit::BYPASS_BLOCKS:
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, changed, builder|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    changed <- changed + 1 if fold_zero_product_bypass(block, builder) else changed
+            lookup_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while lookup_cursor is block |lookup_cursor, changed, builder, module|:
+                lookup_cursor <- LLVMGetNextBasicBlock(block)
+                if fold_boolean_lookup(block, builder, module):
+                    changed <- changed + 1
+                    break
+            bounds_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while bounds_cursor is block |bounds_cursor, changed, builder, module|:
+                bounds_cursor <- LLVMGetNextBasicBlock(block)
+                if fold_state_table_bounds(block, builder, module):
+                    changed <- changed + 1
+                    break
+            changed
+
+        # The first edge of ENTRY_BRANCH whose path from a phi-headed block returns a
+        # constant now returns it directly.
+        def fold_equality_entry_paths(entry_branch: LLVMValueRef, budget: u32, builder: LLVMBuilderRef, module: LLVMModuleRef) -> BudgetedChange can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            entry: LLVMBasicBlockRef = LLVMGetInstructionParent(entry_branch)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(entry)
+            remaining: mutable u32 = budget
+            for edge in 0..<2 |remaining, entry_branch, entry, function, builder, module|:
+                start: LLVMBasicBlockRef = LLVMGetSuccessor(entry_branch, edge.u32())
+                continue if not block_has_phis(start)
+                outcome: PathOutcome = evaluate_integer_path(start, entry, module, remaining, new_value_table())
+                remaining <- outcome.budget
+                if outcome.result is result:
+                    name_storage: mutable darray[u8] = []
+                    done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(LLVMGetModuleContext(module), function, sview_to_cstr("constant.path", name_storage))
+                    LLVMPositionBuilderAtEnd(builder, done)
+                    LLVMSetCurrentDebugLocation2(builder, null)
+                    _ = LLVMBuildRet(builder, result)
+                    LLVMSetSuccessor(entry_branch, edge.u32(), done)
+                    ElisaLLVMBlockRemovePredecessor(start, entry, 0)
+                    _ = ElisaLLVMRemoveUnreachableBlocks(function)
+                    return BudgetedChange{changed: true, budget: remaining}
+            BudgetedChange{changed: false, budget: remaining}
+
+        # The entry-branch folds of FUNCTION.
+        def fold_entry_paths(function: LLVMValueRef, budget: u32, builder: LLVMBuilderRef, module: LLVMModuleRef) -> BudgetedChange can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            unchanged: BudgetedChange = BudgetedChange{changed: false, budget: budget}
+            entry_branch: LLVMValueRef = get conditional_terminator(LLVMGetEntryBasicBlock(function)) else return unchanged
+            return unchanged if LLVMGetSuccessor(entry_branch, 0) == LLVMGetSuccessor(entry_branch, 1)
+            test: LLVMValueRef = LLVMGetCondition(entry_branch)
+            return unchanged if not is_llvm_instruction_with_opcode(test, LLVMOpcode::ICMP)
+            bound: LLVMValueRef = LLVMGetOperand(test, 1)
+            return unchanged if LLVMIsAConstantInt(bound) == null
+            predicate: i32 = LLVMGetICmpPredicate(test)
+            return fold_small_integer_domain(entry_branch, test, bound, budget, builder) if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            return unchanged if LLVMIsAArgument(LLVMGetOperand(test, 0)) == null
+            fold_equality_entry_paths(entry_branch, budget, builder, module)
+
+        def is_constant_path_candidate(function: LLVMValueRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            blocks: u32 = LLVMCountBasicBlocks(function)
+            return false if blocks < ConstantPathLimit::MINIMUM_BLOCKS or blocks > ConstantPathLimit::MAXIMUM_BLOCKS
+            is_llvm_integer_type(LLVMGetReturnType(LLVMGlobalGetValueType(function)), 0) and not skipped_by_loop_pass_policy(function, module)
+
+    public:
+        # The constant-path folds over an AArch64 module; their count.
+        def fold_constant_integer_paths(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetIsAArch64(module) == 0
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            budget: mutable u32 = ConstantPathLimit::BUDGET
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, budget, builder, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                break if budget == 0
+                continue if not is_constant_path_candidate(function, module)
+                changed <- changed + fold_function_table_checks(function, builder, module)
+                outcome: BudgetedChange = fold_entry_paths(function, budget, builder, module)
+                budget <- outcome.budget
+                changed <- changed + 1 if outcome.changed else changed
+            LLVMDisposeBuilder(builder)
+            changed

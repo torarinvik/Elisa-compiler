@@ -1,0 +1,254 @@
+# Branches that constant data or zero products make redundant.
+#
+# A zero-trip bypass around a short chain of multiplications that is zero on the bypass
+# edge anyway is removed. A bounds check before a byte read from a constant Boolean table
+# becomes a bit test of a 64-bit mask. A bounds check before reads from a small constant
+# state table goes when every state the index can hold (constants and values read from
+# such checked tables, through phis and selects) is in range.
+
+const module CheckedTableLimit:
+    ELEMENTS: u64 = 64
+    STATES: u32 = 64
+    PENDING: u32 = 128
+
+extend Backend:
+    private:
+        # `BasicBlock::hasAddressTaken`: a `blockaddress` refers to BLOCK.
+        def block_address_taken(block: LLVMBasicBlockRef) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(LLVMBasicBlockAsValue(block))
+            while use_cursor is use |use_cursor|:
+                use_cursor <- LLVMGetNextUse(use)
+                return true if LLVMIsABlockAddress(LLVMGetUser(use)) != null
+            false
+
+        # Whether EXPECTED is BLOCK's single successor.
+        def is_single_successor(block: LLVMBasicBlockRef, expected: LLVMBasicBlockRef) -> bool:
+            successor: LLVMBasicBlockRef = get single_successor(block) else return false
+            successor == expected
+
+        # `Instruction::hasMetadataOtherThanDebugLoc`.
+        def has_metadata_beyond_debug_location(instruction: LLVMValueRef) -> bool:
+            count: mutable usize = 0
+            entries: void& = get LLVMInstructionGetAllMetadataOtherThanDebugLoc(instruction, &count) else return false
+            LLVMDisposeValueMetadataEntries(entries)
+            count != 0
+
+        # A constant table defined in this module: local, definitively initialized, not
+        # externally initialized, in address space 0.
+        def is_local_constant_table(table: LLVMValueRef) -> bool:
+            return false if LLVMIsAGlobalVariable(table) == null or LLVMIsGlobalConstant(table) == 0 or not has_local_linkage(table)
+            ElisaLLVMGlobalHasDefinitiveInitializer(table) != 0 and LLVMIsExternallyInitialized(table) == 0 and LLVMGetPointerAddressSpace(LLVMTypeOf(table)) == 0
+
+        # Whether the constant integer is the unsigned value EXPECTED.
+        def equals_unsigned(constant: LLVMValueRef, expected: u64) -> bool:
+            ElisaLLVMConstantIntActiveBits(constant) <= 64 and LLVMConstIntGetZExtValue(constant) == expected
+
+        # Whether the constant integer is at least the unsigned LIMIT.
+        def at_least_unsigned(constant: LLVMValueRef, limit: u64) -> bool:
+            ElisaLLVMConstantIntActiveBits(constant) > 64 or LLVMConstIntGetZExtValue(constant) >= limit
+
+        # The table LOAD reads, when the read is reached only through its unsigned
+        # bounds check: `index <u count` on the edge into the load's block.
+        def checked_state_table(load: LLVMValueRef, module: LLVMModuleRef) -> LLVMValueRef? can[Abort.Panic]:
+            address: LLVMValueRef = LLVMGetOperand(load, 0)
+            return null if not is_simple_access(load) or LLVMIsAGetElementPtrInst(address) == null or LLVMGetNumIndices(address) != 1
+            table: LLVMValueRef = LLVMGetOperand(address, 0)
+            return null if not is_local_constant_table(table)
+            array: LLVMTypeRef = LLVMGlobalGetValueType(table)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or LLVMGetArrayLength2(array) > CheckedTableLimit::ELEMENTS
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            return null if LLVMGetElementType(array) != LLVMTypeOf(load) or ElisaLLVMDataLayoutIndexSizeInBits(module, 0) != 64
+            return null if LLVMABISizeOfType(layout, LLVMGetGEPSourceElementType(address)) != LLVMStoreSizeOfType(layout, LLVMTypeOf(load))
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(load)
+            guard: LLVMBasicBlockRef = get single_predecessor(block) else return null
+            branch: LLVMValueRef = get conditional_terminator(guard) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT or LLVMGetICmpSameSign(compare) != 0
+            count: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if LLVMGetOperand(compare, 0) != LLVMGetOperand(address, 1) or LLVMGetSuccessor(branch, 0) != block or LLVMGetSuccessor(branch, 1) == block
+            return null if LLVMIsAConstantInt(count) == null or not equals_unsigned(count, LLVMGetArrayLength2(array))
+            table
+
+        # Every element of the checked TABLE below LIMIT.
+        def table_elements_below(table: LLVMValueRef, limit: u64) -> bool:
+            initializer: LLVMValueRef = LLVMGetInitializer(table)
+            for index in 0..<LLVMGetArrayLength2(LLVMGlobalGetValueType(table)).u32() |initializer, limit|:
+                element: LLVMValueRef = get LLVMGetAggregateElement(initializer, index) else return false
+                return false if LLVMIsAConstantInt(element) == null or at_least_unsigned(element, limit)
+            true
+
+        # Whether STATE can carry only values below LIMIT: constants, or reads of checked
+        # constant tables, through phis and selects, with at least one constant.
+        def state_fits(state: LLVMValueRef, limit: u64, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            pending: mutable darray[LLVMValueRef] = [state]
+            seen: mutable darray[LLVMValueRef] = []
+            has_constant: mutable bool = false
+            while pending.count != 0 |pending, seen, has_constant, limit, module|:
+                current: LLVMValueRef = pending.pop()
+                continue if contains_value(&seen, current)
+                seen.push(current)
+                return false if seen.count > CheckedTableLimit::STATES
+                if LLVMIsAConstantInt(current) != null:
+                    return false if at_least_unsigned(current, limit)
+                    has_constant <- true
+                elif is_llvm_instruction_with_opcode(current, LLVMOpcode::PHI):
+                    return false if pending.count.u32() + LLVMCountIncoming(current) > CheckedTableLimit::PENDING
+                    for incoming in 0..<LLVMCountIncoming(current) |pending, current|:
+                        pending.push(LLVMGetIncomingValue(current, incoming))
+                elif is_llvm_instruction_with_opcode(current, LLVMOpcode::SELECT):
+                    pending.push(LLVMGetOperand(current, 1))
+                    pending.push(LLVMGetOperand(current, 2))
+                elif LLVMIsALoadInst(current) != null:
+                    table: LLVMValueRef = get checked_state_table(current, module) else return false
+                    return false if not table_elements_below(table, limit)
+                else:
+                    return false
+            has_constant
+
+        # Whether V is zero in the product chain: a zero constant or a known zero.
+        def is_known_zero(value: LLVMValueRef, zeros: darray[LLVMValueRef]&) -> bool:
+            return ElisaLLVMIsConstantZero(value) != 0 if LLVMIsAConstantInt(value) != null
+            contains_value(zeros, value)
+
+        # PRODUCT's instructions are integer multiplications that are zero when the
+        # bypassed KEY is: each multiplies a known zero by a constant or a known zero.
+        def product_chain_is_zero(product: LLVMBasicBlockRef, key: LLVMValueRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate]:
+            zeros: mutable darray[LLVMValueRef] = [key]
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(product) else return null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(product)
+            while cursor is instruction |cursor, zeros, terminator|:
+                break if instruction == terminator
+                cursor <- LLVMGetNextInstruction(instruction)
+                return null if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::MUL) or not is_llvm_integer_type(LLVMTypeOf(instruction), 0)
+                left: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                right: LLVMValueRef = LLVMGetOperand(instruction, 1)
+                left_zero: bool = is_known_zero(left, &zeros)
+                right_zero: bool = is_known_zero(right, &zeros)
+                return null if not (left_zero and (right_zero or LLVMIsAConstantInt(right) != null)) and not (right_zero and LLVMIsAConstantInt(left) != null)
+                zeros.push(instruction)
+            zeros
+
+        # The branch around a zero product removed: the bypass always runs the product.
+        def fold_zero_product_bypass(guard: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(guard) else return false
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            bound: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return false if (predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE) or LLVMIsAConstantInt(bound) == null or ElisaLLVMIsConstantZero(bound) == 0
+            zero_edge: u32 = 0 if predicate == LLVMIntPredicate::EQ else 1
+            join: LLVMBasicBlockRef = LLVMGetSuccessor(branch, zero_edge)
+            product: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1 - zero_edge)
+            return false if join == product or not has_single_predecessor(product, guard)
+            product_end: LLVMValueRef = get LLVMGetBasicBlockTerminator(product) else return false
+            join_end: LLVMValueRef = get LLVMGetBasicBlockTerminator(join) else return false
+            size: u32 = instruction_count(product)
+            return false if LLVMGetInstructionOpcode(product_end) != LLVMOpcode::UNCONDITIONAL_BR or not is_single_successor(product, join) or size < 2 or size > 4
+            return false if LLVMGetInstructionOpcode(join_end) != LLVMOpcode::RET or not block_has_phis(join)
+            zeros: darray[LLVMValueRef] = get product_chain_is_zero(product, LLVMGetOperand(compare, 0)) else return false
+            for phi in block_phis(join) |zeros, guard, product|:
+                bypass: LLVMValueRef = get incoming_value_for_block(phi, guard) else return false
+                computed: LLVMValueRef = get incoming_value_for_block(phi, product) else return false
+                return false if bypass != computed and (LLVMIsAConstantInt(bypass) == null or not is_known_zero(bypass, &zeros) or not is_known_zero(computed, &zeros))
+            ElisaLLVMBlockRemovePredecessor(join, guard, 0)
+            position_builder_before(builder, branch)
+            _ = LLVMBuildBr(builder, product)
+            LLVMInstructionEraseFromParent(branch)
+            LLVMInstructionEraseFromParent(compare) if LLVMGetFirstUse(compare) == null
+            true
+
+        # LOOKUP's single `zext (load i8 (gep table, offset))` feeding JOIN's only phi with
+        # a zero fallback from GUARD: that load.
+        def boolean_table_read(guard: LLVMBasicBlockRef, lookup: LLVMBasicBlockRef, join: LLVMBasicBlockRef, offset: LLVMValueRef, module: LLVMModuleRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            phis: darray[LLVMValueRef] = block_phis(join)
+            return null if phis.count != 1
+            fallback: LLVMValueRef = get incoming_value_for_block(phis[0], guard) else return null
+            extend: LLVMValueRef = get incoming_value_for_block(phis[0], lookup) else return null
+            return null if LLVMIsAConstantInt(fallback) == null or ElisaLLVMIsConstantZero(fallback) == 0 or not is_llvm_instruction_with_opcode(extend, LLVMOpcode::ZEXT)
+            load: LLVMValueRef = LLVMGetOperand(extend, 0)
+            return null if LLVMIsALoadInst(load) == null
+            address: LLVMValueRef = LLVMGetOperand(load, 0)
+            return null if LLVMIsAGetElementPtrInst(address) == null
+            table: LLVMValueRef = LLVMGetOperand(address, 0)
+            return null if not is_simple_access(load) or not is_llvm_integer_type(LLVMTypeOf(load), 8) or has_metadata_beyond_debug_location(load)
+            return null if not is_local_constant_table(table) or ElisaLLVMDataLayoutIndexSizeInBits(module, 0) != 64
+            return null if LLVMGetNumIndices(address) != 1 or not is_llvm_integer_type(LLVMGetGEPSourceElementType(address), 8) or LLVMGetOperand(address, 1) != offset
+            return null if LLVMGetInstructionParent(address) != lookup or LLVMGetInstructionParent(load) != lookup or LLVMGetInstructionParent(extend) != lookup
+            return null if not has_one_use(address) or not has_one_use(load) or not has_one_use(extend)
+            load
+
+        # The table's first COUNT bytes, each 0 or 1, as bits from START of a mask.
+        def boolean_table_mask(table: LLVMValueRef, count: u64, start: u64) -> u64?:
+            initializer: LLVMValueRef = LLVMGetInitializer(table)
+            mask: mutable u64 = 0
+            for index in 0..<count.u32() |mask, initializer, start|:
+                byte: LLVMValueRef = get LLVMGetAggregateElement(initializer, index) else return null
+                return null if LLVMIsAConstantInt(byte) == null or not is_llvm_integer_type(LLVMTypeOf(byte), 8) or LLVMConstIntGetZExtValue(byte) > 1
+                mask <- mask | (LLVMConstIntGetZExtValue(byte) << (start + index.u64()))
+            mask
+
+        # `IRBuilder::CreateZExtOrTrunc`.
+        def build_zero_extend_or_truncate(value: LLVMValueRef, type: LLVMTypeRef, builder: LLVMBuilderRef) -> LLVMValueRef:
+            from_width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(value))
+            to_width: u32 = LLVMGetIntTypeWidth(type)
+            return LLVMBuildZExt(builder, value, type, "") if from_width < to_width
+            return LLVMBuildTrunc(builder, value, type, "") if from_width > to_width
+            value
+
+        # A bounds check before a constant Boolean table read made a mask bit test.
+        def fold_boolean_lookup(guard: LLVMBasicBlockRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            branch: LLVMValueRef = get conditional_terminator(guard) else return false
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT or LLVMGetICmpSameSign(compare) != 0
+            offset: LLVMValueRef = LLVMGetOperand(compare, 0)
+            count: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return false if not is_llvm_instruction_with_opcode(offset, LLVMOpcode::ADD) or not is_llvm_integer_type(LLVMTypeOf(offset), 64) or LLVMGetNSW(offset) != 0 or LLVMGetNUW(offset) != 0
+            return false if LLVMIsAConstantInt(count) == null or ElisaLLVMIsConstantZero(count) != 0 or at_least_unsigned(count, 65)
+            bias: LLVMValueRef = LLVMGetOperand(offset, 1)
+            return false if LLVMIsAConstantInt(bias) == null
+            start: u64 = 0 - LLVMConstIntGetZExtValue(bias)
+            entries: u64 = LLVMConstIntGetZExtValue(count)
+            return false if start > 64 - entries
+            lookup: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            join: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            jump: LLVMValueRef = get LLVMGetBasicBlockTerminator(lookup) else return false
+            return false if lookup == join or lookup == guard or join == guard or block_address_taken(lookup) or not has_single_predecessor(lookup, guard)
+            return false if LLVMGetInstructionOpcode(jump) != LLVMOpcode::UNCONDITIONAL_BR or LLVMGetSuccessor(jump, 0) != join or instruction_count(lookup) != 4 or not block_has_phis(join)
+            load: LLVMValueRef = get boolean_table_read(guard, lookup, join, offset, module) else return false
+            mask: u64 = get boolean_table_mask(LLVMGetOperand(LLVMGetOperand(load, 0), 0), entries, start) else return false
+            state: LLVMValueRef = LLVMGetOperand(offset, 0)
+            return false if not state_fits(state, 64, module)
+            result: LLVMValueRef = block_phis(join)[0]
+            int64: LLVMTypeRef = LLVMTypeOf(state)
+            position_builder_before(builder, branch)
+            bit: LLVMValueRef = LLVMBuildAnd(builder, LLVMBuildLShr(builder, LLVMConstInt(int64, mask, 0), state, ""), LLVMConstInt(int64, 1, 0), "")
+            set_incoming_value_for_block(result, guard, build_zero_extend_or_truncate(bit, LLVMTypeOf(result), builder))
+            _ = LLVMBuildBr(builder, join)
+            LLVMInstructionEraseFromParent(branch)
+            blocks: mutable darray[LLVMBasicBlockRef] = [lookup]
+            ElisaLLVMDeleteDeadBlocks((&blocks[0]).cast[void&], 1)
+            true
+
+        # A bounds check before a checked state table read removed when the index always
+        # fits.
+        def fold_state_table_bounds(guard: LLVMBasicBlockRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            branch: LLVMValueRef = get conditional_terminator(guard) else return false
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return false if LLVMIsAConstantInt(limit) == null or at_least_unsigned(limit, 65)
+            accepted: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            rejected: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            return false if rejected == guard or block_address_taken(rejected) or not has_single_predecessor(rejected, guard)
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(accepted)
+            while cursor is instruction |cursor, compare, limit, accepted, rejected, branch, builder, module|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                continue if LLVMIsALoadInst(instruction) == null or checked_state_table(instruction, module) == null
+                return false if not state_fits(LLVMGetOperand(compare, 0), LLVMConstIntGetZExtValue(limit), module)
+                position_builder_before(builder, branch)
+                _ = LLVMBuildBr(builder, accepted)
+                LLVMInstructionEraseFromParent(branch)
+                blocks: mutable darray[LLVMBasicBlockRef] = [rejected]
+                ElisaLLVMDeleteDeadBlocks((&blocks[0]).cast[void&], 1)
+                return true
+            false

@@ -151,6 +151,10 @@ uint64_t ElisaLLVMConstantRangeUnsignedMin(ElisaConstantRangeRef range) {
   return unwrap(range)->getUnsignedMin().getLimitedValue();
 }
 
+uint64_t ElisaLLVMConstantRangeLower(ElisaConstantRangeRef range) { return unwrap(range)->getLower().getZExtValue(); }
+
+uint64_t ElisaLLVMConstantRangeUpper(ElisaConstantRangeRef range) { return unwrap(range)->getUpper().getZExtValue(); }
+
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range) { delete unwrap(range); }
 
 } // extern "C"

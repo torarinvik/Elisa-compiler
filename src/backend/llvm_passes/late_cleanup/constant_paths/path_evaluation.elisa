@@ -1,0 +1,164 @@
+# Bounded, deterministic evaluation of an integer path through a function.
+#
+# Starting at a block entered from a known predecessor with some values known, each
+# instruction is folded over constant operands until a `ret` yields a constant integer.
+# Every instruction costs one unit of a budget shared by the whole module, and one path
+# takes at most 18000 steps; anything unknown, effectful or over budget gives up.
+
+const module PathEvaluationLimit:
+    STEPS: u32 = 18000
+
+# A path's constant result, if it has one, and the budget left after evaluating it.
+struct PathOutcome:
+    result: LLVMValueRef?
+    budget: u32
+
+extend Backend:
+    private:
+        # A constant integer stands for itself; anything else is what the path computed.
+        def path_value(value: LLVMValueRef, values: ValueTable&) -> LLVMValueRef? can[Abort.Panic, Unsafe.PointerCast]:
+            return value if LLVMIsAConstantInt(value) != null
+            value_table_get(values, value)
+
+        # The constant integer VALUE has on the path.
+        def path_integer(value: LLVMValueRef, values: ValueTable&) -> LLVMValueRef? can[Abort.Panic, Unsafe.PointerCast]:
+            constant: LLVMValueRef = get path_value(value, values) else return null
+            return null if LLVMIsAConstantInt(constant) == null
+            constant
+
+        # `CallBase::isConvergent`: the call or its callee is `convergent`.
+        def call_is_convergent(call: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            kind: u32 = attribute_kind("convergent")
+            return true if LLVMGetCallSiteEnumAttribute(call, LLVMAttributeIndexValue::FUNCTION, kind) != null
+            callee: LLVMValueRef = LLVMGetCalledValue(call)
+            LLVMIsAFunction(callee) != null and LLVMGetEnumAttributeAtIndex(callee, LLVMAttributeIndexValue::FUNCTION, kind) != null
+
+        # The overflow, saturating and bit-counting intrinsics a path may fold.
+        def is_foldable_path_intrinsic(id: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if id == intrinsic_identifier("llvm.sadd.with.overflow") or id == intrinsic_identifier("llvm.ssub.with.overflow")
+            return true if id == intrinsic_identifier("llvm.smul.with.overflow") or id == intrinsic_identifier("llvm.uadd.with.overflow")
+            return true if id == intrinsic_identifier("llvm.usub.with.overflow") or id == intrinsic_identifier("llvm.umul.with.overflow")
+            return true if id == intrinsic_identifier("llvm.uadd.sat") or id == intrinsic_identifier("llvm.usub.sat")
+            return true if id == intrinsic_identifier("llvm.sadd.sat") or id == intrinsic_identifier("llvm.ssub.sat")
+            id == intrinsic_identifier("llvm.ctlz") or id == intrinsic_identifier("llvm.cttz") or id == intrinsic_identifier("llvm.ctpop")
+
+        # A constant global with a definitive initializer.
+        def is_constant_table(value: LLVMValueRef) -> bool:
+            LLVMIsAGlobalVariable(value) != null and LLVMIsGlobalConstant(value) != 0 and ElisaLLVMGlobalHasDefinitiveInitializer(value) != 0
+
+        # A foldable intrinsic call over constant integer arguments.
+        def fold_path_intrinsic(call: LLVMValueRef, values: ValueTable&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if LLVMGetNumOperandBundles(call) != 0 or call_is_convergent(call)
+            id: u32 = called_intrinsic_id(call)
+            return null if not is_foldable_path_intrinsic(id)
+            arguments: mutable darray[LLVMValueRef] = []
+            for index in 0..<LLVMGetNumArgOperands(call) |arguments, call, values|:
+                argument: LLVMValueRef = get path_integer(LLVMGetOperand(call, index), values) else return null
+                arguments.push(argument)
+            slots: void&? = (&arguments[0]).cast[void&] if arguments.count != 0 else null
+            ElisaLLVMConstantFoldIntrinsic(id, slots, arguments.count.u32(), LLVMTypeOf(call))
+
+        # An address into a constant table at constant integer indices.
+        def fold_path_address(address: LLVMValueRef, values: ValueTable&, module: LLVMModuleRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            table: LLVMValueRef = LLVMGetOperand(address, 0)
+            return null if not is_constant_table(table)
+            operands: mutable darray[LLVMValueRef] = [table]
+            for index in 1..<LLVMGetNumOperands(address) |operands, address, values|:
+                operand: LLVMValueRef = get path_integer(LLVMGetOperand(address, index), values) else return null
+                operands.push(operand)
+            ElisaLLVMConstantFoldInstructionOperands(address, (&operands[0]).cast[void&], operands.count.u32(), module, 1)
+
+        # A simple integer load from a constant address into a constant table.
+        def fold_path_load(load: LLVMValueRef, values: ValueTable&, module: LLVMModuleRef) -> LLVMValueRef? can[Abort.Panic, Unsafe.PointerCast]:
+            pointer: LLVMValueRef? = path_value(LLVMGetOperand(load, 0), values)
+            return null if not is_simple_access(load) or not is_llvm_integer_type(LLVMTypeOf(load), 0)
+            address: LLVMValueRef = get pointer else return null
+            return null if not is_constant_table(ElisaLLVMUnderlyingObject(address))
+            loaded: LLVMValueRef = get ElisaLLVMConstantFoldLoad(address, LLVMTypeOf(load), module) else return null
+            return null if LLVMIsAConstantInt(loaded) == null
+            loaded
+
+        # The integer instructions a path evaluates by folding their operands.
+        def is_foldable_path_operation(instruction: LLVMValueRef) -> bool:
+            return true if LLVMIsABinaryOperator(instruction) != null
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            return true if opcode == LLVMOpcode::ICMP or opcode == LLVMOpcode::SELECT or opcode == LLVMOpcode::TRUNC
+            opcode == LLVMOpcode::ZEXT or opcode == LLVMOpcode::SEXT or opcode == LLVMOpcode::EXTRACT_VALUE or opcode == LLVMOpcode::FREEZE
+
+        # INSTRUCTION's constant on the path; null when it does not fold.
+        def evaluate_path_instruction(instruction: LLVMValueRef, values: ValueTable&, module: LLVMModuleRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return fold_path_intrinsic(instruction, values) if LLVMIsAIntrinsicInst(instruction) != null
+            return fold_path_address(instruction, values, module) if LLVMIsAGetElementPtrInst(instruction) != null
+            return fold_path_load(instruction, values, module) if LLVMIsALoadInst(instruction) != null
+            return null if not is_llvm_integer_type(LLVMTypeOf(instruction), 0) or not is_foldable_path_operation(instruction)
+            operands: mutable darray[LLVMValueRef] = []
+            for index in 0..<LLVMGetNumOperands(instruction) |operands, instruction, values|:
+                operand: LLVMValueRef = get path_value(LLVMGetOperand(instruction, index), values) else return null
+                operands.push(operand)
+            return operands[0] if LLVMGetInstructionOpcode(instruction) == LLVMOpcode::FREEZE
+            folded: LLVMValueRef = get ElisaLLVMConstantFoldInstructionOperands(instruction, (&operands[0]).cast[void&], operands.count.u32(), module, 0) else return null
+            return null if LLVMIsAConstantInt(folded) == null
+            folded
+
+        # VALUES with BLOCK's phis set, at once, to what they take from PREVIOUS; null
+        # when one is unknown.
+        def enter_path_block(block: LLVMBasicBlockRef, previous: LLVMBasicBlockRef, values: mutable ValueTable) -> ValueTable? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            phis: mutable darray[LLVMValueRef] = []
+            incoming: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is phi |cursor, phis, incoming, previous, values|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                source: LLVMValueRef = get incoming_value_for_block(phi, previous) else return null
+                constant: LLVMValueRef = get path_value(source, &values) else return null
+                incoming.push(constant)
+                phis.push(phi)
+            for index in 0..<phis.count |phis, incoming, values|:
+                values <- value_table_set(values, phis[index], incoming[index])
+            values
+
+        # An `llvm.assume` whose condition holds on the path; false when unknown or false.
+        def path_assumption_holds(assumption: LLVMValueRef, values: ValueTable&) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            condition: LLVMValueRef = get path_integer(LLVMGetOperand(assumption, 0), values) else return false
+            LLVMGetNumOperandBundles(assumption) == 0 and ElisaLLVMIsConstantOne(condition) != 0
+
+        # The block BLOCK's terminator continues to on the path.
+        def next_path_block(block: LLVMBasicBlockRef, values: ValueTable&) -> LLVMBasicBlockRef? can[Abort.Panic, Unsafe.PointerCast]:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return null
+            opcode: u32 = LLVMGetInstructionOpcode(terminator)
+            return LLVMGetSuccessor(terminator, 0) if opcode == LLVMOpcode::UNCONDITIONAL_BR
+            return null if opcode != LLVMOpcode::CONDITIONAL_BR
+            test: LLVMValueRef = get path_integer(LLVMGetCondition(terminator), values) else return null
+            LLVMGetSuccessor(terminator, 1 if ElisaLLVMIsConstantZero(test) != 0 else 0)
+
+    public:
+        # The constant integer the function returns when entered at START from PREVIOUS
+        # with KNOWN values, spending from BUDGET; no result when the path is not
+        # deterministic.
+        def evaluate_integer_path(start: LLVMBasicBlockRef, previous_block: LLVMBasicBlockRef, module: LLVMModuleRef, budget: u32, known: ValueTable) -> PathOutcome can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            values: mutable ValueTable = known
+            remaining: mutable u32 = budget
+            block: mutable LLVMBasicBlockRef = start
+            previous: mutable LLVMBasicBlockRef = previous_block
+            steps: mutable u32 = 0
+            assume: u32 = intrinsic_identifier("llvm.assume")
+            while remaining != 0 and steps < PathEvaluationLimit::STEPS |values, remaining, block, previous, steps, module, assume|:
+                values <- get enter_path_block(block, previous, values) else return PathOutcome{result: null, budget: remaining}
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, values, remaining, steps, module, assume|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return PathOutcome{result: null, budget: remaining} if remaining == 0
+                    steps <- steps + 1
+                    return PathOutcome{result: null, budget: remaining} if steps > PathEvaluationLimit::STEPS
+                    remaining <- remaining - 1
+                    continue if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI)
+                    return PathOutcome{result: path_integer(LLVMGetOperand(instruction, 0), &values), budget: remaining} if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::RET)
+                    break if LLVMIsATerminatorInst(instruction) != null
+                    if LLVMIsAIntrinsicInst(instruction) != null and called_intrinsic_id(instruction) == assume:
+                        return PathOutcome{result: null, budget: remaining} if not path_assumption_holds(instruction, &values)
+                        continue
+                    constant: LLVMValueRef = get evaluate_path_instruction(instruction, &values, module) else return PathOutcome{result: null, budget: remaining}
+                    values <- value_table_set(values, instruction, constant)
+                previous <- block
+                block <- get next_path_block(block, &values) else return PathOutcome{result: null, budget: remaining}
+            PathOutcome{result: null, budget: remaining}

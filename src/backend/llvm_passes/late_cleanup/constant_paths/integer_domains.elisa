@@ -1,0 +1,192 @@
+# A one-argument function whose entry branch accepts a small unsigned interval of its
+# argument returns a precomputed result there.
+#
+# Every key on the accepted edge (8 to 160 of them) is evaluated as a constant path; when
+# that took real work, the edge goes to a lookup instead: a 64-bit mask for at most 64
+# Boolean results, otherwise a private table of the narrowest power-of-two width (at most
+# 1280 bytes). The original guard and invalid-input path stay.
+
+const module IntegerDomainLimit:
+    MINIMUM_KEYS: u64 = 8
+    MAXIMUM_KEYS: u64 = 160
+    TABLE_BYTES: u32 = 1280
+    WORTH_STEPS: u32 = 32
+    MASK_BITS: u32 = 64
+
+# Whether a fold changed the function, and the path budget left after it.
+struct BudgetedChange:
+    changed: bool
+    budget: u32
+
+# The accepted edge of the entry branch and the keys it admits, `lower` to
+# `lower + count - 1`.
+struct AcceptedKeys:
+    lower: u64
+    edge: u32
+    count: u32
+
+# The argument a domain key is computed from: `input + bias` (or `input` with no bias),
+# where `input` is the argument or a freeze of it.
+struct DomainKey:
+    key: LLVMValueRef
+    input: LLVMValueRef
+    bias: u64
+
+# The results a domain's keys evaluated to (all of them when `complete`), whether any is
+# negative, whether any path took enough steps to make a table worthwhile, and the budget
+# left.
+struct DomainResults:
+    results: darray[LLVMValueRef]
+    complete: bool
+    has_negative: bool
+    worth_table: bool
+    budget: u32
+
+extend Backend:
+    private:
+        def is_unsigned_integer_predicate(predicate: i32) -> bool:
+            predicate >= LLVMIntPredicate::UGT and predicate <= LLVMIntPredicate::ULE
+
+        # The key's argument once an added constant is inverted.
+        def domain_key(key: LLVMValueRef) -> DomainKey?:
+            input: mutable LLVMValueRef = key
+            bias: mutable u64 = 0
+            if LLVMIsABinaryOperator(key) != null:
+                offset: LLVMValueRef = LLVMGetOperand(key, 1)
+                return null if LLVMGetInstructionOpcode(key) != LLVMOpcode::ADD or LLVMIsAConstantInt(offset) == null
+                input <- LLVMGetOperand(key, 0)
+                bias <- LLVMConstIntGetZExtValue(offset)
+            argument: LLVMValueRef = LLVMGetOperand(input, 0) if is_llvm_instruction_with_opcode(input, LLVMOpcode::FREEZE) else input
+            return null if LLVMIsAArgument(argument) == null
+            DomainKey{key: key, input: input, bias: bias}
+
+        # The first edge of TEST whose exact region is 8 to 160 keys.
+        def accepted_keys(test: LLVMValueRef, bound: LLVMValueRef) -> AcceptedKeys?:
+            for edge in 0..<2 |test, bound|:
+                predicate: i32 = LLVMGetICmpPredicate(test) if edge == 0 else inverse_integer_predicate(LLVMGetICmpPredicate(test))
+                region: ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(predicate, bound)
+                if ElisaLLVMConstantRangeIsEmpty(region) == 0 and ElisaLLVMConstantRangeIsFull(region) == 0:
+                    lower: u64 = ElisaLLVMConstantRangeLower(region)
+                    size: u64 = ElisaLLVMConstantRangeUpper(region) - lower
+                    if size >= IntegerDomainLimit::MINIMUM_KEYS and size <= IntegerDomainLimit::MAXIMUM_KEYS:
+                        ElisaLLVMDisposeConstantRange(region)
+                        return AcceptedKeys{edge: edge.u32(), lower: lower, count: size.u32()}
+                ElisaLLVMDisposeConstantRange(region)
+            null
+
+        # Each accepted key's path result, stopping at the first that is not a constant.
+        def evaluate_domain(keys: AcceptedKeys, key: DomainKey, start: LLVMBasicBlockRef, entry: LLVMBasicBlockRef, module: LLVMModuleRef, budget: u32) -> DomainResults can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            int64: LLVMTypeRef = LLVMInt64TypeInContext(LLVMGetModuleContext(module))
+            results: mutable darray[LLVMValueRef] = []
+            has_negative: mutable bool = false
+            worth_table: mutable bool = false
+            remaining: mutable u32 = budget
+            for index in 0..<keys.count |results, has_negative, worth_table, remaining, keys, key, start, entry, module, int64|:
+                value: u64 = keys.lower + index.u64()
+                known: mutable ValueTable = new_value_table()
+                known <- value_table_set(known, key.input, LLVMConstInt(int64, value - key.bias, 0))
+                known <- value_table_set(known, key.key, LLVMConstInt(int64, value, 0))
+                outcome: PathOutcome = evaluate_integer_path(start, entry, module, remaining, known)
+                worth_table <- worth_table or remaining - outcome.budget >= IntegerDomainLimit::WORTH_STEPS
+                remaining <- outcome.budget
+                result: LLVMValueRef = get outcome.result else return DomainResults{results: results, complete: false, has_negative: has_negative, worth_table: worth_table, budget: remaining}
+                results.push(result)
+                has_negative <- has_negative or LLVMConstIntGetSExtValue(result) < 0
+            DomainResults{results: results, complete: true, has_negative: has_negative, worth_table: worth_table, budget: remaining}
+
+        def leading_zero_bits(value: u64) -> u32:
+            count: mutable u32 = 0
+            while count < 64 and (value >> (63 - count.u64())) & 1 == 0 |count, value|:
+                count <- count + 1
+            count
+
+        # `APInt::getSignificantBits` (signed) or `getActiveBits` of a constant at most 64
+        # bits wide.
+        def result_bits(result: LLVMValueRef, has_negative: bool) -> u32:
+            if has_negative:
+                extended: i64 = LLVMConstIntGetSExtValue(result)
+                magnitude: u64 = (extended.u64() ^ 0xffffffffffffffff) if extended < 0 else extended.u64()
+                return 65 - leading_zero_bits(magnitude)
+            64 - leading_zero_bits(LLVMConstIntGetZExtValue(result))
+
+        # The bits of the widest result, at least 1.
+        def domain_result_bits(results: DomainResults&) -> u32:
+            bits: mutable u32 = 1
+            for result in results.results |bits, results|:
+                width: u32 = result_bits(result, results.has_negative)
+                bits <- width if width > bits else bits
+            bits
+
+        # `mask >> index & 1` over the Boolean results.
+        def build_result_mask(results: DomainResults&, index: LLVMValueRef, builder: LLVMBuilderRef, int64: LLVMTypeRef) -> LLVMValueRef:
+            mask: mutable u64 = 0
+            for position in 0..<results.results.count |mask, results|:
+                mask <- mask | (1.u64() << position.u64()) if ElisaLLVMIsConstantOne(results.results[position]) != 0 else mask
+            LLVMBuildAnd(builder, LLVMBuildLShr(builder, LLVMConstInt(int64, mask, 0), index, ""), LLVMConstInt(int64, 1, 0), "")
+
+        # A load at INDEX from a new private table of the results, WIDTH bits each.
+        def build_result_table(results: DomainResults&, width: u32, index: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            storage: LLVMTypeRef = LLVMIntTypeInContext(context, width)
+            entries: mutable darray[LLVMValueRef] = []
+            for result in results.results |entries, results, storage|:
+                bits: u64 = LLVMConstIntGetSExtValue(result).u64() if results.has_negative else LLVMConstIntGetZExtValue(result)
+                entries.push(LLVMConstInt(storage, bits, 1 if results.has_negative else 0))
+            table_type: LLVMTypeRef = LLVMArrayType2(storage, entries.count.u64())
+            name_storage: mutable darray[u8] = []
+            table: LLVMValueRef = LLVMAddGlobal(module, table_type, sview_to_cstr("integer.path.results", name_storage))
+            LLVMSetInitializer(table, LLVMConstArray2(storage, (&entries[0]).cast[void&], entries.count.u64()))
+            LLVMSetGlobalConstant(table, 1)
+            LLVMSetLinkage(table, LLVMLinkageValue::PRIVATE)
+            LLVMSetUnnamedAddress(table, LLVMUnnamedAddressValue::GLOBAL)
+            int64: LLVMTypeRef = LLVMInt64TypeInContext(context)
+            indices: mutable darray[LLVMValueRef] = [LLVMConstInt(int64, 0, 0), index]
+            address: LLVMValueRef = LLVMBuildInBoundsGEP2(builder, table_type, table, (&indices[0]).cast[void&], 2, "")
+            LLVMBuildLoad2(builder, storage, address, "")
+
+        # The accepted edge rerouted to a block returning the result for the frozen key.
+        def build_domain_lookup(test: LLVMValueRef, entry_branch: LLVMValueRef, keys: AcceptedKeys, results: DomainResults&, width: u32, bits: u32, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            entry: LLVMBasicBlockRef = LLVMGetInstructionParent(entry_branch)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(entry)
+            module: LLVMModuleRef = LLVMGetGlobalParent(function)
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            int64: LLVMTypeRef = LLVMInt64TypeInContext(context)
+            position_builder_before(builder, test)
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, LLVMGetOperand(test, 0), "")
+            LLVMSetOperand(test, 0, stable)
+            name_storage: mutable darray[u8] = []
+            lookup: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, function, sview_to_cstr("integer.path.lookup", name_storage))
+            LLVMPositionBuilderAtEnd(builder, lookup)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            index: LLVMValueRef = LLVMBuildSub(builder, stable, LLVMConstInt(int64, keys.lower, 0), "")
+            use_mask: bool = not results.has_negative and bits == 1 and keys.count <= IntegerDomainLimit::MASK_BITS
+            result: LLVMValueRef = build_result_mask(results, index, builder, int64) if use_mask else build_result_table(results, width, index, builder, module)
+            return_type: LLVMTypeRef = LLVMGetReturnType(LLVMGlobalGetValueType(function))
+            _ = LLVMBuildRet(builder, LLVMBuildIntCast2(builder, result, return_type, 1 if results.has_negative else 0, ""))
+            start: LLVMBasicBlockRef = LLVMGetSuccessor(entry_branch, keys.edge)
+            LLVMSetSuccessor(entry_branch, keys.edge, lookup)
+            ElisaLLVMBlockRemovePredecessor(start, entry, 0)
+            _ = ElisaLLVMRemoveUnreachableBlocks(function)
+
+    public:
+        # A small unsigned domain makes every execution on the accepted edge concrete.
+        def fold_small_integer_domain(entry_branch: LLVMValueRef, test: LLVMValueRef, bound: LLVMValueRef, budget: u32, builder: LLVMBuilderRef) -> BudgetedChange can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            unchanged: BudgetedChange = BudgetedChange{changed: false, budget: budget}
+            entry: LLVMBasicBlockRef = LLVMGetInstructionParent(entry_branch)
+            function: LLVMValueRef = LLVMGetBasicBlockParent(entry)
+            module: LLVMModuleRef = LLVMGetGlobalParent(function)
+            return_type: LLVMTypeRef = LLVMGetReturnType(LLVMGlobalGetValueType(function))
+            return unchanged if LLVMCountParams(function) != 1 or not is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(test, 0)), 64)
+            return unchanged if not is_llvm_integer_type(return_type, 0) or LLVMGetIntTypeWidth(return_type) > 64 or not is_unsigned_integer_predicate(LLVMGetICmpPredicate(test))
+            key: DomainKey = get domain_key(LLVMGetOperand(test, 0)) else return unchanged
+            keys: AcceptedKeys = get accepted_keys(test, bound) else return unchanged
+            results: DomainResults = evaluate_domain(keys, key, LLVMGetSuccessor(entry_branch, keys.edge), entry, module, budget)
+            spent: BudgetedChange = BudgetedChange{changed: false, budget: results.budget}
+            return spent if not results.complete or not results.worth_table
+            bits: u32 = domain_result_bits(&results)
+            width: mutable u32 = 8
+            while width < bits |width, bits|:
+                width <- width * 2
+            return spent if keys.count * (width / 8) > IntegerDomainLimit::TABLE_BYTES
+            build_domain_lookup(test, entry_branch, keys, &results, width, bits, builder)
+            BudgetedChange{changed: true, budget: results.budget}
