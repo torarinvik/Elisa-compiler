@@ -332,6 +332,17 @@ ElisaConstantRangeRef ElisaLLVMConstantRangeSignExtend(ElisaConstantRangeRef ran
   return wrap(new ConstantRange(unwrap(range)->signExtend(width)));
 }
 
+ElisaConstantRangeRef ElisaLLVMConstantRangeExtremum(uint32_t extremum, ElisaConstantRangeRef left,
+                                                     ElisaConstantRangeRef right) {
+  const ConstantRange &Left = *unwrap(left), &Right = *unwrap(right);
+  switch (extremum) {
+  case 0: return wrap(new ConstantRange(Left.umin(Right)));
+  case 1: return wrap(new ConstantRange(Left.umax(Right)));
+  case 2: return wrap(new ConstantRange(Left.smin(Right)));
+  default: return wrap(new ConstantRange(Left.smax(Right)));
+  }
+}
+
 LLVMValueRef ElisaLLVMConstantIntUnsignedDivideRoundingUp(LLVMValueRef first, LLVMValueRef second) {
   return constantOf(first, APIntOps::RoundingUDiv(constantValue(first), constantValue(second), APInt::Rounding::UP));
 }

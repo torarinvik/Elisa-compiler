@@ -243,10 +243,6 @@ int ElisaLLVMIsSpecificInt(LLVMValueRef value, uint64_t expected) {
   return PatternMatch::match(unwrap(value), PatternMatch::m_SpecificInt(expected));
 }
 
-int ElisaLLVMMayHaveSideEffects(LLVMValueRef instruction) {
-  return cast<Instruction>(unwrap(instruction))->mayHaveSideEffects();
-}
-
 int ElisaLLVMCallDoesNotAccessMemory(LLVMValueRef call) {
   return cast<CallBase>(unwrap(call))->doesNotAccessMemory();
 }
@@ -302,16 +298,8 @@ int ElisaLLVMConstantIntsAgreeInLowBits(LLVMValueRef first, LLVMValueRef second,
   return ((First ^ Second) & APInt::getLowBitsSet(First.getBitWidth(), bits)).isZero();
 }
 
-int ElisaLLVMMayReadOrWriteMemory(LLVMValueRef instruction) {
-  return cast<Instruction>(unwrap(instruction))->mayReadOrWriteMemory();
-}
-
 LLVMValueRef ElisaLLVMStripPointerCasts(LLVMValueRef value) {
   return wrap(unwrap(value)->stripPointerCasts());
-}
-
-int ElisaLLVMMayReadFromMemory(LLVMValueRef instruction) {
-  return cast<Instruction>(unwrap(instruction))->mayReadFromMemory();
 }
 
 int ElisaLLVMUnderlyingObjectsAreAllocas(LLVMValueRef pointer) {

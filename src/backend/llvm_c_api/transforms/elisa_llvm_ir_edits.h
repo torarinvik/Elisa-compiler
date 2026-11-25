@@ -136,6 +136,10 @@ void ElisaLLVMMoveInstructionToBlockEnd(LLVMValueRef instruction, LLVMBasicBlock
  * metadata, to just before BEFORE. */
 void ElisaLLVMMoveInstructionBefore(LLVMValueRef instruction, LLVMValueRef before);
 
+/* CondBrInst::swapSuccessors: the branch's two successors trade places, and so do the
+ * weights of its branch-weight metadata, if it has any. */
+void ElisaLLVMSwapSuccessors(LLVMValueRef branch);
+
 /* CallBase::setAttributes(function->getAttributes()): the call takes the function's
  * whole attribute list, including its parameter and return attributes. */
 void ElisaLLVMSetCallAttributesFromFunction(LLVMValueRef call, LLVMValueRef function);

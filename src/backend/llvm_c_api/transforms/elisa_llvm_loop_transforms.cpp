@@ -1,6 +1,6 @@
 // Implementation of elisa_llvm_loop_transforms.h over LLVM's loop utilities.
 #include "elisa_llvm_loop_transforms.h"
-#include "elisa_llvm_function_analyses.h"
+#include "../analysis/elisa_llvm_function_analyses.h"
 
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
@@ -40,6 +40,12 @@ ElisaLoopRef ElisaLLVMTopLevelLoopAt(ElisaFunctionAnalysesRef analyses, uint32_t
 ElisaLoopRef ElisaLLVMLoopSubLoopAt(ElisaLoopRef loop, uint32_t index) {
   const auto &SubLoops = unwrapLoop(loop)->getSubLoops();
   return index < SubLoops.size() ? wrapLoop(SubLoops[index]) : nullptr;
+}
+
+int ElisaLLVMMakeLoopInvariant(ElisaLoopRef loop, LLVMValueRef value, LLVMValueRef insert_before) {
+  bool Changed = false;
+  return unwrapLoop(loop)->makeLoopInvariant(unwrap(value), Changed,
+                                             cast<Instruction>(unwrap(insert_before)));
 }
 
 int ElisaLLVMLoopIsSimplifyForm(ElisaLoopRef loop) {

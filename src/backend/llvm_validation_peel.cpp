@@ -45,26 +45,12 @@
 #include "llvm_indexed_prefix.h"
 #include "llvm_proven_checks.h"
 #include "llvm_validated_reads.h"
-#include "llvm_bisection_check_versioning.h"
 
 using namespace llvm;
-
-// Also run before O3 (from the scratch-prefix pass), while loops are still
-// in source shape: a countdown scan the unroller later splits into a
-// prologue and a stride -4 body is a guarded `n - 1` loop there.
-extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
-  if (!Module) return 0;
-  unsigned Removed = ElisaIndexedPrefix::removeIndexedPrefixFills(*unwrap(Module));
-  Removed += ElisaValidatedReads::annotateValidatedReads(*unwrap(Module));
-  Removed += ElisaBisectionChecks::versionBisectionChecks(*unwrap(Module));
-  return Removed + ElisaViewBounds::shrinkViewFills(*unwrap(Module));
-}
 
 #include "llvm_checked_signed_ranges.h"
 #include "llvm_copied_scratch.h"
 
-#else
-extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef) { return 0; }
 #endif
 
 // Keep Apple ARM layout policy identical to Stage0's O3 emitter.

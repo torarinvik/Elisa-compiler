@@ -192,6 +192,10 @@ LLVMValueRef ElisaLLVMEmitGEPOffset(LLVMBuilderRef builder, LLVMValueRef gep) {
                             /*NoAssumptions=*/true));
 }
 
+void ElisaLLVMSwapSuccessors(LLVMValueRef branch) {
+  cast<CondBrInst>(unwrap(branch))->swapSuccessors();
+}
+
 void ElisaLLVMSetCallAttributesFromFunction(LLVMValueRef call, LLVMValueRef function) {
   cast<CallBase>(unwrap(call))->setAttributes(cast<Function>(unwrap(function))->getAttributes());
 }

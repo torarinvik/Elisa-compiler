@@ -13,7 +13,7 @@
 #include <llvm-c/Core.h>
 #include <llvm-c/TargetMachine.h>
 
-#include "elisa_llvm_constant_range.h"
+#include "../constants/elisa_llvm_constant_range.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -108,14 +108,8 @@ int ElisaLLVMIsConstantZero(LLVMValueRef value);
 /* PatternMatch's m_SpecificInt(value): an integer constant, or a splat vector of
  * one, equal to `value` at any width. */
 int ElisaLLVMIsSpecificInt(LLVMValueRef value, uint64_t expected);
-/* Instruction::mayHaveSideEffects. */
-int ElisaLLVMMayHaveSideEffects(LLVMValueRef instruction);
-/* Instruction::mayReadOrWriteMemory. */
-int ElisaLLVMMayReadOrWriteMemory(LLVMValueRef instruction);
 /* Value::stripPointerCasts: the value with pointer casts and zero GEPs removed. */
 LLVMValueRef ElisaLLVMStripPointerCasts(LLVMValueRef value);
-/* Instruction::mayReadFromMemory. */
-int ElisaLLVMMayReadFromMemory(LLVMValueRef instruction);
 /* llvm::getUnderlyingObjects(pointer, objects, no loop info, no lookup limit) found at
  * least one object, and every one is an alloca. */
 int ElisaLLVMUnderlyingObjectsAreAllocas(LLVMValueRef pointer);

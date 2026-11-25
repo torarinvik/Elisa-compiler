@@ -1,0 +1,193 @@
+# Bounds checks in binary searches, rewritten so loop unswitching can take them out of the
+# loop. In
+#
+#     while begin < end:
+#         middle = begin + (end - begin) / 2
+#         check middle < N
+#         begin <- middle + 1   or   end <- middle
+#
+# `middle < end` on every trip, and `end` only ever moves down to `middle`, so
+# `middle < end <= end_on_entry`. When end_on_entry <= N the check can never fail;
+# otherwise it still may. The failing condition becomes `end_on_entry > N and middle >= N`,
+# whose first half is loop invariant, and loop unswitching then gives the common case a
+# loop without the check. The check stays exactly where it was for every other entry value.
+include "../ir/llvm_ir_queries.elisa"
+include "../ir/ir_editing.elisa"
+include "../ir/loop_pass_policy.elisa"
+include "../masked_split_multiplies.elisa"
+include "../late_cleanup/signed_checks/range_facts.elisa"
+include "../late_cleanup/vector_loops/paired_counters.elisa"
+
+# The two header phis a midpoint `begin + (end - begin) / 2` lies between.
+struct BisectionBounds:
+    begin: LLVMValueRef
+    end: LLVMValueRef
+
+extend Backend:
+    private:
+        # Whether START, followed through selects and the phis of LOOP other than its
+        # header's, is only ever END itself or MIDDLE.
+        def moves_down_to(start: LLVMValueRef, end: LLVMValueRef, middle: LLVMValueRef, loop: ElisaLoopRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            seen: mutable darray[LLVMValueRef] = []
+            pending: mutable darray[LLVMValueRef] = [start]
+            while pending.count > 0 |seen, pending, end, middle, loop|:
+                value: LLVMValueRef = pending.pop()
+                continue if value == end or value == middle or contains_value(&seen, value)
+                seen.push(value)
+                if is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT):
+                    pending.push(LLVMGetOperand(value, 2))
+                    pending.push(LLVMGetOperand(value, 1))
+                    continue
+                return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+                parent: LLVMBasicBlockRef = LLVMGetInstructionParent(value)
+                return false if ElisaLLVMLoopContainsBlock(loop, parent) == 0 or parent == ElisaLLVMLoopHeader(loop)
+                for index in 0..<LLVMCountIncoming(value) |pending, value|:
+                    pending.push(LLVMGetIncomingValue(value, index))
+            true
+
+        # Whether CONDITION, taken as TRUTH, means `begin <u end` of BOUNDS.
+        def proves_begin_below_end(condition: LLVMValueRef, truth: bool, bounds: BisectionBounds) -> bool:
+            return false if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(condition)
+            holds: i32 = predicate if truth else inverse_predicate(predicate)
+            left: LLVMValueRef = LLVMGetOperand(condition, 0)
+            right: LLVMValueRef = LLVMGetOperand(condition, 1)
+            (holds == LLVMIntPredicate::ULT and left == bounds.begin and right == bounds.end) or (holds == LLVMIntPredicate::UGT and left == bounds.end and right == bounds.begin)
+
+        # Whether BLOCK only runs after a branch inside LOOP found `begin <u end`: some
+        # dominator in the loop branches on it to a single-predecessor block on the way.
+        def guarded_below(block: LLVMBasicBlockRef, bounds: BisectionBounds, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            child: mutable LLVMBasicBlockRef = block
+            while ElisaLLVMImmediateDominator(analyses, child) is parent |child, bounds, loop, analyses|:
+                return false if ElisaLLVMLoopContainsBlock(loop, parent) == 0
+                if conditional_terminator(parent) is branch:
+                    if single_predecessor(child) is predecessor:
+                        if LLVMGetSuccessor(branch, 0) != LLVMGetSuccessor(branch, 1) and predecessor == parent:
+                            return true if proves_begin_below_end(LLVMGetCondition(branch), LLVMGetSuccessor(branch, 0) == child, bounds)
+                child <- parent
+            false
+
+        # The two operands of `high - low` as (high, low), if CANDIDATE halves it with
+        # `lshr 1` or `udiv 2`.
+        def halved_difference(candidate: LLVMValueRef) -> BisectionBounds?:
+            return null if LLVMIsAInstruction(candidate) == null
+            opcode: u32 = LLVMGetInstructionOpcode(candidate)
+            divisor: u64 = 1 if opcode == LLVMOpcode::LSHR else 2
+            return null if opcode != LLVMOpcode::LSHR and opcode != LLVMOpcode::UDIV
+            difference: LLVMValueRef = LLVMGetOperand(candidate, 0)
+            return null if not is_llvm_instruction_with_opcode(difference, LLVMOpcode::SUB) or ElisaLLVMIsSpecificInt(LLVMGetOperand(candidate, 1), divisor) == 0
+            BisectionBounds{begin: LLVMGetOperand(difference, 1), end: LLVMGetOperand(difference, 0)}
+
+        # BOUNDS, when both are phis of LOOP's header and BASE is the lower one.
+        def header_bisection_bounds(bounds: BisectionBounds, base: LLVMValueRef, loop: ElisaLoopRef) -> BisectionBounds?:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            return null if not is_llvm_instruction_with_opcode(bounds.begin, LLVMOpcode::PHI) or not is_llvm_instruction_with_opcode(bounds.end, LLVMOpcode::PHI)
+            return null if base != bounds.begin or LLVMGetInstructionParent(bounds.begin) != header or LLVMGetInstructionParent(bounds.end) != header
+            bounds
+
+        # The header phis of the midpoint `begin + (end - begin) / 2`, if VALUE is one (the
+        # addition either way round).
+        def bisection_midpoint(value: LLVMValueRef, loop: ElisaLoopRef) -> BisectionBounds?:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::ADD)
+            if halved_difference(LLVMGetOperand(value, 0)) is bounds:
+                return header_bisection_bounds(bounds, LLVMGetOperand(value, 1), loop)
+            bounds: BisectionBounds = get halved_difference(LLVMGetOperand(value, 1)) else return null
+            header_bisection_bounds(bounds, LLVMGetOperand(value, 0), loop)
+
+        # A limit loaded in LOOP (a view's length field still in its alloca, before SROA)
+        # moved to the end of PREHEADER, when nothing in the loop writes memory and the load
+        # cannot fault there; whether it moved.
+        def hoist_limit_load(limit: LLVMValueRef, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef) -> bool can[Abort.Panic]:
+            return false if not is_simple_load(limit) or ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(limit)) == 0
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor|:
+                    return false if ElisaLLVMMayWriteToMemory(instruction) != 0
+                    cursor <- LLVMGetNextInstruction(instruction)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return false
+            return false if ElisaLLVMMakeLoopInvariant(loop, LLVMGetOperand(limit, 0), terminator) == 0
+            return false if ElisaLLVMIsSafeToSpeculativelyExecuteAt(limit, terminator) == 0
+            ElisaLLVMMoveInstructionBefore(limit, terminator)
+            true
+
+        # The one value END takes on entry to LOOP, if every value it takes from inside
+        # the loop only moves down to MIDDLE.
+        def bisection_entry(end: LLVMValueRef, middle: LLVMValueRef, loop: ElisaLoopRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            entry: mutable LLVMValueRef? = null
+            for index in 0..<LLVMCountIncoming(end) |entry, end, middle, loop|:
+                value: LLVMValueRef = LLVMGetIncomingValue(end, index)
+                if ElisaLLVMLoopContainsBlock(loop, LLVMGetIncomingBlock(end, index)) == 0:
+                    if entry is known:
+                        return null if known != value
+                    entry <- value
+                else:
+                    return null if not moves_down_to(value, end, middle, loop)
+            entry
+
+        # BRANCH's check `middle <u limit` of a bisection in LOOP made to fail only when
+        # `end_on_entry >u limit` too; whether it was.
+        def version_bisection_check(branch: LLVMValueRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return false
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            fail: u32 = 0 if ends_in_unreachable(LLVMGetSuccessor(branch, 0)) else 1
+            return false if not ends_in_unreachable(LLVMGetSuccessor(branch, fail)) or ends_in_unreachable(LLVMGetSuccessor(branch, 1 - fail))
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            # The passing condition, as `index <u limit`.
+            passes: i32 = predicate if fail == 1 else inverse_predicate(predicate)
+            swapped: bool = passes == LLVMIntPredicate::UGT
+            index: LLVMValueRef = LLVMGetOperand(compare, 1) if swapped else LLVMGetOperand(compare, 0)
+            limit: LLVMValueRef = LLVMGetOperand(compare, 0) if swapped else LLVMGetOperand(compare, 1)
+            return false if (passes != LLVMIntPredicate::ULT and not swapped) or LLVMIsAInstruction(index) == null
+            bounds: BisectionBounds = get bisection_midpoint(index, loop) else return false
+            return false if not guarded_below(LLVMGetInstructionParent(branch), bounds, loop, analyses)
+            entry: LLVMValueRef = get bisection_entry(bounds.end, index, loop) else return false
+            return false if LLVMIsAConstant(entry) != null and LLVMIsAConstant(limit) != null
+            # A limit computed in the loop from invariant values (a view's length field)
+            # moves to the preheader; anything else is not versioned.
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return false
+            if ElisaLLVMMakeLoopInvariant(loop, limit, terminator) == 0:
+                return false if not hoist_limit_load(limit, loop, preheader)
+            if LLVMIsAInstruction(limit) != null:
+                return false if ElisaLLVMInstructionDominates(analyses, limit, terminator) == 0
+            entry_name: mutable darray[u8] = []
+            may_fail_name: mutable darray[u8] = []
+            out_name: mutable darray[u8] = []
+            fail_name: mutable darray[u8] = []
+            position_builder_before(builder, terminator)
+            frozen: LLVMValueRef = LLVMBuildFreeze(builder, entry, sview_to_cstr("bisect.entry", entry_name))
+            may_fail: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGT, frozen, limit, sview_to_cstr("bisect.may.fail", may_fail_name))
+            position_builder_before(builder, branch)
+            failing: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGE, index, limit, sview_to_cstr("bisect.out", out_name))
+            LLVMSetCondition(branch, LLVMBuildAnd(builder, may_fail, failing, sview_to_cstr("bisect.fail", fail_name)))
+            ElisaLLVMSwapSuccessors(branch) if fail == 1
+            true
+
+        # The bisection checks of FUNCTION's loops versioned, each loop in preorder taking
+        # the branches of its own blocks; how many.
+        def version_function_bisection_checks(function: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = 0
+            for loop in loops_in_program_preorder(analyses) |changed, analyses, builder|:
+                for position in 0..<ElisaLLVMLoopBlockCount(loop) |changed, analyses, builder, loop|:
+                    block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, position)
+                    if conditional_terminator(block) is branch:
+                        if ElisaLLVMLoopForBlock(analyses, block) is innermost:
+                            if innermost == loop and version_bisection_check(branch, loop, analyses, builder):
+                                changed <- changed + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # Bisection bounds checks versioned in every defined function that is not
+        # optnone; how many.
+        def version_bisection_checks(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+                changed <- changed + version_function_bisection_checks(function, builder)
+            LLVMDisposeBuilder(builder)
+            changed

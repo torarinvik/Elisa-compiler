@@ -5,7 +5,7 @@
 #ifndef ELISA_LLVM_LOOP_TRANSFORMS_H
 #define ELISA_LLVM_LOOP_TRANSFORMS_H
 
-#include "elisa_llvm_analysis.h"
+#include "../analysis/elisa_llvm_analysis.h"
 #include "elisa_llvm_ir_edits.h"
 
 #ifdef __cplusplus
@@ -23,6 +23,10 @@ void ElisaLLVMForgetLoop(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop);
  * built the cache (one built later finds it anyway). */
 void ElisaLLVMRegisterAssumption(ElisaFunctionAnalysesRef analyses, LLVMValueRef assume);
 
+/* Loop::makeLoopInvariant(value, changed, insert_before) without MemorySSA or scalar
+ * evolution: whether the value is now invariant in the loop, its instructions (and theirs)
+ * moved before `insert_before` where that is safe. A partial move stays when it fails. */
+int ElisaLLVMMakeLoopInvariant(ElisaLoopRef loop, LLVMValueRef value, LLVMValueRef insert_before);
 /* Loop::isLoopSimplifyForm. */
 int ElisaLLVMLoopIsSimplifyForm(ElisaLoopRef loop);
 /* simplifyLoop(L, DT, LI, SE, AC, nullptr, preserve_lcssa): whether it changed the IR. */

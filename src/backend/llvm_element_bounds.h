@@ -9,6 +9,7 @@
 // so a test that reloads the element (and a neighbour it is compared with)
 // decides the stored value itself. Signed tests count when they also show
 // V >=s 0: `0 <=s left <=s V <=s n` puts V in [0, n] unsigned.
+#include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/ValueTracking.h>
 namespace ElisaElementBounds {
 using namespace llvm;

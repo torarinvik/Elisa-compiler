@@ -143,6 +143,9 @@ int ElisaLLVMConstantRangeComparesTrue(LLVMIntPredicate predicate, ElisaConstant
  * and signExtend(width). */
 ElisaConstantRangeRef ElisaLLVMConstantRangeCast(LLVMOpcode opcode, ElisaConstantRangeRef range, uint32_t width);
 ElisaConstantRangeRef ElisaLLVMConstantRangeSignExtend(ElisaConstantRangeRef range, uint32_t width);
+/* umin, umax, smin or smax of two ranges of one width, by `extremum`: 0, 1, 2 or 3. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeExtremum(uint32_t extremum, ElisaConstantRangeRef left,
+                                                     ElisaConstantRangeRef right);
 /* APIntOps::RoundingUDiv(first, second, Rounding::UP) on ConstantInts of one width. */
 LLVMValueRef ElisaLLVMConstantIntUnsignedDivideRoundingUp(LLVMValueRef first, LLVMValueRef second);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);

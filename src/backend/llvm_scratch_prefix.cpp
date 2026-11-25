@@ -166,30 +166,49 @@ static bool canonicalizeTrustedMemset(CallInst *CI, AllocaInst *A,
 #include "llvm_covered_prefix.cpp"
 #include "llvm_stack_prefix.cpp"
 
-extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module);
-
-extern "C" unsigned elisacoreElideScratchPrefixInitializers(LLVMModuleRef Ref) {
-  if (!Ref) return 0;
-  Module &M = *unwrap(Ref);
-  if (M.getNamedMetadata("llvm.dbg.cu")) return 0;
+// The scratch-prefix sequence runs before O3 from Elisa
+// (llvm_passes/scratch_prefix/scratch_prefix_sequence.elisa): these two phases, with the
+// indexed-prefix, validated-read, bisection-check and view-fill passes between them.
+namespace ElisaScratchPrefix {
+// The analysis managers one phase builds over the module.
+struct PhaseAnalyses {
   PassBuilder PB;
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
   ModuleAnalysisManager MAM;
-  PB.registerModuleAnalyses(MAM);
-  PB.registerCGSCCAnalyses(CGAM);
-  PB.registerFunctionAnalyses(FAM);
-  PB.registerLoopAnalyses(LAM);
-  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-  unsigned Removed = prepareCoveredArrayInitializers(M, FAM, PB);
-  Removed += removeCountedPrefixInitializers(M, FAM, PB);
-  Removed += prepareCoveredPrefixZeros(M, FAM, PB);
-  unsigned Analyses = 0;
+  PhaseAnalyses() {
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  }
+};
+} // namespace ElisaScratchPrefix
+
+// Covered and counted array initializers, covered prefix zeros, and (on AArch64 macOS and
+// Linux) stack prefix zeros.
+extern "C" unsigned elisacorePrepareScratchPrefixArrays(LLVMModuleRef Ref) {
+  Module &M = *unwrap(Ref);
+  ElisaScratchPrefix::PhaseAnalyses Phase;
+  unsigned Removed = prepareCoveredArrayInitializers(M, Phase.FAM, Phase.PB);
+  Removed += removeCountedPrefixInitializers(M, Phase.FAM, Phase.PB);
+  Removed += prepareCoveredPrefixZeros(M, Phase.FAM, Phase.PB);
   if ((M.getTargetTriple().isMacOSX() || M.getTargetTriple().isOSLinux()) &&
       M.getTargetTriple().getArch() == Triple::aarch64)
     Removed += removeStackPrefixZeros(M);
-  Removed += elisacoreRemoveIndexedPrefixFills(Ref);
+  return Removed;
+}
+
+// The memsets of byte scratch arrays whose reads verifyScratchPrefix proves are all
+// written first.
+extern "C" unsigned elisacoreElideScratchPrefixArrays(LLVMModuleRef Ref) {
+  Module &M = *unwrap(Ref);
+  ElisaScratchPrefix::PhaseAnalyses Phase;
+  FunctionAnalysisManager &FAM = Phase.FAM;
+  unsigned Removed = 0;
+  unsigned Analyses = 0;
   for (Function &F : M) {
     if (F.isDeclaration() || F.hasOptNone() ||
         F.hasFnAttribute(Attribute::SanitizeAddress) ||
@@ -242,9 +261,8 @@ extern "C" unsigned elisacoreElideScratchPrefixInitializers(LLVMModuleRef Ref) {
 }
 extern "C" unsigned elisacoreScratchPrefixSupported(void) { return 1; }
 #else
-extern "C" unsigned elisacoreElideScratchPrefixInitializers(LLVMModuleRef) {
-  return 0;
-}
+extern "C" unsigned elisacorePrepareScratchPrefixArrays(LLVMModuleRef) { return 0; }
+extern "C" unsigned elisacoreElideScratchPrefixArrays(LLVMModuleRef) { return 0; }
 extern "C" unsigned elisacoreScratchPrefixSupported(void) { return 0; }
 #endif
 static void refineBranchFacts(PrefixState &S, BranchInst *B, unsigned successorIndex,

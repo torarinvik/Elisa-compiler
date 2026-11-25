@@ -14,13 +14,15 @@ backend="$ROOT/src/backend"
 sources=(
   "$backend/llvm_validation_peel.cpp"
   "$backend/llvm_memory_and_call_passes.cpp"
-  "$backend/llvm_c_api/elisa_llvm_analysis.cpp"
-  "$backend/llvm_c_api/elisa_llvm_ir_edits.cpp"
-  "$backend/llvm_c_api/elisa_llvm_loop_transforms.cpp"
-  "$backend/llvm_c_api/elisa_llvm_constant_range.cpp"
-  "$backend/llvm_c_api/elisa_llvm_weak_values.cpp"
-  "$backend/llvm_c_api/elisa_llvm_constant_folding.cpp"
-  "$backend/llvm_c_api/elisa_llvm_pass_pipelines.cpp"
+  "$backend/llvm_c_api/analysis/elisa_llvm_analysis.cpp"
+  "$backend/llvm_c_api/analysis/elisa_llvm_instruction_queries.cpp"
+  "$backend/llvm_c_api/analysis/elisa_llvm_scalar_evolution_expressions.cpp"
+  "$backend/llvm_c_api/transforms/elisa_llvm_ir_edits.cpp"
+  "$backend/llvm_c_api/transforms/elisa_llvm_loop_transforms.cpp"
+  "$backend/llvm_c_api/constants/elisa_llvm_constant_range.cpp"
+  "$backend/llvm_c_api/transforms/elisa_llvm_weak_values.cpp"
+  "$backend/llvm_c_api/constants/elisa_llvm_constant_folding.cpp"
+  "$backend/llvm_c_api/transforms/elisa_llvm_pass_pipelines.cpp"
 )
 export LC_ALL=C
 toolchain_inputs="$(

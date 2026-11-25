@@ -1,0 +1,247 @@
+# Loop exits to a trap that another exit always beats, removed. An exit's count is the
+# number of backedges taken before its condition first holds. When the largest possible
+# count of one exit is below the smallest possible count of a trapping exit, the loop
+# leaves by the first before the second's condition ever holds, in whatever order the two
+# are tested. The counts come from scalar evolution, and their ranges from the facts that
+# hold on the loop's entry edge (bounds checks on an index whose loop limit is itself
+# checked against the array size are the common case).
+include "../../ir/decided_compares.elisa"
+include "../../ir/ir_editing.elisa"
+include "../../ir/llvm_ir_queries.elisa"
+include "../../ir/llvm_c_extra.elisa"
+include "../../../llvm_c_api/analysis/elisa_llvm_scalar_evolution_expressions.elisa"
+include "../signed_checks/range_facts.elisa"
+include "../vector_loops/paired_counters.elisa"
+
+const module DeadTrapExitLimit:
+    # How deep a count's range follows its expression before taking scalar evolution's.
+    COUNT_DEPTH: u32 = 8
+
+# The entry edge of a loop, on which its exit counts' ranges are asked.
+struct LoopEntryEdge:
+    analyses: ElisaFunctionAnalysesRef
+    from: LLVMBasicBlockRef
+    target: LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        # PatternMatch's `m_Add(m_Specific(value), m_APInt(offset))`: an `add` instruction or
+        # constant expression of VALUE and an integer constant.
+        def is_offset_of(candidate: LLVMValueRef, value: LLVMValueRef) -> bool:
+            if LLVMIsAInstruction(candidate) != null:
+                return false if LLVMGetInstructionOpcode(candidate) != LLVMOpcode::ADD
+            else:
+                return false if LLVMIsAConstantExpr(candidate) == null or LLVMGetConstOpcode(candidate) != LLVMOpcode::ADD
+            LLVMGetOperand(candidate, 0) == value and LLVMIsAConstantInt(LLVMGetOperand(candidate, 1)) != null
+
+        # RANGE narrowed by FACT, when it is `value op c` or `(value + offset) op c`.
+        # Disposes RANGE.
+        def narrow_by_guard_fact(range: ElisaConstantRangeRef, value: LLVMValueRef, fact: CompareFact) -> ElisaConstantRangeRef:
+            bound: LLVMValueRef = LLVMGetOperand(fact.compare, 1)
+            left: LLVMValueRef = LLVMGetOperand(fact.compare, 0)
+            shifted: bool = is_offset_of(left, value)
+            return range if LLVMIsAConstantInt(bound) == null or (left != value and not shifted)
+            predicate: i32 = LLVMGetICmpPredicate(fact.compare) if fact.truth else inverse_predicate(LLVMGetICmpPredicate(fact.compare))
+            region: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(predicate, bound)
+            if shifted:
+                offset: ElisaConstantRangeRef = ElisaLLVMConstantRangeOfConstant(LLVMGetOperand(left, 1))
+                moved: ElisaConstantRangeRef = ElisaLLVMConstantRangeBinaryOperation(LLVMOpcode::SUB, region, offset)
+                ElisaLLVMDisposeConstantRange(offset)
+                ElisaLLVMDisposeConstantRange(region)
+                region <- moved
+            narrowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(range, region)
+            ElisaLLVMDisposeConstantRange(region)
+            ElisaLLVMDisposeConstantRange(range)
+            narrowed
+
+        # RANGE narrowed by the facts PREDECESSOR's conditional branch decides on each of
+        # its edges into DOMINATOR that dominates BLOCK. Disposes RANGE.
+        def narrow_by_edges_from(range: ElisaConstantRangeRef, value: LLVMValueRef, predecessor: LLVMBasicBlockRef, dominator: LLVMBasicBlockRef, block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(predecessor) else return range
+            return range if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            narrowed: mutable ElisaConstantRangeRef = range
+            for edge in 0..<2.u32() |narrowed, value, predecessor, dominator, block, analyses, branch|:
+                continue if LLVMGetSuccessor(branch, edge) != dominator or ElisaLLVMEdgeDominates(analyses, predecessor, dominator, block) == 0
+                facts: mutable darray[CompareFact] = []
+                facts <- decided_compares(LLVMGetCondition(branch), edge == 0, facts, 0)
+                for fact in facts |narrowed, value|:
+                    narrowed <- narrow_by_guard_fact(narrowed, value, fact)
+            narrowed
+
+        # RANGE narrowed by the edges from DOMINATOR's predecessors (in use-list order, as
+        # `predecessors` walks them) into it that dominate BLOCK. Disposes RANGE.
+        def narrow_by_edges_into(range: ElisaConstantRangeRef, value: LLVMValueRef, dominator: LLVMBasicBlockRef, block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            narrowed: mutable ElisaConstantRangeRef = range
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(LLVMBasicBlockAsValue(dominator))
+            while use_cursor is use |use_cursor, narrowed, value, dominator, block, analyses|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                if LLVMIsATerminatorInst(user) != null:
+                    narrowed <- narrow_by_edges_from(narrowed, value, LLVMGetInstructionParent(user), dominator, block, analyses)
+            narrowed
+
+        # The range of VALUE implied by `value op constant` decided on branch edges that
+        # dominate BLOCK. Lazy value info gives up on values reaching a block through an
+        # earlier loop's exit; these dominating edges still hold there.
+        def dominating_edge_range(value: LLVMValueRef, block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(value)))
+            return range if ElisaLLVMIsReachableFromEntry(analyses, block) == 0
+            dominator: mutable LLVMBasicBlockRef? = block
+            while dominator is current |dominator, range, value, block, analyses|:
+                range <- narrow_by_edges_into(range, value, current, block, analyses)
+                dominator <- ElisaLLVMImmediateDominator(analyses, current)
+            range
+
+        # The range of an unknown VALUE on EDGE: scalar evolution's KNOWN range, lazy value
+        # info's on the edge and the dominating guards'. Disposes KNOWN.
+        def unknown_count_range(known: ElisaConstantRangeRef, value: LLVMValueRef, edge: LoopEntryEdge) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            on_edge: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(edge.analyses, value, edge.from, edge.target, null)
+            entered: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersectUnsigned(known, on_edge)
+            guarded: ElisaConstantRangeRef = dominating_edge_range(value, edge.target, edge.analyses)
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersectUnsigned(entered, guarded)
+            ElisaLLVMDisposeConstantRange(known)
+            ElisaLLVMDisposeConstantRange(on_edge)
+            ElisaLLVMDisposeConstantRange(entered)
+            ElisaLLVMDisposeConstantRange(guarded)
+            result
+
+        # KNOWN narrowed by the cast COUNT of the range of its operand. Disposes KNOWN.
+        def cast_count_range(known: ElisaConstantRangeRef, count: ElisaScalarEvolutionExpressionRef, kind: u32, edge: LoopEntryEdge, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            inner: ElisaConstantRangeRef = count_range(ElisaLLVMScalarEvolutionExpressionOperandAt(count, 0), edge, depth + 1)
+            if kind == ElisaScalarEvolutionKind::OTHER_CAST:
+                ElisaLLVMDisposeConstantRange(inner)
+                return known
+            opcode: u32 = LLVMOpcode::ZEXT if kind == ElisaScalarEvolutionKind::ZERO_EXTEND else (LLVMOpcode::SEXT if kind == ElisaScalarEvolutionKind::SIGN_EXTEND else LLVMOpcode::TRUNC)
+            converted: ElisaConstantRangeRef = ElisaLLVMConstantRangeCast(opcode, inner, ElisaLLVMConstantRangeBitWidth(known))
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(known, converted)
+            ElisaLLVMDisposeConstantRange(inner)
+            ElisaLLVMDisposeConstantRange(converted)
+            ElisaLLVMDisposeConstantRange(known)
+            result
+
+        # LEFT combined with RIGHT by the n-ary operation KIND, or null for an operation
+        # that is not followed. Disposes neither.
+        def combined_count_range(kind: u32, left: ElisaConstantRangeRef, right: ElisaConstantRangeRef) -> ElisaConstantRangeRef?:
+            return ElisaLLVMConstantRangeBinaryOperation(LLVMOpcode::ADD, left, right) if kind == ElisaScalarEvolutionKind::ADD
+            return ElisaLLVMConstantRangeBinaryOperation(LLVMOpcode::MUL, left, right) if kind == ElisaScalarEvolutionKind::MULTIPLY
+            return ElisaLLVMConstantRangeExtremum(0, left, right) if kind == ElisaScalarEvolutionKind::UNSIGNED_MINIMUM
+            return ElisaLLVMConstantRangeExtremum(1, left, right) if kind == ElisaScalarEvolutionKind::UNSIGNED_MAXIMUM
+            return ElisaLLVMConstantRangeExtremum(2, left, right) if kind == ElisaScalarEvolutionKind::SIGNED_MINIMUM
+            return ElisaLLVMConstantRangeExtremum(3, left, right) if kind == ElisaScalarEvolutionKind::SIGNED_MAXIMUM
+            null
+
+        # KNOWN narrowed by the n-ary COUNT over the ranges of its operands, in order.
+        # Disposes KNOWN.
+        def operation_count_range(known: ElisaConstantRangeRef, count: ElisaScalarEvolutionExpressionRef, kind: u32, edge: LoopEntryEdge, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            result: mutable ElisaConstantRangeRef = count_range(ElisaLLVMScalarEvolutionExpressionOperandAt(count, 0), edge, depth + 1)
+            for index in 1..<ElisaLLVMScalarEvolutionExpressionOperandCount(count) |result, known, count, kind, edge, depth|:
+                next: ElisaConstantRangeRef = count_range(ElisaLLVMScalarEvolutionExpressionOperandAt(count, index), edge, depth + 1)
+                combined: ElisaConstantRangeRef? = combined_count_range(kind, result, next)
+                ElisaLLVMDisposeConstantRange(next)
+                ElisaLLVMDisposeConstantRange(result)
+                result <- get combined else return known
+            narrowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersectUnsigned(known, result)
+            ElisaLLVMDisposeConstantRange(result)
+            ElisaLLVMDisposeConstantRange(known)
+            narrowed
+
+        # The values COUNT can take when the loop is entered along EDGE.
+        def count_range(count: ElisaScalarEvolutionExpressionRef, edge: LoopEntryEdge, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            known: ElisaConstantRangeRef = ElisaLLVMScalarEvolutionExpressionUnsignedRange(edge.analyses, count)
+            return known if depth > DeadTrapExitLimit::COUNT_DEPTH
+            kind: u32 = ElisaLLVMScalarEvolutionExpressionKind(count)
+            if kind == ElisaScalarEvolutionKind::CONSTANT:
+                ElisaLLVMDisposeConstantRange(known)
+                return ElisaLLVMConstantRangeOfConstant(ElisaLLVMScalarEvolutionExpressionValue(count))
+            return unknown_count_range(known, ElisaLLVMScalarEvolutionExpressionValue(count), edge) if kind == ElisaScalarEvolutionKind::UNKNOWN
+            return cast_count_range(known, count, kind, edge, depth) if kind >= ElisaScalarEvolutionKind::TRUNCATE and kind <= ElisaScalarEvolutionKind::OTHER_CAST
+            return operation_count_range(known, count, kind, edge, depth) if kind >= ElisaScalarEvolutionKind::ADD and kind <= ElisaScalarEvolutionKind::OTHER_OPERATION
+            known
+
+        # Whether BLOCK has a successor outside LOOP.
+        def leaves_loop(block: LLVMBasicBlockRef, loop: ElisaLoopRef) -> bool:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return false
+            for successor in 0..<LLVMGetNumSuccessors(terminator) |loop, terminator|:
+                return true if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(terminator, successor)) == 0
+            false
+
+        # `Loop::getExitingBlocks`: LOOP's blocks, in order, with a successor outside it.
+        def loop_exiting_blocks(loop: ElisaLoopRef) -> darray[LLVMBasicBlockRef] can[Abort.Panic, Memory.Allocate]:
+            exiting: mutable darray[LLVMBasicBlockRef] = []
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |exiting, loop|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, index)
+                exiting.push(block) if leaves_loop(block, loop)
+            exiting
+
+        # BLOCK's conditional branch out of LOOP, its exit successor's index and its exit
+        # count, when the count is a known i64 and the exit traps exactly when TRAPPING.
+        def counted_exit(block: LLVMBasicBlockRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, trapping: bool) -> ElisaScalarEvolutionExpressionRef? can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return null
+            out: u32 = 1 if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 0)) != 0 else 0
+            count: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionExitCount(analyses, loop, block)
+            return null if ends_in_unreachable(LLVMGetSuccessor(branch, out)) != trapping or ElisaLLVMScalarEvolutionExpressionKind(count) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            return null if not is_llvm_integer_type(ElisaLLVMScalarEvolutionExpressionType(count), 64)
+            count
+
+        # The smallest maximum count of LOOP's exits that never trap, if one has a count:
+        # it bounds the trip count.
+        def non_trapping_exit_bound(exiting: darray[LLVMBasicBlockRef], loop: ElisaLoopRef, edge: LoopEntryEdge) -> u64? can[Abort.Panic, Memory.Allocate]:
+            bound: mutable u64? = null
+            for block in exiting |bound, loop, edge|:
+                if counted_exit(block, loop, edge.analyses, false) is count:
+                    range: ElisaConstantRangeRef = count_range(count, edge, 0)
+                    most: u64 = ElisaLLVMConstantRangeUnsignedMax(range)
+                    ElisaLLVMDisposeConstantRange(range)
+                    if bound is known:
+                        bound <- most if most < known else known
+                    else:
+                        bound <- most
+            bound
+
+        # BLOCK's exit made to stay in LOOP when it traps and its smallest count is above
+        # BOUND; whether it was.
+        def remove_trap_exit(block: LLVMBasicBlockRef, loop: ElisaLoopRef, edge: LoopEntryEdge, bound: u64) -> bool can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return false
+            inside: bool = ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 0)) != 0
+            return false if inside == (ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1)) != 0)
+            count: ElisaScalarEvolutionExpressionRef = get counted_exit(block, loop, edge.analyses, true) else return false
+            range: ElisaConstantRangeRef = count_range(count, edge, 0)
+            least: u64 = ElisaLLVMConstantRangeUnsignedMin(range)
+            ElisaLLVMDisposeConstantRange(range)
+            return false if bound >= least
+            LLVMSetCondition(branch, LLVMConstInt(LLVMTypeOf(LLVMGetCondition(branch)), 1 if inside else 0, 0))
+            true
+
+        # LOOP's trapping exits whose smallest count is above another exit's largest made
+        # to stay in the loop; whether any was.
+        def remove_loop_trap_exits(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            entry: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return false
+            edge: LoopEntryEdge = LoopEntryEdge{analyses: analyses, from: entry, target: ElisaLLVMLoopHeader(loop)}
+            exiting: darray[LLVMBasicBlockRef] = loop_exiting_blocks(loop)
+            bound: u64 = get non_trapping_exit_bound(exiting, loop, edge) else return false
+            changed: mutable bool = false
+            for block in exiting |changed, loop, edge, bound|:
+                changed <- remove_trap_exit(block, loop, edge, bound) or changed
+            changed
+
+        # Dead trap exits removed from FUNCTION's loops, in preorder; whether any was.
+        def remove_function_trap_exits(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            changed: mutable bool = false
+            if ElisaLLVMTopLevelLoopCount(analyses) != 0:
+                for loop in loops_in_program_preorder(analyses) |changed, analyses|:
+                    changed <- remove_loop_trap_exits(loop, analyses) or changed
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # Dead trap exits removed from every loop of every defined function; the number of
+        # functions changed.
+        def remove_dead_trap_exits(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0
+                changed <- changed + (1 if remove_function_trap_exits(function) else 0)
+            changed
