@@ -6,6 +6,7 @@
 #include <llvm/ADT/SCCIterator.h>
 #include <llvm/Analysis/AssumptionCache.h>
 #include <llvm/Analysis/CFG.h>
+#include <llvm/Analysis/CaptureTracking.h>
 #include <llvm/Analysis/LazyValueInfo.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/LoopIterator.h>
@@ -353,6 +354,18 @@ unsigned ElisaLLVMFunctionMaxBlockNumber(LLVMValueRef function) {
 
 int ElisaLLVMCallHasFunctionAttribute(LLVMValueRef call, unsigned kind) {
   return cast<CallBase>(unwrap(call))->hasFnAttr(static_cast<Attribute::AttrKind>(kind));
+}
+
+int ElisaLLVMPointerMayBeCaptured(LLVMValueRef pointer, int return_captures, uint32_t max_uses) {
+  return PointerMayBeCaptured(unwrap(pointer), return_captures != 0, max_uses);
+}
+
+int ElisaLLVMInstructionIsPotentiallyReachable(LLVMValueRef from, LLVMValueRef to) {
+  return isPotentiallyReachable(cast<Instruction>(unwrap(from)), cast<Instruction>(unwrap(to)));
+}
+
+int ElisaLLVMFunctionOnlyReadsMemory(LLVMValueRef function) {
+  return cast<Function>(unwrap(function))->onlyReadsMemory();
 }
 
 int ElisaLLVMIsMemIntrinsic(LLVMValueRef value) { return isa<MemIntrinsic>(unwrap(value)); }

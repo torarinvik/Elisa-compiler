@@ -1,0 +1,171 @@
+# Peels and runtime-unrolls small scalar validation loops (two blocks, one load, two
+# comparisons, two exits), keeping every load and early exit in order: LLVM's unroller
+# builds the runtime remainder without speculating accesses past an invalid item. One
+# loop per function, since the transform invalidates the function's analyses.
+include "../ir/llvm_ir_queries.elisa"
+include "../ir/loop_pass_policy.elisa"
+include "../../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module ValidationPeelLimit:
+    INSTRUCTIONS: u32 = 16
+    TINY_TRIPS: u32 = 8
+    SMALLEST_BOUNDED_TRIPS: u32 = 64
+    LARGEST_BOUNDED_TRIPS: u32 = 4096
+    EXPANSION_BUDGET: u32 = 1000
+
+# What one walk over a validation loop's blocks found.
+struct ValidationScan:
+    safe: bool
+    loads: u32
+    instructions: u32
+    exits: u32
+    comparisons: u32
+    validated: LLVMValueRef?
+
+extend Backend:
+    private:
+        def scanned_validation_instruction(scan: ValidationScan, instruction: LLVMValueRef, loop: ElisaLoopRef) -> ValidationScan:
+            safe: mutable bool = scan.safe
+            loads: mutable u32 = scan.loads
+            exits: mutable u32 = scan.exits
+            validated: mutable LLVMValueRef? = scan.validated
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            if opcode == LLVMOpcode::LOAD:
+                safe <- safe and is_simple_access(instruction)
+                validated <- instruction
+                loads <- loads + 1
+            elif ElisaLLVMMayHaveSideEffects(instruction) != 0:
+                safe <- false
+            if opcode == LLVMOpcode::CONDITIONAL_BR:
+                for successor in 0..<2 |exits, instruction, loop|:
+                    if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(instruction, successor.u32())) == 0:
+                        exits <- exits + 1
+            comparisons: u32 = scan.comparisons + (1 if opcode == LLVMOpcode::ICMP else 0)
+            ValidationScan{safe: safe, loads: loads, instructions: scan.instructions + 1, exits: exits, comparisons: comparisons, validated: validated}
+
+        def validation_scan(loop: ElisaLoopRef) -> ValidationScan:
+            scan: mutable ValidationScan = ValidationScan{safe: true, loads: 0, instructions: 0, exits: 0, comparisons: 0, validated: null}
+            for block_index in 0..<ElisaLLVMLoopBlockCount(loop) |scan, loop|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, block_index))
+                while cursor is instruction |cursor, scan, loop|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    scan <- scanned_validation_instruction(scan, instruction, loop)
+            scan
+
+        # The validated load of an innermost two-block loop without a loop ID whose body
+        # is at most 16 instructions with one simple load, two comparisons and two exits,
+        # and nothing else with a side effect.
+        def validated_load(loop: ElisaLoopRef) -> LLVMValueRef?:
+            return null if ElisaLLVMLoopSubLoopCount(loop) != 0 or ElisaLLVMLoopBlockCount(loop) != 2 or ElisaLLVMLoopGetLoopID(loop) != null
+            scan: ValidationScan = validation_scan(loop)
+            return null if not scan.safe or scan.loads != 1 or scan.instructions > ValidationPeelLimit::INSTRUCTIONS or scan.exits != 2 or scan.comparisons != 2
+            scan.validated
+
+        # Whether a simple load of INPUT, in the loop, is operand OPERAND of the comparison.
+        def compares_input_load(comparison: LLVMValueRef, operand: u32, input: LLVMValueRef, search: ElisaLoopRef) -> bool:
+            load: LLVMValueRef = LLVMGetOperand(comparison, operand)
+            return false if not is_llvm_instruction_with_opcode(load, LLVMOpcode::LOAD) or not is_simple_access(load)
+            ElisaLLVMLoopContainsBlock(search, LLVMGetInstructionParent(load)) != 0 and ElisaLLVMUnderlyingObject(LLVMGetOperand(load, 0)) == input
+
+        # Whether the block leaves the search loop on an equality comparison of two
+        # different simple loads of INPUT made in the loop.
+        def exits_on_input_comparison(block: LLVMBasicBlockRef, search: ElisaLoopRef, input: LLVMValueRef) -> bool:
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return false
+            return false if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            return false if ElisaLLVMLoopContainsBlock(search, LLVMGetSuccessor(branch, 0)) == ElisaLLVMLoopContainsBlock(search, LLVMGetSuccessor(branch, 1))
+            comparison: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(comparison, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(comparison)
+            return false if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            return false if LLVMGetOperand(comparison, 0) == LLVMGetOperand(comparison, 1)
+            compares_input_load(comparison, 0, input, search) and compares_input_load(comparison, 1, input, search)
+
+        # `precedesNestedInputSearch`: whether a read-only function's validation loop over an
+        # argument leads into an innermost two-block nested loop comparing two loads of the
+        # same argument. A runtime remainder adds setup on short inputs, while the nested
+        # comparisons dominate sustained work on inputs with long matches.
+        def precedes_nested_input_search(validation: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, validated: LLVMValueRef) -> bool:
+            entry: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(validation) else return false
+            input: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(validated, 0))
+            return false if LLVMIsAArgument(input) == null or ElisaLLVMFunctionOnlyReadsMemory(LLVMGetBasicBlockParent(entry)) == 0
+            for loop_index in 0..<ElisaLLVMLoopCount(analyses) |analyses, entry, input|:
+                search: ElisaLoopRef = ElisaLLVMLoopAt(analyses, loop_index)
+                if ElisaLLVMLoopParent(search) != null and ElisaLLVMLoopBlockCount(search) == 2 and ElisaLLVMLoopSubLoopCount(search) == 0:
+                    if ElisaLLVMBlockDominates(analyses, entry, ElisaLLVMLoopHeader(search)) != 0:
+                        for block_index in 0..<2 |search, input|:
+                            return true if exits_on_input_comparison(ElisaLLVMLoopBlockAt(search, block_index.u32()), search, input)
+            false
+
+        # Whether this compiler was built for Linux on AArch64: tuning measured on that
+        # host only.
+        def built_for_linux_aarch64() -> bool:
+            static if ELISA_TARGET_OS_LINUX and ELISA_TARGET_ARCH_ARM64:
+                return true
+            false
+
+        def is_bounded_trip_count(trips: u32) -> bool:
+            trips >= ValidationPeelLimit::SMALLEST_BOUNDED_TRIPS and trips <= ValidationPeelLimit::LARGEST_BOUNDED_TRIPS
+
+        # The unroll count: the whole bound for a tiny AArch64 scan, 16 for bounded scans on
+        # AArch64 Darwin (and on Linux, when built for Linux AArch64), else 8 for bounded
+        # scans and 4 for the rest.
+        def validation_unroll_count(module: LLVMModuleRef, trips: u32, tiny: bool) -> u32:
+            return trips if tiny
+            bounded: bool = is_bounded_trip_count(trips)
+            return 16 if bounded and ElisaLLVMModuleTargetIsAArch64(module) != 0 and ElisaLLVMModuleTargetIsDarwin(module) != 0
+            return 16 if bounded and built_for_linux_aarch64() and ElisaLLVMModuleTargetIsLinux(module) != 0
+            8 if bounded else 4
+
+        # Whether the bounded scan skips the peeled iteration, whose separate runtime
+        # remainder large scans pay for on Linux AArch64 hosts and on Apple Silicon.
+        def unrolls_without_peeling(module: LLVMModuleRef, trips: u32, tiny: bool) -> bool:
+            return true if tiny
+            bounded: bool = is_bounded_trip_count(trips)
+            return true if bounded and built_for_linux_aarch64() and ElisaLLVMModuleTargetIsLinux(module) != 0
+            bounded and ElisaLLVMModuleTargetIsAArch64(module) != 0 and ElisaLLVMModuleTargetIsDarwin(module) != 0
+
+        # Peels and unrolls the loop when it is a validation scan worth it; whether it did.
+        def peel_validation_loop(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, module: LLVMModuleRef) -> bool:
+            validated: LLVMValueRef = get validated_load(loop) else return false
+            # Larger bounded scans amortize the wider runtime unroll; unknown and small
+            # trip-count bounds keep the existing compact code.
+            trips: u32 = ElisaLLVMSmallConstantMaxTripCount(analyses, loop)
+            aarch64: bool = ElisaLLVMModuleTargetIsAArch64(module) != 0
+            # A statically bounded short scan keeps its ordered exits in the unrolled body,
+            # with no peeled iteration and no runtime remainder.
+            tiny: bool = aarch64 and trips > 0 and trips <= ValidationPeelLimit::TINY_TRIPS
+            return false if aarch64 and is_bounded_trip_count(trips) and precedes_nested_input_search(loop, analyses, validated)
+            count: u32 = validation_unroll_count(module, trips, tiny)
+            ElisaLLVMSimplifyLoop(analyses, loop, 0)
+            return false if ElisaLLVMLoopIsSimplifyForm(loop) == 0 or ElisaLLVMCanPeelLoop(loop) == 0
+            ElisaLLVMFormLCSSA(analyses, loop)
+            if not unrolls_without_peeling(module, trips, tiny):
+                ElisaLLVMPeelLoop(analyses, loop, 1, 0, 1)
+            flags: mutable u32 = ElisaUnrollFlag::FORCE | ElisaUnrollFlag::RUNTIME_MULTI_EXIT | ElisaUnrollFlag::PRESERVE_LCSSA
+            if not tiny:
+                flags <- flags | ElisaUnrollFlag::RUNTIME | ElisaUnrollFlag::UNROLL_REMAINDER
+            ElisaLLVMUnrollLoop(analyses, loop, count, flags, ValidationPeelLimit::EXPANSION_BUDGET)
+            true
+
+        def peel_function_validation_loop(function: LLVMValueRef, module: LLVMModuleRef) -> u32:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = 0
+            index: mutable u32 = 0
+            while changed == 0 and index < ElisaLLVMTopLevelLoopCount(analyses) |changed, index, analyses, module|:
+                if peel_validation_loop(ElisaLLVMTopLevelLoopAt(analyses, index), analyses, module):
+                    changed <- 1
+                index <- index + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # Small validation loops peeled and unrolled, at most one per defined function
+        # optimized for speed; the number transformed.
+        def peel_small_validation_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, module|:
+                cursor <- LLVMGetNextFunction(function)
+                if LLVMIsDeclaration(function) == 0 and not function_is_size_optimized(function):
+                    changed <- changed + peel_function_validation_loop(function, module)
+            changed

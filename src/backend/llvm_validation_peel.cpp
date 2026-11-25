@@ -64,7 +64,6 @@ extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
 #include "llvm_bisection_ranges.h"
 #include "llvm_checked_signed_ranges.h"
 #include "llvm_recursive_argument_bounds.h"
-#include "llvm_validation_loop_passes.h"
 #include "llvm_copied_scratch.h"
 #include "llvm_validation_bounded_division.h"
 
@@ -73,11 +72,6 @@ extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef) { return 0;
 extern "C" unsigned elisacoreElideBoundedDivisionSums(LLVMModuleRef) {
   return 0;
 }
-extern "C" unsigned elisacorePredicatePrivateBitUpdates(LLVMModuleRef) { return 0; }
-extern "C" unsigned elisacoreSinkPrivateInitializations(LLVMModuleRef) { return 0; }
-extern "C" unsigned elisacoreInlineSmallRecursion(LLVMModuleRef) { return 0; }
-extern "C" unsigned elisacoreUnrollNestedScans(LLVMModuleRef) { return 0; }
-extern "C" unsigned elisacorePeelSmallValidationLoops(LLVMModuleRef) { return 0; }
 #endif
 
 // Keep Apple ARM layout policy identical to Stage0's O3 emitter.

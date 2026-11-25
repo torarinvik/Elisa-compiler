@@ -1,0 +1,217 @@
+# Predicates a conditional OR update of a private stack array: `if set: a[i] |= mask`
+# becomes the unconditional `a[i] = freeze(a[i]) | (set ? mask : 0)`. A 0/1 switch keeps
+# its edge for invalid inputs. The access the zero path newly makes is allowed only when
+# ScalarEvolution bounds its whole byte range inside the array and the array cannot
+# escape; the select and the freeze keep the result defined without bringing poison in
+# through a value the zero path never evaluated. One update per function, since the
+# analyses describe the original control flow.
+include "./validation_policy.elisa"
+
+const module PrivateBitUpdateLimit:
+    FUNCTION_INSTRUCTIONS: u64 = 1000
+    ARRAY_BYTES: u64 = 256
+
+# The branch deciding whether to update: on `set` (or a 0/1 switch on `selector`, whose
+# other cases go to `invalid`), to `one`, which updates and falls into `zero`.
+struct BitDecision:
+    terminator: LLVMValueRef
+    selector: LLVMValueRef?
+    invalid: LLVMBasicBlockRef?
+    set: LLVMValueRef?
+    zero: LLVMBasicBlockRef
+    one: LLVMBasicBlockRef
+
+# `one`'s single update: `store (or (load pointer), mask), pointer` with `pointer` a
+# one-index GEP.
+struct BitUpdate:
+    pointer: LLVMValueRef
+    load: LLVMValueRef
+    update: LLVMValueRef
+    store: LLVMValueRef
+    mask: LLVMValueRef
+
+extend Backend:
+    private:
+        def switch_decision(terminator: LLVMValueRef) -> BitDecision?:
+            return null if LLVMGetNumSuccessors(terminator) != 3 or LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(terminator, 0))) != LLVMTypeKindValue::INTEGER
+            zero: mutable LLVMBasicBlockRef? = null
+            one: mutable LLVMBasicBlockRef? = null
+            for successor in 1..<3 |zero, one, terminator|:
+                value: LLVMValueRef = LLVMGetSwitchCaseValue(terminator, successor.u32())
+                if ElisaLLVMIsConstantZero(value) != 0:
+                    zero <- LLVMGetSuccessor(terminator, successor.u32())
+                if ElisaLLVMIsConstantOne(value) != 0:
+                    one <- LLVMGetSuccessor(terminator, successor.u32())
+            zero_block: LLVMBasicBlockRef = get zero else return null
+            one_block: LLVMBasicBlockRef = get one else return null
+            invalid: LLVMBasicBlockRef = LLVMGetSwitchDefaultDest(terminator)
+            return null if zero_block == invalid or one_block == invalid
+            BitDecision{terminator: terminator, selector: LLVMGetOperand(terminator, 0), invalid: invalid, set: null, zero: zero_block, one: one_block}
+
+        # The block's 0/1 decision, when `one` is entered only from it, ends in a jump to
+        # `zero`, and `zero` has no phis.
+        def bit_decision(block: LLVMBasicBlockRef) -> BitDecision? can[Abort.Panic]:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return null
+            opcode: u32 = LLVMGetInstructionOpcode(terminator)
+            found: mutable BitDecision? = null
+            if opcode == LLVMOpcode::SWITCH:
+                found <- switch_decision(terminator)
+            elif opcode == LLVMOpcode::CONDITIONAL_BR:
+                found <- BitDecision{terminator: terminator, selector: null, invalid: null, set: LLVMGetCondition(terminator), zero: LLVMGetSuccessor(terminator, 1), one: LLVMGetSuccessor(terminator, 0)}
+            decision: BitDecision = get found else return null
+            predecessor: LLVMBasicBlockRef = get single_predecessor(decision.one) else return null
+            return null if decision.zero == decision.one or predecessor != block
+            first: LLVMValueRef = get LLVMGetFirstInstruction(decision.zero) else return null
+            return null if is_llvm_instruction_with_opcode(first, LLVMOpcode::PHI)
+            end: LLVMValueRef = get LLVMGetBasicBlockTerminator(decision.one) else return null
+            return null if LLVMGetInstructionOpcode(end) != LLVMOpcode::UNCONDITIONAL_BR or LLVMGetSuccessor(end, 0) != decision.zero
+            decision
+
+        # `one`'s only instructions: a simple store of a one-use OR of a one-use simple
+        # integer load (8 to 64 bits) through a one-index GEP, and the jump.
+        def bit_update(one: LLVMBasicBlockRef) -> BitUpdate? can[Abort.Panic]:
+            store: mutable LLVMValueRef? = null
+            stores: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(one)
+            while cursor is instruction |cursor, store, stores|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if LLVMGetInstructionOpcode(instruction) == LLVMOpcode::STORE:
+                    store <- instruction
+                    stores <- stores + 1
+            found_store: LLVMValueRef = get store else return null
+            return null if stores != 1 or not is_simple_access(found_store)
+            update: LLVMValueRef = LLVMGetOperand(found_store, 0)
+            pointer: LLVMValueRef = LLVMGetOperand(found_store, 1)
+            return null if not is_llvm_instruction_with_opcode(update, LLVMOpcode::OR) or LLVMGetInstructionParent(update) != one or not has_one_use(update)
+            return null if not is_llvm_instruction_with_opcode(pointer, LLVMOpcode::GET_ELEMENT_PTR) or LLVMGetInstructionParent(pointer) != one or LLVMGetNumOperands(pointer) != 2
+            load: mutable LLVMValueRef = LLVMGetOperand(update, 0)
+            mask: mutable LLVMValueRef = LLVMGetOperand(update, 1)
+            if not is_llvm_instruction_with_opcode(load, LLVMOpcode::LOAD):
+                load <- LLVMGetOperand(update, 1)
+                mask <- LLVMGetOperand(update, 0)
+            return null if not is_llvm_instruction_with_opcode(load, LLVMOpcode::LOAD) or not is_simple_access(load) or LLVMGetInstructionParent(load) != one
+            return null if not has_one_use(load) or LLVMGetOperand(load, 0) != pointer or LLVMGetTypeKind(LLVMTypeOf(load)) != LLVMTypeKindValue::INTEGER
+            bits: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(load))
+            return null if bits != 8 and bits != 16 and bits != 32 and bits != 64
+            return null if instruction_count(one) != 5
+            BitUpdate{pointer: pointer, load: load, update: update, store: found_store, mask: mask}
+
+        # Whether the GEP's array is an uncaptured static alloca of one element, at most 256
+        # bytes and aligned for the access, available at the decision, and ScalarEvolution
+        # keeps every access of the index inside it.
+        def update_stays_in_array(update: BitUpdate&, decision: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, module: LLVMModuleRef) -> bool:
+            index: LLVMValueRef = LLVMGetOperand(update.pointer, 1)
+            return false if LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMTypeKindValue::INTEGER or LLVMGetIntTypeWidth(LLVMTypeOf(index)) > 64
+            return false if not available_at(index, decision, analyses) or not available_at(update.mask, decision, analyses)
+            array: LLVMValueRef = LLVMGetOperand(update.pointer, 0)
+            return false if LLVMIsAAllocaInst(array) == null or ElisaLLVMIsStaticAlloca(array) == 0 or LLVMGetPointerAddressSpace(LLVMTypeOf(array)) != 0
+            return false if ElisaLLVMIsConstantOne(LLVMGetOperand(array, 0)) == 0 or ElisaLLVMInstructionDominates(analyses, array, decision) == 0
+            return false if ElisaLLVMPointerMayBeCaptured(array, 1, 0) != 0
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            allocated: LLVMTypeRef = LLVMGetAllocatedType(array)
+            element: LLVMTypeRef = LLVMGetGEPSourceElementType(update.pointer)
+            scalable: u32 = LLVMTypeKindValue::SCALABLE_VECTOR
+            return false if LLVMGetTypeKind(allocated) == scalable or LLVMGetTypeKind(element) == scalable
+            bytes: u64 = LLVMABISizeOfType(layout, allocated)
+            step: u64 = LLVMABISizeOfType(layout, element)
+            width: u64 = LLVMStoreSizeOfType(layout, LLVMTypeOf(update.load))
+            load_alignment: u64 = LLVMGetAlignment(update.load).u64()
+            store_alignment: u64 = LLVMGetAlignment(update.store).u64()
+            array_alignment: u64 = LLVMGetAlignment(array).u64()
+            return false if width == 0 or step == 0 or bytes > PrivateBitUpdateLimit::ARRAY_BYTES or bytes < width
+            return false if array_alignment < load_alignment or array_alignment < store_alignment or step % load_alignment != 0 or step % store_alignment != 0
+            range: ElisaConstantRangeRef = ElisaLLVMScalarEvolutionUnsignedRange(analyses, index)
+            highest: u64 = ElisaLLVMConstantRangeUnsignedMax(range)
+            ElisaLLVMDisposeConstantRange(range)
+            highest <= (bytes - width) / step
+
+        # Whether no lifetime end can run before the decision and every lifetime start
+        # dominates it, so the zero path's new access is not to a dead array.
+        def lifetimes_allow_access(function: LLVMValueRef, decision: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, lifetime_start: u32, lifetime_end: u32) -> bool can[Abort.Panic]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, decision, analyses, lifetime_start, lifetime_end|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, decision, analyses, lifetime_start, lifetime_end|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if LLVMIsAIntrinsicInst(instruction) != null:
+                        identifier: u32 = called_intrinsic_id(instruction)
+                        return false if identifier == lifetime_end and ElisaLLVMInstructionIsPotentiallyReachable(instruction, decision) != 0
+                        return false if identifier == lifetime_start and ElisaLLVMInstructionDominates(analyses, instruction, decision) == 0
+            true
+
+        # The unconditional update: the decision becomes a jump to `one` (or, for a switch,
+        # a branch on `selector <= 1`), and `one` ORs in `set ? mask : 0`.
+        def predicate_update(decision: BitDecision&, update: BitUpdate&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(decision.terminator)
+            LLVMPositionBuilderBefore(builder, decision.terminator)
+            set: mutable LLVMValueRef? = decision.set
+            branch: mutable LLVMValueRef? = null
+            if decision.selector is selector:
+                type: LLVMTypeRef = LLVMTypeOf(selector)
+                valid: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::ULE, selector, LLVMConstInt(type, 1, 0), "")
+                set <- LLVMBuildICmp(builder, LLVMIntPredicate::EQ, selector, LLVMConstInt(type, 1, 0), "")
+                if decision.invalid is invalid:
+                    branch <- LLVMBuildCondBr(builder, valid, decision.one, invalid)
+            else:
+                branch <- LLVMBuildBr(builder, decision.one)
+            if branch is created:
+                LLVMInstructionSetDebugLoc(created, LLVMInstructionGetDebugLoc(decision.terminator))
+            ElisaLLVMBlockRemovePredecessor(decision.zero, block, 0)
+            LLVMInstructionEraseFromParent(decision.terminator)
+            chosen: LLVMValueRef = get set else return
+            LLVMPositionBuilderBefore(builder, update.update)
+            type: LLVMTypeRef = LLVMTypeOf(update.load)
+            selected: LLVMValueRef = LLVMBuildSelect(builder, chosen, update.mask, LLVMConstInt(type, 0, 0), "")
+            result: LLVMValueRef = LLVMBuildOr(builder, LLVMBuildFreeze(builder, update.load, ""), selected, "")
+            LLVMSetOperand(update.store, 0, result)
+            LLVMInstructionEraseFromParent(update.update)
+            # Metadata valid only on the original `one` path must not constrain `zero`.
+            clear_metadata_other_than_debug_location(update.load)
+            clear_metadata_other_than_debug_location(update.store)
+
+        def clear_metadata_other_than_debug_location(instruction: LLVMValueRef) -> void can[Unsafe.PointerCast]:
+            count: mutable usize = 0
+            if LLVMInstructionGetAllMetadataOtherThanDebugLoc(instruction, &count) is entries:
+                kinds: mutable darray[u32] = []
+                for index in 0..<count |entries, kinds|:
+                    kinds.push(LLVMValueMetadataEntriesGetKind(entries, index.u32()))
+                LLVMDisposeValueMetadataEntries(entries)
+                for kind in kinds |instruction|:
+                    LLVMSetMetadata(instruction, kind, null)
+
+        # The function's first predicable update, rewritten; 1 when there was one.
+        def predicate_function_update(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef, lifetime_start: u32, lifetime_end: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: mutable ElisaFunctionAnalysesRef? = null
+            changed: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while changed == 0 and block_cursor is block |block_cursor, analyses, changed, function, module, builder, lifetime_start, lifetime_end|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if bit_decision(block) is decision:
+                    if bit_update(decision.one) is update:
+                        if analyses == null:
+                            analyses <- ElisaLLVMCreateFunctionAnalyses(function)
+                        if analyses is built:
+                            if update_stays_in_array(&update, decision.terminator, built, module) and lifetimes_allow_access(function, decision.terminator, built, lifetime_start, lifetime_end):
+                                predicate_update(&decision, &update, builder)
+                                changed <- 1
+            if analyses is built:
+                ElisaLLVMDisposeFunctionAnalyses(built)
+            changed
+
+    public:
+        # Conditional OR updates of private stack arrays predicated, at most one per
+        # function; the number predicated.
+        def predicate_private_bit_updates(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_qualified_for_validation_rewrites(module) or LLVMByteOrder(LLVMGetModuleDataLayout(module)) != 1
+            lifetime_start: u32 = intrinsic_identifier("llvm.lifetime.start")
+            lifetime_end: u32 = intrinsic_identifier("llvm.lifetime.end")
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, module, builder, lifetime_start, lifetime_end|:
+                cursor <- LLVMGetNextFunction(function)
+                if not skipped_by_validation_policy(function) and function_instruction_count(function).u64() <= PrivateBitUpdateLimit::FUNCTION_INSTRUCTIONS:
+                    changed <- changed + predicate_function_update(function, module, builder, lifetime_start, lifetime_end)
+            LLVMDisposeBuilder(builder)
+            changed

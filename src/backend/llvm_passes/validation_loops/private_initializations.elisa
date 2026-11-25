@@ -1,0 +1,108 @@
+# Sinks a large zero `memset` of a private stack array onto the branch edge that can read
+# the array, when the other successor only returns: a return path with no reads cannot
+# observe the initialization, so it stops paying for it. Nothing between the fill and the
+# branch may touch memory, call, or have another side effect.
+include "./validation_policy.elisa"
+include "../small_fills/fill_queries.elisa"
+
+const module PrivateInitializationLimit:
+    SMALLEST_FILL: u64 = 256
+    LARGEST_FILL: u64 = 1048576
+    CAPTURE_USES: u32 = 256
+
+extend Backend:
+    private:
+        # A block that only returns: phis, `llvm.lifetime.end` calls and its `ret`.
+        def is_private_initialization_return(block: LLVMBasicBlockRef, lifetime_end: u32) -> bool can[Abort.Panic]:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return false
+            return false if LLVMGetInstructionOpcode(terminator) != LLVMOpcode::RET
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, lifetime_end|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                if opcode != LLVMOpcode::PHI and opcode != LLVMOpcode::RET:
+                    return false if LLVMIsAIntrinsicInst(instruction) == null or called_intrinsic_id(instruction) != lifetime_end
+            true
+
+        # A plain zero fill of 256 bytes to 1 MiB into address space 0.
+        def is_sinkable_zero_fill(fill: LLVMValueRef) -> bool can[Abort.Panic]:
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            value: LLVMValueRef = LLVMGetOperand(fill, 1)
+            return false if LLVMIsAConstantInt(length) == null or LLVMIsAConstantInt(value) == null or ElisaLLVMIsConstantZero(value) == 0
+            return false if ElisaLLVMConstantIntActiveBits(length) > 64
+            bytes: u64 = LLVMConstIntGetZExtValue(length)
+            return false if bytes < PrivateInitializationLimit::SMALLEST_FILL or bytes > PrivateInitializationLimit::LARGEST_FILL
+            not call_is_volatile(fill) and LLVMGetNumOperandBundles(fill) == 0 and ElisaLLVMHasMetadataOtherThanDebugLoc(fill) == 0 and destination_address_space(fill) == 0
+
+        # Whether nothing from after the fill up to the branch reads or writes memory, calls,
+        # or has a side effect.
+        def nothing_observes_fill(fill: LLVMValueRef, branch: LLVMValueRef) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(fill)
+            while cursor is instruction |cursor, branch|:
+                return true if instruction == branch
+                return false if ElisaLLVMMayReadOrWriteMemory(instruction) != 0 or ElisaLLVMMayHaveSideEffects(instruction) != 0 or LLVMIsACallInst(instruction) != null
+                cursor <- LLVMGetNextInstruction(instruction)
+            true
+
+        # Whether the fill covers part of an uncaptured static alloca of one element that no
+        # metadata uses, inside its storage.
+        def fills_private_array(fill: LLVMValueRef, module: LLVMModuleRef) -> bool can[Unsafe.PointerCast]:
+            offset: mutable i64 = 0
+            base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(LLVMGetOperand(fill, 0), module, (&offset).cast[void&])
+            return false if LLVMIsAAllocaInst(base) == null or ElisaLLVMIsStaticAlloca(base) == 0 or LLVMGetPointerAddressSpace(LLVMTypeOf(base)) != 0
+            return false if ElisaLLVMIsUsedByMetadata(base) != 0 or offset < 0 or ElisaLLVMIsConstantOne(LLVMGetOperand(base, 0)) == 0
+            return false if ElisaLLVMPointerMayBeCaptured(base, 1, PrivateInitializationLimit::CAPTURE_USES) != 0
+            allocated: LLVMTypeRef = LLVMGetAllocatedType(base)
+            return false if LLVMGetTypeKind(allocated) == LLVMTypeKindValue::SCALABLE_VECTOR
+            size: u64 = LLVMABISizeOfType(LLVMGetModuleDataLayout(module), allocated)
+            return false if offset.u64() > size
+            LLVMConstIntGetZExtValue(LLVMGetOperand(fill, 2)) <= size - offset.u64()
+
+        # Moves the fill onto a new block on the branch edge that does not only return.
+        def sink_fill(fill: LLVMValueRef, branch: LLVMValueRef, continuing: u32, builder: LLVMBuilderRef) -> void:
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(fill)
+            destination: LLVMBasicBlockRef = LLVMGetSuccessor(branch, continuing)
+            edge: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(LLVMGetTypeContext(LLVMTypeOf(fill)), destination, "stack.init.nonempty")
+            LLVMPositionBuilderAtEnd(builder, edge)
+            jump: LLVMValueRef = LLVMBuildBr(builder, destination)
+            LLVMInstructionSetDebugLoc(jump, LLVMInstructionGetDebugLoc(fill))
+            LLVMSetSuccessor(branch, continuing, edge)
+            replace_phi_incoming_blocks(destination, block, edge)
+            ElisaLLVMMoveInstructionBefore(fill, jump)
+
+        def sink_function_initializations(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef, lifetime_end: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fills: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, fills|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, fills|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    fills.push(instruction) if ElisaLLVMIsMemSet(instruction) != 0
+            changed: mutable u32 = 0
+            for fill in fills |changed, module, builder, lifetime_end|:
+                if is_sinkable_zero_fill(fill) and LLVMGetBasicBlockTerminator(LLVMGetInstructionParent(fill)) is branch:
+                    if LLVMGetInstructionOpcode(branch) == LLVMOpcode::CONDITIONAL_BR and nothing_observes_fill(fill, branch):
+                        first: bool = is_private_initialization_return(LLVMGetSuccessor(branch, 0), lifetime_end)
+                        second: bool = is_private_initialization_return(LLVMGetSuccessor(branch, 1), lifetime_end)
+                        if first != second and fills_private_array(fill, module):
+                            continuing: u32 = 1 if first else 0
+                            sink_fill(fill, branch, continuing, builder)
+                            changed <- changed + 1
+            changed
+
+    public:
+        # Large zero fills of private stack arrays sunk off the return-only edge, in qualified
+        # functions; the number sunk.
+        def sink_private_initializations(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_qualified_for_validation_rewrites(module) or LLVMPointerSize(LLVMGetModuleDataLayout(module)) != 8
+            lifetime_end: u32 = intrinsic_identifier("llvm.lifetime.end")
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, module, builder, lifetime_end|:
+                cursor <- LLVMGetNextFunction(function)
+                if not skipped_by_validation_policy(function):
+                    changed <- changed + sink_function_initializations(function, module, builder, lifetime_end)
+            LLVMDisposeBuilder(builder)
+            changed

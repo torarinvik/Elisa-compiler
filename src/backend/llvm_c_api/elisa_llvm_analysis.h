@@ -138,6 +138,12 @@ unsigned ElisaLLVMFunctionMaxBlockNumber(LLVMValueRef function);
  * attribute; `kind` is an enum attribute kind (LLVMGetEnumAttributeKindForName). */
 int ElisaLLVMCallHasFunctionAttribute(LLVMValueRef call, unsigned kind);
 /* isa<MemIntrinsic>: a call of llvm.memcpy, memmove, memset or their inline forms. */
+// PointerMayBeCaptured over the pointer's uses (at most MAX_USES of them; 0 is LLVM's
+// default), counting a return as a capture when RETURN_CAPTURES is set.
+int ElisaLLVMPointerMayBeCaptured(LLVMValueRef pointer, int return_captures, uint32_t max_uses);
+// isPotentiallyReachable from one instruction to another, without analyses.
+int ElisaLLVMInstructionIsPotentiallyReachable(LLVMValueRef from, LLVMValueRef to);
+int ElisaLLVMFunctionOnlyReadsMemory(LLVMValueRef function);
 int ElisaLLVMIsMemIntrinsic(LLVMValueRef value);
 /* isa<MemSetInst>: a call of llvm.memset or llvm.memset.inline. */
 int ElisaLLVMIsMemSet(LLVMValueRef value);

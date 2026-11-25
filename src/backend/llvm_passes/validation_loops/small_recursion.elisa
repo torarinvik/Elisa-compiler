@@ -1,0 +1,107 @@
+# Inlines the one self-call of a small local `void` function that loads and stores memory,
+# once, on AArch64 macOS or Linux: the expanded body handles two recursion levels per call.
+# The function is then marked `elisa.recursion.expanded` so it is expanded only once.
+include "./validation_policy.elisa"
+
+const module SmallRecursionLimit:
+    BLOCKS: u32 = 20
+    INSTRUCTIONS: u32 = 80
+
+# What one walk over a candidate's body found.
+struct RecursionBody:
+    safe: bool
+    instructions: u32
+    loads: u32
+    stores: u32
+    recursive: u32
+    site: LLVMValueRef?
+
+extend Backend:
+    private:
+        # A local, defined, fixed-arity `void` function at most 20 blocks long whose
+        # attributes allow inlining and duplicating it, and that was not expanded before.
+        def is_small_recursion_candidate(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not has_local_linkage(function) or LLVMIsDeclaration(function) != 0 or LLVMIsFunctionVarArg(LLVMGlobalGetValueType(function)) != 0
+            return false if LLVMCountBasicBlocks(function) > SmallRecursionLimit::BLOCKS or function_is_size_optimized(function)
+            return false if LLVMHasPersonalityFn(function) != 0 or LLVMGetGC(function) != null or llvm_function_subprogram_or_null(function) != null
+            blocked: darray[sview] = ["noinline", "naked", "convergent", "noduplicate"]
+            return false if any attribute in blocked where function_has_attribute(function, attribute)
+            return false if function_has_string_attribute(function, "elisa.recursion.expanded")
+            LLVMGetTypeKind(LLVMGetReturnType(LLVMGlobalGetValueType(function))) == LLVMTypeKindValue::VOID
+
+        # Whether every use calls the function directly and some call comes from another
+        # function.
+        def has_only_direct_outside_callers(function: LLVMValueRef) -> bool:
+            outside: mutable bool = false
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(function)
+            while use_cursor is use |use_cursor, outside, function|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if (LLVMIsACallInst(user) == null and LLVMIsAInvokeInst(user) == null and LLVMIsACallBrInst(user) == null) or LLVMGetCalledValue(user) != function
+                outside <- outside or LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) != function
+            outside
+
+        # Whether the call's callee is FUNCTION, called with its own type
+        # (CallBase::getCalledFunction).
+        def calls_directly(call: LLVMValueRef, function: LLVMValueRef) -> bool:
+            callee: LLVMValueRef = get direct_callee(call) else return false
+            callee == function
+
+        # One instruction's effect on the body walk.
+        def walked_instruction(body: RecursionBody, instruction: LLVMValueRef, function: LLVMValueRef, trap: u32) -> RecursionBody can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            safe: mutable bool = body.safe
+            loads: mutable u32 = body.loads
+            stores: mutable u32 = body.stores
+            recursive: mutable u32 = body.recursive
+            site: mutable LLVMValueRef? = body.site
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            if opcode == LLVMOpcode::ALLOCA or opcode == LLVMOpcode::INVOKE or opcode == LLVMOpcode::CALL_BR:
+                safe <- false
+            if opcode == LLVMOpcode::LOAD:
+                loads <- loads + 1
+                safe <- safe and is_simple_access(instruction)
+            if opcode == LLVMOpcode::STORE:
+                stores <- stores + 1
+                safe <- safe and is_simple_access(instruction)
+            if opcode == LLVMOpcode::CALL or opcode == LLVMOpcode::INVOKE or opcode == LLVMOpcode::CALL_BR:
+                if LLVMGetNumOperandBundles(instruction) != 0 or call_has_attribute(instruction, "convergent") or call_has_attribute(instruction, "noduplicate") or call_has_attribute(instruction, "noinline"):
+                    safe <- false
+                if calls_directly(instruction, function):
+                    recursive <- recursive + 1
+                    site <- instruction
+                elif LLVMIsAIntrinsicInst(instruction) == null or called_intrinsic_id(instruction) != trap:
+                    safe <- false
+            RecursionBody{safe: safe, instructions: body.instructions + 1, loads: loads, stores: stores, recursive: recursive, site: site}
+
+        def recursion_body(function: LLVMValueRef, trap: u32) -> RecursionBody can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            body: mutable RecursionBody = RecursionBody{safe: true, instructions: 0, loads: 0, stores: 0, recursive: 0, site: null}
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, body, function, trap|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, body, function, trap|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    body <- walked_instruction(body, instruction, function, trap)
+            body
+
+        # The one self-call of a candidate whose body is small, plain and touches memory.
+        def expandable_self_call(function: LLVMValueRef, trap: u32) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if not is_small_recursion_candidate(function) or not has_only_direct_outside_callers(function)
+            body: RecursionBody = recursion_body(function, trap)
+            return null if not body.safe or body.instructions > SmallRecursionLimit::INSTRUCTIONS or body.recursive != 1 or body.loads == 0 or body.stores == 0
+            body.site
+
+    public:
+        # Expands each qualifying function's self-call one level; the number expanded.
+        def inline_small_recursion(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_qualified_for_validation_rewrites(module)
+            trap: u32 = intrinsic_identifier("llvm.trap")
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, trap|:
+                cursor <- LLVMGetNextFunction(function)
+                if expandable_self_call(function, trap) is site:
+                    if ElisaLLVMInlineCall(site) != 0:
+                        add_function_marker(function, "elisa.recursion.expanded")
+                        changed <- changed + 1
+            changed

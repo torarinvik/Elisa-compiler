@@ -1,0 +1,147 @@
+# Runtime-unrolls short nested scans with conditional stores on Linux AArch64. LLVM keeps
+# every exit and bounds check and builds a runtime remainder where needed. One loop per
+# function, since the unroll invalidates the function's analyses.
+include "./validation_policy.elisa"
+include "../../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module NestedScanLimit:
+    FEWEST_BLOCKS: u32 = 5
+    MOST_BLOCKS: u32 = 8
+    INSTRUCTIONS: u32 = 65
+    CHECKED_INSTRUCTIONS: u32 = 40
+    FUNCTION_INSTRUCTIONS: u64 = 1000
+    EXPANSION_BUDGET: u32 = 1000
+
+# What one walk over a nested scan's blocks found.
+struct NestedScanBody:
+    safe: bool
+    loads: u32
+    stores: u32
+    instructions: u32
+    conditions: u32
+    checked_adds: u32
+
+extend Backend:
+    private:
+        # Whether a function attribute or a profile rules the function out.
+        def skipped_for_nested_scans(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function)
+            return true if LLVMHasPersonalityFn(function) != 0 or LLVMGetGC(function) != null or llvm_function_subprogram_or_null(function) != null
+            blocked: darray[sview] = ["naked", "convergent", "noduplicate"]
+            return true if any attribute in blocked where function_has_attribute(function, attribute)
+            ElisaLLVMFunctionHasEntryCount(function) != 0
+
+        # `add phi, 1` (in either order) with the phi in the loop header.
+        def is_header_increment(value: LLVMValueRef, header: LLVMBasicBlockRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::ADD)
+            is_header_phi_plus_one(value, 0, header) or is_header_phi_plus_one(value, 1, header)
+
+        def is_header_phi_plus_one(add: LLVMValueRef, side: u32, header: LLVMBasicBlockRef) -> bool:
+            phi: LLVMValueRef = LLVMGetOperand(add, side)
+            one: LLVMValueRef = LLVMGetOperand(add, 1 - side)
+            is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI) and LLVMGetInstructionParent(phi) == header and LLVMIsAConstantInt(one) != null and ElisaLLVMIsConstantOne(one) != 0
+
+        # An innermost nested loop of 5 to 8 blocks without a loop ID, whose latch exits on
+        # an equality comparison of a header phi's increment.
+        def is_nested_scan_shape(loop: ElisaLoopRef) -> bool:
+            return false if ElisaLLVMLoopParent(loop) == null or ElisaLLVMLoopSubLoopCount(loop) != 0 or ElisaLLVMLoopGetLoopID(loop) != null
+            blocks: u32 = ElisaLLVMLoopBlockCount(loop)
+            return false if blocks < NestedScanLimit::FEWEST_BLOCKS or blocks > NestedScanLimit::MOST_BLOCKS
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(latch) else return false
+            return false if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            comparison: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(comparison, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(comparison)
+            return false if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            is_header_increment(LLVMGetOperand(comparison, 0), header) or is_header_increment(LLVMGetOperand(comparison, 1), header)
+
+        # A call is allowed only as an `llvm.sadd.with.overflow` without bundles that may
+        # be duplicated and is not convergent.
+        def is_duplicable_checked_add(call: LLVMValueRef, checked_add: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAIntrinsicInst(call) == null or called_intrinsic_id(call) != checked_add or LLVMGetNumOperandBundles(call) != 0
+            not call_has_attribute(call, "convergent") and not call_has_attribute(call, "noduplicate")
+
+        def scanned_nested_instruction(body: NestedScanBody, instruction: LLVMValueRef, checked_add: u32) -> NestedScanBody can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            safe: mutable bool = body.safe
+            loads: mutable u32 = body.loads
+            stores: mutable u32 = body.stores
+            conditions: mutable u32 = body.conditions
+            checked_adds: mutable u32 = body.checked_adds
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            if opcode == LLVMOpcode::LOAD:
+                loads <- loads + 1
+                safe <- safe and is_simple_access(instruction)
+            elif opcode == LLVMOpcode::STORE:
+                stores <- stores + 1
+                safe <- safe and is_simple_access(instruction)
+            elif opcode == LLVMOpcode::CONDITIONAL_BR:
+                conditions <- conditions + 1
+            elif opcode == LLVMOpcode::CALL or opcode == LLVMOpcode::INVOKE or opcode == LLVMOpcode::CALL_BR:
+                if is_duplicable_checked_add(instruction, checked_add):
+                    checked_adds <- checked_adds + 1
+                else:
+                    safe <- false
+            elif opcode == LLVMOpcode::ALLOCA or opcode == LLVMOpcode::INDIRECT_BR or LLVMGetTypeKind(LLVMTypeOf(instruction)) == LLVMTypeKindValue::TOKEN:
+                safe <- false
+            NestedScanBody{safe: safe, loads: loads, stores: stores, instructions: body.instructions + 1, conditions: conditions, checked_adds: checked_adds}
+
+        def nested_scan_body(loop: ElisaLoopRef, checked_add: u32) -> NestedScanBody can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            body: mutable NestedScanBody = NestedScanBody{safe: true, loads: 0, stores: 0, instructions: 0, conditions: 0, checked_adds: 0}
+            for block_index in 0..<ElisaLLVMLoopBlockCount(loop) |body, loop, checked_add|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, block_index)
+                blocked: bool = ElisaLLVMBlockHasAddressTaken(block) != 0 or ElisaLLVMBlockIsEHPad(block) != 0
+                body <- NestedScanBody{safe: body.safe and not blocked, loads: body.loads, stores: body.stores, instructions: body.instructions, conditions: body.conditions, checked_adds: body.checked_adds}
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, body, checked_add|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    body <- scanned_nested_instruction(body, instruction, checked_add)
+            body
+
+        # Whether the loop body loads twice, stores, branches three times, stays within 65
+        # instructions, and has at most one checked add (then within 40 instructions, in a
+        # function of at most 1000).
+        def is_unrollable_nested_scan(body: NestedScanBody&, function: LLVMValueRef) -> bool:
+            return false if not body.safe or body.loads < 2 or body.stores < 1 or body.conditions < 3 or body.instructions > NestedScanLimit::INSTRUCTIONS
+            return true if body.checked_adds == 0
+            body.checked_adds == 1 and body.instructions <= NestedScanLimit::CHECKED_INSTRUCTIONS and function_instruction_count(function).u64() <= NestedScanLimit::FUNCTION_INSTRUCTIONS
+
+        # The first nested scan, in preorder of each top-level loop, simplified and unrolled
+        # by 8 with a checked add, else by 2; 1 when the unroll changed it.
+        def unroll_function_nested_scan(function: LLVMValueRef, checked_add: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = 0
+            done: mutable bool = false
+            root_index: mutable u32 = 0
+            while not done and root_index < ElisaLLVMTopLevelLoopCount(analyses) |done, changed, root_index, analyses, function, checked_add|:
+                for loop in loops_in_preorder(ElisaLLVMTopLevelLoopAt(analyses, root_index)) |done, changed, analyses, function, checked_add|:
+                    if not done and is_nested_scan_shape(loop):
+                        body: NestedScanBody = nested_scan_body(loop, checked_add)
+                        if is_unrollable_nested_scan(&body, function):
+                            ElisaLLVMSimplifyLoop(analyses, loop, 0)
+                            if ElisaLLVMLoopIsSimplifyForm(loop) != 0:
+                                ElisaLLVMFormLCSSA(analyses, loop)
+                                count: u32 = 8 if body.checked_adds != 0 else 2
+                                flags: u32 = ElisaUnrollFlag::FORCE | ElisaUnrollFlag::RUNTIME | ElisaUnrollFlag::UNROLL_REMAINDER | ElisaUnrollFlag::RUNTIME_MULTI_EXIT | ElisaUnrollFlag::PRESERVE_LCSSA
+                                if ElisaLLVMUnrollLoop(analyses, loop, count, flags, NestedScanLimit::EXPANSION_BUDGET) != ElisaUnrollResult::UNMODIFIED:
+                                    changed <- 1
+                                # Analyses are recomputed before another loop of this function.
+                                done <- true
+                root_index <- root_index + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # Short nested scans runtime-unrolled on Linux AArch64 without debug info, at most
+        # one per function; the number unrolled.
+        def unroll_nested_scans(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetIsLinux(module) == 0 or not module_targets_aarch64_architecture(module) or module_has_debug_info(module)
+            checked_add: u32 = intrinsic_identifier("llvm.sadd.with.overflow")
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, checked_add|:
+                cursor <- LLVMGetNextFunction(function)
+                if not skipped_for_nested_scans(function):
+                    changed <- changed + unroll_function_nested_scan(function, checked_add)
+            changed
