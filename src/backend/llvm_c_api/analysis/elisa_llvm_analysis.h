@@ -134,13 +134,11 @@ unsigned ElisaLLVMFunctionMaxBlockNumber(LLVMValueRef function);
 /* CallBase::hasFnAttr(kind): the call site or its callee has the function
  * attribute; `kind` is an enum attribute kind (LLVMGetEnumAttributeKindForName). */
 int ElisaLLVMCallHasFunctionAttribute(LLVMValueRef call, unsigned kind);
-/* isa<MemIntrinsic>: a call of llvm.memcpy, memmove, memset or their inline forms. */
 // PointerMayBeCaptured over the pointer's uses (at most MAX_USES of them; 0 is LLVM's
 // default), counting a return as a capture when RETURN_CAPTURES is set.
 int ElisaLLVMPointerMayBeCaptured(LLVMValueRef pointer, int return_captures, uint32_t max_uses);
-// isPotentiallyReachable from one instruction to another, without analyses.
-int ElisaLLVMInstructionIsPotentiallyReachable(LLVMValueRef from, LLVMValueRef to);
 int ElisaLLVMFunctionOnlyReadsMemory(LLVMValueRef function);
+/* isa<MemIntrinsic>: a call of llvm.memcpy, memmove, memset or their inline forms. */
 int ElisaLLVMIsMemIntrinsic(LLVMValueRef value);
 /* isa<MemSetInst>: a call of llvm.memset or llvm.memset.inline. */
 int ElisaLLVMIsMemSet(LLVMValueRef value);
@@ -222,11 +220,11 @@ int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAt(ElisaFunctionAnalysesRef analyse
  * disposes the range with ElisaLLVMDisposeConstantRange. */
 ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef analyses, LLVMValueRef value,
                                                       LLVMValueRef context, int undef_allowed);
-/* llvm::isGuaranteedNotToBeUndefOrPoison at the instruction `context`, with the
- * analyses' assumption cache and dominator tree. */
 /* canCreateUndefOrPoison on an operator (an instruction or constant expression),
  * flags and metadata included. */
 int ElisaLLVMCanCreateUndefOrPoison(LLVMValueRef value);
+/* llvm::isGuaranteedNotToBeUndefOrPoison at the instruction `context`, with the
+ * analyses' assumption cache and dominator tree. */
 int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(ElisaFunctionAnalysesRef analyses,
                                                       LLVMValueRef value, LLVMValueRef context);
 /* LazyValueInfo::getConstantRangeOnEdge of `value` on the edge from -> to, asked at the
@@ -272,6 +270,8 @@ int ElisaLLVMScalarEvolutionIsSCEVable(ElisaFunctionAnalysesRef analyses, LLVMTy
  * and known-one masks as ConstantInts of the value's width. */
 void ElisaLLVMComputeKnownBits(LLVMValueRef value, LLVMModuleRef module, LLVMValueRef *zero,
                                LLVMValueRef *one);
+/* computeKnownBits(value, the module's data layout).countMinTrailingZeros(). */
+unsigned ElisaLLVMKnownMinimumTrailingZeros(LLVMValueRef value, LLVMModuleRef module);
 /* ScalarEvolution::getSmallConstantTripCount(loop, exiting): the exact trip count of the
  * loop through the exiting block, 0 when unknown or wider than 32 bits. */
 uint32_t ElisaLLVMSmallConstantTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,

@@ -1,0 +1,254 @@
+# The accesses of a local integer array (`ElisaArrayRanges::collect`). An array is
+# analyzable when every use reaches it through element-aligned addresses: loads and
+# stores of whole elements (or of fields inside a struct element), vector loads and
+# stores of consecutive elements, zero fills, fills and copies into it from its first
+# element, copies out of it, views `{data, length}` of it passed only to defined
+# functions, lifetime markers and address comparisons. Any other use lets the array's
+# values change in a way the analysis cannot see.
+include "../../ir/llvm_ir_queries.elisa"
+include "../../ir/ir_editing.elisa"
+include "../array_copies/private_blocks.elisa"
+include "../array_copies/full_array_initializers.elisa"
+
+const module ArrayAccessLimit:
+    ADDRESS_DEPTH: u32 = 4
+    LARGEST_ZEROS: u32 = 64
+
+# How a GEP step indexes (`gep_type_iterator`'s current type): a sequential step over a
+# plain type (the pointer itself, or an array's elements), over a vector's elements, or
+# into a struct's field.
+const module AddressStepKind:
+    PLAIN: u32 = 0
+    VECTOR: u32 = 1
+    STRUCT: u32 = 2
+
+# An access to a field of a struct element, and its byte offset inside the element.
+struct FieldResidue:
+    access: LLVMValueRef
+    residue: u64
+
+# The uses of an array, by kind.
+struct ArrayAccesses:
+    loads: mutable darray[LLVMValueRef]
+    vector_loads: mutable darray[LLVMValueRef]
+    stores: mutable darray[LLVMValueRef]
+    vector_stores: mutable darray[LLVMValueRef]
+    copies: mutable darray[LLVMValueRef]
+    writes: mutable darray[LLVMValueRef]
+    fills: mutable darray[LLVMValueRef]
+    views: mutable darray[LLVMValueRef]
+    residues: mutable darray[FieldResidue]
+    filled: mutable bool
+
+# The element an access walk is about: its type and byte size, whether it is a struct
+# (whose fields are accessed separately), whether vector stores count, and the layout.
+struct ArrayElement:
+    type: LLVMTypeRef
+    size: u64
+    composite: bool
+    allows_vector_stores: bool
+    layout: LLVMTargetDataRef
+    module: LLVMModuleRef
+
+# A GEP step's current type and how it indexes.
+struct AddressStep:
+    type: LLVMTypeRef
+    kind: u32
+
+extend Backend:
+    public:
+        def empty_array_accesses() -> ArrayAccesses:
+            ArrayAccesses{loads: [], vector_loads: [], stores: [], vector_stores: [], copies: [], writes: [], fills: [], views: [], residues: [], filled: false}
+
+        # The element of a MODULE array whose elements have type TYPE.
+        def array_element(type: LLVMTypeRef, allows_vector_stores: bool, module: LLVMModuleRef) -> ArrayElement:
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            composite: bool = LLVMGetTypeKind(type) == LLVMTypeKindValue::STRUCT
+            ArrayElement{type: type, size: LLVMABISizeOfType(layout, type), composite: composite, allows_vector_stores: allows_vector_stores, layout: layout, module: module}
+
+        # `Accesses::Residues[access]`: the byte offset inside its element ACCESS reads or
+        # writes a field at, when it is not the element's start.
+        def field_residue(accesses: ArrayAccesses&, access: LLVMValueRef) -> u64?:
+            for entry in accesses.residues |access|:
+                return entry.residue if entry.access == access
+            null
+
+    private:
+        # The step after one that indexed TYPE (`gep_type_iterator::operator++`).
+        def next_address_step(type: LLVMTypeRef) -> AddressStep:
+            kind: u32 = LLVMGetTypeKind(type)
+            return AddressStep{type: LLVMGetElementType(type), kind: AddressStepKind::PLAIN} if kind == LLVMTypeKindValue::ARRAY
+            return AddressStep{type: type, kind: AddressStepKind::VECTOR} if kind == LLVMTypeKindValue::VECTOR or kind == LLVMTypeKindValue::SCALABLE_VECTOR
+            AddressStep{type: type, kind: AddressStepKind::STRUCT}
+
+        # The byte offset modulo SIZE that the constant index INDEX adds with STRIDE:
+        # `(index * stride) % size`, made nonnegative.
+        def constant_index_residue(index: i64, stride: u64, size: u64) -> u64:
+            signed_size: i64 = size.i64()
+            index_residue: i64 = ((index % signed_size) + signed_size) % signed_size
+            (index_residue.u64() * (stride % size)) % size
+
+        # Whether STRIDE times every multiple of 2^ZEROS is a multiple of SIZE, as the
+        # 64-bit product `stride << zeros` computes it.
+        def scaled_stride_aligned(stride: u64, zeros: u32, size: u64) -> bool:
+            return false if zeros >= ArrayAccessLimit::LARGEST_ZEROS
+            kept: u64 = stride & (18446744073709551615.u64() >> zeros.u64())
+            (kept << zeros.u64()) % size == 0
+
+        # `elementResidue`: the byte offset inside an element that ADDRESS adds, when every
+        # variable index steps by whole elements (its stride a multiple of the element size,
+        # or the index's known low zero bits making the product one); constant indices and
+        # struct fields may step into a struct element.
+        def element_residue(address: LLVMValueRef, element: ArrayElement&) -> u64? can[Abort.Panic, Unsafe.PointerCast]:
+            residue: mutable u64 = 0
+            step: mutable AddressStep = AddressStep{type: LLVMGetGEPSourceElementType(address), kind: AddressStepKind::PLAIN}
+            for position in 1..<LLVMGetNumOperands(address) |residue, step, address, element|:
+                operand: LLVMValueRef = LLVMGetOperand(address, position.u32())
+                if step.kind == AddressStepKind::STRUCT:
+                    field: u32 = LLVMConstIntGetZExtValue(operand).u32()
+                    residue <- residue + LLVMOffsetOfElement(element.layout, step.type, field)
+                    step <- next_address_step(LLVMStructGetTypeAtIndex(step.type, field))
+                    continue
+                indexed: LLVMTypeRef = step.type if step.kind == AddressStepKind::PLAIN else LLVMGetElementType(step.type)
+                stride: u64 = LLVMABISizeOfType(element.layout, indexed) if step.kind == AddressStepKind::PLAIN else LLVMStoreSizeOfType(element.layout, indexed)
+                step <- next_address_step(indexed)
+                continue if stride % element.size == 0
+                if LLVMIsAConstantInt(operand) != null:
+                    residue <- residue + constant_index_residue(LLVMConstIntGetSExtValue(operand), stride, element.size)
+                    continue
+                return null if not scaled_stride_aligned(stride, ElisaLLVMKnownMinimumTrailingZeros(operand, element.module), element.size)
+            residue <- residue % element.size
+            return null if residue != 0 and not element.composite
+            residue
+
+        # `CallBase::getCalledFunction()` when it is defined in the module.
+        def calls_defined_function(user: LLVMValueRef) -> bool:
+            return false if not is_call_base(user)
+            callee: LLVMValueRef = LLVMGetCalledValue(user)
+            LLVMIsAFunction(callee) != null and LLVMGlobalGetValueType(callee) == LLVMGetCalledFunctionType(user) and LLVMIsDeclaration(callee) == 0
+
+        # Whether each use of VIEW passes it as an argument of a call to a defined function.
+        def view_reaches_defined_calls(view: LLVMValueRef) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(view)
+            while use_cursor is use |use_cursor|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if not calls_defined_function(user) or ElisaLLVMUseOperandNumber(use) >= LLVMGetNumArgOperands(user)
+            true
+
+        # Whether VALUE is an `insertvalue` at the single index EXPECTED.
+        def inserts_at(value: LLVMValueRef, expected: u32) -> bool:
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::INSERT_VALUE) or LLVMGetNumIndices(value) != 1
+            index: u32 = LLVMGetIndices(value)
+            index == expected
+
+        # `viewFromStart`: the view `{DATA, length}` that DATA starts when DATA puts POINTER,
+        # the array's first element, into an undefined pair whose only user adds a length,
+        # and the view only reaches defined functions' arguments; null otherwise.
+        def view_from_start(data: LLVMValueRef, pointer: LLVMValueRef, element: ArrayElement&) -> LLVMValueRef? can[Unsafe.PointerCast]:
+            shape: LLVMTypeRef = LLVMTypeOf(data)
+            return null if LLVMGetTypeKind(shape) != LLVMTypeKindValue::STRUCT or LLVMCountStructElementTypes(shape) != 2 or not inserts_at(data, 0)
+            return null if LLVMGetOperand(data, 1) != pointer or LLVMIsUndef(LLVMGetOperand(data, 0)) == 0
+            offset: mutable i64 = 0
+            base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(pointer, element.module, (&offset).cast[void&])
+            return null if LLVMIsAAllocaInst(base) == null or offset != 0
+            first_use: LLVMUseRef = get LLVMGetFirstUse(data) else return null
+            return null if LLVMGetNextUse(first_use) != null
+            view: LLVMValueRef = LLVMGetUser(first_use)
+            return null if not inserts_at(view, 1) or LLVMGetFirstUse(view) == null
+            return null if not view_reaches_defined_calls(view)
+            view
+
+        # `Inside`: whether ACCESS of TYPE stays inside the struct element RESIDUE bytes in,
+        # noting the residue when it is not the element's start.
+        def inside_element(access: LLVMValueRef, type: LLVMTypeRef, residue: u64, element: ArrayElement&, accesses: mutable ArrayAccesses&) -> bool can[Memory.Allocate]:
+            return false if not element.composite or residue + LLVMStoreSizeOfType(element.layout, type) > element.size
+            accesses.residues.push(FieldResidue{access: access, residue: residue}) if residue != 0
+            true
+
+        # Whether TYPE is a fixed vector of ELEMENT.
+        def is_vector_of(type: LLVMTypeRef, element: LLVMTypeRef) -> bool:
+            LLVMGetTypeKind(type) == LLVMTypeKindValue::VECTOR and LLVMGetElementType(type) == element
+
+        def accept_array_load(load: LLVMValueRef, residue: u64, element: ArrayElement&, accesses: mutable ArrayAccesses&) -> bool can[Memory.Allocate]:
+            return false if not is_simple_access(load)
+            type: LLVMTypeRef = LLVMTypeOf(load)
+            if type == element.type or inside_element(load, type, residue, element, accesses):
+                accesses.loads.push(load)
+                return true
+            return false if not is_vector_of(type, element.type)
+            accesses.vector_loads.push(load)
+            true
+
+        def accept_array_store(store: LLVMValueRef, pointer: LLVMValueRef, depth: u32, residue: u64, element: ArrayElement&, accesses: mutable ArrayAccesses&) -> bool can[Memory.Allocate]:
+            return false if not is_simple_access(store) or LLVMGetOperand(store, 1) != pointer
+            stored: LLVMValueRef = LLVMGetOperand(store, 0)
+            type: LLVMTypeRef = LLVMTypeOf(stored)
+            if type == element.type or inside_element(store, type, residue, element, accesses):
+                accesses.stores.push(store)
+                return true
+            if element.allows_vector_stores and is_vector_of(type, element.type):
+                accesses.vector_stores.push(store)
+                return true
+            return false if LLVMGetValueKind(stored) != LLVMValueKind::CONSTANT_AGGREGATE_ZERO or depth != 0
+            accesses.filled <- true
+            accesses.fills.push(store)
+            true
+
+        def accept_array_fill(fill: LLVMValueRef, pointer: LLVMValueRef, depth: u32, accesses: mutable ArrayAccesses&) -> bool can[Memory.Allocate]:
+            return false if LLVMGetOperand(fill, 0) != pointer or is_volatile_memory_intrinsic(fill)
+            byte: LLVMValueRef = LLVMGetOperand(fill, 1)
+            if LLVMIsAConstantInt(byte) != null and ElisaLLVMIsConstantZero(byte) != 0:
+                accesses.filled <- true
+                accesses.fills.push(fill)
+                return true
+            # A fill of another byte (`a[i] <- -1` over a prefix) writes the array.
+            return false if depth != 0
+            accesses.writes.push(fill)
+            true
+
+        def accept_array_copy(copy: LLVMValueRef, pointer: LLVMValueRef, depth: u32, accesses: mutable ArrayAccesses&) -> bool can[Memory.Allocate]:
+            return false if is_volatile_memory_intrinsic(copy)
+            into: bool = LLVMGetOperand(copy, 0) == pointer
+            return false if into and (depth > 0 or LLVMGetOperand(copy, 1) == pointer)
+            # Copies out of the array read it; they cannot change it.
+            if into:
+                accesses.writes.push(copy)
+            else:
+                accesses.copies.push(copy)
+            true
+
+        # Whether USER touches no element: a lifetime marker or an address comparison (a
+        # vectorizer's overlap check).
+        def touches_no_element(user: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            is_lifetime_marker(user) or is_llvm_instruction_with_opcode(user, LLVMOpcode::ICMP)
+
+        # Whether USER, a use of POINTER (RESIDUE bytes into its element), is one the
+        # analysis understands; its accesses join ACCESSES.
+        def accept_array_use(user: LLVMValueRef, pointer: LLVMValueRef, depth: u32, residue: u64, element: ArrayElement&, accesses: mutable ArrayAccesses&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return accept_array_load(user, residue, element, accesses) if LLVMIsALoadInst(user) != null
+            return accept_array_store(user, pointer, depth, residue, element, accesses) if LLVMIsAStoreInst(user) != null
+            if LLVMIsAGetElementPtrInst(user) != null:
+                added: u64 = get element_residue(user, element) else return false
+                return collect_array_accesses(user, element, accesses, depth + 1, (residue + added) % element.size)
+            # Only loads and stores may address a field.
+            return touches_no_element(user) if residue != 0
+            return accept_array_fill(user, pointer, depth, accesses) if ElisaLLVMIsMemSet(user) != 0
+            return accept_array_copy(user, pointer, depth, accesses) if LLVMIsAMemCpyInst(user) != null or LLVMIsAMemMoveInst(user) != null
+            if is_llvm_instruction_with_opcode(user, LLVMOpcode::INSERT_VALUE):
+                view: LLVMValueRef = get view_from_start(user, pointer, element) else return false
+                accesses.views.push(view)
+                return true
+            touches_no_element(user)
+
+    public:
+        # `collect`: the accesses of POINTER (the array, or an element-aligned address in it
+        # RESIDUE bytes into its element) joined to ACCESSES; false when some use could read
+        # or write the array another way.
+        def collect_array_accesses(pointer: LLVMValueRef, element: ArrayElement&, accesses: mutable ArrayAccesses&, depth: u32, residue: u64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > ArrayAccessLimit::ADDRESS_DEPTH
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(pointer)
+            while use_cursor is use |use_cursor, pointer, element, accesses, depth, residue|:
+                use_cursor <- LLVMGetNextUse(use)
+                return false if not accept_array_use(LLVMGetUser(use), pointer, depth, residue, element, accesses)
+            true

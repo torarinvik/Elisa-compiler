@@ -54,6 +54,31 @@ ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionExpressionOperandAt(
     ElisaScalarEvolutionExpressionRef expression, uint32_t index);
 /* The ConstantInt of a CONSTANT node, or the IR value of an UNKNOWN one. */
 LLVMValueRef ElisaLLVMScalarEvolutionExpressionValue(ElisaScalarEvolutionExpressionRef expression);
+/* ScalarEvolution::getSCEV of a value whose type is SCEVable. */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionOfValue(ElisaFunctionAnalysesRef analyses,
+                                                                  LLVMValueRef value);
+/* ScalarEvolution::getConstant(type, value): VALUE as a constant of the integer TYPE. */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionConstantOf(ElisaFunctionAnalysesRef analyses,
+                                                                     LLVMTypeRef type, uint64_t value);
+/* SCEVParameterRewriter::rewrite(expression, {value: replacement}): the expression with each
+ * unknown node of VALUE replaced. */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionRewriteValue(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression, LLVMValueRef value,
+    ElisaScalarEvolutionExpressionRef replacement);
+/* The loop of an add recurrence (SCEVAddRecExpr::getLoop), or null for any other node. */
+ElisaLoopRef ElisaLLVMScalarEvolutionRecurrenceLoop(ElisaScalarEvolutionExpressionRef expression);
+/* SCEVAddRecExpr::evaluateAtIteration(iteration) of an add recurrence. */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionEvaluateAtIteration(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef recurrence,
+    ElisaScalarEvolutionExpressionRef iteration);
+/* ScalarEvolution::applyLoopGuards(expression, loop). */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionApplyLoopGuards(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression, ElisaLoopRef loop);
+/* ScalarEvolution::getPointerBase and removePointerBase of a pointer expression. */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionPointerBase(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression);
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionRemovePointerBase(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression);
 /* ScalarEvolution::getUnsignedRange of a node other than COULD_NOT_COMPUTE. */
 ElisaConstantRangeRef ElisaLLVMScalarEvolutionExpressionUnsignedRange(
     ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression);

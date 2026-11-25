@@ -16,6 +16,7 @@ sources=(
   "$backend/llvm_memory_and_call_passes.cpp"
   "$backend/llvm_c_api/analysis/elisa_llvm_analysis.cpp"
   "$backend/llvm_c_api/analysis/elisa_llvm_instruction_queries.cpp"
+  "$backend/llvm_c_api/analysis/elisa_llvm_control_flow.cpp"
   "$backend/llvm_c_api/analysis/elisa_llvm_scalar_evolution_expressions.cpp"
   "$backend/llvm_c_api/transforms/elisa_llvm_ir_edits.cpp"
   "$backend/llvm_c_api/transforms/elisa_llvm_loop_transforms.cpp"

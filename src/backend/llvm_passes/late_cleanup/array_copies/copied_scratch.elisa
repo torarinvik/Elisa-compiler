@@ -1,0 +1,255 @@
+# Zero fills of private byte buffers whose only reader is a copy of a prefix that integer
+# stores always write first, removed (AArch64 Linux, no debug info, 64-bit indices). The
+# buffer of at most 512 bytes may only be filled once (outside loops), stored to through
+# element addresses, copied from, and have its lifetime marked. Some loop before the copy
+# must leave by one exit toward it; for an i64 input (an argument or a frozen value) that
+# guards confine to at most 64 values, each value must give a trip count below 64 and a copy
+# length within the buffer, and every path from that exit to the copy must write each byte
+# the copy reads. When no initializer goes, each i64 argument that may be undef is tried
+# frozen, and the freeze stays only if an initializer then goes.
+include "../../ir/loop_pass_policy.elisa"
+include "../divisions/bounded_remainders.elisa"
+include "./copied_scratch_coverage.elisa"
+include "./full_array_initializers.elisa"
+include "./private_blocks.elisa"
+
+extend Backend:
+    private:
+        # Whether USER of POINTER, a buffer address, is a use the elimination allows, adding
+        # its stores, fill, lifetime markers and further addresses to SCRATCH, MARKERS and
+        # POINTERS.
+        def accept_buffer_user(user: LLVMValueRef, pointer: LLVMValueRef, copy: LLVMValueRef, facts: mutable ScratchCopy&, markers: mutable darray[LLVMValueRef]&, pointers: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return LLVMGetOperand(copy, 0) != pointer if user == copy
+            if LLVMIsAGetElementPtrInst(user) != null:
+                return false if LLVMGetOperand(user, 0) != pointer
+                pointers.push(user)
+                return true
+            if LLVMIsAStoreInst(user) != null:
+                return false if not is_simple_access(user) or LLVMGetOperand(user, 1) != pointer or LLVMGetOperand(user, 0) == pointer
+                stored: LLVMTypeRef = LLVMTypeOf(LLVMGetOperand(user, 0))
+                return false if LLVMGetTypeKind(stored) != LLVMTypeKindValue::INTEGER or LLVMGetIntTypeWidth(stored) % 8 != 0
+                facts.stores.push(user)
+                return true
+            if LLVMIsAMemSetInst(user) != null:
+                value: LLVMValueRef = LLVMGetOperand(user, 1)
+                return false if facts.initializer != facts.copy or call_is_volatile(user) or LLVMGetOperand(user, 0) != pointer
+                return false if LLVMGetNumOperandBundles(user) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(user) != 0
+                return false if LLVMIsAConstantInt(value) == null or ElisaLLVMIsConstantZero(value) == 0 or LLVMIsAConstantInt(LLVMGetOperand(user, 2)) == null
+                facts.initializer <- user
+                return true
+            return false if LLVMIsAIntrinsicInst(user) == null or not is_lifetime_marker(user)
+            markers.push(user)
+            true
+
+        # The buffer COPY reads from, its fill, stores and lifetime markers, when every
+        # address of it (at most 32) has only uses the elimination allows. A missing fill is
+        # left as COPY itself.
+        def scratch_buffer_uses(copy: LLVMValueRef, buffer: LLVMValueRef, markers: mutable darray[LLVMValueRef]&) -> ScratchCopy? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            facts: mutable ScratchCopy = ScratchCopy{copy: copy, buffer: buffer, initializer: copy, stores: []}
+            pointers: mutable darray[LLVMValueRef] = [buffer]
+            visited: mutable darray[LLVMValueRef] = []
+            while pointers.count > 0 |pointers, visited, facts, markers, copy|:
+                pointer: LLVMValueRef = pointers.pop()
+                continue if contains_value(&visited, pointer)
+                visited.push(pointer)
+                return null if ElisaLLVMIsUsedByMetadata(pointer) != 0 or visited.count > CopiedScratchLimit::VISITED_POINTERS.usize()
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(pointer)
+                while use_cursor is use |use_cursor, pointers, facts, markers, copy, pointer|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    return null if not accept_buffer_user(LLVMGetUser(use), pointer, copy, &facts, markers, &pointers)
+            facts
+
+        # Whether the lifetime MARKERS allow removing the fill: at most one start, dominating
+        # the copy and every store, and no end that may reach the copy.
+        def lifetimes_allow_removal(markers: darray[LLVMValueRef], facts: ScratchCopy&, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            start: mutable LLVMValueRef? = null
+            allowed: mutable bool = true
+            for marker in markers |start, allowed, facts, analyses|:
+                if called_intrinsic_id(marker) == intrinsic_identifier("llvm.lifetime.start"):
+                    allowed <- false if start != null or ElisaLLVMInstructionDominates(analyses, marker, facts.copy) == 0
+                    start <- marker
+                elif ElisaLLVMInstructionIsPotentiallyReachableWithin(analyses, marker, facts.copy) != 0:
+                    allowed <- false
+            if start is first:
+                for store in facts.stores |allowed, first, analyses|:
+                    allowed <- false if ElisaLLVMInstructionDominates(analyses, first, store) == 0
+            allowed
+
+        # The scratch facts of COPY, when it copies from a buffer the elimination allows:
+        # one fill outside loops dominating the copy and every store, at most 16 stores.
+        def scratch_copy(copy: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> ScratchCopy? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if LLVMIsAMemCpyInst(copy) == null or call_is_volatile(copy) or LLVMGetNumOperandBundles(copy) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(copy) != 0
+            buffer: LLVMValueRef = LLVMGetOperand(copy, 1)
+            return null if LLVMIsAAllocaInst(buffer) == null or ElisaLLVMIsStaticAlloca(buffer) == 0 or LLVMGetPointerAddressSpace(LLVMTypeOf(buffer)) != 0
+            return null if ElisaLLVMIsUsedByMetadata(buffer) != 0 or not is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(copy, 2)), 64)
+            markers: mutable darray[LLVMValueRef] = []
+            facts: ScratchCopy = get scratch_buffer_uses(copy, buffer, &markers) else return null
+            allowed: mutable bool = lifetimes_allow_removal(markers, &facts, analyses)
+            initializer: LLVMValueRef = facts.initializer
+            if initializer == copy or ElisaLLVMInstructionDominates(analyses, initializer, copy) == 0 or ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(initializer)) != null:
+                allowed <- false
+            if allowed:
+                for store in facts.stores |allowed, initializer, analyses|:
+                    allowed <- false if ElisaLLVMInstructionDominates(analyses, initializer, store) == 0
+            return null if not allowed or facts.stores.count > CopiedScratchLimit::STORES.usize()
+            facts
+
+        # LOOP's exit edges toward the copy's block: the one exit terminator and target, when
+        # exactly one of its (at most 8) exit edges may reach the copy.
+        def copy_exit(loop: ElisaLoopRef, copy_block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> LoopExitEdge? can[Abort.Panic, Memory.Allocate]:
+            exits: mutable darray[LoopExitEdge] = []
+            for position in 0..<ElisaLLVMLoopBlockCount(loop) |exits, loop|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, position)
+                if LLVMGetBasicBlockTerminator(block) is terminator:
+                    for successor in 0..<LLVMGetNumSuccessors(terminator) |exits, loop, block, terminator|:
+                        target: LLVMBasicBlockRef = LLVMGetSuccessor(terminator, successor)
+                        exits.push(LoopExitEdge{from: block, target: target}) if ElisaLLVMLoopContainsBlock(loop, target) == 0
+            return null if ElisaLLVMLoopSubLoopCount(loop) != 0 or exits.count > CopiedScratchLimit::EXIT_EDGES.usize()
+            found: mutable LoopExitEdge? = null
+            for edge in exits |found, copy_block, analyses|:
+                if ElisaLLVMBlockIsPotentiallyReachableWithin(analyses, edge.target, copy_block, 1) != 0:
+                    return null if found != null
+                    found <- edge
+            found
+
+        # The loop facts the coverage check needs for LOOP, when it is an innermost top-level
+        # loop with a preheader dominating the copy, one exit toward it with a known count,
+        # and the buffer is a single array of at most 512 bytes.
+        def scratch_loop(loop: ElisaLoopRef, facts: ScratchCopy&, analyses: ElisaFunctionAnalysesRef) -> ScratchLoop? can[Abort.Panic, Memory.Allocate]:
+            copy_block: LLVMBasicBlockRef = LLVMGetInstructionParent(facts.copy)
+            edge: LoopExitEdge = get copy_exit(loop, copy_block, analyses) else return null
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return null
+            return null if ElisaLLVMBlockDominates(analyses, preheader, copy_block) == 0
+            iterations: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionExitCount(analyses, loop, edge.from)
+            return null if ElisaLLVMScalarEvolutionExpressionKind(iterations) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            return null if ElisaLLVMLoopContainsBlock(loop, copy_block) != 0 or ElisaLLVMEdgeDominates(analyses, edge.from, edge.target, copy_block) == 0
+            return null if ElisaLLVMEdgeDominates(analyses, preheader, ElisaLLVMLoopHeader(loop), copy_block) == 0
+            array: LLVMTypeRef = LLVMGetAllocatedType(facts.buffer)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or not is_llvm_integer_type(LLVMGetElementType(array), 8)
+            return null if LLVMGetArrayLength2(array) > CopiedScratchLimit::CAPACITY or not is_constant_equal_to(LLVMGetOperand(facts.buffer, 0), 1)
+            exit: LLVMValueRef = get LLVMGetBasicBlockTerminator(edge.from) else return null
+            ScratchLoop{loop: loop, preheader: preheader, latch: latch, exit: exit, target: edge.target, iterations: iterations, capacity: LLVMGetArrayLength2(array)}
+
+        # The function's arguments, then its freezes that dominate the end of PREHEADER.
+        def scratch_inputs(function: LLVMValueRef, preheader: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            inputs: mutable darray[LLVMValueRef] = []
+            for index in 0..<LLVMCountParams(function) |inputs, function|:
+                inputs.push(LLVMGetParam(function, index))
+            preheader_end: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return inputs
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, inputs, preheader_end, analyses|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, inputs, preheader_end, analyses|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if LLVMGetInstructionOpcode(instruction) == LLVMOpcode::FREEZE and ElisaLLVMInstructionDominates(analyses, instruction, preheader_end) != 0:
+                        inputs.push(instruction)
+            inputs
+
+        # Whether every value guards on entry to the loop allow for INPUT (an i64 that is
+        # never undef or poison at the copy, confined to at most 64 values) is covered.
+        # A range that ends at 2^64 has upper bound 0 and holds the 2^64 - lower values from
+        # lower on; each of them is checked.
+        def is_scratch_input_covered(input: LLVMValueRef, facts: ScratchCopy&, scratch: ScratchLoop&, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if not is_llvm_integer_type(LLVMTypeOf(input), 64) or ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAt(analyses, input, facts.copy) == 0
+            guarded: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionApplyLoopGuards(analyses, ElisaLLVMScalarEvolutionOfValue(analyses, input), scratch.loop)
+            range: ElisaConstantRangeRef = ElisaLLVMScalarEvolutionExpressionUnsignedRange(analyses, guarded)
+            bounded: bool = ElisaLLVMConstantRangeIsFull(range) == 0 and ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsWrapped(range) == 0
+            lower: u64 = ElisaLLVMConstantRangeLower(range)
+            upper: u64 = ElisaLLVMConstantRangeUpper(range)
+            ElisaLLVMDisposeConstantRange(range)
+            return false if not bounded
+            count: u64 = upper - lower if upper != 0 else (CopiedScratchLimit::LARGEST_INPUT - lower) + 1
+            return false if count > CopiedScratchLimit::INPUT_VALUES
+            for offset in 0..<count |facts, scratch, analyses, input, lower|:
+                return false if not is_input_covered(facts, scratch, ScratchInput{analyses: analyses, argument: input, value: lower + offset})
+            true
+
+        # Whether some top-level loop of the function gives COPY's buffer a covered prefix.
+        def is_scratch_copy_covered(function: LLVMValueRef, facts: ScratchCopy&, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            covered: mutable bool = false
+            for index in 0..<ElisaLLVMTopLevelLoopCount(analyses) |covered, function, facts, analyses|:
+                if scratch_loop(ElisaLLVMTopLevelLoopAt(analyses, index), facts, analyses) is scratch:
+                    for input in scratch_inputs(function, scratch.preheader, analyses) |covered, facts, scratch, analyses|:
+                        if is_scratch_input_covered(input, facts, &scratch, analyses):
+                            covered <- true
+                            break
+            covered
+
+        # FUNCTION's scratch initializers removed, decided before any is; how many.
+        def eliminate_function_copied_scratch(function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            removable: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, removable, function, analyses|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, removable, function, analyses|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if scratch_copy(instruction, analyses) is facts:
+                        if is_scratch_copy_covered(function, &facts, analyses) and not contains_value(&removable, facts.initializer):
+                            removable.push(facts.initializer)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            for initializer in removable:
+                LLVMInstructionEraseFromParent(initializer)
+            removable.count.u32()
+
+        # Whether FUNCTION copies from an alloca and fills with a constant length.
+        def has_copy_and_fill(function: LLVMValueRef) -> bool:
+            has_copy: mutable bool = false
+            has_fill: mutable bool = false
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, has_copy, has_fill|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, has_copy, has_fill|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    has_copy <- has_copy or (LLVMIsAMemCpyInst(instruction) != null and LLVMIsAAllocaInst(LLVMGetOperand(instruction, 1)) != null)
+                    has_fill <- has_fill or (LLVMIsAMemSetInst(instruction) != null and LLVMIsAConstantInt(LLVMGetOperand(instruction, 2)) != null)
+            has_copy and has_fill
+
+        # ARGUMENT frozen (`scratch.length` at the entry's first insertion point) for every
+        # other use: the freeze stays when an initializer then goes. How many did.
+        def eliminate_with_frozen(argument: LLVMValueRef, function: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            at: LLVMValueRef = get first_insertion_point(LLVMGetEntryBasicBlock(function)) else return 0
+            LLVMPositionBuilderBefore(builder, at)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            freeze_name: mutable darray[u8] = []
+            frozen: LLVMValueRef = LLVMBuildFreeze(builder, argument, sview_to_cstr("scratch.length", freeze_name))
+            ElisaLLVMReplaceUsesExceptUser(argument, frozen, frozen)
+            removed: u32 = eliminate_function_copied_scratch(function)
+            return removed if removed != 0
+            LLVMReplaceAllUsesWith(frozen, argument)
+            LLVMInstructionEraseFromParent(frozen)
+            0
+
+        # Each used i64 argument without `noundef` tried frozen, while none lets an
+        # initializer go; how many went.
+        def eliminate_with_frozen_argument(function: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not has_copy_and_fill(function)
+            name_storage: mutable darray[u8] = []
+            no_undef: u32 = LLVMGetEnumAttributeKindForName(sview_to_cstr("noundef", name_storage), 7)
+            for index in 0..<LLVMCountParams(function) |function, builder, no_undef|:
+                argument: LLVMValueRef = LLVMGetParam(function, index)
+                continue if not is_llvm_integer_type(LLVMTypeOf(argument), 64) or LLVMGetEnumAttributeAtIndex(function, index + 1, no_undef) != null
+                continue if LLVMGetFirstUse(argument) == null or ElisaLLVMIsUsedByMetadata(argument) != 0
+                removed: u32 = eliminate_with_frozen(argument, function, builder)
+                return removed if removed != 0
+            0
+
+    public:
+        # Copied-scratch initializers removed; how many.
+        def eliminate_copied_scratch(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_debug_info(module) or ElisaLLVMModuleTargetArchIsAArch64(module) == 0 or ElisaLLVMModuleTargetIsLinux(module) == 0
+            return 0 if ElisaLLVMDataLayoutIndexSizeInBits(module, 0) != 64
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            removed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, removed, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_scalar_pass_policy(function) or function_instruction_count(function) > CopiedScratchLimit::FUNCTION_INSTRUCTIONS
+                direct: u32 = eliminate_function_copied_scratch(function)
+                removed <- removed + (direct if direct != 0 else eliminate_with_frozen_argument(function, builder))
+            LLVMDisposeBuilder(builder)
+            removed

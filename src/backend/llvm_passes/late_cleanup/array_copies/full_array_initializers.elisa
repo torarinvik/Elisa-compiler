@@ -1,0 +1,155 @@
+# Zero fills of i64 arrays that a counted loop overwrites in full before any read,
+# removed. A static array of 16 to 4096 i64 elements, cleared by one memset of its whole
+# size outside loops, qualifies when every other use is a lifetime marker, a copy into it,
+# or a single-index element address whose only uses are simple loads and stores; and one
+# store of an element, in the latch of a zero-based unit-stride loop that ends on
+# `index + 1 == length` right after it, dominates (through that loop's exit edge) every load.
+include "../../ir/ir_editing.elisa"
+include "../../ir/llvm_ir_queries.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../small_fills/fill_queries.elisa"
+
+const module FullArrayLimit:
+    MINIMUM_ELEMENTS: u64 = 16
+    MAXIMUM_ELEMENTS: u64 = 4096
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+
+# A loop's exit edge.
+struct LoopExitEdge:
+    from: LLVMBasicBlockRef
+    target: LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        # A ConstantInt equal to VALUE.
+        def is_constant_equal_to(value: LLVMValueRef, expected: u64) -> bool:
+            LLVMIsAConstantInt(value) != null and ElisaLLVMConstantIntActiveBits(value) <= 64 and LLVMConstIntGetZExtValue(value) == expected
+
+        # The exit edge of a zero-based unit-stride fill loop of COUNT elements whose latch
+        # holds STORE and tests `index + 1` for equality with COUNT right after it.
+        def full_fill_edge(store: LLVMValueRef, index: LLVMValueRef, count: u64, analyses: ElisaFunctionAnalysesRef) -> LoopExitEdge? can[Abort.Panic]:
+            return null if not is_llvm_instruction_with_opcode(index, LLVMOpcode::PHI)
+            latch: LLVMBasicBlockRef = LLVMGetInstructionParent(store)
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, latch) else return null
+            loop_latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            return null if ElisaLLVMLoopParent(loop) != null or loop_latch != latch
+            return null if LLVMGetInstructionParent(index) != ElisaLLVMLoopHeader(loop) or LLVMCountIncoming(index) != 2
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return null
+            start: LLVMValueRef = get phi_incoming_for_block(index, preheader) else return null
+            next: LLVMValueRef = get phi_incoming_for_block(index, latch) else return null
+            branch: LLVMValueRef = get conditional_terminator(latch) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if LLVMIsAConstantInt(start) == null or ElisaLLVMIsConstantZero(start) == 0
+            return null if not is_llvm_instruction_with_opcode(next, LLVMOpcode::ADD) or LLVMGetOperand(next, 0) != index
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetOperand(compare, 0) != next
+            return null if not is_constant_equal_to(LLVMGetOperand(next, 1), 1) or not is_constant_equal_to(LLVMGetOperand(compare, 1), count)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return null if (predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE) or LLVMGetICmpSameSign(compare) != 0
+            exit_index: u32 = 0 if predicate == LLVMIntPredicate::EQ else 1
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(branch, exit_index)
+            return null if ElisaLLVMLoopContainsBlock(loop, exit) != 0 or LLVMGetSuccessor(branch, 1 - exit_index) != ElisaLLVMLoopHeader(loop)
+            LoopExitEdge{from: latch, target: exit}
+
+        # Whether USER of BUFFER is a lifetime end, a lifetime start in the entry block before
+        # INITIALIZER, or a plain copy into the buffer from elsewhere.
+        def is_harmless_buffer_intrinsic(user: LLVMValueRef, buffer: LLVMValueRef, initializer: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAIntrinsicInst(user) == null
+            identifier: u32 = called_intrinsic_id(user)
+            return true if identifier == intrinsic_identifier("llvm.lifetime.end")
+            if identifier == intrinsic_identifier("llvm.lifetime.start"):
+                entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(LLVMGetInstructionParent(buffer)))
+                return true if LLVMGetInstructionParent(user) == entry and ElisaLLVMInstructionDominates(analyses, user, initializer) != 0
+            return false if LLVMIsAMemCpyInst(user) == null
+            LLVMGetOperand(user, 0) == buffer and LLVMGetOperand(user, 1) != buffer and not call_is_volatile(user) and LLVMGetNumOperandBundles(user) == 0
+
+        # The loads and full-fill exit edges reached through ADDRESS, an element address of
+        # the buffer, added to READS and COMPLETIONS; false when it has another use.
+        def collect_element_accesses(address: LLVMValueRef, element: LLVMTypeRef, count: u64, initializer: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, reads: mutable darray[LLVMValueRef]&, completions: mutable darray[LoopExitEdge]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            index: LLVMValueRef = LLVMGetOperand(address, 1)
+            return false if not is_llvm_integer_type(LLVMTypeOf(index), 64)
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(address)
+            while use_cursor is use |use_cursor, reads, completions, address, element, count, initializer, analyses, index|:
+                use_cursor <- LLVMGetNextUse(use)
+                access: LLVMValueRef = LLVMGetUser(use)
+                if LLVMIsALoadInst(access) != null and is_simple_access(access) and LLVMGetOperand(access, 0) == address:
+                    reads.push(access)
+                elif LLVMIsAStoreInst(access) != null and is_simple_access(access) and LLVMGetOperand(access, 1) == address and LLVMGetOperand(access, 0) != address:
+                    if LLVMTypeOf(LLVMGetOperand(access, 0)) == element and ElisaLLVMInstructionDominates(analyses, initializer, access) != 0:
+                        if full_fill_edge(access, index, count, analyses) is edge:
+                            completions.push(edge)
+                else:
+                    return false
+            true
+
+        # Whether EDGE dominates the block of every one of READS.
+        def edge_dominates_reads(edge: LoopExitEdge, reads: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> bool:
+            for read in reads |edge, analyses|:
+                return false if ElisaLLVMEdgeDominates(analyses, edge.from, edge.target, LLVMGetInstructionParent(read)) == 0
+            true
+
+        # Whether every read of BUFFER follows a full overwrite of it after INITIALIZER.
+        def is_fully_overwritten(buffer: LLVMValueRef, initializer: LLVMValueRef, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(initializer)) != null or ElisaLLVMIsUsedByMetadata(buffer) != 0
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            element: LLVMTypeRef = LLVMGetElementType(array)
+            reads: mutable darray[LLVMValueRef] = []
+            completions: mutable darray[LoopExitEdge] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(buffer)
+            while use_cursor is use |use_cursor, reads, completions, buffer, initializer, layout, analyses, array, element|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                continue if user == initializer or is_harmless_buffer_intrinsic(user, buffer, initializer, analyses)
+                return false if LLVMIsAGetElementPtrInst(user) == null or LLVMGetOperand(user, 0) != buffer or LLVMGetNumIndices(user) != 1 or ElisaLLVMIsUsedByMetadata(user) != 0
+                return false if LLVMABISizeOfType(layout, LLVMGetGEPSourceElementType(user)) != LLVMABISizeOfType(layout, element)
+                return false if not collect_element_accesses(user, element, LLVMGetArrayLength2(array), initializer, analyses, &reads, &completions)
+            return false if reads.count == 0
+            for edge in completions |reads, analyses|:
+                return true if edge_dominates_reads(edge, &reads, analyses)
+            false
+
+        # A memset clearing a whole static i64 array of 16 to 4096 elements in address
+        # space 0, with no flags, bundles or metadata besides a debug location.
+        def is_full_array_initializer(instruction: LLVMValueRef, layout: LLVMTargetDataRef) -> bool:
+            return false if LLVMIsAMemSetInst(instruction) == null or call_is_volatile(instruction) or LLVMGetNumOperandBundles(instruction) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+            buffer: LLVMValueRef = LLVMGetOperand(instruction, 0)
+            return false if LLVMIsAAllocaInst(buffer) == null
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return false if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or not is_llvm_integer_type(LLVMGetElementType(array), 64)
+            return false if LLVMGetArrayLength2(array) < FullArrayLimit::MINIMUM_ELEMENTS or LLVMGetArrayLength2(array) > FullArrayLimit::MAXIMUM_ELEMENTS
+            return false if ElisaLLVMIsStaticAlloca(buffer) == 0 or not is_constant_equal_to(LLVMGetOperand(buffer, 0), 1)
+            return false if LLVMGetPointerAddressSpace(LLVMTypeOf(buffer)) != 0
+            is_constant_equal_to(LLVMGetOperand(instruction, 2), LLVMABISizeOfType(layout, array))
+
+        # FUNCTION's full array initializers removed; how many.
+        def remove_function_full_array_initializers(function: LLVMValueRef, layout: LLVMTargetDataRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            initializers: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, initializers, layout|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, initializers, layout|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    initializers.push(instruction) if is_full_array_initializer(instruction, layout)
+            return 0 if initializers.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            removed: mutable u32 = 0
+            for initializer in initializers |removed, layout, analyses|:
+                if is_fully_overwritten(LLVMGetOperand(initializer, 0), initializer, layout, analyses):
+                    LLVMInstructionEraseFromParent(initializer)
+                    removed <- removed + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            removed
+
+    public:
+        # Full array initializers removed on AArch64 from modules without debug info whose
+        # index width is 64 bits; how many.
+        def eliminate_full_array_initializers(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetIsAArch64(module) == 0 or module_has_debug_info(module) or ElisaLLVMDataLayoutIndexSizeInBits(module, 0) != 64
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            removed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, removed, layout|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_scalar_pass_policy(function) or llvm_function_subprogram_or_null(function) != null or function_instruction_count(function) > FullArrayLimit::FUNCTION_INSTRUCTIONS
+                removed <- removed + remove_function_full_array_initializers(function, layout)
+            removed

@@ -48,9 +48,6 @@
 
 using namespace llvm;
 
-#include "llvm_checked_signed_ranges.h"
-#include "llvm_copied_scratch.h"
-
 #endif
 
 // Keep Apple ARM layout policy identical to Stage0's O3 emitter.

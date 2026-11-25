@@ -352,10 +352,6 @@ int ElisaLLVMPointerMayBeCaptured(LLVMValueRef pointer, int return_captures, uin
   return PointerMayBeCaptured(unwrap(pointer), return_captures != 0, max_uses);
 }
 
-int ElisaLLVMInstructionIsPotentiallyReachable(LLVMValueRef from, LLVMValueRef to) {
-  return isPotentiallyReachable(cast<Instruction>(unwrap(from)), cast<Instruction>(unwrap(to)));
-}
-
 int ElisaLLVMFunctionOnlyReadsMemory(LLVMValueRef function) {
   return cast<Function>(unwrap(function))->onlyReadsMemory();
 }
@@ -564,6 +560,10 @@ void ElisaLLVMComputeKnownBits(LLVMValueRef value, LLVMModuleRef module, LLVMVal
   KnownBits Known = computeKnownBits(V, unwrap(module)->getDataLayout());
   *zero = wrap(ConstantInt::get(V->getContext(), Known.Zero));
   *one = wrap(ConstantInt::get(V->getContext(), Known.One));
+}
+
+unsigned ElisaLLVMKnownMinimumTrailingZeros(LLVMValueRef value, LLVMModuleRef module) {
+  return computeKnownBits(unwrap(value), unwrap(module)->getDataLayout()).countMinTrailingZeros();
 }
 
 uint32_t ElisaLLVMSmallConstantTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,

@@ -8,6 +8,8 @@
 // memory runs between them. Such loads get the validated range as `!range`,
 // which removes the overflow checks of arithmetic over input values.
 #include <llvm/Analysis/CFG.h>
+#include <llvm/Analysis/LazyValueInfo.h>
+#include <llvm/IR/MDBuilder.h>
 namespace ElisaValidatedReads {
 using namespace llvm;
 using namespace llvm::PatternMatch;

@@ -93,6 +93,9 @@ uint64_t ElisaLLVMConstantRangeUnsignedMin(ElisaConstantRangeRef range);
 /* getLower() and getUpper() of a range at most 64 bits wide, zero-extended. */
 uint64_t ElisaLLVMConstantRangeLower(ElisaConstantRangeRef range);
 uint64_t ElisaLLVMConstantRangeUpper(ElisaConstantRangeRef range);
+/* getLower() and getUpper() as constants of the range's width, at any width. */
+LLVMValueRef ElisaLLVMConstantRangeLowerBound(ElisaConstantRangeRef range, LLVMContextRef context);
+LLVMValueRef ElisaLLVMConstantRangeUpperBound(ElisaConstantRangeRef range, LLVMContextRef context);
 /* getEmpty(width) and getNonEmpty(lower, upper): the full range when lower == upper. */
 ElisaConstantRangeRef ElisaLLVMConstantRangeEmpty(uint32_t width);
 ElisaConstantRangeRef ElisaLLVMConstantRangeNonEmpty(LLVMValueRef lower, LLVMValueRef upper);

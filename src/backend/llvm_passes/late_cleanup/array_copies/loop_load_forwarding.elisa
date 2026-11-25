@@ -1,0 +1,158 @@
+# Loads that reread the array slot a loop's latch stored last, forwarded. When the latch's
+# last memory write stores to `buffer[next]` of an uncaptured static alloca, nothing else in
+# the loop writes memory, and the body loads `buffer[index]` where the header phi `index`
+# takes `next` from the latch, the load sees the stored value on every iteration after the
+# first. It becomes a header phi of the stored value from the latch and of one load of
+# `buffer[index on entry]` in the preheader (made on the entry edge if the loop has none),
+# when the load runs on every iteration.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../vector_loops/paired_counters.elisa"
+include "./full_array_initializers.elisa"
+
+const module LoopLoadForwardingLimit:
+    LOOP_BLOCKS: u32 = 8
+    CAPTURE_USES: u32 = 128
+
+# A load of `buffer[index]` in the loop body, with the header phi and address it reads.
+struct ReloadCandidate:
+    index: LLVMValueRef
+    address: LLVMValueRef
+    load: LLVMValueRef
+
+extend Backend:
+    private:
+        # The first user of ADDRESS that loads through it.
+        def first_load_through(address: LLVMValueRef) -> LLVMValueRef?:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(address)
+            while use_cursor is use |use_cursor, address|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return user if LLVMIsALoadInst(user) != null and LLVMGetOperand(user, 0) == address
+            null
+
+        # The loads of `buffer[index]` through INDEX's uses that reread the slot STORE wrote
+        # through STORE_ADDRESS, appended to CANDIDATES.
+        def index_reload_candidates(index: LLVMValueRef, loop: ElisaLoopRef, store: LLVMValueRef, store_address: LLVMValueRef, buffer: LLVMValueRef, candidates: mutable darray[ReloadCandidate]&) -> void can[Abort.Panic, Memory.Allocate]:
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(index)
+            while use_cursor is use |use_cursor, candidates, index, loop, store, store_address, buffer, latch|:
+                use_cursor <- LLVMGetNextUse(use)
+                address: LLVMValueRef = LLVMGetUser(use)
+                continue if LLVMIsAGetElementPtrInst(address) == null or LLVMGetOperand(address, 0) != buffer or LLVMGetNumIndices(address) != 1
+                continue if LLVMGetGEPSourceElementType(address) != LLVMGetGEPSourceElementType(store_address) or LLVMGetOperand(address, 1) != index
+                if first_load_through(address) is load:
+                    if is_simple_access(load) and ElisaLLVMHasMetadataOtherThanDebugLoc(load) == 0 and LLVMTypeOf(load) == LLVMTypeOf(LLVMGetOperand(store, 0)):
+                        if LLVMGetInstructionParent(load) != latch and ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(load)) != 0:
+                            candidates.push(ReloadCandidate{index: index, address: address, load: load})
+
+        # The loads in LOOP's body that reread the slot the latch's last STORE wrote.
+        def reload_candidates(loop: ElisaLoopRef, store: LLVMValueRef, store_address: LLVMValueRef, buffer: LLVMValueRef) -> darray[ReloadCandidate] can[Abort.Panic, Memory.Allocate]:
+            candidates: mutable darray[ReloadCandidate] = []
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return candidates
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopHeader(loop))
+            while cursor is phi |cursor, candidates, loop, store, store_address, buffer, latch|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                continue if LLVMCountIncoming(phi) != 2
+                if phi_incoming_for_block(phi, latch) is from_latch:
+                    if from_latch == LLVMGetOperand(store_address, 1):
+                        index_reload_candidates(phi, loop, store, store_address, buffer, &candidates)
+            candidates
+
+        # The latch's last instruction that writes memory, when it is a store.
+        def last_latch_store(latch: LLVMBasicBlockRef) -> LLVMValueRef?:
+            last: mutable LLVMValueRef? = null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(latch)
+            while cursor is instruction |cursor, last|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if ElisaLLVMMayWriteToMemory(instruction) != 0:
+                    last <- instruction if LLVMIsAStoreInst(instruction) != null else null
+            last
+
+        # Whether a block of LOOP other than LATCH writes memory.
+        def body_writes_memory(loop: ElisaLoopRef, latch: LLVMBasicBlockRef) -> bool:
+            for position in 0..<ElisaLLVMLoopBlockCount(loop) |loop, latch|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, position)
+                if block != latch:
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while cursor is instruction |cursor|:
+                        return true if ElisaLLVMMayWriteToMemory(instruction) != 0
+                        cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+        # CANDIDATE's load replaced by a header phi of one load before ENTRY's terminator and
+        # the value STORE writes from LATCH.
+        def forward_reload(candidate: ReloadCandidate, store: LLVMValueRef, buffer: LLVMValueRef, entry: LLVMBasicBlockRef, header: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            initial_index: LLVMValueRef = get phi_incoming_for_block(candidate.index, entry) else return
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(entry) else return
+            position_builder_before(builder, terminator)
+            indices: mutable darray[LLVMValueRef] = [initial_index]
+            empty_name: mutable darray[u8] = []
+            initial_address: LLVMValueRef = LLVMBuildGEP2(builder, LLVMGetGEPSourceElementType(candidate.address), buffer, (&indices[0]).cast[void&], 1, sview_to_cstr("", empty_name))
+            initial: LLVMValueRef = LLVMBuildLoad2(builder, LLVMTypeOf(candidate.load), initial_address, sview_to_cstr("", empty_name))
+            LLVMSetAlignment(initial, LLVMGetAlignment(candidate.load))
+            first: LLVMValueRef = get LLVMGetFirstInstruction(header) else return
+            LLVMPositionBuilderBefore(builder, first)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            phi_name: mutable darray[u8] = []
+            forwarded: LLVMValueRef = LLVMBuildPhi(builder, LLVMTypeOf(candidate.load), sview_to_cstr("forwarded.load", phi_name))
+            add_phi_incoming(forwarded, initial, entry)
+            add_phi_incoming(forwarded, LLVMGetOperand(store, 0), latch)
+            LLVMReplaceAllUsesWith(candidate.load, forwarded)
+            LLVMInstructionEraseFromParent(candidate.load)
+
+        # LOOP's first reload that runs on every iteration forwarded; whether the IR changed
+        # (an entry edge split for a preheader counts).
+        def forward_loop_load(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return false
+            return false if ElisaLLVMLoopSubLoopCount(loop) != 0 or ElisaLLVMLoopBlockCount(loop) > LoopLoadForwardingLimit::LOOP_BLOCKS
+            store: LLVMValueRef = get last_latch_store(latch) else return false
+            return false if not is_simple_access(store) or ElisaLLVMHasMetadataOtherThanDebugLoc(store) != 0
+            store_address: LLVMValueRef = LLVMGetOperand(store, 1)
+            return false if LLVMIsAGetElementPtrInst(store_address) == null
+            buffer: LLVMValueRef = LLVMGetOperand(store_address, 0)
+            return false if LLVMIsAAllocaInst(buffer) == null or ElisaLLVMIsStaticAlloca(buffer) == 0 or LLVMGetPointerAddressSpace(LLVMTypeOf(buffer)) != 0
+            return false if LLVMGetNumIndices(store_address) != 1 or ElisaLLVMPointerMayBeCaptured(buffer, 1, LoopLoadForwardingLimit::CAPTURE_USES) != 0
+            return false if body_writes_memory(loop, latch)
+            candidates: darray[ReloadCandidate] = reload_candidates(loop, store, store_address, buffer)
+            return false if candidates.count == 0
+            # LoopSafetyInfo reads the preheader's incoming values when it proves an exit
+            # untaken on the first iteration, and reads out of bounds without one.
+            entry: mutable LLVMBasicBlockRef? = ElisaLLVMLoopPreheader(loop)
+            split: bool = entry == null
+            entry <- ElisaLLVMSplitEdgeKeepingLoops(analyses, predecessor, header) if split
+            preheader: LLVMBasicBlockRef = get entry else return split
+            current: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return split
+            return split if current != preheader
+            for candidate in candidates |loop, analyses, store, buffer, preheader, header, latch, builder|:
+                if ElisaLLVMLoopIsGuaranteedToExecute(analyses, loop, candidate.load) != 0:
+                    forward_reload(candidate, store, buffer, preheader, header, latch, builder)
+                    return true
+            split
+
+        # FUNCTION's loops, in preorder, with their reloads forwarded; how many changed.
+        def forward_function_loop_loads(function: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            changed: mutable u32 = 0
+            for loop in loops_in_program_preorder(analyses) |changed, analyses, builder|:
+                changed <- changed + (1 if forward_loop_load(loop, analyses, builder) else 0)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # Loop reloads forwarded on AArch64 in modules without debug info; how many loops
+        # changed.
+        def forward_loop_loads(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetIsAArch64(module) == 0 or module_has_debug_info(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_scalar_pass_policy(function) or llvm_function_subprogram_or_null(function) != null or function_instruction_count(function) > FullArrayLimit::FUNCTION_INSTRUCTIONS
+                changed <- changed + forward_function_loop_loads(function, builder)
+            LLVMDisposeBuilder(builder)
+            changed

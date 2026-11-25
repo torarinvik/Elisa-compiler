@@ -1,0 +1,259 @@
+# The values a local integer array can hold, as `!range` metadata on its loads
+# (`ElisaArrayRanges`). When a non-escaping array is accessed only through
+# element-aligned loads and stores (array_accesses.elisa), starts from a zero fill (or an
+# earlier run proved every load reads a written element), and every store writes a value
+# of known range or one loaded from the array itself, every load returns a value in the
+# union of those ranges. Vector stores contribute their lanes, and an element-aligned copy
+# from another analyzed array contributes that array's range. Ranges are signed, so
+# remainders such as [-96, 96] survive. The loads' ranges let later folding remove bounds
+# checks on indices read from the array and overflow checks on arithmetic over its values.
+#
+# Ranges are owned handles: each function here returns a new one, and the documented ones
+# consume the ranges they are given.
+include "./array_accesses.elisa"
+include "../signed_checks/guard_facts.elisa"
+
+const module ArrayValueRangeLimit:
+    CHOICE_DEPTH: u32 = 6
+    ROUNDS: u32 = 2
+    LARGEST_ZEROS: u32 = 64
+
+# The hull of one array's stored values: its own loads (whose values add nothing new),
+# the phis and selects being followed, and the analyses.
+struct ArrayHull:
+    own: darray[LLVMValueRef]
+    visiting: mutable darray[LLVMValueRef]
+    analyses: ElisaFunctionAnalysesRef
+    intrinsics: CheckedIntrinsics
+
+# A choice of a phi or select, and where it is judged: a phi input at the end of its
+# incoming block, a select operand at the select.
+struct ArrayValueChoice:
+    value: LLVMValueRef
+    context: LLVMValueRef
+
+# An analyzable array and its accesses.
+struct ArrayCandidate:
+    array: LLVMValueRef
+    accesses: ArrayAccesses
+
+# An array's hull, once known.
+struct ArrayHullEntry:
+    array: LLVMValueRef
+    range: ElisaConstantRangeRef
+
+extend Backend:
+    private:
+        # `intersectWith(second, Unsigned)`, consuming both ranges.
+        def array_unsigned_intersection(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef) -> ElisaConstantRangeRef:
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersectUnsigned(first, second)
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            result
+
+        # `remainderRange`: the values of a remainder, smaller in magnitude than its divisor,
+        # whose range the guards dominating AT bound even inside a loop lazy value info
+        # cannot see through.
+        def array_remainder_range(remainder: LLVMValueRef, at: LLVMValueRef, hull: ArrayHull&) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(remainder))
+            divisor: LLVMValueRef = LLVMGetOperand(remainder, 1)
+            divisor_range: mutable ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(hull.analyses, divisor, at, 0)
+            incoming: RangeFacts = empty_facts()
+            search: mutable GuardSearch = guard_search(false, false, null)
+            facts: RangeFacts = dominating_bounds(at, hull.analyses, hull.intrinsics, &incoming, &search)
+            if fact_range(&facts, divisor) is fact:
+                divisor_range <- signed_intersection(divisor_range, fact)
+            dispose_facts(&facts)
+            range_operation(LLVMGetInstructionOpcode(remainder), ElisaLLVMConstantRangeFull(width), divisor_range)
+
+        # `laneRange`: every lane of a stored vector, from constant lanes or a load whose
+        # `!range` bounds each lane; lanes of the array's own loads add nothing.
+        def array_lane_range(stored: LLVMValueRef, width: u32, hull: ArrayHull&) -> ElisaConstantRangeRef:
+            return ElisaLLVMConstantRangeEmpty(width) if contains_value(hull.own, stored)
+            if LLVMIsAConstant(stored) != null:
+                result: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeEmpty(width)
+                for lane in 0..<LLVMGetVectorSize(LLVMTypeOf(stored)) |result, stored, width|:
+                    element: LLVMValueRef? = LLVMGetAggregateElement(stored, lane)
+                    if element is value and LLVMIsAConstantInt(value) != null:
+                        result <- signed_union(result, ElisaLLVMConstantRangeOfConstant(value))
+                    else:
+                        ElisaLLVMDisposeConstantRange(result)
+                        return ElisaLLVMConstantRangeFull(width)
+                return result
+            if LLVMIsALoadInst(stored) != null and ElisaLLVMConstantRangeOfRangeMetadata(stored) is bounded:
+                return bounded
+            ElisaLLVMConstantRangeFull(width)
+
+        # The choices of STORED when it is a phi or a select.
+        def array_value_choices(stored: LLVMValueRef) -> darray[ArrayValueChoice] can[Abort.Panic, Memory.Allocate]:
+            choices: mutable darray[ArrayValueChoice] = []
+            if is_llvm_instruction_with_opcode(stored, LLVMOpcode::PHI):
+                for index in 0..<LLVMCountIncoming(stored) |choices, stored|:
+                    if LLVMGetBasicBlockTerminator(LLVMGetIncomingBlock(stored, index)) is terminator:
+                        choices.push(ArrayValueChoice{value: LLVMGetIncomingValue(stored, index), context: terminator})
+            if is_llvm_instruction_with_opcode(stored, LLVMOpcode::SELECT):
+                choices.push(ArrayValueChoice{value: LLVMGetOperand(stored, 1), context: stored})
+                choices.push(ArrayValueChoice{value: LLVMGetOperand(stored, 2), context: stored})
+            choices
+
+        # `rangeOf`: the values STORED can have where AT runs; values flowing from the
+        # array's own loads add nothing, and each choice of a phi or select is judged where
+        # it is available (lazy value info must not be asked about a value at a point it
+        # does not dominate).
+        def array_stored_range(stored: LLVMValueRef, at: LLVMValueRef, depth: u32, hull: mutable ArrayHull&) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(stored))
+            return ElisaLLVMConstantRangeEmpty(width) if contains_value(hull.own, stored) or contains_value(hull.visiting, stored)
+            return ElisaLLVMConstantRangeFull(width) if depth > ArrayValueRangeLimit::CHOICE_DEPTH
+            choices: darray[ArrayValueChoice] = array_value_choices(stored)
+            if choices.count != 0:
+                hull.visiting.push(stored)
+                result: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeEmpty(width)
+                for choice in choices |result, depth, hull|:
+                    result <- signed_union(result, array_stored_range(choice.value, choice.context, depth + 1, hull))
+                _ = hull.visiting.pop()
+                return result
+            known: mutable ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(hull.analyses, stored, at, 0)
+            opcode: u32 = LLVMGetInstructionOpcode(stored) if LLVMIsAInstruction(stored) != null else 0
+            if opcode == LLVMOpcode::SREM or opcode == LLVMOpcode::UREM:
+                known <- signed_intersection(known, array_remainder_range(stored, at, hull))
+            array_unsigned_intersection(known, ElisaLLVMScalarEvolutionUnsignedRange(hull.analyses, stored))
+
+        # `Bounds::hull`: the union of the ranges of values the array can hold, or the full
+        # set.
+        def array_value_hull(accesses: ArrayAccesses&, element_type: LLVMTypeRef, hull: mutable ArrayHull&) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            width: u32 = LLVMGetIntTypeWidth(element_type)
+            result: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeOfConstant(LLVMConstInt(element_type, 0, 0))
+            for store in accesses.stores |result, hull|:
+                result <- signed_union(result, array_stored_range(LLVMGetOperand(store, 0), store, 0, hull))
+                return result if ElisaLLVMConstantRangeIsFull(result) != 0
+            for store in accesses.vector_stores |result, width, hull|:
+                result <- signed_union(result, array_lane_range(LLVMGetOperand(store, 0), width, hull))
+                break if ElisaLLVMConstantRangeIsFull(result) != 0
+            result
+
+        # RANGE as LOAD's `!range` metadata (`MDBuilder::createRange`).
+        def set_load_range(load: LLVMValueRef, range: ElisaConstantRangeRef, range_kind: u32, context: LLVMContextRef) -> void can[Memory.Allocate, Unsafe.PointerCast]:
+            bounds: mutable darray[LLVMMetadataRef] = [LLVMValueAsMetadata(ElisaLLVMConstantRangeLowerBound(range, context)), LLVMValueAsMetadata(ElisaLLVMConstantRangeUpperBound(range, context))]
+            slots: void& = (&bounds[0]).cast[void&]
+            LLVMSetMetadata(load, range_kind, LLVMMetadataAsValue(context, LLVMMDNodeInContext2(context, slots, 2)))
+
+        # `annotate`: RANGE on each of the array's loads that has no `!range` yet; a range
+        # that wraps as unsigned but not as signed is still a valid `!range`.
+        def annotate_array_loads(accesses: ArrayAccesses&, range: ElisaConstantRangeRef, context: LLVMContextRef) -> bool can[Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMConstantRangeIsFull(range) != 0 or ElisaLLVMConstantRangeIsEmpty(range) != 0
+            return false if ElisaLLVMConstantRangeIsWrapped(range) != 0 and ElisaLLVMConstantRangeIsSignWrapped(range) != 0
+            range_kind: u32 = LLVMGetMDKindIDInContext(context, "range", 5)
+            changed: mutable bool = false
+            for load in accesses.loads |changed, range, range_kind, context|:
+                if LLVMGetMetadata(load, range_kind) == null:
+                    set_load_range(load, range, range_kind, context)
+                    changed <- true
+            for load in accesses.vector_loads |changed, range, range_kind, context|:
+                if LLVMGetMetadata(load, range_kind) == null:
+                    set_load_range(load, range, range_kind, context)
+                    changed <- true
+            changed
+
+        # OFFSET as the two's-complement 64-bit value an index-width APInt holds.
+        def offset_bits(offset: i64) -> u64:
+            return offset.u64() if offset >= 0
+            18446744073709551615.u64() - (-(offset + 1)).u64()
+
+        # A copy of the hull HULLS holds for ARRAY, when one does.
+        def known_hull(hulls: darray[ArrayHullEntry]&, array: LLVMValueRef) -> ElisaConstantRangeRef?:
+            for entry in hulls |array|:
+                return ElisaLLVMConstantRangeCopy(entry.range) if entry.array == array
+            null
+
+        # `copiedRange`: the values WRITE, an element-aligned copy into the array from
+        # another analyzed array of the same ELEMENT, moves: that array's hull.
+        def array_copied_range(write: LLVMValueRef, element: ArrayElement&, hulls: darray[ArrayHullEntry]&) -> ElisaConstantRangeRef can[Unsafe.PointerCast]:
+            width: u32 = LLVMGetIntTypeWidth(element.type)
+            return ElisaLLVMConstantRangeFull(width) if LLVMIsAMemCpyInst(write) == null and LLVMIsAMemMoveInst(write) == null
+            source_pointer: LLVMValueRef = LLVMGetOperand(write, 1)
+            source: LLVMValueRef = ElisaLLVMUnderlyingObject(source_pointer)
+            return ElisaLLVMConstantRangeFull(width) if LLVMIsAAllocaInst(source) == null
+            known: ElisaConstantRangeRef = get known_hull(hulls, source) else return ElisaLLVMConstantRangeFull(width)
+            offset: mutable i64 = 0
+            base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(source_pointer, element.module, (&offset).cast[void&])
+            zeros: u32 = ElisaLLVMKnownMinimumTrailingZeros(LLVMGetOperand(write, 2), element.module)
+            aligned_length: bool = zeros >= ArrayValueRangeLimit::LARGEST_ZEROS or (1.u64() << zeros.u64()) % element.size == 0
+            if LLVMGetElementType(LLVMGetAllocatedType(source)) == element.type and base == source and offset_bits(offset) % element.size == 0 and aligned_length:
+                return known
+            ElisaLLVMDisposeConstantRange(known)
+            ElisaLLVMConstantRangeFull(width)
+
+        # The analyzable integer arrays of FUNCTION's entry block: static, zero filled (or
+        # proved to read only written elements), and never viewed.
+        def array_range_candidates(function: LLVMValueRef, module: LLVMModuleRef) -> darray[ArrayCandidate] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidates: mutable darray[ArrayCandidate] = []
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            written_kind: u32 = LLVMGetMDKindIDInContext(context, "elisa.written.prefix", 20)
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while cursor is array |cursor, candidates, module, written_kind|:
+                cursor <- LLVMGetNextInstruction(array)
+                continue if LLVMIsAAllocaInst(array) == null or LLVMGetTypeKind(LLVMGetAllocatedType(array)) != LLVMTypeKindValue::ARRAY
+                element_type: LLVMTypeRef = LLVMGetElementType(LLVMGetAllocatedType(array))
+                continue if LLVMGetTypeKind(element_type) != LLVMTypeKindValue::INTEGER or ElisaLLVMIsStaticAlloca(array) == 0
+                element: ArrayElement = array_element(element_type, true, module)
+                accesses: mutable ArrayAccesses = empty_array_accesses()
+                continue if not collect_array_accesses(array, &element, &accesses, 0, 0)
+                if (accesses.filled or LLVMGetMetadata(array, written_kind) != null) and accesses.views.count == 0:
+                    candidates.push(ArrayCandidate{array: array, accesses: accesses})
+            candidates
+
+        # The hull of CANDIDATE's values, with the arrays copied into it.
+        def candidate_hull(candidate: ArrayCandidate&, hulls: darray[ArrayHullEntry]&, analyses: ElisaFunctionAnalysesRef, intrinsics: CheckedIntrinsics, module: LLVMModuleRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            element: ArrayElement = array_element(LLVMGetElementType(LLVMGetAllocatedType(candidate.array)), true, module)
+            own: mutable darray[LLVMValueRef] = []
+            for load in candidate.accesses.loads |own|:
+                own.push(load)
+            for load in candidate.accesses.vector_loads |own|:
+                own.push(load)
+            hull: mutable ArrayHull = ArrayHull{own: own, visiting: [], analyses: analyses, intrinsics: intrinsics}
+            range: mutable ElisaConstantRangeRef = array_value_hull(&candidate.accesses, element.type, &hull)
+            for write in candidate.accesses.writes |range, element, hulls|:
+                range <- signed_union(range, array_copied_range(write, &element, hulls))
+            range
+
+        # `annotateFunctionArrayRanges`: FUNCTION's analyzable arrays' loads annotated with
+        # their hulls, arrays written only by stores first so copies can read their hulls;
+        # how many arrays gained ranges.
+        def annotate_function_array_ranges(function: LLVMValueRef, module: LLVMModuleRef, intrinsics: CheckedIntrinsics) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidates: darray[ArrayCandidate] = array_range_candidates(function, module)
+            return 0 if candidates.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            hulls: mutable darray[ArrayHullEntry] = []
+            for phase in 0..<2 |hulls, candidates, analyses, intrinsics, module|:
+                copied: bool = phase == 1
+                for candidate in candidates |hulls, copied, analyses, intrinsics, module|:
+                    if (candidate.accesses.writes.count == 0) != copied:
+                        range: ElisaConstantRangeRef = candidate_hull(&candidate, &hulls, analyses, intrinsics, module)
+                        hulls.push(ArrayHullEntry{array: candidate.array, range: range})
+            changed: mutable u32 = 0
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            for candidate in candidates |changed, hulls, context|:
+                if known_hull(&hulls, candidate.array) is range:
+                    changed <- changed + (1 if annotate_array_loads(&candidate.accesses, range, context) else 0)
+                    ElisaLLVMDisposeConstantRange(range)
+            for entry in hulls:
+                ElisaLLVMDisposeConstantRange(entry.range)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # `annotateArrayValueRanges`: every defined function's arrays annotated, a second
+        # round letting an array filled by copying from another bounded array see that
+        # array's fresh ranges; how many arrays gained ranges.
+        def annotate_array_value_ranges(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            intrinsics: CheckedIntrinsics = checked_intrinsics()
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, intrinsics|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0
+                for round in 0..<ArrayValueRangeLimit::ROUNDS |changed, function, module, intrinsics|:
+                    annotated: u32 = annotate_function_array_ranges(function, module, intrinsics)
+                    changed <- changed + annotated
+                    break if annotated == 0
+            changed

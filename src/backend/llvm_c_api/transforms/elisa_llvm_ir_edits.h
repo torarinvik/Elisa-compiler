@@ -136,6 +136,11 @@ void ElisaLLVMMoveInstructionToBlockEnd(LLVMValueRef instruction, LLVMBasicBlock
  * metadata, to just before BEFORE. */
 void ElisaLLVMMoveInstructionBefore(LLVMValueRef instruction, LLVMValueRef before);
 
+/* Value::replaceUsesWithIf(replacement, use.getUser() != excluded_user): every use of
+ * VALUE except those of EXCLUDED_USER now uses REPLACEMENT, moved in use-list order (which
+ * decides the replacement's use-list order). */
+void ElisaLLVMReplaceUsesExceptUser(LLVMValueRef value, LLVMValueRef replacement, LLVMValueRef excluded_user);
+
 /* CondBrInst::swapSuccessors: the branch's two successors trade places, and so do the
  * weights of its branch-weight metadata, if it has any. */
 void ElisaLLVMSwapSuccessors(LLVMValueRef branch);

@@ -1,0 +1,175 @@
+# The coverage check of the copied-scratch elimination for one value of its input: the
+# loop's trip count and the copy's length evaluated at that value, the bytes of the buffer
+# stores write before the loop and on each trip, and then every path from the loop's exit
+# to the copy (branches whose compares the value decides follow one edge) marking the bytes
+# later stores write, until the copy finds its whole length written.
+include "../../ir/ir_editing.elisa"
+include "../../../llvm_c_api/analysis/elisa_llvm_scalar_evolution_expressions.elisa"
+
+const module CopiedScratchLimit:
+    VISITED_POINTERS: u32 = 32
+    STORES: u32 = 16
+    EXIT_EDGES: u32 = 8
+    CAPACITY: u64 = 512
+    INPUT_VALUES: u64 = 64
+    LARGEST_INPUT: u64 = 18446744073709551615
+    TRIPS: u64 = 64
+    PATH_BLOCKS: u32 = 128
+    FUNCTION_INSTRUCTIONS: u32 = 1000
+
+# The copy out of a zero-filled scratch buffer, and the integer stores into it.
+struct ScratchCopy:
+    copy: LLVMValueRef
+    buffer: LLVMValueRef
+    initializer: mutable LLVMValueRef
+    stores: mutable darray[LLVMValueRef]
+
+# The loop before the copy: its one exit toward the copy, and that exit's count.
+struct ScratchLoop:
+    loop: ElisaLoopRef
+    preheader: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+    exit: LLVMValueRef
+    target: LLVMBasicBlockRef
+    iterations: ElisaScalarEvolutionExpressionRef
+    capacity: u64
+
+# One value of the input the check is made for.
+struct ScratchInput:
+    analyses: ElisaFunctionAnalysesRef
+    argument: LLVMValueRef
+    value: u64
+
+# A block still to walk, with the bytes written on the path to it.
+struct CoveragePath:
+    block: LLVMBasicBlockRef
+    coverage: darray[u64]
+
+extend Backend:
+    private:
+        # EXPRESSION with the input bound to its value, as a constant of at most 64 bits; an
+        # add recurrence of LOOP is first evaluated at ITERATION.
+        def evaluate_scratch_expression(expression: ElisaScalarEvolutionExpressionRef, input: ScratchInput, loop: ElisaLoopRef?, iteration: ElisaScalarEvolutionExpressionRef?) -> u64?:
+            binding: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionConstantOf(input.analyses, LLVMTypeOf(input.argument), input.value)
+            current: mutable ElisaScalarEvolutionExpressionRef = expression
+            if ElisaLLVMScalarEvolutionRecurrenceLoop(expression) is recurrence_loop:
+                expected: ElisaLoopRef = get loop else return null
+                step: ElisaScalarEvolutionExpressionRef = get iteration else return null
+                return null if recurrence_loop != expected
+                current <- ElisaLLVMScalarEvolutionEvaluateAtIteration(input.analyses, expression, step)
+            rewritten: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionRewriteValue(input.analyses, current, input.argument, binding)
+            return null if ElisaLLVMScalarEvolutionExpressionKind(rewritten) != ElisaScalarEvolutionKind::CONSTANT
+            constant: LLVMValueRef = ElisaLLVMScalarEvolutionExpressionValue(rewritten)
+            return null if ElisaLLVMConstantIntActiveBits(constant) > 64
+            LLVMConstIntGetZExtValue(constant)
+
+        # VALUE evaluated at the input, outside any loop.
+        def evaluate_scratch_value(value: LLVMValueRef, input: ScratchInput) -> u64?:
+            evaluate_scratch_expression(ElisaLLVMScalarEvolutionOfValue(input.analyses, value), input, null, null)
+
+        # An operand of a compare evaluated at the input; an `and` of two evaluated operands
+        # is their bitwise and.
+        def evaluate_compare_operand(operand: LLVMValueRef, input: ScratchInput) -> u64?:
+            if is_llvm_instruction_with_opcode(operand, LLVMOpcode::AND):
+                left: u64? = evaluate_scratch_value(LLVMGetOperand(operand, 0), input)
+                right: u64? = evaluate_scratch_value(LLVMGetOperand(operand, 1), input)
+                if left is left_value:
+                    if right is right_value:
+                        return left_value & right_value
+            evaluate_scratch_value(operand, input)
+
+        # The branch CONDITION's value at the input, when it is a compare of evaluable operands.
+        def decided_scratch_condition(condition: LLVMValueRef, input: ScratchInput) -> bool?:
+            return null if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP)
+            left: u64? = evaluate_compare_operand(LLVMGetOperand(condition, 0), input)
+            right: u64? = evaluate_compare_operand(LLVMGetOperand(condition, 1), input)
+            left_value: u64 = get left else return null
+            right_value: u64 = get right else return null
+            type: LLVMTypeRef = LLVMIntTypeInContext(LLVMGetTypeContext(LLVMTypeOf(condition)), LLVMGetIntTypeWidth(LLVMTypeOf(LLVMGetOperand(condition, 0))))
+            ElisaLLVMConstantIntCompare(LLVMGetICmpPredicate(condition), LLVMConstInt(type, left_value, 0), LLVMConstInt(type, right_value, 0)) != 0
+
+        # Whether byte POSITION of COVERAGE is written.
+        def is_byte_covered(coverage: darray[u64]&, position: u64) -> bool:
+            (coverage[(position / 64).usize()] >> (position % 64)) & 1 != 0
+
+        # COVERAGE with bytes [START, END) written.
+        def cover_bytes(coverage: mutable darray[u64], start: u64, end: u64) -> darray[u64]:
+            for position in start..<end |coverage|:
+                word: usize = (position / 64).usize()
+                coverage[word] <- coverage[word] | (1.u64() << (position % 64))
+            coverage
+
+        # A copy of COVERAGE.
+        def copied_coverage(coverage: darray[u64]&) -> darray[u64] can[Memory.Allocate]:
+            copy: mutable darray[u64] = []
+            for word in coverage |copy|:
+                copy.push(word)
+            copy
+
+        # COVERAGE with the bytes STORE writes into the buffer at the input (on trip
+        # ITERATION of the loop, for a store in it), when they lie inside its capacity.
+        def mark_store(coverage: mutable darray[u64], store: LLVMValueRef, scratch: ScratchCopy&, scratch_loop: ScratchLoop&, input: ScratchInput, iteration: ElisaScalarEvolutionExpressionRef?) -> darray[u64]:
+            pointer: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionOfValue(input.analyses, LLVMGetOperand(store, 1))
+            return coverage if ElisaLLVMScalarEvolutionPointerBase(input.analyses, pointer) != ElisaLLVMScalarEvolutionOfValue(input.analyses, scratch.buffer)
+            offset: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionRemovePointerBase(input.analyses, pointer)
+            start: u64 = get evaluate_scratch_expression(offset, input, scratch_loop.loop, iteration) else return coverage
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInstructionParent(store))))
+            size: u64 = LLVMStoreSizeOfType(layout, LLVMTypeOf(LLVMGetOperand(store, 0)))
+            return coverage if start > scratch_loop.capacity or size > scratch_loop.capacity - start
+            cover_bytes(coverage, start, start + size)
+
+        # The buffer bytes written when the loop is left at the input, TRIP being the exit
+        # count there: stores before the loop, and stores in it that run on every trip.
+        def initialized_coverage(scratch: ScratchCopy&, scratch_loop: ScratchLoop&, input: ScratchInput, trip: u64) -> darray[u64] can[Abort.Panic, Memory.Allocate]:
+            coverage: mutable darray[u64] = []
+            for _ in 0..<((scratch_loop.capacity + 63) / 64) |coverage|:
+                coverage.push(0)
+            preheader_end: LLVMValueRef = get LLVMGetBasicBlockTerminator(scratch_loop.preheader) else return coverage
+            latch_end: LLVMValueRef = get LLVMGetBasicBlockTerminator(scratch_loop.latch) else return coverage
+            for store in scratch.stores |coverage, scratch, scratch_loop, input, trip, preheader_end, latch_end|:
+                if ElisaLLVMInstructionDominates(input.analyses, store, preheader_end) != 0:
+                    coverage <- mark_store(coverage, store, scratch, scratch_loop, input, null)
+                elif ElisaLLVMLoopContainsBlock(scratch_loop.loop, LLVMGetInstructionParent(store)) != 0 and ElisaLLVMInstructionDominates(input.analyses, store, scratch_loop.exit) != 0 and ElisaLLVMInstructionDominates(input.analyses, store, latch_end) != 0:
+                    for step in 0..=trip |coverage, store, scratch, scratch_loop, input|:
+                        coverage <- mark_store(coverage, store, scratch, scratch_loop, input, ElisaLLVMScalarEvolutionConstantOf(input.analyses, LLVMTypeOf(input.argument), step))
+            coverage
+
+        # BLOCK's instructions walked with COVERAGE: false when it holds the copy and the
+        # copy's BYTES are not all written, else the coverage after its buffer stores.
+        def walk_scratch_block(block: LLVMBasicBlockRef, coverage: mutable darray[u64], scratch: ScratchCopy&, scratch_loop: ScratchLoop&, input: ScratchInput, bytes: u64, last: ElisaScalarEvolutionExpressionRef) -> darray[u64]? can[Abort.Panic, Memory.Allocate]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, coverage, scratch, scratch_loop, input, bytes, last|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if instruction == scratch.copy:
+                    for position in 0..<bytes |coverage|:
+                        return null if not is_byte_covered(&coverage, position)
+                    return coverage
+                if contains_value(&scratch.stores, instruction):
+                    coverage <- mark_store(coverage, instruction, scratch, scratch_loop, input, last)
+            coverage
+
+        # Whether, at the input, every path from the loop's exit writes all the bytes the copy
+        # reads before it runs.
+        def is_input_covered(scratch: ScratchCopy&, scratch_loop: ScratchLoop&, input: ScratchInput) -> bool can[Abort.Panic, Memory.Allocate]:
+            trip: u64 = get evaluate_scratch_expression(scratch_loop.iterations, input, scratch_loop.loop, null) else return false
+            bytes: u64 = get evaluate_scratch_value(LLVMGetOperand(scratch.copy, 2), input) else return false
+            return false if trip >= CopiedScratchLimit::TRIPS or bytes > scratch_loop.capacity
+            last: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionConstantOf(input.analyses, LLVMTypeOf(input.argument), trip)
+            copy_block: LLVMBasicBlockRef = LLVMGetInstructionParent(scratch.copy)
+            pending: mutable darray[CoveragePath] = [CoveragePath{block: scratch_loop.target, coverage: initialized_coverage(scratch, scratch_loop, input, trip)}]
+            work: mutable u32 = 0
+            while pending.count > 0 |pending, work, scratch, scratch_loop, input, bytes, last, copy_block|:
+                path: CoveragePath = pending.pop()
+                work <- work + 1
+                return false if work > CopiedScratchLimit::PATH_BLOCKS or ElisaLLVMLoopContainsBlock(scratch_loop.loop, path.block) != 0
+                coverage: darray[u64] = get walk_scratch_block(path.block, path.coverage, scratch, scratch_loop, input, bytes, last) else return false
+                continue if path.block == copy_block
+                terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(path.block) else return false
+                taken: bool? = decided_scratch_condition(LLVMGetCondition(terminator), input) if LLVMGetInstructionOpcode(terminator) == LLVMOpcode::CONDITIONAL_BR else null
+                for edge in 0..<LLVMGetNumSuccessors(terminator) |pending, coverage, input, copy_block, terminator, taken|:
+                    if taken is decided:
+                        continue if decided != (edge == 0)
+                    target: LLVMBasicBlockRef = LLVMGetSuccessor(terminator, edge)
+                    if ElisaLLVMBlockIsPotentiallyReachableWithin(input.analyses, target, copy_block, 0) != 0:
+                        pending.push(CoveragePath{block: target, coverage: copied_coverage(&coverage)})
+            true

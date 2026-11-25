@@ -187,6 +187,14 @@ uint64_t ElisaLLVMConstantRangeLower(ElisaConstantRangeRef range) { return unwra
 
 uint64_t ElisaLLVMConstantRangeUpper(ElisaConstantRangeRef range) { return unwrap(range)->getUpper().getZExtValue(); }
 
+LLVMValueRef ElisaLLVMConstantRangeLowerBound(ElisaConstantRangeRef range, LLVMContextRef context) {
+  return wrap(ConstantInt::get(*unwrap(context), unwrap(range)->getLower()));
+}
+
+LLVMValueRef ElisaLLVMConstantRangeUpperBound(ElisaConstantRangeRef range, LLVMContextRef context) {
+  return wrap(ConstantInt::get(*unwrap(context), unwrap(range)->getUpper()));
+}
+
 ElisaConstantRangeRef ElisaLLVMConstantRangeEmpty(uint32_t width) {
   return wrap(new ConstantRange(ConstantRange::getEmpty(width)));
 }

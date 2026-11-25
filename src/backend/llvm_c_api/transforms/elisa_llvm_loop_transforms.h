@@ -39,6 +39,10 @@ int ElisaLLVMCanPeelLoop(ElisaLoopRef loop);
 void ElisaLLVMPeelLoop(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop, uint32_t count,
                        int peel_last, int preserve_lcssa);
 
+/* SplitEdge(from, to, DT, LI): the block placed on the edge, with the dominator tree and
+ * loop info updated, or null when the edge cannot be split. */
+LLVMBasicBlockRef ElisaLLVMSplitEdgeKeepingLoops(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef from,
+                                                 LLVMBasicBlockRef to);
 /* SplitBlock(block of `instruction`, instruction, DT, LI, nullptr, name): the new block
  * holds the instruction and everything after it. Updates the dominator tree and loop
  * info. */

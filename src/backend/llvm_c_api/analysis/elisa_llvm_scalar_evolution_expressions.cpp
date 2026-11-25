@@ -69,6 +69,56 @@ LLVMValueRef ElisaLLVMScalarEvolutionExpressionValue(ElisaScalarEvolutionExpress
   return nullptr;
 }
 
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionOfValue(ElisaFunctionAnalysesRef analyses,
+                                                                  LLVMValueRef value) {
+  return wrapExpression(unwrapAnalyses(analyses)->scalarEvolution().getSCEV(unwrap(value)));
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionConstantOf(ElisaFunctionAnalysesRef analyses,
+                                                                     LLVMTypeRef type, uint64_t value) {
+  return wrapExpression(unwrapAnalyses(analyses)->scalarEvolution().getConstant(unwrap(type), value));
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionRewriteValue(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression, LLVMValueRef value,
+    ElisaScalarEvolutionExpressionRef replacement) {
+  ValueToSCEVMapTy Bindings;
+  Bindings[unwrap(value)] = unwrapExpression(replacement);
+  return wrapExpression(SCEVParameterRewriter::rewrite(
+      unwrapExpression(expression), unwrapAnalyses(analyses)->scalarEvolution(), Bindings));
+}
+
+ElisaLoopRef ElisaLLVMScalarEvolutionRecurrenceLoop(ElisaScalarEvolutionExpressionRef expression) {
+  auto *Recurrence = dyn_cast<SCEVAddRecExpr>(unwrapExpression(expression));
+  return Recurrence ? wrapLoop(const_cast<Loop *>(Recurrence->getLoop())) : nullptr;
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionEvaluateAtIteration(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef recurrence,
+    ElisaScalarEvolutionExpressionRef iteration) {
+  return wrapExpression(cast<SCEVAddRecExpr>(unwrapExpression(recurrence))
+                            ->evaluateAtIteration(unwrapExpression(iteration),
+                                                  unwrapAnalyses(analyses)->scalarEvolution()));
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionApplyLoopGuards(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression, ElisaLoopRef loop) {
+  return wrapExpression(unwrapAnalyses(analyses)->scalarEvolution().applyLoopGuards(
+      unwrapExpression(expression), unwrapLoop(loop)));
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionPointerBase(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression) {
+  return wrapExpression(unwrapAnalyses(analyses)->scalarEvolution().getPointerBase(
+      unwrapExpression(expression)));
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionRemovePointerBase(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression) {
+  return wrapExpression(unwrapAnalyses(analyses)->scalarEvolution().removePointerBase(
+      unwrapExpression(expression)));
+}
+
 ElisaConstantRangeRef ElisaLLVMScalarEvolutionExpressionUnsignedRange(
     ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef expression) {
   ConstantRange Range =

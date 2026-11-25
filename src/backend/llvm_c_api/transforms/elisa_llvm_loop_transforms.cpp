@@ -74,6 +74,12 @@ void ElisaLLVMPeelLoop(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop, uin
            *A->dominators, &A->assumptionCache(), preserve_lcssa != 0, Map);
 }
 
+LLVMBasicBlockRef ElisaLLVMSplitEdgeKeepingLoops(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef from,
+                                                 LLVMBasicBlockRef to) {
+  FunctionAnalyses *A = unwrapAnalyses(analyses);
+  return wrap(SplitEdge(unwrap(from), unwrap(to), A->dominators.get(), &A->loops()));
+}
+
 LLVMBasicBlockRef ElisaLLVMSplitBlockKeepingLoops(ElisaFunctionAnalysesRef analyses,
                                                   LLVMValueRef instruction, const char *name) {
   FunctionAnalyses *A = unwrapAnalyses(analyses);

@@ -192,6 +192,12 @@ LLVMValueRef ElisaLLVMEmitGEPOffset(LLVMBuilderRef builder, LLVMValueRef gep) {
                             /*NoAssumptions=*/true));
 }
 
+void ElisaLLVMReplaceUsesExceptUser(LLVMValueRef value, LLVMValueRef replacement, LLVMValueRef excluded_user) {
+  User *Excluded = cast<User>(unwrap(excluded_user));
+  unwrap(value)->replaceUsesWithIf(unwrap(replacement),
+                                   [Excluded](Use &Use) { return Use.getUser() != Excluded; });
+}
+
 void ElisaLLVMSwapSuccessors(LLVMValueRef branch) {
   cast<CondBrInst>(unwrap(branch))->swapSuccessors();
 }

@@ -8,12 +8,6 @@
 #define ELISA_MODULE_PASS_ENTRY(EntryName, Pass)                                          \
   extern "C" unsigned EntryName(LLVMModuleRef Module) { return Pass(*unwrap(Module)); }
 
-ELISA_MODULE_PASS_ENTRY(elisacoreEliminateCopiedScratch, ElisaCopiedScratch::eliminate)
-ELISA_MODULE_PASS_ENTRY(elisacoreEliminateFullArrayInitializers,
-                        ElisaCopiedScratch::eliminateFullArrayInitializers)
-ELISA_MODULE_PASS_ENTRY(elisacoreForwardLoopLoads, ElisaCopiedScratch::forwardLoopLoads)
-ELISA_MODULE_PASS_ENTRY(elisacoreAnnotateArrayValueRangesEntry,
-                        ElisaArrayRanges::annotateArrayValueRanges)
 ELISA_MODULE_PASS_ENTRY(elisacoreRemoveIndexedPrefixFillsOnly,
                         ElisaIndexedPrefix::removeIndexedPrefixFills)
 ELISA_MODULE_PASS_ENTRY(elisacoreAnnotateValidatedReads, ElisaValidatedReads::annotateValidatedReads)
