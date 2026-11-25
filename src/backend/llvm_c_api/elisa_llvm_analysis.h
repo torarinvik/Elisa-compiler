@@ -96,6 +96,9 @@ int ElisaLLVMHasMetadataOtherThanDebugLoc(LLVMValueRef instruction);
 /* llvm::FindInsertedValue(aggregate, {index}): the value inserted at the top-level
  * index, or null when it is not known (or the value is not a struct or array). */
 LLVMValueRef ElisaLLVMFindInsertedValue(LLVMValueRef aggregate, uint32_t index);
+/* llvm::FindInsertedValue(aggregate, indices): the value inserted at the index path
+ * (an extractvalue's indices), or null when it is not known. */
+LLVMValueRef ElisaLLVMFindInsertedValueAt(LLVMValueRef aggregate, const uint32_t *indices, uint32_t count);
 /* GlobalVariable::hasDefinitiveInitializer: an initializer no other definition can replace. */
 int ElisaLLVMGlobalHasDefinitiveInitializer(LLVMValueRef global);
 /* PatternMatch's m_One() and m_Zero(): an integer constant, or a vector

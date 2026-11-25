@@ -1,0 +1,220 @@
+# Ranges of stepped and shrinking loop values for the signed-check prover (the C++
+# `ElisaCheckedLoopRanges`, second part). A value each iteration keeps or moves by a
+# constant where a guard bounds it (a stack's top: pushed while below its capacity,
+# popped while above zero) stays in a hull of its start and those guards' constants,
+# checked by induction over every path to the latch. A value with a nonnegative start
+# that every iteration keeps or moves toward zero (divided by at least one, or less such a
+# quotient of itself: `x - x / f`) stays between zero and its start. A phi inside one
+# iteration takes one of its incoming values, each bounded where the phi is.
+include "./loop_counters.elisa"
+
+const module LoopStepLimit:
+    STEPS: u64 = 4
+    SHRINK_DEPTH: u32 = 6
+
+# The minuend and subtrahend of a subtraction.
+struct Subtraction:
+    whole: LLVMValueRef
+    part: LLVMValueRef
+
+# One path's step of a stepped phi: its constant offset and the guard's range for the phi
+# where the step is taken (owned).
+struct GuardedStep:
+    offset: LLVMValueRef
+    guard: ElisaConstantRangeRef
+
+extend Backend:
+    public:
+        # `m_c_Add(m_Specific(phi), m_APInt(offset))`: the constant offset.
+        def constant_offset_of(leaf: LLVMValueRef, phi: LLVMValueRef) -> LLVMValueRef?:
+            return null if LLVMIsABinaryOperator(leaf) == null or LLVMGetInstructionOpcode(leaf) != LLVMOpcode::ADD
+            left: LLVMValueRef = LLVMGetOperand(leaf, 0)
+            right: LLVMValueRef = LLVMGetOperand(leaf, 1)
+            return right if left == phi and LLVMIsAConstantInt(right) != null
+            return left if right == phi and LLVMIsAConstantInt(left) != null
+            null
+
+        def dispose_steps(steps: darray[GuardedStep]&) -> void:
+            for step in steps:
+                ElisaLLVMDisposeConstantRange(step.guard)
+
+        # Whether every step from inside [LOW, HIGH] lands inside it again.
+        def is_inductive(low: LLVMValueRef, high: LLVMValueRef, steps: darray[GuardedStep]&, width: u32) -> bool:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(low))
+            wide: u32 = width + 1
+            for step in steps |low, high, context, wide|:
+                before: ElisaConstantRangeRef = signed_intersection(nonempty_range(low, plus_one(high)), ElisaLLVMConstantRangeCopy(step.guard))
+                if not is_empty_range(before):
+                    if is_sign_wrapped(before):
+                        ElisaLLVMDisposeConstantRange(before)
+                        return false
+                    offset: LLVMValueRef = ElisaLLVMConstantIntSignExtend(step.offset, wide)
+                    least: LLVMValueRef = LLVMConstAdd(ElisaLLVMConstantIntSignExtend(signed_minimum(before, context), wide), offset)
+                    most: LLVMValueRef = LLVMConstAdd(ElisaLLVMConstantIntSignExtend(signed_maximum(before, context), wide), offset)
+                    ElisaLLVMDisposeConstantRange(before)
+                    return false if compares(LLVMIntPredicate::SLT, least, ElisaLLVMConstantIntSignExtend(low, wide)) or compares(LLVMIntPredicate::SGT, most, ElisaLLVMConstantIntSignExtend(high, wide))
+                else:
+                    ElisaLLVMDisposeConstantRange(before)
+            true
+
+        # The narrowest inductive hull [low, high] of the candidate BOUNDS around START.
+        def narrowest_inductive_hull(start: ElisaConstantRangeRef, bounds: darray[LLVMValueRef]&, steps: darray[GuardedStep]&, width: u32) -> ElisaConstantRangeRef?:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(bounds[0]))
+            least: LLVMValueRef = signed_minimum(start, context)
+            most: LLVMValueRef = signed_maximum(start, context)
+            best: mutable ElisaConstantRangeRef? = null
+            for low in bounds |best, bounds, steps, width, least, most, context|:
+                for high in bounds |best, low, steps, width, least, most, context|:
+                    if compares(LLVMIntPredicate::SLE, low, least) and compares(LLVMIntPredicate::SGE, high, most) and not is_signed_maximum(high):
+                        narrower: mutable bool = true
+                        if best is current:
+                            narrower <- compares(LLVMIntPredicate::ULT, LLVMConstSub(high, low), LLVMConstSub(signed_maximum(current, context), signed_minimum(current, context)))
+                        if narrower and is_inductive(low, high, steps, width):
+                            if best is previous:
+                                ElisaLLVMDisposeConstantRange(previous)
+                            best <- nonempty_range(low, plus_one(high))
+            best
+
+        # The steps of a stepped phi's leaves and the bounds they suggest; null when a leaf
+        # is not `phi + constant` or there are more than four.
+        def guarded_steps(phi: LLVMValueRef, leaves: darray[LLVMValueRef]&, bounds: mutable darray[LLVMValueRef]&, search: mutable RangeSearch&) -> darray[GuardedStep]? can[Abort.Panic, Memory.Allocate]:
+            steps: mutable darray[GuardedStep] = []
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(phi))
+            for leaf in leaves |steps, bounds, phi, search, context|:
+                if leaf != phi:
+                    offset: LLVMValueRef? = constant_offset_of(leaf, phi)
+                    if steps.count.u64() == LoopStepLimit::STEPS or offset == null:
+                        dispose_steps(&steps)
+                        return null
+                    amount: LLVMValueRef = offset
+                    guard: ElisaConstantRangeRef = guard_fact_on(leaf, phi, search)
+                    steps.push(GuardedStep{offset: amount, guard: guard})
+                    inverse: ElisaConstantRangeRef = ElisaLLVMConstantRangeInverse(guard)
+                    if single_element(inverse, context) is excluded:
+                        bounds.push(excluded)
+                    elif not is_full_range(guard) and not is_sign_wrapped(guard):
+                        bounds.push(LLVMConstAdd(signed_minimum(guard, context), amount))
+                        bounds.push(LLVMConstAdd(signed_maximum(guard, context), amount))
+                    ElisaLLVMDisposeConstantRange(inverse)
+            steps
+
+        # `steppedRange`: the narrowest hull of the start and the guards' constants that
+        # every path keeps a stepped header phi in.
+        def stepped_range(phi: LLVMValueRef, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            shape: LoopHeader = get header_of(phi, search.analyses) else return null
+            return null if LLVMGetTypeKind(LLVMTypeOf(phi)) != LLVMTypeKindValue::INTEGER
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(phi))
+            leaves: darray[LLVMValueRef] = get back_edge_leaves(incoming_from(phi, shape.latch), phi, search.analyses) else return null
+            at_header: mutable RangeFacts = facts_at(first_non_phi(ElisaLLVMLoopHeader(shape.owner)), search)
+            start: ElisaConstantRangeRef = range_of(incoming_from(phi, shape.entry), &at_header, search, depth)
+            dispose_facts(&at_header)
+            if is_empty_range(start) or is_full_range(start) or is_sign_wrapped(start):
+                ElisaLLVMDisposeConstantRange(start)
+                return null
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(phi))
+            bounds: mutable darray[LLVMValueRef] = [signed_minimum(start, context), signed_maximum(start, context)]
+            result: mutable ElisaConstantRangeRef? = null
+            if guarded_steps(phi, &leaves, &bounds, search) is steps:
+                if steps.count > 0:
+                    result <- narrowest_inductive_hull(start, &bounds, &steps, width)
+                dispose_steps(&steps)
+            ElisaLLVMDisposeConstantRange(start)
+            result
+
+        # The dividend of `value sdiv divisor` when the divisor is at least one where the
+        # division is.
+        def shrinking_quotient(value: LLVMValueRef, search: mutable RangeSearch&, depth: u32) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            return null if LLVMIsABinaryOperator(value) == null or LLVMGetInstructionOpcode(value) != LLVMOpcode::SDIV
+            where: mutable RangeFacts = facts_at(value, search)
+            divisors: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 1), &where, search, depth)
+            dispose_facts(&where)
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(value))
+            positive: bool = not is_empty_range(divisors) and compares(LLVMIntPredicate::SGE, signed_minimum(divisors, context), LLVMConstInt(LLVMTypeOf(value), 1, 0))
+            ElisaLLVMDisposeConstantRange(divisors)
+            return null if not positive
+            LLVMGetOperand(value, 0)
+
+        # The minuend and subtrahend of `whole - part`, checked (signed or unsigned) or not.
+        def subtraction_parts(leaf: LLVMValueRef, intrinsics: CheckedIntrinsics&) -> Subtraction? can[Abort.Panic]:
+            if is_first_field(leaf):
+                checked: LLVMValueRef = LLVMGetOperand(leaf, 0)
+                if LLVMIsAIntrinsicInst(checked) != null:
+                    identifier: u32 = called_intrinsic_id(checked)
+                    if identifier == intrinsics.signed_subtract or identifier == intrinsics.unsigned_subtract:
+                        return Subtraction{whole: LLVMGetOperand(checked, 0), part: LLVMGetOperand(checked, 1)}
+            return null if LLVMIsABinaryOperator(leaf) == null or LLVMGetInstructionOpcode(leaf) != LLVMOpcode::SUB
+            Subtraction{whole: LLVMGetOperand(leaf, 0), part: LLVMGetOperand(leaf, 1)}
+
+        # `shrinks`: whether LEAF lies in [0, BASE] whenever BASE is nonnegative.
+        def shrinks(leaf: LLVMValueRef, base: LLVMValueRef, search: mutable RangeSearch&, depth: u32, level: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if leaf == base
+            return false if LLVMIsAInstruction(leaf) == null or level > LoopStepLimit::SHRINK_DEPTH
+            if shrinking_quotient(leaf, search, depth) is dividend:
+                return shrinks(dividend, base, search, depth, level + 1)
+            if subtraction_parts(leaf, &search.intrinsics) is parts:
+                quotient_dividend: LLVMValueRef = get shrinking_quotient(parts.part, search, depth) else return false
+                return quotient_dividend == parts.whole and shrinks(parts.whole, base, search, depth, level + 1)
+            return false if not is_llvm_instruction_with_opcode(leaf, LLVMOpcode::PHI)
+            if header_of(leaf, search.analyses) is shape:
+                return false if not shrinks(incoming_from(leaf, shape.entry), base, search, depth, level + 1)
+                leaves: darray[LLVMValueRef] = get back_edge_leaves(incoming_from(leaf, shape.latch), leaf, search.analyses) else return false
+                for inner in leaves |leaf, search, depth, level|:
+                    return false if not shrinks(inner, leaf, search, depth, level + 1)
+                return true
+            for incoming in 0..<LLVMCountIncoming(leaf) |leaf, base, search, depth, level|:
+                return false if not shrinks(LLVMGetIncomingValue(leaf, incoming), base, search, depth, level + 1)
+            true
+
+        # `shrinkingRange`: [0, start] for a header phi from a nonnegative start whose every
+        # iteration shrinks it.
+        def shrinking_range(phi: LLVMValueRef, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            shape: LoopHeader = get header_of(phi, search.analyses) else return null
+            return null if LLVMGetTypeKind(LLVMTypeOf(phi)) != LLVMTypeKindValue::INTEGER
+            at_header: mutable RangeFacts = facts_at(first_non_phi(ElisaLLVMLoopHeader(shape.owner)), search)
+            start: ElisaConstantRangeRef = range_of(incoming_from(phi, shape.entry), &at_header, search, depth)
+            dispose_facts(&at_header)
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(phi))
+            if is_empty_range(start) or is_sign_wrapped(start) or ElisaLLVMConstantIntIsNegative(signed_minimum(start, context)) != 0:
+                ElisaLLVMDisposeConstantRange(start)
+                return null
+            most: LLVMValueRef = signed_maximum(start, context)
+            ElisaLLVMDisposeConstantRange(start)
+            leaves: darray[LLVMValueRef] = get back_edge_leaves(incoming_from(phi, shape.latch), phi, search.analyses) else return null
+            for leaf in leaves |phi, search, depth|:
+                return null if not shrinks(leaf, phi, search, depth, 0)
+            nonempty_range(LLVMConstInt(LLVMTypeOf(phi), 0, 0), plus_one(most))
+
+        # `headerRange`: a header phi's range under every shape that bounds it.
+        def header_range(phi: LLVMValueRef, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            summed: ElisaConstantRangeRef? = summed_range(phi, search, depth)
+            stepped: ElisaConstantRangeRef? = stepped_range(phi, search, depth)
+            if summed is sum_range:
+                if stepped is step_range:
+                    return signed_intersection(sum_range, step_range)
+                return sum_range
+            if stepped is step_range:
+                return step_range
+            shrinking_range(phi, search, depth)
+
+        # `joinRange`: the range a stepped header phi carries when JOIN feeds it, else the
+        # hull of JOIN's incoming values where it is.
+        def join_range(join: LLVMValueRef, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(join)
+            while use_cursor is use |use_cursor, join, search, depth|:
+                use_cursor <- LLVMGetNextUse(use)
+                carrier: LLVMValueRef = LLVMGetUser(use)
+                if carrier != join and is_llvm_instruction_with_opcode(carrier, LLVMOpcode::PHI):
+                    if header_of(carrier, search.analyses) is shape:
+                        if incoming_from(carrier, shape.latch) == join:
+                            if stepped_range(carrier, search, depth) is carried:
+                                return carried
+            here: mutable RangeFacts = facts_at(join, search)
+            hull: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeEmpty(LLVMGetIntTypeWidth(LLVMTypeOf(join)))
+            for incoming in 0..<LLVMCountIncoming(join) |hull, here, join, search, depth|:
+                hull <- signed_union(hull, range_of(LLVMGetIncomingValue(join, incoming), &here, search, depth))
+                if is_full_range(hull):
+                    ElisaLLVMDisposeConstantRange(hull)
+                    dispose_facts(&here)
+                    return null
+            dispose_facts(&here)
+            hull

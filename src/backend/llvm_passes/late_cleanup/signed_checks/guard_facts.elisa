@@ -1,0 +1,208 @@
+# The ranges the guards dominating an instruction give values (the C++
+# `ElisaCheckedSignedRanges::collect`, `dominatingBounds` and `directFact`). A branch edge
+# that dominates the instruction narrows each value its condition compares with a
+# constant, through `and`/`or` and boolean selects, an added constant and `abs`. Only
+# values the guard and the instruction see alike count: values that cannot be undefined,
+# not redefined between them, and parameters the caller may freeze.
+include "./range_facts.elisa"
+include "../../../llvm_c_api/elisa_llvm_analysis.elisa"
+
+const module GuardSearchLimit:
+    GUARDS: u32 = 96
+    REEXECUTION_BLOCKS: u32 = 256
+    UNSTABLE_LOAD_BOUND: i64 = 32
+
+# The state of one walk over the guards: the conditions it may still visit, the parameters
+# whose facts need freezing (when collected), the unstable loads worth freezing (when
+# collected), and the one value it is about (when it is about one).
+struct GuardSearch:
+    budget: mutable u32
+    collects_parameters: bool
+    parameters: mutable darray[LLVMValueRef]
+    collects_loads: bool
+    unstable_loads: mutable darray[LLVMValueRef]
+    only: LLVMValueRef?
+
+# Parameters whose facts a proof may use once they are frozen, in insertion order; only
+# collected when `collects` is set (a null `SmallPtrSetImpl<Argument *> *` otherwise).
+struct ParameterSet:
+    collects: bool
+    values: mutable darray[LLVMValueRef]
+
+# A compared value and the range an edge gives it (owned).
+struct ComparedRegion:
+    input: LLVMValueRef
+    range: ElisaConstantRangeRef
+
+# Where a guard's condition is read: the branch, the edge's target, and the analyses.
+struct GuardEdge:
+    branch: LLVMValueRef
+    target: LLVMBasicBlockRef
+    analyses: ElisaFunctionAnalysesRef
+    intrinsics: CheckedIntrinsics
+
+extend Backend:
+    public:
+        def guard_search(collects_parameters: bool, collects_loads: bool, only: LLVMValueRef?) -> GuardSearch:
+            GuardSearch{budget: GuardSearchLimit::GUARDS, collects_parameters: collects_parameters, parameters: [], collects_loads: collects_loads, unstable_loads: [], only: only}
+
+        def add_once(values: mutable darray[LLVMValueRef]&, value: LLVMValueRef) -> void can[Memory.Allocate]:
+            values.push(value) if not contains_value(values, value)
+
+        # `mayReexecute`: whether walking back from DEFINITION reaches the edge's target
+        # (or more than 256 blocks), so the value may change between guard and use.
+        def may_reexecute(definition: LLVMBasicBlockRef, edge_target: LLVMBasicBlockRef) -> bool can[Memory.Allocate]:
+            pending: mutable darray[LLVMBasicBlockRef] = [definition]
+            visited: mutable darray[LLVMBasicBlockRef] = []
+            while pending.count > 0 |pending, visited, edge_target|:
+                block: LLVMBasicBlockRef = pending.pop()
+                if not block_listed(visited, block):
+                    visited.push(block)
+                    return true if block == edge_target or visited.count.u32() > GuardSearchLimit::REEXECUTION_BLOCKS
+                    for predecessor in predecessor_edges(block) |pending, visited|:
+                        pending.push(predecessor) if not block_listed(visited, predecessor)
+            false
+
+        def block_listed(blocks: darray[LLVMBasicBlockRef]&, block: LLVMBasicBlockRef) -> bool:
+            any listed in blocks where listed == block
+
+        # `isStable`: not redefined after the edge, and never undefined there (a field of a
+        # frozen aggregate, or what `isGuaranteedNotToBeUndefOrPoison` proves).
+        def is_stable(input: LLVMValueRef, edge: GuardEdge&) -> bool can[Abort.Panic, Memory.Allocate]:
+            if LLVMIsAInstruction(input) != null:
+                return false if may_reexecute(LLVMGetInstructionParent(input), edge.target)
+            if is_llvm_instruction_with_opcode(input, LLVMOpcode::EXTRACT_VALUE):
+                return true if is_llvm_instruction_with_opcode(LLVMGetOperand(input, 0), LLVMOpcode::FREEZE)
+            ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(edge.analyses, input, edge.branch) != 0
+
+        def is_signed_maximum(constant: LLVMValueRef) -> bool:
+            type: LLVMTypeRef = LLVMTypeOf(constant)
+            constant == ElisaLLVMConstantIntLowBits(type, LLVMGetIntTypeWidth(type) - 1)
+
+        # The compared value and its range on the edge: the exact region of the compare,
+        # less an added constant, or `[-K, K]` for `abs(x) <= K`.
+        def compared_region(compare: LLVMValueRef, taken: bool, edge: GuardEdge&) -> ComparedRegion? can[Abort.Panic]:
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if LLVMIsAConstantInt(limit) == null
+            input: mutable LLVMValueRef = LLVMGetOperand(compare, 0)
+            predicate: i32 = LLVMGetICmpPredicate(compare) if taken else inverse_predicate(LLVMGetICmpPredicate(compare))
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(predicate, limit)
+            if LLVMIsABinaryOperator(input) != null and LLVMGetInstructionOpcode(input) == LLVMOpcode::ADD:
+                offset: LLVMValueRef = LLVMGetOperand(input, 1)
+                if LLVMIsAConstantInt(offset) != null:
+                    shifted: ElisaConstantRangeRef = ElisaLLVMConstantRangeSubtract(range, offset)
+                    ElisaLLVMDisposeConstantRange(range)
+                    range <- shifted
+                    input <- LLVMGetOperand(input, 0)
+            if LLVMIsAIntrinsicInst(input) != null and called_intrinsic_id(input) == edge.intrinsics.absolute and predicate == LLVMIntPredicate::ULE:
+                if ElisaLLVMConstantIntIsNegative(limit) == 0 and not is_signed_maximum(limit):
+                    ElisaLLVMDisposeConstantRange(range)
+                    range <- ElisaLLVMConstantRangeFromBounds(LLVMConstNeg(limit), plus_one(limit))
+                    input <- LLVMGetOperand(input, 0)
+            ComparedRegion{input: input, range: range}
+
+        # Whether an unstable load is worth freezing: a simple i32 load the edge bounds
+        # within [-32, 32] and that is not redefined after it.
+        def is_freezable_load(input: LLVMValueRef, range: ElisaConstantRangeRef, edge: GuardEdge&) -> bool can[Memory.Allocate]:
+            return false if LLVMIsALoadInst(input) == null or LLVMGetTypeKind(LLVMTypeOf(input)) != LLVMTypeKindValue::INTEGER or LLVMGetIntTypeWidth(LLVMTypeOf(input)) != 32
+            return false if not is_simple_access(input) or is_empty_range(range)
+            bound: i64 = GuardSearchLimit::UNSTABLE_LOAD_BOUND
+            return false if ElisaLLVMConstantRangeSignedMin(range) < -bound or ElisaLLVMConstantRangeSignedMax(range) > bound
+            not may_reexecute(LLVMGetInstructionParent(input), edge.target)
+
+        # Records the region for the one value the search is about, when it can.
+        def record_only_fact(region: ComparedRegion, only: LLVMValueRef, edge: GuardEdge&, facts: mutable RangeFacts&, search: mutable GuardSearch&) -> void can[Abort.Panic, Memory.Allocate]:
+            if region.input != only:
+                ElisaLLVMDisposeConstantRange(region.range)
+                return
+            if LLVMIsAArgument(region.input) != null:
+                if not is_stable(region.input, edge):
+                    if not search.collects_parameters:
+                        ElisaLLVMDisposeConstantRange(region.range)
+                        return
+                    add_once(search.parameters, region.input)
+            elif not never_undefined(region.input, &edge.intrinsics):
+                ElisaLLVMDisposeConstantRange(region.range)
+                return
+            add_fact(facts, region.input, region.range)
+
+        # Records the region when the guard and its uses see the same value.
+        def record_fact(region: ComparedRegion, edge: GuardEdge&, facts: mutable RangeFacts&, search: mutable GuardSearch&) -> void can[Abort.Panic, Memory.Allocate]:
+            if LLVMIsAArgument(region.input) != null and search.collects_parameters and not is_stable(region.input, edge):
+                add_once(search.parameters, region.input)
+            elif not is_stable(region.input, edge):
+                if search.collects_loads and is_freezable_load(region.input, region.range, edge):
+                    add_once(search.unstable_loads, region.input)
+                ElisaLLVMDisposeConstantRange(region.range)
+                return
+            add_fact(facts, region.input, region.range)
+
+        # `collect`: the facts CONDITION gives when it is TAKEN on the edge.
+        def collect_guard(condition: LLVMValueRef, taken: bool, edge: GuardEdge&, facts: mutable RangeFacts&, search: mutable GuardSearch&) -> void can[Abort.Panic, Memory.Allocate]:
+            if search.budget == 0:
+                return
+            search.budget <- search.budget - 1
+            if LLVMIsABinaryOperator(condition) != null:
+                opcode: u32 = LLVMGetInstructionOpcode(condition)
+                if (opcode == LLVMOpcode::OR and not taken) or (opcode == LLVMOpcode::AND and taken):
+                    collect_guard(LLVMGetOperand(condition, 0), taken, edge, facts, search)
+                    collect_guard(LLVMGetOperand(condition, 1), taken, edge, facts, search)
+                return
+            if is_llvm_instruction_with_opcode(condition, LLVMOpcode::SELECT):
+                collect_select_guard(condition, taken, edge, facts, search)
+                return
+            if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP):
+                return
+            region: ComparedRegion = get compared_region(condition, taken, edge) else return
+            if search.only is only:
+                record_only_fact(region, only, edge, facts, search)
+                return
+            record_fact(region, edge, facts, search)
+
+        # A boolean select `c ? 1 : x` or `c ? x : 1` read as `or`/`and` of its parts.
+        def collect_select_guard(choice: LLVMValueRef, taken: bool, edge: GuardEdge&, facts: mutable RangeFacts&, search: mutable GuardSearch&) -> void can[Abort.Panic, Memory.Allocate]:
+            true_value: LLVMValueRef = LLVMGetOperand(choice, 1)
+            false_value: LLVMValueRef = LLVMGetOperand(choice, 2)
+            if LLVMIsAConstantInt(true_value) != null and (ElisaLLVMIsConstantOne(true_value) != 0) != taken:
+                collect_guard(LLVMGetOperand(choice, 0), false, edge, facts, search)
+                collect_guard(false_value, taken, edge, facts, search)
+            elif LLVMIsAConstantInt(false_value) != null and (ElisaLLVMIsConstantOne(false_value) != 0) != taken:
+                collect_guard(LLVMGetOperand(choice, 0), true, edge, facts, search)
+                collect_guard(true_value, taken, edge, facts, search)
+
+        # The facts of every branch edge dominating POINT, walking up its dominators while
+        # the search has budget.
+        def collect_dominating_guards(point: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, intrinsics: CheckedIntrinsics, facts: mutable RangeFacts&, search: mutable GuardSearch&) -> void can[Abort.Panic, Memory.Allocate]:
+            home: LLVMBasicBlockRef = LLVMGetInstructionParent(point)
+            if ElisaLLVMIsReachableFromEntry(analyses, home) == 0:
+                return
+            cursor: mutable LLVMBasicBlockRef? = home
+            while search.budget > 0 and cursor is block |cursor, search, facts, home, analyses, intrinsics|:
+                cursor <- ElisaLLVMImmediateDominator(analyses, block)
+                if LLVMGetBasicBlockTerminator(block) is branch:
+                    if LLVMGetInstructionOpcode(branch) == LLVMOpcode::CONDITIONAL_BR and LLVMGetSuccessor(branch, 0) != LLVMGetSuccessor(branch, 1):
+                        for edge_index in 0..<2 |branch, block, home, analyses, intrinsics, facts, search|:
+                            target: LLVMBasicBlockRef = LLVMGetSuccessor(branch, edge_index.u32())
+                            if ElisaLLVMEdgeDominates(analyses, block, target, home) != 0:
+                                edge: GuardEdge = GuardEdge{branch: branch, target: target, analyses: analyses, intrinsics: intrinsics}
+                                collect_guard(LLVMGetCondition(branch), edge_index == 0, &edge, facts, search)
+
+        # `dominatingBounds`: INCOMING plus the facts of the guards dominating POINT.
+        def dominating_bounds(point: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, intrinsics: CheckedIntrinsics, incoming: RangeFacts&, search: mutable GuardSearch&) -> RangeFacts can[Abort.Panic, Memory.Allocate]:
+            bounds: mutable RangeFacts = copied_facts(incoming)
+            collect_dominating_guards(point, analyses, intrinsics, &bounds, search)
+            bounds
+
+        # `directFact`: the guards' range for SUBJECT itself at POINT; the parameters that
+        # need freezing for it join PARAMETERS when it collects them.
+        def direct_fact(point: LLVMValueRef, subject: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, intrinsics: CheckedIntrinsics, parameters: mutable ParameterSet&) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            found: mutable RangeFacts = empty_facts()
+            search: mutable GuardSearch = guard_search(parameters.collects, false, subject)
+            collect_dominating_guards(point, analyses, intrinsics, &found, &search)
+            for parameter in search.parameters |parameters|:
+                add_once(parameters.values, parameter)
+            result: mutable ElisaConstantRangeRef? = fact_range(&found, subject)
+            dispose_facts(&found)
+            if result is range:
+                return range
+            ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(subject)))

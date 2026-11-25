@@ -6,6 +6,7 @@
 #define ELISA_LLVM_IR_EDITS_H
 
 #include <llvm-c/Core.h>
+#include <llvm-c/TargetMachine.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -36,6 +37,9 @@ void ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(LLVMValueRef value);
 /* llvm::removeUnreachableBlocks: deletes the blocks the function's entry
  * cannot reach; whether any was deleted. */
 int ElisaLLVMRemoveUnreachableBlocks(LLVMValueRef function);
+/* ConstantFoldTerminator(block, delete_dead_conditions): folds the block's
+ * terminator when its condition is a constant; whether it changed. */
+int ElisaLLVMConstantFoldTerminator(LLVMBasicBlockRef block, int delete_dead_conditions);
 
 /* llvm::CloneFunction with an empty value map: a copy of the function,
  * appended to its module. */
@@ -53,6 +57,10 @@ int ElisaLLVMInlineCall(LLVMValueRef call);
 /* llvm::isInlineViable: whether the function's body can be inlined at all
  * (no indirect branches, no `returns_twice` calls, no dynamic stack recovery). */
 int ElisaLLVMIsInlineViable(LLVMValueRef function);
+/* llvm::getAttributeBasedInliningDecision for the direct call, with the callee's
+ * TargetTransformInfo and the TargetLibraryInfo of a PassBuilder for `machine` (NULL:
+ * none): 0 when the attributes forbid inlining, 1 when they allow it or do not decide. */
+int ElisaLLVMAttributesAllowInlining(LLVMValueRef call, LLVMTargetMachineRef machine);
 
 /* llvm::SplitBlockAndInsertIfThenElse(condition, before): splits the block before
  * `before` and branches on `condition` to a new then block and else block that both

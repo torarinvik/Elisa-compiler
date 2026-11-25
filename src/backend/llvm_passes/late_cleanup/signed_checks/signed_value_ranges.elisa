@@ -1,0 +1,193 @@
+# The signed range of an integer value at a checked operation (the C++
+# `ElisaCheckedSignedRanges::rangeOf`). A value takes its range, in order of preference,
+# from the case being split on, the guard facts, a constant, a case's narrowing of
+# comparisons, selects and arithmetic, a cast, a bisection web, a freeze it sees through,
+# the arithmetic computing it, a loop's counter or carried value, and scalar evolution.
+# Every lookup spends one step of the search's budget, and a value nested 14 deep is full.
+include "./bisection_ranges.elisa"
+
+const module RangeSearchLimit:
+    DEPTH: u32 = 14
+    CARRIED_WIDTH: u32 = 64
+
+# The low bits fixed for one case of a case split (`Cases`), each with its constant.
+struct AssignedBits:
+    values: darray[LLVMValueRef]
+    constants: darray[LLVMValueRef]
+
+# One search for ranges in a function: its analyses, the steps left, the case being split
+# on, whether it may read the guards at loop-carried values' definitions (a C++ `Scope`),
+# the facts every point starts from, and the parameters whose guards it used.
+struct RangeSearch:
+    analyses: ElisaFunctionAnalysesRef
+    intrinsics: CheckedIntrinsics
+    range_kind: u32
+    budget: mutable u32
+    assigned: mutable AssignedBits
+    scoped: mutable bool
+    incoming: RangeFacts
+    parameters: mutable ParameterSet
+
+extend Backend:
+    public:
+        def no_assigned_bits() -> AssignedBits:
+            AssignedBits{values: [], constants: []}
+
+        def range_search(analyses: ElisaFunctionAnalysesRef, intrinsics: CheckedIntrinsics, range_kind: u32, incoming: RangeFacts) -> RangeSearch:
+            RangeSearch{analyses: analyses, intrinsics: intrinsics, range_kind: range_kind, budget: 0, assigned: no_assigned_bits(), scoped: false, incoming: incoming, parameters: ParameterSet{collects: false, values: []}}
+
+        def assigned_constant(assigned: AssignedBits&, value: LLVMValueRef) -> LLVMValueRef?:
+            for index in 0..<assigned.values.count |assigned, value|:
+                return assigned.constants[index] if assigned.values[index] == value
+            null
+
+        # `At`: the incoming facts and the guards dominating POINT, collecting the
+        # parameters they need frozen when the search collects them.
+        def facts_at(point: LLVMValueRef, search: mutable RangeSearch&) -> RangeFacts can[Abort.Panic, Memory.Allocate]:
+            guards: mutable GuardSearch = guard_search(search.parameters.collects, false, null)
+            bounds: RangeFacts = dominating_bounds(point, search.analyses, search.intrinsics, &search.incoming, &guards)
+            for parameter in guards.parameters |search|:
+                add_once(search.parameters.values, parameter)
+            bounds
+
+        # `On`: the guards' range for SUBJECT itself at POINT.
+        def guard_fact_on(point: LLVMValueRef, subject: LLVMValueRef, search: mutable RangeSearch&) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            direct_fact(point, subject, search.analyses, search.intrinsics, &search.parameters)
+
+        def is_loop_header(block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            if ElisaLLVMLoopForBlock(analyses, block) is owner:
+                return ElisaLLVMLoopHeader(owner) == block
+            false
+
+        # Within one case, comparisons and selects narrow, and arithmetic narrows with
+        # scalar evolution; null for every other value.
+        def case_range(value: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&, depth: u32, width: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            next: u32 = depth + 1
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::ICMP):
+                return ElisaLLVMConstantRangeFull(width) if LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(value, 0))) != LLVMTypeKindValue::INTEGER
+                left: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 0), bounds, search, next)
+                right: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 1), bounds, search, next)
+                predicate: i32 = LLVMGetICmpPredicate(value)
+                truth: LLVMTypeRef = LLVMTypeOf(value)
+                result: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(1)
+                if ElisaLLVMConstantRangeComparesTrue(predicate, left, right) != 0:
+                    ElisaLLVMDisposeConstantRange(result)
+                    result <- ElisaLLVMConstantRangeOfConstant(LLVMConstInt(truth, 1, 0))
+                elif ElisaLLVMConstantRangeComparesTrue(inverse_predicate(predicate), left, right) != 0:
+                    ElisaLLVMDisposeConstantRange(result)
+                    result <- ElisaLLVMConstantRangeOfConstant(LLVMConstInt(truth, 0, 0))
+                ElisaLLVMDisposeConstantRange(left)
+                ElisaLLVMDisposeConstantRange(right)
+                return result
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT):
+                condition: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 0), bounds, search, next)
+                known: LLVMValueRef? = single_element(condition, LLVMGetTypeContext(LLVMTypeOf(value)))
+                ElisaLLVMDisposeConstantRange(condition)
+                if known is bit:
+                    chosen: mutable u32 = 2
+                    if ElisaLLVMIsConstantOne(bit) != 0:
+                        chosen <- 1
+                    return range_of(LLVMGetOperand(value, chosen), bounds, search, next)
+                when_true: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 1), bounds, search, next)
+                return smallest_union(when_true, range_of(LLVMGetOperand(value, 2), bounds, search, next))
+            return ElisaLLVMConstantRangeFull(width) if width == 1
+            return null if LLVMIsABinaryOperator(value) == null
+            left: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 0), bounds, search, next)
+            combined: ElisaConstantRangeRef = range_operation(LLVMGetInstructionOpcode(value), left, range_of(LLVMGetOperand(value, 1), bounds, search, next))
+            signed_intersection(combined, ElisaLLVMScalarEvolutionSignedRange(search.analyses, value))
+
+        # An exact `lshr` or `udiv` by a constant of a nonnegative range: its quotient range
+        # with the least value rounded up; null when the dividend is not such a range.
+        def exact_quotient_range(value: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&, depth: u32, width: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            divisor: LLVMValueRef = LLVMGetOperand(value, 1)
+            dividend: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 0), bounds, search, depth + 1)
+            scale: mutable LLVMValueRef = divisor
+            if LLVMGetInstructionOpcode(value) == LLVMOpcode::LSHR:
+                scale <- ElisaLLVMConstantIntShiftLeft(LLVMConstInt(LLVMTypeOf(value), 1, 0), (LLVMConstIntGetZExtValue(divisor) % width.u64()).u32())
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(value))
+            result: mutable ElisaConstantRangeRef? = null
+            if ElisaLLVMIsConstantZero(scale) == 0 and not is_empty_range(dividend) and not is_sign_wrapped(dividend) and ElisaLLVMConstantIntIsNegative(signed_minimum(dividend, context)) == 0:
+                least: LLVMValueRef = ElisaLLVMConstantIntUnsignedDivideRoundingUp(signed_minimum(dividend, context), scale)
+                result <- nonempty_range(least, plus_one(ElisaLLVMConstantIntUnsignedDivide(signed_maximum(dividend, context), scale)))
+            ElisaLLVMDisposeConstantRange(dividend)
+            result
+
+        def is_ranged_opcode(opcode: u32) -> bool:
+            opcode == LLVMOpcode::ADD or opcode == LLVMOpcode::SUB or opcode == LLVMOpcode::MUL or opcode == LLVMOpcode::SREM or opcode == LLVMOpcode::UREM or opcode == LLVMOpcode::SDIV or opcode == LLVMOpcode::UDIV or opcode == LLVMOpcode::LSHR or opcode == LLVMOpcode::AND
+
+        # A binary operator's range from its operands' (a remainder is bounded by its
+        # divisor whatever the dividend is); null for an opcode without one.
+        def binary_range(value: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&, depth: u32, width: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            if (opcode == LLVMOpcode::LSHR or opcode == LLVMOpcode::UDIV) and LLVMIsAConstantInt(LLVMGetOperand(value, 1)) != null and LLVMGetExact(value) != 0:
+                if exact_quotient_range(value, bounds, search, depth, width) is quotient:
+                    return quotient
+            return null if not is_ranged_opcode(opcode)
+            left: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 0), bounds, search, depth + 1)
+            range_operation(opcode, left, range_of(LLVMGetOperand(value, 1), bounds, search, depth + 1))
+
+        # The result field of a checked signed add, subtract or multiply.
+        def checked_field_range(value: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            return null if not is_first_field(value)
+            call: LLVMValueRef = LLVMGetOperand(value, 0)
+            opcode: u32 = get checked_opcode(call, &search.intrinsics) else return null
+            left: ElisaConstantRangeRef = range_of(LLVMGetOperand(call, 0), bounds, search, depth + 1)
+            range_operation(opcode, left, range_of(LLVMGetOperand(call, 1), bounds, search, depth + 1))
+
+        # The operand a freeze keeps: a load whose `!range` holds is never poison, and in a
+        # scoped search neither is a computed value.
+        def frozen_operand(value: LLVMValueRef, search: RangeSearch&) -> LLVMValueRef?:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::FREEZE)
+            operand: LLVMValueRef = LLVMGetOperand(value, 0)
+            if LLVMIsALoadInst(operand) != null:
+                return operand if LLVMGetMetadata(operand, search.range_kind) != null
+                return null
+            return operand if search.scoped and LLVMIsAArgument(operand) == null
+            null
+
+        # A phi's range as a counted loop's counter, or (scoped) as a loop-carried value.
+        def phi_range(phi: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&, depth: u32, width: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            next: u32 = depth + 1
+            if counter_range(phi, bounds, search, next) is counted:
+                return counted
+            return null if not search.scoped or width > RangeSearchLimit::CARRIED_WIDTH
+            carried: mutable ElisaConstantRangeRef? = null
+            if is_loop_header(LLVMGetInstructionParent(phi), search.analyses):
+                carried <- header_range(phi, search, next)
+            else:
+                carried <- join_range(phi, search, next)
+            if carried is range:
+                return signed_intersection(range, ElisaLLVMScalarEvolutionSignedRange(search.analyses, phi))
+            null
+
+        # `rangeOf`: the signed range of VALUE given BOUNDS, DEPTH lookups deep.
+        def range_of(value: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(value))
+            return ElisaLLVMConstantRangeFull(width) if search.budget == 0 or depth == RangeSearchLimit::DEPTH
+            search.budget <- search.budget - 1
+            if assigned_constant(&search.assigned, value) is fixed:
+                return ElisaLLVMConstantRangeOfConstant(fixed)
+            if fact_range(bounds, value) is fact:
+                return fact
+            return ElisaLLVMConstantRangeOfConstant(value) if LLVMIsAConstantInt(value) != null
+            if search.assigned.values.count > 0:
+                if case_range(value, bounds, search, depth, width) is narrowed:
+                    return narrowed
+            if LLVMIsACastInst(value) != null and LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(value, 0))) == LLVMTypeKindValue::INTEGER:
+                source: ElisaConstantRangeRef = range_of(LLVMGetOperand(value, 0), bounds, search, depth + 1)
+                cast: ElisaConstantRangeRef = ElisaLLVMConstantRangeCast(LLVMGetInstructionOpcode(value), source, width)
+                ElisaLLVMDisposeConstantRange(source)
+                return cast
+            if bisection_hull(value, bounds, search, depth + 1) is hull:
+                return hull
+            if frozen_operand(value, search) is operand:
+                return range_of(operand, bounds, search, depth + 1)
+            if LLVMIsABinaryOperator(value) != null:
+                if binary_range(value, bounds, search, depth, width) is computed:
+                    return computed
+            if checked_field_range(value, bounds, search, depth) is checked:
+                return checked
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI):
+                if phi_range(value, bounds, search, depth, width) is carried:
+                    return carried
+            ElisaLLVMScalarEvolutionSignedRange(search.analyses, value)

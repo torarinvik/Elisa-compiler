@@ -26,6 +26,12 @@ ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompare(LLVMIntPredicate pr
       ConstantRange::makeAllowedICmpRegion(compare, ConstantRange(constantValue(constant)))));
 }
 
+ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompareWith(LLVMIntPredicate predicate,
+                                                                 ElisaConstantRangeRef range) {
+  auto compare = static_cast<CmpInst::Predicate>(predicate);
+  return wrap(new ConstantRange(ConstantRange::makeAllowedICmpRegion(compare, *unwrap(range))));
+}
+
 ElisaConstantRangeRef ElisaLLVMConstantRangeSubtract(ElisaConstantRangeRef range,
                                                      LLVMValueRef constant) {
   return wrap(new ConstantRange(unwrap(range)->sub(ConstantRange(constantValue(constant)))));
@@ -271,6 +277,50 @@ int ElisaLLVMConstantIntCompare(LLVMIntPredicate predicate, LLVMValueRef first, 
 
 LLVMValueRef ElisaLLVMConstantIntUnsignedDivide(LLVMValueRef first, LLVMValueRef second) {
   return constantOf(first, constantValue(first).udiv(constantValue(second)));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeIntersectSigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second) {
+  return wrap(new ConstantRange(unwrap(first)->intersectWith(*unwrap(second), ConstantRange::Signed)));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeUnionSigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second) {
+  return wrap(new ConstantRange(unwrap(first)->unionWith(*unwrap(second), ConstantRange::Signed)));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeUnion(ElisaConstantRangeRef first, ElisaConstantRangeRef second) {
+  return wrap(new ConstantRange(unwrap(first)->unionWith(*unwrap(second))));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeInverse(ElisaConstantRangeRef range) {
+  return wrap(new ConstantRange(unwrap(range)->inverse()));
+}
+
+int ElisaLLVMConstantRangeIsSignWrapped(ElisaConstantRangeRef range) {
+  return unwrap(range)->isSignWrappedSet();
+}
+
+int ElisaLLVMConstantRangeComparesTrue(LLVMIntPredicate predicate, ElisaConstantRangeRef left,
+                                       ElisaConstantRangeRef right) {
+  return unwrap(left)->icmp(static_cast<CmpInst::Predicate>(predicate), *unwrap(right));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeCast(LLVMOpcode opcode, ElisaConstantRangeRef range, uint32_t width) {
+  Instruction::CastOps Cast;
+  switch (opcode) {
+  case LLVMTrunc: Cast = Instruction::Trunc; break;
+  case LLVMZExt: Cast = Instruction::ZExt; break;
+  case LLVMSExt: Cast = Instruction::SExt; break;
+  default: return wrap(new ConstantRange(ConstantRange::getFull(width)));
+  }
+  return wrap(new ConstantRange(unwrap(range)->castOp(Cast, width)));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeSignExtend(ElisaConstantRangeRef range, uint32_t width) {
+  return wrap(new ConstantRange(unwrap(range)->signExtend(width)));
+}
+
+LLVMValueRef ElisaLLVMConstantIntUnsignedDivideRoundingUp(LLVMValueRef first, LLVMValueRef second) {
+  return constantOf(first, APIntOps::RoundingUDiv(constantValue(first), constantValue(second), APInt::Rounding::UP));
 }
 
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range) { delete unwrap(range); }

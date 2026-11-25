@@ -3,7 +3,11 @@
 
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/InlineCost.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Analysis/Utils/Local.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Target/TargetMachine.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Instructions.h>
@@ -45,6 +49,10 @@ int ElisaLLVMRemoveUnreachableBlocks(LLVMValueRef function) {
   return removeUnreachableBlocks(*cast<Function>(unwrap(function)));
 }
 
+int ElisaLLVMConstantFoldTerminator(LLVMBasicBlockRef block, int delete_dead_conditions) {
+  return ConstantFoldTerminator(unwrap(block), delete_dead_conditions != 0);
+}
+
 LLVMValueRef ElisaLLVMCloneFunction(LLVMValueRef function) {
   ValueToValueMapTy Map;
   return wrap(CloneFunction(cast<Function>(unwrap(function)), Map));
@@ -68,6 +76,20 @@ int ElisaLLVMInlineCall(LLVMValueRef call) {
 
 int ElisaLLVMIsInlineViable(LLVMValueRef function) {
   return isInlineViable(*cast<Function>(unwrap(function))).isSuccess();
+}
+
+int ElisaLLVMAttributesAllowInlining(LLVMValueRef call, LLVMTargetMachineRef machine) {
+  CallBase &Call = *cast<CallBase>(unwrap(call));
+  Function *Callee = Call.getCalledFunction();
+  FunctionAnalysisManager Analyses;
+  PassBuilder Builder(reinterpret_cast<TargetMachine *>(machine));
+  Builder.registerFunctionAnalyses(Analyses);
+  auto &Target = Analyses.getResult<TargetIRAnalysis>(*Callee);
+  auto GetLibrary = [&](Function &Function) -> const TargetLibraryInfo & {
+    return Analyses.getResult<TargetLibraryAnalysis>(Function);
+  };
+  auto Decision = getAttributeBasedInliningDecision(Call, Callee, Target, GetLibrary);
+  return !Decision || Decision->isSuccess();
 }
 
 void ElisaLLVMSplitBlockAndInsertIfThenElse(LLVMValueRef condition, LLVMValueRef before,

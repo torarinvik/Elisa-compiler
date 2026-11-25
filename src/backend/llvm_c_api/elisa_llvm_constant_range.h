@@ -19,6 +19,12 @@ typedef struct ElisaOpaqueConstantRange *ElisaConstantRangeRef;
  * `x` for which `x <predicate> constant` can hold. */
 ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompare(LLVMIntPredicate predicate,
                                                              LLVMValueRef constant);
+
+/* ConstantRange::makeAllowedICmpRegion(predicate, range): every value `x` for
+ * which `x <predicate> y` can hold for some `y` in RANGE. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompareWith(LLVMIntPredicate predicate,
+                                                                 ElisaConstantRangeRef range);
+
 /* ConstantRange::sub with the single value `constant`: `range - constant`. */
 ElisaConstantRangeRef ElisaLLVMConstantRangeSubtract(ElisaConstantRangeRef range,
                                                      LLVMValueRef constant);
@@ -115,6 +121,23 @@ int ElisaLLVMConstantIntIsSignedIntN(LLVMValueRef constant, uint32_t bits);
  * ConstantInts of one width (elisa_llvm_analysis has the active bits and product). */
 int ElisaLLVMConstantIntCompare(LLVMIntPredicate predicate, LLVMValueRef first, LLVMValueRef second);
 LLVMValueRef ElisaLLVMConstantIntUnsignedDivide(LLVMValueRef first, LLVMValueRef second);
+/* intersectWith and unionWith preferring the smaller signed range, and unionWith
+ * preferring the smallest range. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeIntersectSigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second);
+ElisaConstantRangeRef ElisaLLVMConstantRangeUnionSigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second);
+ElisaConstantRangeRef ElisaLLVMConstantRangeUnion(ElisaConstantRangeRef first, ElisaConstantRangeRef second);
+/* ConstantRange::inverse, isSignWrappedSet, and icmp(predicate, right): whether every
+ * pair of values compares true. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeInverse(ElisaConstantRangeRef range);
+int ElisaLLVMConstantRangeIsSignWrapped(ElisaConstantRangeRef range);
+int ElisaLLVMConstantRangeComparesTrue(LLVMIntPredicate predicate, ElisaConstantRangeRef left,
+                                       ElisaConstantRangeRef right);
+/* castOp(opcode, width) for trunc, zext and sext (the full range for any other opcode),
+ * and signExtend(width). */
+ElisaConstantRangeRef ElisaLLVMConstantRangeCast(LLVMOpcode opcode, ElisaConstantRangeRef range, uint32_t width);
+ElisaConstantRangeRef ElisaLLVMConstantRangeSignExtend(ElisaConstantRangeRef range, uint32_t width);
+/* APIntOps::RoundingUDiv(first, second, Rounding::UP) on ConstantInts of one width. */
+LLVMValueRef ElisaLLVMConstantIntUnsignedDivideRoundingUp(LLVMValueRef first, LLVMValueRef second);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus

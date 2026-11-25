@@ -1,0 +1,245 @@
+# Folds the checked signed i64 adds, subtracts and multiplies the prover shows cannot
+# overflow into plain arithmetic (the C++ `foldProvenSignedChecks`, `findRelatedCalls` and
+# `stabilizeGuardedSignedOperands`). A proof may use the guards on a parameter that can be
+# undefined once the parameter is frozen at entry, so the guard and every later use see
+# one value. Removing the checks can bring a private helper under the inliner's size, so
+# a pair of calls sharing most of their aggregate inputs is inlined afterwards.
+include "./signed_check_proofs.elisa"
+include "../divisions/bounded_remainders.elisa"
+include "../../../llvm_c_api/elisa_llvm_ir_edits.elisa"
+
+const module SignedFoldLimit:
+    FUNCTION_INSTRUCTIONS: u32 = 4000
+    CANDIDATES: usize = 256
+    SAFE_FOR_INLINING: usize = 8
+    PENDING_CALLS: usize = 8
+    HELPER_INSTRUCTIONS: u32 = 300
+    CALLER_INSTRUCTIONS: u32 = 1200
+    UNSTABLE_LOADS: usize = 16
+
+# What a fold changed: its count, and the callers that had helpers inlined into them, in
+# module order.
+struct SignedFoldResult:
+    changes: u32
+    inlined: darray[LLVMValueRef]
+
+# The checks of one function the prover showed safe, and the parameters to freeze for them.
+struct SafeChecks:
+    calls: mutable darray[LLVMValueRef]
+    frozen: mutable darray[LLVMValueRef]
+
+extend Backend:
+    public:
+        # `Value::replaceUsesWithIf(replacement, user != replacement)`, in use-list order.
+        def replace_uses_but_own(original: LLVMValueRef, replacement: LLVMValueRef) -> void:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(original)
+            while use_cursor is use |use_cursor, replacement|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                if user != replacement:
+                    LLVMSetOperand(user, ElisaLLVMUseOperandNumber(use), replacement)
+
+        # Freezes VALUE before POSITION (taking its debug location) for all of VALUE's uses.
+        def freeze_for_uses(builder: LLVMBuilderRef, value: LLVMValueRef, position: LLVMValueRef, name: cstr) -> void:
+            position_builder_before(builder, position)
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, value, name)
+            replace_uses_but_own(value, stable)
+
+        # The checked signed i64 operations of FUNCTION; empty when there are none or more
+        # than 256.
+        def signed_check_candidates(function: LLVMValueRef, intrinsics: CheckedIntrinsics&) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            candidates: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates, intrinsics|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, candidates, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if checked_opcode(instruction, intrinsics) != null and is_llvm_integer_type(LLVMTypeOf(LLVMGetOperand(instruction, 0)), 64):
+                        candidates.push(instruction)
+            return [] if candidates.count > SignedFoldLimit::CANDIDATES
+            candidates
+
+        # Whether CALL is safe: from the guards alone, then with guarded parameters frozen
+        # (added to FROZEN), then within the cases of a split.
+        def is_proven_signed_check(call: LLVMValueRef, search: mutable RangeSearch&, frozen: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            stable_guards: mutable GuardSearch = guard_search(false, false, null)
+            bounds: mutable RangeFacts = dominating_bounds(call, search.analyses, search.intrinsics, &search.incoming, &stable_guards)
+            search.parameters <- ParameterSet{collects: false, values: []}
+            safe: bool = proven_safe(call, &bounds, search)
+            dispose_facts(&bounds)
+            return true if safe
+            freezing_guards: mutable GuardSearch = guard_search(true, false, null)
+            split: mutable RangeFacts = dominating_bounds(call, search.analyses, search.intrinsics, &search.incoming, &freezing_guards)
+            search.parameters <- ParameterSet{collects: true, values: freezing_guards.parameters}
+            proven: mutable bool = search.parameters.values.count > 0 and proven_safe(call, &split, search)
+            if not proven and has_facts(&split):
+                proven <- split_cannot_overflow(call, &split, search)
+            dispose_facts(&split)
+            if proven:
+                for parameter in search.parameters.values |frozen|:
+                    add_once(frozen, parameter)
+            proven
+
+        # The checks of FUNCTION the prover shows safe, with the parameters to freeze.
+        def safe_signed_checks(function: LLVMValueRef, candidates: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef, intrinsics: CheckedIntrinsics) -> SafeChecks can[Abort.Panic, Memory.Allocate]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+            range_kind: u32 = LLVMGetMDKindIDInContext(context, "range", 5)
+            search: mutable RangeSearch = range_search(analyses, intrinsics, range_kind, incoming_field_bounds(function))
+            safe: mutable SafeChecks = SafeChecks{calls: [], frozen: []}
+            for call in candidates |search, safe|:
+                if is_proven_signed_check(call, &search, &safe.frozen):
+                    safe.calls.push(call)
+            dispose_facts(&search.incoming)
+            safe
+
+        # Plain arithmetic for a proven check: `{op(left, right), false}`.
+        def replace_proven_signed_check(call: LLVMValueRef, builder: LLVMBuilderRef, intrinsics: CheckedIntrinsics&) -> void:
+            opcode: u32 = get checked_opcode(call, intrinsics) else return
+            position_builder_before(builder, call)
+            result: LLVMValueRef = LLVMBuildBinOp(builder, opcode, LLVMGetOperand(call, 0), LLVMGetOperand(call, 1), "")
+            type: LLVMTypeRef = LLVMTypeOf(call)
+            with_result: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetPoison(type), result, 0, "")
+            pair: LLVMValueRef = LLVMBuildInsertValue(builder, with_result, LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(type)), 0, 0), 1, "")
+            LLVMReplaceAllUsesWith(call, pair)
+            LLVMInstructionEraseFromParent(call)
+
+        def is_foldable_function(function: LLVMValueRef, only: LLVMValueRef?) -> bool can[Abort.Panic, Memory.Allocate]:
+            if only is chosen:
+                return false if function != chosen
+            LLVMIsDeclaration(function) == 0 and not function_has_attribute(function, "optnone") and function_instruction_count(function) <= SignedFoldLimit::FUNCTION_INSTRUCTIONS
+
+        # Folds FUNCTION's proven checks; the count folded. Related calls of its helper join
+        # PENDING when COLLECTS_RELATED.
+        def fold_function_signed_checks(function: LLVMValueRef, builder: LLVMBuilderRef, intrinsics: CheckedIntrinsics, machine: void&?, collects_related: bool, pending: mutable darray[LLVMValueRef]&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidates: darray[LLVMValueRef] = signed_check_candidates(function, &intrinsics)
+            return 0 if candidates.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            safe: SafeChecks = safe_signed_checks(function, &candidates, analyses, intrinsics)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            for parameter in safe.frozen |builder, function|:
+                position: LLVMValueRef = get first_insertion_point(LLVMGetEntryBasicBlock(function)) else return 0
+                freeze_for_uses(builder, parameter, position, "validated.parameter")
+            for call in safe.calls |builder, intrinsics|:
+                replace_proven_signed_check(call, builder, &intrinsics)
+            if collects_related and safe.calls.count >= SignedFoldLimit::SAFE_FOR_INLINING:
+                find_related_calls(function, machine, pending)
+            safe.calls.count.u32()
+
+        # The callers among CALLERS, in module order.
+        def in_module_order(module: LLVMModuleRef, callers: darray[LLVMValueRef]&) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            ordered: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, ordered, callers|:
+                cursor <- LLVMGetNextFunction(function)
+                ordered.push(function) if contains_value(callers, function)
+            ordered
+
+        # `foldProvenSignedChecks` over MODULE (or ONLY, when given); with COLLECTS_INLINED,
+        # related helper calls are inlined and their callers reported.
+        def fold_proven_signed_checks(module: LLVMModuleRef, machine: void&?, collects_inlined: bool, only: LLVMValueRef?) -> SignedFoldResult can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return SignedFoldResult{changes: 0, inlined: []} if ElisaLLVMModuleTargetIsAArch64(module) == 0
+            intrinsics: CheckedIntrinsics = checked_intrinsics()
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changes: mutable u32 = 0
+            pending: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changes, pending, builder, intrinsics, machine, collects_inlined, only|:
+                cursor <- LLVMGetNextFunction(function)
+                if is_foldable_function(function, only):
+                    changes <- changes + fold_function_signed_checks(function, builder, intrinsics, machine, collects_inlined, &pending)
+            LLVMDisposeBuilder(builder)
+            inlined: mutable darray[LLVMValueRef] = []
+            for call in pending |changes, inlined|:
+                caller: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInstructionParent(call))
+                if ElisaLLVMInlineCall(call) != 0:
+                    add_once(inlined, caller)
+                    changes <- changes + 1
+            SignedFoldResult{changes: changes, inlined: in_module_order(module, &inlined)}
+
+        # The follow-up for a caller after its cleanup pipeline ran: its guarded loads
+        # stabilized, then its proven checks folded; the count folded.
+        def refold_proven_signed_checks(module: LLVMModuleRef, machine: void&?, function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            stabilize_guarded_signed_operands(function)
+            fold_proven_signed_checks(module, machine, false, function).changes
+
+        # `stabilizeGuardedSignedOperands`: freezes the loads (at most 16) whose guards on
+        # the way to a checked operation give them useful narrow ranges.
+        def stabilize_guarded_signed_operands(function: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return
+            intrinsics: CheckedIntrinsics = checked_intrinsics()
+            nothing: RangeFacts = empty_facts()
+            loads: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, loads, analyses, intrinsics, nothing|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, loads, analyses, intrinsics, nothing|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if checked_opcode(instruction, &intrinsics) != null:
+                        guards: mutable GuardSearch = guard_search(false, true, null)
+                        bounds: RangeFacts = dominating_bounds(instruction, analyses, intrinsics, &nothing, &guards)
+                        dispose_facts(&bounds)
+                        for load in guards.unstable_loads |loads|:
+                            add_once(loads, load)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            return if loads.count > SignedFoldLimit::UNSTABLE_LOADS
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetTypeContext(LLVMTypeOf(function)))
+            block_cursor <- LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, loads, builder|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, loads, builder|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if LLVMIsALoadInst(instruction) != null and contains_value(loads, instruction):
+                        next: LLVMValueRef = get LLVMGetNextInstruction(instruction) else return
+                        freeze_for_uses(builder, instruction, next, "validated.input")
+            LLVMDisposeBuilder(builder)
+
+        # A direct, inlinable call of HELPER from another function: a plain call (no musttail,
+        # bundles, `noinline` or `convergent`) with the helper's own type.
+        def related_call_through(use: LLVMUseRef, helper: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            call: LLVMValueRef = get direct_call_through(use, helper) else return null
+            return null if LLVMGetBasicBlockParent(LLVMGetInstructionParent(call)) == helper or LLVMGetTailCallKind(call) == LLVMTailCallKindValue::MUST_TAIL
+            return null if ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("noinline")) != 0 or LLVMGetNumOperandBundles(call) != 0 or ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("convergent")) != 0
+            call
+
+        # Whether a private HELPER of at most 300 instructions, called exactly twice, may be
+        # inlined at its two related calls.
+        def is_related_helper(helper: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            has_local_linkage(helper) and use_count(helper) == 2 and not function_has_attribute(helper, "noinline") and function_instruction_count(helper) <= SignedFoldLimit::HELPER_INSTRUCTIONS
+
+        # Whether the two calls, in one block of a caller optimized for speed with at most
+        # 1200 instructions, share at least two aggregate arguments and differ in one.
+        def are_related_calls(first: LLVMValueRef, second: LLVMValueRef, helper: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMGetInstructionParent(first) != LLVMGetInstructionParent(second)
+            caller: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInstructionParent(first))
+            return false if function_has_attribute(caller, "optsize") or function_has_attribute(caller, "minsize") or function_has_attribute(caller, "optnone")
+            return false if function_instruction_count(caller) > SignedFoldLimit::CALLER_INSTRUCTIONS or ElisaLLVMIsInlineViable(helper) == 0
+            shared_aggregates: mutable u32 = 0
+            differences: mutable u32 = 0
+            for index in 0..<LLVMCountParams(helper) |shared_aggregates, differences, first, second|:
+                left: LLVMValueRef = LLVMGetOperand(first, index)
+                right: LLVMValueRef = LLVMGetOperand(second, index)
+                kind: u32 = LLVMGetTypeKind(LLVMTypeOf(left))
+                if left == right and (kind == LLVMTypeKindValue::STRUCT or kind == LLVMTypeKindValue::ARRAY):
+                    shared_aggregates <- shared_aggregates + 1
+                if left != right:
+                    differences <- differences + 1
+            shared_aggregates >= 2 and differences == 1
+
+        # `findRelatedCalls`: the two calls of HELPER join PENDING when they share most of
+        # their aggregate inputs and the inliner's attribute checks allow both.
+        def find_related_calls(helper: LLVMValueRef, machine: void&?, pending: mutable darray[LLVMValueRef]&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if pending.count >= SignedFoldLimit::PENDING_CALLS or not is_related_helper(helper)
+            calls: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(helper)
+            while use_cursor is use |use_cursor, calls, helper|:
+                use_cursor <- LLVMGetNextUse(use)
+                call: LLVMValueRef = get related_call_through(use, helper) else return
+                calls.push(call)
+            return if not are_related_calls(calls[0], calls[1], helper)
+            for call in calls |machine|:
+                return if ElisaLLVMAttributesAllowInlining(call, machine) == 0
+            for call in calls |pending|:
+                pending.push(call)

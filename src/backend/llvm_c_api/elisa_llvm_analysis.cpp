@@ -223,6 +223,10 @@ LLVMValueRef ElisaLLVMFindInsertedValue(LLVMValueRef aggregate, uint32_t index) 
   return wrap(FindInsertedValue(Aggregate, Indices));
 }
 
+LLVMValueRef ElisaLLVMFindInsertedValueAt(LLVMValueRef aggregate, const uint32_t *indices, uint32_t count) {
+  return wrap(FindInsertedValue(unwrap(aggregate), ArrayRef<unsigned>(indices, count)));
+}
+
 int ElisaLLVMGlobalHasDefinitiveInitializer(LLVMValueRef global) {
   return cast<GlobalVariable>(unwrap(global))->hasDefinitiveInitializer();
 }

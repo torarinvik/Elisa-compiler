@@ -61,9 +61,7 @@ extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
   return Removed + ElisaViewBounds::shrinkViewFills(*unwrap(Module));
 }
 
-#include "llvm_bisection_ranges.h"
 #include "llvm_checked_signed_ranges.h"
-#include "llvm_recursive_argument_bounds.h"
 #include "llvm_copied_scratch.h"
 
 #else

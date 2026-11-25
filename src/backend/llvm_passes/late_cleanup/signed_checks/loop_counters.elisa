@@ -1,0 +1,229 @@
+# Ranges of loop counters and sums for the signed-check prover (the C++
+# `ElisaCheckedLoopRanges`, first part). A counter from zero, incremented once per
+# iteration and leaving the loop when it reaches a positive limit, stays below that limit;
+# a sum that adds at most one bounded term per iteration of a counted loop stays within its
+# start plus that many terms. A header phi's back-edge value is read through the phis of
+# its own iteration, so each leaf is what one path through an iteration computes.
+include "./guard_facts.elisa"
+
+const module LoopRangeLimit:
+    WEB_VALUES: u64 = 32
+    SUM_WIDTH: u32 = 130
+
+# A header phi's loop, the block entering it, and its latch.
+struct LoopHeader:
+    owner: ElisaLoopRef
+    entry: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+
+# The hull of a sum's terms, and whether any path added one.
+struct SummedTerms:
+    range: ElisaConstantRangeRef
+    summed: bool
+
+# A step `phi + term`, checked or not, and where it is computed.
+struct AddedTerm:
+    term: LLVMValueRef
+    at: LLVMValueRef
+
+extend Backend:
+    public:
+        # `neverUndefined`: computed only from constants and from instructions that compute
+        # one (checked results included), so every use sees the same value.
+        def never_undefined(root: LLVMValueRef, intrinsics: CheckedIntrinsics&) -> bool can[Abort.Panic, Memory.Allocate]:
+            work: mutable darray[LLVMValueRef] = [root]
+            seen: mutable darray[LLVMValueRef] = []
+            while work.count > 0 |work, seen, intrinsics|:
+                current: LLVMValueRef = work.pop()
+                if not contains_value(seen, current):
+                    seen.push(current)
+                    return false if seen.count.u64() > LoopRangeLimit::WEB_VALUES
+                    if LLVMIsAConstantInt(current) == null:
+                        if is_llvm_instruction_with_opcode(current, LLVMOpcode::EXTRACT_VALUE):
+                            checked: LLVMValueRef = LLVMGetOperand(current, 0)
+                            return false if not is_with_overflow(checked, intrinsics) or not is_extract_of_field(current, 0)
+                            work.push(LLVMGetOperand(checked, 0))
+                            work.push(LLVMGetOperand(checked, 1))
+                        else:
+                            return false if not is_defined_operation(current)
+                            if not is_llvm_instruction_with_opcode(current, LLVMOpcode::FREEZE):
+                                for operand in 0..<LLVMGetNumOperands(current).u32() |work, current|:
+                                    work.push(LLVMGetOperand(current, operand))
+            true
+
+        # A phi, binary operator, cast, select, compare or freeze.
+        def is_defined_operation(value: LLVMValueRef) -> bool:
+            return false if LLVMIsAInstruction(value) == null
+            return true if LLVMIsABinaryOperator(value) != null or LLVMIsACastInst(value) != null
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            opcode == LLVMOpcode::PHI or opcode == LLVMOpcode::SELECT or opcode == LLVMOpcode::ICMP or opcode == LLVMOpcode::FREEZE
+
+        def loop_of(analyses: ElisaFunctionAnalysesRef, block: LLVMBasicBlockRef) -> ElisaLoopRef?:
+            ElisaLLVMLoopForBlock(analyses, block)
+
+        # `headerOf`: the loop of a two-entry header phi, with its entering block and latch.
+        def header_of(phi: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> LoopHeader?:
+            return null if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+            owner: ElisaLoopRef = get loop_of(analyses, LLVMGetInstructionParent(phi)) else return null
+            return null if ElisaLLVMLoopHeader(owner) != LLVMGetInstructionParent(phi) or LLVMCountIncoming(phi) != 2
+            entry: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(owner) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(owner) else return null
+            LoopHeader{owner: owner, entry: entry, latch: latch}
+
+        def incoming_from(phi: LLVMValueRef, block: LLVMBasicBlockRef) -> LLVMValueRef can[Abort.Panic]:
+            if phi_incoming_for_block(phi, block) is value:
+                return value
+            panic("a phi without a value from the block")
+
+        # `backEdgeLeaves`: what reaches HEADER from its latch, through the phis of the same
+        # loop; null past 32 values.
+        def back_edge_leaves(next: LLVMValueRef, header: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate]:
+            owner: ElisaLoopRef? = loop_of(analyses, LLVMGetInstructionParent(header))
+            work: mutable darray[LLVMValueRef] = [next]
+            seen: mutable darray[LLVMValueRef] = []
+            leaves: mutable darray[LLVMValueRef] = []
+            while work.count > 0 |work, seen, leaves, header, analyses, owner|:
+                current: LLVMValueRef = work.pop()
+                if not contains_value(seen, current):
+                    seen.push(current)
+                    return null if seen.count.u64() > LoopRangeLimit::WEB_VALUES
+                    if is_iteration_join(current, header, owner, analyses):
+                        for incoming in 0..<LLVMCountIncoming(current) |work, current|:
+                            work.push(LLVMGetIncomingValue(current, incoming))
+                    else:
+                        leaves.push(current)
+            leaves
+
+        # A phi of OWNER other than HEADER and not in OWNER's header.
+        def is_iteration_join(value: LLVMValueRef, header: LLVMValueRef, owner: ElisaLoopRef?, analyses: ElisaFunctionAnalysesRef) -> bool:
+            return false if value == header or not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+            loop: ElisaLoopRef = get owner else return false
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(value)
+            found: ElisaLoopRef = get loop_of(analyses, block) else return false
+            found == loop and ElisaLLVMLoopHeader(loop) != block
+
+        # `m_c_Add(m_Specific(phi), m_One())`.
+        def is_increment_of(value: LLVMValueRef, phi: LLVMValueRef) -> bool:
+            return false if LLVMIsABinaryOperator(value) == null or LLVMGetInstructionOpcode(value) != LLVMOpcode::ADD
+            left: LLVMValueRef = LLVMGetOperand(value, 0)
+            right: LLVMValueRef = LLVMGetOperand(value, 1)
+            (left == phi and ElisaLLVMIsConstantOne(right) != 0) or (right == phi and ElisaLLVMIsConstantOne(left) != 0)
+
+        # `countedLoopLimit`: the invariant limit a zero-based counter, incremented on every
+        # path, is compared with for equality at the latch's exit.
+        def counted_loop_limit(counter: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            shape: LoopHeader = get header_of(counter, analyses) else return null
+            initial: LLVMValueRef = incoming_from(counter, shape.entry)
+            next: LLVMValueRef = incoming_from(counter, shape.latch)
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(shape.latch) else return null
+            return null if LLVMIsAConstantInt(initial) == null or ElisaLLVMIsConstantZero(initial) == 0 or LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            return null if LLVMGetSuccessor(branch, 1) != ElisaLLVMLoopHeader(shape.owner) or ElisaLLVMLoopContainsBlock(shape.owner, LLVMGetSuccessor(branch, 0)) != 0
+            leaves: darray[LLVMValueRef] = get back_edge_leaves(next, counter, analyses) else return null
+            return null if any leaf in leaves where not is_increment_of(leaf, counter)
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::EQ
+            limit: mutable LLVMValueRef? = null
+            if LLVMGetOperand(compare, 0) == next:
+                limit <- LLVMGetOperand(compare, 1)
+            elif LLVMGetOperand(compare, 1) == next:
+                limit <- LLVMGetOperand(compare, 0)
+            found: LLVMValueRef = get limit else return null
+            return null if ElisaLLVMLoopIsInvariant(shape.owner, found) == 0
+            found
+
+        # `positiveLimits`: LIMITS (consumed) narrowed by the guards on the limit at the loop,
+        # when every value left is positive.
+        def positive_limits(counter: LLVMValueRef, limit: LLVMValueRef, limits: ElisaConstantRangeRef, search: mutable RangeSearch&) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            narrowed: mutable ElisaConstantRangeRef = limits
+            if search.scoped:
+                narrowed <- signed_intersection(narrowed, guard_fact_on(first_non_phi(LLVMGetInstructionParent(counter)), limit, search))
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(limit))
+            if is_empty_range(narrowed) or is_sign_wrapped(narrowed) or ElisaLLVMConstantIntSignedLess(LLVMConstInt(LLVMTypeOf(signed_minimum(narrowed, context)), 0, 0), signed_minimum(narrowed, context)) == 0:
+                ElisaLLVMDisposeConstantRange(narrowed)
+                return null
+            narrowed
+
+        # `tripBound`: the most iterations one entry runs, from a counter of PHI's loop.
+        def trip_bound(phi: LLVMValueRef, at_entry: RangeFacts&, search: mutable RangeSearch&, depth: u32) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetInstructionParent(phi))
+            while cursor is counter |cursor, at_entry, search, depth|:
+                return null if not is_llvm_instruction_with_opcode(counter, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(counter)
+                if counted_loop_limit(counter, search.analyses) is limit:
+                    if positive_limits(counter, limit, range_of(limit, at_entry, search, depth), search) is limits:
+                        most: LLVMValueRef = signed_maximum(limits, LLVMGetTypeContext(LLVMTypeOf(limit)))
+                        ElisaLLVMDisposeConstantRange(limits)
+                        return most
+            null
+
+        # `counterRange`: [0, the largest limit) for a counted loop's counter.
+        def counter_range(counter: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            limit: LLVMValueRef = get counted_loop_limit(counter, search.analyses) else return null
+            limits: ElisaConstantRangeRef = get positive_limits(counter, limit, range_of(limit, bounds, search, depth), search) else return null
+            most: LLVMValueRef = signed_maximum(limits, LLVMGetTypeContext(LLVMTypeOf(limit)))
+            ElisaLLVMDisposeConstantRange(limits)
+            ElisaLLVMConstantRangeFromBounds(LLVMConstInt(LLVMTypeOf(most), 0, 0), most)
+
+        # `addedTerm`: the term of `phi + term` or of a checked add of PHI.
+        def added_term(leaf: LLVMValueRef, phi: LLVMValueRef, intrinsics: CheckedIntrinsics&) -> AddedTerm? can[Abort.Panic]:
+            if LLVMIsABinaryOperator(leaf) != null and LLVMGetInstructionOpcode(leaf) == LLVMOpcode::ADD:
+                return AddedTerm{term: LLVMGetOperand(leaf, 1), at: leaf} if LLVMGetOperand(leaf, 0) == phi
+                return AddedTerm{term: LLVMGetOperand(leaf, 0), at: leaf} if LLVMGetOperand(leaf, 1) == phi
+            return null if not is_first_field(leaf)
+            call: LLVMValueRef = LLVMGetOperand(leaf, 0)
+            return null if LLVMIsAIntrinsicInst(call) == null or called_intrinsic_id(call) != intrinsics.signed_add
+            return AddedTerm{term: LLVMGetOperand(call, 1), at: call} if LLVMGetOperand(call, 0) == phi
+            return AddedTerm{term: LLVMGetOperand(call, 0), at: call} if LLVMGetOperand(call, 1) == phi
+            null
+
+        # The hull with zero of every term the iteration adds to SUM, and whether any leaf
+        # added one; null when a leaf is not a step or the hull is full.
+        def summed_terms(sum: LLVMValueRef, leaves: darray[LLVMValueRef]&, search: mutable RangeSearch&, depth: u32) -> SummedTerms? can[Abort.Panic, Memory.Allocate]:
+            terms: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeOfConstant(LLVMConstInt(LLVMTypeOf(sum), 0, 0))
+            summed: mutable bool = false
+            for leaf in leaves |terms, summed, sum, search, depth|:
+                if leaf != sum:
+                    if added_term(leaf, sum, &search.intrinsics) is step:
+                        where: RangeFacts = facts_at(step.at, search)
+                        terms <- signed_union(terms, range_of(step.term, &where, search, depth))
+                        dispose_facts(&where)
+                        if is_full_range(terms):
+                            ElisaLLVMDisposeConstantRange(terms)
+                            return null
+                        summed <- true
+                    else:
+                        ElisaLLVMDisposeConstantRange(terms)
+                        return null
+            SummedTerms{range: terms, summed: summed}
+
+        # start + [0, trips] * terms, computed in 130 bits; null when it leaves i64.
+        def summed_hull(start: ElisaConstantRangeRef, trips: LLVMValueRef, terms: ElisaConstantRangeRef) -> ElisaConstantRangeRef?:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(trips))
+            count: LLVMValueRef = ElisaLLVMConstantIntSignExtend(trips, LoopRangeLimit::SUM_WIDTH)
+            low: LLVMValueRef = LLVMConstAdd(ElisaLLVMConstantIntSignExtend(signed_minimum(start, context), LoopRangeLimit::SUM_WIDTH), ElisaLLVMConstantIntMultiply(count, ElisaLLVMConstantIntSignExtend(signed_minimum(terms, context), LoopRangeLimit::SUM_WIDTH)))
+            high: LLVMValueRef = LLVMConstAdd(ElisaLLVMConstantIntSignExtend(signed_maximum(start, context), LoopRangeLimit::SUM_WIDTH), ElisaLLVMConstantIntMultiply(count, ElisaLLVMConstantIntSignExtend(signed_maximum(terms, context), LoopRangeLimit::SUM_WIDTH)))
+            return null if ElisaLLVMConstantIntIsSignedIntN(low, 64) == 0 or ElisaLLVMConstantIntIsSignedIntN(high, 64) == 0
+            nonempty_range(ElisaLLVMConstantIntTruncate(low, 64), plus_one(ElisaLLVMConstantIntTruncate(high, 64)))
+
+        # `summedRange`: the range of an i64 sum adding at most one bounded term per
+        # iteration of a counted loop.
+        def summed_range(sum: LLVMValueRef, search: mutable RangeSearch&, depth: u32) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            shape: LoopHeader = get header_of(sum, search.analyses) else return null
+            return null if LLVMGetTypeKind(LLVMTypeOf(sum)) != LLVMTypeKindValue::INTEGER or LLVMGetIntTypeWidth(LLVMTypeOf(sum)) != 64
+            at_entry: mutable RangeFacts = facts_at(first_non_phi(ElisaLLVMLoopHeader(shape.owner)), search)
+            trips: mutable LLVMValueRef? = trip_bound(sum, &at_entry, search, depth)
+            leaves: mutable darray[LLVMValueRef]? = null
+            if trips != null:
+                leaves <- back_edge_leaves(incoming_from(sum, shape.latch), sum, search.analyses)
+            if trips is bound and leaves is found:
+                if summed_terms(sum, &found, search, depth) is terms:
+                    start: ElisaConstantRangeRef = range_of(incoming_from(sum, shape.entry), &at_entry, search, depth)
+                    dispose_facts(&at_entry)
+                    result: mutable ElisaConstantRangeRef? = null
+                    if terms.summed and not is_empty_range(start) and not is_full_range(start):
+                        result <- summed_hull(start, bound, terms.range)
+                    ElisaLLVMDisposeConstantRange(start)
+                    ElisaLLVMDisposeConstantRange(terms.range)
+                    return result
+            dispose_facts(&at_entry)
+            null

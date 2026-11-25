@@ -1,0 +1,218 @@
+# Proves a recursive helper's index in bounds by checking its initial calls and each
+# recursive edge (the C++ `ElisaRecursiveArgumentBounds`). An `index < view.length` check
+# trapping on failure holds everywhere when every outside call passes a constant index
+# below the view's length (constant, or bounded by the guards at the call), and every
+# recursive call forwards the same view with an index already checked against its length
+# in the current invocation. The forwarded indices are frozen so the entry tests and the
+# recursive calls agree on one value even when the argument could be undefined.
+include "./proven_signed_checks.elisa"
+
+const module RecursiveBoundsLimit:
+    USES: u32 = 8
+    INSTRUCTIONS: u32 = 160
+    CALLER_INSTRUCTIONS: u32 = 1500
+    FEWEST_CHECKS: usize = 2
+    MOST_CHECKS: usize = 12
+
+# `index < length` ending a block, the length a field of a view argument.
+struct BoundsCheck:
+    branch: LLVMValueRef
+    index: LLVMValueRef
+    length: LLVMValueRef
+
+# A check every call keeps in bounds, and the indices the recursive calls forward for it.
+struct ProvenBoundsCheck:
+    check: BoundsCheck
+    forwarded: darray[LLVMValueRef]
+
+# The outside and recursive calls of a helper.
+struct HelperCalls:
+    initial: mutable darray[LLVMValueRef]
+    recursive: mutable darray[LLVMValueRef]
+
+extend Backend:
+    public:
+        def parameter_number(parameter: LLVMValueRef) -> u32:
+            argument_number(LLVMGetParamParent(parameter), parameter).u32()
+
+        # `ExtractValueInst::getIndices() ==`: whether two extracts read the same field path.
+        def same_extract_indices(first: LLVMValueRef, second: LLVMValueRef) -> bool can[Unsafe.PointerArithmetic]:
+            count: u32 = LLVMGetNumIndices(first)
+            return false if count != LLVMGetNumIndices(second)
+            left: u32& = LLVMGetIndices(first)
+            right: u32& = LLVMGetIndices(second)
+            for position in 0..<count |left, right|:
+                return false if left[position] != right[position]
+            true
+
+        # `matchBoundsCheck`: BLOCK's `icmp ult index, length` branch, with an i64 argument
+        # index and a length extracted from an argument.
+        def match_bounds_check(block: LLVMBasicBlockRef) -> BoundsCheck? can[Abort.Panic]:
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return null
+            return null if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            index: LLVMValueRef = LLVMGetOperand(compare, 0)
+            length: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if LLVMIsAArgument(index) == null or not is_llvm_instruction_with_opcode(length, LLVMOpcode::EXTRACT_VALUE) or not is_llvm_integer_type(LLVMTypeOf(index), 64)
+            return null if LLVMIsAArgument(LLVMGetOperand(length, 0)) == null
+            BoundsCheck{branch: branch, index: index, length: length}
+
+        # `isTrapBlock`: a block of debug intrinsics and `llvm.trap` ending in unreachable.
+        def is_trap_block(block: LLVMBasicBlockRef, trap: u32) -> bool:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return false
+            return false if LLVMGetInstructionOpcode(terminator) != LLVMOpcode::UNREACHABLE
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, trap|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                return true if LLVMIsAIntrinsicInst(instruction) != null and called_intrinsic_id(instruction) == trap
+                return false if LLVMIsADbgInfoIntrinsic(instruction) == null
+            false
+
+        # Whether CHECK traps on failure.
+        def traps_on_failure(check: BoundsCheck&, trap: u32) -> bool:
+            is_trap_block(LLVMGetSuccessor(check.branch, 1), trap)
+
+        # Whether a retained entry guard on another argument rejects CALL before it reaches
+        # CHECK: its index is at least the constant LENGTH.
+        def entry_guard_rejects(call: LLVMValueRef, check: BoundsCheck&, view: LLVMValueRef, checks: darray[BoundsCheck]&, length: LLVMValueRef, trap: u32) -> bool can[Abort.Panic, Unsafe.PointerArithmetic]:
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(LLVMGetParamParent(check.index))
+            for guard in checks |call, check, view, length, trap, entry|:
+                if guard.index != check.index and LLVMGetInstructionParent(guard.branch) == entry and LLVMGetOperand(guard.length, 0) == view and same_extract_indices(guard.length, check.length) and traps_on_failure(&guard, trap):
+                    actual: LLVMValueRef = LLVMGetOperand(call, parameter_number(guard.index))
+                    return true if LLVMIsAConstantInt(actual) != null and compares(LLVMIntPredicate::UGE, actual, length)
+            false
+
+        # Whether the guards dominating CALL bound LENGTH's unsigned minimum above INDEX.
+        def guarded_length_exceeds(call: LLVMValueRef, length: LLVMValueRef, index: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            caller: LLVMValueRef = LLVMGetBasicBlockParent(LLVMGetInstructionParent(call))
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(caller) else return false
+            nothing: RangeFacts = empty_facts()
+            guards: mutable GuardSearch = guard_search(false, false, null)
+            bounds: mutable RangeFacts = dominating_bounds(call, analyses, checked_intrinsics(), &nothing, &guards)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            known: ElisaConstantRangeRef? = fact_range(&bounds, length)
+            dispose_facts(&bounds)
+            range: ElisaConstantRangeRef = get known else return false
+            exceeds: bool = not is_empty_range(range) and compares(LLVMIntPredicate::ULT, index, ElisaLLVMConstantRangeUnsignedMinimum(range, LLVMGetTypeContext(LLVMTypeOf(index))))
+            ElisaLLVMDisposeConstantRange(range)
+            exceeds
+
+        # `initialIndexIsBounded`: whether the outside CALL passes a constant index below the
+        # length of the view it passes.
+        def initial_index_is_bounded(call: LLVMValueRef, check: BoundsCheck&, view: LLVMValueRef, checks: darray[BoundsCheck]&, trap: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerArithmetic]:
+            index: LLVMValueRef = LLVMGetOperand(call, parameter_number(check.index))
+            found: LLVMValueRef? = ElisaLLVMFindInsertedValueAt(LLVMGetOperand(call, parameter_number(view)), LLVMGetIndices(check.length), LLVMGetNumIndices(check.length))
+            length: LLVMValueRef = get found else return false
+            return false if LLVMIsAConstantInt(index) == null or LLVMTypeOf(length) != LLVMTypeOf(index)
+            return false if function_instruction_count(LLVMGetBasicBlockParent(LLVMGetInstructionParent(call))) > RecursiveBoundsLimit::CALLER_INSTRUCTIONS
+            if LLVMIsAConstantInt(length) != null:
+                return true if compares(LLVMIntPredicate::ULT, index, length)
+                return entry_guard_rejects(call, check, view, checks, length, trap)
+            guarded_length_exceeds(call, length, index)
+
+        # `knownAtRecursiveCall`: the forwarded index of the recursive CALL when a check of
+        # it against the same view field dominates the call.
+        def known_at_recursive_call(call: LLVMValueRef, check: BoundsCheck&, checks: darray[BoundsCheck]&, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef? can[Unsafe.PointerArithmetic]:
+            forwarded: LLVMValueRef = LLVMGetOperand(call, parameter_number(check.index))
+            return null if LLVMIsAArgument(forwarded) == null or forwarded == check.index
+            home: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            for guard in checks |forwarded, check, analyses, home|:
+                if guard.index == forwarded and LLVMGetOperand(guard.length, 0) == LLVMGetOperand(check.length, 0) and same_extract_indices(guard.length, check.length):
+                    return forwarded if ElisaLLVMEdgeDominates(analyses, LLVMGetInstructionParent(guard.branch), LLVMGetSuccessor(guard.branch, 0), home) != 0
+            null
+
+        # The outside and recursive calls of a private FUNCTION with one to eight uses, all
+        # direct calls; null otherwise.
+        def helper_calls(function: LLVMValueRef) -> HelperCalls? can[Memory.Allocate]:
+            calls: mutable HelperCalls = HelperCalls{initial: [], recursive: []}
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(function)
+            while use_cursor is use |use_cursor, calls, function|:
+                use_cursor <- LLVMGetNextUse(use)
+                return null if calls.initial.count + calls.recursive.count == RecursiveBoundsLimit::USES.usize()
+                call: LLVMValueRef = get direct_caller_through(use, function) else return null
+                if LLVMGetBasicBlockParent(LLVMGetInstructionParent(call)) == function:
+                    calls.recursive.push(call)
+                else:
+                    calls.initial.push(call)
+            return null if calls.initial.count == 0 or calls.recursive.count == 0
+            calls
+
+        def bounds_checks(function: LLVMValueRef) -> darray[BoundsCheck] can[Abort.Panic, Memory.Allocate]:
+            checks: mutable darray[BoundsCheck] = []
+            cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while cursor is block |cursor, checks|:
+                cursor <- LLVMGetNextBasicBlock(block)
+                if match_bounds_check(block) is check:
+                    checks.push(check)
+            checks
+
+        # The indices the recursive calls forward for CANDIDATE, each checked where it is
+        # forwarded; null when a recursive call passes another view or an unchecked index.
+        def forwarded_indices(candidate: BoundsCheck&, view: LLVMValueRef, calls: HelperCalls&, checks: darray[BoundsCheck]&, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMValueRef]? can[Memory.Allocate, Unsafe.PointerArithmetic]:
+            forwarded: mutable darray[LLVMValueRef] = []
+            for call in calls.recursive |forwarded, candidate, view, checks, analyses|:
+                return null if LLVMGetOperand(call, parameter_number(view)) != view
+                index: LLVMValueRef = get known_at_recursive_call(call, candidate, checks, analyses) else return null
+                add_once(forwarded, index)
+            forwarded
+
+        # The candidate check every call keeps in bounds, with the indices to freeze for it.
+        def proven_bounds_check(function: LLVMValueRef, calls: HelperCalls&, checks: darray[BoundsCheck]&, trap: u32) -> ProvenBoundsCheck? can[Abort.Panic, Memory.Allocate, Unsafe.PointerArithmetic]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return null
+            for candidate in checks |calls, checks, trap, analyses|:
+                if traps_on_failure(&candidate, trap):
+                    view: LLVMValueRef = LLVMGetOperand(candidate.length, 0)
+                    if all call in calls.initial where initial_index_is_bounded(call, &candidate, view, checks, trap):
+                        if forwarded_indices(&candidate, view, calls, checks, analyses) is forwarded:
+                            ElisaLLVMDisposeFunctionAnalyses(analyses)
+                            return ProvenBoundsCheck{check: candidate, forwarded: forwarded}
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            null
+
+        # Freezes FUNCTION's forwarded indices that may be undefined, at its entry.
+        def freeze_forwarded_indices(function: LLVMValueRef, forwarded: darray[LLVMValueRef]&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: LLVMValueRef = get first_insertion_point(LLVMGetEntryBasicBlock(function)) else return
+            no_undefined: u32 = attribute_kind("noundef")
+            for parameter in 0..<LLVMCountParams(function) |function, forwarded, builder, position, no_undefined|:
+                argument: LLVMValueRef = LLVMGetParam(function, parameter)
+                if contains_value(forwarded, argument) and LLVMGetEnumAttributeAtIndex(function, parameter + 1, no_undefined) == null:
+                    freeze_for_uses(builder, argument, position, "checked.index")
+
+        # `fold`: the checks of PROVEN's index against the same view field that trap, made
+        # unconditional; their count.
+        def remove_redundant_bounds_checks(proven: ProvenBoundsCheck&, checks: darray[BoundsCheck]&, trap: u32, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerArithmetic]:
+            view: LLVMValueRef = LLVMGetOperand(proven.check.length, 0)
+            redundant: mutable darray[LLVMValueRef] = []
+            for check in checks |redundant, proven, view, trap|:
+                if check.index == proven.check.index and LLVMGetOperand(check.length, 0) == view and same_extract_indices(check.length, proven.check.length) and traps_on_failure(&check, trap):
+                    redundant.push(check.branch)
+            always: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(context), 1, 0)
+            for branch in redundant |always|:
+                block: LLVMBasicBlockRef = LLVMGetInstructionParent(branch)
+                LLVMSetCondition(branch, always)
+                _ = ElisaLLVMConstantFoldTerminator(block, 1)
+            redundant.count.u32()
+
+        def fold_recursive_argument_bounds_in(function: LLVMValueRef, builder: LLVMBuilderRef, trap: u32) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return 0 if not has_local_linkage(function) or function_instruction_count(function) > RecursiveBoundsLimit::INSTRUCTIONS or function_has_attribute(function, "optnone")
+            calls: HelperCalls = get helper_calls(function) else return 0
+            checks: darray[BoundsCheck] = bounds_checks(function)
+            return 0 if checks.count < RecursiveBoundsLimit::FEWEST_CHECKS or checks.count > RecursiveBoundsLimit::MOST_CHECKS
+            proven: ProvenBoundsCheck = get proven_bounds_check(function, &calls, &checks, trap) else return 0
+            freeze_forwarded_indices(function, &proven.forwarded, builder)
+            remove_redundant_bounds_checks(&proven, &checks, trap, LLVMGetTypeContext(LLVMTypeOf(function)))
+
+        # `foldRecursiveArgumentBounds` over every defined function of an AArch64 MODULE.
+        def fold_recursive_argument_bounds(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast, Unsafe.PointerArithmetic]:
+            return 0 if ElisaLLVMModuleTargetIsAArch64(module) == 0
+            trap: u32 = intrinsic_identifier("llvm.trap")
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changes: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changes, builder, trap|:
+                cursor <- LLVMGetNextFunction(function)
+                if LLVMIsDeclaration(function) == 0:
+                    changes <- changes + fold_recursive_argument_bounds_in(function, builder, trap)
+            LLVMDisposeBuilder(builder)
+            changes

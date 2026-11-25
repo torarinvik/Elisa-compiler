@@ -1,0 +1,214 @@
+# The proofs that a checked signed add, subtract or multiply cannot overflow (the C++
+# `cannotOverflow`, `comparedRange`, `provenSafe`, `splitCannotOverflow` and
+# `incomingFieldBounds`). An operation is safe when its operands' ranges cannot overflow it,
+# narrowed if need be by guards comparing an operand with another value, or within every
+# case of a split on the low bits (`x & 1`) its operands depend on.
+include "./signed_value_ranges.elisa"
+include "../divisions/literal_divisors.elisa"
+include "../stack_view_helpers.elisa"
+
+const module SignedProofLimit:
+    PROOF_BUDGET: u32 = 256
+    CASE_BUDGET: u32 = 128
+    COMPARED_GUARDS: u32 = 32
+    SPLIT_BITS: usize = 3
+    SPLIT_DEPTH: u32 = 8
+    PRIVATE_CALLERS: u32 = 8
+
+# A value waiting in the split's operand walk, with its depth.
+struct SplitOperand:
+    value: LLVMValueRef
+    depth: u32
+
+extend Backend:
+    public:
+        # `cannotOverflow`: whether OPCODE on any values of LEFT and RIGHT stays in range
+        # (the bounds of a product are computed as constants of CONTEXT).
+        def cannot_overflow(opcode: u32, left: ElisaConstantRangeRef, right: ElisaConstantRangeRef, context: LLVMContextRef) -> bool can[Memory.Allocate]:
+            return false if is_empty_range(left) or is_empty_range(right)
+            return ElisaLLVMConstantRangeNeverOverflows(opcode, 1, left, right) != 0 if opcode == LLVMOpcode::ADD or opcode == LLVMOpcode::SUB
+            width: u32 = ElisaLLVMConstantRangeBitWidth(left)
+            factors: darray[LLVMValueRef] = [signed_minimum(left, context), signed_maximum(left, context)]
+            others: darray[LLVMValueRef] = [signed_minimum(right, context), signed_maximum(right, context)]
+            for first in factors |others, width|:
+                for second in others |first, width|:
+                    product: LLVMValueRef = ElisaLLVMConstantIntMultiply(ElisaLLVMConstantIntSignExtend(first, 2 * width), ElisaLLVMConstantIntSignExtend(second, 2 * width))
+                    return false if ElisaLLVMConstantIntIsSignedIntN(product, width) == 0
+            true
+
+        # The guard comparing OPERAND with another value at one edge, as the region of
+        # OPERAND it allows (owned); null when the edge does not dominate the call.
+        def compared_edge_range(compare: LLVMValueRef, swapped: bool, other: LLVMValueRef, edge: u32, block: LLVMBasicBlockRef, home: LLVMBasicBlockRef, bounds: RangeFacts&, search: mutable RangeSearch&) -> ElisaConstantRangeRef? can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return null
+            return null if ElisaLLVMEdgeDominates(search.analyses, block, LLVMGetSuccessor(branch, edge), home) == 0
+            predicate: mutable i32 = LLVMGetICmpPredicate(compare)
+            if edge == 1:
+                predicate <- inverse_predicate(predicate)
+            if swapped:
+                predicate <- swapped_predicate(predicate)
+            bound: ElisaConstantRangeRef = range_of(other, bounds, search, 1)
+            allowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeAllowedByCompareWith(predicate, bound)
+            ElisaLLVMDisposeConstantRange(bound)
+            allowed
+
+        # `comparedRange`: OPERAND's range narrowed by the guards dominating CALL that compare
+        # it with another never-undefined value (`factor <= remaining / factor`).
+        def compared_range(operand: LLVMValueRef, call: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            result: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(operand)))
+            return result if LLVMIsAConstant(operand) != null or not never_undefined(operand, &search.intrinsics)
+            home: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            return result if ElisaLLVMIsReachableFromEntry(search.analyses, home) == 0
+            cursor: mutable LLVMBasicBlockRef? = home
+            steps: mutable u32 = SignedProofLimit::COMPARED_GUARDS
+            while steps > 0 and cursor is block |cursor, steps, result, operand, home, bounds, search|:
+                cursor <- ElisaLLVMImmediateDominator(search.analyses, block)
+                steps <- steps - 1
+                if compared_guard(block) is compare:
+                    swapped: bool = LLVMGetOperand(compare, 1) == operand
+                    other: LLVMValueRef = LLVMGetOperand(compare, 0) if swapped else LLVMGetOperand(compare, 1)
+                    if (swapped or LLVMGetOperand(compare, 0) == operand) and LLVMIsAConstant(other) == null and never_undefined(other, &search.intrinsics):
+                        for edge in 0..<2 |result, compare, swapped, other, block, home, bounds, search|:
+                            if compared_edge_range(compare, swapped, other, edge.u32(), block, home, bounds, search) is allowed:
+                                result <- signed_intersection(result, allowed)
+            result
+
+        # The integer comparison a two-way conditional branch ending BLOCK tests.
+        def compared_guard(block: LLVMBasicBlockRef) -> LLVMValueRef? can[Abort.Panic]:
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return null
+            return null if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            condition: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP) or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            condition
+
+        # `provenSafe`: whether CALL cannot overflow given BOUNDS, its operands narrowed by
+        # compared guards when their ranges alone do not show it.
+        def proven_safe(call: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&) -> bool can[Abort.Panic, Memory.Allocate]:
+            search.budget <- SignedProofLimit::PROOF_BUDGET
+            search.assigned <- no_assigned_bits()
+            search.scoped <- true
+            opcode: u32 = get checked_opcode(call, &search.intrinsics) else return false
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(call))
+            left: mutable ElisaConstantRangeRef = range_of(LLVMGetOperand(call, 0), bounds, search, 0)
+            right: mutable ElisaConstantRangeRef = range_of(LLVMGetOperand(call, 1), bounds, search, 0)
+            safe: mutable bool = cannot_overflow(opcode, left, right, context)
+            if not safe:
+                left <- signed_intersection(left, compared_range(LLVMGetOperand(call, 0), call, bounds, search))
+                right <- signed_intersection(right, compared_range(LLVMGetOperand(call, 1), call, bounds, search))
+                safe <- cannot_overflow(opcode, left, right, context)
+            ElisaLLVMDisposeConstantRange(left)
+            ElisaLLVMDisposeConstantRange(right)
+            safe
+
+        # `m_And(m_Value(), m_One())` outside every loop: a low bit a split may fix.
+        def is_split_bit(value: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(value, LLVMOpcode::AND) or ElisaLLVMIsConstantOne(LLVMGetOperand(value, 1)) == 0
+            ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(value)) == null
+
+        # The low bits outside loops CALL's operands depend on (through no phi, at most 8
+        # deep); null when there are more than three.
+        def split_bits(call: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMValueRef]? can[Memory.Allocate]:
+            bits: mutable darray[LLVMValueRef] = []
+            seen: mutable darray[LLVMValueRef] = []
+            work: mutable darray[SplitOperand] = [SplitOperand{value: LLVMGetOperand(call, 0), depth: 0}, SplitOperand{value: LLVMGetOperand(call, 1), depth: 0}]
+            while work.count > 0 |bits, seen, work, analyses|:
+                item: SplitOperand = work.pop()
+                value: LLVMValueRef = item.value
+                if LLVMIsAInstruction(value) != null and item.depth != SignedProofLimit::SPLIT_DEPTH and not contains_value(seen, value):
+                    seen.push(value)
+                    if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI):
+                        if is_split_bit(value, analyses):
+                            return null if bits.count == SignedProofLimit::SPLIT_BITS
+                            bits.push(value)
+                        for index in 0..<LLVMGetNumOperands(value) |work, value, item|:
+                            work.push(SplitOperand{value: LLVMGetOperand(value, index), depth: item.depth + 1})
+            bits
+
+        # The case CHOICE of a split on BITS: each bit fixed to its bit of CHOICE.
+        def split_case(bits: darray[LLVMValueRef]&, choice: u32) -> AssignedBits can[Memory.Allocate]:
+            values: mutable darray[LLVMValueRef] = []
+            constants: mutable darray[LLVMValueRef] = []
+            for index in 0..<bits.count |values, constants, bits, choice|:
+                values.push(bits[index])
+                constants.push(LLVMConstInt(LLVMTypeOf(bits[index]), ((choice >> index.u32()) & 1).u64(), 0))
+            AssignedBits{values: values, constants: constants}
+
+        # `splitCannotOverflow`: whether CALL cannot overflow in any case of a split on the
+        # low bits its operands depend on.
+        def split_cannot_overflow(call: LLVMValueRef, bounds: RangeFacts&, search: mutable RangeSearch&) -> bool can[Abort.Panic, Memory.Allocate]:
+            bits: darray[LLVMValueRef] = get split_bits(call, search.analyses) else return false
+            return false if bits.count == 0
+            opcode: u32 = get checked_opcode(call, &search.intrinsics) else return false
+            search.scoped <- false
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(call))
+            one: u32 = 1
+            cases: u32 = one << bits.count.u32()
+            for choice in 0..<cases |bits, bounds, search, call, opcode, context|:
+                search.assigned <- split_case(&bits, choice)
+                search.budget <- SignedProofLimit::CASE_BUDGET
+                left: ElisaConstantRangeRef = range_of(LLVMGetOperand(call, 0), bounds, search, 0)
+                right: ElisaConstantRangeRef = range_of(LLVMGetOperand(call, 1), bounds, search, 0)
+                safe: bool = cannot_overflow(opcode, left, right, context)
+                ElisaLLVMDisposeConstantRange(left)
+                ElisaLLVMDisposeConstantRange(right)
+                if not safe:
+                    search.assigned <- no_assigned_bits()
+                    return false
+            search.assigned <- no_assigned_bits()
+            true
+
+        # A direct call (or invoke) of FUNCTION through USE, with the function's own type.
+        def direct_caller_through(use: LLVMUseRef, function: LLVMValueRef) -> LLVMValueRef?:
+            call: LLVMValueRef = LLVMGetUser(use)
+            return null if LLVMIsACallInst(call) == null and LLVMIsAInvokeInst(call) == null and LLVMIsACallBrInst(call) == null
+            return null if LLVMGetOperandUse(call, LLVMGetNumOperands(call) - 1) != use
+            return null if LLVMGetCalledFunctionType(call) != LLVMGlobalGetValueType(function)
+            call
+
+        # The direct callers of a private FUNCTION with one to eight uses, all of them direct
+        # calls; empty otherwise.
+        def private_callers(function: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            callers: mutable darray[LLVMValueRef] = []
+            return callers if not has_local_linkage(function)
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(function)
+            while use_cursor is use |use_cursor, callers, function|:
+                use_cursor <- LLVMGetNextUse(use)
+                return [] if callers.count == SignedProofLimit::PRIVATE_CALLERS.usize()
+                caller: LLVMValueRef = get direct_caller_through(use, function) else return []
+                callers.push(caller)
+            callers
+
+        # The hull of what every caller passes in FIELD's part of its argument: a constant,
+        # or any value of a sign-extended narrower integer; full for anything else.
+        def caller_field_range(field: LLVMValueRef, number: u32, callers: darray[LLVMValueRef]&) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            combined: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeEmpty(64)
+            for call in callers |combined, field, number|:
+                actual: LLVMValueRef? = ElisaLLVMFindInsertedValueAt(LLVMGetOperand(call, number), LLVMGetIndices(field), LLVMGetNumIndices(field))
+                if actual is passed and LLVMIsAConstantInt(passed) != null:
+                    combined <- smallest_union(combined, ElisaLLVMConstantRangeOfConstant(passed))
+                elif actual is passed and is_llvm_instruction_with_opcode(passed, LLVMOpcode::SEXT):
+                    narrow: ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(LLVMGetOperand(passed, 0))))
+                    combined <- smallest_union(combined, ElisaLLVMConstantRangeSignExtend(narrow, 64))
+                    ElisaLLVMDisposeConstantRange(narrow)
+                else:
+                    ElisaLLVMDisposeConstantRange(combined)
+                    return ElisaLLVMConstantRangeFull(64)
+            combined
+
+        # `incomingFieldBounds`: for a private helper, the ranges common to all of its direct
+        # callers of the i64 fields its entry block extracts from its arguments.
+        def incoming_field_bounds(function: LLVMValueRef) -> RangeFacts can[Abort.Panic, Memory.Allocate]:
+            bounds: mutable RangeFacts = empty_facts()
+            callers: darray[LLVMValueRef] = private_callers(function)
+            return bounds if callers.count == 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while cursor is field |cursor, bounds, callers, function|:
+                cursor <- LLVMGetNextInstruction(field)
+                if is_llvm_instruction_with_opcode(field, LLVMOpcode::EXTRACT_VALUE) and is_llvm_integer_type(LLVMTypeOf(field), 64):
+                    aggregate: LLVMValueRef = LLVMGetOperand(field, 0)
+                    if LLVMIsAArgument(aggregate) != null:
+                        combined: ElisaConstantRangeRef = caller_field_range(field, argument_number(function, aggregate).u32(), &callers)
+                        if is_full_range(combined):
+                            ElisaLLVMDisposeConstantRange(combined)
+                        else:
+                            add_fact(&bounds, field, combined)
+            bounds
