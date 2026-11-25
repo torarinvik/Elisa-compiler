@@ -147,6 +147,14 @@ int64_t ElisaLLVMConstantRangeSignedMax(ElisaConstantRangeRef range) {
   return unwrap(range)->getSignedMax().getSExtValue();
 }
 
+LLVMValueRef ElisaLLVMConstantRangeSignedMinimum(ElisaConstantRangeRef range, LLVMContextRef context) {
+  return wrap(ConstantInt::get(*unwrap(context), unwrap(range)->getSignedMin()));
+}
+
+LLVMValueRef ElisaLLVMConstantRangeSignedMaximum(ElisaConstantRangeRef range, LLVMContextRef context) {
+  return wrap(ConstantInt::get(*unwrap(context), unwrap(range)->getSignedMax()));
+}
+
 uint64_t ElisaLLVMConstantRangeUnsignedMin(ElisaConstantRangeRef range) {
   return unwrap(range)->getUnsignedMin().getLimitedValue();
 }

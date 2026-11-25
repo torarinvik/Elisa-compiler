@@ -1,0 +1,147 @@
+# Rewrites a matched checked-accumulator recursion into two loops: a descent that
+# counts the recursion depth while the changing arguments become header phis, and an
+# ascent that applies `x op acc` that many times to the base case's value. The ascent
+# applies the same operation to the same values innermost-first, exactly as the
+# returning calls did, so every intermediate value and the first overflowing step are
+# unchanged.
+#
+# `builder` follows the C++ IRBuilder's insertion points, and so its debug location;
+# `plain` inserts the instructions the C++ created without a builder.
+
+# The two builders of a rewrite and the 64-bit depth type.
+struct AccumulatorBuilders:
+    builder: LLVMBuilderRef
+    plain: LLVMBuilderRef
+    count_type: LLVMTypeRef
+
+extend Backend:
+    private:
+        # An unconditional branch to TARGET inserted before INSTRUCTION, with no debug location.
+        def branch_before(instruction: LLVMValueRef, target: LLVMBasicBlockRef, plain: LLVMBuilderRef) -> LLVMValueRef:
+            LLVMPositionBuilderBefore(plain, instruction)
+            LLVMSetCurrentDebugLocation2(plain, null)
+            LLVMBuildBr(plain, target)
+
+        def named_phi(builder: LLVMBuilderRef, type: LLVMTypeRef, name: sview) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            name_storage: mutable darray[u8] = []
+            LLVMBuildPhi(builder, type, sview_to_cstr(name, name_storage))
+
+        # Each argument the recursive call changes becomes a phi of HEADER: the argument
+        # from ENTRY, the call's operand from RECURSE.
+        def thread_changing_arguments(function: LLVMValueRef, call: LLVMValueRef, entry: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            recurse: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            for position in 0..<LLVMCountParams(function) |function, call, entry, builder, recurse|:
+                argument: LLVMValueRef = LLVMGetParam(function, position)
+                continue if LLVMGetOperand(call, position) == argument
+                name: mutable darray[u8] = suffixed_name(argument, ".recursion")
+                current: LLVMValueRef = LLVMBuildPhi(builder, LLVMTypeOf(argument), (&name[0]).cast[cstr])
+                LLVMReplaceAllUsesWith(argument, current)
+                add_phi_incoming(current, argument, entry)
+                add_phi_incoming(current, LLVMGetOperand(call, position), recurse)
+
+        # The descent: a new entry block jumps to the old one, now a loop header that
+        # counts calls in `recursion.depth`; the recursive call's block loops back to it.
+        # Returns the depth phi.
+        def build_descent(function: LLVMValueRef, shape: AccumulatorShape&, builders: AccumulatorBuilders&) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+            header: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            name_storage: mutable darray[u8] = []
+            entry: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, header, sview_to_cstr("recursion.entry", name_storage))
+            LLVMPositionBuilderAtEnd(builders.builder, entry)
+            LLVMSetCurrentDebugLocation2(builders.builder, null)
+            _ = LLVMBuildBr(builders.builder, header)
+            LLVMPositionBuilder(builders.builder, header, LLVMGetFirstInstruction(header))
+            depth: LLVMValueRef = named_phi(builders.builder, builders.count_type, "recursion.depth")
+            add_phi_incoming(depth, LLVMConstInt(builders.count_type, 0, 0), entry)
+            thread_changing_arguments(function, shape.call, entry, builders.builder)
+            LLVMPositionBuilderBefore(builders.builder, shape.branch)
+            next_storage: mutable darray[u8] = []
+            next: LLVMValueRef = LLVMBuildAdd(builders.builder, depth, LLVMConstInt(builders.count_type, 1, 0), sview_to_cstr("recursion.depth.next", next_storage))
+            add_phi_incoming(depth, next, LLVMGetInstructionParent(shape.call))
+            _ = LLVMBuildBr(builders.builder, header)
+            LLVMInstructionEraseFromParent(shape.branch)
+            depth
+
+        # The call, the checked operation and its parts removed, and the continue block
+        # with them unless it is the shared return block.
+        def remove_recursive_step(shape: AccumulatorShape&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            recurse: LLVMBasicBlockRef = LLVMGetInstructionParent(shape.call)
+            parts: darray[LLVMValueRef] = [shape.result, shape.overflow, shape.checked, shape.call]
+            dead: mutable darray[LLVMValueRef] = []
+            for part in parts |dead, recurse|:
+                dead.push(part) if LLVMGetInstructionParent(part) == recurse
+            if shape.continue_returns:
+                ElisaLLVMBlockRemovePredecessor(shape.continue_block, recurse, 0)
+            else:
+                blocks: mutable darray[LLVMBasicBlockRef] = [shape.continue_block]
+                ElisaLLVMDeleteDeadBlocks((&blocks[0]).cast[void&], 1)
+            for part in dead:
+                LLVMInstructionEraseFromParent(part)
+
+        # The blocks of FUNCTION that end in `ret`, in order, with their returns.
+        def function_returns(function: LLVMValueRef) -> darray[LLVMValueRef]:
+            returns: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while cursor is block |cursor, returns|:
+                cursor <- LLVMGetNextBasicBlock(block)
+                if LLVMGetBasicBlockTerminator(block) is terminator:
+                    returns.push(terminator) if is_llvm_instruction_with_opcode(terminator, LLVMOpcode::RET)
+            returns
+
+        # `IRBuilder::CreateBinaryIntrinsic` of a `*.with.overflow` intrinsic.
+        def build_checked_operation(id: u32, left: LLVMValueRef, right: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            types: mutable darray[LLVMTypeRef] = [LLVMTypeOf(left)]
+            declaration: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, id, (&types[0]).cast[void&], 1)
+            intrinsic_type: LLVMTypeRef = LLVMIntrinsicGetType(LLVMGetModuleContext(module), id, (&types[0]).cast[void&], 1)
+            arguments: mutable darray[LLVMValueRef] = [left, right]
+            LLVMBuildCall2(builder, intrinsic_type, declaration, (&arguments[0]).cast[void&], 2, "")
+
+        # The ascent: every return now feeds its value into `recursion.value`, which the
+        # step block combines with the invariant once per counted call, trapping on overflow.
+        def build_ascent(function: LLVMValueRef, shape: AccumulatorShape&, depth: LLVMValueRef, id: u32, weights: LLVMValueRef?, builders: AccumulatorBuilders&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+            module: LLVMModuleRef = LLVMGetGlobalParent(function)
+            returns: darray[LLVMValueRef] = function_returns(function)
+            result_type: LLVMTypeRef = LLVMGetReturnType(LLVMGlobalGetValueType(function))
+            names: mutable darray[u8] = []
+            ascent: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, function, sview_to_cstr("recursion.ascent", names))
+            step_names: mutable darray[u8] = []
+            step: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, function, sview_to_cstr("recursion.step", step_names))
+            done_names: mutable darray[u8] = []
+            done: LLVMBasicBlockRef = LLVMAppendBasicBlockInContext(context, function, sview_to_cstr("recursion.done", done_names))
+            LLVMPositionBuilderAtEnd(builders.builder, ascent)
+            accumulator: LLVMValueRef = named_phi(builders.builder, result_type, "recursion.value")
+            remaining: LLVMValueRef = named_phi(builders.builder, builders.count_type, "recursion.remaining")
+            for ending in returns |accumulator, remaining, depth, ascent, builders|:
+                block: LLVMBasicBlockRef = LLVMGetInstructionParent(ending)
+                add_phi_incoming(accumulator, LLVMGetOperand(ending, 0), block)
+                add_phi_incoming(remaining, depth, block)
+                _ = branch_before(ending, ascent, builders.plain)
+                LLVMInstructionEraseFromParent(ending)
+            finished: LLVMValueRef = LLVMBuildICmp(builders.builder, LLVMIntPredicate::EQ, remaining, LLVMConstInt(builders.count_type, 0, 0), "")
+            _ = LLVMBuildCondBr(builders.builder, finished, done, step)
+            LLVMPositionBuilderAtEnd(builders.builder, step)
+            left: LLVMValueRef = shape.invariant if shape.invariant_operand == 0 else accumulator
+            right: LLVMValueRef = accumulator if shape.invariant_operand == 0 else shape.invariant
+            checked: LLVMValueRef = build_checked_operation(id, left, right, module, builders.builder)
+            add_phi_incoming(accumulator, LLVMBuildExtractValue(builders.builder, checked, 0, ""), step)
+            add_phi_incoming(remaining, LLVMBuildSub(builders.builder, remaining, LLVMConstInt(builders.count_type, 1, 0), ""), step)
+            overflowed: LLVMValueRef = LLVMBuildExtractValue(builders.builder, checked, 1, "")
+            guard: LLVMValueRef = LLVMBuildCondBr(builders.builder, overflowed, shape.trap, ascent)
+            if weights is profile:
+                LLVMSetMetadata(guard, profile_kind(context), profile)
+            LLVMPositionBuilderAtEnd(builders.builder, done)
+            _ = LLVMBuildRet(builders.builder, accumulator)
+
+    public:
+        # Rewrites FUNCTION, matched as SHAPE, into its descent and ascent loops.
+        def rewrite_checked_accumulator(function: LLVMValueRef, shape: AccumulatorShape&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+            builders: AccumulatorBuilders = AccumulatorBuilders{builder: LLVMCreateBuilderInContext(context), plain: LLVMCreateBuilderInContext(context), count_type: LLVMInt64TypeInContext(context)}
+            weights: LLVMValueRef? = LLVMGetMetadata(shape.branch, profile_kind(context))
+            id: u32 = called_intrinsic_id(shape.checked)
+            depth: LLVMValueRef = build_descent(function, shape, &builders)
+            remove_recursive_step(shape)
+            build_ascent(function, shape, depth, id, weights, &builders)
+            LLVMDisposeBuilder(builders.builder)
+            LLVMDisposeBuilder(builders.plain)

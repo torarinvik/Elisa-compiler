@@ -376,6 +376,15 @@ LLVMValueRef ElisaLLVMConstantIntMultiply(LLVMValueRef left, LLVMValueRef right)
                                Left->getValue() * cast<ConstantInt>(unwrap(right))->getValue()));
 }
 
+LLVMValueRef ElisaLLVMConstantIntZeroExtend(LLVMValueRef constant, uint32_t width) {
+  ConstantInt *Constant = cast<ConstantInt>(unwrap(constant));
+  return wrap(ConstantInt::get(Constant->getContext(), Constant->getValue().zext(width)));
+}
+
+int ElisaLLVMFunctionHasAddressTaken(LLVMValueRef function) {
+  return cast<Function>(unwrap(function))->hasAddressTaken();
+}
+
 uint64_t ElisaLLVMConstantDoubleBits(LLVMValueRef constant) {
   return cast<ConstantFP>(unwrap(constant))->getValueAPF().bitcastToAPInt().getZExtValue();
 }

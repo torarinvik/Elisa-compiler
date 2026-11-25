@@ -1,0 +1,114 @@
+# A private recursive function whose outside calls all pass the same literal for one
+# integer argument gets a copy with that literal substituted. Inside the copy, a
+# recursive call that still passes the literal stays in the copy; one whose argument
+# changes goes back to the original body.
+
+const module LiteralSpecializationLimit:
+    MINIMUM_INSTRUCTIONS: u32 = 40
+    MAXIMUM_INSTRUCTIONS: u32 = 256
+    MAXIMUM_RECURSIVE_CALLS: u32 = 4
+    MAXIMUM_FUNCTIONS: usize = 16
+    MAXIMUM_ROOTS: usize = 16
+    MAXIMUM_GROWTH: u32 = 2048
+    SPECIALIZED: sview = "elisa.literal-specialized"
+    SUFFIX: sview = ".literal_specialized"
+
+extend Backend:
+    private:
+        # Attributes and size that allow specializing FUNCTION.
+        def is_specializable_recursion(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_expandable_private_function(function) or ElisaLLVMFunctionHasAddressTaken(function) != 0
+            return false if function_has_attribute(function, "noduplicate") or function_has_attribute(function, "returns_twice")
+            return false if function_has_string_attribute(function, LiteralSpecializationLimit::SPECIALIZED)
+            size: u32 = function_instruction_count(function)
+            size >= LiteralSpecializationLimit::MINIMUM_INSTRUCTIONS and size <= LiteralSpecializationLimit::MAXIMUM_INSTRUCTIONS
+
+        # No invoke, callbr, indirect branch, inline assembly or unrepeatable call.
+        def has_only_duplicable_calls(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for instruction in function_instructions(function):
+                opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                return false if opcode == LLVMOpcode::INVOKE or opcode == LLVMOpcode::CALL_BR or opcode == LLVMOpcode::INDIRECT_BR
+                if is_call_base(instruction):
+                    return false if LLVMIsAInlineAsm(LLVMGetCalledValue(instruction)) != null or call_resists_duplication(instruction)
+            true
+
+        # How many of FUNCTION's users are its own recursive calls, or none when some
+        # user is not a plain direct call of it.
+        def own_recursive_calls(function: LLVMValueRef) -> u32? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            recursive: mutable u32 = 0
+            for user in value_users(function) |recursive, function|:
+                return null if LLVMIsACallInst(user) == null or not calls_function(user, function) or is_must_tail_call(user)
+                return null if call_has_attribute(user, RecursionCallKind::CONVERGENT) or LLVMGetNumOperandBundles(user) != 0
+                recursive <- recursive + 1 if enclosing_function(user) == function else recursive
+            recursive
+
+        # The functions worth specializing, in module order.
+        def literal_specialization_work(module: LLVMModuleRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            work: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, work|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if not is_specializable_recursion(function) or not has_only_duplicable_calls(function)
+                recursive: u32 = get own_recursive_calls(function) else 0
+                work.push(function) if recursive != 0 and recursive <= LiteralSpecializationLimit::MAXIMUM_RECURSIVE_CALLS
+            work
+
+        # The outside calls of FUNCTION passing a literal for argument INDEX, when they
+        # all pass the same one.
+        def literal_roots(function: LLVMValueRef, index: u32) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            roots: mutable darray[LLVMValueRef] = []
+            literal: mutable LLVMValueRef? = null
+            for call in value_users(function) |roots, literal, function, index|:
+                continue if enclosing_function(call) == function
+                argument: LLVMValueRef = LLVMGetOperand(call, index)
+                continue if LLVMIsAConstantInt(argument) == null
+                if literal is chosen:
+                    return [] if argument != chosen
+                literal <- argument
+                roots.push(call)
+            roots
+
+        # The copy of FUNCTION with argument INDEX replaced by LITERAL; its recursive calls
+        # passing LITERAL stay in it, the others go back to FUNCTION.
+        def literal_specialized_copy(function: LLVMValueRef, index: u32, literal: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            copy: LLVMValueRef = ElisaLLVMCloneFunction(function)
+            name: mutable darray[u8] = suffixed_name(function, LiteralSpecializationLimit::SUFFIX)
+            LLVMSetValueName2(copy, (&name[0]).cast[cstr], name.count - 1)
+            add_function_marker(copy, LiteralSpecializationLimit::SPECIALIZED)
+            LLVMReplaceAllUsesWith(LLVMGetParam(copy, index), literal)
+            for instruction in function_instructions(copy) |function, copy, index, literal|:
+                continue if LLVMIsACallInst(instruction) == null
+                continue if not calls_function(instruction, copy) and not calls_function(instruction, function)
+                set_called_function(instruction, copy if LLVMGetOperand(instruction, index) == literal else function)
+            copy
+
+        # Specializes the first integer argument of FUNCTION, used at least twice, whose
+        # outside calls agree on one literal; whether one was.
+        def specialize_first_literal_argument(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<LLVMCountParams(function) |function|:
+                argument: LLVMValueRef = LLVMGetParam(function, index)
+                continue if not is_llvm_integer_type(LLVMTypeOf(argument), 0) or argument_uses(argument) < 2
+                roots: darray[LLVMValueRef] = literal_roots(function, index)
+                continue if roots.count == 0 or roots.count > LiteralSpecializationLimit::MAXIMUM_ROOTS
+                literal: LLVMValueRef = LLVMGetOperand(roots[0], index)
+                copy: LLVMValueRef = literal_specialized_copy(function, index, literal)
+                for root in roots |copy|:
+                    set_called_function(root, copy)
+                add_function_marker(function, LiteralSpecializationLimit::SPECIALIZED)
+                return true
+            false
+
+    public:
+        # `specializeRecursiveLiteralCalls`: how many functions got a literal copy.
+        def specialize_recursive_literal_calls(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            work: darray[LLVMValueRef] = literal_specialization_work(module)
+            return 0 if work.count > LiteralSpecializationLimit::MAXIMUM_FUNCTIONS
+            changed: mutable u32 = 0
+            growth: mutable u32 = 0
+            for function in work |changed, growth|:
+                size: u32 = function_instruction_count(function)
+                continue if growth + size > LiteralSpecializationLimit::MAXIMUM_GROWTH
+                if specialize_first_literal_argument(function):
+                    growth <- growth + function_instruction_count(function)
+                    changed <- changed + 1
+            changed

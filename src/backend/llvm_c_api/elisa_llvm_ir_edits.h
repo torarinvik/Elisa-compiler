@@ -50,6 +50,16 @@ void ElisaLLVMAdoptFunctionBody(LLVMValueRef function, LLVMValueRef donor);
  * the call was inlined. */
 int ElisaLLVMInlineCall(LLVMValueRef call);
 
+/* llvm::isInlineViable: whether the function's body can be inlined at all
+ * (no indirect branches, no `returns_twice` calls, no dynamic stack recovery). */
+int ElisaLLVMIsInlineViable(LLVMValueRef function);
+
+/* llvm::SplitBlockAndInsertIfThenElse(condition, before): splits the block before
+ * `before` and branches on `condition` to a new then block and else block that both
+ * fall through to it; stores their terminators. */
+void ElisaLLVMSplitBlockAndInsertIfThenElse(LLVMValueRef condition, LLVMValueRef before,
+                                            LLVMValueRef *then_terminator, LLVMValueRef *else_terminator);
+
 /* ICmpInst::setPredicate: `predicate` is an LLVMIntPredicate. */
 void ElisaLLVMSetICmpPredicate(LLVMValueRef compare, LLVMIntPredicate predicate);
 

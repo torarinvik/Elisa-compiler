@@ -1,0 +1,141 @@
+# Expands small private recursion from stable snapshots, within fixed budgets.
+#
+# On AArch64 macOS and Linux without debug info: checked-accumulator recursion becomes
+# loops; recursive functions get literal-argument copies; each small binary or guarded
+# linear recursion inlines a snapshot of itself at its own calls, up to two levels, and a
+# linear one also at its outside calls. After an O3 cleanup, one loop-invariant call of a
+# literal-specialized helper is versioned for a zero argument, the accumulator loops'
+# provable overflow checks are removed, and calls guarded in search loops are biased.
+include "./recursion_calls.elisa"
+include "./recursion_candidates.elisa"
+include "./literal_specialization.elisa"
+include "./zero_versioning.elisa"
+include "./guard_bias.elisa"
+include "./checked_accumulators/checked_accumulators.elisa"
+
+const module RecursiveInlineLimit:
+    MAXIMUM_CANDIDATES: usize = 16
+    LEVELS: u32 = 2
+    MAXIMUM_SELF_CALLS: usize = 4
+    MAXIMUM_FUNCTION: u32 = 2048
+    MAXIMUM_GROWTH: u32 = 16384
+    MAXIMUM_ENTRIES: usize = 2
+    MAXIMUM_CALLER: u32 = 2048
+    MAXIMUM_ENTRY_COPIES: u32 = 512
+    SNAPSHOT: sview = ".recursive_snapshot"
+    ENTRY_SNAPSHOT: sview = ".entry_snapshot"
+
+# The calls a snapshot expansion inlined and the budget it has used.
+struct RecursiveExpansion:
+    inlined: u32
+    growth: u32
+
+extend Backend:
+    private:
+        # Points each call at SNAPSHOT and inlines it, sending a call that does not inline
+        # back to FUNCTION; how many inlined.
+        def inline_through_snapshot(calls: darray[LLVMValueRef]&, snapshot: LLVMValueRef, function: LLVMValueRef) -> u32:
+            inlined: mutable u32 = 0
+            for call in calls |inlined, snapshot, function|:
+                set_called_function(call, snapshot)
+                if ElisaLLVMInlineCall(call) != 0:
+                    inlined <- inlined + 1
+                else:
+                    set_called_function(call, function)
+            inlined
+
+        # FUNCTION's own calls inlined from a snapshot of it, one level after another,
+        # while the copies stay within budget.
+        def expand_from_snapshots(function: LLVMValueRef, growth: u32) -> RecursiveExpansion can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            expansion: mutable RecursiveExpansion = RecursiveExpansion{inlined: 0, growth: growth}
+            for level in 0..<RecursiveInlineLimit::LEVELS |expansion, function|:
+                calls: darray[LLVMValueRef] = calls_to(function, function)
+                size: u32 = function_instruction_count(function)
+                cost: u32 = size * calls.count.u32()
+                break if calls.count > RecursiveInlineLimit::MAXIMUM_SELF_CALLS or size + cost > RecursiveInlineLimit::MAXIMUM_FUNCTION
+                break if expansion.growth + cost > RecursiveInlineLimit::MAXIMUM_GROWTH
+                snapshot: LLVMValueRef = recursion_snapshot(function, RecursiveInlineLimit::SNAPSHOT)
+                if ElisaLLVMIsInlineViable(snapshot) == 0:
+                    LLVMDeleteFunction(snapshot)
+                    break
+                inlined: u32 = inline_through_snapshot(&calls, snapshot, function)
+                expansion <- RecursiveExpansion{inlined: expansion.inlined + inlined, growth: expansion.growth + cost}
+                LLVMDeleteFunction(snapshot) if LLVMGetFirstUse(snapshot) == null
+            expansion
+
+        # The outside calls of FUNCTION when it calls itself once and at most two plain
+        # calls in callers small enough to grow reach it.
+        def linear_entries(function: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            entries: mutable darray[LLVMValueRef] = []
+            recursive: mutable u32 = 0
+            for user in value_users(function) |entries, recursive, function|:
+                return [] if LLVMIsACallInst(user) == null or not calls_function(user, function)
+                if enclosing_function(user) == function:
+                    recursive <- recursive + 1
+                    continue
+                caller: LLVMValueRef = enclosing_function(user)
+                return [] if entries.count == RecursiveInlineLimit::MAXIMUM_ENTRIES or is_must_tail_call(user) or function_is_size_optimized(caller)
+                return [] if function_instruction_count(caller) > RecursiveInlineLimit::MAXIMUM_CALLER
+                entries.push(user)
+            return [] if recursive != 1
+            return [] if function_instruction_count(function) * entries.count.u32() > RecursiveInlineLimit::MAXIMUM_ENTRY_COPIES
+            entries
+
+        # An expanded linear recursion inlined at its outside calls: its first levels then
+        # run in the caller's frame and deeper ones still call FUNCTION. How many inlined.
+        def inline_linear_entries(function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            entries: darray[LLVMValueRef] = linear_entries(function)
+            return 0 if entries.count == 0
+            snapshot: LLVMValueRef = recursion_snapshot(function, RecursiveInlineLimit::ENTRY_SNAPSHOT)
+            inlined: u32 = inline_through_snapshot(&entries, snapshot, function) if ElisaLLVMIsInlineViable(snapshot) != 0 else 0
+            LLVMDeleteFunction(snapshot)
+            inlined
+
+        # The module's recursive-inline candidates, in module order.
+        def recursive_inline_candidates(module: LLVMModuleRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidates: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, candidates|:
+                cursor <- LLVMGetNextFunction(function)
+                candidates.push(function) if recursive_inline_candidate(function)
+            candidates
+
+        # Every candidate expanded and marked; how many calls were inlined.
+        def expand_candidates(candidates: darray[LLVMValueRef]&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            inlined: mutable u32 = 0
+            growth: mutable u32 = 0
+            for function in candidates |inlined, growth|:
+                expansion: RecursiveExpansion = expand_from_snapshots(function, growth)
+                growth <- expansion.growth
+                add_function_marker(function, RecursionCandidateLimit::EXPANDED)
+                inlined <- inlined + expansion.inlined + inline_linear_entries(function)
+            inlined
+
+        # The cleanup after an expansion: O3, zero versioning (and O3 again if one call
+        # was versioned), the accumulator proofs when loops were made, and guard bias.
+        def clean_up_expanded_recursion(module: LLVMModuleRef, target: void&, looped: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            ElisaLLVMRunDefaultO3Pipeline(module, target)
+            ElisaLLVMRunDefaultO3Pipeline(module, target) if version_recursive_zero_call(module) != 0
+            if looped:
+                _ = prove_bounded_accumulators(module, target)
+            _ = bias_guarded_recursive_calls(module)
+
+        # AArch64 macOS or Linux, without debug info.
+        def is_recursive_inline_module(module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if ElisaLLVMModuleTargetIsMacOSX(module) == 0 and ElisaLLVMModuleTargetIsLinux(module) == 0
+            ElisaLLVMModuleTargetArchIsAArch64(module) != 0 and not module_has_debug_info(module)
+
+    public:
+        # `inlineSmallRecursiveFunctions`: 1 when the module was expanded and cleaned up;
+        # the number of accumulator loops made when there were too many candidates; else 0.
+        def inline_small_recursive_functions(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            machine: void& = get target else return 0
+            return 0 if not is_recursive_inline_module(module)
+            looped: u32 = loop_checked_accumulator_recursion(module)
+            candidates: darray[LLVMValueRef] = recursive_inline_candidates(module)
+            return looped if candidates.count > RecursiveInlineLimit::MAXIMUM_CANDIDATES
+            changed: u32 = specialize_recursive_literal_calls(module) + looped
+            return 0 if candidates.count == 0 and changed == 0
+            return 0 if changed + expand_candidates(&candidates) == 0
+            clean_up_expanded_recursion(module, machine, looped != 0)
+            1

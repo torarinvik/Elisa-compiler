@@ -71,6 +71,9 @@ int ElisaLLVMConstantRangeIsAllNonNegative(ElisaConstantRangeRef range);
 /* getSignedMin() / getSignedMax() sign-extended; the range is at most 64 bits wide. */
 int64_t ElisaLLVMConstantRangeSignedMin(ElisaConstantRangeRef range);
 int64_t ElisaLLVMConstantRangeSignedMax(ElisaConstantRangeRef range);
+/* getSignedMin() / getSignedMax() as ConstantInts of the range's width, any width. */
+LLVMValueRef ElisaLLVMConstantRangeSignedMinimum(ElisaConstantRangeRef range, LLVMContextRef context);
+LLVMValueRef ElisaLLVMConstantRangeSignedMaximum(ElisaConstantRangeRef range, LLVMContextRef context);
 /* getUnsignedMin() as APInt::getLimitedValue. */
 uint64_t ElisaLLVMConstantRangeUnsignedMin(ElisaConstantRangeRef range);
 /* getLower() and getUpper() of a range at most 64 bits wide, zero-extended. */

@@ -1,0 +1,156 @@
+# A literal-specialized recursive helper that returns zero straight away for a zero
+# argument, called once in a loop with a loop-invariant argument, gets that call
+# versioned: a zero argument calls an inlined copy with the argument substituted, so
+# LLVM's cleanup can drop work that caller never observes; any other value keeps the
+# call. The guarded operand is frozen and the same value reaches the kept call.
+
+const module ZeroVersionLimit:
+    MAXIMUM_INSTRUCTIONS: u32 = 256
+    VERSIONED: sview = "elisa.zero-versioned"
+    SUFFIX: sview = ".zero_version"
+
+# A helper's zero test: the argument it compares with zero and that zero.
+struct ZeroTest:
+    argument: LLVMValueRef
+    zero: LLVMValueRef
+
+extend Backend:
+    private:
+        # Attributes and size that allow versioning calls of FUNCTION.
+        def is_zero_versionable(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_expandable_private_function(function)
+            return false if function_has_attribute(function, "noduplicate") or function_has_attribute(function, "returns_twice")
+            return false if not function_has_string_attribute(function, LiteralSpecializationLimit::SPECIALIZED)
+            return false if function_has_string_attribute(function, ZeroVersionLimit::VERSIONED)
+            function_instruction_count(function) <= ZeroVersionLimit::MAXIMUM_INSTRUCTIONS
+
+        # The incoming value of PHI from BLOCK, the first when there are several.
+        def incoming_value_from(phi: LLVMValueRef, block: LLVMBasicBlockRef) -> LLVMValueRef?:
+            for incoming in 0..<LLVMCountIncoming(phi) |phi, block|:
+                return LLVMGetIncomingValue(phi, incoming) if LLVMGetIncomingBlock(phi, incoming) == block
+            null
+
+        # BLOCK ends in `br (icmp eq argument, 0)` whose true edge returns a phi that is
+        # zero from BLOCK.
+        def zero_return_test(block: LLVMBasicBlockRef, function: LLVMValueRef) -> ZeroTest? can[Abort.Panic, Unsafe.PointerCast]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::EQ
+            argument: LLVMValueRef = LLVMGetOperand(compare, 0)
+            zero: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if LLVMIsAArgument(argument) == null or LLVMGetParamParent(argument) != function
+            return null if LLVMIsAConstantInt(zero) == null or ElisaLLVMIsConstantZero(zero) == 0
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(LLVMGetSuccessor(branch, 0)) else return null
+            return null if not is_llvm_instruction_with_opcode(terminator, LLVMOpcode::RET) or LLVMGetNumOperands(terminator) == 0
+            returned: LLVMValueRef = LLVMGetOperand(terminator, 0)
+            return null if not is_llvm_instruction_with_opcode(returned, LLVMOpcode::PHI)
+            result: LLVMValueRef = get incoming_value_from(returned, block) else return null
+            return null if LLVMIsAConstantInt(result) == null or ElisaLLVMIsConstantZero(result) == 0
+            ZeroTest{argument: argument, zero: zero}
+
+        # A caller whose code may be versioned: no personality, not size-optimized, not sanitized.
+        def is_versionable_caller(caller: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            LLVMHasPersonalityFn(caller) == 0 and not function_is_size_optimized(caller) and not function_is_sanitized(caller)
+
+        # Whether CALL, an outside call of FUNCTION returning an integer, passes a
+        # non-constant ARGUMENT that its enclosing loop never changes.
+        def is_loop_invariant_root(call: LLVMValueRef, function: LLVMValueRef, position: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsACallInst(call) == null or not calls_function(call, function) or enclosing_function(call) == function
+            return false if is_must_tail_call(call) or call_resists_duplication(call) or not is_llvm_integer_type(LLVMTypeOf(call), 0)
+            argument: LLVMValueRef = LLVMGetOperand(call, position)
+            caller: LLVMValueRef = enclosing_function(call)
+            return false if LLVMIsAConstant(argument) != null or not is_versionable_caller(caller)
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(caller) else return false
+            invariant: mutable bool = false
+            if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(call)) is loop:
+                invariant <- ElisaLLVMLoopIsInvariant(loop, argument) != 0
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            invariant
+
+        # The copy of FUNCTION with argument POSITION replaced by ZERO, or none when it
+        # cannot be inlined.
+        def zero_version_copy(function: LLVMValueRef, position: u32, zero: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            copy: LLVMValueRef = ElisaLLVMCloneFunction(function)
+            name: mutable darray[u8] = suffixed_name(function, ZeroVersionLimit::SUFFIX)
+            LLVMSetValueName2(copy, (&name[0]).cast[cstr], name.count - 1)
+            LLVMReplaceAllUsesWith(LLVMGetParam(copy, position), zero)
+            for call in calls_to(copy, copy) |function|:
+                set_called_function(call, function) if LLVMIsACallInst(call) != null
+            if ElisaLLVMIsInlineViable(copy) == 0:
+                LLVMDeleteFunction(copy)
+                return null
+            copy
+
+        # A clone of ROOT inserted before TERMINATOR with no tail-call marker.
+        def call_copy_before(root: LLVMValueRef, terminator: LLVMValueRef, builder: LLVMBuilderRef) -> LLVMValueRef:
+            copy: LLVMValueRef = LLVMInstructionClone(root)
+            LLVMSetTailCallKind(copy, LLVMTailCallKindValue::NONE)
+            LLVMPositionBuilderBefore(builder, terminator)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            LLVMInsertIntoBuilderWithName(builder, copy, "")
+            copy
+
+        # Splits ROOT on `frozen argument == 0`: the zero side calls COPY, inlined, the
+        # other keeps calling the original with the frozen value.
+        def version_root(root: LLVMValueRef, copy: LLVMValueRef, test: ZeroTest&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: u32 = argument_position(test.argument)
+            name_storage: mutable darray[u8] = []
+            LLVMPositionBuilderBefore(builder, root)
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, LLVMGetOperand(root, position), sview_to_cstr("zero.version.value", name_storage))
+            condition: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::EQ, stable, test.zero, "")
+            LLVMSetOperand(root, position, stable)
+            # Pointer-sized slots for the shim to fill: an optional handle is not one.
+            then_terminator: mutable void&? = null
+            else_terminator: mutable void&? = null
+            ElisaLLVMSplitBlockAndInsertIfThenElse(condition, root, (&then_terminator).cast[void&], (&else_terminator).cast[void&])
+            then_slot: void& = get then_terminator else return
+            else_slot: void& = get else_terminator else return
+            then_end: LLVMValueRef = then_slot.cast[LLVMValueRef]
+            else_end: LLVMValueRef = else_slot.cast[LLVMValueRef]
+            fast: LLVMValueRef = call_copy_before(root, then_end, builder)
+            set_called_function(fast, copy)
+            LLVMSetOperand(fast, position, test.zero)
+            slow: LLVMValueRef = call_copy_before(root, else_end, builder)
+            LLVMPositionBuilderBefore(builder, root)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            result_storage: mutable darray[u8] = []
+            result: LLVMValueRef = LLVMBuildPhi(builder, LLVMTypeOf(root), sview_to_cstr("zero.version.result", result_storage))
+            add_phi_incoming(result, fast, LLVMGetInstructionParent(then_end))
+            add_phi_incoming(result, slow, LLVMGetInstructionParent(else_end))
+            LLVMReplaceAllUsesWith(root, result)
+            LLVMInstructionEraseFromParent(root)
+            _ = ElisaLLVMInlineCall(fast)
+            LLVMDeleteFunction(copy) if LLVMGetFirstUse(copy) == null
+
+        # Versions the one loop-invariant outside call of FUNCTION behind a zero test in
+        # BLOCK; whether it did.
+        def version_zero_test(function: LLVMValueRef, test: ZeroTest&, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: u32 = argument_position(test.argument)
+            roots: mutable darray[LLVMValueRef] = []
+            for user in value_users(function) |roots, function, position|:
+                roots.push(user) if is_loop_invariant_root(user, function, position)
+            return false if roots.count != 1
+            copy: LLVMValueRef = get zero_version_copy(function, position, test.zero) else return false
+            version_root(roots[0], copy, test, builder)
+            add_function_marker(function, ZeroVersionLimit::VERSIONED)
+            true
+
+    public:
+        # `versionRecursiveZeroCall`: 1 when one call was versioned, else 0.
+        def version_recursive_zero_call(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            versioned: mutable bool = false
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, versioned, builder|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if not is_zero_versionable(function)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, versioned, function, builder|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    if zero_return_test(block, function) is test:
+                        if version_zero_test(function, &test, builder):
+                            versioned <- true
+                            break
+                break if versioned
+            LLVMDisposeBuilder(builder)
+            1 if versioned else 0

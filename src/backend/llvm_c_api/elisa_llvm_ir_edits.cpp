@@ -2,6 +2,7 @@
 #include "elisa_llvm_ir_edits.h"
 
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/InlineCost.h>
 #include <llvm/Analysis/Utils/Local.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/BasicBlock.h>
@@ -63,6 +64,18 @@ void ElisaLLVMAdoptFunctionBody(LLVMValueRef function, LLVMValueRef donor) {
 int ElisaLLVMInlineCall(LLVMValueRef call) {
   InlineFunctionInfo Info;
   return InlineFunction(*cast<CallBase>(unwrap(call)), Info).isSuccess();
+}
+
+int ElisaLLVMIsInlineViable(LLVMValueRef function) {
+  return isInlineViable(*cast<Function>(unwrap(function))).isSuccess();
+}
+
+void ElisaLLVMSplitBlockAndInsertIfThenElse(LLVMValueRef condition, LLVMValueRef before,
+                                            LLVMValueRef *then_terminator, LLVMValueRef *else_terminator) {
+  Instruction *Then = nullptr, *Else = nullptr;
+  SplitBlockAndInsertIfThenElse(unwrap(condition), cast<Instruction>(unwrap(before))->getIterator(), &Then, &Else);
+  *then_terminator = wrap(Then);
+  *else_terminator = wrap(Else);
 }
 
 void ElisaLLVMSetICmpPredicate(LLVMValueRef compare, LLVMIntPredicate predicate) {

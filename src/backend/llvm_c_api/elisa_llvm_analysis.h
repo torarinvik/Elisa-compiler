@@ -179,6 +179,10 @@ int ElisaLLVMConstantIntsAgreeInLowBits(LLVMValueRef first, LLVMValueRef second,
 int ElisaLLVMConstantFloatIsNegativeFiniteNonzero(LLVMValueRef constant);
 /* The product of two ConstantInts of one width, wrapping (APInt::operator*). */
 LLVMValueRef ElisaLLVMConstantIntMultiply(LLVMValueRef left, LLVMValueRef right);
+/* A ConstantInt zero-extended to `width` bits, at least its own (APInt::zext). */
+LLVMValueRef ElisaLLVMConstantIntZeroExtend(LLVMValueRef constant, uint32_t width);
+/* Function::hasAddressTaken: some use of the function is not the callee of a call. */
+int ElisaLLVMFunctionHasAddressTaken(LLVMValueRef function);
 /* The IEEE bits of a `double` ConstantFP (APFloat::bitcastToAPInt). */
 uint64_t ElisaLLVMConstantDoubleBits(LLVMValueRef constant);
 /* Whether some strongly connected component of the function's control flow graph has a

@@ -1,0 +1,82 @@
+# Which private recursions are small enough to expand from snapshots: a binary
+# recursion (two self-calls behind an argument-equals-constant entry test) or a linear
+# one (one self-call behind an `index <u view.length` entry check that traps), with no
+# other calls but intrinsics.
+
+const module RecursionCandidateLimit:
+    MINIMUM_INSTRUCTIONS: u32 = 16
+    MAXIMUM_INSTRUCTIONS: u32 = 128
+    MAXIMUM_LINEAR_INSTRUCTIONS: u32 = 64
+    EXPANDED: sview = "elisa.recursive-expanded"
+
+extend Backend:
+    private:
+        # Uses of an argument, looking through a lone freeze (loop unswitching freezes the
+        # arguments of the conditions it hoists).
+        def argument_uses(argument: LLVMValueRef) -> u32:
+            uses: u32 = use_count(argument)
+            if uses == 1:
+                if LLVMGetFirstUse(argument) is only_use:
+                    user: LLVMValueRef = LLVMGetUser(only_use)
+                    return use_count(user) if is_llvm_instruction_with_opcode(user, LLVMOpcode::FREEZE)
+            uses
+
+        # Whether a block calls `llvm.trap`.
+        def block_calls_trap(block: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            trap: u32 = intrinsic_identifier("llvm.trap")
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, trap|:
+                return true if LLVMIsAIntrinsicInst(instruction) != null and called_intrinsic_id(instruction) == trap
+                cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+        # The entry tests `argument <u view.length` (the argument possibly frozen, the
+        # view an argument) and its false edge reaches an `unreachable` after a trap.
+        def has_guarded_linear_entry(entry_branch: LLVMValueRef, compare: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT
+            operand: LLVMValueRef = LLVMGetOperand(compare, 0)
+            index: LLVMValueRef = LLVMGetOperand(operand, 0) if is_llvm_instruction_with_opcode(operand, LLVMOpcode::FREEZE) else operand
+            length: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return false if LLVMIsAArgument(index) == null or not is_llvm_instruction_with_opcode(length, LLVMOpcode::EXTRACT_VALUE)
+            return false if LLVMIsAArgument(LLVMGetOperand(length, 0)) == null
+            failure: LLVMBasicBlockRef = LLVMGetSuccessor(entry_branch, 1)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(failure) else return false
+            LLVMGetInstructionOpcode(terminator) == LLVMOpcode::UNREACHABLE and block_calls_trap(failure)
+
+        # Attributes and size that allow expanding FUNCTION.
+        def is_expandable_recursion(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_expandable_private_function(function) or ElisaLLVMFunctionHasAddressTaken(function) != 0
+            return false if not function_has_attribute(function, "nounwind") or function_has_string_attribute(function, RecursionCandidateLimit::EXPANDED)
+            size: u32 = function_instruction_count(function)
+            size >= RecursionCandidateLimit::MINIMUM_INSTRUCTIONS and size <= RecursionCandidateLimit::MAXIMUM_INSTRUCTIONS
+
+        # FUNCTION's calls to itself, or none when an instruction rules expansion out: an
+        # alloca, an invoke, a callbr, an indirect branch, a call that cannot be repeated,
+        # or a call to anything but itself or an intrinsic.
+        def expandable_self_calls(function: LLVMValueRef) -> u32? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: mutable u32 = 0
+            for instruction in function_instructions(function) |calls, function|:
+                opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                return null if opcode == LLVMOpcode::ALLOCA or opcode == LLVMOpcode::INVOKE or opcode == LLVMOpcode::CALL_BR or opcode == LLVMOpcode::INDIRECT_BR
+                if opcode == LLVMOpcode::CALL:
+                    return null if call_resists_duplication(instruction) or is_must_tail_call(instruction)
+                    if calls_function(instruction, function):
+                        calls <- calls + 1
+                    elif LLVMIsAIntrinsicInst(instruction) == null:
+                        return null
+            calls
+
+    public:
+        # A small private binary or guarded linear recursion to expand in its own body.
+        def recursive_inline_candidate(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not is_expandable_recursion(function)
+            entry_branch: LLVMValueRef = get conditional_terminator(LLVMGetEntryBasicBlock(function)) else return false
+            compare: LLVMValueRef = LLVMGetCondition(entry_branch)
+            return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            equality: bool = predicate == LLVMIntPredicate::EQ or predicate == LLVMIntPredicate::NE
+            binary: bool = equality and LLVMIsAArgument(LLVMGetOperand(compare, 0)) != null and LLVMIsAConstantInt(LLVMGetOperand(compare, 1)) != null
+            linear: bool = has_guarded_linear_entry(entry_branch, compare) and function_instruction_count(function) <= RecursionCandidateLimit::MAXIMUM_LINEAR_INSTRUCTIONS
+            return false if not binary and not linear
+            calls: u32 = get expandable_self_calls(function) else return false
+            (binary and calls == 2) or (linear and calls == 1)

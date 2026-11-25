@@ -1,0 +1,78 @@
+# A search loop whose equality edge calls a zero-versioned recursive helper is costly
+# to enter. On Apple Silicon, that edge is marked rarely taken, so the path without the
+# call keeps its values in caller-saved registers. A branch that already has profile
+# weights keeps them.
+
+const module GuardBiasWeight:
+    TAKEN: u64 = 1
+    NOT_TAKEN: u64 = 1024
+
+extend Backend:
+    private:
+        # Whether LOOP is the innermost loop of BLOCK.
+        def is_innermost_loop_of(analyses: ElisaFunctionAnalysesRef, block: LLVMBasicBlockRef, loop: ElisaLoopRef) -> bool:
+            if ElisaLLVMLoopForBlock(analyses, block) is innermost:
+                return innermost == loop
+            false
+
+        # A call of a private zero-versioned helper that can be weighed.
+        def calls_zero_versioned_helper(call: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsACallInst(call) == null
+            callee: LLVMValueRef = get direct_callee(call) else return false
+            return false if not has_local_linkage(callee) or not function_has_string_attribute(callee, ZeroVersionLimit::VERSIONED)
+            not call_has_attribute(call, RecursionCallKind::CONVERGENT) and LLVMGetNumOperandBundles(call) == 0
+
+        # How many calls in BLOCK reach a zero-versioned helper.
+        def zero_versioned_calls(block: LLVMBasicBlockRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            calls: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, calls|:
+                calls <- calls + 1 if calls_zero_versioned_helper(instruction) else calls
+                cursor <- LLVMGetNextInstruction(instruction)
+            calls
+
+        # BLOCK's branch when it ends a loop's equality test without profile weights
+        # whose true edge, entered only from BLOCK, makes exactly one zero-versioned
+        # call, and both edges stay in the loop.
+        def guarded_recursive_call_branch(block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return null
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, block) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::EQ
+            return null if LLVMGetMetadata(branch, profile_kind(context)) != null
+            matched: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            other: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            return null if matched == other or not is_innermost_loop_of(analyses, matched, loop) or not is_innermost_loop_of(analyses, other, loop)
+            return null if not has_single_predecessor(matched, block) or zero_versioned_calls(matched) != 1
+            branch
+
+        # A caller whose branches may be weighed: defined, not a versioned helper itself,
+        # not size-optimized and not sanitized.
+        def is_biasable_caller(caller: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsDeclaration(caller) != 0 or function_has_string_attribute(caller, ZeroVersionLimit::VERSIONED)
+            not function_is_size_optimized(caller) and not function_is_sanitized(caller)
+
+        # The guarded recursive calls of CALLER biased; how many.
+        def bias_caller_guards(caller: LLVMValueRef, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(caller) else return 0
+            changed: mutable u32 = 0
+            cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(caller)
+            while cursor is block |cursor, changed, analyses, context|:
+                cursor <- LLVMGetNextBasicBlock(block)
+                if guarded_recursive_call_branch(block, analyses, context) is branch:
+                    set_branch_weights(branch, GuardBiasWeight::TAKEN, GuardBiasWeight::NOT_TAKEN, context)
+                    changed <- changed + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # `biasGuardedRecursiveCalls`: how many branches were weighed, on Darwin only.
+        def bias_guarded_recursive_calls(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMModuleTargetIsDarwin(module) == 0
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is caller |cursor, changed, context|:
+                cursor <- LLVMGetNextFunction(caller)
+                changed <- changed + bias_caller_guards(caller, context) if is_biasable_caller(caller) else changed
+            changed

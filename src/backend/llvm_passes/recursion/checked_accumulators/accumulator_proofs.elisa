@@ -1,0 +1,147 @@
+# A loop's `acc = x op acc` (checked, signed, x invariant) whose every value is proved
+# in range by the ranges of x and the start value and the loop's maximum trip count
+# loses its overflow check. The bounds are LLVM integer constants, so they keep the
+# accumulator's own width.
+
+# The signed checked operation that updates a header phi, and its invariant operand.
+struct AccumulatorUpdate:
+    checked: LLVMValueRef
+    invariant: LLVMValueRef
+
+extend Backend:
+    private:
+        # `APInt::abs` of a constant, or none for the signed minimum.
+        def constant_magnitude(constant: LLVMValueRef) -> LLVMValueRef?:
+            return constant if ElisaLLVMConstantIntIsNegative(constant) == 0
+            negated: LLVMValueRef = LLVMConstNeg(constant)
+            return null if ElisaLLVMConstantIntIsNegative(negated) != 0
+            negated
+
+        # The largest magnitude in a signed range, absent when it is empty or reaches the
+        # signed minimum. Disposes RANGE.
+        def range_magnitude(range: ElisaConstantRangeRef, context: LLVMContextRef) -> LLVMValueRef?:
+            empty: bool = ElisaLLVMConstantRangeIsEmpty(range) != 0
+            minimum: LLVMValueRef? = null if empty else constant_magnitude(ElisaLLVMConstantRangeSignedMinimum(range, context))
+            maximum: LLVMValueRef? = null if empty else constant_magnitude(ElisaLLVMConstantRangeSignedMaximum(range, context))
+            ElisaLLVMDisposeConstantRange(range)
+            low: LLVMValueRef = get minimum else return null
+            high: LLVMValueRef = get maximum else return null
+            low if ElisaLLVMConstantIntUnsignedGreater(low, high) != 0 else high
+
+        # Whether START times FACTOR, TRIPS times over, stays at most LIMIT throughout. A product equal
+        # to its input repeats forever, so the products stop there.
+        def products_fit(start: LLVMValueRef, factor: LLVMValueRef, limit: LLVMValueRef, trips: u64) -> bool:
+            value: mutable LLVMValueRef = start
+            for index in 0..<trips |value, factor, limit|:
+                next: LLVMValueRef = ElisaLLVMConstantIntMultiply(value, factor)
+                return false if ElisaLLVMConstantIntUnsignedGreater(next, limit) != 0
+                break if next == value
+                value <- next
+            ElisaLLVMConstantIntUnsignedGreater(value, limit) == 0
+
+        # Whether |acc| stays below the signed maximum for TRIPS applications of
+        # `acc = x op acc` (op one of +, -, *) from |acc| <= START with |x| <= STEP.
+        def accumulator_fits(id: u32, start: LLVMValueRef, step: LLVMValueRef, trips: u64) -> bool can[Abort.Panic, Memory.Allocate]:
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(start))
+            wide: u32 = 2 * width + 66
+            wide_type: LLVMTypeRef = LLVMIntTypeInContext(LLVMGetTypeContext(LLVMTypeOf(start)), wide)
+            limit: LLVMValueRef = ElisaLLVMConstantIntLowBits(wide_type, width - 1)
+            value: LLVMValueRef = ElisaLLVMConstantIntZeroExtend(start, wide)
+            factor: LLVMValueRef = ElisaLLVMConstantIntZeroExtend(step, wide)
+            if id != intrinsic_identifier("llvm.smul.with.overflow"):
+                total: LLVMValueRef = LLVMConstAdd(value, ElisaLLVMConstantIntMultiply(factor, LLVMConstInt(wide_type, trips, 0)))
+                return ElisaLLVMConstantIntUnsignedGreater(total, limit) == 0
+            products_fit(value, factor, limit, trips)
+
+        # `WithOverflowInst::isSigned`.
+        def is_signed_checked_operation(id: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            id == intrinsic_identifier("llvm.sadd.with.overflow") or id == intrinsic_identifier("llvm.ssub.with.overflow") or id == intrinsic_identifier("llvm.smul.with.overflow")
+
+        # Whether every user of CHECKED is a single-index extractvalue.
+        def has_only_extracted_parts(checked: LLVMValueRef) -> bool can[Memory.Allocate]:
+            for user in value_users(checked):
+                return false if not is_llvm_instruction_with_opcode(user, LLVMOpcode::EXTRACT_VALUE) or LLVMGetNumIndices(user) != 1
+            true
+
+        # ACCUMULATOR's update from LATCH: the value part of a signed checked operation in
+        # LOOP that combines ACCUMULATOR with a loop-invariant operand.
+        def accumulator_update(accumulator: LLVMValueRef, latch: LLVMBasicBlockRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> AccumulatorUpdate? can[Abort.Panic, Memory.Allocate]:
+            next: LLVMValueRef = get incoming_value_from(accumulator, latch) else return null
+            return null if not is_llvm_instruction_with_opcode(next, LLVMOpcode::EXTRACT_VALUE)
+            checked: LLVMValueRef = LLVMGetOperand(next, 0)
+            return null if not is_overflow_checked_operation(checked) or not is_signed_checked_operation(called_intrinsic_id(checked))
+            return null if not is_extract_of_field(next, 0)
+            checked_loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(checked)) else return null
+            return null if checked_loop != loop or not has_only_extracted_parts(checked)
+            position: u32 = 1 if LLVMGetOperand(checked, 0) == accumulator else 0
+            invariant: LLVMValueRef = LLVMGetOperand(checked, position)
+            return null if LLVMGetOperand(checked, 1 - position) != accumulator or ElisaLLVMLoopIsInvariant(loop, invariant) == 0
+            AccumulatorUpdate{checked: checked, invariant: invariant}
+
+        # `WithOverflowInst::getBinaryOp`.
+        def checked_binary_opcode(id: u32) -> u32 can[Abort.Panic, Memory.Allocate]:
+            return LLVMOpcode::ADD if id == intrinsic_identifier("llvm.sadd.with.overflow")
+            LLVMOpcode::SUB if id == intrinsic_identifier("llvm.ssub.with.overflow") else LLVMOpcode::MUL
+
+        # CHECKED replaced by the plain `nsw` operation; its overflow part becomes false.
+        def remove_overflow_check(checked: LLVMValueRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate]:
+            LLVMPositionBuilderBefore(builder, checked)
+            opcode: u32 = checked_binary_opcode(called_intrinsic_id(checked))
+            plain: LLVMValueRef = LLVMBuildBinOp(builder, opcode, LLVMGetOperand(checked, 0), LLVMGetOperand(checked, 1), "")
+            LLVMSetNSW(plain, 1)
+            no_overflow: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(plain))), 0, 0)
+            for part in value_users(checked) |plain, no_overflow|:
+                LLVMReplaceAllUsesWith(part, plain if is_extract_of_field(part, 0) else no_overflow)
+                LLVMInstructionEraseFromParent(part)
+            LLVMInstructionEraseFromParent(checked)
+
+        # ACCUMULATOR's check removed when its start value and invariant keep it in range
+        # for TRIPS iterations, both measured at CONTEXT; whether it was.
+        def prove_accumulator(accumulator: LLVMValueRef, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, context: LLVMValueRef, trips: u64, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            update: AccumulatorUpdate = get accumulator_update(accumulator, latch, loop, analyses) else return false
+            initial: LLVMValueRef = get incoming_value_from(accumulator, preheader) else return false
+            type_context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(accumulator))
+            start: LLVMValueRef? = range_magnitude(ElisaLLVMLazyValueConstantRange(analyses, initial, context, 0), type_context)
+            step: LLVMValueRef? = range_magnitude(ElisaLLVMLazyValueConstantRange(analyses, update.invariant, context, 0), type_context)
+            start_bound: LLVMValueRef = get start else return false
+            step_bound: LLVMValueRef = get step else return false
+            return false if not accumulator_fits(called_intrinsic_id(update.checked), start_bound, step_bound, trips)
+            remove_overflow_check(update.checked, builder)
+            true
+
+        # The provable accumulators of LOOP's header lose their checks; whether any did.
+        def prove_loop_accumulators(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return false
+            return false if ElisaLLVMLoopLatch(loop) == null
+            backedges: mutable u64 = 0
+            return false if ElisaLLVMConstantMaxBackedgeTakenCount(analyses, loop, &backedges) == 0 or backedges > 4294967295
+            context: LLVMValueRef = get LLVMGetBasicBlockTerminator(preheader) else return false
+            changed: mutable bool = false
+            for accumulator in block_phis(ElisaLLVMLoopHeader(loop)) |changed, loop, preheader, context, backedges, analyses, builder|:
+                changed <- prove_accumulator(accumulator, loop, preheader, context, backedges + 1, analyses, builder) or changed
+            changed
+
+        # Every loop of FUNCTION proved, in preorder; whether any check went.
+        def prove_function_accumulators(function: LLVMValueRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            changed: mutable bool = false
+            for loop in loops_in_program_preorder(analyses) |changed, analyses, builder|:
+                changed <- prove_loop_accumulators(loop, analyses, builder) or changed
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # `proveBoundedAccumulators`: each function that lost a check is cleaned up with
+        # instcombine and simplifycfg; how many did.
+        def prove_bounded_accumulators(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, builder, target|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or not prove_function_accumulators(function, builder)
+                _ = run_function_pipeline(function, target, "instcombine<no-verify-fixpoint>,simplifycfg")
+                changed <- changed + 1
+            LLVMDisposeBuilder(builder)
+            changed

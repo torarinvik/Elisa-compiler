@@ -1,0 +1,169 @@
+# Recognizes linear recursion that combines its result with checked arithmetic:
+# `return x op f(..., x, ...)`, `op` an overflow-checked add, sub or mul whose overflow
+# edge traps, `x` a constant or an argument the call passes through unchanged, and some
+# other return as the base case.
+
+# The recursion's parts: its one self-call, the checked operation applied to the call's
+# result and its two extracted parts, the overflow branch and its two edges, and which
+# operand of the operation is the invariant `x`.
+struct AccumulatorShape:
+    call: LLVMValueRef
+    checked: LLVMValueRef
+    result: LLVMValueRef
+    overflow: LLVMValueRef
+    branch: LLVMValueRef
+    trap: LLVMBasicBlockRef
+    continue_block: LLVMBasicBlockRef
+    # Set when the overflow-free edge enters the shared return block itself.
+    continue_returns: bool
+    invariant: LLVMValueRef
+    invariant_operand: u32
+
+# The checked operation's value and overflow parts.
+struct CheckedParts:
+    result: LLVMValueRef
+    overflow: LLVMValueRef
+
+extend Backend:
+    private:
+        # `isa<WithOverflowInst>`: a call of one of the six `*.with.overflow` intrinsics.
+        def is_overflow_checked_operation(value: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsAIntrinsicInst(value) == null
+            id: u32 = called_intrinsic_id(value)
+            return true if id == intrinsic_identifier("llvm.sadd.with.overflow") or id == intrinsic_identifier("llvm.uadd.with.overflow")
+            return true if id == intrinsic_identifier("llvm.ssub.with.overflow") or id == intrinsic_identifier("llvm.usub.with.overflow")
+            id == intrinsic_identifier("llvm.smul.with.overflow") or id == intrinsic_identifier("llvm.umul.with.overflow")
+
+        # The single user of VALUE, when it has exactly one use.
+        def single_user(value: LLVMValueRef) -> LLVMValueRef?:
+            return null if use_count(value) != 1
+            use: LLVMUseRef = get LLVMGetFirstUse(value) else return null
+            LLVMGetUser(use)
+
+        # EXIT holds only `ret (phi ...)` and the phi, used once, takes RESULT from FROM.
+        def returns_merged(merge: LLVMValueRef, from: LLVMBasicBlockRef, result: LLVMValueRef) -> bool:
+            exit: LLVMBasicBlockRef = LLVMGetInstructionParent(merge)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(exit) else return false
+            return false if not is_llvm_instruction_with_opcode(terminator, LLVMOpcode::RET) or LLVMGetNumOperands(terminator) == 0
+            return false if LLVMGetOperand(terminator, 0) != merge or instruction_count(exit) != 2 or use_count(merge) != 1
+            incoming: LLVMValueRef = get incoming_value_from(merge, from) else return false
+            incoming == result
+
+        # Whether CONTINUE_BLOCK holds nothing but RESULT and its terminator.
+        def holds_only_result(continue_block: LLVMBasicBlockRef, result: LLVMValueRef) -> bool:
+            terminator: LLVMValueRef? = LLVMGetBasicBlockTerminator(continue_block)
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(continue_block)
+            while cursor is step |cursor, result, terminator|:
+                cursor <- LLVMGetNextInstruction(step)
+                continue if step == result
+                if terminator is ending:
+                    return false if step != ending
+                else:
+                    return false
+            true
+
+        # How the recursion's value reaches a return unchanged, as `continue_returns`: the
+        # overflow-free edge enters the shared `ret (phi ... v ...)` block (true), or the
+        # continue block holds `ret v` or branches to such a block (false). None otherwise.
+        def returned_unchanged(call: LLVMValueRef, result: LLVMValueRef, continue_block: LLVMBasicBlockRef) -> bool? can[Abort.Panic, Memory.Allocate]:
+            user: LLVMValueRef = get single_user(result) else return null
+            merge: bool = is_llvm_instruction_with_opcode(user, LLVMOpcode::PHI)
+            recurse: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            if merge and LLVMGetInstructionParent(user) == continue_block:
+                return true if LLVMGetInstructionParent(result) == recurse and returns_merged(user, recurse, result)
+                return null
+            return null if single_predecessor(continue_block) == null or not holds_only_result(continue_block, result)
+            if is_llvm_instruction_with_opcode(user, LLVMOpcode::RET):
+                return false if LLVMGetInstructionParent(user) == continue_block
+                return null
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(continue_block) else return null
+            return false if merge and LLVMGetInstructionOpcode(terminator) == LLVMOpcode::UNCONDITIONAL_BR and returns_merged(user, continue_block, result)
+            null
+
+        # Some return other than the recursion's own path: the base case.
+        def has_base_return(function: LLVMValueRef, result: LLVMValueRef, continue_block: LLVMBasicBlockRef, continue_returns: bool) -> bool:
+            user: LLVMValueRef? = single_user(result)
+            cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while cursor is block |cursor, user, continue_block, continue_returns|:
+                cursor <- LLVMGetNextBasicBlock(block)
+                continue if not ends_in_return(block) or (block == continue_block and not continue_returns)
+                merge: LLVMValueRef = get user else return true
+                return true if not is_llvm_instruction_with_opcode(merge, LLVMOpcode::PHI) or LLVMGetInstructionParent(merge) != block or LLVMCountIncoming(merge) > 1
+            false
+
+        # A block that ends in `unreachable` and does not start with a phi.
+        def is_unreachable_exit(block: LLVMBasicBlockRef) -> bool:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return false
+            first: LLVMValueRef = get LLVMGetFirstInstruction(block) else return false
+            LLVMGetInstructionOpcode(terminator) == LLVMOpcode::UNREACHABLE and not is_llvm_instruction_with_opcode(first, LLVMOpcode::PHI)
+
+        # A defined private function returning an integer that may be rewritten.
+        def is_accumulator_candidate(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if not has_local_linkage(function) or LLVMIsDeclaration(function) != 0
+            return false if LLVMIsFunctionVarArg(LLVMGlobalGetValueType(function)) != 0 or LLVMHasPersonalityFn(function) != 0
+            not function_is_size_optimized(function) and is_llvm_integer_type(LLVMGetReturnType(LLVMGlobalGetValueType(function)), 0)
+
+        # FUNCTION's one self-call, or none when there are several, a musttail or bundled
+        # one, none at all, or an alloca anywhere.
+        def lone_self_call(function: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            found: mutable LLVMValueRef? = null
+            for instruction in function_instructions(function) |found, function|:
+                return null if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::ALLOCA)
+                continue if LLVMIsACallInst(instruction) == null or not calls_function(instruction, function)
+                return null if found != null or is_must_tail_call(instruction) or LLVMGetNumOperandBundles(instruction) != 0
+                found <- instruction
+            found
+
+        # The value and overflow parts of CHECKED, each a single-index extractvalue.
+        def checked_parts(checked: LLVMValueRef) -> CheckedParts? can[Abort.Panic, Memory.Allocate]:
+            result: mutable LLVMValueRef? = null
+            overflow: mutable LLVMValueRef? = null
+            for user in value_users(checked) |result, overflow|:
+                return null if not is_llvm_instruction_with_opcode(user, LLVMOpcode::EXTRACT_VALUE) or LLVMGetNumIndices(user) != 1
+                if is_extract_of_field(user, 0):
+                    result <- user
+                else:
+                    overflow <- user
+            value: LLVMValueRef = get result else return null
+            flag: LLVMValueRef = get overflow else return null
+            CheckedParts{result: value, overflow: flag}
+
+        # Whether only CHECKED and its parts sit between CALL and BRANCH.
+        def only_check_follows(call: LLVMValueRef, branch: LLVMValueRef, checked: LLVMValueRef, parts: CheckedParts&) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(call)
+            while cursor is step |cursor, branch, checked, parts|:
+                break if step == branch
+                return false if step != checked and step != parts.overflow and step != parts.result
+                cursor <- LLVMGetNextInstruction(step)
+            true
+
+        # The checked operation's invariant operand: a constant, or an argument the
+        # recursive call passes through unchanged.
+        def is_invariant_operand(invariant: LLVMValueRef, call: LLVMValueRef) -> bool:
+            return false if invariant == call
+            return true if LLVMIsAConstant(invariant) != null
+            LLVMIsAArgument(invariant) != null and LLVMGetOperand(call, argument_position(invariant)) == invariant
+
+    public:
+        # FUNCTION's checked-accumulator recursion, if it has that shape.
+        def match_checked_accumulator(function: LLVMValueRef) -> AccumulatorShape? can[Abort.Panic, Memory.Allocate]:
+            return null if not is_accumulator_candidate(function)
+            call: LLVMValueRef = get lone_self_call(function) else return null
+            checked: LLVMValueRef = get single_user(call) else return null
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            return null if not is_overflow_checked_operation(checked) or LLVMGetInstructionParent(checked) != block or use_count(checked) != 2
+            invariant_operand: u32 = 1 if LLVMGetOperand(checked, 0) == call else 0
+            invariant: LLVMValueRef = LLVMGetOperand(checked, invariant_operand)
+            return null if not is_invariant_operand(invariant, call)
+            parts: CheckedParts = get checked_parts(checked) else return null
+            branch: LLVMValueRef = get conditional_terminator(block) else return null
+            return null if use_count(parts.overflow) != 1 or LLVMGetCondition(branch) != parts.overflow
+            return null if not only_check_follows(call, branch, checked, &parts)
+            trap: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            continue_block: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            result_block: LLVMBasicBlockRef = LLVMGetInstructionParent(parts.result)
+            return null if trap == continue_block or not is_unreachable_exit(trap) or continue_block == block
+            return null if result_block != block and result_block != continue_block
+            continue_returns: bool = get returned_unchanged(call, parts.result, continue_block) else return null
+            return null if not has_base_return(function, parts.result, continue_block, continue_returns)
+            AccumulatorShape{call: call, checked: checked, result: parts.result, overflow: parts.overflow, branch: branch, trap: trap, continue_block: continue_block, continue_returns: continue_returns, invariant: invariant, invariant_operand: invariant_operand}
