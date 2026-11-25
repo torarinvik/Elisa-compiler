@@ -1,0 +1,155 @@
+# Definedness and ranges for the bounded-product proofs. Composing ranges proves
+# nothing about poison, so flagged arithmetic is checked separately, using only the
+# ranges of operands already proved defined. Both searches share a step budget across
+# their recursion and stop six levels down.
+include "../../ir/ir_editing.elisa"
+include "../../ir/llvm_ir_queries.elisa"
+
+const module ProductProofLimit:
+    DEPTH: u32 = 6
+    STEPS: u32 = 64
+
+# A value proved defined on every visit that matters, with the range it stays in.
+struct KnownRange:
+    value: LLVMValueRef
+    range: ElisaConstantRangeRef
+
+# A range found within the step budget, and the steps left.
+struct BudgetedRange:
+    range: ElisaConstantRangeRef
+    steps: u32
+
+# Whether a value was proved defined, and the steps left.
+struct BudgetedProof:
+    defined: bool
+    steps: u32
+
+extend Backend:
+    private:
+        def known_range(known: darray[KnownRange]&, value: LLVMValueRef) -> ElisaConstantRangeRef?:
+            for entry in known |value|:
+                return entry.range if entry.value == value
+            null
+
+        def is_known(known: darray[KnownRange]&, value: LLVMValueRef) -> bool:
+            for entry in known |value|:
+                return true if entry.value == value
+            false
+
+        # The range of VALUE at CONTEXT: a known range, or lazy value info narrowed by the
+        # ranges of a binary operator's operands.
+        def budgeted_range(value: LLVMValueRef, context: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, depth: u32, steps: u32) -> BudgetedRange:
+            return BudgetedRange{range: ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(value))), steps: 0} if steps == 0
+            remaining: u32 = steps - 1
+            if known_range(known, value) is range:
+                return BudgetedRange{range: ElisaLLVMConstantRangeCopy(range), steps: remaining}
+            found: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, value, context, 0)
+            return BudgetedRange{range: found, steps: remaining} if depth >= ProductProofLimit::DEPTH or LLVMIsABinaryOperator(value) == null
+            first: BudgetedRange = budgeted_range(LLVMGetOperand(value, 0), context, analyses, known, depth + 1, remaining)
+            second: BudgetedRange = budgeted_range(LLVMGetOperand(value, 1), context, analyses, known, depth + 1, first.steps)
+            combined: ElisaConstantRangeRef = ElisaLLVMConstantRangeBinaryOperation(LLVMGetInstructionOpcode(value), first.range, second.range)
+            narrowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(found, combined)
+            ElisaLLVMDisposeConstantRange(found)
+            ElisaLLVMDisposeConstantRange(first.range)
+            ElisaLLVMDisposeConstantRange(second.range)
+            ElisaLLVMDisposeConstantRange(combined)
+            BudgetedRange{range: narrowed, steps: second.steps}
+
+        def product_range(value: LLVMValueRef, context: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&) -> ElisaConstantRangeRef:
+            budgeted_range(value, context, analyses, known, 0, ProductProofLimit::STEPS).range
+
+        # Whether every product of the two ranges' signed bounds fits their width.
+        def signed_bound_products_fit(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            width: u32 = ElisaLLVMConstantRangeBitWidth(first)
+            first_bounds: darray[LLVMValueRef] = [ElisaLLVMConstantRangeSignedMinimum(first, context), ElisaLLVMConstantRangeSignedMaximum(first, context)]
+            second_bounds: darray[LLVMValueRef] = [ElisaLLVMConstantRangeSignedMinimum(second, context), ElisaLLVMConstantRangeSignedMaximum(second, context)]
+            for left in first_bounds |second_bounds, width|:
+                for right in second_bounds |left, width|:
+                    product: LLVMValueRef = ElisaLLVMConstantIntMultiply(ElisaLLVMConstantIntSignExtend(left, 2 * width), ElisaLLVMConstantIntSignExtend(right, 2 * width))
+                    return false if ElisaLLVMConstantIntIsSignedIntN(product, width) == 0
+            true
+
+        # Whether the operand ranges rule out every overflow the operator's `nsw` and
+        # `nuw` flags turn into poison.
+        def flags_hold(operator: LLVMValueRef, opcode: u32, first: ElisaConstantRangeRef, second: ElisaConstantRangeRef, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if ElisaLLVMConstantRangeIsEmpty(first) != 0 or ElisaLLVMConstantRangeIsEmpty(second) != 0
+            if LLVMGetNSW(operator) != 0:
+                if opcode == LLVMOpcode::MUL:
+                    return false if not signed_bound_products_fit(first, second, context)
+                else:
+                    return false if ElisaLLVMConstantRangeNeverOverflows(opcode, 1, first, second) == 0
+            return false if LLVMGetNUW(operator) != 0 and ElisaLLVMConstantRangeNeverOverflows(opcode, 0, first, second) == 0
+            true
+
+        # An inexact `udiv` by a nonzero constant, or an add, sub or mul whose flags the
+        # ranges of its (defined) operands uphold.
+        def binary_operation_defined(operator: LLVMValueRef, context: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            opcode: u32 = LLVMGetInstructionOpcode(operator)
+            if opcode == LLVMOpcode::UDIV:
+                divisor: LLVMValueRef = LLVMGetOperand(operator, 1)
+                return LLVMIsAConstantInt(divisor) != null and LLVMIsNull(divisor) == 0 and LLVMGetExact(operator) == 0
+            return false if opcode != LLVMOpcode::ADD and opcode != LLVMOpcode::SUB and opcode != LLVMOpcode::MUL
+            first: ElisaConstantRangeRef = product_range(LLVMGetOperand(operator, 0), context, analyses, known)
+            second: ElisaConstantRangeRef = product_range(LLVMGetOperand(operator, 1), context, analyses, known)
+            holds: bool = flags_hold(operator, opcode, first, second, LLVMGetTypeContext(LLVMTypeOf(operator)))
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            holds
+
+        # Each of the operands FIRST..<LAST of USER defined at CONTEXT, in order, stopping at
+        # the first that is not.
+        def operands_defined(user: LLVMValueRef, first: u32, last: u32, context: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, depth: u32, steps: u32) -> BudgetedProof can[Abort.Panic, Memory.Allocate]:
+            remaining: mutable u32 = steps
+            for index in first..<last |user, context, analyses, known, depth, remaining|:
+                operand_proof: BudgetedProof = is_defined(LLVMGetOperand(user, index), context, analyses, known, depth, remaining)
+                return operand_proof if not operand_proof.defined
+                remaining <- operand_proof.steps
+            BudgetedProof{defined: true, steps: remaining}
+
+        def phi_defined(phi: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, depth: u32, steps: u32) -> BudgetedProof can[Abort.Panic, Memory.Allocate]:
+            remaining: mutable u32 = steps
+            for index in 0..<LLVMCountIncoming(phi) |phi, analyses, known, depth, remaining|:
+                edge: LLVMValueRef = get LLVMGetBasicBlockTerminator(LLVMGetIncomingBlock(phi, index)) else return BudgetedProof{defined: false, steps: remaining}
+                operand_proof: BudgetedProof = is_defined(LLVMGetIncomingValue(phi, index), edge, analyses, known, depth, remaining)
+                return operand_proof if not operand_proof.defined
+                remaining <- operand_proof.steps
+            BudgetedProof{defined: true, steps: remaining}
+
+        # A `samesign` compare of defined operands whose ranges at CONTEXT share a sign.
+        def compare_defined(compare: LLVMValueRef, context: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, depth: u32, steps: u32) -> BudgetedProof can[Abort.Panic, Memory.Allocate]:
+            return BudgetedProof{defined: false, steps: steps} if LLVMGetICmpSameSign(compare) == 0
+            operands: BudgetedProof = operands_defined(compare, 0, 2, context, analyses, known, depth, steps)
+            return operands if not operands.defined
+            first: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, LLVMGetOperand(compare, 0), context, 0)
+            second: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, LLVMGetOperand(compare, 1), context, 0)
+            nonempty: bool = ElisaLLVMConstantRangeIsEmpty(first) == 0 and ElisaLLVMConstantRangeIsEmpty(second) == 0
+            nonnegative: bool = ElisaLLVMConstantRangeIsAllNonNegative(first) != 0 and ElisaLLVMConstantRangeIsAllNonNegative(second) != 0
+            negative: bool = ElisaLLVMConstantRangeIsAllNegative(first) != 0 and ElisaLLVMConstantRangeIsAllNegative(second) != 0
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            BudgetedProof{defined: nonempty and (nonnegative or negative), steps: operands.steps}
+
+        # Whether VALUE is never undef or poison when CONTEXT runs: a known value, one
+        # value tracking proves, or a poison-free cast, select, phi, compare or flagged
+        # arithmetic over values proved the same way.
+        def is_defined(value: LLVMValueRef, context: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, depth: u32, steps: u32) -> BudgetedProof can[Abort.Panic, Memory.Allocate]:
+            return BudgetedProof{defined: false, steps: 0} if steps == 0
+            remaining: u32 = steps - 1
+            return BudgetedProof{defined: true, steps: remaining} if is_known(known, value)
+            return BudgetedProof{defined: false, steps: remaining} if depth > ProductProofLimit::DEPTH
+            return BudgetedProof{defined: true, steps: remaining} if ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, value, context) != 0
+            if LLVMIsACastInst(value) != null and ElisaLLVMCanCreateUndefOrPoison(value) == 0:
+                return is_defined(LLVMGetOperand(value, 0), context, analyses, known, depth + 1, remaining)
+            if LLVMIsABinaryOperator(value) != null:
+                return BudgetedProof{defined: false, steps: remaining} if LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMTypeKindValue::INTEGER
+                operands: BudgetedProof = operands_defined(value, 0, 2, context, analyses, known, depth + 1, remaining)
+                return operands if not operands.defined
+                return BudgetedProof{defined: binary_operation_defined(value, context, analyses, known), steps: operands.steps}
+            opcode: u32 = LLVMGetInstructionOpcode(value) if LLVMIsAInstruction(value) != null else 0
+            return phi_defined(value, analyses, known, depth + 1, remaining) if opcode == LLVMOpcode::PHI
+            return operands_defined(value, 0, 3, context, analyses, known, depth + 1, remaining) if opcode == LLVMOpcode::SELECT
+            return compare_defined(value, context, analyses, known, depth + 1, remaining) if opcode == LLVMOpcode::ICMP
+            BudgetedProof{defined: false, steps: remaining}
+
+        def product_defined(value: LLVMValueRef, context: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            is_defined(value, context, analyses, known, 0, ProductProofLimit::STEPS).defined

@@ -140,6 +140,10 @@ int ElisaLLVMConstantRangeIsAllNonNegative(ElisaConstantRangeRef range) {
   return unwrap(range)->isAllNonNegative();
 }
 
+int ElisaLLVMConstantRangeIsAllNegative(ElisaConstantRangeRef range) {
+  return unwrap(range)->isAllNegative();
+}
+
 int64_t ElisaLLVMConstantRangeSignedMin(ElisaConstantRangeRef range) {
   return unwrap(range)->getSignedMin().getSExtValue();
 }
@@ -230,6 +234,22 @@ int ElisaLLVMConstantIntMultiplyOverflows(LLVMValueRef first, LLVMValueRef secon
 
 int ElisaLLVMConstantRangeSignedAddNeverOverflows(ElisaConstantRangeRef first, ElisaConstantRangeRef second) {
   return unwrap(first)->signedAddMayOverflow(*unwrap(second)) == ConstantRange::OverflowResult::NeverOverflows;
+}
+
+int ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode opcode, int is_signed, ElisaConstantRangeRef first,
+                                         ElisaConstantRangeRef second) {
+  const ConstantRange &Left = *unwrap(first), &Right = *unwrap(second);
+  ConstantRange::OverflowResult Result;
+  switch (opcode) {
+  case LLVMAdd: Result = is_signed ? Left.signedAddMayOverflow(Right) : Left.unsignedAddMayOverflow(Right); break;
+  case LLVMSub: Result = is_signed ? Left.signedSubMayOverflow(Right) : Left.unsignedSubMayOverflow(Right); break;
+  case LLVMMul:
+    if (is_signed) return 0;
+    Result = Left.unsignedMulMayOverflow(Right);
+    break;
+  default: return 0;
+  }
+  return Result == ConstantRange::OverflowResult::NeverOverflows;
 }
 
 LLVMValueRef ElisaLLVMConstantIntSignExtend(LLVMValueRef constant, uint32_t width) {

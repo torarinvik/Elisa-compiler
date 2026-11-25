@@ -2,7 +2,31 @@
 // whose multiplier is a unit-step counter under a small constant loop bound.
 // The product sequence is then fully determined, so simulate it exactly: range
 // multiplication cannot prove this shape, since 20^20 overflows while 20! fits.
-#include "llvm_bounded_product.cpp"
+#include <algorithm>
+#include "llvm_loop_pass_policy.h"
+#include <llvm/Config/llvm-config.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/ConstantRange.h>
+#include <llvm/Analysis/LazyValueInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/OptimizationRemarkEmitter.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Transforms/Utils/LoopUtils.h>
+#include <llvm/Transforms/Utils/LoopPeel.h>
+#include <llvm/Transforms/Utils/ValueMapper.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Transforms/Utils/UnrollLoop.h>
+#include <llvm/Support/CBindingWrapping.h>
 #include <llvm/Analysis/LoopIterator.h>
 #include <algorithm>
 #include <optional>
@@ -10,6 +34,8 @@
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #if LLVM_VERSION_MAJOR >= 23
+using namespace llvm;
+
 namespace {
 constexpr unsigned BFP_MaxIterations = 64;
 constexpr unsigned BFP_MaxIntervalIterations = 192;

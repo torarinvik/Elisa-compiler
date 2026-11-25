@@ -217,6 +217,9 @@ ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef a
                                                       LLVMValueRef context, int undef_allowed);
 /* llvm::isGuaranteedNotToBeUndefOrPoison at the instruction `context`, with the
  * analyses' assumption cache and dominator tree. */
+/* canCreateUndefOrPoison on an operator (an instruction or constant expression),
+ * flags and metadata included. */
+int ElisaLLVMCanCreateUndefOrPoison(LLVMValueRef value);
 int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(ElisaFunctionAnalysesRef analyses,
                                                       LLVMValueRef value, LLVMValueRef context);
 /* LazyValueInfo::getConstantRangeOnEdge of `value` on the edge from -> to, asked at the

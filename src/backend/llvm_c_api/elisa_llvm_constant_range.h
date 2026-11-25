@@ -68,6 +68,7 @@ int ElisaLLVMConstantRangeIsWrapped(ElisaConstantRangeRef range);
 /* isSingleElement(): the range holds exactly one value, of any width. */
 int ElisaLLVMConstantRangeIsSingleElement(ElisaConstantRangeRef range);
 int ElisaLLVMConstantRangeIsAllNonNegative(ElisaConstantRangeRef range);
+int ElisaLLVMConstantRangeIsAllNegative(ElisaConstantRangeRef range);
 /* getSignedMin() / getSignedMax() sign-extended; the range is at most 64 bits wide. */
 int64_t ElisaLLVMConstantRangeSignedMin(ElisaConstantRangeRef range);
 int64_t ElisaLLVMConstantRangeSignedMax(ElisaConstantRangeRef range);
@@ -102,6 +103,10 @@ int ElisaLLVMConstantIntShiftLeftOverflows(LLVMValueRef constant, uint32_t amoun
 int ElisaLLVMConstantIntMultiplyOverflows(LLVMValueRef first, LLVMValueRef second);
 /* signedAddMayOverflow(second) == NeverOverflows. */
 int ElisaLLVMConstantRangeSignedAddNeverOverflows(ElisaConstantRangeRef first, ElisaConstantRangeRef second);
+/* Whether FIRST OPCODE SECOND never overflows, signed when IS_SIGNED: the add and sub
+ * tests of either kind and unsignedMulMayOverflow. 0 for any other operation. */
+int ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode opcode, int is_signed, ElisaConstantRangeRef first,
+                                         ElisaConstantRangeRef second);
 /* APInt sext / trunc to WIDTH, and isSignedIntN(bits), on ConstantInts. */
 LLVMValueRef ElisaLLVMConstantIntSignExtend(LLVMValueRef constant, uint32_t width);
 LLVMValueRef ElisaLLVMConstantIntTruncate(LLVMValueRef constant, uint32_t width);

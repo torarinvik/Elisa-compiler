@@ -1,0 +1,341 @@
+# Keeps overflow traps unless an inductive loop bound and widened interval products prove
+# every intermediate result fits signed arithmetic. The first phase (division_facts.elisa)
+# bounds divided phis and their counters with assumptions; with those facts, an innermost
+# loop counted from zero to a defined limit of at most 16 trips that multiplies a phi by
+# a defined invariant base keeps every endpoint product inside the width. Its multiply
+# gains `nsw`, and the matching `smul.with.overflow` calls it dominates become that
+# product with a clear overflow flag.
+include "./division_facts.elisa"
+include "../../ir/loop_pass_policy.elisa"
+
+const module BoundedProductLimit:
+    FUNCTIONS: u32 = 32
+    LOOPS: u32 = 64
+    CANDIDATES: u32 = 64
+    GROWTH: u32 = 1024
+    TRIPS: u64 = 16
+
+# A product multiply that gains `nsw`, and the freeze of its base it drops.
+struct ProductFact:
+    multiply: LLVMValueRef
+    freeze: LLVMValueRef?
+
+# A checked multiply that becomes the result of `multiply`.
+struct CheckedMultiply:
+    call: LLVMValueRef
+    multiply: LLVMValueRef
+
+# A header phi's constant start and the multiply that updates it.
+struct PowerUpdate:
+    start: LLVMValueRef
+    multiply: LLVMValueRef
+
+# A proved product and the checked multiplies its result replaces.
+struct ProvedProduct:
+    fact: ProductFact
+    calls: darray[CheckedMultiply]
+
+# The budgets the module shares, and the changes so far.
+struct ProductProgress:
+    changed: u32
+    functions: u32
+    loops: u32
+    growth: u32
+    product_loops: u32
+    candidates: u32
+
+# The facts the division phase found in one function.
+struct DivisionFacts:
+    facts: darray[DivisionFact]
+    loops: u32
+    growth: u32
+
+# The products the product phase proved in one loop or function.
+struct FoundProducts:
+    products: darray[ProductFact]
+    calls: darray[CheckedMultiply]
+    growth: u32
+    candidates: u32
+    loops: u32
+
+extend Backend:
+    private:
+        def function_division_facts(analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef, progress: ProductProgress&) -> DivisionFacts can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            facts: mutable darray[DivisionFact] = []
+            loops: mutable u32 = progress.loops
+            growth: mutable u32 = progress.growth
+            for index in 0..<ElisaLLVMLoopCount(analyses) |facts, loops, growth, analyses, context|:
+                loops <- loops + 1
+                break if loops > BoundedProductLimit::LOOPS
+                if loop_division_fact(ElisaLLVMLoopAt(analyses, index), analyses, context) is fact:
+                    added: u32 = 2 + 6 * fact.counters.count.u32()
+                    if growth + added <= BoundedProductLimit::GROWTH:
+                        growth <- growth + added
+                        facts.push(fact)
+            DivisionFacts{facts: facts, loops: loops, growth: growth}
+
+        # Each divided phi in [0, maximum] and each counter in [low, high], first fact first.
+        def known_ranges(facts: darray[DivisionFact]&) -> darray[KnownRange] can[Abort.Panic, Memory.Allocate]:
+            known: mutable darray[KnownRange] = []
+            for fact in facts |known|:
+                one: LLVMValueRef = LLVMConstInt(LLVMTypeOf(fact.maximum), 1, 0)
+                if not is_known(&known, fact.phi):
+                    known.push(KnownRange{value: fact.phi, range: ElisaLLVMConstantRangeNonEmpty(LLVMConstNull(LLVMTypeOf(fact.maximum)), LLVMConstAdd(fact.maximum, one))})
+                for counter in fact.counters |known|:
+                    if not is_known(&known, counter.phi):
+                        increment: LLVMValueRef = LLVMConstInt(LLVMTypeOf(counter.high), 1, 0)
+                        known.push(KnownRange{value: counter.phi, range: ElisaLLVMConstantRangeNonEmpty(counter.low, LLVMConstAdd(counter.high, increment))})
+            known
+
+        def dispose_known_ranges(known: darray[KnownRange]&) -> void:
+            for entry in known:
+                ElisaLLVMDisposeConstantRange(entry.range)
+
+        # The limit a header phi counts to from zero by one, when the latch compares the
+        # incremented phi against a loop-invariant value.
+        def counted_phi_limit(phi: LLVMValueRef, predecessor: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, compare: LLVMValueRef, loop: ElisaLoopRef) -> LLVMValueRef?:
+            return null if LLVMCountIncoming(phi) != 2 or LLVMGetTypeKind(LLVMTypeOf(phi)) != LLVMTypeKindValue::INTEGER
+            entry_index: i64 = phi_incoming_index(phi, predecessor)
+            return null if entry_index < 0
+            start: LLVMValueRef = LLVMGetIncomingValue(phi, entry_index.u32())
+            increment: LLVMValueRef = LLVMGetIncomingValue(phi, 1 - entry_index.u32())
+            return null if LLVMIsAConstantInt(start) == null or LLVMIsNull(start) == 0
+            return null if LLVMIsABinaryOperator(increment) == null or LLVMGetInstructionOpcode(increment) != LLVMOpcode::ADD
+            return null if LLVMGetOperand(increment, 0) != phi or LLVMGetInstructionParent(increment) != latch or not is_constant_integer(LLVMGetOperand(increment, 1), 1)
+            limit: LLVMValueRef = get operand_beside(compare, increment) else return null
+            return null if ElisaLLVMLoopIsInvariant(loop, limit) == 0
+            limit
+
+        def counted_limit(header: LLVMBasicBlockRef, predecessor: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, compare: LLVMValueRef, loop: ElisaLoopRef) -> LLVMValueRef?:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(header)
+            while cursor is phi |cursor, predecessor, latch, compare, loop|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                if counted_phi_limit(phi, predecessor, latch, compare, loop) is limit:
+                    return limit
+            null
+
+        # Whether the latch leaves the loop exactly when its compare decides to.
+        def exits_on_latch_compare(loop: ElisaLoopRef, branch: LLVMValueRef, compare: LLVMValueRef) -> bool:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            taken: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            other: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            equal_exit: bool = predicate == LLVMIntPredicate::EQ and ElisaLLVMLoopContainsBlock(loop, taken) == 0 and other == header
+            unequal_exit: bool = predicate == LLVMIntPredicate::NE and ElisaLLVMLoopContainsBlock(loop, other) == 0 and taken == header
+            equal_exit or unequal_exit
+
+        # The trips of an innermost loop counted from zero to a defined limit between 1
+        # and 16.
+        def product_loop_trips(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&) -> u32? can[Abort.Panic, Memory.Allocate]:
+            return null if ElisaLLVMLoopSubLoopCount(loop) != 0
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(latch) else return null
+            return null if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or not exits_on_latch_compare(loop, branch, compare)
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            limit: LLVMValueRef = get counted_limit(header, predecessor, latch, compare, loop) else return null
+            edge: LLVMValueRef = get LLVMGetBasicBlockTerminator(predecessor) else return null
+            return null if not product_defined(limit, edge, analyses, known)
+            range: mutable ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, limit, predecessor, header, edge)
+            if known_range(known, limit) is proven:
+                narrowed: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(range, proven)
+                ElisaLLVMDisposeConstantRange(range)
+                range <- narrowed
+            type: LLVMTypeRef = LLVMTypeOf(limit)
+            usable: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeSignedMinAtMost(range, LLVMConstNull(type)) == 0 and ElisaLLVMConstantRangeUnsignedMaxAtMost(range, LLVMConstInt(type, BoundedProductLimit::TRIPS, 0)) != 0
+            trips: u64 = ElisaLLVMConstantRangeUnsignedMax(range) if usable else 0
+            ElisaLLVMDisposeConstantRange(range)
+            return null if not usable
+            trips.u32()
+
+        # A header phi of at most 128 bits starting at a constant and updated by a multiply
+        # without `nuw` in the loop itself.
+        def power_update(power: LLVMValueRef, predecessor: LLVMBasicBlockRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> PowerUpdate?:
+            type: LLVMTypeRef = LLVMTypeOf(power)
+            return null if LLVMGetTypeKind(type) != LLVMTypeKindValue::INTEGER or LLVMGetIntTypeWidth(type) > DivisionFactLimit::WIDTH or LLVMCountIncoming(power) != 2
+            entry_index: i64 = phi_incoming_index(power, predecessor)
+            return null if entry_index < 0
+            start: LLVMValueRef = LLVMGetIncomingValue(power, entry_index.u32())
+            multiply: LLVMValueRef = LLVMGetIncomingValue(power, 1 - entry_index.u32())
+            return null if LLVMIsAConstantInt(start) == null or LLVMIsABinaryOperator(multiply) == null
+            return null if LLVMGetInstructionOpcode(multiply) != LLVMOpcode::MUL or LLVMGetNUW(multiply) != 0
+            return null if not same_loop(ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(multiply)), loop)
+            PowerUpdate{start: start, multiply: multiply}
+
+        # Whether START multiplied TRIPS times by any value in BASE_RANGE stays inside its
+        # width: each trip's four endpoint products are formed at twice the width before
+        # they narrow, so the interval never wraps silently.
+        def product_fits_width(start: LLVMValueRef, base_range: ElisaConstantRangeRef, trips: u32, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(start))
+            wide: u32 = 2 * width
+            base_low: LLVMValueRef = ElisaLLVMConstantIntSignExtend(ElisaLLVMConstantRangeSignedMinimum(base_range, context), wide)
+            base_high: LLVMValueRef = ElisaLLVMConstantIntSignExtend(ElisaLLVMConstantRangeSignedMaximum(base_range, context), wide)
+            low: mutable LLVMValueRef = start
+            high: mutable LLVMValueRef = start
+            for _ in 0..<trips |low, high, base_low, base_high, width, wide|:
+                wide_low: LLVMValueRef = ElisaLLVMConstantIntSignExtend(low, wide)
+                wide_high: LLVMValueRef = ElisaLLVMConstantIntSignExtend(high, wide)
+                products: darray[LLVMValueRef] = [ElisaLLVMConstantIntMultiply(wide_low, base_low), ElisaLLVMConstantIntMultiply(wide_low, base_high), ElisaLLVMConstantIntMultiply(wide_high, base_low), ElisaLLVMConstantIntMultiply(wide_high, base_high)]
+                minimum: mutable LLVMValueRef = products[0]
+                maximum: mutable LLVMValueRef = products[0]
+                for product in products |minimum, maximum|:
+                    minimum <- product if ElisaLLVMConstantIntCompare(LLVMIntPredicate::SLT, product, minimum) != 0
+                    maximum <- product if ElisaLLVMConstantIntCompare(LLVMIntPredicate::SGT, product, maximum) != 0
+                return false if ElisaLLVMConstantIntIsSignedIntN(minimum, width) == 0 or ElisaLLVMConstantIntIsSignedIntN(maximum, width) == 0
+                low <- ElisaLLVMConstantIntTruncate(minimum, width)
+                high <- ElisaLLVMConstantIntTruncate(maximum, width)
+            true
+
+        # The freeze when every instruction using it is the multiply or one the multiply
+        # dominates: definedness was proved at the multiply, and other users may run where
+        # that proof does not hold. (The C++ pass asked only whether the multiply dominated
+        # each user; a value never dominates itself, so it kept every freeze.)
+        def removable_freeze(freeze: LLVMValueRef, multiply: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> LLVMValueRef?:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(freeze)
+            while use_cursor is use |use_cursor, multiply, analyses|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return null if LLVMIsAInstruction(user) == null
+                return null if user != multiply and ElisaLLVMInstructionDominates(analyses, multiply, user) == 0
+            freeze
+
+        def is_matching_checked_multiply(call: LLVMValueRef, update: PowerUpdate&, power: LLVMValueRef, operand: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, marker: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAIntrinsicInst(call) == null or called_intrinsic_id(call) != intrinsic_identifier("llvm.smul.with.overflow")
+            return false if LLVMGetNumOperandBundles(call) != 0 or ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("convergent")) != 0
+            first: LLVMValueRef = LLVMGetOperand(call, 0)
+            second: LLVMValueRef = LLVMGetOperand(call, 1)
+            same: bool = (first == power and second == operand) or (second == power and first == operand)
+            same and ElisaLLVMInstructionDominates(analyses, update.multiply, call) != 0 and has_only_slow_marker(call, marker)
+
+        # The loop's `smul.with.overflow` calls of the same operands the multiply dominates.
+        def matching_checked_multiplies(loop: ElisaLoopRef, update: PowerUpdate&, power: LLVMValueRef, operand: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef) -> darray[CheckedMultiply] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            marker: u32 = LLVMGetMDKindIDInContext(context, "elisa.checkedmul.slow", 21)
+            calls: mutable darray[CheckedMultiply] = []
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |calls, loop, update, power, operand, analyses, marker|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor, calls, update, power, operand, analyses, marker|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    calls.push(CheckedMultiply{call: instruction, multiply: update.multiply}) if is_matching_checked_multiply(instruction, update, power, operand, analyses, marker)
+            calls
+
+        # The product of POWER when its base is a defined invariant whose range keeps every
+        # trip's product inside the width.
+        def prove_power_product(power: LLVMValueRef, update: PowerUpdate&, loop: ElisaLoopRef, trips: u32, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, context: LLVMContextRef) -> ProvedProduct? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            operand: LLVMValueRef = get operand_beside(update.multiply, power) else return null
+            frozen: bool = is_llvm_instruction_with_opcode(operand, LLVMOpcode::FREEZE)
+            base: LLVMValueRef = LLVMGetOperand(operand, 0) if frozen else operand
+            return null if ElisaLLVMLoopIsInvariant(loop, base) == 0 or not product_defined(base, update.multiply, analyses, known)
+            range: ElisaConstantRangeRef = ElisaLLVMScalarEvolutionUnsignedRange(analyses, base)
+            fits: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeIsFull(range) == 0 and product_fits_width(update.start, range, trips, context)
+            ElisaLLVMDisposeConstantRange(range)
+            return null if not fits
+            freeze: mutable LLVMValueRef? = null
+            if frozen:
+                freeze <- removable_freeze(operand, update.multiply, analyses)
+            ProvedProduct{fact: ProductFact{multiply: update.multiply, freeze: freeze}, calls: matching_checked_multiplies(loop, update, power, operand, analyses, context)}
+
+        # The products of one counted loop's header phis, within the candidate and growth
+        # budgets.
+        def loop_products(loop: ElisaLoopRef, trips: u32, analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, context: LLVMContextRef, growth: u32, candidates: u32) -> FoundProducts can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            products: mutable darray[ProductFact] = []
+            calls: mutable darray[CheckedMultiply] = []
+            used: mutable u32 = growth
+            seen: mutable u32 = candidates
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return FoundProducts{products: products, calls: calls, growth: used, candidates: seen, loops: 0}
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopHeader(loop))
+            while cursor is power |cursor, products, calls, used, seen, predecessor, loop, trips, analyses, known, context|:
+                break if not is_llvm_instruction_with_opcode(power, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(power)
+                if power_update(power, predecessor, loop, analyses) is update:
+                    seen <- seen + 1
+                    break if seen > BoundedProductLimit::CANDIDATES
+                    if prove_power_product(power, &update, loop, trips, analyses, known, context) is proved:
+                        added: u32 = 2 * proved.calls.count.u32()
+                        if proved.calls.count > 0 and used + added <= BoundedProductLimit::GROWTH:
+                            used <- used + added
+                            products.push(proved.fact)
+                            calls.extend(proved.calls)
+            FoundProducts{products: products, calls: calls, growth: used, candidates: seen, loops: 0}
+
+        # The products of the function's counted loops, in preorder, with the budgets the
+        # module shares.
+        def function_products(analyses: ElisaFunctionAnalysesRef, known: darray[KnownRange]&, context: LLVMContextRef, growth: u32, progress: ProductProgress&) -> FoundProducts can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            products: mutable darray[ProductFact] = []
+            calls: mutable darray[CheckedMultiply] = []
+            used: mutable u32 = growth
+            candidates: mutable u32 = progress.candidates
+            loops: mutable u32 = progress.product_loops
+            for index in 0..<ElisaLLVMLoopCount(analyses) |products, calls, used, candidates, loops, analyses, known, context|:
+                loops <- loops + 1
+                break if loops > BoundedProductLimit::LOOPS or candidates >= BoundedProductLimit::CANDIDATES
+                loop: ElisaLoopRef = ElisaLLVMLoopAt(analyses, index)
+                if product_loop_trips(loop, analyses, known) is trips:
+                    found: FoundProducts = loop_products(loop, trips, analyses, known, context, used, candidates)
+                    products.extend(found.products)
+                    calls.extend(found.calls)
+                    used <- found.growth
+                    candidates <- found.candidates
+            FoundProducts{products: products, calls: calls, growth: used, candidates: candidates, loops: loops}
+
+        # Marks each product `nsw`, replaces its checked multiplies with its result and a
+        # clear flag, and drops the freezes it made redundant. The number of replaced calls.
+        def apply_products(found: FoundProducts&, builder: LLVMBuilderRef, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            for product in found.products:
+                LLVMSetNSW(product.multiply, 1)
+            for checked in found.calls |builder, context|:
+                position_builder_before(builder, checked.call)
+                pair: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetPoison(LLVMTypeOf(checked.call)), checked.multiply, 0, "")
+                result: LLVMValueRef = LLVMBuildInsertValue(builder, pair, LLVMConstInt(LLVMInt1TypeInContext(context), 0, 0), 1, "")
+                LLVMReplaceAllUsesWith(checked.call, result)
+                LLVMInstructionEraseFromParent(checked.call)
+            freezes: mutable darray[LLVMValueRef] = []
+            for product in found.products |freezes|:
+                if product.freeze is freeze:
+                    freezes.push(freeze) if not contains_value(&freezes, freeze)
+            for freeze in freezes:
+                LLVMReplaceAllUsesWith(freeze, LLVMGetOperand(freeze, 0))
+            for freeze in freezes:
+                LLVMInstructionEraseFromParent(freeze)
+            found.calls.count.u32()
+
+        # Both phases over one function: the division facts, then, over fresh analyses that
+        # keep only those facts, the products.
+        def bound_function_products(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef, progress: ProductProgress&) -> ProductProgress can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return ProductProgress{changed: progress.changed, functions: progress.functions, loops: progress.loops, growth: progress.growth, product_loops: progress.product_loops, candidates: progress.candidates}
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            division: DivisionFacts = function_division_facts(analyses, context, progress)
+            changed: mutable u32 = progress.changed
+            for fact in division.facts |changed, builder, module, context|:
+                changed <- changed + apply_division_fact(&fact, builder, module, context)
+            if division.facts.count == 0:
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+                return ProductProgress{changed: changed, functions: progress.functions, loops: division.loops, growth: division.growth, product_loops: progress.product_loops, candidates: progress.candidates}
+            known: darray[KnownRange] = known_ranges(&division.facts)
+            # The rebuilt assumption cache holds the assumptions just added, so the product
+            # proofs see the bounds the first phase proved. (The C++ pass kept its
+            # assumption cache, which `FAM.invalidate` never drops, and lost them.)
+            ElisaLLVMInvalidateFunctionAnalyses(analyses)
+            found: FoundProducts = function_products(analyses, &known, context, division.growth, progress)
+            changed <- changed + apply_products(&found, builder, context)
+            dispose_known_ranges(&known)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            ProductProgress{changed: changed, functions: progress.functions, loops: division.loops, growth: found.growth, product_loops: found.loops, candidates: found.candidates}
+
+    public:
+        # The bounded-product proofs over every function the loop policy allows and the
+        # division screen admits, at most 32 of them; the number of changes.
+        def prove_bounded_products(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            progress: mutable ProductProgress = ProductProgress{changed: 0, functions: 0, loops: 0, growth: 0, product_loops: 0, candidates: 0}
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, progress, module, builder|:
+                cursor <- LLVMGetNextFunction(function)
+                if not skipped_by_loop_pass_policy(function, module) and may_hold_division_loop(function, function_instruction_count(function)):
+                    break if progress.functions + 1 > BoundedProductLimit::FUNCTIONS
+                    counted: ProductProgress = ProductProgress{changed: progress.changed, functions: progress.functions + 1, loops: progress.loops, growth: progress.growth, product_loops: progress.product_loops, candidates: progress.candidates}
+                    progress <- bound_function_products(function, module, builder, &counted)
+            LLVMDisposeBuilder(builder)
+            progress.changed

@@ -448,6 +448,10 @@ ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef a
   return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
 }
 
+int ElisaLLVMCanCreateUndefOrPoison(LLVMValueRef value) {
+  return canCreateUndefOrPoison(cast<Operator>(unwrap(value)));
+}
+
 int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(ElisaFunctionAnalysesRef analyses,
                                                       LLVMValueRef value, LLVMValueRef context) {
   FunctionAnalyses *A = unwrapAnalyses(analyses);
