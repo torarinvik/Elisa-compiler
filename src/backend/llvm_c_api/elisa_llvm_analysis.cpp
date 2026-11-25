@@ -503,6 +503,25 @@ ElisaConstantRangeRef ElisaLLVMScalarEvolutionSignedRange(ElisaFunctionAnalysesR
   return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
 }
 
+ElisaConstantRangeRef ElisaLLVMScalarEvolutionUnsignedRange(ElisaFunctionAnalysesRef analyses,
+                                                            LLVMValueRef value) {
+  ScalarEvolution &SE = unwrapAnalyses(analyses)->scalarEvolution();
+  ConstantRange Range = SE.getUnsignedRange(SE.getSCEV(unwrap(value)));
+  return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
+}
+
+int ElisaLLVMScalarEvolutionIsSCEVable(ElisaFunctionAnalysesRef analyses, LLVMTypeRef type) {
+  return unwrapAnalyses(analyses)->scalarEvolution().isSCEVable(unwrap(type));
+}
+
+void ElisaLLVMComputeKnownBits(LLVMValueRef value, LLVMModuleRef module, LLVMValueRef *zero,
+                               LLVMValueRef *one) {
+  Value *V = unwrap(value);
+  KnownBits Known = computeKnownBits(V, unwrap(module)->getDataLayout());
+  *zero = wrap(ConstantInt::get(V->getContext(), Known.Zero));
+  *one = wrap(ConstantInt::get(V->getContext(), Known.One));
+}
+
 uint32_t ElisaLLVMSmallConstantTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
                                          LLVMBasicBlockRef exiting) {
   return unwrapAnalyses(analyses)->scalarEvolution().getSmallConstantTripCount(unwrapLoop(loop),

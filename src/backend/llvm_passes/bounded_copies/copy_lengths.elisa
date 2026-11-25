@@ -1,0 +1,128 @@
+# The lengths a variable-length copy can have: the comparisons on every path to it
+# (path_ranges.elisa), through constant scalings and zero extensions of the length,
+# capped by the room left in an alloca it reads or writes, and filtered by the
+# length's known bits.
+
+const module BoundedCopyLimit:
+    LARGEST_LENGTH: u64 = 32
+    LENGTH_DEPTH: u32 = 4
+    # `UINT64_MAX`: no alloca bounds the copy.
+    NO_ROOM: u64 = 18446744073709551615
+
+# A copy and every length it can have, ascending.
+struct BoundedCopy:
+    copy: LLVMValueRef
+    lengths: darray[u64]
+
+# The memo after bounding a copy, and the copy's lengths.
+struct CopyBound:
+    memo: PathRangeMemo
+    lengths: darray[u64]
+
+# A length scaled by a constant: the scaled value and the factor.
+struct ScaledLength:
+    inner: LLVMValueRef
+    factor: LLVMValueRef
+
+# The memo after a length query, and the range found.
+struct LengthLookup:
+    memo: PathRangeMemo
+    range: ElisaConstantRangeRef
+
+extend Backend:
+    private:
+        # [low << k, high << k] or [low * k, high * k] when the scaling loses no bits of
+        # high; the full range otherwise. Consumes RANGE.
+        def scaled_range(range: ElisaConstantRangeRef, factor: LLVMValueRef, shift: bool) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            width: u32 = ElisaLLVMConstantRangeBitWidth(range)
+            type: LLVMTypeRef = LLVMTypeOf(factor)
+            context: LLVMContextRef = LLVMGetTypeContext(type)
+            too_far: bool = shift and ElisaLLVMConstantIntUnsignedGreater(LLVMConstInt(type, width.u64(), 0), factor) == 0
+            if ElisaLLVMConstantRangeIsEmpty(range) != 0 or too_far:
+                ElisaLLVMDisposeConstantRange(range)
+                return ElisaLLVMConstantRangeFull(width)
+            amount: u32 = LLVMConstIntGetZExtValue(factor).u32() if shift else 0
+            high: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMaximum(range, context)
+            low: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMinimum(range, context)
+            ElisaLLVMDisposeConstantRange(range)
+            overflow: bool = ElisaLLVMConstantIntShiftLeftOverflows(high, amount) != 0 if shift else ElisaLLVMConstantIntMultiplyOverflows(high, factor) != 0
+            scaled_high: LLVMValueRef = ElisaLLVMConstantIntShiftLeft(high, amount) if shift else ElisaLLVMConstantIntMultiply(high, factor)
+            return ElisaLLVMConstantRangeFull(width) if overflow or scaled_high == LLVMConstAllOnes(type)
+            scaled_low: LLVMValueRef = ElisaLLVMConstantIntShiftLeft(low, amount) if shift else ElisaLLVMConstantIntMultiply(low, factor)
+            ElisaLLVMConstantRangeNonEmpty(scaled_low, LLVMConstAdd(scaled_high, LLVMConstInt(type, 1, 0)))
+
+        # `m_NUWShl(inner, constant)` and `m_NUWMul` in either operand order: the scaled
+        # operand and the constant factor.
+        def scaling_operands(length: LLVMValueRef, opcode: u32) -> ScaledLength?:
+            return null if not is_llvm_instruction_with_opcode(length, opcode) or LLVMGetNUW(length) == 0
+            first: LLVMValueRef = LLVMGetOperand(length, 0)
+            second: LLVMValueRef = LLVMGetOperand(length, 1)
+            return ScaledLength{inner: first, factor: second} if LLVMIsAConstantInt(second) != null
+            return null if opcode == LLVMOpcode::SHL or LLVMIsAConstantInt(first) == null
+            ScaledLength{inner: second, factor: first}
+
+        # The unsigned values LENGTH can have at BLOCK. The caller owns the range.
+        def length_range(memo: mutable PathRangeMemo, length: LLVMValueRef, block: LLVMBasicBlockRef, depth: u32, analyses: ElisaFunctionAnalysesRef) -> LengthLookup can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if LLVMIsAConstantInt(length) != null:
+                return LengthLookup{memo: memo, range: ElisaLLVMConstantRangeOfConstant(length)}
+            paths: PathRangeLookup = path_range_at(memo, length, block, 0, analyses)
+            return LengthLookup{memo: paths.memo, range: paths.range} if depth >= BoundedCopyLimit::LENGTH_DEPTH
+            if scaling_operands(length, LLVMOpcode::SHL) is shifted:
+                inner: LengthLookup = length_range(paths.memo, shifted.inner, block, depth + 1, analyses)
+                return LengthLookup{memo: inner.memo, range: intersect_ranges(paths.range, scaled_range(inner.range, shifted.factor, true))}
+            if scaling_operands(length, LLVMOpcode::MUL) is multiplied:
+                inner: LengthLookup = length_range(paths.memo, multiplied.inner, block, depth + 1, analyses)
+                return LengthLookup{memo: inner.memo, range: intersect_ranges(paths.range, scaled_range(inner.range, multiplied.factor, false))}
+            if is_llvm_instruction_with_opcode(length, LLVMOpcode::ZEXT):
+                inner: LengthLookup = length_range(paths.memo, LLVMGetOperand(length, 0), block, depth + 1, analyses)
+                extended: ElisaConstantRangeRef = ElisaLLVMConstantRangeZeroExtend(inner.range, value_width(length))
+                ElisaLLVMDisposeConstantRange(inner.range)
+                return LengthLookup{memo: inner.memo, range: intersect_ranges(paths.range, extended)}
+            LengthLookup{memo: paths.memo, range: paths.range}
+
+        # The bytes left in the alloca POINTER points into, or NO_ROOM.
+        def alloca_room(pointer: LLVMValueRef, module: LLVMModuleRef) -> u64 can[Unsafe.PointerCast]:
+            offset: mutable i64 = 0
+            base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(pointer, module, (&offset).cast[void&])
+            return BoundedCopyLimit::NO_ROOM if LLVMIsAAllocaInst(base) == null or offset < 0
+            size: mutable u64 = 0
+            return BoundedCopyLimit::NO_ROOM if ElisaLLVMAllocaFixedAllocationSize(base, LLVMGetModuleDataLayout(module), &size) == 0
+            return BoundedCopyLimit::NO_ROOM if offset.u64() > size
+            size - offset.u64()
+
+        # Whether N agrees with LENGTH's known bits.
+        def allowed_by_known_bits(n: u64, zero: LLVMValueRef, one: LLVMValueRef) -> bool:
+            value: LLVMValueRef = LLVMConstInt(LLVMTypeOf(zero), n, 0)
+            ElisaLLVMConstantIntAnd(value, zero) == LLVMConstInt(LLVMTypeOf(zero), 0, 0) and ElisaLLVMConstantIntAnd(value, one) == one
+
+        # Every length in RANGE (consumed) up to HIGH that LENGTH's known bits allow.
+        def known_lengths(length: LLVMValueRef, range: ElisaConstantRangeRef, high: u64, module: LLVMModuleRef) -> darray[u64] can[Memory.Allocate, Unsafe.PointerCast]:
+            low: u64 = ElisaLLVMConstantRangeUnsignedMin(range)
+            ElisaLLVMDisposeConstantRange(range)
+            # Pointer-sized slots for the shim to fill: an optional handle is not one.
+            zero_slot: mutable void&? = null
+            one_slot: mutable void&? = null
+            ElisaLLVMComputeKnownBits(length, module, (&zero_slot).cast[void&], (&one_slot).cast[void&])
+            zero: void& = get zero_slot else return []
+            one: void& = get one_slot else return []
+            lengths: mutable darray[u64] = []
+            for n in low..<high + 1 |lengths, zero, one|:
+                lengths.push(n) if allowed_by_known_bits(n, zero.cast[LLVMValueRef], one.cast[LLVMValueRef])
+            lengths
+
+    public:
+        # `bound`: COPY's lengths when at most LARGEST_LENGTH and more than one; none
+        # otherwise. Threads the function's path memo.
+        def bound_copy(memo: mutable PathRangeMemo, copy: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> CopyBound can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            length: LLVMValueRef = LLVMGetOperand(copy, 2)
+            module: LLVMModuleRef = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInstructionParent(copy)))
+            found: LengthLookup = length_range(memo, length, LLVMGetInstructionParent(copy), 0, analyses)
+            destination_room: u64 = alloca_room(LLVMGetOperand(copy, 0), module)
+            source_room: u64 = alloca_room(LLVMGetOperand(copy, 1), module)
+            room: u64 = destination_room if destination_room < source_room else source_room
+            most: u64 = ElisaLLVMConstantRangeUnsignedMax(found.range)
+            high: u64 = most if most < room else room
+            if ElisaLLVMConstantRangeIsEmpty(found.range) != 0 or high > BoundedCopyLimit::LARGEST_LENGTH:
+                ElisaLLVMDisposeConstantRange(found.range)
+                return CopyBound{memo: found.memo, lengths: []}
+            CopyBound{memo: found.memo, lengths: known_lengths(length, found.range, high, module)}

@@ -245,6 +245,14 @@ unsigned ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(ElisaFunctionAnalysesRef 
 /* ScalarEvolution::getSignedRange(getSCEV(value)) of an integer value. */
 ElisaConstantRangeRef ElisaLLVMScalarEvolutionSignedRange(ElisaFunctionAnalysesRef analyses,
                                                           LLVMValueRef value);
+/* ScalarEvolution::getUnsignedRange(getSCEV(value)), and isSCEVable(type). */
+ElisaConstantRangeRef ElisaLLVMScalarEvolutionUnsignedRange(ElisaFunctionAnalysesRef analyses,
+                                                            LLVMValueRef value);
+int ElisaLLVMScalarEvolutionIsSCEVable(ElisaFunctionAnalysesRef analyses, LLVMTypeRef type);
+/* computeKnownBits(value, the module's data layout) with no context: the known-zero
+ * and known-one masks as ConstantInts of the value's width. */
+void ElisaLLVMComputeKnownBits(LLVMValueRef value, LLVMModuleRef module, LLVMValueRef *zero,
+                               LLVMValueRef *one);
 /* ScalarEvolution::getSmallConstantTripCount(loop, exiting): the exact trip count of the
  * loop through the exiting block, 0 when unknown or wider than 32 bits. */
 uint32_t ElisaLLVMSmallConstantTripCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,

@@ -163,6 +163,70 @@ uint64_t ElisaLLVMConstantRangeLower(ElisaConstantRangeRef range) { return unwra
 
 uint64_t ElisaLLVMConstantRangeUpper(ElisaConstantRangeRef range) { return unwrap(range)->getUpper().getZExtValue(); }
 
+ElisaConstantRangeRef ElisaLLVMConstantRangeEmpty(uint32_t width) {
+  return wrap(new ConstantRange(ConstantRange::getEmpty(width)));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeNonEmpty(LLVMValueRef lower, LLVMValueRef upper) {
+  return wrap(new ConstantRange(ConstantRange::getNonEmpty(constantValue(lower), constantValue(upper))));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeIntersectUnsigned(ElisaConstantRangeRef first,
+                                                              ElisaConstantRangeRef second) {
+  return wrap(new ConstantRange(unwrap(first)->intersectWith(*unwrap(second), ConstantRange::Unsigned)));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeUnionUnsigned(ElisaConstantRangeRef first,
+                                                          ElisaConstantRangeRef second) {
+  return wrap(new ConstantRange(unwrap(first)->unionWith(*unwrap(second), ConstantRange::Unsigned)));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeZeroExtend(ElisaConstantRangeRef range, uint32_t width) {
+  return wrap(new ConstantRange(unwrap(range)->zeroExtend(width)));
+}
+
+uint32_t ElisaLLVMConstantRangeBitWidth(ElisaConstantRangeRef range) { return unwrap(range)->getBitWidth(); }
+
+LLVMValueRef ElisaLLVMConstantRangeUnsignedMinimum(ElisaConstantRangeRef range, LLVMContextRef context) {
+  return wrap(ConstantInt::get(*unwrap(context), unwrap(range)->getUnsignedMin()));
+}
+
+LLVMValueRef ElisaLLVMConstantRangeUnsignedMaximum(ElisaConstantRangeRef range, LLVMContextRef context) {
+  return wrap(ConstantInt::get(*unwrap(context), unwrap(range)->getUnsignedMax()));
+}
+
+static LLVMValueRef constantOf(LLVMValueRef like, const APInt &Value) {
+  return wrap(ConstantInt::get(cast<ConstantInt>(unwrap(like))->getContext(), Value));
+}
+
+LLVMValueRef ElisaLLVMConstantIntShiftLeft(LLVMValueRef constant, uint32_t amount) {
+  return constantOf(constant, constantValue(constant).shl(amount));
+}
+
+LLVMValueRef ElisaLLVMConstantIntLogicalShiftRight(LLVMValueRef constant, uint32_t amount) {
+  return constantOf(constant, constantValue(constant).lshr(amount));
+}
+
+LLVMValueRef ElisaLLVMConstantIntAnd(LLVMValueRef first, LLVMValueRef second) {
+  return constantOf(first, constantValue(first) & constantValue(second));
+}
+
+LLVMValueRef ElisaLLVMConstantIntOr(LLVMValueRef first, LLVMValueRef second) {
+  return constantOf(first, constantValue(first) | constantValue(second));
+}
+
+int ElisaLLVMConstantIntShiftLeftOverflows(LLVMValueRef constant, uint32_t amount) {
+  bool Overflow = false;
+  (void)constantValue(constant).ushl_ov(amount, Overflow);
+  return Overflow;
+}
+
+int ElisaLLVMConstantIntMultiplyOverflows(LLVMValueRef first, LLVMValueRef second) {
+  bool Overflow = false;
+  (void)constantValue(first).umul_ov(constantValue(second), Overflow);
+  return Overflow;
+}
+
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range) { delete unwrap(range); }
 
 } // extern "C"

@@ -67,6 +67,9 @@ void ElisaLLVMSetICmpPredicate(LLVMValueRef compare, LLVMIntPredicate predicate)
  * and keeps the phi even when no edge is left. */
 void ElisaLLVMRemoveIncomingValue(LLVMValueRef phi, uint32_t index);
 
+/* BasicBlock::splitBasicBlock(instruction, name): the new block holds INSTRUCTION
+ * and everything after it, and the old block branches to it. */
+LLVMBasicBlockRef ElisaLLVMSplitBasicBlock(LLVMValueRef instruction, const char *name);
 /* llvm::SplitBlock(parent, instruction) without analyses: moves the
  * instruction and everything after it into a new block named
  * "<parent>.split", placed after the parent, which now branches to it. */

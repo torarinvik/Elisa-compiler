@@ -1,0 +1,178 @@
+# The unsigned values an integer can have at a block, from the branch edges on every
+# path there (`ElisaPathRanges::PathRanges`). Walking up the dominator tree, an edge
+# that is the only way into a block narrows the range by its comparisons; at a join
+# the range is the union over the incoming edges, each followed to its own
+# dominators, so a path whose comparisons contradict each other adds nothing. A
+# loop's back edges are skipped for values defined before the loop. An edge taken
+# only when `trunc V to i1` is false leaves V's even values.
+#
+# Ranges are owned handles: each function here returns a new one, and consumes the
+# ranges it is given.
+include "./path_range_memo.elisa"
+include "./decided_compares.elisa"
+
+const module PathRangeLimit:
+    JOIN_DEPTH: u32 = 12
+    LOW_BIT_DEPTH: u32 = 6
+    PREIMAGE_DEPTH: u32 = 4
+
+# The memo after a lookup, and the range found.
+struct PathRangeLookup:
+    memo: PathRangeMemo
+    range: ElisaConstantRangeRef
+
+extend Backend:
+    private:
+        def value_width(value: LLVMValueRef) -> u32:
+            LLVMGetIntTypeWidth(LLVMTypeOf(value))
+
+        # `intersectWith(second, Unsigned)`, consuming both ranges.
+        def intersect_ranges(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef) -> ElisaConstantRangeRef:
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersectUnsigned(first, second)
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            result
+
+        # `unionWith(second, Unsigned)`, consuming both ranges.
+        def unite_ranges(first: ElisaConstantRangeRef, second: ElisaConstantRangeRef) -> ElisaConstantRangeRef:
+            result: ElisaConstantRangeRef = ElisaLLVMConstantRangeUnionUnsigned(first, second)
+            ElisaLLVMDisposeConstantRange(first)
+            ElisaLLVMDisposeConstantRange(second)
+            result
+
+        def unsigned_minimum_of(first: LLVMValueRef, second: LLVMValueRef) -> LLVMValueRef:
+            second if ElisaLLVMConstantIntUnsignedGreater(first, second) != 0 else first
+
+        # The even values of RANGE, for a value whose low bit an edge cleared.
+        def even_only(range: ElisaConstantRangeRef, even: bool, context: LLVMContextRef) -> ElisaConstantRangeRef:
+            return range if not even or ElisaLLVMConstantRangeIsEmpty(range) != 0
+            width: u32 = ElisaLLVMConstantRangeBitWidth(range)
+            low: mutable LLVMValueRef = ElisaLLVMConstantRangeUnsignedMinimum(range, context)
+            high: LLVMValueRef = ElisaLLVMConstantIntShiftLeft(ElisaLLVMConstantIntLogicalShiftRight(ElisaLLVMConstantRangeUnsignedMaximum(range, context), 1), 1)
+            if ElisaLLVMConstantIntTrailingZeros(low) == 0:
+                if low == LLVMConstAllOnes(LLVMTypeOf(low)):
+                    ElisaLLVMDisposeConstantRange(range)
+                    return ElisaLLVMConstantRangeEmpty(width)
+                low <- LLVMConstAdd(low, LLVMConstInt(LLVMTypeOf(low), 1, 0))
+            if ElisaLLVMConstantIntUnsignedGreater(low, high) != 0:
+                ElisaLLVMDisposeConstantRange(range)
+                return ElisaLLVMConstantRangeEmpty(width)
+            intersect_ranges(range, ElisaLLVMConstantRangeNonEmpty(low, LLVMConstAdd(high, LLVMConstInt(LLVMTypeOf(high), 1, 0))))
+
+        # Whether CONDITION having value TRUTH clears VALUE's low bit: `trunc V to i1`
+        # false, through logical and/or.
+        def low_bit_clear(condition: LLVMValueRef, truth: bool, value: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            if not truth and is_llvm_integer_type(LLVMTypeOf(condition), 1) and is_llvm_instruction_with_opcode(condition, LLVMOpcode::TRUNC):
+                return true if LLVMGetOperand(condition, 0) == value
+            return false if depth >= PathRangeLimit::LOW_BIT_DEPTH
+            operands: LogicalOperands = get logical_operands(condition, truth) else return false
+            low_bit_clear(operands.left, truth, value, depth + 1) or low_bit_clear(operands.right, truth, value, depth + 1)
+
+        # Whether FROM -> TARGET is taken only when `trunc VALUE to i1` is false.
+        def even_on_edge(value: LLVMValueRef, from: LLVMBasicBlockRef, target: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(from) else return false
+            return false if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+            low_bit_clear(LLVMGetCondition(branch), LLVMGetSuccessor(branch, 0) == target, value, 0)
+
+        # The values of VALUE for which IMAGE, a chain of constant additions and right
+        # shifts of VALUE, lies in HOLDS.
+        def path_preimage(value: LLVMValueRef, image: LLVMValueRef, holds: ElisaConstantRangeRef, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            return holds if image == value
+            width: u32 = value_width(value)
+            opcode: u32 = LLVMGetInstructionOpcode(image) if LLVMIsAInstruction(image) != null else 0
+            if depth >= PathRangeLimit::PREIMAGE_DEPTH or ElisaLLVMConstantRangeIsEmpty(holds) != 0 or (opcode != LLVMOpcode::ADD and opcode != LLVMOpcode::LSHR):
+                ElisaLLVMDisposeConstantRange(holds)
+                return ElisaLLVMConstantRangeFull(width)
+            inner: LLVMValueRef = LLVMGetOperand(image, 0)
+            amount: LLVMValueRef = LLVMGetOperand(image, 1)
+            if opcode == LLVMOpcode::ADD and LLVMIsAConstantInt(amount) != null:
+                moved: ElisaConstantRangeRef = ElisaLLVMConstantRangeSubtract(holds, amount)
+                ElisaLLVMDisposeConstantRange(holds)
+                return path_preimage(value, inner, moved, depth + 1)
+            type: LLVMTypeRef = LLVMTypeOf(image)
+            if opcode == LLVMOpcode::LSHR and LLVMIsAConstantInt(amount) != null and ElisaLLVMConstantIntUnsignedGreater(LLVMConstInt(type, width.u64(), 0), amount) != 0:
+                # Inner >> k in [a, b] puts Inner in [a << k, (b << k) + 2^k - 1].
+                shift: u32 = LLVMConstIntGetZExtValue(amount).u32()
+                context: LLVMContextRef = LLVMGetTypeContext(type)
+                top: LLVMValueRef = ElisaLLVMConstantIntLogicalShiftRight(LLVMConstAllOnes(type), shift)
+                low: LLVMValueRef = ElisaLLVMConstantIntShiftLeft(unsigned_minimum_of(ElisaLLVMConstantRangeUnsignedMinimum(holds, context), top), shift)
+                high: LLVMValueRef = ElisaLLVMConstantIntOr(ElisaLLVMConstantIntShiftLeft(unsigned_minimum_of(ElisaLLVMConstantRangeUnsignedMaximum(holds, context), top), shift), ElisaLLVMConstantIntLowBits(type, shift))
+                ElisaLLVMDisposeConstantRange(holds)
+                return path_preimage(value, inner, ElisaLLVMConstantRangeNonEmpty(low, LLVMConstAdd(high, LLVMConstInt(type, 1, 0))), depth + 1)
+            ElisaLLVMDisposeConstantRange(holds)
+            ElisaLLVMConstantRangeFull(width)
+
+        # The values of VALUE for which `left predicate right` holds.
+        def path_region(value: LLVMValueRef, predicate: i32, left: LLVMValueRef, right: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            if left == value and predicate == LLVMIntPredicate::EQ and ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(right)) != 0:
+                return ElisaLLVMScalarEvolutionUnsignedRange(analyses, right)
+            return ElisaLLVMConstantRangeFull(value_width(value)) if LLVMIsAConstantInt(right) == null
+            path_preimage(value, left, ElisaLLVMConstantRangeExactByCompare(predicate, right), 0)
+
+        # The values the comparisons decided on FROM -> TARGET leave VALUE.
+        def range_on_edge(value: LLVMValueRef, from: LLVMBasicBlockRef, target: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(value_width(value))
+            for fact in edge_compares(from, target) |range, value, analyses|:
+                compare: LLVMValueRef = fact.compare
+                predicate: i32 = LLVMGetICmpPredicate(compare) if fact.truth else inverse_integer_predicate(LLVMGetICmpPredicate(compare))
+                first: LLVMValueRef = LLVMGetOperand(compare, 0)
+                second: LLVMValueRef = LLVMGetOperand(compare, 1)
+                swap: bool = second == value or (LLVMIsAConstant(first) != null and LLVMIsAConstant(second) == null)
+                left: LLVMValueRef = second if swap else first
+                right: LLVMValueRef = first if swap else second
+                oriented: i32 = swapped_integer_predicate(predicate) if swap else predicate
+                continue if LLVMTypeOf(left) != LLVMTypeOf(value)
+                range <- intersect_ranges(range, path_region(value, oriented, left, right, analyses))
+            range
+
+        # The predecessors of BLOCK other than its loop's back edges when it is a header.
+        def loop_entry_edges(block: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> darray[LLVMBasicBlockRef] can[Memory.Allocate]:
+            entries: mutable darray[LLVMBasicBlockRef] = []
+            header_loop: ElisaLoopRef? = ElisaLLVMLoopForBlock(analyses, block)
+            for predecessor in predecessor_edges(block) |entries, header_loop, block|:
+                if header_loop is loop:
+                    continue if ElisaLLVMLoopHeader(loop) == block and ElisaLLVMLoopContainsBlock(loop, predecessor) != 0
+                entries.push(predecessor)
+            entries
+
+        # The union over ENTRIES of each edge's facts and VALUE's range at its source.
+        def joined_range(memo: mutable PathRangeMemo, value: LLVMValueRef, block: LLVMBasicBlockRef, entries: darray[LLVMBasicBlockRef]&, depth: u32, analyses: ElisaFunctionAnalysesRef) -> PathRangeLookup can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            merged: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeEmpty(value_width(value))
+            current: mutable PathRangeMemo = memo
+            for entry in entries |merged, current, value, block, depth, analyses|:
+                edge: ElisaConstantRangeRef = range_on_edge(value, entry, block, analyses)
+                found: PathRangeLookup = path_range_at(current, value, entry, depth + 1, analyses)
+                current <- found.memo
+                merged <- unite_ranges(merged, intersect_ranges(edge, found.range))
+            PathRangeLookup{memo: current, range: merged}
+
+        # `PathRanges::walk`: VALUE's range at BLOCK from the edges above it.
+        def walk_path_range(memo: mutable PathRangeMemo, value: LLVMValueRef, block: LLVMBasicBlockRef, depth: u32, analyses: ElisaFunctionAnalysesRef) -> PathRangeLookup can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            current: mutable PathRangeMemo = memo
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(value_width(value))
+            even: mutable bool = false
+            definition: LLVMBasicBlockRef? = LLVMGetInstructionParent(value) if LLVMIsAInstruction(value) != null else null
+            node: mutable LLVMBasicBlockRef? = block if ElisaLLVMIsReachableFromEntry(analyses, block) != 0 else null
+            while node is dominator |node, current, range, even, value, depth, analyses, definition|:
+                node <- ElisaLLVMImmediateDominator(analyses, dominator)
+                # No edge above the definition can compare the value.
+                if definition is defined:
+                    break if defined == dominator
+                entries: darray[LLVMBasicBlockRef] = loop_entry_edges(dominator, analyses)
+                if entries.count == 1:
+                    range <- intersect_ranges(range, range_on_edge(value, entries[0], dominator, analyses))
+                    even <- even or even_on_edge(value, entries[0], dominator)
+                    continue
+                continue if entries.count == 0 or depth >= PathRangeLimit::JOIN_DEPTH
+                joined: PathRangeLookup = joined_range(current, value, dominator, &entries, depth, analyses)
+                return PathRangeLookup{memo: joined.memo, range: even_only(intersect_ranges(range, joined.range), even, LLVMGetTypeContext(LLVMTypeOf(value)))}
+            PathRangeLookup{memo: current, range: even_only(range, even, LLVMGetTypeContext(LLVMTypeOf(value)))}
+
+    public:
+        # `PathRanges::at`: VALUE's range at BLOCK, remembered in MEMO. The caller owns
+        # the returned range.
+        def path_range_at(memo: mutable PathRangeMemo, value: LLVMValueRef, block: LLVMBasicBlockRef, depth: u32, analyses: ElisaFunctionAnalysesRef) -> PathRangeLookup can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if path_range_memo_get(&memo, value, block) is known:
+                return PathRangeLookup{memo: memo, range: known}
+            walked: PathRangeLookup = walk_path_range(memo, value, block, depth, analyses)
+            PathRangeLookup{memo: path_range_memo_insert(walked.memo, value, block, walked.range), range: walked.range}

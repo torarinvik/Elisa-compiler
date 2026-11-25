@@ -79,6 +79,27 @@ uint64_t ElisaLLVMConstantRangeUnsignedMin(ElisaConstantRangeRef range);
 /* getLower() and getUpper() of a range at most 64 bits wide, zero-extended. */
 uint64_t ElisaLLVMConstantRangeLower(ElisaConstantRangeRef range);
 uint64_t ElisaLLVMConstantRangeUpper(ElisaConstantRangeRef range);
+/* getEmpty(width) and getNonEmpty(lower, upper): the full range when lower == upper. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeEmpty(uint32_t width);
+ElisaConstantRangeRef ElisaLLVMConstantRangeNonEmpty(LLVMValueRef lower, LLVMValueRef upper);
+/* intersectWith and unionWith, preferring the smaller unsigned range. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeIntersectUnsigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second);
+ElisaConstantRangeRef ElisaLLVMConstantRangeUnionUnsigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second);
+/* zeroExtend(width). */
+ElisaConstantRangeRef ElisaLLVMConstantRangeZeroExtend(ElisaConstantRangeRef range, uint32_t width);
+uint32_t ElisaLLVMConstantRangeBitWidth(ElisaConstantRangeRef range);
+/* getUnsignedMin() / getUnsignedMax() as ConstantInts of the range's width, any width. */
+LLVMValueRef ElisaLLVMConstantRangeUnsignedMinimum(ElisaConstantRangeRef range, LLVMContextRef context);
+LLVMValueRef ElisaLLVMConstantRangeUnsignedMaximum(ElisaConstantRangeRef range, LLVMContextRef context);
+/* APInt operations on ConstantInts of any width, which the C API's constant
+ * expressions no longer fold: shl and lshr by AMOUNT (below the width), and, or,
+ * and whether ushl_ov / umul_ov overflow. */
+LLVMValueRef ElisaLLVMConstantIntShiftLeft(LLVMValueRef constant, uint32_t amount);
+LLVMValueRef ElisaLLVMConstantIntLogicalShiftRight(LLVMValueRef constant, uint32_t amount);
+LLVMValueRef ElisaLLVMConstantIntAnd(LLVMValueRef first, LLVMValueRef second);
+LLVMValueRef ElisaLLVMConstantIntOr(LLVMValueRef first, LLVMValueRef second);
+int ElisaLLVMConstantIntShiftLeftOverflows(LLVMValueRef constant, uint32_t amount);
+int ElisaLLVMConstantIntMultiplyOverflows(LLVMValueRef first, LLVMValueRef second);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus

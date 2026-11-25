@@ -1,0 +1,184 @@
+# Expands a memcpy or memmove whose length is not a constant but has a small proven
+# upper bound into fixed-size loads and stores. The backend calls the C library for
+# every variable-length copy; a row of at most a few dozen bytes then pays a call, the
+# library's size dispatch and the callee-saved spills around the call. A length in
+# [C, 2C] is copied as two C-byte chunks, one at the start and one ending at the last
+# byte, which overlap when the length is below 2C. Both chunks are loaded before
+# either is stored, so the expansion is also correct for an overlapping memmove. The
+# bounds come from copy_lengths.elisa. Runs late, so the bounded length reaches the
+# copy after every inlining.
+include "../ir/ir_editing.elisa"
+include "../ir/llvm_ir_queries.elisa"
+include "../ir/path_ranges.elisa"
+include "./copy_lengths.elisa"
+
+extend Backend:
+    private:
+        # The chunk sizes, largest first.
+        def copy_chunk_sizes() -> darray[u32] can[Memory.Allocate]:
+            [16, 8, 4, 2, 1]
+
+        def chunk_block_name(chunk: u32) -> sview:
+            when chunk:
+                16 -> "bounded.copy.16"
+                8 -> "bounded.copy.8"
+                4 -> "bounded.copy.4"
+                2 -> "bounded.copy.2"
+                _ -> "bounded.copy.1"
+
+        def chunk_test_name(chunk: u32) -> sview:
+            when chunk:
+                16 -> "bounded.copy.below.16"
+                8 -> "bounded.copy.below.8"
+                4 -> "bounded.copy.below.4"
+                2 -> "bounded.copy.below.2"
+                _ -> "bounded.copy.below.1"
+
+        # Whether LENGTH is copied as CHUNK-byte pieces: [chunk, 2 chunk), and up to the
+        # largest expanded length for the largest chunk.
+        def in_chunk_tier(length: u64, chunk: u32) -> bool:
+            return false if length < chunk.u64()
+            length <= BoundedCopyLimit::LARGEST_LENGTH if chunk == 16 else length < 2 * chunk.u64()
+
+        # The copy's `align` on argument ARGUMENT, or 1 (`MaybeAlign::valueOrOne`).
+        def copy_argument_alignment(copy: LLVMValueRef, argument: u32) -> u64 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            attribute: LLVMAttributeRef = get LLVMGetCallSiteEnumAttribute(copy, argument + 1, attribute_kind("align")) else return 1
+            LLVMGetEnumAttributeValue(attribute)
+
+        # `commonAlignment(alignment, chunk)` of two powers of two.
+        def chunk_alignment(alignment: u64, chunk: u32) -> u32:
+            alignment.u32() if alignment < chunk.u64() else chunk
+
+        def aligned_load(builder: LLVMBuilderRef, type: LLVMTypeRef, address: LLVMValueRef, alignment: u32) -> LLVMValueRef:
+            load: LLVMValueRef = LLVMBuildLoad2(builder, type, address, "")
+            LLVMSetAlignment(load, alignment)
+            load
+
+        def aligned_store(builder: LLVMBuilderRef, value: LLVMValueRef, address: LLVMValueRef, alignment: u32) -> void:
+            LLVMSetAlignment(LLVMBuildStore(builder, value, address), alignment)
+
+        def byte_offset_address(builder: LLVMBuilderRef, address: LLVMValueRef, offset: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            indices: mutable darray[LLVMValueRef] = [offset]
+            LLVMBuildGEP2(builder, LLVMInt8TypeInContext(LLVMGetTypeContext(LLVMTypeOf(offset))), address, (&indices[0]).cast[void&], 1, "")
+
+        # The lengths in [chunk, 2 chunk] copied as two CHUNK-byte pieces, or one piece
+        # when CHUNK is the only such length.
+        def emit_copy_chunks(builder: LLVMBuilderRef, copy: LLVMValueRef, chunk: u32, single: bool) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            destination: LLVMValueRef = LLVMGetOperand(copy, 0)
+            source: LLVMValueRef = LLVMGetOperand(copy, 1)
+            length: LLVMValueRef = LLVMGetOperand(copy, 2)
+            piece: LLVMTypeRef = LLVMIntTypeInContext(LLVMGetTypeContext(LLVMTypeOf(length)), chunk * 8)
+            destination_alignment: u32 = chunk_alignment(copy_argument_alignment(copy, 0), chunk)
+            head: LLVMValueRef = aligned_load(builder, piece, source, chunk_alignment(copy_argument_alignment(copy, 1), chunk))
+            if single:
+                aligned_store(builder, head, destination, destination_alignment)
+                return
+            tail_offset: LLVMValueRef = LLVMBuildSub(builder, length, LLVMConstInt(LLVMTypeOf(length), chunk.u64(), 0), "")
+            tail_piece: LLVMValueRef = aligned_load(builder, piece, byte_offset_address(builder, source, tail_offset), 1)
+            aligned_store(builder, head, destination, destination_alignment)
+            aligned_store(builder, tail_piece, byte_offset_address(builder, destination, tail_offset), 1)
+
+        def any_in_tier(lengths: darray[u64]&, chunk: u32) -> bool:
+            for length in lengths:
+                return true if in_chunk_tier(length, chunk)
+            false
+
+        # Whether CHUNK is the only length of its tier.
+        def is_single_chunk(lengths: darray[u64]&, chunk: u32) -> bool:
+            for length in lengths:
+                return false if in_chunk_tier(length, chunk) and length != chunk.u64()
+            true
+
+        def outside_tier(lengths: darray[u64]&, chunk: u32) -> darray[u64] can[Memory.Allocate]:
+            kept: mutable darray[u64] = []
+            for length in lengths |kept, chunk|:
+                kept.push(length) if not in_chunk_tier(length, chunk)
+            kept
+
+        # Dispatches on the length from the largest chunk size down; a length below every
+        # reachable chunk size (zero) copies nothing.
+        def expand_bounded_copy(bounded: BoundedCopy&) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            copy: LLVMValueRef = bounded.copy
+            length: LLVMValueRef = LLVMGetOperand(copy, 2)
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(length))
+            location: LLVMMetadataRef? = LLVMInstructionGetDebugLoc(copy)
+            first_test: LLVMBasicBlockRef = LLVMGetInstructionParent(copy)
+            done_name: mutable darray[u8] = []
+            after: LLVMBasicBlockRef = ElisaLLVMSplitBasicBlock(copy, sview_to_cstr("bounded.copy.done", done_name))
+            if LLVMGetBasicBlockTerminator(first_test) is split_branch:
+                LLVMInstructionEraseFromParent(split_branch)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            test: mutable LLVMBasicBlockRef? = first_test
+            lengths: mutable darray[u64] = bounded.lengths
+            for chunk in copy_chunk_sizes() |test, lengths, builder, copy, length, context, location, after|:
+                continue if not any_in_tier(&lengths, chunk)
+                single: bool = is_single_chunk(&lengths, chunk)
+                body_name: mutable darray[u8] = []
+                body: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, after, sview_to_cstr(chunk_block_name(chunk), body_name))
+                LLVMPositionBuilderAtEnd(builder, body)
+                LLVMSetCurrentDebugLocation2(builder, location)
+                emit_copy_chunks(builder, copy, chunk, single)
+                _ = LLVMBuildBr(builder, after)
+                lengths <- outside_tier(&lengths, chunk)
+                if test is current:
+                    LLVMPositionBuilderAtEnd(builder, current)
+                if lengths.count == 0:
+                    _ = LLVMBuildBr(builder, body)
+                    test <- null
+                    break
+                test_name: mutable darray[u8] = []
+                next: LLVMBasicBlockRef = LLVMInsertBasicBlockInContext(context, body, sview_to_cstr(chunk_test_name(chunk), test_name))
+                large: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGE, length, LLVMConstInt(LLVMTypeOf(length), chunk.u64(), 0), "")
+                _ = LLVMBuildCondBr(builder, large, body, next)
+                test <- next
+            if test is last:
+                LLVMPositionBuilderAtEnd(builder, last)
+                LLVMSetCurrentDebugLocation2(builder, null)
+                _ = LLVMBuildBr(builder, after)
+            LLVMDisposeBuilder(builder)
+            LLVMInstructionEraseFromParent(copy)
+
+        # `candidate`: a plain, non-volatile memcpy or memmove of a variable length
+        # between address space 0 pointers, without operand bundles.
+        def is_bounded_copy_candidate(instruction: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsAIntrinsicInst(instruction) == null
+            id: u32 = called_intrinsic_id(instruction)
+            return false if id != intrinsic_identifier("llvm.memcpy") and id != intrinsic_identifier("llvm.memmove")
+            return false if ElisaLLVMIsConstantZero(LLVMGetOperand(instruction, 3)) == 0 or LLVMIsAConstantInt(LLVMGetOperand(instruction, 2)) != null
+            return false if LLVMGetPointerAddressSpace(LLVMTypeOf(LLVMGetOperand(instruction, 0))) != 0
+            LLVMGetPointerAddressSpace(LLVMTypeOf(LLVMGetOperand(instruction, 1))) == 0 and LLVMGetNumOperandBundles(instruction) == 0
+
+        # The function's copies with more than one bounded length, in instruction order.
+        def bounded_function_copies(copies: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> darray[BoundedCopy] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            memo: mutable PathRangeMemo = new_path_range_memo()
+            bounded: mutable darray[BoundedCopy] = []
+            for copy in copies |memo, bounded, analyses|:
+                found: CopyBound = bound_copy(memo, copy, analyses)
+                memo <- found.memo
+                bounded.push(BoundedCopy{copy: copy, lengths: found.lengths}) if found.lengths.count > 1
+            dispose_path_range_memo(&memo)
+            bounded
+
+        # `expandFunction`: how many copies of FUNCTION were expanded.
+        def expand_function_copies(function: LLVMValueRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone") or function_has_attribute(function, "minsize")
+            copies: mutable darray[LLVMValueRef] = []
+            for instruction in function_instructions(function) |copies|:
+                copies.push(instruction) if is_bounded_copy_candidate(instruction)
+            return 0 if copies.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            bounded: darray[BoundedCopy] = bounded_function_copies(&copies, analyses)
+            for copy in bounded:
+                expand_bounded_copy(&copy)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            bounded.count.u32()
+
+    public:
+        # `elisacoreExpandBoundedCopies`: how many copies were expanded.
+        def expand_bounded_copies(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed|:
+                cursor <- LLVMGetNextFunction(function)
+                changed <- changed + expand_function_copies(function)
+            changed
