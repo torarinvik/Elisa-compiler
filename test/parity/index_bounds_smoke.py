@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Qualify paired-index validation rewrites with independent linked results."""
-import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'test' / 'llvm'))
+from elisa_llvm_pass import run_pass
 
 def run(args):
     p = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=29)
@@ -26,25 +27,8 @@ def main():
         print('index bounds: requires LLVM 23; skipped')
         return
     bindir = Path(run([config, '--bindir']).stdout.strip())
-    flags = shlex.split(run([config, '--cxxflags']).stdout)
-    links = shlex.split(run([config, '--ldflags', '--libs', '--system-libs']).stdout)
-    libdir = run([config, '--libdir']).stdout.strip()
     with tempfile.TemporaryDirectory(prefix='elisa-index-bounds-') as tmp:
         work=Path(tmp)
-        driver=work/'driver.cpp'
-        driver.write_text('#include '+json.dumps(str(ROOT/'src/backend/llvm_index_bounds.cpp'))+r'''
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/Support/SourceMgr.h>
-int main(int argc,char **argv){using namespace llvm;if(argc!=2)return 2;
- LLVMContext C;SMDiagnostic E;auto M=parseIRFile(argv[1],E,C);if(!M){E.print(argv[0],errs());return 2;}
- if(verifyModule(*M,&errs()))return 2;
- errs()<<elisacoreValidatedIndexBounds(wrap(M.get()))<<"\n";
- if(verifyModule(*M,&errs()))return 2;M->print(outs(),nullptr);return 0;
-}
-''')
-        transform=work/'transform'
-        run([bindir/'clang++',*flags,'-O2',driver,*links,'-Wl,-rpath,'+libdir,'-o',transform])
         fixture=(ROOT/'test/parity/index_bounds_fixture.ll').read_text()
         cases={
           'paired':(fixture,1,0),
@@ -60,14 +44,12 @@ int main(int argc,char **argv){using namespace llvm;if(argc!=2)return 2;
             ' %next = add i64 %i, 1\n %done = icmp eq i64 %next, 16\n'
             ' br i1 %done, label %finished, label %loop\nfinished:\n ret i64 7', 1)
         for label, target, expected in [('darwin-loop','arm64-apple-darwin',True), ('linux-loop','aarch64-unknown-linux-gnu',False)]:
-            source=work/(label+'.ll');source.write_text(loop.replace('aarch64-unknown-linux-gnu',target))
-            output=run([transform,source]).stdout
+            _,output=run_pass('index-bounds',loop.replace('aarch64-unknown-linux-gnu',target))
             if ('llvm.loop.align' in output)!=expected:raise RuntimeError(label+': wrong alignment policy')
         explicit=loop.replace('aarch64-unknown-linux-gnu','arm64-apple-darwin').replace(
             'br i1 %done, label %finished, label %loop','br i1 %done, label %finished, label %loop, !llvm.loop !0')
         explicit+='\n!0 = distinct !{!0, !1}\n!1 = !{!"llvm.loop.align", i32 8}\n'
-        source=work/'explicit-align.ll';source.write_text(explicit)
-        output=run([transform,source]).stdout
+        _,output=run_pass('index-bounds',explicit)
         if '!"llvm.loop.align", i32 8' not in output or '!"llvm.loop.align", i32 16' in output:
             raise RuntimeError('explicit loop alignment was changed')
         harness=work/'check.c'
@@ -94,10 +76,10 @@ int main(void){unsigned count=0;
 ''')
         for name,(text,want,mode) in cases.items():
             source=work/(name+'.ll');source.write_text(text)
-            result=run([transform,source])
-            if result.stderr.strip()!=str(want):raise RuntimeError(name+': wrong rewrite count '+result.stderr)
-            changed=work/(name+'-changed.ll');changed.write_text(result.stdout)
-            if run([transform,changed]).stderr.strip()!='0':raise RuntimeError(name+': not idempotent')
+            count,module=run_pass('index-bounds',text)
+            if count!=want:raise RuntimeError(f'{name}: wrong rewrite count {count}')
+            changed=work/(name+'-changed.ll');changed.write_text(module)
+            if run_pass('index-bounds',module)[0]!=0:raise RuntimeError(name+': not idempotent')
             for label,ir in [('baseline',source),('candidate',changed)]:
                 binary=work/(name+'-'+label)
                 run([bindir/'clang','-O3',f'-DMODE={mode}',ir,harness,'-o',binary])

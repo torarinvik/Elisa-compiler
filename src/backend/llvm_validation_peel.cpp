@@ -134,7 +134,6 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 #include "llvm_bounded_factorial.cpp"
 extern "C" unsigned elisacoreElideArrayRoundTrips(LLVMModuleRef);
 extern "C" unsigned elisacoreOptimizeBoundedSums(LLVMModuleRef, LLVMTargetMachineRef);
-extern "C" unsigned elisacoreOptimizeIndexBounds(LLVMModuleRef, LLVMTargetMachineRef);
 extern "C" unsigned elisacoreFoldBoundedRemainders(LLVMModuleRef);
 #include "llvm_ordered_vector.cpp"
 

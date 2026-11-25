@@ -65,6 +65,8 @@ ElisaConstantRangeRef ElisaLLVMConstantRangeSignedMultiplyFast(ElisaConstantRang
 int ElisaLLVMConstantRangeIsFull(ElisaConstantRangeRef range);
 /* isWrappedSet(): the range wraps past the unsigned maximum (and is not full or empty). */
 int ElisaLLVMConstantRangeIsWrapped(ElisaConstantRangeRef range);
+/* isSingleElement(): the range holds exactly one value, of any width. */
+int ElisaLLVMConstantRangeIsSingleElement(ElisaConstantRangeRef range);
 int ElisaLLVMConstantRangeIsAllNonNegative(ElisaConstantRangeRef range);
 /* getSignedMin() / getSignedMax() sign-extended; the range is at most 64 bits wide. */
 int64_t ElisaLLVMConstantRangeSignedMin(ElisaConstantRangeRef range);

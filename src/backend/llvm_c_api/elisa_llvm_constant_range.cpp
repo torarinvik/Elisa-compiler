@@ -131,6 +131,10 @@ int ElisaLLVMConstantRangeIsWrapped(ElisaConstantRangeRef range) {
   return unwrap(range)->isWrappedSet();
 }
 
+int ElisaLLVMConstantRangeIsSingleElement(ElisaConstantRangeRef range) {
+  return unwrap(range)->isSingleElement();
+}
+
 int ElisaLLVMConstantRangeIsAllNonNegative(ElisaConstantRangeRef range) {
   return unwrap(range)->isAllNonNegative();
 }

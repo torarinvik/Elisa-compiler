@@ -1,0 +1,304 @@
+# Fold paired signed-index validations using a poison-safe bound.
+#
+# `a < 0 or b < 0` followed by `a >= n or b >= n`, both rejecting to the same block, is
+# `a >=u n' or b >=u n'` for a bound n that LazyValueInfo proves nonnegative, where n' is
+# `freeze(n) & SIGNED_MAX`: a concrete nonnegative bound is unchanged, and for a poison
+# bound the mask still rejects every negative index, as the signed checks did. With two
+# nonnegative indices the old use of the bound was already undefined. The two checks may
+# share one block or sit in a block and its single successor; the second block's
+# successor then takes the first block's edge. On Darwin AArch64 the function's small leaf
+# loops are also aligned to 16 bytes after the checks shrink, unless they set their own
+# alignment.
+include "../../ir/loop_pass_policy.elisa"
+
+const module IndexBoundLimit:
+    LEAF_DEPTH: u32 = 6
+    LEAF_COUNT: usize = 4
+    PAIRED_COMPARES: usize = 4
+    MINIMUM_WIDTH: u32 = 2
+    MAXIMUM_WIDTH: u32 = 128
+    FUNCTION_INSTRUCTIONS: u32 = 2500
+    LOOP_BLOCKS: u32 = 3
+    LOOP_INSTRUCTIONS: u32 = 32
+    LOOP_ALIGNMENT: u64 = 16
+    ALL_ONES: u64 = 18446744073709551615
+    CLEANUP: sview = "function(instcombine<max-iterations=8;no-verify-fixpoint>,simplifycfg)"
+
+# The indices `first` and `second` checked against `0 <= index < bound`.
+struct PairedIndexCheck:
+    first: LLVMValueRef
+    second: LLVMValueRef
+    bound: LLVMValueRef
+
+# A branch whose condition rejects both indices. When `merged`, the upper checks sit in the
+# branch's second successor, which continues to `continue_block`.
+struct IndexBoundCandidate:
+    branch: LLVMValueRef
+    merged: bool
+    continue_block: LLVMBasicBlockRef
+    check: PairedIndexCheck
+
+extend Backend:
+    private:
+        # The `select c, true, f` and `or` operands of a disjunction VALUE, or nothing.
+        def disjunction_operands(value: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            return [] if not is_llvm_integer_type(LLVMTypeOf(value), 1)
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::SELECT):
+                return [LLVMGetOperand(value, 0), LLVMGetOperand(value, 2)] if is_constant_integer(LLVMGetOperand(value, 1), 1)
+            return [LLVMGetOperand(value, 0), LLVMGetOperand(value, 1)] if is_llvm_instruction_with_opcode(value, LLVMOpcode::OR)
+            []
+
+        # The compares a disjunction tree over VALUE ends in, left to right; empty when a leaf
+        # is not a compare, the tree is deeper than six, or COLLECTED plus the compares found
+        # so far passes four.
+        def compare_leaves(value: LLVMValueRef, depth: u32, collected: usize) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            return [] if depth > IndexBoundLimit::LEAF_DEPTH or collected > IndexBoundLimit::LEAF_COUNT
+            return [value] if is_llvm_instruction_with_opcode(value, LLVMOpcode::ICMP)
+            operands: darray[LLVMValueRef] = disjunction_operands(value)
+            return [] if operands.count != 2
+            left: darray[LLVMValueRef] = compare_leaves(operands[0], depth + 1, collected)
+            return [] if left.count == 0
+            right: darray[LLVMValueRef] = compare_leaves(operands[1], depth + 1, collected + left.count)
+            return [] if right.count == 0
+            leaves: mutable darray[LLVMValueRef] = []
+            for leaf in left |leaves|:
+                leaves.push(leaf)
+            for leaf in right |leaves|:
+                leaves.push(leaf)
+            leaves
+
+        # The index COMPARE tests with `index <s 0`.
+        def negative_index(compare: LLVMValueRef) -> LLVMValueRef?:
+            zero: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return null if LLVMGetICmpPredicate(compare) != LLVMIntPredicate::SLT or LLVMIsAConstantInt(zero) == null or LLVMIsNull(zero) == 0
+            LLVMGetOperand(compare, 0)
+
+        def is_upper_index_predicate(compare: LLVMValueRef) -> bool:
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            predicate == LLVMIntPredicate::SGE or predicate == LLVMIntPredicate::UGE
+
+        # `a <s 0, b <s 0, a >= n, b >= n` (the upper checks in either order) over two
+        # distinct integer indices of 2 to 128 bits and one bound n.
+        def paired_index_check(compares: darray[LLVMValueRef]&) -> PairedIndexCheck? can[Abort.Panic]:
+            return null if compares.count != IndexBoundLimit::PAIRED_COMPARES
+            for compare in compares:
+                return null if ElisaLLVMHasMetadataOtherThanDebugLoc(compare) != 0
+            first_compare: LLVMValueRef = compares[0]
+            second_compare: LLVMValueRef = compares[1]
+            first_upper: LLVMValueRef = compares[2]
+            second_upper: LLVMValueRef = compares[3]
+            first: LLVMValueRef = get negative_index(first_compare) else return null
+            second: LLVMValueRef = get negative_index(second_compare) else return null
+            index_type: LLVMTypeRef = LLVMTypeOf(first)
+            return null if first == second or not is_llvm_integer_type(index_type, 0) or LLVMTypeOf(second) != index_type
+            width: u32 = LLVMGetIntTypeWidth(index_type)
+            return null if width < IndexBoundLimit::MINIMUM_WIDTH or width > IndexBoundLimit::MAXIMUM_WIDTH
+            bound: LLVMValueRef = LLVMGetOperand(first_upper, 1)
+            return null if LLVMTypeOf(bound) != index_type or LLVMGetOperand(second_upper, 1) != bound
+            return null if not is_upper_index_predicate(first_upper) or not is_upper_index_predicate(second_upper)
+            first_checked: LLVMValueRef = LLVMGetOperand(first_upper, 0)
+            second_checked: LLVMValueRef = LLVMGetOperand(second_upper, 0)
+            return null if not ((first_checked == first and second_checked == second) or (first_checked == second and second_checked == first))
+            PairedIndexCheck{first: first, second: second, bound: bound}
+
+        # An i1 compare, select or or: the only instructions the merged upper block may hold.
+        def is_pure_check_instruction(instruction: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            opcode == LLVMOpcode::ICMP or opcode == LLVMOpcode::SELECT or (opcode == LLVMOpcode::OR and is_llvm_integer_type(LLVMTypeOf(instruction), 1))
+
+        # Whether every user of INSTRUCTION is an instruction of BLOCK.
+        def users_stay_in_block(instruction: LLVMValueRef, block: LLVMBasicBlockRef) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(instruction)
+            while use_cursor is use |use_cursor, block|:
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if LLVMIsAInstruction(user) == null or LLVMGetInstructionParent(user) != block
+                use_cursor <- LLVMGetNextUse(use)
+            true
+
+        # INSTRUCTION while it is still one of its block's leading phis.
+        def leading_phi(instruction: LLVMValueRef?) -> LLVMValueRef?:
+            if instruction is present:
+                return present if is_llvm_instruction_with_opcode(present, LLVMOpcode::PHI)
+            null
+
+        # Whether SECOND, reached only from FIRST, only computes its checks, and both blocks
+        # give EXIT's phis the same value, so FIRST can branch to CONTINUE_BLOCK itself.
+        def upper_check_is_mergeable(first: LLVMBasicBlockRef, second: LLVMBasicBlockRef, exit: LLVMBasicBlockRef, continue_block: LLVMBasicBlockRef) -> bool:
+            return false if first == second or first == exit or first == continue_block or second == exit or second == continue_block or exit == continue_block
+            return false if ElisaLLVMBlockIsEHPad(second) != 0 or ElisaLLVMBlockIsEHPad(exit) != 0 or ElisaLLVMBlockIsEHPad(continue_block) != 0
+            return false if not same_optional_block(single_predecessor(second), first) or block_has_phis(continue_block)
+            # Redirected invalid cases formerly used the second block's phi value; keeping an
+            # unreachable old edge does not preserve that selection.
+            phi_cursor: mutable LLVMValueRef? = leading_phi(LLVMGetFirstInstruction(exit))
+            while phi_cursor is phi |phi_cursor, first, second|:
+                first_index: i64 = phi_incoming_index(phi, first)
+                second_index: i64 = phi_incoming_index(phi, second)
+                return false if first_index < 0 or second_index < 0 or LLVMGetIncomingValue(phi, first_index.u32()) != LLVMGetIncomingValue(phi, second_index.u32())
+                phi_cursor <- leading_phi(LLVMGetNextInstruction(phi))
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(second)
+            while cursor is instruction |cursor, second|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if LLVMIsATerminatorInst(instruction) == null and LLVMIsADbgInfoIntrinsic(instruction) == null:
+                    return false if not is_pure_check_instruction(instruction) or ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+                    return false if not users_stay_in_block(instruction, second)
+            true
+
+        # The paired check BLOCK's conditional branch rejects, alone or with its successor.
+        def index_bound_candidate(block: LLVMBasicBlockRef) -> IndexBoundCandidate? can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return null
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(branch) != 0
+            compares: darray[LLVMValueRef] = compare_leaves(LLVMGetCondition(branch), 0, 0)
+            return null if compares.count == 0
+            if compares.count != 2:
+                check: PairedIndexCheck = get paired_index_check(&compares) else return null
+                return IndexBoundCandidate{branch: branch, merged: false, continue_block: block, check: check}
+            exit: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            second: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            second_branch: LLVMValueRef = get conditional_terminator(second) else return null
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(second_branch) != 0 or LLVMGetSuccessor(second_branch, 0) != exit
+            continue_block: LLVMBasicBlockRef = LLVMGetSuccessor(second_branch, 1)
+            return null if not upper_check_is_mergeable(block, second, exit, continue_block)
+            upper: darray[LLVMValueRef] = compare_leaves(LLVMGetCondition(second_branch), 0, compares.count)
+            return null if upper.count == 0
+            all_compares: mutable darray[LLVMValueRef] = []
+            for compare in compares |all_compares|:
+                all_compares.push(compare)
+            for compare in upper |all_compares|:
+                all_compares.push(compare)
+            check: PairedIndexCheck = get paired_index_check(&all_compares) else return null
+            IndexBoundCandidate{branch: branch, merged: true, continue_block: continue_block, check: check}
+
+        def available_at(value: LLVMValueRef, at: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            LLVMIsAInstruction(value) == null or ElisaLLVMInstructionDominates(analyses, value, at) != 0
+
+        # Whether the indices and bound are available at the branch and LazyValueInfo bounds
+        # the bound to one nonnegative, unwrapped range (a single value only when it cannot
+        # be undef or poison).
+        def proves_index_bound(candidate: IndexBoundCandidate, analyses: ElisaFunctionAnalysesRef) -> bool:
+            branch: LLVMValueRef = candidate.branch
+            bound: LLVMValueRef = candidate.check.bound
+            return false if not available_at(candidate.check.first, branch, analyses) or not available_at(candidate.check.second, branch, analyses) or not available_at(bound, branch, analyses)
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, bound, branch, 0)
+            rejected: bool = ElisaLLVMConstantRangeIsEmpty(range) != 0 or ElisaLLVMConstantRangeIsFull(range) != 0 or ElisaLLVMConstantRangeIsWrapped(range) != 0 or ElisaLLVMConstantRangeSignedMinIsNegative(range) != 0
+            single: bool = ElisaLLVMConstantRangeIsSingleElement(range) != 0
+            ElisaLLVMDisposeConstantRange(range)
+            return false if rejected
+            not single or ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAt(analyses, bound, branch) != 0
+
+        # The largest signed value of the integer TYPE, 2 to 128 bits wide.
+        def signed_maximum_constant(integer_type: LLVMTypeRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            width: u32 = LLVMGetIntTypeWidth(integer_type)
+            return LLVMConstInt(integer_type, IndexBoundLimit::ALL_ONES >> (65 - width).u64(), 0) if width <= 64
+            high: u64 = 0 if width == 65 else IndexBoundLimit::ALL_ONES >> (129 - width).u64()
+            words: mutable darray[u64] = [IndexBoundLimit::ALL_ONES, high]
+            LLVMConstIntOfArbitraryPrecision(integer_type, 2, (&words[0]).cast[void&])
+
+        # Rejects both indices against the masked, frozen bound in one select.
+        def rewrite_index_bound(candidate: IndexBoundCandidate, builder: LLVMBuilderRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            branch: LLVMValueRef = candidate.branch
+            check: PairedIndexCheck = candidate.check
+            position_builder_before(builder, branch)
+            name_storage: mutable darray[u8] = []
+            defined: LLVMValueRef = LLVMBuildFreeze(builder, check.bound, sview_to_cstr("index.bound.defined", name_storage))
+            mask_storage: mutable darray[u8] = []
+            safe: LLVMValueRef = LLVMBuildAnd(builder, defined, signed_maximum_constant(LLVMTypeOf(check.bound)), sview_to_cstr("index.bound.nonnegative", mask_storage))
+            empty_storage: mutable darray[u8] = []
+            unnamed: cstr = sview_to_cstr("", empty_storage)
+            first_outside: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGE, check.first, safe, unnamed)
+            second_outside: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGE, check.second, safe, unnamed)
+            invalid_storage: mutable darray[u8] = []
+            always: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(context), 1, 0)
+            LLVMSetCondition(branch, LLVMBuildSelect(builder, first_outside, always, second_outside, sview_to_cstr("index.invalid", invalid_storage)))
+            LLVMSetSuccessor(branch, 1, candidate.continue_block) if candidate.merged
+
+        # Whether OPTION is a loop property node named `llvm.loop.align`.
+        def is_loop_align_property(option: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAMDNode(option) == null
+            words: darray[usize] = metadata_operand_words(option)
+            return false if words.count == 0
+            name: LLVMValueRef = get metadata_word_value(&words, 0) else return false
+            return false if LLVMIsAMDString(name) == null
+            length: mutable u32 = 0
+            text: void& = get LLVMGetMDString(name, (&length).cast[void&]) else return false
+            unsafe_sview_bounded_bytes(text.cast[u8&], length.usize()) == "llvm.loop.align"
+
+        # Whether LOOP is a leaf of at most three blocks and 32 instructions that calls only
+        # debug intrinsics and has one latch.
+        def is_small_leaf_loop(loop: ElisaLoopRef) -> bool:
+            return false if ElisaLLVMLoopSubLoopCount(loop) != 0 or ElisaLLVMLoopBlockCount(loop) > IndexBoundLimit::LOOP_BLOCKS
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return false if is_call_base(instruction) and LLVMIsADbgInfoIntrinsic(instruction) == null
+            loop_instruction_count(loop) <= IndexBoundLimit::LOOP_INSTRUCTIONS and ElisaLLVMLoopLatch(loop) != null
+
+        # Gives LOOP a fresh loop ID with `llvm.loop.align` 16 after its existing properties,
+        # unless one of them already sets the alignment.
+        def align_loop(loop: ElisaLoopRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            options: mutable darray[usize] = []
+            if ElisaLLVMLoopGetLoopID(loop) is raw_id:
+                loop_id: LLVMValueRef = LLVMMetadataAsValue(context, raw_id.cast[LLVMMetadataRef])
+                words: darray[usize] = metadata_operand_words(loop_id)
+                for index in 1..<words.count |words, options|:
+                    word: mutable usize = 0
+                    if metadata_word_value(&words, index) is option:
+                        return if is_loop_align_property(option)
+                        metadata: LLVMMetadataRef = LLVMValueAsMetadata(option)
+                        word <- ((&metadata).cast[usize&])[0]
+                    options.push(word)
+            name_storage: mutable darray[u8] = []
+            fields: mutable darray[LLVMMetadataRef] = [LLVMMDStringInContext2(context, sview_to_cstr("llvm.loop.align", name_storage), 15), LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(context), IndexBoundLimit::LOOP_ALIGNMENT, 0))]
+            alignment: LLVMMetadataRef = LLVMMDNodeInContext2(context, (&fields[0]).cast[void&], 2)
+            options.push(((&alignment).cast[usize&])[0])
+            ElisaLLVMLoopSetLoopID(loop, ElisaLLVMCreateLoopID(context, (&options[0]).cast[void&], options.count.u32()))
+
+        # Keeps small guarded scans aligned after their entry checks shrink. Other AArch64
+        # targets keep their default layout.
+        def align_small_leaf_loops(analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<ElisaLLVMLoopCount(analyses) |analyses, context|:
+                loop: ElisaLoopRef = ElisaLLVMLoopAt(analyses, index)
+                align_loop(loop, context) if is_small_leaf_loop(loop)
+
+        # Rewrites the first proven candidate of FUNCTION; the analyses are discarded after
+        # one rewrite.
+        def fold_function_index_bounds(function: LLVMValueRef, module: LLVMModuleRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if skipped_by_scalar_pass_policy(function) or function_instruction_count(function) > IndexBoundLimit::FUNCTION_INSTRUCTIONS
+            candidates: mutable darray[IndexBoundCandidate] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if index_bound_candidate(block) is candidate:
+                    candidates.push(candidate)
+            return 0 if candidates.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            for candidate in candidates |analyses, context, module, builder|:
+                if proves_index_bound(candidate, analyses):
+                    align_small_leaf_loops(analyses, context) if module_targets_darwin_aarch64(module)
+                    rewrite_index_bound(candidate, builder, context)
+                    ElisaLLVMDisposeFunctionAnalyses(analyses)
+                    return 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            0
+
+    public:
+        # The paired index checks rewritten, at most one per function; modules with debug
+        # info are left alone.
+        def fold_validated_index_bounds(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_debug_info(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                changed <- changed + fold_function_index_bounds(function, module, builder)
+            LLVMDisposeBuilder(builder)
+            changed
+
+        # The folds, then instcombine and simplifycfg over them: 0 unchanged, 1 changed, 2
+        # when the cleanup pipeline fails.
+        def optimize_index_bounds(module: LLVMModuleRef, target: void&?) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if fold_validated_index_bounds(module) == 0
+            return 2 if not run_module_pipeline(module, target, IndexBoundLimit::CLEANUP)
+            1
