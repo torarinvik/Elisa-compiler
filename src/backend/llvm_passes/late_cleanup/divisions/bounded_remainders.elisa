@@ -1,0 +1,240 @@
+# Remainders by a constant reduced to one conditional subtraction, on AArch64.
+#
+# When the dividend is proven nonnegative and below twice the modulus, `x % m` is
+# `x >= m ? x - m : x`. A 64-bit `urem` by a Mersenne modulus `2^k - 1` (17 <= k <= 31,
+# whose division constants take several instructions) with a dividend below `m << k`
+# first folds the dividend into that range: splitting at bit k preserves the residue.
+# Validated divisors (`select true-on-reject, ..., load + offset <cmp> limit`) first get
+# their accepted range as an assumption, so a later remainder check can use it.
+include "../../ir/ir_editing.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../../llvm_c_api/elisa_llvm_constant_range.elisa"
+include "./bounded_remainder_proofs.elisa"
+
+const module BoundedRemainderLimit:
+    FUNCTION_INSTRUCTIONS: u32 = 2000
+    CANDIDATES: usize = 64
+    MERSENNE_SHIFT_LOW: u32 = 17
+    MERSENNE_SHIFT_HIGH: u32 = 31
+
+# A remainder whose dividend is proven bounded, and the Mersenne split's shift (0 for the
+# conditional subtraction).
+struct ProvenRemainder:
+    remainder: LLVMValueRef
+    shift: u32
+
+extend Backend:
+    private:
+        # `x <=u maximum` for every value the accepted edge admits, and some `urem` of the
+        # divisor checked `<u extent` with `maximum <= extent`.
+        def divisor_has_checked_remainder(divisor: LLVMValueRef, maximum: u64) -> bool can[Abort.Panic]:
+            remainder_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(divisor)
+            while remainder_cursor is remainder_use |remainder_cursor, divisor, maximum|:
+                remainder_cursor <- LLVMGetNextUse(remainder_use)
+                remainder: LLVMValueRef = LLVMGetUser(remainder_use)
+                continue if not is_llvm_instruction_with_opcode(remainder, LLVMOpcode::UREM) or LLVMGetOperand(remainder, 1) != divisor
+                check_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(remainder)
+                while check_cursor is check_use |check_cursor, remainder, maximum|:
+                    check_cursor <- LLVMGetNextUse(check_use)
+                    check: LLVMValueRef = LLVMGetUser(check_use)
+                    continue if not is_llvm_instruction_with_opcode(check, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(check) != LLVMIntPredicate::ULT or LLVMGetOperand(check, 0) != remainder
+                    extent: LLVMValueRef = LLVMGetOperand(check, 1)
+                    return true if LLVMIsAConstantInt(extent) != null and LLVMConstIntGetZExtValue(extent) >= maximum
+            false
+
+        # The largest value the inverse of COMPARISON admits once OFFSET is taken off, if
+        # that range is neither empty nor reaches the width's all-ones value.
+        def accepted_divisor_maximum(comparison: LLVMValueRef, limit: LLVMValueRef, offset: LLVMValueRef) -> u64? can[Abort.Panic]:
+            exact: ElisaConstantRangeRef = ElisaLLVMConstantRangeExactByCompare(inverse_integer_predicate(LLVMGetICmpPredicate(comparison)), limit)
+            range: ElisaConstantRangeRef = ElisaLLVMConstantRangeSubtract(exact, offset)
+            ElisaLLVMDisposeConstantRange(exact)
+            empty: bool = ElisaLLVMConstantRangeIsEmpty(range) != 0
+            maximum: u64 = ElisaLLVMConstantRangeUnsignedMax(range)
+            ElisaLLVMDisposeConstantRange(range)
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(limit))
+            all_ones: u64 = 18446744073709551615 if width == 64 else (1.u64() << width.u64()) - 1
+            return null if empty or maximum == all_ones
+            maximum
+
+        # The first instruction of BLOCK after its phis and any exception-handling pad.
+        def first_insertion_point(block: LLVMBasicBlockRef) -> LLVMValueRef? can[Abort.Panic]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor|:
+                if not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI):
+                    return LLVMGetNextInstruction(instruction) if ElisaLLVMBlockIsEHPad(block) != 0
+                    return instruction
+                cursor <- LLVMGetNextInstruction(instruction)
+            null
+
+        # On the false edge of `select A, true, B` the comparison B was evaluated and
+        # failed, so a validated divisor's accepted range holds there; keep it as an
+        # assumption on a frozen copy, which short-circuit folding cannot lose.
+        def expose_validated_divisor_bound(block: LLVMBasicBlockRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return false
+            accepted: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            return false if LLVMGetSuccessor(branch, 0) == accepted
+            predecessor: LLVMBasicBlockRef = get single_predecessor(accepted) else return false
+            return false if predecessor != block
+            insertion: LLVMValueRef = get first_insertion_point(accepted) else return false
+            condition: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::SELECT) or ElisaLLVMIsConstantOne(LLVMGetOperand(condition, 1)) == 0 or LLVMIsAConstantInt(LLVMGetOperand(condition, 1)) == null
+            comparison: LLVMValueRef = LLVMGetOperand(condition, 2)
+            return false if not is_llvm_instruction_with_opcode(comparison, LLVMOpcode::ICMP)
+            adjusted: LLVMValueRef = LLVMGetOperand(comparison, 0)
+            limit: LLVMValueRef = LLVMGetOperand(comparison, 1)
+            return false if not is_llvm_instruction_with_opcode(adjusted, LLVMOpcode::ADD) or LLVMIsAConstantInt(limit) == null
+            offset: LLVMValueRef = LLVMGetOperand(adjusted, 1)
+            divisor: LLVMValueRef = LLVMGetOperand(adjusted, 0)
+            return false if LLVMIsAConstantInt(offset) == null or LLVMIsALoadInst(divisor) == null or LLVMGetInstructionParent(divisor) != block
+            return false if LLVMGetIntTypeWidth(LLVMTypeOf(limit)) > 64
+            maximum: u64 = get accepted_divisor_maximum(comparison, limit, offset) else return false
+            return false if not divisor_has_checked_remainder(divisor, maximum)
+            defined: LLVMValueRef = freeze_after(builder, divisor, "validated.divisor")
+            position_builder_before(builder, insertion)
+            upper: LLVMValueRef = LLVMConstInt(LLVMTypeOf(defined), maximum, 0)
+            empty_storage: mutable darray[u8] = []
+            within: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::ULE, defined, upper, sview_to_cstr("", empty_storage))
+            build_assumption(builder, module, within)
+            true
+
+        # A freeze of VALUE right after it that every other use of VALUE now reads, so a
+        # check and its consumers agree even when VALUE is undefined.
+        def freeze_after(builder: LLVMBuilderRef, value: LLVMValueRef, name: sview) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            # A load is never its block's terminator, so it always has a next instruction.
+            next: LLVMValueRef = get LLVMGetNextInstruction(value) else return value
+            position_builder_before(builder, next)
+            name_storage: mutable darray[u8] = []
+            defined: LLVMValueRef = LLVMBuildFreeze(builder, value, sview_to_cstr(name, name_storage))
+            replace_uses_except(value, defined, defined)
+            defined
+
+        # `IRBuilder::CreateAssumption(condition)`.
+        def build_assumption(builder: LLVMBuilderRef, module: LLVMModuleRef, condition: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            id: u32 = intrinsic_identifier("llvm.assume")
+            declaration: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, id, null, 0)
+            arguments: mutable darray[LLVMValueRef] = [condition]
+            argument_slots: void& = (&arguments[0]).cast[void&] can Unsafe.PointerCast
+            _ = LLVMBuildCall2(builder, LLVMIntrinsicGetType(context, id, null, 0), declaration, argument_slots, 1, "")
+
+        # An integer `srem` or `urem` of at most 64 bits by a positive constant other than a
+        # power of two, with no metadata other than its debug location.
+        def is_bounded_remainder_candidate(instruction: LLVMValueRef) -> bool can[Abort.Panic]:
+            modulus: LLVMValueRef = get remainder_modulus(instruction) else return false
+            type: LLVMTypeRef = LLVMTypeOf(instruction)
+            return false if ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0 or not is_llvm_integer_type(type, 0) or LLVMGetIntTypeWidth(type) > 64
+            is_strictly_positive_constant(modulus) and ElisaLLVMConstantIntIsPositivePowerOfTwo(modulus) == 0
+
+        def bounded_remainder_candidates(function: LLVMValueRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            candidates: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidates|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, candidates|:
+                    candidates.push(instruction) if is_bounded_remainder_candidate(instruction)
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            candidates
+
+        # The Mersenne split's shift k for a 64-bit `urem` by `2^k - 1`, 17 <= k <= 31.
+        def mersenne_shift(remainder: LLVMValueRef, modulus: u64) -> u32:
+            return 0 if LLVMGetInstructionOpcode(remainder) != LLVMOpcode::UREM or LLVMGetIntTypeWidth(LLVMTypeOf(remainder)) != 64
+            shift: mutable u32 = 0
+            while shift < 64 and ((modulus >> shift.u64()) & 1) == 1 |shift, modulus|:
+                shift <- shift + 1
+            return 0 if shift < BoundedRemainderLimit::MERSENNE_SHIFT_LOW or shift > BoundedRemainderLimit::MERSENNE_SHIFT_HIGH
+            return 0 if (modulus >> shift.u64()) != 0
+            shift
+
+        # Proves each candidate, collecting the guarded loads its proof relied on.
+        def prove_function_remainders[@r](proven: mutable darray[ProvenRemainder] @r, loads: mutable darray[LLVMValueRef]&, candidates: darray[LLVMValueRef]&, analyses: ElisaFunctionAnalysesRef) -> darray[ProvenRemainder] @r can[Abort.Panic, Memory.Allocate]:
+            for remainder in candidates |proven, loads, analyses|:
+                modulus_value: LLVMValueRef = LLVMGetOperand(remainder, 1)
+                width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(modulus_value))
+                signed_maximum: u64 = (1.u64() << (width - 1).u64()) - 1
+                modulus: u64 = LLVMConstIntGetZExtValue(modulus_value)
+                dividend_proof: mutable BoundedRemainderProof = new_bounded_remainder_proof(analyses, modulus, signed_maximum, false)
+                if prove_bounded_remainder(&dividend_proof, remainder, 2 * modulus):
+                    proven.push(ProvenRemainder{remainder: remainder, shift: 0})
+                    remember_loads(loads, &dividend_proof.guarded_loads)
+                    continue
+                shift: u32 = mersenne_shift(remainder, modulus)
+                continue if shift == 0
+                mersenne_proof: mutable BoundedRemainderProof = new_bounded_remainder_proof(analyses, modulus, signed_maximum, true)
+                if prove_bounded_remainder(&mersenne_proof, remainder, modulus << shift.u64()):
+                    proven.push(ProvenRemainder{remainder: remainder, shift: shift})
+                    remember_loads(loads, &mersenne_proof.guarded_loads)
+            proven
+
+        def remember_loads(loads: mutable darray[LLVMValueRef]&, guarded: darray[LLVMValueRef]&) -> void can[Abort.Panic, Memory.Allocate]:
+            for load in guarded |loads|:
+                loads.push(load) if not any seen in loads where seen == load
+
+        # Freezes every guarded load the proofs used, in instruction order, so the range
+        # check and the rewritten remainders read the same value.
+        def freeze_guarded_loads(function: LLVMValueRef, loads: darray[LLVMValueRef]&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, loads, builder|:
+                instruction_cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while instruction_cursor is instruction |instruction_cursor, loads, builder|:
+                    instruction_cursor <- LLVMGetNextInstruction(instruction)
+                    if any load in loads where load == instruction:
+                        _ = freeze_after(builder, instruction, "bounded.load")
+                block_cursor <- LLVMGetNextBasicBlock(block)
+
+        # `x >= m ? x - m : x`, or for a Mersenne modulus the folded dividend
+        # `d = (x & m) + (x >> k)` reduced as `(d + ((d + 1) >> k)) & m`.
+        def rewrite_bounded_remainder(proven: ProvenRemainder, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate]:
+            remainder: LLVMValueRef = proven.remainder
+            position_builder_before(builder, remainder)
+            dividend: LLVMValueRef = LLVMGetOperand(remainder, 0)
+            modulus: LLVMValueRef = LLVMGetOperand(remainder, 1)
+            empty_storage: mutable darray[u8] = []
+            unnamed: cstr = sview_to_cstr("", empty_storage)
+            name_storage: mutable darray[u8] = []
+            result: mutable LLVMValueRef = dividend
+            if proven.shift != 0:
+                type: LLVMTypeRef = LLVMTypeOf(dividend)
+                shift: LLVMValueRef = LLVMConstInt(type, proven.shift.u64(), 0)
+                frozen: LLVMValueRef = LLVMBuildFreeze(builder, dividend, unnamed)
+                folded: LLVMValueRef = LLVMBuildAdd(builder, LLVMBuildAnd(builder, frozen, modulus, unnamed), LLVMBuildLShr(builder, frozen, shift, unnamed), unnamed)
+                carry: LLVMValueRef = LLVMBuildLShr(builder, LLVMBuildAdd(builder, folded, LLVMConstInt(type, 1, 0), unnamed), shift, unnamed)
+                result <- LLVMBuildAnd(builder, LLVMBuildAdd(builder, folded, carry, unnamed), modulus, sview_to_cstr("mersenne.remainder", name_storage))
+            else:
+                large: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::UGE, dividend, modulus, unnamed)
+                reduced: LLVMValueRef = LLVMBuildSub(builder, dividend, modulus, unnamed)
+                result <- LLVMBuildSelect(builder, large, reduced, dividend, sview_to_cstr("bounded.remainder", name_storage))
+            LLVMReplaceAllUsesWith(remainder, result)
+            LLVMInstructionEraseFromParent(remainder)
+
+        def fold_function_bounded_remainders(function: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, changed, builder, module|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                changed <- changed + 1 if expose_validated_divisor_bound(block, builder, module)
+            candidates: darray[LLVMValueRef] = bounded_remainder_candidates(function)
+            return changed if candidates.count == 0 or candidates.count > BoundedRemainderLimit::CANDIDATES
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return changed
+            loads: mutable darray[LLVMValueRef] = []
+            proven: mutable darray[ProvenRemainder] = []
+            proven <- prove_function_remainders(proven, &loads, &candidates, analyses)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            return changed if proven.count == 0
+            freeze_guarded_loads(function, &loads, builder)
+            for entry in proven |builder|:
+                rewrite_bounded_remainder(entry, builder)
+            changed + proven.count.u32()
+
+    public:
+        def fold_bounded_remainders(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, builder, module|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_loop_pass_policy(function, module) or function_instruction_count(function) > BoundedRemainderLimit::FUNCTION_INSTRUCTIONS
+                changed <- changed + fold_function_bounded_remainders(function, builder, module)
+            LLVMDisposeBuilder(builder)
+            changed

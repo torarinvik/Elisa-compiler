@@ -1,0 +1,176 @@
+# Upper bounds on the dividend of a remainder by a constant modulus.
+#
+# A value is bounded when it is a nonnegative constant, a phi, sum or (for Mersenne
+# moduli) product of bounded values that cannot pass the signed maximum, a remainder by a
+# positive constant, or a load a dominating unsigned range check bounds. A loop-header phi
+# whose back edges all take a remainder by the modulus is assumed below the modulus; the
+# proof then discharges every such hypothesis together, from its entry and back edges.
+
+# A bound already proven for VALUE used at AT.
+struct KnownBound:
+    value: LLVMValueRef
+    at: LLVMValueRef
+    bound: u64
+
+# One candidate's proof state.
+struct BoundedRemainderProof:
+    analyses: ElisaFunctionAnalysesRef
+    modulus: u64
+    signed_maximum: u64
+    allow_product_bounds: bool
+    work: mutable u32
+    active: mutable darray[LLVMValueRef]
+    known: mutable darray[KnownBound]
+    assumed: mutable darray[LLVMValueRef]
+    pending: mutable darray[LLVMValueRef]
+    guarded_loads: mutable darray[LLVMValueRef]
+
+const module BoundedRemainderProofLimit:
+    WORK: u32 = 512
+    ACTIVE_VALUES: usize = 96
+
+extend Backend:
+    private:
+        def new_bounded_remainder_proof(analyses: ElisaFunctionAnalysesRef, modulus: u64, signed_maximum: u64, allow_product_bounds: bool) -> BoundedRemainderProof:
+            BoundedRemainderProof{analyses: analyses, modulus: modulus, signed_maximum: signed_maximum, allow_product_bounds: allow_product_bounds, work: 0, active: [], known: [], assumed: [], pending: [], guarded_loads: []}
+
+        # The constant modulus of an `srem` or `urem`.
+        def remainder_modulus(operation: LLVMValueRef) -> LLVMValueRef?:
+            return null if LLVMIsABinaryOperator(operation) == null
+            opcode: u32 = LLVMGetInstructionOpcode(operation)
+            return null if opcode != LLVMOpcode::SREM and opcode != LLVMOpcode::UREM
+            modulus: LLVMValueRef = LLVMGetOperand(operation, 1)
+            return null if LLVMIsAConstantInt(modulus) == null
+            modulus
+
+        def is_strictly_positive_constant(constant: LLVMValueRef) -> bool:
+            ElisaLLVMConstantIntIsNegative(constant) == 0 and ElisaLLVMIsConstantZero(constant) == 0
+
+        # The bound a dominating `load <u K` or `load <=u K` edge gives LOAD used at AT.
+        def guarded_load_bound(dividend_proof: mutable BoundedRemainderProof&, load: LLVMValueRef, at: LLVMValueRef) -> u64? can[Abort.Panic, Memory.Allocate]:
+            return null if LLVMIsALoadInst(load) == null
+            at_block: LLVMBasicBlockRef = LLVMGetInstructionParent(at)
+            compare_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(load)
+            while compare_cursor is compare_use |compare_cursor, dividend_proof, load, at_block|:
+                compare_cursor <- LLVMGetNextUse(compare_use)
+                compare: LLVMValueRef = LLVMGetUser(compare_use)
+                continue if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetOperand(compare, 0) != load
+                limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+                continue if LLVMIsAConstantInt(limit) == null or ElisaLLVMConstantIntIsNegative(limit) != 0
+                branch_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(compare)
+                while branch_cursor is branch_use |branch_cursor, dividend_proof, load, at_block, compare, limit|:
+                    branch_cursor <- LLVMGetNextUse(branch_use)
+                    branch: LLVMValueRef = LLVMGetUser(branch_use)
+                    continue if not is_llvm_instruction_with_opcode(branch, LLVMOpcode::CONDITIONAL_BR) or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                    for edge in 0..<2.u32() |dividend_proof, load, at_block, compare, limit, branch|:
+                        predicate: i32 = LLVMGetICmpPredicate(compare) if edge == 0 else inverse_integer_predicate(LLVMGetICmpPredicate(compare))
+                        maximum: mutable u64 = LLVMConstIntGetZExtValue(limit)
+                        if predicate == LLVMIntPredicate::ULT and maximum != 0:
+                            maximum <- maximum - 1
+                        elif predicate != LLVMIntPredicate::ULE:
+                            continue
+                        if ElisaLLVMEdgeDominates(dividend_proof.analyses, LLVMGetInstructionParent(branch), LLVMGetSuccessor(branch, edge), at_block) != 0:
+                            dividend_proof.guarded_loads.push(load) if not any seen in dividend_proof.guarded_loads where seen == load
+                            return maximum
+            null
+
+        # A loop header's phi whose every back edge takes a remainder by the modulus.
+        def is_modular_header(dividend_proof: BoundedRemainderProof&, phi: LLVMValueRef) -> bool can[Abort.Panic]:
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(phi)
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(dividend_proof.analyses, block) else return false
+            return false if ElisaLLVMLoopHeader(loop) != block
+            has_entry: mutable bool = false
+            has_back_edge: mutable bool = false
+            for incoming in 0..<LLVMCountIncoming(phi) |dividend_proof, phi, loop, has_entry, has_back_edge|:
+                if ElisaLLVMLoopContainsBlock(loop, LLVMGetIncomingBlock(phi, incoming)) == 0:
+                    has_entry <- true
+                else:
+                    modulus: LLVMValueRef = get remainder_modulus(LLVMGetIncomingValue(phi, incoming)) else return false
+                    return false if ElisaLLVMConstantIntActiveBits(modulus) > 64 or LLVMConstIntGetZExtValue(modulus) != dividend_proof.modulus
+                    has_back_edge <- true
+            has_entry and has_back_edge
+
+        def known_bound(dividend_proof: BoundedRemainderProof&, value: LLVMValueRef, at: LLVMValueRef) -> u64?:
+            for entry in dividend_proof.known |value, at|:
+                return entry.bound if entry.value == value and entry.at == at
+            null
+
+        # VALUE's bound at AT. A load's bound holds only where its range check dominates.
+        def remainder_dividend_bound(dividend_proof: mutable BoundedRemainderProof&, value: LLVMValueRef, at: LLVMValueRef) -> u64? can[Abort.Panic, Memory.Allocate]:
+            if known_bound(dividend_proof, value, at) is remembered:
+                return remembered
+            dividend_proof.work <- dividend_proof.work + 1
+            return null if dividend_proof.work > BoundedRemainderProofLimit::WORK or dividend_proof.active.count >= BoundedRemainderProofLimit::ACTIVE_VALUES
+            if LLVMIsAConstantInt(value) != null:
+                return LLVMConstIntGetZExtValue(value) if ElisaLLVMConstantIntIsNegative(value) == 0
+                return null
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI) and is_modular_header(dividend_proof, value):
+                if not any seen in dividend_proof.assumed where seen == value:
+                    dividend_proof.assumed.push(value)
+                    dividend_proof.pending.push(value)
+                return dividend_proof.modulus - 1
+            return null if any seen in dividend_proof.active where seen == value
+            dividend_proof.active.push(value)
+            result: u64? = acyclic_dividend_bound(dividend_proof, value, at)
+            _ = dividend_proof.active.pop()
+            if result is proven:
+                dividend_proof.known.push(KnownBound{value: value, at: at, bound: proven})
+            result
+
+        # The largest bound of PHI's incoming values, each used at its edge's terminator.
+        def phi_dividend_bound(dividend_proof: mutable BoundedRemainderProof&, phi: LLVMValueRef) -> u64? can[Abort.Panic, Memory.Allocate]:
+            maximum: mutable u64 = 0
+            for incoming in 0..<LLVMCountIncoming(phi) |dividend_proof, phi, maximum|:
+                terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(LLVMGetIncomingBlock(phi, incoming)) else return null
+                bound: u64 = get remainder_dividend_bound(dividend_proof, LLVMGetIncomingValue(phi, incoming), terminator) else return null
+                maximum <- bound if bound > maximum
+            maximum
+
+        def sum_bound(dividend_proof: BoundedRemainderProof&, left: u64?, right: u64?) -> u64?:
+            first: u64 = get left else return null
+            second: u64 = get right else return null
+            return null if first > dividend_proof.signed_maximum or second > dividend_proof.signed_maximum - first
+            first + second
+
+        def product_bound(dividend_proof: BoundedRemainderProof&, left: u64?, right: u64?) -> u64?:
+            first: u64 = get left else return null
+            second: u64 = get right else return null
+            return null if first != 0 and second > dividend_proof.signed_maximum / first
+            first * second
+
+        def acyclic_dividend_bound(dividend_proof: mutable BoundedRemainderProof&, value: LLVMValueRef, at: LLVMValueRef) -> u64? can[Abort.Panic, Memory.Allocate]:
+            return phi_dividend_bound(dividend_proof, value) if is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+            if LLVMIsABinaryOperator(value) != null:
+                opcode: u32 = LLVMGetInstructionOpcode(value)
+                if opcode == LLVMOpcode::ADD:
+                    left: u64? = remainder_dividend_bound(dividend_proof, LLVMGetOperand(value, 0), value)
+                    right: u64? = remainder_dividend_bound(dividend_proof, LLVMGetOperand(value, 1), value)
+                    if sum_bound(dividend_proof, left, right) is sum:
+                        return sum
+                elif dividend_proof.allow_product_bounds and opcode == LLVMOpcode::MUL:
+                    left: u64? = remainder_dividend_bound(dividend_proof, LLVMGetOperand(value, 0), value)
+                    right: u64? = remainder_dividend_bound(dividend_proof, LLVMGetOperand(value, 1), value)
+                    if product_bound(dividend_proof, left, right) is product:
+                        return product
+                elif remainder_modulus(value) is modulus:
+                    if is_strictly_positive_constant(modulus):
+                        unsigned_product: bool = dividend_proof.allow_product_bounds and opcode == LLVMOpcode::UREM
+                        if unsigned_product or remainder_dividend_bound(dividend_proof, LLVMGetOperand(value, 0), value) != null:
+                            return LLVMConstIntGetZExtValue(modulus) - 1
+            guarded_load_bound(dividend_proof, value, at)
+
+    public:
+        # Whether REMAINDER's dividend stays below LIMIT, every assumed loop-header phi
+        # staying below the modulus from its entry and back edges.
+        def prove_bounded_remainder(dividend_proof: mutable BoundedRemainderProof&, remainder: LLVMValueRef, limit: u64) -> bool can[Abort.Panic, Memory.Allocate]:
+            dividend: u64 = get remainder_dividend_bound(dividend_proof, LLVMGetOperand(remainder, 0), remainder) else return false
+            return false if dividend >= limit
+            index: mutable usize = 0
+            while index < dividend_proof.pending.count |index, dividend_proof|:
+                phi: LLVMValueRef = dividend_proof.pending[index]
+                for incoming in 0..<LLVMCountIncoming(phi) |dividend_proof, phi|:
+                    terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(LLVMGetIncomingBlock(phi, incoming)) else return false
+                    bound: u64 = get remainder_dividend_bound(dividend_proof, LLVMGetIncomingValue(phi, incoming), terminator) else return false
+                    return false if bound >= dividend_proof.modulus
+                index <- index + 1
+            true
