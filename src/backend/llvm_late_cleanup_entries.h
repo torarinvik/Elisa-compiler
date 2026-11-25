@@ -23,11 +23,6 @@ static unsigned writeFunctions(Module &Module, const Set &Selected, LLVMValueRef
 #define ELISA_MODULE_PASS_ENTRY(EntryName, Pass)                                          \
   extern "C" unsigned EntryName(LLVMModuleRef Module) { return Pass(*unwrap(Module)); }
 
-extern "C" unsigned elisacoreOptimizeOrderedConversionsEntry(LLVMModuleRef Module,
-                                                            LLVMTargetMachineRef Target) {
-  return elisacoreOptimizeOrderedConversions(Module, Target);
-}
-
 ELISA_MODULE_PASS_ENTRY(elisacoreEliminateCopiedScratch, ElisaCopiedScratch::eliminate)
 ELISA_MODULE_PASS_ENTRY(elisacoreEliminateFullArrayInitializers,
                         ElisaCopiedScratch::eliminateFullArrayInitializers)

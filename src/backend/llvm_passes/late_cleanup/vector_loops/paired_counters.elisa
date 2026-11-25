@@ -1,0 +1,126 @@
+# Two independent zero-based i64 loop counters stepped as one `<2 x i64>` vector.
+#
+# A loop whose header has exactly two counters (phis starting at 0 from the preheader,
+# advanced in the latch by an invariant step, at least one of them 1) keeps one vector
+# phi instead; control flow is unchanged. Dropping the scalar no-wrap flags is
+# conservative: vector lanes cannot introduce poison where the original unflagged
+# additions were defined.
+
+# A header phi, its latch update and the update's invariant step.
+struct LoopCounter:
+    phi: LLVMValueRef
+    update: LLVMValueRef
+    step: LLVMValueRef
+
+extend Backend:
+    private:
+        # PHI as a counter of LOOP: i64, two incoming values, 0 from PREHEADER and
+        # `phi + step` (either order) computed in LATCH with STEP invariant.
+        def loop_counter(phi: LLVMValueRef, loop: ElisaLoopRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef) -> LoopCounter? can[Abort.Panic]:
+            return null if not is_llvm_integer_type(LLVMTypeOf(phi), 64) or LLVMCountIncoming(phi) != 2
+            initial: LLVMValueRef = get incoming_value_for_block(phi, preheader) else return null
+            update: LLVMValueRef = get incoming_value_for_block(phi, latch) else return null
+            return null if LLVMIsAConstantInt(initial) == null or ElisaLLVMIsConstantZero(initial) == 0
+            return null if not is_llvm_instruction_with_opcode(update, LLVMOpcode::ADD) or LLVMGetInstructionParent(update) != latch
+            step: mutable LLVMValueRef = LLVMGetOperand(update, 1)
+            if LLVMGetOperand(update, 0) != phi:
+                return null if LLVMGetOperand(update, 1) != phi
+                step <- LLVMGetOperand(update, 0)
+            return null if LLVMIsAInstruction(step) != null and ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(step)) != 0
+            LoopCounter{phi: phi, update: update, step: step}
+
+        # The counters among HEADER's phis, in order.
+        def header_counters(loop: ElisaLoopRef, header: LLVMBasicBlockRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef) -> darray[LoopCounter] can[Abort.Panic, Memory.Allocate]:
+            counters: mutable darray[LoopCounter] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(header)
+            while cursor is phi |cursor, counters, loop, preheader, latch|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                if loop_counter(phi, loop, preheader, latch) is counter:
+                    counters.push(counter)
+            counters
+
+        # Whether a phi uses COUNTER's phi.
+        def counter_feeds_phi(counter: LoopCounter) -> bool:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(counter.phi)
+            while use_cursor is use |use_cursor|:
+                use_cursor <- LLVMGetNextUse(use)
+                return true if is_llvm_instruction_with_opcode(LLVMGetUser(use), LLVMOpcode::PHI)
+            false
+
+        def is_unit_step(step: LLVMValueRef) -> bool:
+            LLVMIsAConstantInt(step) != null and ElisaLLVMIsConstantOne(step) != 0
+
+        # A step defined by an instruction must dominate EARLIER, where the vector step
+        # is built.
+        def step_available_at(step: LLVMValueRef, earlier: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            LLVMIsAInstruction(step) == null or ElisaLLVMInstructionDominates(analyses, step, earlier) != 0
+
+        # `<2 x i64>` lanes 0 and 1 of VECTOR, built at the builder.
+        def vector_lanes(vector: LLVMValueRef, builder: LLVMBuilderRef, int32: LLVMTypeRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            [LLVMBuildExtractElement(builder, vector, LLVMConstInt(int32, 0, 0), ""), LLVMBuildExtractElement(builder, vector, LLVMConstInt(int32, 1, 0), "")]
+
+        # FIRST and SECOND replaced by lanes of one vector phi at HEADER's start, stepped
+        # before the earlier of their updates.
+        def pair_counters(first: LoopCounter, second: LoopCounter, earlier: LLVMValueRef, header: LLVMBasicBlockRef, preheader: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(first.phi))
+            int32: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            pair_type: LLVMTypeRef = LLVMVectorType(LLVMInt64TypeInContext(context), 2)
+            insertion: LLVMValueRef = get first_insertion_point(header) else return
+            LLVMPositionBuilder(builder, header, LLVMGetFirstInstruction(header))
+            LLVMSetCurrentDebugLocation2(builder, null)
+            counters: LLVMValueRef = LLVMBuildPhi(builder, pair_type, "paired.counters")
+            position_builder_before(builder, insertion)
+            values: darray[LLVMValueRef] = vector_lanes(counters, builder, int32)
+            position_builder_before(builder, earlier)
+            step: mutable LLVMValueRef = LLVMBuildInsertElement(builder, LLVMGetPoison(pair_type), first.step, LLVMConstInt(int32, 0, 0), "")
+            step <- LLVMBuildInsertElement(builder, step, second.step, LLVMConstInt(int32, 1, 0), "")
+            next: LLVMValueRef = LLVMBuildAdd(builder, counters, step, "paired.next")
+            updates: darray[LLVMValueRef] = vector_lanes(next, builder, int32)
+            incoming_values: mutable darray[LLVMValueRef] = [LLVMConstNull(pair_type), next]
+            incoming_blocks: mutable darray[LLVMBasicBlockRef] = [preheader, latch]
+            LLVMAddIncoming(counters, (&incoming_values[0]).cast[void&], (&incoming_blocks[0]).cast[void&], 2)
+            LLVMReplaceAllUsesWith(first.phi, values[0])
+            LLVMReplaceAllUsesWith(second.phi, values[1])
+            LLVMReplaceAllUsesWith(first.update, updates[0])
+            LLVMReplaceAllUsesWith(second.update, updates[1])
+            LLVMInstructionEraseFromParent(first.update)
+            LLVMInstructionEraseFromParent(second.update)
+            LLVMInstructionEraseFromParent(first.phi)
+            LLVMInstructionEraseFromParent(second.phi)
+
+        # Whether LOOP's two counters were paired.
+        def pair_loop_counters(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return false
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return false
+            return false if header == latch
+            counters: darray[LoopCounter] = header_counters(loop, header, preheader, latch)
+            return false if counters.count != 2 or counter_feeds_phi(counters[0]) or counter_feeds_phi(counters[1])
+            first: LoopCounter = counters[0]
+            second: LoopCounter = counters[1]
+            return false if first.update == second.update or not (is_unit_step(first.step) or is_unit_step(second.step))
+            earlier: LLVMValueRef = first.update if comes_before(first.update, second.update) else second.update
+            return false if not step_available_at(first.step, earlier, analyses) or not step_available_at(second.step, earlier, analyses)
+            pair_counters(first, second, earlier, header, preheader, latch, builder)
+            true
+
+        # `LoopInfo::getLoopsInPreorder`: top-level loops in program order (LoopInfo
+        # keeps them in reverse), each followed by its nest in preorder.
+        def loops_in_program_preorder(analyses: ElisaFunctionAnalysesRef) -> darray[ElisaLoopRef] can[Memory.Allocate]:
+            loops: mutable darray[ElisaLoopRef] = []
+            count: u32 = ElisaLLVMTopLevelLoopCount(analyses)
+            for offset in 0..<count |loops, analyses, count|:
+                loops.extend(loops_in_preorder(ElisaLLVMTopLevelLoopAt(analyses, count - 1 - offset)))
+            loops
+
+    public:
+        # Every loop's pair of counters vectorized; whether FUNCTION changed.
+        def pair_function_counters(function: LLVMValueRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsDeclaration(function) != 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            changed: mutable bool = false
+            for loop in loops_in_program_preorder(analyses) |changed, analyses, builder|:
+                changed <- pair_loop_counters(loop, analyses, builder) or changed
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed

@@ -131,7 +131,6 @@ extern "C" void elisacoreConfigureAppleCodeLayout() {
 }
 #include "llvm_bounded_factorial.cpp"
 extern "C" unsigned elisacoreOptimizeBoundedSums(LLVMModuleRef, LLVMTargetMachineRef);
-#include "llvm_ordered_vector.cpp"
 
 // The late scalar cleanup sequence lives in Elisa
 // (llvm_passes/late_cleanup/late_scalar_cleanup.elisa); these are its entries.

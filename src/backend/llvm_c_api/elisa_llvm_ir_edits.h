@@ -111,6 +111,10 @@ LLVMValueRef ElisaLLVMCloneFunctionWithMap(LLVMValueRef function, ElisaValueMapR
  * debug location and metadata, to the end of the block. */
 void ElisaLLVMMoveInstructionToBlockEnd(LLVMValueRef instruction, LLVMBasicBlockRef block);
 
+/* Instruction::moveBefore(before): moves the instruction, keeping its debug location and
+ * metadata, to just before BEFORE. */
+void ElisaLLVMMoveInstructionBefore(LLVMValueRef instruction, LLVMValueRef before);
+
 /* CallBase::setAttributes(function->getAttributes()): the call takes the function's
  * whole attribute list, including its parameter and return attributes. */
 void ElisaLLVMSetCallAttributesFromFunction(LLVMValueRef call, LLVMValueRef function);

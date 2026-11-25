@@ -1,0 +1,234 @@
+# Eight consecutive i64 loads converted to double and summed in order, converted as one
+# vector instead.
+#
+# The loads become four `<2 x i64>` loads, the conversions one `<8 x double>` `sitofp`,
+# and the in-order sum of the first six one `llvm.vector.reduce.fadd` starting from -0.0.
+# The scalar floating-point order is kept: the inputs are signed integers, so their
+# conversions are finite and the ordered reduction's initial -0 is exact. Only
+# consecutive unconditional loads in the same side-effect-free block pair up.
+
+const module OrderedCastGroup:
+    WIDTH: u32 = 8
+    REDUCED: u32 = 6
+    # The largest first offset whose neighbour's offset (8 bytes on) is still an i64.
+    OFFSET_LIMIT: i64 = 9223372036854775799
+
+extend Backend:
+    private:
+        # A side effect, or a load that is not simple, stops the conversions moving past it.
+        def blocks_ordered_casts(instruction: LLVMValueRef) -> bool:
+            ElisaLLVMMayHaveSideEffects(instruction) != 0 or (LLVMIsALoadInst(instruction) != null and not is_simple_access(instruction))
+
+        # BLOCK's `sitofp i64 (load) to double` conversions, in order.
+        def ordered_conversions_in(block: LLVMBasicBlockRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            conversions: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, conversions|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::SI_TO_FP):
+                    source: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                    if is_llvm_integer_type(LLVMTypeOf(source), 64) and LLVMGetTypeKind(LLVMTypeOf(instruction)) == LLVMTypeKindValue::DOUBLE and LLVMIsALoadInst(source) != null:
+                        conversions.push(instruction)
+            conversions
+
+        # Each conversion of the group at START loads simply, earlier in BLOCK.
+        def group_loads_are_local(conversions: darray[LLVMValueRef]&, start: u32, block: LLVMBasicBlockRef) -> bool:
+            for offset in 0..<OrderedCastGroup::WIDTH |conversions, start, block|:
+                conversion: LLVMValueRef = conversions[start + offset]
+                load: LLVMValueRef = LLVMGetOperand(conversion, 0)
+                return false if not is_simple_access(load) or LLVMGetInstructionParent(load) != block or not comes_before(load, conversion)
+            true
+
+        # The fadds from FIRST up to (not including) LAST; null when something there
+        # blocks the move.
+        def fadds_before_last(first: LLVMValueRef, last: LLVMValueRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate]:
+            fadds: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = first
+            while cursor is instruction |cursor, fadds, last|:
+                break if instruction == last
+                cursor <- LLVMGetNextInstruction(instruction)
+                return null if blocks_ordered_casts(instruction)
+                fadds.push(instruction) if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::FADD)
+            fadds
+
+        # Every user of VALUE is in BLOCK, and none before LAST stays behind.
+        def users_follow_last(value: LLVMValueRef, block: LLVMBasicBlockRef, last: LLVMValueRef, moving: darray[LLVMValueRef]&) -> bool can[Abort.Panic]:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+            while use_cursor is use |use_cursor, block, last, moving|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return false if LLVMIsAInstruction(user) == null or LLVMGetInstructionParent(user) != block
+                return false if user != last and comes_before(user, last) and not contains_value(moving, user)
+            true
+
+        # The five in-order fadds summing the group's first six conversions, the later ones
+        # with the first one's fast-math flags.
+        def ordered_reduction(conversions: darray[LLVMValueRef]&, start: u32, block: LLVMBasicBlockRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate]:
+            reduction: mutable darray[LLVMValueRef] = []
+            previous: mutable LLVMValueRef = conversions[start]
+            for offset in 1..<OrderedCastGroup::REDUCED |reduction, previous, conversions, start, block|:
+                return null if not has_one_use(previous)
+                use: LLVMUseRef = get LLVMGetFirstUse(previous) else return null
+                add: LLVMValueRef = LLVMGetUser(use)
+                return null if not is_llvm_instruction_with_opcode(add, LLVMOpcode::FADD) or LLVMGetOperand(add, 0) != previous
+                return null if LLVMGetOperand(add, 1) != conversions[start + offset] or LLVMGetInstructionParent(add) != block
+                return null if offset > 1 and LLVMGetFastMathFlags(add) != LLVMGetFastMathFlags(reduction[0])
+                reduction.push(add)
+                previous <- add
+            reduction
+
+        # LEFT and RIGHT load from one base 8 bytes apart, RIGHT second.
+        def loads_are_adjacent(left: LLVMValueRef, right: LLVMValueRef, module: LLVMModuleRef) -> bool can[Unsafe.PointerCast]:
+            left_offset: mutable i64 = 0
+            right_offset: mutable i64 = 0
+            left_base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(LLVMGetOperand(left, 0), module, (&left_offset).cast[void&])
+            right_base: LLVMValueRef = ElisaLLVMPointerBaseWithConstantOffset(LLVMGetOperand(right, 0), module, (&right_offset).cast[void&])
+            left_base == right_base and left_offset <= OrderedCastGroup::OFFSET_LIMIT and right_offset == left_offset + 8
+
+        # The group's loads pair up: each pair in order, adjacent, with no side effect
+        # between them.
+        def group_loads_pair(conversions: darray[LLVMValueRef]&, start: u32, module: LLVMModuleRef) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            pair: mutable u32 = 0
+            while pair < OrderedCastGroup::WIDTH |pair, conversions, start, module|:
+                left: LLVMValueRef = LLVMGetOperand(conversions[start + pair], 0)
+                right: LLVMValueRef = LLVMGetOperand(conversions[start + pair + 1], 0)
+                return false if not comes_before(left, right)
+                cursor: mutable LLVMValueRef? = LLVMGetNextInstruction(left)
+                while cursor is instruction |cursor, right|:
+                    break if instruction == right
+                    return false if ElisaLLVMMayHaveSideEffects(instruction) != 0
+                    cursor <- LLVMGetNextInstruction(instruction)
+                return false if not loads_are_adjacent(left, right, module)
+                pair <- pair + 2
+            true
+
+        # LEFT and RIGHT replaced by the two lanes of one `<2 x i64>` load built before LEFT.
+        def merge_load_pair(left: LLVMValueRef, right: LLVMValueRef, builder: LLVMBuilderRef) -> void:
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(left))
+            int32: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            position_builder_before(builder, left)
+            wide: LLVMValueRef = LLVMBuildLoad2(builder, LLVMVectorType(LLVMInt64TypeInContext(context), 2), LLVMGetOperand(left, 0), "")
+            left_alignment: u32 = LLVMGetAlignment(left)
+            right_alignment: u32 = LLVMGetAlignment(right)
+            LLVMSetAlignment(wide, left_alignment if left_alignment < right_alignment else right_alignment)
+            first: LLVMValueRef = LLVMBuildExtractElement(builder, wide, LLVMConstInt(int32, 0, 0), "")
+            second: LLVMValueRef = LLVMBuildExtractElement(builder, wide, LLVMConstInt(int32, 1, 0), "")
+            LLVMReplaceAllUsesWith(left, first)
+            LLVMReplaceAllUsesWith(right, second)
+            LLVMInstructionEraseFromParent(left)
+            LLVMInstructionEraseFromParent(right)
+
+        # `llvm.vector.reduce.fadd(-0.0, first six lanes of CONVERTED)` built at the builder.
+        def build_ordered_sum(converted: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            int32: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            double: LLVMTypeRef = LLVMDoubleTypeInContext(context)
+            lanes: mutable darray[LLVMValueRef] = []
+            for lane in 0..<OrderedCastGroup::REDUCED |lanes, int32|:
+                lanes.push(LLVMConstInt(int32, lane.u64(), 0))
+            mask: LLVMValueRef = LLVMConstVector((&lanes[0]).cast[void&], OrderedCastGroup::REDUCED)
+            six: LLVMValueRef = LLVMBuildShuffleVector(builder, converted, LLVMGetPoison(LLVMTypeOf(converted)), mask, "")
+            types: mutable darray[LLVMTypeRef] = [LLVMTypeOf(six)]
+            reduce: LLVMValueRef = LLVMGetIntrinsicDeclaration(module, intrinsic_identifier("llvm.vector.reduce.fadd"), (&types[0]).cast[void&], 1)
+            arguments: mutable darray[LLVMValueRef] = [LLVMConstRealOfString(double, "-0.0"), six]
+            LLVMBuildCall2(builder, LLVMGlobalGetValueType(reduce), reduce, (&arguments[0]).cast[void&], 2, "")
+
+        # The group's loads paired, its conversions one vector conversion before LAST and
+        # its first six summed by one ordered reduction.
+        def vectorize_ordered_group(conversions: darray[LLVMValueRef]&, start: u32, moved: darray[LLVMValueRef]&, reduction: darray[LLVMValueRef]&, builder: LLVMBuilderRef, module: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            pair: mutable u32 = 0
+            while pair < OrderedCastGroup::WIDTH |pair, conversions, start, builder|:
+                merge_load_pair(LLVMGetOperand(conversions[start + pair], 0), LLVMGetOperand(conversions[start + pair + 1], 0), builder)
+                pair <- pair + 2
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            int32: LLVMTypeRef = LLVMInt32TypeInContext(context)
+            last: LLVMValueRef = conversions[start + OrderedCastGroup::WIDTH - 1]
+            position_builder_before(builder, last)
+            integers: mutable LLVMValueRef = LLVMGetPoison(LLVMVectorType(LLVMInt64TypeInContext(context), OrderedCastGroup::WIDTH))
+            for lane in 0..<OrderedCastGroup::WIDTH |integers, conversions, start, builder, int32|:
+                integers <- LLVMBuildInsertElement(builder, integers, LLVMGetOperand(conversions[start + lane], 0), LLVMConstInt(int32, lane.u64(), 0), "")
+            converted: LLVMValueRef = LLVMBuildSIToFP(builder, integers, LLVMVectorType(LLVMDoubleTypeInContext(context), OrderedCastGroup::WIDTH), "")
+            results: mutable darray[LLVMValueRef] = []
+            for lane in 0..<OrderedCastGroup::WIDTH |results, converted, builder, int32|:
+                results.push(LLVMBuildExtractElement(builder, converted, LLVMConstInt(int32, lane.u64(), 0), ""))
+            sum: LLVMValueRef = build_ordered_sum(converted, builder, module)
+            LLVMSetFastMathFlags(sum, LLVMGetFastMathFlags(reduction[0]))
+            for add in moved |last|:
+                ElisaLLVMMoveInstructionBefore(add, last)
+            LLVMReplaceAllUsesWith(reduction[reduction.count - 1], sum)
+            for offset in 0..<reduction.count |reduction|:
+                LLVMInstructionEraseFromParent(reduction[reduction.count - 1 - offset])
+            for lane in 0..<OrderedCastGroup::WIDTH |conversions, start, results|:
+                LLVMReplaceAllUsesWith(conversions[start + lane], results[lane])
+            for lane in 0..<OrderedCastGroup::WIDTH |conversions, start|:
+                LLVMInstructionEraseFromParent(conversions[start + lane])
+
+        # Whether the group of eight conversions at START qualifies; it is rewritten when so.
+        def order_conversion_group(conversions: darray[LLVMValueRef]&, start: u32, block: LLVMBasicBlockRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            first: LLVMValueRef = conversions[start]
+            last: LLVMValueRef = conversions[start + OrderedCastGroup::WIDTH - 1]
+            return false if not comes_before(first, last) or not group_loads_are_local(conversions, start, block)
+            moved: darray[LLVMValueRef] = get fadds_before_last(first, last) else return false
+            for offset in 0..<OrderedCastGroup::WIDTH |conversions, start, block, last, moved|:
+                return false if not users_follow_last(conversions[start + offset], block, last, &moved)
+            for add in moved |block, last, moved|:
+                return false if not users_follow_last(add, block, last, &moved)
+            reduction: darray[LLVMValueRef] = get ordered_reduction(conversions, start, block) else return false
+            return false if not group_loads_pair(conversions, start, module)
+            vectorize_ordered_group(conversions, start, &moved, &reduction, builder, module)
+            true
+
+        # The first block ending in a conditional branch whose only effects are three
+        # simple i64 loads: its first two load as one `<2 x i64>` when adjacent.
+        def pair_branch_block_loads(function: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, builder, module|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                continue if conditional_terminator(block) == null
+                loads: mutable darray[LLVMValueRef] = []
+                blocked: mutable bool = false
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, loads, blocked|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if LLVMIsALoadInst(instruction) != null:
+                        if not is_simple_access(instruction) or not is_llvm_integer_type(LLVMTypeOf(instruction), 64):
+                            blocked <- true
+                            break
+                        loads.push(instruction)
+                    elif ElisaLLVMMayHaveSideEffects(instruction) != 0 and not is_branch_instruction(instruction):
+                        blocked <- true
+                        break
+                continue if blocked or loads.count != 3 or not loads_are_adjacent(loads[0], loads[1], module)
+                merge_load_pair(loads[0], loads[1], builder)
+                break
+
+        # `isa<BranchInst>`: either branch opcode.
+        def is_branch_instruction(instruction: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            opcode == LLVMOpcode::CONDITIONAL_BR or opcode == LLVMOpcode::UNCONDITIONAL_BR
+
+        # Functions the casts leave alone: optimized for size or not at all, strict
+        # floating point, or sanitized.
+        def skips_ordered_casts(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone") or function_has_attribute(function, "optsize")
+            return true if function_has_attribute(function, "minsize") or function_has_attribute(function, "strictfp")
+            return true if function_has_attribute(function, "sanitize_address") or function_has_attribute(function, "sanitize_memory")
+            function_has_attribute(function, "sanitize_thread") or function_has_attribute(function, "sanitize_hwaddress")
+
+    public:
+        # Each block's groups of eight ordered conversions vectorized, then one branch
+        # block's load pair merged; whether FUNCTION changed.
+        def order_function_conversions(function: LLVMValueRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if skips_ordered_casts(function)
+            module: LLVMModuleRef = LLVMGetGlobalParent(function)
+            changed: mutable bool = false
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, changed, builder, module|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                conversions: darray[LLVMValueRef] = ordered_conversions_in(block)
+                start: mutable u32 = 0
+                while start + OrderedCastGroup::WIDTH <= conversions.count |start, changed, conversions, block, builder, module|:
+                    changed <- order_conversion_group(&conversions, start, block, builder, module) or changed
+                    start <- start + OrderedCastGroup::WIDTH
+            pair_branch_block_loads(function, builder, module) if changed
+            changed

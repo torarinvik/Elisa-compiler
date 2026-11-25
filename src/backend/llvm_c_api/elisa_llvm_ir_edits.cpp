@@ -142,6 +142,10 @@ void ElisaLLVMMoveInstructionToBlockEnd(LLVMValueRef instruction, LLVMBasicBlock
   unwrap<Instruction>(instruction)->moveBefore(*Destination, Destination->end());
 }
 
+void ElisaLLVMMoveInstructionBefore(LLVMValueRef instruction, LLVMValueRef before) {
+  unwrap<Instruction>(instruction)->moveBefore(unwrap<Instruction>(before)->getIterator());
+}
+
 LLVMValueRef ElisaLLVMEmitGEPOffset(LLVMBuilderRef builder, LLVMValueRef gep) {
   auto *Instruction = cast<GetElementPtrInst>(unwrap(gep));
   return wrap(emitGEPOffset(unwrap(builder), Instruction->getModule()->getDataLayout(), Instruction,
