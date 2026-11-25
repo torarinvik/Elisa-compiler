@@ -258,6 +258,15 @@ int ElisaLLVMConstantMaxBackedgeTakenCount(ElisaFunctionAnalysesRef analyses, El
  * integer value; 0 for a value scalar evolution cannot describe. */
 unsigned ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(ElisaFunctionAnalysesRef analyses,
                                                       LLVMValueRef value);
+/* The terms of the loop's symbolic maximum backedge-taken count: the operands of
+ * an add expression, else the count itself. For each of the first CAPACITY terms,
+ * KNOWN is 1 and TERMS holds a constant's ConstantInt or an unknown's value, or
+ * KNOWN is 0 (TERMS untouched) for any other expression. Returns the number of
+ * terms (and the count's width in WIDTH), or -1 when the count cannot be computed
+ * or is not an integer. */
+int ElisaLLVMSymbolicMaxBackedgeTakenTerms(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
+                                           LLVMValueRef *terms, uint32_t *known, unsigned capacity,
+                                           unsigned *width);
 /* ScalarEvolution::getSignedRange(getSCEV(value)) of an integer value. */
 ElisaConstantRangeRef ElisaLLVMScalarEvolutionSignedRange(ElisaFunctionAnalysesRef analyses,
                                                           LLVMValueRef value);

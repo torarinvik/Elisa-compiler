@@ -5,6 +5,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/Support/CBindingWrapping.h>
 
 #include <optional>
@@ -24,6 +25,18 @@ ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompare(LLVMIntPredicate pr
   auto compare = static_cast<CmpInst::Predicate>(predicate);
   return wrap(new ConstantRange(
       ConstantRange::makeAllowedICmpRegion(compare, ConstantRange(constantValue(constant)))));
+}
+
+int ElisaLLVMConstantRangeSatisfiesCompare(LLVMIntPredicate predicate, ElisaConstantRangeRef left,
+                                           ElisaConstantRangeRef right) {
+  auto compare = static_cast<CmpInst::Predicate>(predicate);
+  return ConstantRange::makeSatisfyingICmpRegion(compare, *unwrap(right)).contains(*unwrap(left));
+}
+
+ElisaConstantRangeRef ElisaLLVMConstantRangeOfRangeMetadata(LLVMValueRef instruction) {
+  MDNode *Range = cast<Instruction>(unwrap(instruction))->getMetadata(LLVMContext::MD_range);
+  if (!Range) return nullptr;
+  return wrap(new ConstantRange(getConstantRangeFromMetadata(*Range)));
 }
 
 ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompareWith(LLVMIntPredicate predicate,

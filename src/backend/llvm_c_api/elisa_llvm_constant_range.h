@@ -20,6 +20,13 @@ typedef struct ElisaOpaqueConstantRange *ElisaConstantRangeRef;
 ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompare(LLVMIntPredicate predicate,
                                                              LLVMValueRef constant);
 
+/* ConstantRange::makeSatisfyingICmpRegion(predicate, right).contains(left):
+ * whether every value of LEFT compares true with every value of RIGHT. */
+int ElisaLLVMConstantRangeSatisfiesCompare(LLVMIntPredicate predicate, ElisaConstantRangeRef left,
+                                           ElisaConstantRangeRef right);
+/* getConstantRangeFromMetadata of the instruction's `!range`; null without one. */
+ElisaConstantRangeRef ElisaLLVMConstantRangeOfRangeMetadata(LLVMValueRef instruction);
+
 /* ConstantRange::makeAllowedICmpRegion(predicate, range): every value `x` for
  * which `x <predicate> y` can hold for some `y` in RANGE. */
 ElisaConstantRangeRef ElisaLLVMConstantRangeAllowedByCompareWith(LLVMIntPredicate predicate,

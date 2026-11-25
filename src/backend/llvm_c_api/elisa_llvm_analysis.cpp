@@ -522,6 +522,28 @@ int ElisaLLVMConstantMaxBackedgeTakenCount(ElisaFunctionAnalysesRef analyses, El
   return 1;
 }
 
+int ElisaLLVMSymbolicMaxBackedgeTakenTerms(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
+                                           LLVMValueRef *terms, uint32_t *known, unsigned capacity,
+                                           unsigned *width) {
+  const SCEV *Symbolic =
+      unwrapAnalyses(analyses)->scalarEvolution().getSymbolicMaxBackedgeTakenCount(unwrapLoop(loop));
+  if (isa<SCEVCouldNotCompute>(Symbolic) || !Symbolic->getType()->isIntegerTy()) return -1;
+  *width = Symbolic->getType()->getIntegerBitWidth();
+  SmallVector<const SCEV *, 4> Parts;
+  if (auto *Sum = dyn_cast<SCEVAddExpr>(Symbolic))
+    Parts.append(Sum->operands().begin(), Sum->operands().end());
+  else
+    Parts.push_back(Symbolic);
+  for (unsigned Index = 0; Index < Parts.size() && Index < capacity; ++Index) {
+    Value *Term = nullptr;
+    if (auto *Constant = dyn_cast<SCEVConstant>(Parts[Index])) Term = Constant->getValue();
+    else if (auto *Unknown = dyn_cast<SCEVUnknown>(Parts[Index])) Term = Unknown->getValue();
+    known[Index] = Term != nullptr;
+    if (Term) terms[Index] = wrap(Term);
+  }
+  return static_cast<int>(Parts.size());
+}
+
 unsigned ElisaLLVMScalarEvolutionUnsignedMaxActiveBits(ElisaFunctionAnalysesRef analyses,
                                                       LLVMValueRef value) {
   ScalarEvolution &SE = unwrapAnalyses(analyses)->scalarEvolution();

@@ -1,0 +1,350 @@
+# Proves overflow checks and compares dead in loops that run a small, known number of
+# times (the C++ `ElisaBoundedTripRanges`). Range analysis gives up on a recurrence such as
+# `next = 2 * current - previous + a`: no fixed interval contains it. When scalar
+# evolution bounds the loop's back edges by a small constant M, iterating the interval
+# transfer over the body M + 1 times covers every value the header phis can take, without
+# widening. A checked operation whose operand intervals cannot overflow then has a false
+# overflow bit, and a compare the intervals decide becomes a constant.
+include "../signed_checks/range_facts.elisa"
+include "../bounded_factorials/bounded_factorials.elisa"
+include "../vector_loops/paired_counters.elisa"
+
+const module BoundedTripLimit:
+    TRIPS: u64 = 64
+    INSTRUCTIONS: u32 = 256
+    DOMINATOR_STEPS: u32 = 32
+    WIDE_PRODUCT: u32 = 128
+
+# The loop the interpreter runs: the edge into it and its back edge.
+struct TripLoop:
+    loop: ElisaLoopRef
+    analyses: ElisaFunctionAnalysesRef
+    before: LLVMBasicBlockRef
+    header: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+    intrinsics: CheckedIntrinsics
+
+# A term of a symbolic trip count: a constant or an unknown value when KNOWN, else any
+# other expression.
+struct TripTerm:
+    value: LLVMValueRef
+    known: bool
+
+# The checked operations and integer compares of a loop.
+struct TripCandidates:
+    checks: mutable darray[LLVMValueRef]
+    compares: mutable darray[LLVMValueRef]
+
+extend Backend:
+    public:
+        # VALUE's range on the edge into LOOP (lazy value info's), narrowed by the guard
+        # edge into each single-predecessor block on the dominator chain above it (`count
+        # > 32` returns three blocks up), which lazy value info, asked at the entry alone,
+        # does not chain.
+        def guarded_entry_range(value: LLVMValueRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic]:
+            before: LLVMBasicBlockRef = loop_predecessor(loop)
+            range: mutable ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, value, before, ElisaLLVMLoopHeader(loop), null)
+            defined: LLVMValueRef? = LLVMIsAInstruction(value)
+            cursor: mutable LLVMBasicBlockRef? = before
+            steps: mutable u32 = 0
+            while steps < BoundedTripLimit::DOMINATOR_STEPS and cursor is block |cursor, steps, range, value, defined, analyses|:
+                steps <- steps + 1
+                cursor <- null
+                if ElisaLLVMImmediateDominator(analyses, block) is up:
+                    if single_predecessor(block) is from:
+                        if conditional_terminator(from) is branch:
+                            if defined == null or ElisaLLVMInstructionDominates(analyses, value, branch) != 0:
+                                range <- signed_intersection(range, ElisaLLVMLazyValueConstantRangeOnEdge(analyses, value, from, block, null))
+                    terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(up) else return range
+                    if defined == null or ElisaLLVMInstructionDominates(analyses, value, terminator) != 0:
+                        cursor <- up
+            range
+
+        # The loop's predecessor, which every loop the pass folds has.
+        def loop_predecessor(loop: ElisaLoopRef) -> LLVMBasicBlockRef can[Abort.Panic]:
+            if ElisaLLVMLoopPredecessor(loop) is before:
+                return before
+            panic("a folded loop without a predecessor")
+
+        # `entryRange`: a guard that branched on x proved x is not poison (branching on
+        # poison is undefined), so freeze(x) is x wherever those guards bound it.
+        def entry_range(value: LLVMValueRef, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic]:
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::FREEZE):
+                inner: ElisaConstantRangeRef = entry_range(LLVMGetOperand(value, 0), loop, analyses)
+                return signed_intersection(inner, guarded_entry_range(value, loop, analyses))
+            guarded_entry_range(value, loop, analyses)
+
+        def is_inside_loop(value: LLVMValueRef, loop: ElisaLoopRef) -> bool:
+            LLVMIsAInstruction(value) != null and ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(value)) != 0
+
+        # `outside`: a constant, full for a value of the loop, else its range on entry.
+        def trip_outside_range(value: LLVMValueRef, shape: TripLoop&) -> ElisaConstantRangeRef can[Abort.Panic]:
+            return ElisaLLVMConstantRangeOfConstant(value) if LLVMIsAConstantInt(value) != null
+            return ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(value))) if is_inside_loop(value, shape.loop)
+            entry_range(value, shape.loop, shape.analyses)
+
+        # `rangeOf`: a loop value's range over the trips so far (empty before its first).
+        def trip_range(value: LLVMValueRef, state: RangeFacts&, shape: TripLoop&) -> ElisaConstantRangeRef can[Abort.Panic]:
+            return ElisaLLVMConstantRangeOfConstant(value) if LLVMIsAConstantInt(value) != null
+            return trip_outside_range(value, shape) if not is_inside_loop(value, shape.loop)
+            if fact_range(state, value) is known:
+                return known
+            ElisaLLVMConstantRangeEmpty(LLVMGetIntTypeWidth(LLVMTypeOf(value)))
+
+        # `set`: VALUE's range joined with RANGE (consumed).
+        def join_trip_range(state: mutable RangeFacts&, value: LLVMValueRef, range: ElisaConstantRangeRef) -> void can[Memory.Allocate]:
+            index: i64 = fact_index(state, value)
+            if index < 0:
+                state.values.push(value)
+                state.ranges.push(range)
+                return
+            existing: ElisaConstantRangeRef = state.ranges[index.usize()]
+            state.ranges[index.usize()] <- smallest_union(existing, range)
+
+        # `WithOverflowInst::getBinaryOp` of any of the six checked intrinsics.
+        def overflow_operation(value: LLVMValueRef, intrinsics: CheckedIntrinsics&) -> u32?:
+            return null if LLVMIsAIntrinsicInst(value) == null
+            identifier: u32 = called_intrinsic_id(value)
+            return LLVMOpcode::ADD if identifier == intrinsics.signed_add or identifier == intrinsics.unsigned_add
+            return LLVMOpcode::SUB if identifier == intrinsics.signed_subtract or identifier == intrinsics.unsigned_subtract
+            return LLVMOpcode::MUL if identifier == intrinsics.signed_multiply or identifier == intrinsics.unsigned_multiply
+            null
+
+        # The range of a `shl nsw` by a constant below the width less one: a multiply, which
+        # doubles signed values too where the shift rule gives up on negative ones.
+        def doubled_range(instruction: LLVMValueRef, state: RangeFacts&, shape: TripLoop&, width: u32) -> ElisaConstantRangeRef? can[Abort.Panic]:
+            return null if LLVMGetInstructionOpcode(instruction) != LLVMOpcode::SHL
+            shift: LLVMValueRef = LLVMGetOperand(instruction, 1)
+            return null if LLVMIsAConstantInt(shift) == null or LLVMGetNSW(instruction) == 0
+            type: LLVMTypeRef = LLVMTypeOf(instruction)
+            return null if ElisaLLVMConstantIntUnsignedGreater(LLVMConstInt(type, (width - 1).u64(), 0), shift) == 0
+            factor: LLVMValueRef = ElisaLLVMConstantIntShiftLeft(LLVMConstInt(type, 1, 0), LLVMConstIntGetZExtValue(shift).u32())
+            range_operation(LLVMOpcode::MUL, trip_range(LLVMGetOperand(instruction, 0), state, shape), ElisaLLVMConstantRangeOfConstant(factor))
+
+        # The range an integer instruction computes from its operands' ranges.
+        def computed_range(instruction: LLVMValueRef, state: RangeFacts&, shape: TripLoop&, width: u32) -> ElisaConstantRangeRef can[Abort.Panic]:
+            if doubled_range(instruction, state, shape, width) is doubled:
+                return doubled
+            if LLVMIsABinaryOperator(instruction) != null:
+                left: ElisaConstantRangeRef = trip_range(LLVMGetOperand(instruction, 0), state, shape)
+                return range_operation(LLVMGetInstructionOpcode(instruction), left, trip_range(LLVMGetOperand(instruction, 1), state, shape))
+            if LLVMIsACastInst(instruction) != null and LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(instruction, 0))) == LLVMTypeKindValue::INTEGER:
+                source: ElisaConstantRangeRef = trip_range(LLVMGetOperand(instruction, 0), state, shape)
+                cast: ElisaConstantRangeRef = ElisaLLVMConstantRangeCast(LLVMGetInstructionOpcode(instruction), source, width)
+                ElisaLLVMDisposeConstantRange(source)
+                return cast
+            if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::SELECT):
+                when_true: ElisaConstantRangeRef = trip_range(LLVMGetOperand(instruction, 1), state, shape)
+                return smallest_union(when_true, trip_range(LLVMGetOperand(instruction, 2), state, shape))
+            if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI):
+                hull: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeEmpty(width)
+                for incoming in 0..<LLVMCountIncoming(instruction) |hull, instruction, state, shape|:
+                    hull <- smallest_union(hull, trip_range(LLVMGetIncomingValue(instruction, incoming), state, shape))
+                return hull
+            if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::FREEZE):
+                operand: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                if LLVMIsALoadInst(operand) != null and LLVMGetMetadata(operand, LLVMGetMDKindIDInContext(LLVMGetTypeContext(LLVMTypeOf(operand)), "range", 5)) != null:
+                    return trip_range(operand, state, shape)
+                return ElisaLLVMConstantRangeFull(width)
+            if LLVMIsALoadInst(instruction) != null:
+                if ElisaLLVMConstantRangeOfRangeMetadata(instruction) is bounded:
+                    return bounded
+            ElisaLLVMConstantRangeFull(width)
+
+        # `transfer`: INSTRUCTION's range this trip joined into STATE.
+        def transfer_trip(instruction: LLVMValueRef, state: mutable RangeFacts&, shape: TripLoop&) -> void can[Abort.Panic, Memory.Allocate]:
+            if overflow_operation(instruction, &shape.intrinsics) is opcode:
+                left: ElisaConstantRangeRef = trip_range(LLVMGetOperand(instruction, 0), state, shape)
+                join_trip_range(state, instruction, range_operation(opcode, left, trip_range(LLVMGetOperand(instruction, 1), state, shape)))
+                return
+            type: LLVMTypeRef = LLVMTypeOf(instruction)
+            is_integer: bool = LLVMGetTypeKind(type) == LLVMTypeKindValue::INTEGER
+            if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::EXTRACT_VALUE):
+                aggregate: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                first_index: u32 = LLVMGetIndices(instruction)
+                known: ElisaConstantRangeRef? = fact_range(state, aggregate) if overflow_operation(aggregate, &shape.intrinsics) != null and first_index == 0 else null
+                if known is carried:
+                    join_trip_range(state, instruction, carried)
+                elif is_integer:
+                    join_trip_range(state, instruction, ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(type)))
+                return
+            if is_integer:
+                join_trip_range(state, instruction, computed_range(instruction, state, shape, LLVMGetIntTypeWidth(type)))
+
+        # `run`: the ranges of every integer value the loop computes, over TRIPS + 1 trips.
+        def run_trips(shape: TripLoop&, trips: u64) -> RangeFacts can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            state: mutable RangeFacts = empty_facts()
+            phis: darray[LLVMValueRef] = integer_header_phis(shape.header)
+            for phi in phis |state, shape|:
+                join_trip_range(&state, phi, trip_outside_range(incoming_from(phi, shape.before), shape))
+            blocks: darray[LLVMBasicBlockRef] = loop_blocks_in_reverse_postorder(shape.loop, shape.analyses)
+            for _ in 0..<(trips + 1) |state, shape, blocks, phis|:
+                for block in blocks |state, shape|:
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while cursor is instruction |cursor, state, shape, block|:
+                        cursor <- LLVMGetNextInstruction(instruction)
+                        if block != shape.header or not is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI):
+                            transfer_trip(instruction, &state, shape)
+                for phi in phis |state, shape|:
+                    join_trip_range(&state, phi, trip_range(incoming_from(phi, shape.latch), &state, shape))
+            state
+
+        def integer_header_phis(header: LLVMBasicBlockRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            phis: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(header)
+            while cursor is instruction |cursor, phis|:
+                cursor <- null
+                if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::PHI):
+                    phis.push(instruction) if LLVMGetTypeKind(LLVMTypeOf(instruction)) == LLVMTypeKindValue::INTEGER
+                    cursor <- LLVMGetNextInstruction(instruction)
+            phis
+
+        # `cannotOverflow`: whether the checked CALL on any values of LEFT and RIGHT stays in
+        # range (a signed product is computed in 128 bits).
+        def trip_cannot_overflow(call: LLVMValueRef, left: ElisaConstantRangeRef, right: ElisaConstantRangeRef, intrinsics: CheckedIntrinsics&) -> bool can[Abort.Panic]:
+            return false if is_empty_range(left) or is_empty_range(right)
+            identifier: u32 = called_intrinsic_id(call)
+            return ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode::ADD, 1, left, right) != 0 if identifier == intrinsics.signed_add
+            return ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode::SUB, 1, left, right) != 0 if identifier == intrinsics.signed_subtract
+            return ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode::ADD, 0, left, right) != 0 if identifier == intrinsics.unsigned_add
+            return ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode::SUB, 0, left, right) != 0 if identifier == intrinsics.unsigned_subtract
+            return ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode::MUL, 0, left, right) != 0 if identifier == intrinsics.unsigned_multiply
+            return false if identifier != intrinsics.signed_multiply
+            width: u32 = ElisaLLVMConstantRangeBitWidth(left)
+            wide: ElisaConstantRangeRef = range_operation(LLVMOpcode::MUL, ElisaLLVMConstantRangeSignExtend(left, BoundedTripLimit::WIDE_PRODUCT), ElisaLLVMConstantRangeSignExtend(right, BoundedTripLimit::WIDE_PRODUCT))
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(call))
+            fits: bool = ElisaLLVMConstantIntIsSignedIntN(signed_minimum(wide, context), width) != 0 and ElisaLLVMConstantIntIsSignedIntN(signed_maximum(wide, context), width) != 0
+            ElisaLLVMDisposeConstantRange(wide)
+            fits
+
+        # The terms of the loop's symbolic maximum back-edge count, and its width.
+        def symbolic_trip_terms(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, width: mutable u32&) -> darray[TripTerm]? can[Memory.Allocate, Unsafe.PointerCast]:
+            placeholder: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(LLVMGetBasicBlockParent(ElisaLLVMLoopHeader(loop))))), 0, 0)
+            values: mutable darray[LLVMValueRef] = [placeholder]
+            known: mutable darray[u32] = [0]
+            count: i32 = ElisaLLVMSymbolicMaxBackedgeTakenTerms(analyses, loop, (&values[0]).cast[void&], (&known[0]).cast[void&], 0, width)
+            return null if count < 0
+            while values.count < count.usize() + 1 |values, known, placeholder|:
+                values.push(placeholder)
+                known.push(0)
+            _ = ElisaLLVMSymbolicMaxBackedgeTakenTerms(analyses, loop, (&values[0]).cast[void&], (&known[0]).cast[void&], count.u32(), width)
+            terms: mutable darray[TripTerm] = []
+            for index in 0..<count.usize() |terms, values, known|:
+                terms.push(TripTerm{value: values[index], known: known[index] != 0})
+            terms
+
+        # `maxTrips`: the most back edges LOOP takes: scalar evolution's constant bound, or
+        # its symbolic count (`count - 3`) bounded by the ranges its values have on entry.
+        def max_trips(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> u64? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            constant: mutable u64 = 0
+            if ElisaLLVMConstantMaxBackedgeTakenCount(analyses, loop, &constant) != 0:
+                return constant if constant < BoundedTripLimit::TRIPS
+            width: mutable u32 = 0
+            terms: darray[TripTerm] = get symbolic_trip_terms(loop, analyses, &width) else return null
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(LLVMGetBasicBlockParent(ElisaLLVMLoopHeader(loop))))
+            type: LLVMTypeRef = LLVMIntTypeInContext(context, width)
+            total: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeOfConstant(LLVMConstInt(type, 0, 0))
+            for term in terms |total, loop, analyses, width|:
+                part: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(width)
+                if term.known:
+                    ElisaLLVMDisposeConstantRange(part)
+                    if LLVMIsAConstantInt(term.value) != null:
+                        part <- ElisaLLVMConstantRangeOfConstant(term.value)
+                    else:
+                        part <- entry_range(term.value, loop, analyses)
+                total <- range_operation(LLVMOpcode::ADD, total, part)
+            most: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMaximum(total, context)
+            bounded: bool = not is_full_range(total) and ElisaLLVMConstantRangeIsWrapped(total) == 0 and compares(LLVMIntPredicate::ULT, most, LLVMConstInt(type, BoundedTripLimit::TRIPS, 0))
+            ElisaLLVMDisposeConstantRange(total)
+            return null if not bounded
+            LLVMConstIntGetZExtValue(most)
+
+        # The loop's checked operations and integer compares; null past 256 instructions.
+        def trip_candidates(loop: ElisaLoopRef, intrinsics: CheckedIntrinsics&) -> TripCandidates? can[Memory.Allocate]:
+            found: mutable TripCandidates = TripCandidates{checks: [], compares: []}
+            size: mutable u32 = 0
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |found, size, loop, intrinsics|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor, found, size, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    size <- size + 1
+                    return null if size > BoundedTripLimit::INSTRUCTIONS
+                    found.checks.push(instruction) if overflow_operation(instruction, intrinsics) != null
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |found, loop|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor, found|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::ICMP):
+                        found.compares.push(instruction) if LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(instruction, 0))) == LLVMTypeKindValue::INTEGER
+            found
+
+        # The overflow bits of CALL made false; how many.
+        def clear_overflow_bits(call: LLVMValueRef) -> u32 can[Abort.Panic]:
+            cleared: mutable u32 = 0
+            false_bit: LLVMValueRef = LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(call))), 0, 0)
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(call)
+            while use_cursor is use |use_cursor, cleared, false_bit|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                if is_llvm_instruction_with_opcode(user, LLVMOpcode::EXTRACT_VALUE):
+                    first_index: u32 = LLVMGetIndices(user)
+                    if first_index == 1:
+                        LLVMReplaceAllUsesWith(user, false_bit)
+                        cleared <- cleared + 1
+            cleared
+
+        # COMPARE made a constant when the trip ranges decide it; whether they did.
+        def decide_trip_compare(compare: LLVMValueRef, state: RangeFacts&, shape: TripLoop&) -> bool can[Abort.Panic]:
+            left: ElisaConstantRangeRef = trip_range(LLVMGetOperand(compare, 0), state, shape)
+            right: ElisaConstantRangeRef = trip_range(LLVMGetOperand(compare, 1), state, shape)
+            decided: mutable u64? = null
+            if not is_empty_range(left) and not is_empty_range(right):
+                predicate: i32 = LLVMGetICmpPredicate(compare)
+                if ElisaLLVMConstantRangeSatisfiesCompare(predicate, left, right) != 0:
+                    decided <- 1
+                elif ElisaLLVMConstantRangeSatisfiesCompare(inverse_predicate(predicate), left, right) != 0:
+                    decided <- 0
+            ElisaLLVMDisposeConstantRange(left)
+            ElisaLLVMDisposeConstantRange(right)
+            truth: u64 = get decided else return false
+            LLVMReplaceAllUsesWith(compare, LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(LLVMTypeOf(compare))), truth, 0))
+            true
+
+        # `foldLoop`: the overflow bits and compares an innermost LOOP's trip ranges decide.
+        def fold_trip_loop(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, intrinsics: CheckedIntrinsics) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMLoopSubLoopCount(loop) != 0
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return 0
+            before: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return 0
+            trips: u64 = get max_trips(loop, analyses) else return 0
+            found: TripCandidates = get trip_candidates(loop, &intrinsics) else return 0
+            return 0 if found.checks.count == 0 and found.compares.count == 0
+            shape: TripLoop = TripLoop{loop: loop, analyses: analyses, before: before, header: ElisaLLVMLoopHeader(loop), latch: latch, intrinsics: intrinsics}
+            state: mutable RangeFacts = run_trips(&shape, trips)
+            folded: mutable u32 = 0
+            for call in found.checks |folded, state, shape|:
+                left: ElisaConstantRangeRef = trip_range(LLVMGetOperand(call, 0), &state, &shape)
+                right: ElisaConstantRangeRef = trip_range(LLVMGetOperand(call, 1), &state, &shape)
+                if trip_cannot_overflow(call, left, right, &shape.intrinsics):
+                    folded <- folded + clear_overflow_bits(call)
+                ElisaLLVMDisposeConstantRange(left)
+                ElisaLLVMDisposeConstantRange(right)
+            for compare in found.compares |folded, state, shape|:
+                if decide_trip_compare(compare, &state, &shape):
+                    folded <- folded + 1
+            dispose_facts(&state)
+            folded
+
+        # `foldBoundedTripChecks` over every defined function of MODULE.
+        def fold_bounded_trip_checks(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            intrinsics: CheckedIntrinsics = checked_intrinsics()
+            folded: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, folded, intrinsics|:
+                cursor <- LLVMGetNextFunction(function)
+                if LLVMIsDeclaration(function) == 0 and not function_has_attribute(function, "optnone"):
+                    if ElisaLLVMCreateFunctionAnalyses(function) is analyses:
+                        if ElisaLLVMTopLevelLoopCount(analyses) > 0:
+                            for loop in loops_in_program_preorder(analyses) |folded, analyses, intrinsics|:
+                                folded <- folded + fold_trip_loop(loop, analyses, intrinsics)
+                        ElisaLLVMDisposeFunctionAnalyses(analyses)
+            folded

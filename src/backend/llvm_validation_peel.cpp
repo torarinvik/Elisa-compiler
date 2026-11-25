@@ -45,7 +45,6 @@
 #include "llvm_indexed_prefix.h"
 #include "llvm_proven_checks.h"
 #include "llvm_validated_reads.h"
-#include "llvm_bounded_trip_ranges.h"
 #include "llvm_bisection_check_versioning.h"
 
 using namespace llvm;
