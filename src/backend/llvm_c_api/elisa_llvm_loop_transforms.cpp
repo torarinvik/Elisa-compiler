@@ -2,6 +2,7 @@
 #include "elisa_llvm_loop_transforms.h"
 #include "elisa_llvm_function_analyses.h"
 
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/LoopPeel.h>
@@ -14,6 +15,16 @@ using namespace llvm;
 using namespace elisa_llvm;
 
 extern "C" {
+
+void ElisaLLVMForgetLoop(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop) {
+  FunctionAnalyses *A = unwrapAnalyses(analyses);
+  if (A->evolution) A->evolution->forgetLoop(unwrapLoop(loop));
+}
+
+void ElisaLLVMRegisterAssumption(ElisaFunctionAnalysesRef analyses, LLVMValueRef assume) {
+  FunctionAnalyses *A = unwrapAnalyses(analyses);
+  if (A->assumptions) A->assumptions->registerAssumption(cast<AssumeInst>(unwrap(assume)));
+}
 
 uint32_t ElisaLLVMTopLevelLoopCount(ElisaFunctionAnalysesRef analyses) {
   LoopInfo &LI = unwrapAnalyses(analyses)->loops();

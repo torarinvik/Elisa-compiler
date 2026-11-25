@@ -4,6 +4,7 @@
 #include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/InstrTypes.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/Support/CBindingWrapping.h>
 
 #include <optional>
@@ -241,6 +242,15 @@ LLVMValueRef ElisaLLVMConstantIntTruncate(LLVMValueRef constant, uint32_t width)
 
 int ElisaLLVMConstantIntIsSignedIntN(LLVMValueRef constant, uint32_t bits) {
   return constantValue(constant).isSignedIntN(bits);
+}
+
+int ElisaLLVMConstantIntCompare(LLVMIntPredicate predicate, LLVMValueRef first, LLVMValueRef second) {
+  return ICmpInst::compare(constantValue(first), constantValue(second),
+                           static_cast<CmpInst::Predicate>(predicate));
+}
+
+LLVMValueRef ElisaLLVMConstantIntUnsignedDivide(LLVMValueRef first, LLVMValueRef second) {
+  return constantOf(first, constantValue(first).udiv(constantValue(second)));
 }
 
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range) { delete unwrap(range); }

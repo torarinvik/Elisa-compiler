@@ -1,0 +1,297 @@
+# Unrolls small single-block AArch64 loops whose phis rotate a window of earlier values
+# by whole rotations: two states summed (`next = a + b`), a scaled state
+# (`next = a + 2 * b`) or an offset sum (`next = a + b + C`), unrolled by four after
+# their first iteration is peeled, or three states of which the two oldest are summed,
+# unrolled by three. The offset sum is first rebased: shifting both states by C makes
+# it a plain sum, and the loop's results subtract C again. Only loops of 16 to 256
+# trips qualify, counted by ScalarEvolution or, for a two-state loop an entry switch
+# dispatches to, by the switch's default range.
+include "../../ir/ir_editing.elisa"
+include "../../ir/llvm_ir_queries.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module LaggedRecurrenceLimit:
+    FUNCTION_BLOCKS: u32 = 24
+    CANDIDATES: u32 = 32
+    MINIMUM_TRIPS: u32 = 16
+    MAXIMUM_TRIPS: u32 = 256
+    # Trip counts above this are only "too many".
+    TRIP_CAP: u64 = 257
+    SHORT_BLOCK: u32 = 7
+    LONG_BLOCK: u32 = 8
+    ROTATION: u32 = 4
+    THREE_STATE_ROTATION: u32 = 3
+    EXPANSION_BUDGET: u32 = 1000
+
+# `next = previous + current + offset`, as `bias = previous + offset` and
+# `sum = bias + current`.
+struct AffineLaggedRecurrence:
+    previous: LLVMValueRef
+    current: LLVMValueRef
+    bias: LLVMValueRef
+    sum: LLVMValueRef
+    offset: LLVMValueRef
+
+# How far to unroll a recurrence loop, and its offset sum when it has one.
+struct LaggedShape:
+    factor: u32
+    affine: AffineLaggedRecurrence?
+
+# The loop's update instructions besides its counter step.
+struct LaggedUpdates:
+    phis: u32
+    sum: LLVMValueRef?
+    scale: LLVMValueRef?
+    bias: LLVMValueRef?
+
+# What a function's recurrence changed, and the candidates the module has seen.
+struct LaggedProgress:
+    changed: u32
+    candidates: u32
+
+extend Backend:
+    private:
+        # A two-input phi of BLOCK other than its counter.
+        def window_phi(value: LLVMValueRef, block: LLVMBasicBlockRef, counter: LLVMValueRef) -> LLVMValueRef?:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI) or value == counter
+            return null if LLVMGetInstructionParent(value) != block or LLVMCountIncoming(value) != 2
+            value
+
+        def takes_from(phi: LLVMValueRef, block: LLVMBasicBlockRef, value: LLVMValueRef) -> bool:
+            optional_equals(phi_incoming_for_block(phi, block), value)
+
+        # The phis and update instructions of BLOCK besides STEP, COMPARE and BRANCH:
+        # the first add is the sum, a shift before any second add the scale, and a second
+        # add the sum with the first as its bias. Anything else rules the block out.
+        def lagged_updates(block: LLVMBasicBlockRef, skipped: darray[LLVMValueRef]&) -> LaggedUpdates?:
+            updates: mutable LaggedUpdates = LaggedUpdates{phis: 0, sum: null, scale: null, bias: null}
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, updates, skipped|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                if opcode == LLVMOpcode::PHI:
+                    updates <- LaggedUpdates{phis: updates.phis + 1, sum: updates.sum, scale: updates.scale, bias: updates.bias}
+                elif not contains_value(skipped, instruction):
+                    open: bool = updates.scale == null and updates.bias == null
+                    if updates.sum == null and opcode == LLVMOpcode::ADD:
+                        updates <- LaggedUpdates{phis: updates.phis, sum: instruction, scale: updates.scale, bias: updates.bias}
+                    elif open and opcode == LLVMOpcode::SHL:
+                        updates <- LaggedUpdates{phis: updates.phis, sum: updates.sum, scale: instruction, bias: null}
+                    elif open and updates.sum != null and opcode == LLVMOpcode::ADD:
+                        updates <- LaggedUpdates{phis: updates.phis, sum: instruction, scale: null, bias: updates.sum}
+                    else:
+                        return null
+            updates
+
+        # `next = previous + (current + offset)`: rotate by four once rebased.
+        def affine_shape(block: LLVMBasicBlockRef, counter: LLVMValueRef, updates: LaggedUpdates&, sum: LLVMValueRef, bias: LLVMValueRef) -> LaggedShape?:
+            offset: LLVMValueRef = LLVMGetOperand(bias, 1)
+            return null if updates.phis != 3 or LLVMIsAConstantInt(offset) == null or LLVMIsNull(offset) != 0 or not has_one_use(bias)
+            return null if LLVMGetNSW(bias) != 0 or LLVMGetNUW(bias) != 0 or LLVMGetNSW(sum) != 0 or LLVMGetNUW(sum) != 0
+            other: LLVMValueRef = get operand_beside(sum, bias) else return null
+            first: LLVMValueRef = get window_phi(LLVMGetOperand(bias, 0), block, counter) else return null
+            second: LLVMValueRef = get window_phi(other, block, counter) else return null
+            return null if first == second
+            swapped: bool = takes_from(second, block, first)
+            previous: LLVMValueRef = second if swapped else first
+            current: LLVMValueRef = first if swapped else second
+            return null if not takes_from(previous, block, current) or not takes_from(current, block, sum)
+            return null if not has_one_use(previous) or use_count(current) != 2
+            LaggedShape{factor: LaggedRecurrenceLimit::ROTATION, affine: AffineLaggedRecurrence{previous: previous, current: current, bias: bias, sum: sum, offset: offset}}
+
+        # `next = previous + (current << 1)`: rotate by four.
+        def scaled_shape(block: LLVMBasicBlockRef, counter: LLVMValueRef, updates: LaggedUpdates&, sum: LLVMValueRef, scale: LLVMValueRef) -> LaggedShape?:
+            return null if updates.phis != 3 or not has_one_use(scale)
+            shift: LLVMValueRef = LLVMGetOperand(scale, 1)
+            other: LLVMValueRef = get operand_beside(sum, scale) else return null
+            current: LLVMValueRef = get window_phi(LLVMGetOperand(scale, 0), block, counter) else return null
+            previous: LLVMValueRef = get window_phi(other, block, counter) else return null
+            return null if LLVMIsAConstantInt(shift) == null or ElisaLLVMIsConstantOne(shift) == 0 or current == previous
+            return null if not takes_from(previous, block, current) or not takes_from(current, block, sum)
+            LaggedShape{factor: LaggedRecurrenceLimit::ROTATION, affine: null}
+
+        # `next = a + b` over a window of two states (rotate by four) or three states
+        # whose two oldest it sums (rotate by three).
+        def plain_shape(block: LLVMBasicBlockRef, counter: LLVMValueRef, updates: LaggedUpdates&, sum: LLVMValueRef) -> LaggedShape?:
+            first: LLVMValueRef = get window_phi(LLVMGetOperand(sum, 0), block, counter) else return null
+            second: LLVMValueRef = get window_phi(LLVMGetOperand(sum, 1), block, counter) else return null
+            return null if first == second
+            swapped: bool = not takes_from(first, block, second)
+            oldest: LLVMValueRef = second if swapped else first
+            next: LLVMValueRef = first if swapped else second
+            return null if not takes_from(oldest, block, next)
+            if updates.phis == 3:
+                return LaggedShape{factor: LaggedRecurrenceLimit::ROTATION, affine: null} if takes_from(next, block, sum)
+                return null
+            return null if updates.phis != 4
+            incoming: LLVMValueRef = get phi_incoming_for_block(next, block) else return null
+            newest: LLVMValueRef = get window_phi(incoming, block, counter) else return null
+            return null if newest == oldest or newest == next or not takes_from(newest, block, sum)
+            LaggedShape{factor: LaggedRecurrenceLimit::THREE_STATE_ROTATION, affine: null}
+
+        # The counter of BLOCK's `icmp eq/ne counter, limit` self-loop: an i64 header phi
+        # stepping by one in BLOCK; with the step, compare and branch.
+        def lagged_counter(block: LLVMBasicBlockRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate]:
+            branch: LLVMValueRef = get conditional_terminator(block) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            size: u32 = instruction_count(block)
+            return null if size != LaggedRecurrenceLimit::SHORT_BLOCK and size != LaggedRecurrenceLimit::LONG_BLOCK
+            stay: u32 = 1 if predicate == LLVMIntPredicate::EQ else 0
+            return null if LLVMGetSuccessor(branch, stay) != block or LLVMGetSuccessor(branch, 1 - stay) == block
+            counter: LLVMValueRef = LLVMGetOperand(compare, 0)
+            return null if not is_llvm_instruction_with_opcode(counter, LLVMOpcode::PHI) or LLVMGetInstructionParent(counter) != block
+            return null if not is_llvm_integer_type(LLVMTypeOf(counter), 64) or LLVMCountIncoming(counter) != 2
+            step: LLVMValueRef = get phi_incoming_for_block(counter, block) else return null
+            return null if not is_llvm_instruction_with_opcode(step, LLVMOpcode::ADD) or LLVMGetInstructionParent(step) != block or LLVMGetOperand(step, 0) != counter
+            one: LLVMValueRef = LLVMGetOperand(step, 1)
+            return null if LLVMIsAConstantInt(one) == null or ElisaLLVMIsConstantOne(one) == 0
+            shape: darray[LLVMValueRef] = [counter, step, compare, branch]
+            shape
+
+        # `laggedRecurrenceUnrollFactor`: how far BLOCK's recurrence unrolls; none when it
+        # is not one.
+        def lagged_shape(block: LLVMBasicBlockRef) -> LaggedShape? can[Abort.Panic, Memory.Allocate]:
+            counted: darray[LLVMValueRef] = get lagged_counter(block) else return null
+            counter: LLVMValueRef = counted[0]
+            updates: LaggedUpdates = get lagged_updates(block, &counted) else return null
+            sum: LLVMValueRef = get updates.sum else return null
+            if updates.bias is bias:
+                return affine_shape(block, counter, &updates, sum, bias)
+            if updates.scale is scale:
+                return scaled_shape(block, counter, &updates, sum, scale)
+            plain_shape(block, counter, &updates, sum)
+
+        # `laggedRecurrenceSwitchTripBound`: the trips an entry switch allows when its
+        # default edge enters LOOP and switches on the loop's limit, from the limit's
+        # range on that edge; 0 when unknown.
+        def switch_trip_bound(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            entry: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return 0
+            dispatch: LLVMValueRef = get LLVMGetBasicBlockTerminator(entry) else return 0
+            return 0 if not is_llvm_instruction_with_opcode(dispatch, LLVMOpcode::SWITCH) or LLVMGetSwitchDefaultDest(dispatch) != header
+            branch: LLVMValueRef = get conditional_terminator(header) else return 0
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            counter: LLVMValueRef = LLVMGetOperand(compare, 0)
+            start: LLVMValueRef = get phi_incoming_for_block(counter, entry) else return 0
+            limit: LLVMValueRef = LLVMGetOperand(compare, 1)
+            return 0 if LLVMIsAConstantInt(start) == null or limit != LLVMGetOperand(dispatch, 0)
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, limit, entry, header, compare)
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(limit))
+            if ElisaLLVMConstantRangeIsEmpty(range) != 0:
+                ElisaLLVMDisposeConstantRange(range)
+                return 0
+            low: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMinimum(range, context)
+            high: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMaximum(range, context)
+            ElisaLLVMDisposeConstantRange(range)
+            return 0 if ElisaLLVMConstantIntCompare(LLVMIntPredicate::ULT, low, start) != 0 or ElisaLLVMConstantIntCompare(LLVMIntPredicate::EQ, high, LLVMConstAllOnes(LLVMTypeOf(high))) != 0
+            trips: LLVMValueRef = LLVMConstAdd(LLVMConstSub(high, start), LLVMConstInt(LLVMTypeOf(high), 1, 0))
+            return LaggedRecurrenceLimit::TRIP_CAP.u32() if ElisaLLVMConstantIntActiveBits(trips) > 64
+            count: u64 = LLVMConstIntGetZExtValue(trips)
+            return LaggedRecurrenceLimit::TRIP_CAP.u32() if count > LaggedRecurrenceLimit::TRIP_CAP
+            count.u32()
+
+        # The users of SUM besides CURRENT, when each is a single-input phi outside LOOP
+        # fed from HEADER.
+        def rebased_exits(sum: LLVMValueRef, current: LLVMValueRef, loop: ElisaLoopRef, header: LLVMBasicBlockRef) -> darray[LLVMValueRef]? can[Memory.Allocate]:
+            exits: mutable darray[LLVMValueRef] = []
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(sum)
+            while use_cursor is use |use_cursor, exits, current, loop, header|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                continue if user == current
+                return null if not is_llvm_instruction_with_opcode(user, LLVMOpcode::PHI) or ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(user)) != 0
+                return null if LLVMCountIncoming(user) != 1 or LLVMGetIncomingBlock(user, 0) != header
+                exits.push(user)
+            exits
+
+        # `rebaseLaggedRecurrence`: with wrapping arithmetic, starting both states C
+        # higher turns `previous + current + C` into `previous + current`; the loop's
+        # results subtract C again. False, changing nothing, when a seed is not a
+        # constant or the sum has other users.
+        def rebase_lagged_recurrence(recurrence: AffineLaggedRecurrence&, loop: ElisaLoopRef, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            entry: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return false
+            previous_seed: LLVMValueRef = get phi_incoming_for_block(recurrence.previous, entry) else return false
+            current_seed: LLVMValueRef = get phi_incoming_for_block(recurrence.current, entry) else return false
+            return false if LLVMIsAConstantInt(previous_seed) == null or LLVMIsAConstantInt(current_seed) == null
+            exits: darray[LLVMValueRef] = get rebased_exits(recurrence.sum, recurrence.current, loop, header) else return false
+            set_phi_incoming_for_block(recurrence.previous, entry, LLVMConstAdd(previous_seed, recurrence.offset))
+            set_phi_incoming_for_block(recurrence.current, entry, LLVMConstAdd(current_seed, recurrence.offset))
+            base: LLVMValueRef = LLVMGetOperand(recurrence.bias, 0)
+            for operand in 0..<2 |recurrence, base|:
+                LLVMSetOperand(recurrence.sum, operand.u32(), base) if LLVMGetOperand(recurrence.sum, operand.u32()) == recurrence.bias
+            LLVMInstructionEraseFromParent(recurrence.bias)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            for exit in exits |builder, recurrence|:
+                position_builder_before(builder, first_non_phi(LLVMGetInstructionParent(exit)))
+                restored: LLVMValueRef = LLVMBuildSub(builder, exit, recurrence.offset, "")
+                replace_uses_except(exit, restored, restored)
+            LLVMDisposeBuilder(builder)
+            true
+
+        # Peels the first iteration of a rotate-by-four loop (rebasing an offset sum
+        # first) and unrolls the loop by its rotation; the changes made, or none when the
+        # loop cannot be peeled or rebased.
+        def unroll_lagged_loop(loop: ElisaLoopRef, shape: LaggedShape&, analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 1 if ElisaLLVMSimplifyLoop(analyses, loop, 0) != 0 else 0
+            return changed if ElisaLLVMLoopIsSimplifyForm(loop) == 0
+            changed <- changed + 1 if ElisaLLVMFormLCSSA(analyses, loop) != 0
+            if shape.factor == LaggedRecurrenceLimit::ROTATION:
+                return changed if ElisaLLVMCanPeelLoop(loop) == 0
+                if shape.affine is affine:
+                    return changed if not rebase_lagged_recurrence(&affine, loop, context)
+                    ElisaLLVMForgetLoop(analyses, loop)
+                ElisaLLVMPeelLoop(analyses, loop, 1, 0, 1)
+                changed <- changed + 1
+            flags: u32 = ElisaUnrollFlag::FORCE + ElisaUnrollFlag::RUNTIME + ElisaUnrollFlag::ALLOW_EXPENSIVE_TRIP_COUNT + ElisaUnrollFlag::PRESERVE_LCSSA
+            return changed + 1 if ElisaLLVMUnrollLoop(analyses, loop, shape.factor, flags, LaggedRecurrenceLimit::EXPANSION_BUDGET) != ElisaUnrollResult::UNMODIFIED
+            changed
+
+        # The trips of BLOCK's loop when it is a top-level single-block loop without a
+        # loop ID: ScalarEvolution's maximum or, rotating by four, the entry switch's.
+        def lagged_loop_trips(loop: ElisaLoopRef, block: LLVMBasicBlockRef, factor: u32, analyses: ElisaFunctionAnalysesRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if ElisaLLVMLoopHeader(loop) != block or ElisaLLVMLoopParent(loop) != null or ElisaLLVMLoopGetLoopID(loop) != null or ElisaLLVMLoopBlockCount(loop) != 1
+            trips: u32 = ElisaLLVMSmallConstantMaxTripCount(analyses, loop)
+            return switch_trip_bound(loop, analyses) if trips == 0 and factor == LaggedRecurrenceLimit::ROTATION
+            trips
+
+        # The first block of FUNCTION holding a recurrence, unrolled when its loop
+        # qualifies; the changes made and the candidates seen, or none past the module's
+        # 32 candidates.
+        def unroll_function_lagged_recurrence(function: LLVMValueRef, context: LLVMContextRef, candidates: u32) -> LaggedProgress can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, function, context, candidates|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if lagged_shape(block) is shape:
+                    return LaggedProgress{changed: 0, candidates: candidates + 1} if candidates + 1 > LaggedRecurrenceLimit::CANDIDATES
+                    analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return LaggedProgress{changed: 0, candidates: candidates + 1}
+                    changed: mutable u32 = 0
+                    if ElisaLLVMLoopForBlock(analyses, block) is loop:
+                        trips: u32 = lagged_loop_trips(loop, block, shape.factor, analyses)
+                        if trips >= LaggedRecurrenceLimit::MINIMUM_TRIPS and trips <= LaggedRecurrenceLimit::MAXIMUM_TRIPS:
+                            changed <- unroll_lagged_loop(loop, &shape, analyses, context)
+                    ElisaLLVMDisposeFunctionAnalyses(analyses)
+                    return LaggedProgress{changed: changed, candidates: candidates + 1}
+            LaggedProgress{changed: 0, candidates: candidates}
+
+    public:
+        # `elisacoreUnrollLaggedRecurrences`: AArch64 modules only, functions of at most
+        # 24 blocks, at most 32 candidates a module.
+        def unroll_lagged_recurrences(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            changed: mutable u32 = 0
+            candidates: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, module, context, changed, candidates|:
+                function_cursor <- LLVMGetNextFunction(function)
+                continue if skipped_by_loop_pass_policy(function, module) or function_block_count(function) > LaggedRecurrenceLimit::FUNCTION_BLOCKS
+                progress: LaggedProgress = unroll_function_lagged_recurrence(function, context, candidates)
+                changed <- changed + progress.changed
+                candidates <- progress.candidates
+                break if candidates > LaggedRecurrenceLimit::CANDIDATES
+            changed

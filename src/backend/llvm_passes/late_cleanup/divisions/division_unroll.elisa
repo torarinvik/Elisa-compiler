@@ -1,0 +1,399 @@
+# Unrolls small loops that divide a value by a constant until it drops below the
+# divisor (or reaches zero), when the value's range on the entry edge bounds the trips.
+# The loop's tests and arithmetic checks stay: the range only picks the unroll count,
+# and LLVM's unroller keeps the runtime exits. With a defined seed and an inexact
+# division the loop also assumes the value never exceeds its entry maximum, and a
+# checked constant counter whose every update provably fits becomes an `add nsw`.
+include "../../ir/ir_editing.elisa"
+include "../../ir/llvm_ir_queries.elisa"
+include "../../ir/loop_metadata.elisa"
+include "../../ir/loop_pass_policy.elisa"
+include "../../ir/trap_blocks.elisa"
+include "../../../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+const module DivisionUnrollLimit:
+    TRIPS: u32 = 16
+    FUNCTION_INSTRUCTIONS: u32 = 800
+    LOOP_INSTRUCTIONS: u32 = 64
+    GROWTH_INSTRUCTIONS: u32 = 256
+    MODULE_GROWTH: u32 = 1024
+    FUNCTIONS: u32 = 32
+    LOOPS: u32 = 64
+    LOOP_ID_OPERANDS: usize = 64
+    DIVISOR_BITS: u32 = 32
+    # Bits beyond the counter's width that keep its widened sum exact.
+    COUNTER_HEADROOM: u32 = 6
+    EXPANSION_BUDGET: u32 = 1000
+
+# A loop that divides PHI by DIVISOR each trip, with at most BOUND trips from the
+# value INITIAL has on the edge from PREDECESSOR, where it is at most INITIAL_MAXIMUM.
+struct DivisionLoop:
+    loop: ElisaLoopRef
+    phi: LLVMValueRef
+    division: LLVMValueRef
+    initial: LLVMValueRef
+    predecessor: LLVMBasicBlockRef
+    divisor: u64
+    bound: u32
+    initial_maximum: LLVMValueRef
+    growth: u32
+
+# The header's conditional branch and its compare, and whether the compare is
+# `<u` (a test against the divisor, rather than against zero).
+struct DivisionExit:
+    branch: LLVMValueRef
+    compare: LLVMValueRef
+    threshold: bool
+
+# A checked counter's constant step and the counter value it adds to.
+struct CounterStep:
+    step: LLVMValueRef
+    counter: LLVMValueRef
+
+# A header counter phi whose checked add becomes an `add nsw`.
+struct FoldableCounter:
+    phi: LLVMValueRef
+    call: LLVMValueRef
+    step: CounterStep
+
+# How much of the module's budgets the pass has used, and what it changed.
+struct DivisionProgress:
+    growth: u32
+    functions: u32
+    loops: u32
+    changed: u32
+
+extend Backend:
+    private:
+        # A loop ID, if any, with at most 64 operands whose properties are all named
+        # and none of them an unroll setting.
+        def allows_division_unroll(loop: ElisaLoopRef, context: LLVMContextRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            raw_id: void& = get ElisaLLVMLoopGetLoopID(loop) else return true
+            operands: darray[LLVMValueRef] = metadata_node_operands(LLVMMetadataAsValue(context, raw_id.cast[LLVMMetadataRef]))
+            return false if operands.count > DivisionUnrollLimit::LOOP_ID_OPERANDS
+            for index in 1..<operands.count |operands|:
+                name: darray[u8] = get loop_property_name(operands[index]) else return false
+                return false if name_has_prefix(&name, "llvm.loop.unroll")
+            true
+
+        # A constant integer of at most 32 significant bits, as a word.
+        def small_constant_word(value: LLVMValueRef) -> u64? can[Abort.Panic]:
+            return null if LLVMIsAConstantInt(value) == null or ElisaLLVMConstantIntActiveBits(value) > DivisionUnrollLimit::DIVISOR_BITS
+            LLVMConstIntGetZExtValue(value)
+
+        # A cheap screen before any analysis: a `udiv` by a constant of at least 2 and a
+        # checked add, in a function of at most 800 instructions.
+        def may_hold_division_loop(function: LLVMValueRef, instructions: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if instructions > DivisionUnrollLimit::FUNCTION_INSTRUCTIONS
+            division: mutable bool = false
+            checked_add: mutable bool = false
+            signed_add: u32 = intrinsic_identifier("llvm.sadd.with.overflow")
+            unsigned_add: u32 = intrinsic_identifier("llvm.uadd.with.overflow")
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, division, checked_add, signed_add, unsigned_add|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, division, checked_add, signed_add, unsigned_add|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::UDIV):
+                        if small_constant_word(LLVMGetOperand(instruction, 1)) is divisor:
+                            division <- true if divisor >= 2
+                    if LLVMIsAIntrinsicInst(instruction) != null:
+                        identifier: u32 = called_intrinsic_id(instruction)
+                        checked_add <- true if identifier == signed_add or identifier == unsigned_add
+                    return true if division and checked_add
+            false
+
+        # A call of one of the six checked arithmetic intrinsics, without bundles and not
+        # convergent.
+        def is_plain_checked_arithmetic(call: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsAIntrinsicInst(call) == null or LLVMGetNumOperandBundles(call) != 0 or ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("convergent")) != 0
+            identifier: u32 = called_intrinsic_id(call)
+            names: darray[sview] = ["llvm.sadd.with.overflow", "llvm.ssub.with.overflow", "llvm.smul.with.overflow", "llvm.uadd.with.overflow", "llvm.usub.with.overflow", "llvm.umul.with.overflow"]
+            for name in names |identifier|:
+                return true if intrinsic_identifier(name) == identifier
+            false
+
+        # Whether the instruction rules a division loop out: memory, allocas, invokes and
+        # other control flow or side effects, or a call other than a trap or checked
+        # arithmetic.
+        def blocks_division_unroll(instruction: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            excluded: darray[u32] = [LLVMOpcode::LOAD, LLVMOpcode::STORE, LLVMOpcode::ATOMIC_RMW, LLVMOpcode::ATOMIC_COMPARE_EXCHANGE, LLVMOpcode::ALLOCA, LLVMOpcode::INVOKE, LLVMOpcode::CALL_BR, LLVMOpcode::VA_ARG, LLVMOpcode::FENCE, LLVMOpcode::INDIRECT_BR]
+            for code in excluded |opcode|:
+                return true if code == opcode
+            is_call_base(instruction) and not is_plain_trap_call(instruction) and not is_plain_checked_arithmetic(instruction)
+
+        def is_branch(instruction: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            opcode == LLVMOpcode::CONDITIONAL_BR or opcode == LLVMOpcode::UNCONDITIONAL_BR
+
+        # The loop's instruction count when it is a two-block innermost loop of branches
+        # and safe instructions with one exit edge to a block other than a trap, and at
+        # most 64 instructions; none otherwise.
+        def safe_division_loop_size(loop: ElisaLoopRef) -> u32? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if ElisaLLVMLoopBlockCount(loop) != 2 or ElisaLLVMLoopSubLoopCount(loop) != 0
+            instructions: mutable u32 = 0
+            exits: mutable u32 = 0
+            for index in 0..<2 |loop, instructions, exits|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, index.u32())
+                terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return null
+                return null if not is_branch(terminator)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, loop, instructions, exits|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    instructions <- instructions + 1
+                    return null if blocks_division_unroll(instruction)
+                    if is_branch(instruction):
+                        for successor in 0..<LLVMGetNumSuccessors(instruction) |instruction, loop, exits|:
+                            target: LLVMBasicBlockRef = LLVMGetSuccessor(instruction, successor)
+                            exits <- exits + 1 if ElisaLLVMLoopContainsBlock(loop, target) == 0 and not is_bare_trap_block(target)
+            return null if instructions > DivisionUnrollLimit::LOOP_INSTRUCTIONS or exits != 1
+            instructions
+
+        # The trips a value of at most MAXIMUM takes to leave: dividing by DIVISOR until
+        # it drops below the divisor (THRESHOLD) or reaches zero. More than 16 means too
+        # many.
+        def division_trips(maximum: LLVMValueRef, divisor: u64, threshold: bool) -> u32 can[Abort.Panic]:
+            divisor_value: LLVMValueRef = LLVMConstInt(LLVMTypeOf(maximum), divisor, 0)
+            current: mutable LLVMValueRef = maximum
+            trips: mutable u32 = 0
+            while trips <= DivisionUnrollLimit::TRIPS |current, trips, divisor_value, threshold|:
+                staying: bool = ElisaLLVMConstantIntCompare(LLVMIntPredicate::UGE, current, divisor_value) != 0 if threshold else LLVMIsNull(current) == 0
+                break if not staying
+                trips <- trips + 1
+                current <- ElisaLLVMConstantIntUnsignedDivide(current, divisor_value)
+            trips
+
+        # PHI's exit test in the header: `phi <u divisor` leaving the loop, or
+        # `phi != 0` staying in it.
+        def division_exit(phi: LLVMValueRef, divisor: u64, exit: DivisionExit&, loop: ElisaLoopRef) -> bool can[Abort.Panic]:
+            compare: LLVMValueRef = exit.compare
+            return false if LLVMGetOperand(compare, 0) != phi and LLVMGetOperand(compare, 1) != phi
+            other: LLVMValueRef = LLVMGetOperand(compare, 0) if LLVMGetOperand(compare, 1) == phi else LLVMGetOperand(compare, 1)
+            true_stays: bool = ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(exit.branch, 0)) != 0
+            if exit.threshold:
+                return false if LLVMGetOperand(compare, 0) != phi
+                limit: u64 = get small_constant_word(other) else return false
+                return limit == divisor and not true_stays
+            return false if LLVMGetICmpPredicate(compare) != LLVMIntPredicate::NE
+            LLVMIsAConstantInt(other) != null and LLVMIsNull(other) != 0 and true_stays
+
+        # The header's conditional branch on an integer compare with one successor in the
+        # loop, classified by predicate; none for other predicates.
+        def header_exit(header: LLVMBasicBlockRef, loop: ElisaLoopRef) -> DivisionExit? can[Abort.Panic]:
+            branch: LLVMValueRef = get conditional_terminator(header) else return null
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP)
+            first_inside: bool = ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 0)) != 0
+            return null if first_inside == (ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1)) != 0)
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            DivisionExit{branch: branch, compare: compare, threshold: predicate == LLVMIntPredicate::ULT}
+
+        # A header phi `phi = phi udiv divisor` from inside the loop, with its exit test,
+        # and the trips its range on the entry edge allows.
+        def division_phi_candidate(phi: LLVMValueRef, loop: ElisaLoopRef, predecessor: LLVMBasicBlockRef, exit: DivisionExit&, instructions: u32, analyses: ElisaFunctionAnalysesRef) -> DivisionLoop? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if LLVMCountIncoming(phi) != 2
+            entry_index: i64 = phi_incoming_index(phi, predecessor)
+            return null if entry_index < 0
+            back_index: u32 = 1 - entry_index.u32()
+            back_block: LLVMBasicBlockRef = LLVMGetIncomingBlock(phi, back_index)
+            return null if ElisaLLVMLoopContainsBlock(loop, back_block) == 0
+            division: LLVMValueRef = LLVMGetIncomingValue(phi, back_index)
+            return null if not is_llvm_instruction_with_opcode(division, LLVMOpcode::UDIV) or LLVMGetOperand(division, 0) != phi or LLVMGetInstructionParent(division) != back_block
+            divisor: u64 = get small_constant_word(LLVMGetOperand(division, 1)) else return null
+            return null if divisor < 2
+            return null if not division_exit(phi, divisor, exit, loop)
+            initial: LLVMValueRef = LLVMGetIncomingValue(phi, entry_index.u32())
+            header: LLVMBasicBlockRef = LLVMGetInstructionParent(phi)
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, initial, predecessor, header, LLVMGetBasicBlockTerminator(predecessor))
+            if ElisaLLVMConstantRangeIsEmpty(range) != 0 or ElisaLLVMConstantRangeIsFull(range) != 0 or ElisaLLVMConstantRangeBitWidth(range) == 0:
+                ElisaLLVMDisposeConstantRange(range)
+                return null
+            initial_maximum: LLVMValueRef = ElisaLLVMConstantRangeUnsignedMaximum(range, LLVMGetTypeContext(LLVMTypeOf(phi)))
+            ElisaLLVMDisposeConstantRange(range)
+            trips: u32 = division_trips(initial_maximum, divisor, exit.threshold)
+            return null if trips == 0 or trips > DivisionUnrollLimit::TRIPS
+            count: u32 = trips + 1 if trips + 1 < DivisionUnrollLimit::TRIPS else DivisionUnrollLimit::TRIPS
+            growth: u32 = (instructions + 2) * (count - 1) + 2
+            return null if growth > DivisionUnrollLimit::GROWTH_INSTRUCTIONS
+            DivisionLoop{loop: loop, phi: phi, division: division, initial: initial, predecessor: predecessor, divisor: divisor, bound: trips, initial_maximum: initial_maximum, growth: growth}
+
+        # LOOP's first header phi that is a bounded division recurrence.
+        def division_loop_candidate(loop: ElisaLoopRef, context: LLVMContextRef, analyses: ElisaFunctionAnalysesRef) -> DivisionLoop? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return null
+            return null if not allows_division_unroll(loop, context)
+            instructions: u32 = get safe_division_loop_size(loop) else return null
+            exit: DivisionExit = get header_exit(header, loop) else return null
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(header)
+            while cursor is phi |cursor, loop, predecessor, exit, instructions, analyses|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                if division_phi_candidate(phi, loop, predecessor, &exit, instructions, analyses) is found:
+                    return found
+            null
+
+        # The start of a `{start, false}` constant counter seed.
+        def constant_counter_start(initial: LLVMValueRef) -> LLVMValueRef?:
+            return null if LLVMIsAConstant(initial) == null
+            start: LLVMValueRef = get LLVMGetAggregateElement(initial, 0) else return null
+            flag: LLVMValueRef = get LLVMGetAggregateElement(initial, 1) else return null
+            return null if LLVMIsAConstantInt(start) == null or LLVMIsAConstantInt(flag) == null or LLVMIsNull(flag) == 0
+            start
+
+        # A `{iN, i1}` phi of two inputs.
+        def is_checked_pair_phi(phi: LLVMValueRef) -> bool:
+            type: LLVMTypeRef = LLVMTypeOf(phi)
+            return false if LLVMGetTypeKind(type) != LLVMTypeKindValue::STRUCT or LLVMCountStructElementTypes(type) != 2
+            is_llvm_integer_type(LLVMStructGetTypeAtIndex(type, 0), 0) and is_llvm_integer_type(LLVMStructGetTypeAtIndex(type, 1), 1) and LLVMCountIncoming(phi) == 2
+
+        # The constant step of `sadd.with.overflow(extractvalue phi 0, step)`, either way
+        # round, and the counter it adds to.
+        def counter_step(call: LLVMValueRef, phi: LLVMValueRef) -> CounterStep? can[Abort.Panic]:
+            found: mutable CounterStep? = null
+            for index in 0..<2 |call, phi, found|:
+                step: LLVMValueRef = LLVMGetOperand(call, index.u32())
+                counter: LLVMValueRef = LLVMGetOperand(call, 1 - index.u32())
+                if LLVMIsAConstantInt(step) != null and is_llvm_instruction_with_opcode(counter, LLVMOpcode::EXTRACT_VALUE):
+                    found <- CounterStep{step: step, counter: counter} if LLVMGetOperand(counter, 0) == phi and is_extract_of_field(counter, 0)
+            found
+
+        # Whether START plus BOUND steps of STEP stays in the counter's width, computed
+        # six bits wider.
+        def counter_stays_in_range(start: LLVMValueRef, step: LLVMValueRef, bound: u32) -> bool can[Abort.Panic]:
+            width: u32 = LLVMGetIntTypeWidth(LLVMTypeOf(start))
+            wide: u32 = width + DivisionUnrollLimit::COUNTER_HEADROOM
+            first: LLVMValueRef = ElisaLLVMConstantIntSignExtend(start, wide)
+            steps: LLVMValueRef = ElisaLLVMConstantIntMultiply(ElisaLLVMConstantIntSignExtend(step, wide), LLVMConstInt(LLVMTypeOf(first), bound.u64(), 0))
+            last: LLVMValueRef = LLVMConstAdd(first, steps)
+            ElisaLLVMConstantIntIsSignedIntN(first, width) != 0 and ElisaLLVMConstantIntIsSignedIntN(last, width) != 0
+
+        # The checked add feeding a header counter phi seeded with `{start, false}`, from
+        # the block it flows back from, when BOUND steps of it fit.
+        def foldable_counter(phi: LLVMValueRef, predecessor: LLVMBasicBlockRef, bound: u32, signed_add: u32) -> FoldableCounter? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if not is_checked_pair_phi(phi)
+            initial_index: i64 = phi_incoming_index(phi, predecessor)
+            return null if initial_index < 0
+            start: LLVMValueRef = get constant_counter_start(LLVMGetIncomingValue(phi, initial_index.u32())) else return null
+            back_index: u32 = 1 - initial_index.u32()
+            call: LLVMValueRef = LLVMGetIncomingValue(phi, back_index)
+            return null if LLVMIsAIntrinsicInst(call) == null or called_intrinsic_id(call) != signed_add or LLVMGetNumOperandBundles(call) != 0
+            return null if ElisaLLVMCallHasFunctionAttribute(call, attribute_kind("convergent")) != 0 or LLVMGetInstructionParent(call) != LLVMGetIncomingBlock(phi, back_index)
+            found: CounterStep = get counter_step(call, phi) else return null
+            return null if not counter_stays_in_range(start, found.step, bound)
+            FoldableCounter{phi: phi, call: call, step: found}
+
+        # `add nsw counter, step` packed with a false flag in place of the checked add.
+        def fold_counter(counter: FoldableCounter&, builder: LLVMBuilderRef) -> void can[Abort.Panic, Memory.Allocate]:
+            position_builder_before(builder, counter.call)
+            name_storage: mutable darray[u8] = []
+            sum: LLVMValueRef = LLVMBuildNSWAdd(builder, counter.step.counter, counter.step.step, sview_to_cstr("bounded.counter", name_storage))
+            type: LLVMTypeRef = LLVMTypeOf(counter.phi)
+            pair: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetPoison(type), sum, 0, "")
+            flagged: LLVMValueRef = LLVMBuildInsertValue(builder, pair, LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(type)), 0, 0), 1, "")
+            LLVMReplaceAllUsesWith(counter.call, flagged)
+
+        # `BDU_FoldCheckedCounter`: the header's checked constant counters whose BOUND
+        # updates fit become plain `add nsw`; how many.
+        def fold_checked_counters(loop: ElisaLoopRef, bound: u32, context: LLVMContextRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            predecessor: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return 0
+            signed_add: u32 = intrinsic_identifier("llvm.sadd.with.overflow")
+            folded: mutable darray[LLVMValueRef] = []
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopHeader(loop))
+            while cursor is phi |cursor, folded, predecessor, bound, signed_add, builder|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                if foldable_counter(phi, predecessor, bound, signed_add) is counter:
+                    fold_counter(&counter, builder)
+                    folded.push(counter.call)
+            LLVMDisposeBuilder(builder)
+            for call in folded:
+                LLVMInstructionEraseFromParent(call)
+            folded.count.u32()
+
+        # Whether VALUE is `phi udiv divisor` by the constant DIVISOR.
+        def divides_phi_by(value: LLVMValueRef?, phi: LLVMValueRef, divisor: u64) -> bool can[Abort.Panic]:
+            division: LLVMValueRef = get value else return false
+            return false if not is_llvm_instruction_with_opcode(division, LLVMOpcode::UDIV) or LLVMGetOperand(division, 0) != phi
+            divisor_value: LLVMValueRef = LLVMGetOperand(division, 1)
+            return false if LLVMIsAConstantInt(divisor_value) == null
+            ElisaLLVMConstantIntCompare(LLVMIntPredicate::EQ, divisor_value, LLVMConstInt(LLVMTypeOf(divisor_value), divisor, 0)) != 0
+
+        # The header phi dividing itself by DIVISOR from inside LOOP, after normalization.
+        def division_recurrence(loop: ElisaLoopRef, divisor: u64) -> LLVMValueRef? can[Abort.Panic]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopHeader(loop))
+            while cursor is phi |cursor, loop, divisor|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                continue if LLVMCountIncoming(phi) != 2
+                inside: mutable LLVMValueRef? = null
+                for index in 0..<2 |phi, loop, inside|:
+                    inside <- LLVMGetIncomingValue(phi, index.u32()) if ElisaLLVMLoopContainsBlock(loop, LLVMGetIncomingBlock(phi, index.u32())) != 0
+                return phi if divides_phi_by(inside, phi, divisor)
+            null
+
+        # `phi <=u initial_maximum` assumed before the header's branch, and registered
+        # with the assumption cache.
+        def assume_division_invariant(candidate: DivisionLoop&, analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef, module: LLVMModuleRef) -> void can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(ElisaLLVMLoopHeader(candidate.loop)) else return
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            position_builder_before(builder, terminator)
+            valid: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::ULE, candidate.phi, candidate.initial_maximum, "")
+            ElisaLLVMRegisterAssumption(analyses, build_assumption(builder, module, valid))
+            LLVMDisposeBuilder(builder)
+
+        # The changes made to CANDIDATE: the invariant and counter folds when its seed is
+        # defined, loop-simplify and LCSSA form, then the unroll. Whatever happens, the
+        # function's analyses are stale afterwards.
+        def unroll_division_candidate(candidate: DivisionLoop&, analyses: ElisaFunctionAnalysesRef, context: LLVMContextRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            loop: ElisaLoopRef = candidate.loop
+            entry_branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(candidate.predecessor) else return 0
+            defined: bool = LLVMGetExact(candidate.division) == 0 and ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(analyses, candidate.initial, entry_branch) != 0
+            changed: mutable u32 = fold_checked_counters(loop, candidate.bound, context) if defined else 0
+            if defined:
+                assume_division_invariant(candidate, analyses, context, module)
+                changed <- changed + 1
+                ElisaLLVMForgetLoop(analyses, loop)
+            normalized: mutable bool = ElisaLLVMSimplifyLoop(analyses, loop, 0) != 0
+            if ElisaLLVMLoopIsSimplifyForm(loop) != 0:
+                normalized <- ElisaLLVMFormLCSSA(analyses, loop) != 0 or normalized
+            changed <- changed + 1 if normalized
+            return changed if ElisaLLVMLoopIsSimplifyForm(loop) == 0 or division_recurrence(loop, candidate.divisor) == null
+            count: u32 = candidate.bound + 1 if candidate.bound + 1 < DivisionUnrollLimit::TRIPS else DivisionUnrollLimit::TRIPS
+            flags: u32 = ElisaUnrollFlag::UNROLL_REMAINDER + ElisaUnrollFlag::RUNTIME_MULTI_EXIT + ElisaUnrollFlag::PRESERVE_LCSSA
+            return changed + 1 if ElisaLLVMUnrollLoop(analyses, loop, count, flags, DivisionUnrollLimit::EXPANSION_BUDGET) != ElisaUnrollResult::UNMODIFIED
+            changed
+
+        # FUNCTION's top-level loops in LoopInfo order until the first candidate that fits
+        # the module's growth budget is unrolled (its analyses are stale after that).
+        def unroll_function_division_loop(function: LLVMValueRef, module: LLVMModuleRef, progress: DivisionProgress) -> DivisionProgress can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return progress
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            current: mutable DivisionProgress = progress
+            for index in 0..<ElisaLLVMTopLevelLoopCount(analyses) |analyses, context, module, current|:
+                current <- DivisionProgress{growth: current.growth, functions: current.functions, loops: current.loops + 1, changed: current.changed}
+                break if current.loops > DivisionUnrollLimit::LOOPS
+                if division_loop_candidate(ElisaLLVMTopLevelLoopAt(analyses, index), context, analyses) is candidate:
+                    if current.growth + candidate.growth <= DivisionUnrollLimit::MODULE_GROWTH:
+                        changed: u32 = unroll_division_candidate(&candidate, analyses, context, module)
+                        current <- DivisionProgress{growth: current.growth + candidate.growth, functions: current.functions, loops: current.loops, changed: current.changed + changed}
+                        break
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            current
+
+    public:
+        # `elisacoreUnrollBoundedDivisionLoops`: at most 32 screened functions and 64
+        # top-level loops a module, and at most 1024 instructions of growth.
+        def unroll_bounded_division_loops(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            progress: mutable DivisionProgress = DivisionProgress{growth: 0, functions: 0, loops: 0, changed: 0}
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, module, progress|:
+                function_cursor <- LLVMGetNextFunction(function)
+                break if progress.loops >= DivisionUnrollLimit::LOOPS
+                continue if skipped_by_loop_pass_policy(function, module) or not may_hold_division_loop(function, function_instruction_count(function))
+                progress <- DivisionProgress{growth: progress.growth, functions: progress.functions + 1, loops: progress.loops, changed: progress.changed}
+                break if progress.functions > DivisionUnrollLimit::FUNCTIONS
+                progress <- unroll_function_division_loop(function, module, progress)
+            progress.changed

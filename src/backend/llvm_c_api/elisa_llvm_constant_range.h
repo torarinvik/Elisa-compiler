@@ -106,6 +106,10 @@ int ElisaLLVMConstantRangeSignedAddNeverOverflows(ElisaConstantRangeRef first, E
 LLVMValueRef ElisaLLVMConstantIntSignExtend(LLVMValueRef constant, uint32_t width);
 LLVMValueRef ElisaLLVMConstantIntTruncate(LLVMValueRef constant, uint32_t width);
 int ElisaLLVMConstantIntIsSignedIntN(LLVMValueRef constant, uint32_t bits);
+/* ICmpInst::compare(first, second, predicate) and the unsigned quotient, on
+ * ConstantInts of one width (elisa_llvm_analysis has the active bits and product). */
+int ElisaLLVMConstantIntCompare(LLVMIntPredicate predicate, LLVMValueRef first, LLVMValueRef second);
+LLVMValueRef ElisaLLVMConstantIntUnsignedDivide(LLVMValueRef first, LLVMValueRef second);
 void ElisaLLVMDisposeConstantRange(ElisaConstantRangeRef range);
 
 #ifdef __cplusplus

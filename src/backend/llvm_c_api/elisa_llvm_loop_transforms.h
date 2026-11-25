@@ -17,6 +17,12 @@ uint32_t ElisaLLVMTopLevelLoopCount(ElisaFunctionAnalysesRef analyses);
 ElisaLoopRef ElisaLLVMTopLevelLoopAt(ElisaFunctionAnalysesRef analyses, uint32_t index);
 ElisaLoopRef ElisaLLVMLoopSubLoopAt(ElisaLoopRef loop, uint32_t index);
 
+/* ScalarEvolution::forgetLoop(loop), when the analyses have built ScalarEvolution. */
+void ElisaLLVMForgetLoop(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop);
+/* AssumptionCache::registerAssumption of the `llvm.assume` call, when the analyses have
+ * built the cache (one built later finds it anyway). */
+void ElisaLLVMRegisterAssumption(ElisaFunctionAnalysesRef analyses, LLVMValueRef assume);
+
 /* Loop::isLoopSimplifyForm. */
 int ElisaLLVMLoopIsSimplifyForm(ElisaLoopRef loop);
 /* simplifyLoop(L, DT, LI, SE, AC, nullptr, preserve_lcssa): whether it changed the IR. */

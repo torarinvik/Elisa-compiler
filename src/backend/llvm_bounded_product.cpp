@@ -1,8 +1,55 @@
 // Preserve overflow traps unless an inductive loop bound and widened
 // interval products prove every intermediate result fits signed arithmetic.
-#include "llvm_bounded_division_unroll.cpp"
+#include <algorithm>
+#include "llvm_loop_pass_policy.h"
+#include <llvm/Config/llvm-config.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/ConstantRange.h>
+#include <llvm/Analysis/LazyValueInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/OptimizationRemarkEmitter.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Transforms/Utils/LoopUtils.h>
+#include <llvm/Transforms/Utils/LoopPeel.h>
+#include <llvm/Transforms/Utils/ValueMapper.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Transforms/Utils/UnrollLoop.h>
+#include <llvm/Support/CBindingWrapping.h>
 #if LLVM_VERSION_MAJOR >= 23
+using namespace llvm;
+
 namespace {
+// Cheap gate before building analyses: a udiv by a constant of at least 2 and a
+// checked add, in a function of at most 800 instructions.
+static bool BDU_MayContainCandidate(const Function &F, unsigned FunctionInsts) {
+  if (FunctionInsts > 800) return false;
+  bool HasDiv = false, HasCheckedAdd = false;
+  for (const BasicBlock &BB : F) for (const Instruction &I : BB) {
+    if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (BO->getOpcode() == Instruction::UDiv) {
+        auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+        if (C && C->getValue().getActiveBits() <= 32 && C->getZExtValue() >= 2)
+          HasDiv = true;
+      }
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getIntrinsicID() == Intrinsic::sadd_with_overflow ||
+          II->getIntrinsicID() == Intrinsic::uadd_with_overflow)
+        HasCheckedAdd = true;
+    if (HasDiv && HasCheckedAdd) return true;
+  }
+  return false;
+}
 // Range composition is not a definedness proof: flagged arithmetic is
 // checked separately, using only ranges of operands already proved defined.
 static ConstantRange BDP_Range(Value *V, Instruction *Context,
