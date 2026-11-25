@@ -202,6 +202,10 @@ int ElisaLLVMHasMetadataOtherThanDebugLoc(LLVMValueRef instruction) {
   return cast<Instruction>(unwrap(instruction))->hasMetadataOtherThanDebugLoc();
 }
 
+int ElisaLLVMGlobalHasDefinitiveInitializer(LLVMValueRef global) {
+  return cast<GlobalVariable>(unwrap(global))->hasDefinitiveInitializer();
+}
+
 int ElisaLLVMIsConstantOne(LLVMValueRef value) {
   return PatternMatch::match(unwrap(value), PatternMatch::m_One());
 }
@@ -432,7 +436,7 @@ ElisaConstantRangeRef ElisaLLVMLazyValueConstantRangeOnEdge(ElisaFunctionAnalyse
                                                             LLVMValueRef value, LLVMBasicBlockRef from,
                                                             LLVMBasicBlockRef to, LLVMValueRef context) {
   ConstantRange Range = unwrapAnalyses(analyses)->lazyValueInfo().getConstantRangeOnEdge(
-      unwrap(value), unwrap(from), unwrap(to), cast<Instruction>(unwrap(context)));
+      unwrap(value), unwrap(from), unwrap(to), dyn_cast_or_null<Instruction>(unwrap(context)));
   return reinterpret_cast<ElisaConstantRangeRef>(new ConstantRange(std::move(Range)));
 }
 

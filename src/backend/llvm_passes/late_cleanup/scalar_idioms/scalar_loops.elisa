@@ -1,0 +1,213 @@
+# Single-block loops whose result has a closed form.
+#
+# A carry loop `while y != 0: (x, y) = (x ^ y, (x & y) << 1)` leaves `x + y`. A loop
+# shifting away the low zero bits of a seed LazyValueInfo proves nonzero runs `cttz(seed)`
+# times, before or after testing bit zero. The threshold search lives in
+# threshold_searches.elisa.
+
+const module ScalarLoopLimit:
+    TRAILING_ZERO_LOOP_INSTRUCTIONS: u32 = 7
+
+# A loop's iteration count phi and its increment; `found` is false for a loop without one.
+struct IterationCounter:
+    found: bool
+    count: LLVMValueRef
+    increment: LLVMValueRef
+
+extend Backend:
+    private:
+        def has_use_count(value: LLVMValueRef, count: u32) -> bool:
+            use_count(value) == count
+
+        # PHI's value for BLOCK when PHI is a two-entry phi of LOOP.
+        def loop_phi_incoming(phi: LLVMValueRef, block: LLVMBasicBlockRef) -> LLVMValueRef?:
+            phi_incoming_for_block(phi, block)
+
+        # The block a two-entry phi of LOOP enters from.
+        def phi_entry_block(phi: LLVMValueRef, loop: LLVMBasicBlockRef) -> LLVMBasicBlockRef:
+            LLVMGetIncomingBlock(phi, 1 if LLVMGetIncomingBlock(phi, 0) == loop else 0)
+
+        # The successor a loop's back branch leaves through: the one that is not the loop.
+        def scalar_loop_exit(branch: LLVMValueRef, loop: LLVMBasicBlockRef) -> LLVMBasicBlockRef?:
+            return null if ElisaLLVMHasMetadataOtherThanDebugLoc(branch) != 0
+            first: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            second: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 1)
+            return second if first == loop and second != loop
+            return first if second == loop and first != loop
+            null
+
+        # A single-use `value ==/!= 0` compare on which BRANCH takes TAKEN when it holds:
+        # its tested value.
+        def zero_test_operand(branch: LLVMValueRef, taken: LLVMBasicBlockRef) -> LLVMValueRef?:
+            test: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(test, LLVMOpcode::ICMP) or not has_one_use(test)
+            predicate: i32 = LLVMGetICmpPredicate(test)
+            return null if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            return null if LLVMGetSuccessor(branch, 0 if predicate == LLVMIntPredicate::EQ else 1) != taken
+            LLVMGetOperand(test, 0)
+
+        # Replaces the loop's back branch by a branch to EXIT, built at the old branch.
+        def close_scalar_loop(branch: LLVMValueRef, exit: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> void:
+            test: LLVMValueRef = LLVMGetCondition(branch)
+            LLVMBuildBr(builder, exit)
+            LLVMInstructionEraseFromParent(branch)
+            LLVMInstructionEraseFromParent(test)
+
+        # (x xor y) + 2 * (x and y) == x + y modulo the width. Each iteration shifts the
+        # remaining carry left, so the loop terminates.
+        def fold_carry_addition(loop: LLVMBasicBlockRef, branch: LLVMValueRef, exit: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            tested: LLVMValueRef = get zero_test_operand(branch, exit) else return 0
+            test: LLVMValueRef = LLVMGetCondition(branch)
+            carry: LLVMValueRef = get block_binary_operator(tested, LLVMOpcode::SHL, loop) else return 0
+            return 0 if not is_constant_integer(LLVMGetOperand(test, 1), 0) or not is_constant_integer(LLVMGetOperand(carry, 1), 1) or not has_use_count(carry, 2)
+            return 0 if not is_llvm_integer_type(LLVMTypeOf(carry), 0) or is_llvm_integer_type(LLVMTypeOf(carry), 1)
+            both: LLVMValueRef = get block_binary_operator(LLVMGetOperand(carry, 0), LLVMOpcode::AND, loop) else return 0
+            return 0 if not has_one_use(both)
+            first: LLVMValueRef = LLVMGetOperand(both, 0)
+            second: LLVMValueRef = LLVMGetOperand(both, 1)
+            return 0 if not is_carry_phi(first, loop) or not is_carry_phi(second, loop) or first == second
+            first_back: LLVMValueRef = get loop_phi_incoming(first, loop) else return 0
+            sum_phi: LLVMValueRef = second if first_back == carry else first
+            carry_phi: LLVMValueRef = first if first_back == carry else second
+            carry_back: LLVMValueRef = get loop_phi_incoming(carry_phi, loop) else return 0
+            return 0 if carry_back != carry
+            sum_back: LLVMValueRef = get loop_phi_incoming(sum_phi, loop) else return 0
+            sum_bits: LLVMValueRef = get block_binary_operator(sum_back, LLVMOpcode::XOR, loop) else return 0
+            return 0 if not has_operand_pair(sum_bits, sum_phi, carry_phi)
+            entry: LLVMBasicBlockRef = phi_entry_block(sum_phi, loop)
+            return 0 if entry == loop
+            initial_sum: LLVMValueRef = get loop_phi_incoming(sum_phi, entry) else return 0
+            initial_carry: LLVMValueRef = get loop_phi_incoming(carry_phi, entry) else return 0
+            position_builder_before(builder, branch)
+            empty_storage: mutable darray[u8] = []
+            unnamed: cstr = sview_to_cstr("", empty_storage)
+            left: LLVMValueRef = LLVMBuildFreeze(builder, initial_sum, unnamed)
+            right: LLVMValueRef = LLVMBuildFreeze(builder, initial_carry, unnamed)
+            sum_storage: mutable darray[u8] = []
+            sum: LLVMValueRef = LLVMBuildAdd(builder, left, right, sview_to_cstr("carry.sum", sum_storage))
+            close_scalar_loop(branch, exit, builder)
+            ElisaLLVMRemoveIncomingForBlock(sum_phi, loop)
+            ElisaLLVMRemoveIncomingForBlock(carry_phi, loop)
+            LLVMReplaceAllUsesWith(sum_bits, sum)
+            erase_instructions([sum_bits, carry, both, sum_phi, carry_phi])
+            1
+
+        # A two-entry phi of LOOP used twice: by the carry's `and` and the sum's `xor`.
+        def is_carry_phi(value: LLVMValueRef, loop: LLVMBasicBlockRef) -> bool:
+            is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI) and LLVMGetInstructionParent(value) == loop and LLVMCountIncoming(value) == 2 and has_use_count(value, 2)
+
+        def erase_instructions(instructions: darray[LLVMValueRef]) -> void:
+            for instruction in instructions:
+                LLVMInstructionEraseFromParent(instruction)
+
+        # The phi of LOOP other than WORD counting its iterations from zero by one, and its
+        # increment; `found` is false when LOOP has no other phi. Null when another phi does
+        # anything else.
+        def trailing_zero_counter(loop: LLVMBasicBlockRef, word: LLVMValueRef, entry: LLVMBasicBlockRef) -> IterationCounter?:
+            counter: mutable IterationCounter = IterationCounter{found: false, count: word, increment: word}
+            cursor: mutable LLVMValueRef? = leading_phi(LLVMGetFirstInstruction(loop))
+            while cursor is phi |cursor, counter, loop, word, entry|:
+                cursor <- leading_phi(LLVMGetNextInstruction(phi))
+                if phi != word:
+                    return null if counter.found or LLVMTypeOf(phi) != LLVMTypeOf(word) or LLVMCountIncoming(phi) != 2
+                    initial: LLVMValueRef = get loop_phi_incoming(phi, entry) else return null
+                    return null if not is_constant_integer(initial, 0)
+                    back: LLVMValueRef? = loop_phi_incoming(phi, loop)
+                    increment: LLVMValueRef = get block_binary_operator(back, LLVMOpcode::ADD, loop) else return null
+                    return null if LLVMGetOperand(increment, 0) != phi or not is_constant_integer(LLVMGetOperand(increment, 1), 1)
+                    counter <- IterationCounter{found: true, count: phi, increment: increment}
+            counter
+
+        # Whether LOOP holds only the matched instructions, none with metadata beyond a
+        # debug location.
+        def holds_only(loop: LLVMBasicBlockRef, allowed: darray[LLVMValueRef]&) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(loop)
+            while cursor is instruction |cursor, allowed|:
+                return false if not (any member in allowed where member == instruction) or ElisaLLVMHasMetadataOtherThanDebugLoc(instruction) != 0
+                cursor <- LLVMGetNextInstruction(instruction)
+            true
+
+        # Whether LazyValueInfo, built fresh, keeps SEED nonzero entering LOOP from ENTRY.
+        def proves_nonzero_seed(seed: LLVMValueRef, entry: LLVMBasicBlockRef, loop: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(entry) else return false
+            ElisaLLVMForgetValueAnalyses(analyses)
+            at_entry: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, seed, terminator, 0)
+            on_edge: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRangeOnEdge(analyses, seed, entry, loop, null)
+            range: ElisaConstantRangeRef = ElisaLLVMConstantRangeIntersect(at_entry, on_edge)
+            proven: bool = ElisaLLVMConstantRangeIsEmpty(range) == 0 and ElisaLLVMConstantRangeContains(range, 0) == 0
+            ElisaLLVMDisposeConstantRange(at_entry)
+            ElisaLLVMDisposeConstantRange(on_edge)
+            ElisaLLVMDisposeConstantRange(range)
+            proven
+
+        # A self-loop that shifts away low zero bits terminates after cttz(seed) shifts for
+        # a nonzero seed: a pre-test of bit zero, or a post-test of bit one paired with an
+        # exact shift.
+        def fold_trailing_zero_loop(loop: LLVMBasicBlockRef, branch: LLVMValueRef, exit: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            tested: LLVMValueRef = get zero_test_operand(branch, loop) else return false
+            test: LLVMValueRef = LLVMGetCondition(branch)
+            return false if not is_constant_integer(LLVMGetOperand(test, 1), 0)
+            bit: LLVMValueRef = get block_binary_operator(tested, LLVMOpcode::AND, loop) else return false
+            return false if not has_one_use(bit)
+            post: bool = is_constant_integer(LLVMGetOperand(bit, 1), 2)
+            return false if not post and not is_constant_integer(LLVMGetOperand(bit, 1), 1)
+            word: LLVMValueRef = LLVMGetOperand(bit, 0)
+            return false if not is_llvm_instruction_with_opcode(word, LLVMOpcode::PHI) or LLVMGetInstructionParent(word) != loop or LLVMCountIncoming(word) != 2
+            return false if not is_word_or_double_word(LLVMTypeOf(word))
+            entry: LLVMBasicBlockRef = phi_entry_block(word, loop)
+            shift: LLVMValueRef = get block_binary_operator(loop_phi_incoming(word, loop), LLVMOpcode::LSHR, loop) else return false
+            return false if entry == loop or LLVMGetOperand(shift, 0) != word or not is_constant_integer(LLVMGetOperand(shift, 1), 1) or (LLVMGetExact(shift) != 0) != post
+            counter: IterationCounter = get trailing_zero_counter(loop, word, entry) else return false
+            allowed: darray[LLVMValueRef] = [word, shift, bit, test, counter.count, counter.increment, branch]
+            return false if not holds_only(loop, &allowed)
+            seed: LLVMValueRef = get loop_phi_incoming(word, entry) else return false
+            return false if not proves_nonzero_seed(seed, entry, loop, analyses)
+            position_builder_before(builder, branch)
+            word_type: LLVMTypeRef = LLVMTypeOf(word)
+            seed_storage: mutable darray[u8] = []
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, seed, sview_to_cstr("trailing.zero.seed", seed_storage))
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            count_arguments: darray[LLVMValueRef] = [stable, LLVMConstInt(LLVMInt1TypeInContext(context), 1, 0)]
+            zeros: LLVMValueRef = build_overloaded_intrinsic(builder, module, "llvm.cttz", &count_arguments)
+            one: LLVMValueRef = LLVMConstInt(word_type, 1, 0)
+            empty_storage: mutable darray[u8] = []
+            unnamed: cstr = sview_to_cstr("", empty_storage)
+            before: mutable LLVMValueRef = zeros
+            if post:
+                # An odd seed can exit after one iteration with a defined count, even though
+                # its exact shift is poison. Keep that iteration in the count.
+                bound_arguments: darray[LLVMValueRef] = [zeros, one]
+                before <- LLVMBuildSub(builder, build_overloaded_intrinsic(builder, module, "llvm.umax", &bound_arguments), one, unnamed)
+            word_storage: mutable darray[u8] = []
+            current: LLVMValueRef = LLVMBuildLShr(builder, stable, before, sview_to_cstr("trailing.zero.word", word_storage))
+            next: LLVMValueRef = LLVMBuildLShr(builder, current, one, unnamed)
+            next_count: mutable LLVMValueRef = next
+            if counter.found:
+                next_count <- LLVMBuildAdd(builder, before, one, unnamed)
+            close_scalar_loop(branch, exit, builder)
+            LLVMInstructionEraseFromParent(bit)
+            ElisaLLVMRemoveIncomingForBlock(word, loop)
+            LLVMReplaceAllUsesWith(word, current)
+            LLVMReplaceAllUsesWith(shift, next)
+            LLVMInstructionEraseFromParent(shift)
+            LLVMInstructionEraseFromParent(word)
+            if counter.found:
+                ElisaLLVMRemoveIncomingForBlock(counter.count, loop)
+                LLVMReplaceAllUsesWith(counter.count, before)
+                LLVMReplaceAllUsesWith(counter.increment, next_count)
+                LLVMInstructionEraseFromParent(counter.increment)
+                LLVMInstructionEraseFromParent(counter.count)
+            true
+
+        # The loop folds of one block: its instruction count picks the candidates.
+        def fold_scalar_loop(loop: LLVMBasicBlockRef, function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            size: u32 = instruction_count(loop)
+            return 0 if (size != 5 and size != 7 and size != 11) or ElisaLLVMBlockHasAddressTaken(loop) != 0
+            branch: LLVMValueRef = get conditional_terminator(loop) else return 0
+            exit: LLVMBasicBlockRef = get scalar_loop_exit(branch, loop) else return 0
+            if size <= ScalarLoopLimit::TRAILING_ZERO_LOOP_INSTRUCTIONS:
+                return 1 if fold_trailing_zero_loop(loop, branch, exit, analyses, builder, module)
+            return 0 if LLVMCountBasicBlocks(function) > ScalarIdiomLimit::SEARCH_FUNCTION_BLOCKS
+            return fold_carry_addition(loop, branch, exit, builder) if size == 7
+            return fold_threshold_search(loop, branch, exit, builder, module) if size == 11
+            0

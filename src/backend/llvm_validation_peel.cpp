@@ -62,8 +62,6 @@ extern "C" unsigned elisacoreRemoveIndexedPrefixFills(LLVMModuleRef Module) {
 }
 
 unsigned elisacoreFoldConstantIntegerPaths(llvm::Module &);
-unsigned elisacoreFoldScalarLoopIdioms(llvm::Module &);
-unsigned elisacoreFoldOddTrailingZeroSelects(llvm::Module &);
 #include "llvm_bisection_ranges.h"
 #include "llvm_checked_signed_ranges.h"
 #include "llvm_recursive_argument_bounds.h"

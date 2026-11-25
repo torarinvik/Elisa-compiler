@@ -1,0 +1,209 @@
+# Bit-counting idioms written without loops.
+#
+# A shift-and-or chain `x | x >> 1 | x >> 2 ...` fills every bit below the highest set
+# bit, so adding one gives `1 << bit_length(x)` when x fits in the span the chain covers.
+# A vector sum of eight lookups in the nibble population table, one per nibble of a word,
+# is that word's population count.
+
+const module BitCountLimit:
+    TABLE_ENTRIES: u32 = 16
+    REDUCED_LANES: u32 = 8
+    NIBBLE_MASK: u64 = 15
+    LAST_NIBBLE_SHIFT: u64 = 28
+    MINIMUM_INDEX_BITS: u32 = 7
+
+# The seed a shift-and-or chain spreads and the number of low bits it fills.
+struct BitSpread:
+    seed: LLVMValueRef
+    span: u32
+
+# The word a nibble-table lookup reads and the shift selecting its nibble.
+struct NibbleLookup:
+    word: LLVMValueRef
+    shift: u32
+
+extend Backend:
+    private:
+        def is_word_or_double_word(type: LLVMTypeRef) -> bool:
+            is_llvm_integer_type(type, 32) or is_llvm_integer_type(type, 64)
+
+        # The value the stage of a shift-and-or chain shifts by SHIFT: `base | base >> SHIFT`
+        # in either operand order. The first stage of a 64-bit chain may start at 16.
+        def spread_stage_base(stage: LLVMValueRef, shift: u64) -> LLVMValueRef?:
+            return null if not binary_operator_with_opcode(stage, LLVMOpcode::OR)
+            right: mutable LLVMValueRef = LLVMGetOperand(stage, 1)
+            base: mutable LLVMValueRef = LLVMGetOperand(stage, 0)
+            if not binary_operator_with_opcode(right, LLVMOpcode::LSHR):
+                right <- base
+                base <- LLVMGetOperand(stage, 1)
+            return null if not binary_operator_with_opcode(right, LLVMOpcode::LSHR) or LLVMGetOperand(right, 0) != base
+            return null if not is_constant_integer(LLVMGetOperand(right, 1), shift)
+            base
+
+        # A 64-bit chain may skip its 32-bit stage.
+        def first_spread_shift(stage: LLVMValueRef, width: u32) -> u64:
+            half: u64 = (width / 2).u64()
+            return half if half != 32 or not binary_operator_with_opcode(stage, LLVMOpcode::OR)
+            right: LLVMValueRef = LLVMGetOperand(stage, 1)
+            shifted: LLVMValueRef = right if binary_operator_with_opcode(right, LLVMOpcode::LSHR) else LLVMGetOperand(stage, 0)
+            return half if not binary_operator_with_opcode(shifted, LLVMOpcode::LSHR)
+            16 if is_constant_integer(LLVMGetOperand(shifted, 1), 16) else half
+
+        # `seed | seed >> s | ...` for shifts halving down to 1: the seed, with the span it
+        # covers (twice the first shift).
+        def spread_chain_seed(top: LLVMValueRef, width: u32) -> BitSpread?:
+            first: u64 = first_spread_shift(top, width)
+            seed: mutable LLVMValueRef = top
+            shift: mutable u64 = first
+            while shift != 0 |seed, shift|:
+                seed <- get spread_stage_base(seed, shift) else return null
+                shift <- shift / 2
+            BitSpread{seed: seed, span: (2 * first).u32()}
+
+        # Rewrites `spread(x) + 1` as `1 << ((width - ctlz(freeze x)) & (width - 1))` when
+        # LazyValueInfo keeps x inside the span the chain fills.
+        def fold_bit_spread_increment(add: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            integer_type: LLVMTypeRef = LLVMTypeOf(add)
+            return 0 if LLVMGetInstructionOpcode(add) != LLVMOpcode::ADD or not is_word_or_double_word(integer_type)
+            return 0 if not is_constant_integer(LLVMGetOperand(add, 1), 1) or LLVMGetFirstUse(add) == null
+            width: u32 = LLVMGetIntTypeWidth(integer_type)
+            spread: BitSpread = get spread_chain_seed(LLVMGetOperand(add, 0), width) else return 0
+            range: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, spread.seed, add, 0)
+            limit: u32 = spread.span if spread.span < width - 1 else width - 1
+            rejected: bool = ElisaLLVMConstantRangeIsEmpty(range) != 0 or active_bits(ElisaLLVMConstantRangeUnsignedMax(range)) > limit
+            ElisaLLVMDisposeConstantRange(range)
+            return 0 if rejected
+            position_builder_before(builder, add)
+            seed_storage: mutable darray[u8] = []
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, spread.seed, sview_to_cstr("bit.spread.seed", seed_storage))
+            context: LLVMContextRef = LLVMGetModuleContext(module)
+            arguments: darray[LLVMValueRef] = [stable, LLVMConstInt(LLVMInt1TypeInContext(context), 0, 0)]
+            leading: LLVMValueRef = build_overloaded_intrinsic(builder, module, "llvm.ctlz", &arguments)
+            empty_storage: mutable darray[u8] = []
+            unnamed: cstr = sview_to_cstr("", empty_storage)
+            length: LLVMValueRef = LLVMBuildSub(builder, LLVMConstInt(integer_type, width.u64(), 0), leading, unnamed)
+            # Keep the shift defined even if freeze picks a value outside the inferred range
+            # for an undef input. AArch64 shifts already mask the count.
+            count: LLVMValueRef = LLVMBuildAnd(builder, length, LLVMConstInt(integer_type, (width - 1).u64(), 0), unnamed)
+            rounded_storage: mutable darray[u8] = []
+            rounded: LLVMValueRef = LLVMBuildShl(builder, LLVMConstInt(integer_type, 1, 0), count, sview_to_cstr("bit.spread.rounded", rounded_storage))
+            LLVMReplaceAllUsesWith(add, rounded)
+            1
+
+        # Whether TABLE is a constant [16 x i32] with a definitive initializer holding the
+        # population count of each index.
+        def is_nibble_population_table(table: LLVMValueRef, context: LLVMContextRef) -> bool:
+            return false if LLVMIsGlobalConstant(table) == 0 or ElisaLLVMGlobalHasDefinitiveInitializer(table) == 0
+            return false if LLVMGlobalGetValueType(table) != LLVMArrayType2(LLVMInt32TypeInContext(context), BitCountLimit::TABLE_ENTRIES.u64())
+            initializer: LLVMValueRef = LLVMGetInitializer(table)
+            for index in 0..<BitCountLimit::TABLE_ENTRIES |initializer|:
+                element: LLVMValueRef = get LLVMGetAggregateElement(initializer, index) else return false
+                return false if not is_constant_integer(element, bit_population(index.u64()).u64())
+            true
+
+        def bit_population(value: u64) -> u32:
+            count: mutable u32 = 0
+            remaining: mutable u64 = value
+            while remaining != 0 |remaining, count|:
+                count <- count + (remaining & 1).u32()
+                remaining <- remaining >> 1
+            count
+
+        # The pointer a nibble-table lookup LOAD reads: a simple i32 load through a
+        # one-index GEP or a zero-first two-index array GEP of 4-byte elements, in an
+        # address space with at least 7 index bits.
+        def nibble_table_address(load: LLVMValueRef, module: LLVMModuleRef) -> LLVMValueRef?:
+            return null if LLVMIsALoadInst(load) == null
+            address: LLVMValueRef = LLVMGetOperand(load, 0)
+            return null if LLVMIsAGetElementPtrInst(address) == null and not is_constant_gep(address)
+            return null if LLVMGetVolatile(load) != 0 or LLVMGetOrdering(load) != 0 or not is_llvm_integer_type(LLVMTypeOf(load), 32)
+            indices: u32 = LLVMGetNumIndices(address)
+            return null if indices != 1 and indices != 2
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            source: LLVMTypeRef = LLVMGetGEPSourceElementType(address)
+            return null if indices == 2 and LLVMGetTypeKind(source) != LLVMTypeKindValue::ARRAY
+            element: LLVMTypeRef = source if indices == 1 else LLVMGetElementType(source)
+            return null if LLVMABISizeOfType(layout, element) != 4 or LLVMABISizeOfType(layout, LLVMTypeOf(load)) != 4
+            return null if ElisaLLVMDataLayoutIndexSizeInBits(module, LLVMGetPointerAddressSpace(LLVMTypeOf(LLVMGetOperand(address, 0)))) < BitCountLimit::MINIMUM_INDEX_BITS
+            return null if indices == 2 and not is_constant_integer(LLVMGetOperand(address, 1), 0)
+            address
+
+        def is_constant_gep(value: LLVMValueRef) -> bool:
+            LLVMIsAConstantExpr(value) != null and LLVMGetConstOpcode(value) == LLVMOpcode::GET_ELEMENT_PTR
+
+        # The word VALUE looks up one nibble of in the population table, with the nibble's
+        # shift: `table[(word >> shift) & 15]`, the shift a multiple of 4 up to 28.
+        def nibble_population_input(value: LLVMValueRef, module: LLVMModuleRef) -> NibbleLookup?:
+            address: LLVMValueRef = get nibble_table_address(value, module) else return null
+            table: LLVMValueRef = LLVMGetOperand(address, 0)
+            return null if LLVMIsAGlobalVariable(table) == null or not is_nibble_population_table(table, LLVMGetModuleContext(module))
+            mask: LLVMValueRef = LLVMGetOperand(address, LLVMGetNumIndices(address))
+            return null if not binary_operator_with_opcode(mask, LLVMOpcode::AND) or not is_constant_integer(LLVMGetOperand(mask, 1), BitCountLimit::NIBBLE_MASK)
+            input: LLVMValueRef = LLVMGetOperand(mask, 0)
+            return NibbleLookup{word: input, shift: 0} if not binary_operator_with_opcode(input, LLVMOpcode::LSHR)
+            amount: LLVMValueRef = LLVMGetOperand(input, 1)
+            return null if LLVMIsAConstantInt(amount) == null or ElisaLLVMConstantIntActiveBits(amount) > 32
+            shift: u64 = LLVMConstIntGetZExtValue(amount)
+            return null if shift > BitCountLimit::LAST_NIBBLE_SHIFT or shift % 4 != 0
+            NibbleLookup{word: LLVMGetOperand(input, 0), shift: shift.u32()}
+
+        # The word eight insertelements into the reduced vector look up, one distinct lane
+        # and one distinct nibble each.
+        def nibble_population_word(vector: LLVMValueRef, module: LLVMModuleRef) -> LLVMValueRef?:
+            seed: mutable LLVMValueRef? = null
+            lanes: mutable u32 = 0
+            nibbles: mutable u32 = 0
+            cursor: mutable LLVMValueRef = vector
+            for lane_index in 0..<BitCountLimit::REDUCED_LANES |seed, lanes, nibbles, cursor, module|:
+                return null if not is_llvm_instruction_with_opcode(cursor, LLVMOpcode::INSERT_ELEMENT)
+                lane: LLVMValueRef = LLVMGetOperand(cursor, 2)
+                return null if LLVMIsAConstantInt(lane) == null or ElisaLLVMConstantIntActiveBits(lane) > 3
+                lane_bit: u32 = 1.u32() << LLVMConstIntGetZExtValue(lane).u32()
+                return null if (lanes & lane_bit) != 0
+                lanes <- lanes | lane_bit
+                lookup: NibbleLookup = get nibble_population_input(LLVMGetOperand(cursor, 1), module) else return null
+                nibble_bit: u32 = 1.u32() << (lookup.shift / 4)
+                if seed is previous:
+                    return null if previous != lookup.word
+                return null if (nibbles & nibble_bit) != 0
+                seed <- lookup.word
+                nibbles <- nibbles | nibble_bit
+                cursor <- LLVMGetOperand(cursor, 0)
+            seed
+
+        # Rewrites `vector.reduce.add` of the eight nibble lookups of a word as `ctpop` of
+        # its frozen low 32 bits.
+        def fold_nibble_population_reduction(reduce: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if called_intrinsic_id(reduce) != intrinsic_identifier("llvm.vector.reduce.add") or LLVMGetFirstUse(reduce) == null
+            word_type: LLVMTypeRef = LLVMTypeOf(reduce)
+            return 0 if not is_llvm_integer_type(word_type, 32)
+            vector: LLVMValueRef = LLVMGetOperand(reduce, 0)
+            return 0 if LLVMTypeOf(vector) != LLVMVectorType(word_type, BitCountLimit::REDUCED_LANES)
+            seed: LLVMValueRef = get nibble_population_word(vector, module) else return 0
+            return 0 if not is_word_or_double_word(LLVMTypeOf(seed))
+            position_builder_before(builder, reduce)
+            seed_storage: mutable darray[u8] = []
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, seed, sview_to_cstr("nibble.population.seed", seed_storage))
+            word: mutable LLVMValueRef = stable
+            if LLVMTypeOf(stable) != word_type:
+                empty_storage: mutable darray[u8] = []
+                word <- LLVMBuildTrunc(builder, stable, word_type, sview_to_cstr("", empty_storage))
+            LLVMReplaceAllUsesWith(reduce, build_population_count(builder, module, word))
+            1
+
+    public:
+        # The bit-spread increments and nibble population sums of FUNCTION rewritten, in
+        # block order.
+        def fold_function_bit_count_idioms(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            changed: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, changed, analyses, builder, module|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, changed, analyses, builder, module|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    if LLVMIsABinaryOperator(instruction) != null:
+                        changed <- changed + fold_bit_spread_increment(instruction, analyses, builder, module)
+                    elif LLVMIsAIntrinsicInst(instruction) != null:
+                        changed <- changed + fold_nibble_population_reduction(instruction, builder, module)
+            changed

@@ -89,6 +89,8 @@ int ElisaLLVMTargetMachineChecksFeatures(LLVMTargetMachineRef machine, const cha
 int ElisaLLVMBlockHasAddressTaken(LLVMBasicBlockRef block);
 /* Whether the instruction carries metadata other than its debug location. */
 int ElisaLLVMHasMetadataOtherThanDebugLoc(LLVMValueRef instruction);
+/* GlobalVariable::hasDefinitiveInitializer: an initializer no other definition can replace. */
+int ElisaLLVMGlobalHasDefinitiveInitializer(LLVMValueRef global);
 /* PatternMatch's m_One() and m_Zero(): an integer constant, or a vector
  * of them (a splat, or lanes that are all the value or poison). */
 int ElisaLLVMIsConstantOne(LLVMValueRef value);
@@ -208,7 +210,7 @@ ElisaConstantRangeRef ElisaLLVMLazyValueConstantRange(ElisaFunctionAnalysesRef a
 int ElisaLLVMIsGuaranteedNotToBeUndefOrPoisonAssuming(ElisaFunctionAnalysesRef analyses,
                                                       LLVMValueRef value, LLVMValueRef context);
 /* LazyValueInfo::getConstantRangeOnEdge of `value` on the edge from -> to, asked at the
- * instruction `context`. */
+ * instruction `context`, or with no context instruction when it is null. */
 ElisaConstantRangeRef ElisaLLVMLazyValueConstantRangeOnEdge(ElisaFunctionAnalysesRef analyses,
                                                             LLVMValueRef value, LLVMBasicBlockRef from,
                                                             LLVMBasicBlockRef to, LLVMValueRef context);

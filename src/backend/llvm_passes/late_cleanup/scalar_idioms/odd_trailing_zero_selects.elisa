@@ -1,0 +1,88 @@
+# Odd words have zero trailing zeros.
+#
+# Loop idiom recognition may keep the odd exit of a trailing-zero count as
+# `select (x & 1) == 0, cttz(x) [>> k], 0`, because the count on the even edge carries a
+# return range excluding zero. A fresh `cttz(x) [>> k]` without that restriction is the
+# select's value on both edges.
+include "../../../llvm_c_api/elisa_llvm_weak_values.elisa"
+
+const module OddTrailingZeroLimit:
+    FUNCTION_BLOCKS: u32 = 48
+
+extend Backend:
+    private:
+        # The `lshr` SELECT applies to its trailing-zero count, when it has one: a single-use,
+        # inexact shift by a constant below the width, without metadata.
+        def is_plain_count_shift(shift: LLVMValueRef) -> bool:
+            return false if LLVMGetInstructionOpcode(shift) != LLVMOpcode::LSHR or LLVMGetExact(shift) != 0
+            amount: LLVMValueRef = LLVMGetOperand(shift, 1)
+            return false if LLVMIsAConstantInt(amount) == null
+            # At least the width: more than 32 active bits, or a small value no smaller.
+            return false if ElisaLLVMConstantIntActiveBits(amount) > 32 or LLVMConstIntGetZExtValue(amount) >= LLVMGetIntTypeWidth(LLVMTypeOf(shift)).u64()
+            has_one_use(shift) and ElisaLLVMHasMetadataOtherThanDebugLoc(shift) == 0
+
+        # Whether COUNT is a single-use `cttz(value, flag)` without operand bundles over a
+        # non-boolean integer.
+        def is_plain_trailing_zero_count(count: LLVMValueRef, value: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if called_intrinsic_id(count) != intrinsic_identifier("llvm.cttz") or not has_one_use(count) or LLVMGetNumOperandBundles(count) != 0
+            return false if LLVMGetOperand(count, 0) != value
+            is_llvm_integer_type(LLVMTypeOf(count), 0) and not is_llvm_integer_type(LLVMTypeOf(count), 1)
+
+        # Rewrites SELECT `(x & 1) ==/!= 0 ? ... : ...` choosing zero for an odd x and
+        # `cttz(x) [>> k]` otherwise.
+        def fold_odd_trailing_zero_select(select: LLVMValueRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            test: LLVMValueRef = LLVMGetOperand(select, 0)
+            return 0 if not is_llvm_instruction_with_opcode(test, LLVMOpcode::ICMP) or ElisaLLVMHasMetadataOtherThanDebugLoc(select) != 0
+            predicate: i32 = LLVMGetICmpPredicate(test)
+            return 0 if predicate != LLVMIntPredicate::EQ and predicate != LLVMIntPredicate::NE
+            zero_on_true: bool = predicate == LLVMIntPredicate::NE
+            return 0 if not is_constant_integer(LLVMGetOperand(select, 1 if zero_on_true else 2), 0)
+            masked: LLVMValueRef = LLVMGetOperand(test, 0)
+            return 0 if not binary_operator_with_opcode(masked, LLVMOpcode::AND) or not is_constant_integer(LLVMGetOperand(masked, 1), 1)
+            return 0 if not is_constant_integer(LLVMGetOperand(test, 1), 0)
+            even_value: LLVMValueRef = LLVMGetOperand(select, 2 if zero_on_true else 1)
+            shifted: bool = LLVMIsABinaryOperator(even_value) != null
+            return 0 if shifted and not is_plain_count_shift(even_value)
+            count: LLVMValueRef = LLVMGetOperand(even_value, 0) if shifted else even_value
+            return 0 if not is_plain_trailing_zero_count(count, LLVMGetOperand(masked, 0))
+            position_builder_before(builder, select)
+            arguments: darray[LLVMValueRef] = [LLVMGetOperand(count, 0), LLVMGetOperand(count, 1)]
+            result: mutable LLVMValueRef = build_overloaded_intrinsic(builder, module, "llvm.cttz", &arguments)
+            if shifted:
+                name_storage: mutable darray[u8] = []
+                result <- LLVMBuildLShr(builder, result, LLVMGetOperand(even_value, 1), sview_to_cstr("", name_storage))
+            LLVMReplaceAllUsesWith(select, result)
+            ElisaLLVMRecursivelyDeleteTriviallyDeadInstructions(select)
+            1
+
+        # Every select of FUNCTION, held weakly: a rewrite may delete later selects.
+        def function_selects(function: LLVMValueRef) -> ElisaWeakValuesRef:
+            selects: ElisaWeakValuesRef = ElisaLLVMCreateWeakValues()
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, selects|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, selects|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    ElisaLLVMWeakValuesPush(selects, instruction) if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::SELECT)
+            selects
+
+    public:
+        # The selects rewritten in AArch64 modules; the loop-pass policy skips debug info and
+        # sanitizers, and functions over 48 blocks are left alone.
+        def fold_odd_trailing_zero_selects(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                if LLVMCountBasicBlocks(function) <= OddTrailingZeroLimit::FUNCTION_BLOCKS and not skipped_by_loop_pass_policy(function, module):
+                    selects: ElisaWeakValuesRef = function_selects(function)
+                    for index in 0..<ElisaLLVMWeakValuesCount(selects) |selects, changed, builder, module|:
+                        if ElisaLLVMWeakValueAt(selects, index) is selected:
+                            if is_llvm_instruction_with_opcode(selected, LLVMOpcode::SELECT):
+                                changed <- changed + fold_odd_trailing_zero_select(selected, builder, module)
+                    ElisaLLVMDisposeWeakValues(selects)
+            LLVMDisposeBuilder(builder)
+            changed

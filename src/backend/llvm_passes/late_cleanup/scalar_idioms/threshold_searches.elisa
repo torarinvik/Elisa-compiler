@@ -1,0 +1,114 @@
+# Unsigned lower-bound searches against a fixed threshold.
+#
+# `while low < high: mid = low + (high - low) / 2; (low, high) = mid < target ? (mid + 1,
+# high) : (low, mid)` ends at the target clamped to the entry interval, so the loop is
+# `umax(first, umin(target, last))` over the frozen bounds the entry guard also reads.
+
+# The parts of a matched search loop.
+struct ThresholdSearch:
+    next_low: LLVMValueRef
+    next_high: LLVMValueRef
+    split: LLVMValueRef
+    low: LLVMValueRef
+    high: LLVMValueRef
+    middle: LLVMValueRef
+    step: LLVMValueRef
+    shift: LLVMValueRef
+    width: LLVMValueRef
+
+# The search bounds' halves: the selects updating them and the compare choosing a side.
+struct SearchUpdate:
+    next_low: LLVMValueRef
+    next_high: LLVMValueRef
+    split: LLVMValueRef
+
+extend Backend:
+    private:
+        # The selects the loop's continue test `next_low <u next_high` compares, sharing one
+        # condition, the high one used twice.
+        def search_update(loop: LLVMBasicBlockRef, branch: LLVMValueRef) -> SearchUpdate?:
+            test: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(test, LLVMOpcode::ICMP) or not has_one_use(test)
+            back_on_true: bool = LLVMGetSuccessor(branch, 0) == loop
+            predicate: i32 = LLVMGetICmpPredicate(test) if back_on_true else inverse_integer_predicate(LLVMGetICmpPredicate(test))
+            return null if predicate != LLVMIntPredicate::ULT and predicate != LLVMIntPredicate::UGT
+            below: bool = predicate == LLVMIntPredicate::ULT
+            next_low: LLVMValueRef = LLVMGetOperand(test, 0 if below else 1)
+            next_high: LLVMValueRef = LLVMGetOperand(test, 1 if below else 0)
+            return null if not is_llvm_instruction_with_opcode(next_low, LLVMOpcode::SELECT) or not is_llvm_instruction_with_opcode(next_high, LLVMOpcode::SELECT)
+            return null if LLVMGetInstructionParent(next_low) != loop or LLVMGetInstructionParent(next_high) != loop
+            return null if not has_use_count(next_high, 2) or LLVMGetOperand(next_low, 0) != LLVMGetOperand(next_high, 0)
+            split: LLVMValueRef = LLVMGetOperand(next_low, 0)
+            return null if not is_llvm_instruction_with_opcode(split, LLVMOpcode::ICMP) or LLVMGetInstructionParent(split) != loop
+            split_predicate: i32 = LLVMGetICmpPredicate(split)
+            return null if split_predicate != LLVMIntPredicate::ULT and split_predicate != LLVMIntPredicate::UGE
+            SearchUpdate{next_low: next_low, next_high: next_high, split: split}
+
+        def is_loop_phi_with_back_value(phi: LLVMValueRef, loop: LLVMBasicBlockRef, back: LLVMValueRef) -> bool:
+            return false if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI) or LLVMGetInstructionParent(phi) != loop or LLVMCountIncoming(phi) != 2
+            incoming: LLVMValueRef = get loop_phi_incoming(phi, loop) else return false
+            incoming == back
+
+        # The whole search: the bounds' phis, `mid = low + ((high - low) >> 1)`, the step
+        # `mid + 1`, and each value's exact use count.
+        def threshold_search(loop: LLVMBasicBlockRef, branch: LLVMValueRef) -> ThresholdSearch?:
+            update: SearchUpdate = get search_update(loop, branch) else return null
+            go_right: bool = LLVMGetICmpPredicate(update.split) == LLVMIntPredicate::ULT
+            low: LLVMValueRef = LLVMGetOperand(update.next_low, 2 if go_right else 1)
+            high: LLVMValueRef = LLVMGetOperand(update.next_high, 1 if go_right else 2)
+            target: LLVMValueRef = LLVMGetOperand(update.split, 1)
+            middle: LLVMValueRef = get block_binary_operator(LLVMGetOperand(update.split, 0), LLVMOpcode::ADD, loop) else return null
+            return null if low == high or is_defined_in_block(target, loop) or LLVMGetOperand(update.next_high, 2 if go_right else 1) != middle
+            return null if not is_loop_phi_with_back_value(low, loop, update.next_low) or not is_loop_phi_with_back_value(high, loop, update.next_high)
+            step: LLVMValueRef = get block_binary_operator(LLVMGetOperand(update.next_low, 1 if go_right else 2), LLVMOpcode::ADD, loop) else return null
+            return null if LLVMGetOperand(step, 0) != middle or not is_constant_integer(LLVMGetOperand(step, 1), 1)
+            half: LLVMValueRef? = middle_half(middle, low)
+            shift: LLVMValueRef = get block_binary_operator(half, LLVMOpcode::LSHR, loop) else return null
+            width: LLVMValueRef = get block_binary_operator(LLVMGetOperand(shift, 0), LLVMOpcode::SUB, loop) else return null
+            return null if not is_constant_integer(LLVMGetOperand(shift, 1), 1) or LLVMGetOperand(width, 0) != high or LLVMGetOperand(width, 1) != low
+            return null if not has_use_count(low, 3) or not has_use_count(high, 2) or not has_use_count(middle, 3)
+            return null if not has_one_use(shift) or not has_one_use(width) or not has_one_use(step) or not has_use_count(update.split, 2)
+            return null if not is_llvm_integer_type(LLVMTypeOf(low), 0)
+            ThresholdSearch{next_low: update.next_low, next_high: update.next_high, split: update.split, low: low, high: high, middle: middle, step: step, shift: shift, width: width}
+
+        # The operand of MIDDLE other than LOW.
+        def middle_half(middle: LLVMValueRef, low: LLVMValueRef) -> LLVMValueRef?:
+            return LLVMGetOperand(middle, 1) if LLVMGetOperand(middle, 0) == low
+            return LLVMGetOperand(middle, 0) if LLVMGetOperand(middle, 1) == low
+            null
+
+        # An unsigned lower-bound search with a direct threshold comparison preserves the
+        # threshold clamped to its interval as the interval shrinks.
+        def fold_threshold_search(loop: LLVMBasicBlockRef, branch: LLVMValueRef, exit: LLVMBasicBlockRef, builder: LLVMBuilderRef, module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            search: ThresholdSearch = get threshold_search(loop, branch) else return 0
+            entry: LLVMBasicBlockRef = phi_entry_block(search.low, loop)
+            return 0 if entry == loop
+            guard: LLVMValueRef = get conditional_terminator(entry) else return 0
+            initial_low: LLVMValueRef = get loop_phi_incoming(search.low, entry) else return 0
+            initial_high: LLVMValueRef = get loop_phi_incoming(search.high, entry) else return 0
+            guard_test: UnsignedContinueTest = get unsigned_continue_test(guard, loop, initial_high) else return 0
+            return 0 if initial_low != guard_test.lower or initial_low == initial_high
+            position_builder_before(builder, guard_test.compare)
+            empty_storage: mutable darray[u8] = []
+            unnamed: cstr = sview_to_cstr("", empty_storage)
+            first: LLVMValueRef = LLVMBuildFreeze(builder, initial_low, unnamed)
+            last: LLVMValueRef = LLVMBuildFreeze(builder, initial_high, unnamed)
+            replace_operand_uses(guard_test.compare, initial_low, first)
+            replace_operand_uses(guard_test.compare, initial_high, last)
+            position_builder_before(builder, branch)
+            target: LLVMValueRef = LLVMGetOperand(search.split, 1)
+            key: mutable LLVMValueRef = first
+            if target == initial_high:
+                key <- last
+            elif target != initial_low:
+                key <- LLVMBuildFreeze(builder, target, unnamed)
+            capped_arguments: darray[LLVMValueRef] = [key, last]
+            capped: LLVMValueRef = build_overloaded_intrinsic(builder, module, "llvm.umin", &capped_arguments)
+            result_arguments: darray[LLVMValueRef] = [first, capped]
+            result: LLVMValueRef = build_overloaded_intrinsic(builder, module, "llvm.umax", &result_arguments)
+            close_scalar_loop(branch, exit, builder)
+            ElisaLLVMRemoveIncomingForBlock(search.low, loop)
+            ElisaLLVMRemoveIncomingForBlock(search.high, loop)
+            LLVMReplaceAllUsesWith(search.next_low, result)
+            erase_instructions([search.next_low, search.next_high, search.step, search.split, search.middle, search.shift, search.width, search.low, search.high])
+            1
