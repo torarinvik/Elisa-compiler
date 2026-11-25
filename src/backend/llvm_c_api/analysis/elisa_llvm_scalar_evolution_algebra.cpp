@@ -55,6 +55,22 @@ ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionAddTerms(ElisaFunction
   return wrapExpression(evolutionOf(analyses).getAddExpr(Terms));
 }
 
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionMultiplyTerms(ElisaFunctionAnalysesRef analyses,
+                                                                        ElisaScalarEvolutionExpressionRef *factors,
+                                                                        uint32_t count) {
+  SmallVector<SCEVUse, 4> Factors;
+  for (uint32_t Index = 0; Index < count; ++Index) Factors.push_back(unwrapExpression(factors[Index]));
+  return wrapExpression(evolutionOf(analyses).getMulExpr(Factors));
+}
+
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionUnsignedDivideExact(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef dividend,
+    ElisaScalarEvolutionExpressionRef divisor) {
+  const SCEV *Quotient =
+      evolutionOf(analyses).getUDivExactExpr(unwrapExpression(dividend), unwrapExpression(divisor));
+  return isa<SCEVUDivExpr>(Quotient) ? nullptr : wrapExpression(Quotient);
+}
+
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionAddRecurrence(
     ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef start,
     ElisaScalarEvolutionExpressionRef step, ElisaLoopRef loop, int no_unsigned_wrap) {

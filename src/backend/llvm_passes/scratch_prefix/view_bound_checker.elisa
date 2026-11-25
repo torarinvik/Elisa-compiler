@@ -1,0 +1,220 @@
+# The view checker (`ElisaViewBounds::Checker`): every access through a view's data
+# pointer stays below its length. A view may be passed on whole to a defined function
+# whose parameter passes the same check; a parameter being checked is assumed to pass,
+# an induction over the depth of calls. Callees are checked on copies that SROA,
+# EarlyCSE, instcombine and simplifycfg have cleaned (the view in SSA form, each access
+# still under its bounds check); the checker deletes them when it is disposed.
+include "../ir/pass_pipelines.elisa"
+
+const module ViewCheckLimit:
+    BUDGET: u32 = 64
+    PLAIN_LENGTH_STEPS: u32 = 4
+
+struct ViewChecker:
+    function: LLVMValueRef
+    analyses: ElisaFunctionAnalysesRef
+    element_size: u64
+    budget: mutable u32
+    # Claims being checked: a view parameter bounded by a parameter (itself for its
+    # own length).
+    checking_parameters: mutable darray[LLVMValueRef]
+    checking_bounds: mutable darray[LLVMValueRef]
+    # The cleaned copy of each callee, made once, with its analyses.
+    originals: mutable darray[LLVMValueRef]
+    copies: mutable darray[LLVMValueRef]
+    copy_analyses: mutable darray[ElisaFunctionAnalysesRef]
+
+# What a bound passed beside a view must satisfy: at most LENGTH where AT runs, in
+# FUNCTION (the C++ `Accept` predicate).
+struct BoundAcceptance:
+    length: LLVMValueRef
+    at: LLVMValueRef
+    function: LLVMValueRef
+
+extend Backend:
+    private:
+        # The one index of an `insertvalue` or `extractvalue`.
+        def aggregate_field_index(instruction: LLVMValueRef) -> u32:
+            LLVMGetIndices(instruction)
+
+        # The opcode of an instruction or constant expression; 0 for any other value.
+        def value_opcode(value: LLVMValueRef) -> u32:
+            return LLVMGetInstructionOpcode(value) if LLVMIsAInstruction(value) != null
+            return LLVMGetConstOpcode(value) if LLVMIsAConstantExpr(value) != null
+            0
+
+        def first_entry_instruction(function: LLVMValueRef) -> LLVMValueRef can[Abort.Panic]:
+            if LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function)) is first:
+                return first
+            panic("view checker: a function with an empty entry block")
+
+        # Every extraction of a parameter's field is the same value; one at the entry
+        # lets a bounds check inside a loop and the length share it.
+        def hoist_parameter_fields(copy: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate]:
+            for position in 0..<LLVMCountParams(copy) |copy|:
+                parameter: LLVMValueRef = LLVMGetParam(copy, position)
+                kept_indices: mutable darray[u32] = []
+                kept_fields: mutable darray[LLVMValueRef] = []
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(parameter)
+                while use_cursor is use |use_cursor, kept_indices, kept_fields, copy|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    field: LLVMValueRef = LLVMGetUser(use)
+                    continue if LLVMGetInstructionOpcode(field) != LLVMOpcode::EXTRACT_VALUE or LLVMGetNumIndices(field) != 1
+                    index: u32 = aggregate_field_index(field)
+                    kept: mutable LLVMValueRef? = null
+                    for slot in 0..<kept_indices.count |kept, kept_indices, kept_fields, index|:
+                        kept <- kept_fields[slot] if kept == null and kept_indices[slot] == index
+                    if kept is earlier:
+                        LLVMReplaceAllUsesWith(field, earlier)
+                        LLVMInstructionEraseFromParent(field)
+                    else:
+                        kept_indices.push(index)
+                        kept_fields.push(field)
+                        ElisaLLVMMoveInstructionBefore(field, first_entry_instruction(copy))
+
+        # A slice from zero (`items[0:count]`) builds its length as `hi - 0`, with hi
+        # chosen by a test that always holds (`hi >= 0`): one step through either.
+        def plain_length_step(length: LLVMValueRef) -> LLVMValueRef?:
+            return LLVMGetOperand(length, 0) if value_opcode(length) == LLVMOpcode::SUB and LLVMIsNull(LLVMGetOperand(length, 1)) != 0
+            return null if LLVMGetInstructionOpcode(length) != LLVMOpcode::SELECT
+            test: LLVMValueRef = LLVMGetOperand(length, 0)
+            return null if LLVMGetInstructionOpcode(test) != LLVMOpcode::ICMP or LLVMGetICmpPredicate(test) != LLVMIntPredicate::UGE
+            return null if LLVMIsNull(LLVMGetOperand(test, 1)) == 0
+            LLVMGetOperand(length, 1)
+
+        def plain_view_length(length: LLVMValueRef) -> LLVMValueRef:
+            current: mutable LLVMValueRef = length
+            for step in 0..<ViewCheckLimit::PLAIN_LENGTH_STEPS |current|:
+                if plain_length_step(current) is next:
+                    current <- next
+                else:
+                    break
+            current
+
+        # The view's length: the inserted value of the view being built, or an
+        # extraction of it (made at the function's entry for a parameter) (`lengthOf`).
+        def view_length(view: LLVMValueRef, function: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            if LLVMGetInstructionOpcode(view) == LLVMOpcode::INSERT_VALUE:
+                return null if LLVMGetNumIndices(view) != 1 or aggregate_field_index(view) != 1
+                return plain_view_length(LLVMGetOperand(view, 1))
+            parameter: bool = LLVMIsAArgument(view) != null
+            entry: LLVMBasicBlockRef = LLVMGetEntryBasicBlock(function)
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(view)
+            while use_cursor is use |use_cursor, parameter, entry|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                return user if is_extract_of_field(user, 1) and parameter and LLVMGetInstructionParent(user) == entry
+            return null if not parameter
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetTypeContext(LLVMTypeOf(view)))
+            LLVMPositionBuilderBefore(builder, first_entry_instruction(function))
+            name_storage: mutable darray[u8] = []
+            length: LLVMValueRef = LLVMBuildExtractValue(builder, view, 1, sview_to_cstr("view.len", name_storage))
+            LLVMDisposeBuilder(builder)
+            length
+
+        # A copy of CALLEE in SSA form, made once (`cleaned`).
+        def cleaned_callee(checker: mutable ViewChecker&, callee: LLVMValueRef) -> LLVMValueRef can[Abort.Panic, Memory.Allocate]:
+            for index in 0..<checker.originals.count |checker, callee|:
+                return checker.copies[index] if checker.originals[index] == callee
+            copy: LLVMValueRef = ElisaLLVMCloneFunction(callee)
+            LLVMSetLinkage(copy, LLVMLinkageValue::PRIVATE)
+            _ = run_function_pipeline(copy, null, "sroa<modify-cfg>,early-cse,instcombine<no-verify-fixpoint>,simplifycfg")
+            hoist_parameter_fields(copy)
+            if ElisaLLVMCreateFunctionAnalyses(copy) is analyses:
+                checker.originals.push(callee)
+                checker.copies.push(copy)
+                checker.copy_analyses.push(analyses)
+                return copy
+            panic("view checker: no analyses for a callee copy")
+
+        # The analyses of FUNCTION: the checked function's, or a callee copy's.
+        def view_checker_analyses(checker: ViewChecker&, function: LLVMValueRef) -> ElisaFunctionAnalysesRef can[Abort.Panic]:
+            return checker.analyses if function == checker.function
+            for index in 0..<checker.copies.count |checker, function|:
+                return checker.copy_analyses[index] if checker.copies[index] == function
+            panic("view checker: analyses of a function it does not hold")
+
+        # BOUND <=u the accepted length where the acceptance's instruction runs (`atMost`).
+        def view_bound_at_most(checker: ViewChecker&, bound: LLVMValueRef, acceptance: BoundAcceptance&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if bound == acceptance.length
+            analyses: ElisaFunctionAnalysesRef = view_checker_analyses(checker, acceptance.function)
+            type: LLVMTypeRef = LLVMTypeOf(bound)
+            return false if ElisaLLVMScalarEvolutionIsSCEVable(analyses, type) == 0 or type != LLVMTypeOf(acceptance.length)
+            prover: mutable IndexProver = new_index_prover(acceptance.function, analyses)
+            holds: bool = prove_at_most(&prover, term_of(analyses, bound), term_of(analyses, acceptance.length), acceptance.at)
+            dispose_index_prover(&prover)
+            holds
+
+        # CALLEE's view parameter INDEX stays below parameter LIMIT (its own length when
+        # LIMIT is INDEX); a claim being checked is assumed (`argumentBounded`). A
+        # position past the parameters (a variadic callee) is not bounded.
+        def view_argument_bounded(checker: mutable ViewChecker&, callee: LLVMValueRef, index: u32, limit: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if index >= LLVMCountParams(callee) or limit >= LLVMCountParams(callee)
+            parameter: LLVMValueRef = LLVMGetParam(callee, index)
+            bound: LLVMValueRef = LLVMGetParam(callee, limit)
+            for claim in 0..<checker.checking_parameters.count |checker, parameter, bound|:
+                return true if checker.checking_parameters[claim] == parameter and checker.checking_bounds[claim] == bound
+            return false if checker.budget == 0
+            checker.budget <- checker.budget - 1
+            length: mutable LLVMValueRef? = bound
+            if limit == index:
+                length <- view_length(parameter, callee)
+            real_length: LLVMValueRef = get length else return false
+            checker.checking_parameters.push(parameter)
+            checker.checking_bounds.push(bound)
+            holds: bool = view_users_bounded(checker, parameter, real_length, callee)
+            checker.checking_parameters.truncate(checker.checking_parameters.count - 1)
+            checker.checking_bounds.truncate(checker.checking_bounds.count - 1)
+            holds
+
+        # Every access through VIEW's data pointer, in FUNCTION, stays below LENGTH; a
+        # call may take the view whole when its callee keeps below a bound the caller
+        # shows is at most LENGTH (`bounded`).
+        def view_users_bounded(checker: mutable ViewChecker&, view: LLVMValueRef, length: LLVMValueRef, function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(view)
+            while use_cursor is use |use_cursor, checker, view, length, function|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                if LLVMGetInstructionOpcode(user) == LLVMOpcode::EXTRACT_VALUE:
+                    return false if LLVMGetNumIndices(user) != 1
+                    continue if aggregate_field_index(user) == 1
+                    return false if not view_data_bounded(checker, user, length, function)
+                elif is_call_base(user):
+                    acceptance: BoundAcceptance = BoundAcceptance{length: length, at: user, function: function}
+                    for position in 0..<LLVMGetNumArgOperands(user) |checker, view, user, function, acceptance|:
+                        continue if LLVMGetOperand(user, position) != view
+                        return false if view_call_bound(checker, user, position, function, &acceptance) == null
+                else:
+                    return false
+            true
+
+    public:
+        def new_view_checker(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, element_size: u64) -> ViewChecker:
+            ViewChecker{function: function, analyses: analyses, element_size: element_size, budget: ViewCheckLimit::BUDGET, checking_parameters: [], checking_bounds: [], originals: [], copies: [], copy_analyses: []}
+
+        # CHECKER's callee copies deleted, with their analyses.
+        def dispose_view_checker(checker: ViewChecker&) -> void:
+            for index in 0..<checker.copies.count |checker|:
+                ElisaLLVMDisposeFunctionAnalyses(checker.copy_analyses[index])
+                LLVMDeleteFunction(checker.copies[index])
+
+        # A value, in CALLER, below which the callee accesses the view passed at
+        # POSITION and that ACCEPTANCE takes: that view's length, else an integer
+        # argument the callee's indices stay below (a count passed beside a whole
+        # buffer, `sort(items[0:capacity], count)`); null when none is (`callBound`).
+        def view_call_bound(checker: mutable ViewChecker&, call: LLVMValueRef, position: u32, caller: LLVMValueRef, acceptance: BoundAcceptance&) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            callee: LLVMValueRef = get direct_callee(call) else return null
+            return null if LLVMIsDeclaration(callee) != 0
+            copy: LLVMValueRef = cleaned_callee(checker, callee)
+            if view_length(LLVMGetOperand(call, position), caller) is length:
+                return length if view_bound_at_most(checker, length, acceptance) and view_argument_bounded(checker, copy, position, position)
+            for count in 0..<LLVMGetNumArgOperands(call) |checker, call, position, acceptance, copy|:
+                bound: LLVMValueRef = LLVMGetOperand(call, count)
+                continue if count == position or not is_llvm_integer_type(LLVMTypeOf(bound), 64)
+                return bound if view_bound_at_most(checker, bound, acceptance) and view_argument_bounded(checker, copy, position, count)
+            null
+
+        # Every access through VIEW's data pointer stays below VIEW's length (`bounded`).
+        def view_bounded(checker: mutable ViewChecker&, view: LLVMValueRef, function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            length: LLVMValueRef = get view_length(view, function) else return false
+            view_users_bounded(checker, view, length, function)

@@ -4,6 +4,7 @@
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Support/CBindingWrapping.h>
 
 using namespace llvm;
@@ -32,5 +33,14 @@ int ElisaLLVMIsSafeToSpeculativelyExecuteAt(LLVMValueRef instruction, LLVMValueR
 }
 
 int ElisaLLVMCallOnlyReadsMemory(LLVMValueRef call) { return cast<CallBase>(unwrap(call))->onlyReadsMemory(); }
+
+int ElisaLLVMCallOnlyAccessesInaccessibleMemory(LLVMValueRef call) {
+  return cast<CallBase>(unwrap(call))->onlyAccessesInaccessibleMemory();
+}
+
+unsigned ElisaLLVMMemoryIntrinsicDestinationAlignment(LLVMValueRef intrinsic) {
+  MaybeAlign Alignment = cast<MemIntrinsic>(unwrap(intrinsic))->getDestAlign();
+  return Alignment ? static_cast<unsigned>(Alignment->value()) : 0;
+}
 
 } // extern "C"

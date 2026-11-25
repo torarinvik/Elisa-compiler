@@ -1,0 +1,187 @@
+# The validating loops of the validated reads (`ElisaValidatedReads::validation`): a
+# loop counting i from 0 by 1 that reads element Start + Step * i of memory outside the
+# stack, leaves when an element fails a compare with constants, and otherwise runs until
+# every element below its bound passed.
+include "../index_proofs/proof_terms.elisa"
+include "./stack_writes.elisa"
+
+const module ReadValidationLimit:
+    STAYING_DEPTH: u32 = 6
+
+# One validating loop: elements START + STEP * i for i < BOUND passed, with values in
+# RANGE (owned), by the time the loop leaves to EXIT.
+struct ReadValidation:
+    load: LLVMValueRef
+    start: ElisaScalarEvolutionExpressionRef
+    step: u64
+    bound: LLVMValueRef
+    exit: LLVMBasicBlockRef
+    range: ElisaConstantRangeRef
+
+# How a counted loop ends: from EXITING to EXIT once every element below BOUND passed.
+struct CountedExit:
+    bound: LLVMValueRef
+    exiting: LLVMBasicBlockRef
+    exit: LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        # Whether TESTED reads the element LOADED read: the same value, or a simple load
+        # of the same address and type (`sameElement`).
+        def same_element(tested: LLVMValueRef, loaded: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            return true if tested == loaded
+            return false if LLVMIsALoadInst(tested) == null or LLVMIsALoadInst(loaded) == null or not is_simple_access(tested)
+            LLVMTypeOf(tested) == LLVMTypeOf(loaded) and term_of(analyses, LLVMGetOperand(tested, 0)) == term_of(analyses, LLVMGetOperand(loaded, 0))
+
+        # RANGE narrowed by the incoming values of the i1 phi MERGE when the loop leaves
+        # where it is true: one non-constant input, and `true` inputs each from a
+        # dominating branch that did not leave.
+        def staying_phi(merge: LLVMValueRef, loaded: LLVMValueRef, range: ElisaConstantRangeRef, analyses: ElisaFunctionAnalysesRef, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            only: mutable LLVMValueRef? = null
+            conditions: mutable darray[LLVMValueRef] = []
+            truths: mutable darray[bool] = []
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(merge)
+            for index in 0..<LLVMCountIncoming(merge) |only, conditions, truths, merge, block, analyses|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(merge, index)
+                from: LLVMBasicBlockRef = LLVMGetIncomingBlock(merge, index)
+                if LLVMIsAConstantInt(incoming) == null:
+                    return range if only != null
+                    only <- incoming
+                    continue
+                branch: LLVMValueRef = get conditional_terminator(from) else return range
+                return range if ElisaLLVMConstantIntEquals(incoming, 1) == 0 or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                return range if ElisaLLVMBlockDominates(analyses, from, block) == 0
+                conditions.push(LLVMGetCondition(branch))
+                truths.push(LLVMGetSuccessor(branch, 0) == block)
+            remaining: LLVMValueRef = get only else return range
+            narrowed: mutable ElisaConstantRangeRef = range
+            for index in 0..<conditions.count |narrowed, conditions, truths, loaded, analyses, depth|:
+                narrowed <- staying_range(conditions[index], loaded, truths[index], narrowed, analyses, depth + 1)
+            staying_range(remaining, loaded, true, narrowed, analyses, depth + 1)
+
+        # RANGE narrowed to the values LOADED keeps when CONDITION does not leave the loop
+        # (LEAVES: the loop leaves when CONDITION holds) (`staying`).
+        def staying_range(condition: LLVMValueRef, loaded: LLVMValueRef, leaves: bool, range: ElisaConstantRangeRef, analyses: ElisaFunctionAnalysesRef, depth: u32) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            return range if depth > ReadValidationLimit::STAYING_DEPTH
+            if leaves:
+                if logical_operands(condition, false) is operands:
+                    left: ElisaConstantRangeRef = staying_range(operands.left, loaded, true, range, analyses, depth + 1)
+                    return staying_range(operands.right, loaded, true, left, analyses, depth + 1)
+                return staying_phi(condition, loaded, range, analyses, depth) if is_llvm_instruction_with_opcode(condition, LLVMOpcode::PHI)
+            return range if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP)
+            constant: LLVMValueRef = LLVMGetOperand(condition, 1)
+            return range if LLVMIsAConstantInt(constant) == null or not same_element(LLVMGetOperand(condition, 0), loaded, analyses)
+            predicate: i32 = inverse_integer_predicate(LLVMGetICmpPredicate(condition)) if leaves else LLVMGetICmpPredicate(condition)
+            intersect_smallest_ranges(range, ElisaLLVMConstantRangeExactByCompare(predicate, constant))
+
+        # The header phi counting from 0 at BEFORE whose increment by one is NEXT
+        # (`counter`).
+        def zero_based_counter(loop: ElisaLoopRef, before: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, next: LLVMValueRef) -> LLVMValueRef? can[Memory.Allocate]:
+            for phi in block_phis(ElisaLLVMLoopHeader(loop)) |before, latch, next|:
+                if phi_incoming_for_block(phi, before) is start:
+                    if LLVMIsAConstantInt(start) != null and is_zero_constant(start):
+                        if phi_incoming_for_block(phi, latch) is incoming:
+                            if incoming == next and is_llvm_instruction_with_opcode(next, LLVMOpcode::ADD) and LLVMGetOperand(next, 0) == phi:
+                                step: LLVMValueRef = LLVMGetOperand(next, 1)
+                                return phi if LLVMIsAConstantInt(step) != null and ElisaLLVMConstantIntEquals(step, 1) != 0
+            null
+
+        # Whether EXITING's test counts the loop: the latch leaves when i + 1 == bound, or
+        # the header leaves when i >=u bound or i == bound.
+        def exit_counts(loop: ElisaLoopRef, exiting: LLVMBasicBlockRef, latch: LLVMBasicBlockRef, before: LLVMBasicBlockRef, tested: LLVMValueRef, predicate: i32) -> bool can[Abort.Panic, Memory.Allocate]:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            if exiting == latch and exiting != header:
+                return predicate == LLVMIntPredicate::EQ and LLVMIsAInstruction(tested) != null and zero_based_counter(loop, before, latch, tested) != null
+            return false if exiting != header or exiting == latch
+            return false if predicate != LLVMIntPredicate::UGE and predicate != LLVMIntPredicate::EQ
+            for phi in block_phis(header) |loop, latch, before, tested|:
+                if phi == tested:
+                    if phi_incoming_for_block(phi, latch) is next:
+                        if LLVMIsAInstruction(next) != null:
+                            if zero_based_counter(loop, before, latch, next) is counter:
+                                return counter == phi
+                            return false
+            false
+
+        # How LOOP ends, when it is counted (`counted`).
+        def validated_loop_exit(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef) -> CountedExit? can[Abort.Panic, Memory.Allocate]:
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            before: LLVMBasicBlockRef = get ElisaLLVMLoopPredecessor(loop) else return null
+            exitings: darray[LLVMBasicBlockRef] = [latch, ElisaLLVMLoopHeader(loop)]
+            for exiting in exitings |loop, analyses, latch, before|:
+                if conditional_terminator(exiting) is branch:
+                    compare: LLVMValueRef = LLVMGetCondition(branch)
+                    if is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP):
+                        bound: LLVMValueRef = LLVMGetOperand(compare, 1)
+                        if LLVMGetTypeKind(LLVMTypeOf(bound)) == LLVMTypeKindValue::INTEGER and is_term_invariant(analyses, term_of(analyses, bound), loop):
+                            leaving: u32 = 1 if ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 0)) != 0 else 0
+                            leaves: bool = ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, leaving)) == 0
+                            if leaves and ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1 - leaving)) != 0:
+                                predicate: i32 = LLVMGetICmpPredicate(compare) if leaving == 0 else inverse_integer_predicate(LLVMGetICmpPredicate(compare))
+                                if exit_counts(loop, exiting, latch, before, LLVMGetOperand(compare, 0), predicate):
+                                    return CountedExit{bound: bound, exiting: exiting, exit: LLVMGetSuccessor(branch, leaving)}
+            null
+
+        # Every path into the exit other than the counted one decided bound == 0
+        # (`exitCoversBound`).
+        def exit_covers_bound(loop: ElisaLoopRef, counted: CountedExit&) -> bool can[Abort.Panic, Memory.Allocate]:
+            for from in predecessor_edges(counted.exit) |loop, counted|:
+                continue if from == counted.exiting
+                return false if ElisaLLVMLoopContainsBlock(loop, from) != 0
+                branch: LLVMValueRef = get conditional_terminator(from) else return false
+                compare: LLVMValueRef = LLVMGetCondition(branch)
+                return false if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::EQ
+                zero: LLVMValueRef = LLVMGetOperand(compare, 1)
+                return false if LLVMGetOperand(compare, 0) != counted.bound or LLVMIsAConstantInt(zero) == null or not is_zero_constant(zero)
+                return false if LLVMGetSuccessor(branch, 0) != counted.exit or LLVMGetSuccessor(branch, 1) == counted.exit
+            true
+
+        # The validated memory is not a stack object: the writes the proof skips are
+        # stores to stack objects (`outsideStack`).
+        def outside_stack(pointer: ElisaScalarEvolutionExpressionRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            base: LLVMValueRef = get term_value(ElisaLLVMScalarEvolutionPointerBase(analyses, pointer)) else return false
+            LLVMIsAAllocaInst(ElisaLLVMUnderlyingObject(base)) == null
+
+        # Every instruction of LOOP writes only the stack: a compare may test a second
+        # load of the element, so nothing between them may write it.
+        def loop_writes_only_stack(loop: ElisaLoopRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |loop|:
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                while cursor is instruction |cursor|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    return false if not writes_only_stack(instruction)
+            true
+
+        # The values LOAD keeps on every exit test of LOOP that dominates the latch, other
+        # than the counted one.
+        def staying_values(loop: ElisaLoopRef, load: LLVMValueRef, latch: LLVMBasicBlockRef, counted: CountedExit&, analyses: ElisaFunctionAnalysesRef) -> ElisaConstantRangeRef can[Abort.Panic, Memory.Allocate]:
+            range: mutable ElisaConstantRangeRef = ElisaLLVMConstantRangeFull(LLVMGetIntTypeWidth(LLVMTypeOf(load)))
+            for index in 0..<ElisaLLVMLoopBlockCount(loop) |range, loop, load, latch, counted, analyses|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, index)
+                if conditional_terminator(block) is branch:
+                    if ElisaLLVMBlockDominates(analyses, block, latch) != 0 and block != counted.exiting:
+                        for side in 0..<2 |range, loop, load, analyses, branch|:
+                            inside: bool = ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, side.u32())) != 0
+                            if not inside and ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1 - side.u32())) != 0:
+                                range <- staying_range(LLVMGetCondition(branch), load, side == 0, range, analyses, 0)
+            range
+
+    public:
+        # The validation LOAD in LOOP performs, if any (`validation`).
+        def read_validation(loop: ElisaLoopRef, load: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef) -> ReadValidation? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            counted: CountedExit = get validated_loop_exit(loop, analyses) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            return null if ElisaLLVMBlockDominates(analyses, LLVMGetInstructionParent(load), latch) == 0
+            address: ElisaScalarEvolutionExpressionRef = term_of(analyses, LLVMGetOperand(load, 0))
+            return null if term_kind(address) != ElisaScalarEvolutionKind::ADD_RECURRENCE
+            step: LLVMValueRef = get term_constant(ElisaLLVMScalarEvolutionStepRecurrence(analyses, address)) else return null
+            size: u64 = LLVMStoreSizeOfType(layout, LLVMTypeOf(load))
+            address_loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(address) else return null
+            return null if address_loop != loop or term_operand_count(address) != 2 or ElisaLLVMConstantIntEquals(step, size) == 0
+            start: ElisaScalarEvolutionExpressionRef = term_operand(address, 0)
+            return null if not outside_stack(start, analyses) or not loop_writes_only_stack(loop)
+            range: ElisaConstantRangeRef = staying_values(loop, load, latch, &counted, analyses)
+            if ElisaLLVMConstantRangeIsFull(range) != 0 or ElisaLLVMConstantRangeIsEmpty(range) != 0 or not exit_covers_bound(loop, &counted):
+                ElisaLLVMDisposeConstantRange(range)
+                return null
+            ReadValidation{load: load, start: start, step: size, bound: counted.bound, exit: counted.exit, range: range}

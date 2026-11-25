@@ -301,6 +301,14 @@ LLVMValueRef ElisaLLVMConstantIntUnsignedDivide(LLVMValueRef first, LLVMValueRef
   return constantOf(first, constantValue(first).udiv(constantValue(second)));
 }
 
+LLVMValueRef ElisaLLVMConstantIntSignedDivide(LLVMValueRef first, LLVMValueRef second) {
+  return constantOf(first, constantValue(first).sdiv(constantValue(second)));
+}
+
+LLVMValueRef ElisaLLVMConstantIntSignedRemainder(LLVMValueRef first, LLVMValueRef second) {
+  return constantOf(first, constantValue(first).srem(constantValue(second)));
+}
+
 ElisaConstantRangeRef ElisaLLVMConstantRangeIntersectSigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second) {
   return wrap(new ConstantRange(unwrap(first)->intersectWith(*unwrap(second), ConstantRange::Signed)));
 }

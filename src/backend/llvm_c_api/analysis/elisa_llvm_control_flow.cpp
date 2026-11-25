@@ -21,6 +21,13 @@ int ElisaLLVMInstructionIsPotentiallyReachableWithin(ElisaFunctionAnalysesRef an
                                 unwrapAnalyses(analyses)->dominators.get(), nullptr);
 }
 
+int ElisaLLVMInstructionIsPotentiallyReachableInLoops(ElisaFunctionAnalysesRef analyses, LLVMValueRef from,
+                                                      LLVMValueRef to) {
+  FunctionAnalyses *A = unwrapAnalyses(analyses);
+  return isPotentiallyReachable(cast<Instruction>(unwrap(from)), cast<Instruction>(unwrap(to)), nullptr,
+                                A->dominators.get(), &A->loops());
+}
+
 int ElisaLLVMBlockIsPotentiallyReachableWithin(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef from,
                                                LLVMBasicBlockRef to, int use_loops) {
   FunctionAnalyses *A = unwrapAnalyses(analyses);

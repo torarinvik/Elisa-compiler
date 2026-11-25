@@ -1,0 +1,97 @@
+# Writes that can only reach local stack memory (`writesOnlyStack` in
+# `ElisaValidatedReads`): a store or fill into an alloca, a lifetime marker, a call that
+# touches only memory no program code reads (a trap), or a call of a defined helper that
+# is passed only the caller's stack and writes only through what it was passed.
+
+const module StackWriteLimit:
+    ON_STACK_DEPTH: u32 = 4
+    SLOT_DEPTH: u32 = 3
+    CALL_DEPTH: u32 = 1
+
+extend Backend:
+    private:
+        # The pointer a store or memory intrinsic writes through, if WRITER is one.
+        def written_pointer(writer: LLVMValueRef) -> LLVMValueRef?:
+            return LLVMGetOperand(writer, 1) if LLVMIsAStoreInst(writer) != null
+            return LLVMGetOperand(writer, 0) if ElisaLLVMIsMemIntrinsic(writer) != 0
+            null
+
+        def is_call_site_instruction(instruction: LLVMValueRef) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            opcode == LLVMOpcode::CALL or opcode == LLVMOpcode::INVOKE or opcode == LLVMOpcode::CALL_BR
+
+        # A write that can be skipped outright: no memory write, a lifetime marker, or a
+        # call that only touches inaccessible memory.
+        def harmless_write(writer: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if ElisaLLVMMayWriteToMemory(writer) == 0 or is_lifetime_marker(writer)
+            is_call_site_instruction(writer) and ElisaLLVMCallOnlyAccessesInaccessibleMemory(writer) != 0
+
+        # A pointer into a local stack object, or a view {data, length} whose data is
+        # (`onStack`).
+        def on_stack(value: LLVMValueRef, depth: u32) -> bool:
+            return false if depth > StackWriteLimit::ON_STACK_DEPTH
+            kind: u32 = LLVMGetTypeKind(LLVMTypeOf(value))
+            return LLVMIsAAllocaInst(ElisaLLVMUnderlyingObject(value)) != null if kind == LLVMTypeKindValue::POINTER
+            if is_llvm_instruction_with_opcode(value, LLVMOpcode::INSERT_VALUE):
+                aggregate: LLVMValueRef = LLVMGetOperand(value, 0)
+                inserted: LLVMValueRef = LLVMGetOperand(value, 1)
+                return false if LLVMIsUndef(aggregate) == 0 and not on_stack(aggregate, depth + 1)
+                return LLVMGetTypeKind(LLVMTypeOf(inserted)) != LLVMTypeKindValue::POINTER or on_stack(inserted, depth + 1)
+            kind != LLVMTypeKindValue::STRUCT and kind != LLVMTypeKindValue::ARRAY
+
+        # Whether a callee's stack SLOT only ever holds its arguments: a view argument
+        # spilled before its fields are read back (`holdsArguments`).
+        def holds_arguments(slot: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if depth > StackWriteLimit::SLOT_DEPTH
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(slot)
+            while use_cursor is use |use_cursor, slot, depth|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                if LLVMIsAStoreInst(user) != null:
+                    return false if LLVMGetOperand(user, 1) != slot or LLVMIsAArgument(LLVMGetOperand(user, 0)) == null
+                elif LLVMIsAGetElementPtrInst(user) != null:
+                    return false if not holds_arguments(user, depth + 1)
+                elif LLVMIsALoadInst(user) == null and not is_lifetime_marker(user):
+                    return false
+            true
+
+        # A pointer the callee received: an argument, a view argument's data (read
+        # directly or from the slot it was spilled to), or its own stack (`callerOwned`).
+        def caller_owned(target: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            base: mutable LLVMValueRef = ElisaLLVMUnderlyingObject(target)
+            if is_llvm_instruction_with_opcode(base, LLVMOpcode::EXTRACT_VALUE):
+                base <- LLVMGetOperand(base, 0)
+            if LLVMIsALoadInst(base) != null:
+                slot: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(base, 0))
+                return holds_arguments(slot, 0) if LLVMIsAAllocaInst(slot) != null
+            LLVMIsAArgument(base) != null or LLVMIsAAllocaInst(base) != null
+
+        # Every write of CALLEE goes through what it was passed or its own stack.
+        def callee_writes_only_owned(callee: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(callee)
+            while block_cursor is block |block_cursor|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is inner |cursor|:
+                    cursor <- LLVMGetNextInstruction(inner)
+                    continue if harmless_write(inner)
+                    target: LLVMValueRef = get written_pointer(inner) else return false
+                    return false if not caller_owned(target)
+            true
+
+        # A call whose callee writes only through what it was passed, and is passed only
+        # the caller's stack (`stackOnlyCall`).
+        def stack_only_call(call: LLVMValueRef, depth: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            callee: LLVMValueRef = get direct_callee(call) else return false
+            return false if LLVMIsDeclaration(callee) != 0 or LLVMIsFunctionVarArg(LLVMGlobalGetValueType(callee)) != 0 or depth > StackWriteLimit::CALL_DEPTH
+            for index in 0..<LLVMGetNumArgOperands(call) |call|:
+                return false if not on_stack(LLVMGetOperand(call, index), 0)
+            callee_writes_only_owned(callee)
+
+    public:
+        # Whether WRITER can only write local stack memory (`writesOnlyStack`).
+        def writes_only_stack(writer: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if harmless_write(writer)
+            if written_pointer(writer) is target:
+                return LLVMIsAAllocaInst(ElisaLLVMUnderlyingObject(target)) != null
+            is_call_site_instruction(writer) and stack_only_call(writer, 0)

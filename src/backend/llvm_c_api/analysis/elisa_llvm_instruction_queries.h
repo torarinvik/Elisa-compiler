@@ -24,6 +24,11 @@ int ElisaLLVMMayWriteToMemory(LLVMValueRef instruction);
 int ElisaLLVMIsSafeToSpeculativelyExecuteAt(LLVMValueRef instruction, LLVMValueRef context);
 /* CallBase::onlyReadsMemory: the call, by its own or its callee's attributes, at most reads memory. */
 int ElisaLLVMCallOnlyReadsMemory(LLVMValueRef call);
+/* CallBase::onlyAccessesInaccessibleMemory: the call touches only memory no program code
+ * reads (a trap's). */
+int ElisaLLVMCallOnlyAccessesInaccessibleMemory(LLVMValueRef call);
+/* MemIntrinsic::getDestAlign in bytes, or 0 when the destination carries no alignment. */
+unsigned ElisaLLVMMemoryIntrinsicDestinationAlignment(LLVMValueRef intrinsic);
 
 #ifdef __cplusplus
 }

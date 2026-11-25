@@ -1,0 +1,146 @@
+# Shrink the zero fill of a local array that is used only through one view of its first
+# L elements (a scratch buffer handed to a helper as `scratch[0:length]`) to those L
+# elements (`ElisaViewBounds::shrinkViewFills`). Elements past L would need their zeros
+# only if some access through the view reached them, so every access is proved to stay
+# inside it (view_bound_checker.elisa).
+include "../index_proofs/index_prover.elisa"
+include "./view_bound_checker.elisa"
+include "./view_data_bounds.elisa"
+
+# A local array's one full zero fill and the view of its first elements built from it.
+struct ViewFill:
+    buffer: LLVMValueRef
+    fill: LLVMValueRef
+    view: LLVMValueRef
+
+extend Backend:
+    private:
+        # USER zero-fills all BYTES of BUFFER.
+        def zero_byte_fill(user: LLVMValueRef, buffer: LLVMValueRef, bytes: u64) -> bool:
+            byte: LLVMValueRef = LLVMGetOperand(user, 1)
+            length: LLVMValueRef = LLVMGetOperand(user, 2)
+            return false if memory_intrinsic_volatile(user) or LLVMGetOperand(user, 0) != buffer
+            return false if LLVMIsAConstantInt(byte) == null or not is_zero_constant(byte)
+            LLVMIsAConstantInt(length) != null and LLVMConstIntGetZExtValue(length) == bytes
+
+        # Every index of GEP is a zero constant.
+        def has_zero_indices(gep: LLVMValueRef) -> bool:
+            for index in 1..<LLVMGetNumOperands(gep) |gep|:
+                operand: LLVMValueRef = LLVMGetOperand(gep, index)
+                return false if LLVMIsAConstantInt(operand) == null or not is_zero_constant(operand)
+            true
+
+        # The view's data: the `insertvalue` at index 0 of BUFFER, or of its first
+        # element's address, that is used once.
+        def view_data_insert(user: LLVMValueRef, buffer: LLVMValueRef) -> LLVMValueRef?:
+            start: mutable LLVMValueRef = user
+            if LLVMGetInstructionOpcode(user) == LLVMOpcode::GET_ELEMENT_PTR:
+                return null if not has_zero_indices(user) or not has_one_use(user)
+                if LLVMGetFirstUse(user) is only_use:
+                    start <- LLVMGetUser(only_use)
+            return null if LLVMGetInstructionOpcode(start) != LLVMOpcode::INSERT_VALUE or LLVMGetNumIndices(start) != 1
+            return null if aggregate_field_index(start) != 0 or not has_one_use(start)
+            expected: mutable LLVMValueRef = user
+            if start == user:
+                expected <- buffer
+            return null if LLVMGetOperand(start, 1) != expected
+            start
+
+        # BUFFER's fill and view, when the fill, the view of its first elements and
+        # lifetime markers are all its uses (`candidate`).
+        def view_fill_candidate(buffer: LLVMValueRef, layout: LLVMTargetDataRef) -> ViewFill? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            bytes: u64 = LLVMABISizeOfType(layout, LLVMGetAllocatedType(buffer))
+            fill: mutable LLVMValueRef? = null
+            data: mutable LLVMValueRef? = null
+            use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(buffer)
+            while use_cursor is use |use_cursor, fill, data, buffer, bytes|:
+                use_cursor <- LLVMGetNextUse(use)
+                user: LLVMValueRef = LLVMGetUser(use)
+                opcode: u32 = LLVMGetInstructionOpcode(user)
+                if ElisaLLVMIsMemSet(user) != 0:
+                    return null if fill != null or not zero_byte_fill(user, buffer, bytes)
+                    fill <- user
+                elif opcode == LLVMOpcode::INSERT_VALUE or opcode == LLVMOpcode::GET_ELEMENT_PTR:
+                    inserted: LLVMValueRef = get view_data_insert(user, buffer) else return null
+                    return null if data != null
+                    data <- inserted
+                elif not is_lifetime_marker(user):
+                    return null
+            data_insert: LLVMValueRef = get data else return null
+            full_fill: LLVMValueRef = get fill else return null
+            first_use: LLVMUseRef = get LLVMGetFirstUse(data_insert) else return null
+            view: LLVMValueRef = LLVMGetUser(first_use)
+            type: LLVMTypeRef = LLVMTypeOf(view)
+            return null if LLVMGetInstructionOpcode(view) != LLVMOpcode::INSERT_VALUE or LLVMGetOperand(view, 0) != data_insert
+            return null if LLVMGetNumIndices(view) != 1 or aggregate_field_index(view) != 1
+            return null if LLVMGetTypeKind(type) != LLVMTypeKindValue::STRUCT or LLVMCountStructElementTypes(type) != 2
+            return null if not is_llvm_integer_type(LLVMStructGetTypeAtIndex(type, 1), 64)
+            ViewFill{buffer: buffer, fill: full_fill, view: view}
+
+        # The fill runs once, before the view, whose length fits the array, and every
+        # access through the view stays below its length.
+        def view_fill_shrinkable(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, shape: ViewFill&, element_size: u64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            length: LLVMValueRef = LLVMGetOperand(shape.view, 1)
+            return false if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(shape.fill)) != null
+            return false if ElisaLLVMInstructionDominates(analyses, shape.fill, shape.view) == 0
+            array_length: u64 = LLVMGetArrayLength2(LLVMGetAllocatedType(shape.buffer))
+            prover: mutable IndexProver = new_index_prover(function, analyses)
+            fits: bool = prove_at_most(&prover, term_of(analyses, length), ElisaLLVMScalarEvolutionConstantOf(analyses, LLVMTypeOf(length), array_length), shape.view)
+            dispose_index_prover(&prover)
+            return false if not fits
+            checker: mutable ViewChecker = new_view_checker(function, analyses, element_size)
+            bounded: bool = view_bounded(&checker, shape.view, function)
+            dispose_view_checker(&checker)
+            bounded
+
+        # Zero the first `length` elements where the view is built, in place of the
+        # whole fill.
+        def shrink_view_fill(shape: ViewFill&, element_size: u64) -> void can[Abort.Panic, Memory.Allocate]:
+            length: LLVMValueRef = LLVMGetOperand(shape.view, 1)
+            context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(length))
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(context)
+            LLVMPositionBuilderBefore(builder, shape.view)
+            name_storage: mutable darray[u8] = []
+            bytes: LLVMValueRef = LLVMBuildMul(builder, length, LLVMConstInt(LLVMTypeOf(length), element_size, 0), sview_to_cstr("view.fill.bytes", name_storage))
+            if LLVMIsAInstruction(bytes) != null:
+                LLVMSetNUW(bytes, 1)
+                LLVMSetNSW(bytes, 1)
+            alignment: u32 = ElisaLLVMMemoryIntrinsicDestinationAlignment(shape.fill)
+            _ = LLVMBuildMemSet(builder, shape.buffer, LLVMConstInt(LLVMInt8TypeInContext(context), 0, 0), bytes, alignment)
+            LLVMDisposeBuilder(builder)
+            LLVMInstructionEraseFromParent(shape.fill)
+
+        # The view fills of FUNCTION's static integer arrays, shrunk.
+        def shrink_function_view_fills(function: LLVMValueRef, layout: LLVMTargetDataRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            found: mutable darray[ViewFill] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while cursor is buffer |cursor, found, layout|:
+                cursor <- LLVMGetNextInstruction(buffer)
+                continue if LLVMIsAAllocaInst(buffer) == null or ElisaLLVMIsStaticAlloca(buffer) == 0
+                type: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+                continue if LLVMGetTypeKind(type) != LLVMTypeKindValue::ARRAY or LLVMGetTypeKind(LLVMGetElementType(type)) != LLVMTypeKindValue::INTEGER
+                if view_fill_candidate(buffer, layout) is shape:
+                    found.push(shape)
+            return 0 if found.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            shrunk: mutable u32 = 0
+            for shape in found |shrunk, function, analyses, layout|:
+                element_size: u64 = LLVMABISizeOfType(layout, LLVMGetElementType(LLVMGetAllocatedType(shape.buffer)))
+                continue if not view_fill_shrinkable(function, analyses, &shape, element_size)
+                shrink_view_fill(&shape, element_size)
+                ElisaLLVMInvalidateFunctionAnalyses(analyses)
+                shrunk <- shrunk + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            shrunk
+
+    public:
+        # Every view fill of MODULE shrunk; how many were.
+        def shrink_view_fills(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            shrunk: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, shrunk, layout|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+                shrunk <- shrunk + shrink_function_view_fills(function, layout)
+            shrunk

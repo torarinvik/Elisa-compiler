@@ -1,0 +1,172 @@
+# Bound reads of input elements an earlier loop validated (`ElisaValidatedReads`). A
+# program that checks every element of an argument range (`input[2 + i]` for i < n + m
+# against [0, 1e9], returning on a bad one) and then reads those elements again gets no
+# range for the second reads: they load memory again. When the validating loop
+# finished, every element below its bound passed the check, and a later load reads one
+# of them if its element index is provably below that bound (the index prover) and no
+# write that could reach the argument's memory runs between them. Such loads get the
+# validated range as `!range`, which removes the overflow checks of arithmetic over
+# input values.
+include "../index_proofs/index_prover.elisa"
+include "./read_validations.elisa"
+
+const module ValidatedReadLimit:
+    DIVIDE_DEPTH: u32 = 6
+
+extend Backend:
+    private:
+        # Whether a write that may reach the validated memory can run before LOAD
+        # (`unwritten`).
+        def unwritten(function: LLVMValueRef, load: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, load, analyses|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is writer |cursor, load, analyses|:
+                    cursor <- LLVMGetNextInstruction(writer)
+                    continue if writes_only_stack(writer)
+                    return false if ElisaLLVMInstructionIsPotentiallyReachableInLoops(analyses, writer, load) != 0
+            true
+
+        # CONSTANT /u SIZE as a term, when SIZE divides it.
+        def divided_constant(constant: LLVMValueRef, size: u64, analyses: ElisaFunctionAnalysesRef) -> ElisaScalarEvolutionExpressionRef?:
+            divisor: LLVMValueRef = LLVMConstInt(LLVMTypeOf(constant), size, 0)
+            quotient: LLVMValueRef = ElisaLLVMConstantIntUnsignedDivide(constant, divisor)
+            return null if ElisaLLVMConstantIntMultiply(quotient, divisor) != constant
+            term_of(analyses, quotient)
+
+        # OFFSET / SIZE term by term, when every term is a multiple of SIZE (`divided`).
+        # The quotient times SIZE equals OFFSET modulo 2^64, so a quotient below the bound
+        # addresses a validated element even where `/u` would not fold.
+        def divided_offset(offset: ElisaScalarEvolutionExpressionRef, size: u64, analyses: ElisaFunctionAnalysesRef, depth: u32) -> ElisaScalarEvolutionExpressionRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if depth > ValidatedReadLimit::DIVIDE_DEPTH
+            kind: u32 = term_kind(offset)
+            if term_constant(offset) is constant:
+                return divided_constant(constant, size, analyses)
+            if kind == ElisaScalarEvolutionKind::ADD:
+                total: mutable ElisaScalarEvolutionExpressionRef = term_constant_like(analyses, offset, 0)
+                for index in 0..<term_operand_count(offset) |total, offset, size, analyses, depth|:
+                    part: ElisaScalarEvolutionExpressionRef = get divided_offset(term_operand(offset, index), size, analyses, depth + 1) else return null
+                    total <- term_sum(analyses, total, part)
+                return total
+            if kind == ElisaScalarEvolutionKind::MULTIPLY:
+                factor: LLVMValueRef = get term_constant(term_operand(offset, 0)) else return null
+                result: mutable ElisaScalarEvolutionExpressionRef = get divided_constant(factor, size, analyses) else return null
+                for index in 1..<term_operand_count(offset) |result, offset, analyses|:
+                    result <- ElisaLLVMScalarEvolutionMultiply(analyses, result, term_operand(offset, index))
+                return result
+            return null if kind != ElisaScalarEvolutionKind::ADD_RECURRENCE or term_operand_count(offset) != 2
+            loop: ElisaLoopRef = get ElisaLLVMScalarEvolutionRecurrenceLoop(offset) else return null
+            start: ElisaScalarEvolutionExpressionRef? = divided_offset(term_operand(offset, 0), size, analyses, depth + 1)
+            step: ElisaScalarEvolutionExpressionRef? = divided_offset(ElisaLLVMScalarEvolutionStepRecurrence(analyses, offset), size, analyses, depth + 1)
+            first: ElisaScalarEvolutionExpressionRef = get start else return null
+            stride: ElisaScalarEvolutionExpressionRef = get step else return null
+            ElisaLLVMScalarEvolutionAddRecurrence(analyses, first, stride, loop, 0)
+
+        # A bound `x + y` that cannot wrap (two input counts) holds every index below x,
+        # and x + d for every d below y.
+        def below_sum(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, sum: LLVMValueRef, load: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            if LLVMGetNUW(sum) == 0:
+                first: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, LLVMGetOperand(sum, 0), load, 0)
+                second: ElisaConstantRangeRef = ElisaLLVMLazyValueConstantRange(analyses, LLVMGetOperand(sum, 1), load, 0)
+                safe: bool = ElisaLLVMConstantRangeNeverOverflows(LLVMOpcode::ADD, 0, first, second) != 0
+                ElisaLLVMDisposeConstantRange(first)
+                ElisaLLVMDisposeConstantRange(second)
+                return false if not safe
+            for side in 0..<2 |prover, index, sum, load, analyses|:
+                part: ElisaScalarEvolutionExpressionRef = term_of(analyses, LLVMGetOperand(sum, side.u32()))
+                other: ElisaScalarEvolutionExpressionRef = term_of(analyses, LLVMGetOperand(sum, 1 - side.u32()))
+                return true if prove_below(prover, index, part, load) or prove_below(prover, term_difference(analyses, index, part), other, load)
+            false
+
+        # INDEX <u BOUND where LOAD runs (`below`).
+        def index_below_bound(prover: mutable IndexProver&, index: ElisaScalarEvolutionExpressionRef, bound: LLVMValueRef, load: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            limit: ElisaScalarEvolutionExpressionRef = term_of(analyses, bound)
+            return true if prove_below(prover, index, limit, load)
+            # Index = i - k below Limit = n - k (a loop from k reading element i - k):
+            # i < n with i >= k, so neither side wraps.
+            if term_kind(limit) == ElisaScalarEvolutionKind::ADD and is_term_negative(term_operand(limit, 0)):
+                offset: ElisaScalarEvolutionExpressionRef = term_operand(limit, 0)
+                shifted: ElisaScalarEvolutionExpressionRef = term_difference(analyses, index, offset)
+                whole: ElisaScalarEvolutionExpressionRef = term_difference(analyses, limit, offset)
+                return true if prove_below(prover, shifted, whole, load) and prove_at_most(prover, term_negation(analyses, offset), shifted, load)
+            return false if not is_llvm_instruction_with_opcode(bound, LLVMOpcode::ADD)
+            below_sum(prover, index, bound, load)
+
+        # CHECK's range as LOAD's `!range` when LOAD reads an element CHECK validated
+        # (`annotateLoad`).
+        def annotate_validated_load(prover: mutable IndexProver&, load: LLVMValueRef, check: ReadValidation&, range_kind: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            return false if LLVMGetMetadata(load, range_kind) != null or not is_simple_access(load)
+            return false if LLVMGetTypeKind(LLVMTypeOf(load)) != LLVMTypeKindValue::INTEGER
+            return false if ElisaLLVMConstantRangeBitWidth(check.range) != LLVMGetIntTypeWidth(LLVMTypeOf(load))
+            return false if ElisaLLVMBlockDominates(analyses, check.exit, LLVMGetInstructionParent(load)) == 0
+            offset: ElisaScalarEvolutionExpressionRef = term_difference(analyses, term_of(analyses, LLVMGetOperand(load, 0)), check.start)
+            return false if term_kind(offset) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            index: ElisaScalarEvolutionExpressionRef = get divided_offset(offset, check.step, analyses, 0) else return false
+            return false if LLVMTypeOf(check.bound) != term_type(index) or not index_below_bound(prover, index, check.bound, load)
+            set_load_range(load, check.range, range_kind, prover.context)
+            true
+
+        # FUNCTION's validations: the simple integer loads of each loop, in preorder.
+        def function_validations(analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef) -> darray[ReadValidation] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            checks: mutable darray[ReadValidation] = []
+            for loop in loops_in_program_preorder(analyses) |checks, analyses, layout|:
+                for index in 0..<ElisaLLVMLoopBlockCount(loop) |checks, analyses, layout, loop|:
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopBlockAt(loop, index))
+                    while cursor is load |cursor, checks, analyses, layout, loop|:
+                        cursor <- LLVMGetNextInstruction(load)
+                        continue if LLVMIsALoadInst(load) == null or not is_simple_access(load) or LLVMGetTypeKind(LLVMTypeOf(load)) != LLVMTypeKindValue::INTEGER
+                        if read_validation(loop, load, analyses, layout) is check:
+                            checks.push(check)
+            checks
+
+        # Whether LOAD gets the range of one of CHECKS.
+        def annotate_from_checks(prover: mutable IndexProver&, function: LLVMValueRef, load: LLVMValueRef, checks: darray[ReadValidation]&, range_kind: u32) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            base: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionPointerBase(analyses, term_of(analyses, LLVMGetOperand(load, 0)))
+            for check in checks |prover, function, load, range_kind, analyses, base|:
+                continue if load == check.load or base != ElisaLLVMScalarEvolutionPointerBase(analyses, check.start)
+                continue if not unwritten(function, load, analyses)
+                return true if annotate_validated_load(prover, load, &check, range_kind)
+            false
+
+        def annotate_function_validated_reads(function: LLVMValueRef, layout: LLVMTargetDataRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            if ElisaLLVMTopLevelLoopCount(analyses) == 0:
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+                return 0
+            checks: darray[ReadValidation] = function_validations(analyses, layout)
+            changed: mutable u32 = 0
+            if checks.count != 0:
+                prover: mutable IndexProver = new_index_prover(function, analyses)
+                context: LLVMContextRef = LLVMGetTypeContext(LLVMTypeOf(function))
+                range_kind: u32 = LLVMGetMDKindIDInContext(context, "range", 5)
+                block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+                while block_cursor is block |block_cursor, prover, changed, function, checks, range_kind|:
+                    block_cursor <- LLVMGetNextBasicBlock(block)
+                    cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                    while cursor is load |cursor, prover, changed, function, checks, range_kind|:
+                        cursor <- LLVMGetNextInstruction(load)
+                        if LLVMIsALoadInst(load) != null:
+                            changed <- changed + 1 if annotate_from_checks(prover, function, load, &checks, range_kind) else changed
+                dispose_index_prover(&prover)
+            for check in checks:
+                ElisaLLVMDisposeConstantRange(check.range)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            changed
+
+    public:
+        # MODULE's loads of validated input elements annotated with the validated range;
+        # returns how many (`annotateValidatedReads`).
+        def annotate_validated_reads(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            changed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, changed, layout|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone")
+                changed <- changed + annotate_function_validated_reads(function, layout)
+            changed

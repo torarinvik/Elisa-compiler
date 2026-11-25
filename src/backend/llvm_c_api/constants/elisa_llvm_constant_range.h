@@ -131,6 +131,9 @@ int ElisaLLVMConstantIntIsSignedIntN(LLVMValueRef constant, uint32_t bits);
  * ConstantInts of one width (elisa_llvm_analysis has the active bits and product). */
 int ElisaLLVMConstantIntCompare(LLVMIntPredicate predicate, LLVMValueRef first, LLVMValueRef second);
 LLVMValueRef ElisaLLVMConstantIntUnsignedDivide(LLVMValueRef first, LLVMValueRef second);
+/* APInt::sdiv and APInt::srem on ConstantInts of one width (second nonzero). */
+LLVMValueRef ElisaLLVMConstantIntSignedDivide(LLVMValueRef first, LLVMValueRef second);
+LLVMValueRef ElisaLLVMConstantIntSignedRemainder(LLVMValueRef first, LLVMValueRef second);
 /* intersectWith and unionWith preferring the smaller signed range, and unionWith
  * preferring the smallest range. */
 ElisaConstantRangeRef ElisaLLVMConstantRangeIntersectSigned(ElisaConstantRangeRef first, ElisaConstantRangeRef second);

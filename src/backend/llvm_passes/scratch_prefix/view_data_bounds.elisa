@@ -1,0 +1,145 @@
+# Accesses through a view's data pointer (`dataBounded` in `ElisaViewBounds::Checker`):
+# the bytes each load, store or memory intrinsic touches lie inside the view's first
+# LENGTH elements, by the index prover's proofs in the function that makes the access.
+# The vectorizer's overlap checks may compare the pointer's address; any other use of
+# the pointer (a cast back to a pointer, a store of it, a call with the bare pointer)
+# fails the check.
+include "../index_proofs/element_offsets.elisa"
+
+# The view's terms: its length in elements, its data pointer, and the layout.
+struct ViewTerms:
+    elements: ElisaScalarEvolutionExpressionRef
+    base: ElisaScalarEvolutionExpressionRef
+    layout: LLVMTargetDataRef
+
+extend Backend:
+    private:
+        # BYTES / the element size, when BYTES is computable and a multiple of it.
+        def element_quotient(analyses: ElisaFunctionAnalysesRef, bytes: ElisaScalarEvolutionExpressionRef, element_size: u64) -> ElisaScalarEvolutionExpressionRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if term_kind(bytes) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            element_offset_quotient(analyses, bytes, element_size)
+
+        # The element of a field access (`items[i].count`: element i's offset plus a
+        # residue that leaves room for a field of WIDTH bytes).
+        def residue_offset(analyses: ElisaFunctionAnalysesRef, raw: ElisaScalarEvolutionExpressionRef, width: u64, element_size: u64) -> ElisaScalarEvolutionExpressionRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            residue: mutable u64 = 0
+            while residue + width <= element_size |residue, analyses, raw, width, element_size|:
+                residue_term: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionConstantOf(analyses, term_type(raw), residue)
+                if element_quotient(analyses, term_difference(analyses, raw, residue_term), element_size) is shifted:
+                    return shifted
+                residue <- residue + 1
+            null
+
+        # Elements [OFFSET, OFFSET + COUNT) lie below ELEMENTS where AT runs.
+        def offsets_inside(prover: mutable IndexProver&, offset: ElisaScalarEvolutionExpressionRef, count: ElisaScalarEvolutionExpressionRef, elements: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if term_type(offset) != term_type(elements) or term_type(count) != term_type(offset)
+            return false if not prove_at_most(prover, term_sum(prover.analyses, offset, count), elements, at)
+            is_term_constant(count, 0) or prove_below(prover, offset, elements, at)
+
+        # The BYTES an access at POINTER touches, from the view's BASE, lie inside its
+        # ELEMENTS (`Inside`). A pointer scalar evolution cannot relate to the base is
+        # not inside (the C++ read the type of the uncomputable difference).
+        def access_inside(prover: mutable IndexProver&, element_size: u64, pointer: LLVMValueRef, bytes: ElisaScalarEvolutionExpressionRef, at: LLVMValueRef, base: ElisaScalarEvolutionExpressionRef, elements: ElisaScalarEvolutionExpressionRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            raw: ElisaScalarEvolutionExpressionRef = term_difference(analyses, term_of(analyses, pointer), base)
+            return false if term_kind(raw) == ElisaScalarEvolutionKind::COULD_NOT_COMPUTE
+            offset: ElisaScalarEvolutionExpressionRef? = element_quotient(analyses, raw, element_size)
+            count: ElisaScalarEvolutionExpressionRef? = element_quotient(analyses, bytes, element_size)
+            if count == null:
+                if term_constant(bytes) is size:
+                    width: u64 = LLVMConstIntGetZExtValue(size)
+                    if width < element_size:
+                        shifted: ElisaScalarEvolutionExpressionRef = get residue_offset(analyses, raw, width, element_size) else return false
+                        return offsets_inside(prover, shifted, ElisaLLVMScalarEvolutionConstantOf(analyses, term_type(raw), 1), elements, at)
+            first: ElisaScalarEvolutionExpressionRef = get offset else return false
+            number: ElisaScalarEvolutionExpressionRef = get count else return false
+            offsets_inside(prover, first, number, elements, at)
+
+        def is_address_arithmetic(value: LLVMValueRef, minimum: u32, maximum: u32) -> bool:
+            opcode: u32 = LLVMGetInstructionOpcode(value)
+            return true if opcode >= LLVMOpcode::ADD and opcode <= LLVMOpcode::XOR
+            return true if opcode == LLVMOpcode::SELECT or opcode == LLVMOpcode::PHI or opcode == LLVMOpcode::FREEZE
+            return true if opcode == LLVMOpcode::TRUNC or opcode == LLVMOpcode::ZEXT or opcode == LLVMOpcode::SEXT
+            return true if opcode == LLVMOpcode::PTR_TO_ADDR or opcode == LLVMOpcode::PTR_TO_INT
+            intrinsic: u32 = called_intrinsic_id(value)
+            intrinsic != 0 and (intrinsic == minimum or intrinsic == maximum)
+
+        # An address compared or computed with (the vectorizer's overlap checks), never
+        # turned back into a pointer, stored, or passed on (`addressOnly`).
+        def address_only_uses(address: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            minimum: u32 = intrinsic_identifier("llvm.umin")
+            maximum: u32 = intrinsic_identifier("llvm.umax")
+            work: mutable darray[LLVMValueRef] = [address]
+            seen: mutable KeyTable = new_key_table()
+            while work.count > 0 |work, seen, minimum, maximum|:
+                value: LLVMValueRef = work[work.count - 1]
+                work.truncate(work.count - 1)
+                key: TableKey = TableKey{first: object_key(value.cast[void&]), second: 0, third: 0}
+                continue if key_table_find(&seen, key) != null
+                seen <- key_table_insert(seen, key, 0)
+                continue if LLVMGetInstructionOpcode(value) == LLVMOpcode::ICMP
+                return false if not is_address_arithmetic(value, minimum, maximum)
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(value)
+                while use_cursor is use |use_cursor, work|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    user: LLVMValueRef = LLVMGetUser(use)
+                    return false if LLVMIsAInstruction(user) == null
+                    work.push(user)
+            true
+
+        # A memory intrinsic's `isvolatile` operand is set.
+        def memory_intrinsic_volatile(intrinsic: LLVMValueRef) -> bool:
+            LLVMConstIntGetZExtValue(LLVMGetOperand(intrinsic, 3)) != 0
+
+        # One use of a pointer derived from the view's data stays inside it; a GEP
+        # from the pointer joins POINTERS instead.
+        def data_use_inside(prover: mutable IndexProver&, element_size: u64, pointer: LLVMValueRef, user: LLVMValueRef, view: ViewTerms&, pointers: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            opcode: u32 = LLVMGetInstructionOpcode(user)
+            count_type: LLVMTypeRef = term_type(view.elements)
+            if opcode == LLVMOpcode::GET_ELEMENT_PTR and LLVMGetOperand(user, 0) == pointer:
+                pointers.push(user)
+                return true
+            if opcode == LLVMOpcode::LOAD:
+                return false if LLVMGetVolatile(user) != 0
+                size: u64 = LLVMStoreSizeOfType(view.layout, LLVMTypeOf(user))
+                return access_inside(prover, element_size, pointer, ElisaLLVMScalarEvolutionConstantOf(analyses, count_type, size), user, view.base, view.elements)
+            if opcode == LLVMOpcode::STORE:
+                stored: LLVMValueRef = LLVMGetOperand(user, 0)
+                return false if LLVMGetVolatile(user) != 0 or stored == pointer
+                size: u64 = LLVMStoreSizeOfType(view.layout, LLVMTypeOf(stored))
+                return access_inside(prover, element_size, pointer, ElisaLLVMScalarEvolutionConstantOf(analyses, count_type, size), user, view.base, view.elements)
+            return address_only_uses(user) if opcode == LLVMOpcode::PTR_TO_ADDR or opcode == LLVMOpcode::PTR_TO_INT
+            return false if ElisaLLVMIsMemIntrinsic(user) == 0 or memory_intrinsic_volatile(user)
+            length: LLVMValueRef = LLVMGetOperand(user, 2)
+            return false if LLVMTypeOf(length) != count_type
+            access_inside(prover, element_size, pointer, term_of(analyses, length), user, view.base, view.elements)
+
+        # Loads, stores and memory intrinsics through DATA stay inside the LENGTH
+        # elements it points to.
+        def data_accesses_bounded(prover: mutable IndexProver&, element_size: u64, data: LLVMValueRef, length: LLVMValueRef, function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = prover.analyses
+            return false if ElisaLLVMScalarEvolutionIsSCEVable(analyses, LLVMTypeOf(length)) == 0
+            view: ViewTerms = ViewTerms{elements: term_of(analyses, length), base: term_of(analyses, data), layout: LLVMGetModuleDataLayout(LLVMGetGlobalParent(function))}
+            pointers: mutable darray[LLVMValueRef] = [data]
+            seen: mutable KeyTable = new_key_table()
+            while pointers.count > 0 |pointers, seen, prover, element_size, view|:
+                pointer: LLVMValueRef = pointers[pointers.count - 1]
+                pointers.truncate(pointers.count - 1)
+                key: TableKey = TableKey{first: object_key(pointer.cast[void&]), second: 0, third: 0}
+                continue if key_table_find(&seen, key) != null
+                seen <- key_table_insert(seen, key, 0)
+                use_cursor: mutable LLVMUseRef? = LLVMGetFirstUse(pointer)
+                while use_cursor is use |use_cursor, pointers, prover, element_size, view, pointer|:
+                    use_cursor <- LLVMGetNextUse(use)
+                    return false if not data_use_inside(prover, element_size, pointer, LLVMGetUser(use), &view, &pointers)
+            true
+
+    public:
+        # Accesses through DATA, in FUNCTION, stay inside the view's LENGTH elements.
+        def view_data_bounded(checker: mutable ViewChecker&, data: LLVMValueRef, length: LLVMValueRef, function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = view_checker_analyses(checker, function)
+            prover: mutable IndexProver = new_index_prover(function, analyses)
+            holds: bool = data_accesses_bounded(&prover, checker.element_size, data, length, function)
+            dispose_index_prover(&prover)
+            holds

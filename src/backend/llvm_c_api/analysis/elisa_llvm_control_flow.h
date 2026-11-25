@@ -18,6 +18,10 @@ int ElisaLLVMInstructionIsPotentiallyReachable(LLVMValueRef from, LLVMValueRef t
  * analyses' dominator tree. */
 int ElisaLLVMInstructionIsPotentiallyReachableWithin(ElisaFunctionAnalysesRef analyses, LLVMValueRef from,
                                                      LLVMValueRef to);
+/* isPotentiallyReachable(from, to, nullptr, DT, LI) between instructions, with the
+ * analyses' dominator tree and loop info. */
+int ElisaLLVMInstructionIsPotentiallyReachableInLoops(ElisaFunctionAnalysesRef analyses, LLVMValueRef from,
+                                                      LLVMValueRef to);
 /* isPotentiallyReachable(from, to, nullptr, DT, LI) between blocks, with the analyses'
  * dominator tree, and their loop info when USE_LOOPS is set. */
 int ElisaLLVMBlockIsPotentiallyReachableWithin(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef from,

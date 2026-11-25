@@ -1,18 +1,15 @@
-// Shrink the zero fill of a local array that is used only through one view
-// of its first L elements (a scratch buffer handed to a helper as
-// `scratch[0:length]`) to those L elements. Elements past L would need
-// their zeros only if some access through the view reached them, so every
-// access is proved to stay inside it: the bytes a load, store or memory
-// intrinsic touches through the view's data pointer lie below its length,
-// by ElisaIndexBounds' proofs in the function that makes the access. A
-// view may be passed on whole to a defined function whose parameter passes
-// the same check; a parameter being checked is assumed to pass, an
-// induction over the depth of calls. Callees are checked on a copy that
-// SROA and instcombine have cleaned (the view in SSA form, each access
-// still under its bounds check, as before O3 vectorizes and hoists the
-// checks); the copies are deleted afterwards. The vectorizer's overlap checks may
-// compare its address; any other use of the pointer (a cast back to a
-// pointer, a store of it, a call with the bare pointer) keeps the fill.
+// The view checker the indexed-prefix proofs (llvm_indexed_prefix.h) consult for a view
+// passed to a call: every access through a view's data pointer stays below its length,
+// by ElisaIndexBounds' proofs in the function that makes the access. A view may be passed
+// on whole to a defined function whose parameter passes the same check; a parameter
+// being checked is assumed to pass, an induction over the depth of calls. Callees are
+// checked on a copy that SROA and instcombine have cleaned (the view in SSA form, each
+// access still under its bounds check, as before O3 vectorizes and hoists the checks);
+// the copies are deleted afterwards. The vectorizer's overlap checks may compare its
+// address; any other use of the pointer (a cast back to a pointer, a store of it, a call
+// with the bare pointer) fails the check. The view-fill pass that also used it is Elisa
+// now (llvm_passes/scratch_prefix/view_bounded_fills.elisa), as is this checker
+// (view_bound_checker.elisa), which replaces it once the indexed prefix is ported.
 #include <llvm/IR/Argument.h>
 #include "llvm_element_offsets.h"
 #include <llvm/IR/IRBuilder.h>
@@ -258,98 +255,4 @@ private:
   }
 };
 
-// The fill, the view of the first Length elements built from Buffer, and
-// nothing else, or null.
-struct Candidate {
-  MemSetInst *Fill = nullptr;
-  InsertValueInst *View = nullptr;
-};
-
-static Candidate candidate(AllocaInst &Buffer, const DataLayout &Layout) {
-  Candidate Found;
-  InsertValueInst *Data = nullptr;
-  uint64_t Bytes = Layout.getTypeAllocSize(Buffer.getAllocatedType()).getFixedValue();
-  for (User *Use : Buffer.users()) {
-    if (auto *Fill = dyn_cast<MemSetInst>(Use)) {
-      auto *Byte = dyn_cast<ConstantInt>(Fill->getValue());
-      auto *Length = dyn_cast<ConstantInt>(Fill->getLength());
-      if (Found.Fill || Fill->isVolatile() || Fill->getRawDest() != &Buffer || !Byte || !Byte->isZero() ||
-          !Length || Length->getZExtValue() != Bytes)
-        return {};
-      Found.Fill = Fill;
-    } else if (isa<InsertValueInst>(Use) || isa<GetElementPtrInst>(Use)) {
-      // The view's data: the buffer, or its first element's address.
-      Value *Start = Use;
-      if (auto *First = dyn_cast<GetElementPtrInst>(Use)) {
-        if (!First->hasAllZeroIndices() || !First->hasOneUse()) return {};
-        Start = *First->user_begin();
-      }
-      auto *Insert = dyn_cast<InsertValueInst>(Start);
-      if (Data || !Insert || Insert->getNumIndices() != 1 || Insert->getIndices()[0] != 0 ||
-          Insert->getInsertedValueOperand() != (Start == Use ? static_cast<Value *>(&Buffer) : Use) ||
-          !Insert->hasOneUse())
-        return {};
-      Data = Insert;
-    } else if (!isa<LifetimeIntrinsic>(Use)) {
-      return {};
-    }
-  }
-  auto *View = Data ? dyn_cast<InsertValueInst>(*Data->user_begin()) : nullptr;
-  auto *Type = View ? dyn_cast<StructType>(View->getType()) : nullptr;
-  if (!Found.Fill || !View || View->getAggregateOperand() != Data || View->getNumIndices() != 1 ||
-      View->getIndices()[0] != 1 || !Type || Type->getNumElements() != 2 ||
-      !Type->getElementType(1)->isIntegerTy(64))
-    return {};
-  Found.View = View;
-  return Found;
-}
-
-static unsigned shrinkViewFills(Module &Module) {
-  // Cleaning callee copies runs function passes that consult module
-  // analyses, so every manager is registered and linked.
-  PassBuilder Builder;
-  LoopAnalysisManager LoopAnalyses;
-  FunctionAnalysisManager Analyses;
-  CGSCCAnalysisManager CallGraphAnalyses;
-  ModuleAnalysisManager ModuleAnalyses;
-  Builder.registerModuleAnalyses(ModuleAnalyses);
-  Builder.registerCGSCCAnalyses(CallGraphAnalyses);
-  Builder.registerFunctionAnalyses(Analyses);
-  Builder.registerLoopAnalyses(LoopAnalyses);
-  Builder.crossRegisterProxies(LoopAnalyses, Analyses, CallGraphAnalyses, ModuleAnalyses);
-  unsigned Shrunk = 0;
-  for (Function &F : Module) {
-    if (F.isDeclaration() || F.hasOptNone()) continue;
-    const DataLayout &Layout = F.getDataLayout();
-    SmallVector<std::pair<AllocaInst *, Candidate>, 2> Found;
-    for (Instruction &Instruction : F.getEntryBlock())
-      if (auto *Buffer = dyn_cast<AllocaInst>(&Instruction);
-          Buffer && Buffer->isStaticAlloca() && isa<ArrayType>(Buffer->getAllocatedType()) &&
-          Buffer->getAllocatedType()->getArrayElementType()->isIntegerTy())
-        if (Candidate Shape = candidate(*Buffer, Layout); Shape.View) Found.push_back({Buffer, Shape});
-    for (auto [Buffer, Shape] : Found) {
-      auto *Type = cast<ArrayType>(Buffer->getAllocatedType());
-      uint64_t Size = Layout.getTypeAllocSize(Type->getElementType()).getFixedValue();
-      Value *Length = Shape.View->getInsertedValueOperand();
-      auto &Evolution = Analyses.getResult<ScalarEvolutionAnalysis>(F);
-      auto &Tree = Analyses.getResult<DominatorTreeAnalysis>(F);
-      auto &Loops = Analyses.getResult<LoopAnalysis>(F);
-      ElisaIndexBounds::Prover Proof(Evolution, Tree, Loops);
-      if (Loops.getLoopFor(Shape.Fill->getParent()) || !Tree.dominates(Shape.Fill, Shape.View) ||
-          !Proof.proveAtMost(Evolution.getSCEV(Length),
-                             Evolution.getConstant(Length->getType(), Type->getNumElements()), Shape.View) ||
-          !Checker(Analyses, Size).bounded(*Shape.View, F))
-        continue;
-      // Zero the first Length elements where the view is built.
-      IRBuilder<> Here(Shape.View);
-      Value *Bytes = Here.CreateMul(Length, ConstantInt::get(Length->getType(), Size), "view.fill.bytes",
-                                    /*HasNUW=*/true, /*HasNSW=*/true);
-      Here.CreateMemSet(Buffer, Here.getInt8(0), Bytes, Shape.Fill->getDestAlign());
-      Shape.Fill->eraseFromParent();
-      Analyses.invalidate(F, PreservedAnalyses::none());
-      ++Shrunk;
-    }
-  }
-  return Shrunk;
-}
 } // namespace ElisaViewBounds

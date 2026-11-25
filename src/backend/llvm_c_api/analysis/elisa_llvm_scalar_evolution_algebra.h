@@ -34,6 +34,15 @@ ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionNegate(ElisaFunctionAn
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionAddTerms(ElisaFunctionAnalysesRef analyses,
                                                                    ElisaScalarEvolutionExpressionRef *terms,
                                                                    uint32_t count);
+/* getMulExpr over COUNT factors at once (a SmallVector of SCEVUse), with no wrap flags. */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionMultiplyTerms(ElisaFunctionAnalysesRef analyses,
+                                                                        ElisaScalarEvolutionExpressionRef *factors,
+                                                                        uint32_t count);
+/* getUDivExactExpr(dividend, divisor), or null when scalar evolution leaves it a udiv
+ * node (the division does not simplify away). */
+ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionUnsignedDivideExact(
+    ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef dividend,
+    ElisaScalarEvolutionExpressionRef divisor);
 /* getAddRecExpr(start, step, loop, FlagNUW when no_unsigned_wrap is nonzero). */
 ElisaScalarEvolutionExpressionRef ElisaLLVMScalarEvolutionAddRecurrence(
     ElisaFunctionAnalysesRef analyses, ElisaScalarEvolutionExpressionRef start,
