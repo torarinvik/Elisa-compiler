@@ -1,0 +1,150 @@
+# Proves the checked digit sums of a divide-down loop before O3. A positive signed W-bit
+# value divided by a constant B >= 2 reaches zero within W-1 iterations, and each
+# remainder lies in [0, B-1], so a zero-based sum of the remainders stays within
+# (W-1)*(B-1). When that fits, the sum's `llvm.sadd.with.overflow` becomes a plain add
+# with a false overflow bit. The recognizer checks the exact phi recurrences, the
+# positive header guard and the signed maximum; other initial values, divisors, guards
+# and update shapes keep their checks. Each function holding a signed division, a signed
+# remainder and a checked add is first put through mem2reg and loop-simplify.
+include "./ir/llvm_ir_queries.elisa"
+include "./ir/ir_editing.elisa"
+include "./ir/loop_pass_policy.elisa"
+include "./ir/pass_pipelines.elisa"
+include "../llvm_c_api/elisa_llvm_loop_transforms.elisa"
+
+# The divide-down counter of a loop: the header phi `n` the loop stays in while `n > 0`,
+# divided by the constant `base` on the latch edge.
+struct DivisionCounter:
+    counter: LLVMValueRef
+    base: LLVMValueRef
+    branch: LLVMValueRef
+    preheader: LLVMBasicBlockRef
+    latch: LLVMBasicBlockRef
+
+extend Backend:
+    private:
+        # Whether the function has a signed division, a signed remainder and a checked
+        # signed add.
+        def has_division_sum_operations(function: LLVMValueRef, checked_add: u32) -> bool:
+            division: mutable bool = false
+            remainder: mutable bool = false
+            add: mutable bool = false
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, division, remainder, add, checked_add|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, division, remainder, add, checked_add|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    opcode: u32 = LLVMGetInstructionOpcode(instruction)
+                    division <- division or opcode == LLVMOpcode::SDIV
+                    remainder <- remainder or opcode == LLVMOpcode::SREM
+                    add <- add or (LLVMIsAIntrinsicInst(instruction) != null and called_intrinsic_id(instruction) == checked_add)
+            division and remainder and add
+
+        # The loop's counter when its header leaves on `n <= 0` for a two-entry header phi
+        # `n` of 3 to 64 bits, and the latch sets `n` to `n sdiv base` with a constant
+        # `base >= 2` small enough that (W-1)*(base-1) fits the signed maximum.
+        def division_counter(loop: ElisaLoopRef) -> DivisionCounter?:
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            branch: LLVMValueRef = get LLVMGetBasicBlockTerminator(header) else return null
+            return null if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            comparison: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(comparison, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(comparison) != LLVMIntPredicate::SGT
+            counter: LLVMValueRef = LLVMGetOperand(comparison, 0)
+            zero: LLVMValueRef = LLVMGetOperand(comparison, 1)
+            return null if not is_llvm_instruction_with_opcode(counter, LLVMOpcode::PHI) or LLVMGetInstructionParent(counter) != header
+            return null if LLVMIsAConstantInt(zero) == null or ElisaLLVMIsConstantZero(zero) == 0 or LLVMCountIncoming(counter) != 2
+            type: LLVMTypeRef = LLVMTypeOf(counter)
+            return null if LLVMGetTypeKind(type) != LLVMTypeKindValue::INTEGER
+            width: u32 = LLVMGetIntTypeWidth(type)
+            return null if width < 3 or width > 64
+            division: LLVMValueRef = get phi_incoming_for_block(counter, latch) else return null
+            return null if not is_llvm_instruction_with_opcode(division, LLVMOpcode::SDIV) or LLVMGetOperand(division, 0) != counter
+            return null if ElisaLLVMLoopContainsBlock(loop, LLVMGetInstructionParent(division)) == 0
+            base: LLVMValueRef = LLVMGetOperand(division, 1)
+            return null if LLVMIsAConstantInt(base) == null or LLVMConstIntGetSExtValue(base) < 2
+            # APInt::getSignedMaxValue(W), divided among the W-1 remainders.
+            limit: u64 = ((1).u64() << (width - 1).u64()) - 1
+            return null if LLVMConstIntGetZExtValue(base) - 1 > limit / (width - 1).u64()
+            DivisionCounter{counter: counter, base: base, branch: branch, preheader: preheader, latch: latch}
+
+        # The checked add of TOTAL, a zero-started header phi summing `n srem base` through
+        # an `llvm.sadd.with.overflow` in the loop body: a block of the loop other than the
+        # header that the header's staying edge dominates, while its other edge leaves.
+        def digit_sum_call(total: LLVMValueRef, divided: DivisionCounter&, loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, checked_add: u32) -> LLVMValueRef?:
+            return null if LLVMTypeOf(total) != LLVMTypeOf(divided.counter) or LLVMCountIncoming(total) != 2
+            initial: LLVMValueRef = get phi_incoming_for_block(total, divided.preheader) else return null
+            value: LLVMValueRef = get phi_incoming_for_block(total, divided.latch) else return null
+            return null if LLVMIsAConstantInt(initial) == null or ElisaLLVMIsConstantZero(initial) == 0 or not is_extract_of_field(value, 0)
+            call: LLVMValueRef = LLVMGetOperand(value, 0)
+            return null if LLVMIsAIntrinsicInst(call) == null or called_intrinsic_id(call) != checked_add
+            block: LLVMBasicBlockRef = LLVMGetInstructionParent(call)
+            header: LLVMBasicBlockRef = LLVMGetInstructionParent(divided.counter)
+            staying: LLVMBasicBlockRef = LLVMGetSuccessor(divided.branch, 0)
+            return null if ElisaLLVMLoopContainsBlock(loop, block) == 0 or block == header or staying == header
+            return null if ElisaLLVMBlockDominates(analyses, staying, block) == 0 or ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(divided.branch, 1)) != 0
+            other: mutable LLVMValueRef? = null
+            if LLVMGetOperand(call, 0) == total:
+                other <- LLVMGetOperand(call, 1)
+            elif LLVMGetOperand(call, 1) == total:
+                other <- LLVMGetOperand(call, 0)
+            remainder: LLVMValueRef = get other else return null
+            return null if not is_llvm_instruction_with_opcode(remainder, LLVMOpcode::SREM) or LLVMGetOperand(remainder, 0) != divided.counter or LLVMGetOperand(remainder, 1) != divided.base
+            call
+
+        # The checked add replaced by `{add a, b, false}`.
+        def replace_proven_digit_sum(call: LLVMValueRef, builder: LLVMBuilderRef) -> void:
+            LLVMPositionBuilderBefore(builder, call)
+            set_builder_debug_location(builder, call)
+            sum: LLVMValueRef = LLVMBuildAdd(builder, LLVMGetOperand(call, 0), LLVMGetOperand(call, 1), "proved.digit.sum")
+            type: LLVMTypeRef = LLVMTypeOf(call)
+            with_sum: LLVMValueRef = LLVMBuildInsertValue(builder, LLVMGetPoison(type), sum, 0, "")
+            result: LLVMValueRef = LLVMBuildInsertValue(builder, with_sum, LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(type)), 0, 0), 1, "")
+            LLVMReplaceAllUsesWith(call, result)
+            LLVMInstructionEraseFromParent(call)
+
+        # The first proven digit sum of the loop's header phis, rewritten; whether there
+        # was one.
+        def prove_loop_digit_sum(loop: ElisaLoopRef, analyses: ElisaFunctionAnalysesRef, builder: LLVMBuilderRef, checked_add: u32) -> bool:
+            divided: DivisionCounter = get division_counter(loop) else return false
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(ElisaLLVMLoopHeader(loop))
+            while cursor is total |cursor, loop, analyses, builder, checked_add, divided|:
+                return false if not is_llvm_instruction_with_opcode(total, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(total)
+                if digit_sum_call(total, &divided, loop, analyses, checked_add) is call:
+                    replace_proven_digit_sum(call, builder)
+                    return true
+            false
+
+        # Every loop of the function, taken from a stack seeded with the top-level loops
+        # in LoopInfo order and refilled with each popped loop's subloops.
+        def prove_function_digit_sums(function: LLVMValueRef, builder: LLVMBuilderRef, checked_add: u32) -> void can[Memory.Allocate]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return
+            pending: mutable darray[ElisaLoopRef] = []
+            for index in 0..<ElisaLLVMTopLevelLoopCount(analyses) |pending, analyses|:
+                pending.push(ElisaLLVMTopLevelLoopAt(analyses, index))
+            while pending.count > 0 |pending, analyses, builder, checked_add|:
+                loop: ElisaLoopRef = pending.pop()
+                for index in 0..<ElisaLLVMLoopSubLoopCount(loop) |pending, loop|:
+                    pending.push(ElisaLLVMLoopSubLoopAt(loop, index))
+                prove_loop_digit_sum(loop, analyses, builder, checked_add)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+
+    public:
+        # Digit sums of divide-down loops proven in the defined functions optimized for
+        # speed; the number of functions put through mem2reg and loop-simplify for it.
+        def elide_bounded_division_sums(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate]:
+            checked_add: u32 = intrinsic_identifier("llvm.sadd.with.overflow")
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            candidates: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, candidates, builder, checked_add|:
+                cursor <- LLVMGetNextFunction(function)
+                if LLVMIsDeclaration(function) == 0 and not function_is_size_optimized(function) and has_division_sum_operations(function, checked_add):
+                    run_function_pipeline(function, null, "mem2reg,loop-simplify")
+                    prove_function_digit_sums(function, builder, checked_add)
+                    candidates <- candidates + 1
+            LLVMDisposeBuilder(builder)
+            candidates
