@@ -559,7 +559,6 @@ extern "C" unsigned elisacoreUnrollLaggedRecurrences(LLVMModuleRef Ref) {
   return Changed;
 }
 
-#include "llvm_edge_division_reuse.cpp"
 #include "llvm_stack_view_inline.cpp"
 
 #else

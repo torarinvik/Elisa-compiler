@@ -77,6 +77,11 @@ LLVMBasicBlockRef ElisaLLVMSplitEdge(LLVMBasicBlockRef from, LLVMBasicBlockRef t
   return wrap(SplitEdge(unwrap(from), unwrap(to)));
 }
 
+LLVMBasicBlockRef ElisaLLVMSplitCriticalEdge(LLVMValueRef terminator, uint32_t successor, const char *name) {
+  return wrap(SplitCriticalEdge(cast<Instruction>(unwrap(terminator)), successor,
+                                CriticalEdgeSplittingOptions(), name));
+}
+
 LLVMBasicBlockRef ElisaLLVMSplitBlock(LLVMValueRef instruction) {
   Instruction *At = cast<Instruction>(unwrap(instruction));
   return wrap(SplitBlock(At->getParent(), At));

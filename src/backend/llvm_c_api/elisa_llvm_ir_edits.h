@@ -63,6 +63,9 @@ void ElisaLLVMRemoveIncomingValue(LLVMValueRef phi, uint32_t index);
 LLVMBasicBlockRef ElisaLLVMSplitBlock(LLVMValueRef instruction);
 /* llvm::SplitEdge(from, to) without analyses: the block placed on the edge. */
 LLVMBasicBlockRef ElisaLLVMSplitEdge(LLVMBasicBlockRef from, LLVMBasicBlockRef to);
+/* llvm::SplitCriticalEdge(terminator, successor) with default options and no analyses:
+ * the block named `name` placed on the edge, or null when the edge is not critical. */
+LLVMBasicBlockRef ElisaLLVMSplitCriticalEdge(LLVMValueRef terminator, uint32_t successor, const char *name);
 
 ElisaValueMapRef ElisaLLVMCreateValueMap(void);
 void ElisaLLVMDisposeValueMap(ElisaValueMapRef map);

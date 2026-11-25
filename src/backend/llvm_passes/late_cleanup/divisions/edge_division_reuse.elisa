@@ -1,0 +1,245 @@
+# Reuse an i64 division one predecessor already computed.
+#
+# A join whose first instruction divides values flowing in through its phis takes the
+# quotient a predecessor computed for the same operands, and computes a new one only on
+# the other edge (a logical shift when that edge's guard proves the dividend nonnegative).
+# A block whose single predecessor already joins both quotients takes that phi, and the
+# factor and induction loops of factor_quotients.elisa carry a quotient their entry or
+# latch computed. At most four rewrites per function, on AArch64 only.
+include "../../ir/loop_pass_policy.elisa"
+include "./factor_quotients.elisa"
+
+const module EdgeDivisionLimit:
+    FUNCTION_BLOCKS: u32 = 128
+    FUNCTION_REWRITES: u32 = 4
+    SCANNED_INSTRUCTIONS: u32 = 16
+
+extend Backend:
+    private:
+        # INSTRUCTION as a binary operator with OPCODE.
+        def binary_operator_with_opcode(value: LLVMValueRef, opcode: u32) -> bool:
+            LLVMIsABinaryOperator(value) != null and LLVMGetInstructionOpcode(value) == opcode
+
+        # The block's first non-phi instruction as an i64 division with OPCODE, no exact
+        # flag and no metadata but a debug location.
+        def plain_i64_division(block: LLVMBasicBlockRef, opcode: u32) -> LLVMValueRef? can[Abort.Panic]:
+            division: LLVMValueRef = first_non_phi(block)
+            return null if not binary_operator_with_opcode(division, opcode) or LLVMGetExact(division) != 0
+            return null if not is_llvm_integer_type(LLVMTypeOf(division), 64) or ElisaLLVMHasMetadataOtherThanDebugLoc(division) != 0
+            division
+
+        # OPERAND as it reaches JOIN from PREDECESSOR: itself unless JOIN defines it, the
+        # phi's incoming value for a phi of JOIN, and nothing for any other JOIN value.
+        def division_operand_on_edge(operand: LLVMValueRef, join: LLVMBasicBlockRef, predecessor: LLVMBasicBlockRef) -> LLVMValueRef?:
+            return operand if LLVMIsAInstruction(operand) == null or LLVMGetInstructionParent(operand) != join
+            return null if not is_llvm_instruction_with_opcode(operand, LLVMOpcode::PHI)
+            phi_incoming_for_block(operand, predecessor)
+
+        # `log2(VALUE)` for an integer constant of at most 64 bits that is a power of two
+        # read as unsigned; -1 otherwise.
+        def power_of_two_exponent(value: LLVMValueRef) -> i32:
+            return -1 if LLVMIsAConstantInt(value) == null or LLVMGetIntTypeWidth(LLVMTypeOf(value)) > 64
+            bits: u64 = LLVMConstIntGetZExtValue(value)
+            return -1 if bits == 0 or (bits & (bits - 1)) != 0
+            exponent: mutable i32 = 0
+            remaining: mutable u64 = bits
+            while remaining > 1 |remaining, exponent|:
+                remaining <- remaining >> 1
+                exponent <- exponent + 1
+            exponent
+
+        # `log2(VALUE)` for a power-of-two constant that is also positive as signed.
+        def positive_power_of_two_exponent(value: LLVMValueRef) -> i32:
+            exponent: i32 = power_of_two_exponent(value)
+            return -1 if exponent < 0 or exponent.u32() + 1 >= LLVMGetIntTypeWidth(LLVMTypeOf(value))
+            exponent
+
+        def is_negative_constant(value: LLVMValueRef) -> bool:
+            LLVMConstIntGetSExtValue(value) < 0
+
+        # The integer compare a conditional branch BRANCH tests, if it tests one.
+        def conditional_guard(branch: LLVMValueRef?) -> LLVMValueRef?:
+            if branch is present:
+                return null if not is_llvm_instruction_with_opcode(present, LLVMOpcode::CONDITIONAL_BR)
+                condition: LLVMValueRef = LLVMGetCondition(present)
+                return condition if is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP)
+            null
+
+        # The constant right operand of GUARD.
+        def guard_bound(guard: LLVMValueRef) -> LLVMValueRef?:
+            bound: LLVMValueRef = LLVMGetOperand(guard, 1)
+            return bound if LLVMIsAConstantInt(bound) != null
+            null
+
+        # The shift for a signed division by a positive power of two on an edge whose
+        # comparison proves the dividend nonnegative; -1 otherwise.
+        def nonnegative_division_shift(division: LLVMValueRef, dividend: LLVMValueRef, divisor: LLVMValueRef, predecessor: LLVMBasicBlockRef, join: LLVMBasicBlockRef) -> i32:
+            terminator: LLVMValueRef? = LLVMGetBasicBlockTerminator(predecessor)
+            guard: LLVMValueRef = get conditional_guard(terminator) else return -1
+            exponent: i32 = positive_power_of_two_exponent(divisor)
+            return -1 if LLVMGetInstructionOpcode(division) != LLVMOpcode::SDIV or exponent < 0 or LLVMGetOperand(guard, 0) != dividend or not is_llvm_instruction_with_opcode(dividend, LLVMOpcode::FREEZE)
+            bound: LLVMValueRef = get guard_bound(guard) else return -1
+            branch: LLVMValueRef = get terminator else return -1
+            predicate: i32 = LLVMGetICmpPredicate(guard) if LLVMGetSuccessor(branch, 0) == join else inverse_integer_predicate(LLVMGetICmpPredicate(guard))
+            range: ElisaConstantRangeRef = ElisaLLVMConstantRangeAllowedByCompare(predicate, bound)
+            rejected: bool = ElisaLLVMConstantRangeIsEmpty(range) != 0 or ElisaLLVMConstantRangeSignedMinIsNegative(range) != 0
+            ElisaLLVMDisposeConstantRange(range)
+            -1 if rejected else exponent
+
+        # Whether QUOTIENT, reaching JOIN from PREDECESSOR, is `DIVIDEND >> log2(DIVISOR)`
+        # under a samesign guard `DIVIDEND <pred> bound >= 0` ending the predecessor's single
+        # predecessor. A samesign compare with a nonnegative constant is poison for a
+        # negative dividend, so any taken branch proves the sign.
+        def is_guarded_shift_quotient(quotient: LLVMValueRef, dividend: LLVMValueRef, divisor: LLVMValueRef, predecessor: LLVMBasicBlockRef, join: LLVMBasicBlockRef) -> bool:
+            shift: LLVMValueRef = LLVMGetOperand(quotient, 1)
+            exponent: i32 = positive_power_of_two_exponent(divisor)
+            return false if LLVMGetInstructionOpcode(quotient) != LLVMOpcode::LSHR or LLVMIsAConstantInt(shift) == null or exponent < 0
+            return false if not is_constant_integer(shift, exponent.u64()) or not is_llvm_instruction_with_opcode(dividend, LLVMOpcode::FREEZE)
+            entry: LLVMValueRef = get LLVMGetBasicBlockTerminator(predecessor) else return false
+            return false if LLVMGetInstructionOpcode(entry) != LLVMOpcode::UNCONDITIONAL_BR or LLVMGetSuccessor(entry, 0) != join
+            guard_block: LLVMBasicBlockRef = get single_predecessor(predecessor) else return false
+            guard: LLVMValueRef = get conditional_guard(LLVMGetBasicBlockTerminator(guard_block)) else return false
+            bound: LLVMValueRef = get guard_bound(guard) else return false
+            LLVMGetICmpSameSign(guard) != 0 and LLVMGetOperand(guard, 0) == dividend and not is_negative_constant(bound)
+
+        # Whether PHI joins, from two distinct predecessors, quotients of DIVISION's
+        # operands as they reach JOIN.
+        def joins_division_quotients(phi: LLVMValueRef, division: LLVMValueRef, join: LLVMBasicBlockRef) -> bool:
+            for index in 0..<2.u32() |phi, division, join|:
+                predecessor: LLVMBasicBlockRef = LLVMGetIncomingBlock(phi, index)
+                return false if predecessor == join or predecessor == LLVMGetIncomingBlock(phi, 1 - index)
+                dividend: LLVMValueRef = get division_operand_on_edge(LLVMGetOperand(division, 0), join, predecessor) else return false
+                divisor: LLVMValueRef = get division_operand_on_edge(LLVMGetOperand(division, 1), join, predecessor) else return false
+                quotient: LLVMValueRef = LLVMGetIncomingValue(phi, index)
+                return false if LLVMIsABinaryOperator(quotient) == null or LLVMGetExact(quotient) != 0 or LLVMGetOperand(quotient, 0) != dividend
+                if not (LLVMGetInstructionOpcode(quotient) == LLVMOpcode::SDIV and LLVMGetOperand(quotient, 1) == divisor):
+                    return false if not is_guarded_shift_quotient(quotient, dividend, divisor, predecessor, join)
+            true
+
+        # A preheader can take the quotient its single predecessor already joins, even when
+        # the incoming dividend and divisor are themselves phis.
+        def reuse_joined_quotient(block: LLVMBasicBlockRef) -> bool can[Abort.Panic]:
+            join: LLVMBasicBlockRef = get single_predecessor(block) else return false
+            return false if join == block
+            division: LLVMValueRef = get plain_i64_division(block, LLVMOpcode::SDIV) else return false
+            cursor: mutable LLVMValueRef? = leading_phi(LLVMGetFirstInstruction(join))
+            while cursor is phi |cursor, division, join|:
+                cursor <- leading_phi(LLVMGetNextInstruction(phi))
+                if LLVMTypeOf(phi) == LLVMTypeOf(division) and LLVMCountIncoming(phi) == 2 and joins_division_quotients(phi, division, join):
+                    LLVMReplaceAllUsesWith(division, phi)
+                    LLVMInstructionEraseFromParent(division)
+                    return true
+            false
+
+        # The last of the predecessor's final sixteen instructions dividing INPUTS with
+        # DIVISION's opcode and exact flag.
+        def available_division(predecessor: LLVMBasicBlockRef, division: LLVMValueRef, dividend: LLVMValueRef, divisor: LLVMValueRef) -> LLVMValueRef?:
+            scanned: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetLastInstruction(predecessor)
+            while cursor is instruction |cursor, scanned, division, dividend, divisor|:
+                scanned <- scanned + 1
+                return null if scanned > EdgeDivisionLimit::SCANNED_INSTRUCTIONS
+                if binary_operator_with_opcode(instruction, LLVMGetInstructionOpcode(division)) and LLVMGetOperand(instruction, 0) == dividend and LLVMGetOperand(instruction, 1) == divisor:
+                    return instruction if LLVMGetExact(instruction) == LLVMGetExact(division)
+                cursor <- LLVMGetPreviousInstruction(instruction)
+            null
+
+        # Computes DIVISION's quotient on the edge from PREDECESSOR, splitting the edge
+        # when the predecessor can branch elsewhere (a division may be undefined); the
+        # quotient and the block it is computed in.
+        def edge_quotient(division: LLVMValueRef, dividend: LLVMValueRef, divisor: LLVMValueRef, predecessor: LLVMBasicBlockRef, join: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> EdgeQuotient? can[Abort.Panic, Memory.Allocate]:
+            shift: i32 = nonnegative_division_shift(division, dividend, divisor, predecessor, join)
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(predecessor) else return null
+            edge: mutable LLVMBasicBlockRef = predecessor
+            if LLVMGetInstructionOpcode(terminator) == LLVMOpcode::CONDITIONAL_BR:
+                edge <- ElisaLLVMSplitEdge(predecessor, join)
+            edge_terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(edge) else return null
+            LLVMPositionBuilderBefore(builder, edge_terminator)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            name_storage: mutable darray[u8] = []
+            unnamed: cstr = sview_to_cstr("", name_storage)
+            if shift >= 0:
+                shifted: LLVMValueRef = LLVMBuildLShr(builder, dividend, LLVMConstInt(LLVMTypeOf(division), shift.u64(), 0), unnamed)
+                LLVMSetExact(shifted, LLVMGetExact(division))
+                return EdgeQuotient{quotient: shifted, block: edge}
+            copy: LLVMValueRef = LLVMInstructionClone(division)
+            LLVMSetOperand(copy, 0, dividend)
+            LLVMSetOperand(copy, 1, divisor)
+            LLVMInsertIntoBuilder(builder, copy)
+            EdgeQuotient{quotient: copy, block: edge}
+
+        # A join dividing values from two predecessors, one of which already computed the
+        # quotient: the other edge computes it and a phi joins both.
+        def reuse_edge_division(join: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            division: LLVMValueRef = first_non_phi(join)
+            opcode: u32 = LLVMGetInstructionOpcode(division)
+            return false if LLVMIsABinaryOperator(division) == null or (opcode != LLVMOpcode::SDIV and opcode != LLVMOpcode::UDIV)
+            return false if not is_llvm_integer_type(LLVMTypeOf(division), 64) or ElisaLLVMHasMetadataOtherThanDebugLoc(division) != 0
+            return false if ElisaLLVMBlockIsEHPad(join) != 0 or ElisaLLVMBlockHasAddressTaken(join) != 0
+            edges: darray[LLVMBasicBlockRef] = predecessor_edges(join)
+            return false if edges.count != 2 or edges[0] == edges[1] or edges[0] == join or edges[1] == join
+            operands: mutable darray[LLVMValueRef] = []
+            available: mutable darray[LLVMValueRef?] = []
+            for predecessor in edges |operands, available, division, join|:
+                terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(predecessor) else return false
+                terminator_opcode: u32 = LLVMGetInstructionOpcode(terminator)
+                return false if terminator_opcode != LLVMOpcode::UNCONDITIONAL_BR and terminator_opcode != LLVMOpcode::CONDITIONAL_BR
+                dividend: LLVMValueRef = get division_operand_on_edge(LLVMGetOperand(division, 0), join, predecessor) else return false
+                divisor: LLVMValueRef = get division_operand_on_edge(LLVMGetOperand(division, 1), join, predecessor) else return false
+                operands.push(dividend)
+                operands.push(divisor)
+                available.push(available_division(predecessor, division, dividend, divisor))
+            return false if available[0] == null and available[1] == null
+            quotients: mutable darray[LLVMValueRef] = []
+            blocks: mutable darray[LLVMBasicBlockRef] = []
+            for index in 0..<2.usize() |quotients, blocks, available, operands, edges, division, join, builder|:
+                if available[index] is reused:
+                    quotients.push(reused)
+                    blocks.push(edges[index])
+                else:
+                    computed: EdgeQuotient = get edge_quotient(division, operands[2 * index], operands[2 * index + 1], edges[index], join, builder) else return false
+                    quotients.push(computed.quotient)
+                    blocks.push(computed.block)
+            LLVMPositionBuilderBefore(builder, division)
+            LLVMSetCurrentDebugLocation2(builder, null)
+            name_storage: mutable darray[u8] = []
+            joined: LLVMValueRef = LLVMBuildPhi(builder, LLVMTypeOf(division), sview_to_cstr("edge.quotient", name_storage))
+            LLVMAddIncoming(joined, (&quotients[0]).cast[void&], (&blocks[0]).cast[void&], 2)
+            LLVMReplaceAllUsesWith(division, joined)
+            LLVMInstructionEraseFromParent(division)
+            true
+
+        # Tries each rewrite on BLOCK in order.
+        def rewrite_block_division(block: LLVMBasicBlockRef, builder: LLVMBuilderRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return true if skip_redundant_factor_division(block)
+            return true if carry_factor_quotient(block, builder)
+            return true if reuse_unsigned_induction_quotient(block, builder)
+            return true if reuse_joined_quotient(block)
+            reuse_edge_division(block, builder)
+
+        # Blocks the rewrites insert are visited after the block that created them, as the
+        # function's block list iterates; inlining can leave several copies of one loop.
+        def reuse_function_divisions(function: LLVMValueRef, builder: LLVMBuilderRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            rewrites: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, rewrites, builder|:
+                if rewrite_block_division(block, builder):
+                    rewrites <- rewrites + 1
+                    return rewrites if rewrites == EdgeDivisionLimit::FUNCTION_REWRITES
+                block_cursor <- LLVMGetNextBasicBlock(block)
+            rewrites
+
+    public:
+        # The divisions reused in AArch64 modules; the loop-pass policy skips debug info and
+        # sanitizers, and functions over 128 blocks are left alone.
+        def reuse_edge_divisions(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetModuleContext(module))
+            changed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, changed, module, builder|:
+                function_cursor <- LLVMGetNextFunction(function)
+                if not skipped_by_loop_pass_policy(function, module) and LLVMCountBasicBlocks(function) <= EdgeDivisionLimit::FUNCTION_BLOCKS:
+                    changed <- changed + reuse_function_divisions(function, builder)
+            LLVMDisposeBuilder(builder)
+            changed
