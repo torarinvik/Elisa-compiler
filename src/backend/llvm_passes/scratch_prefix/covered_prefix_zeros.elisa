@@ -1,0 +1,273 @@
+# The covered prefix zeros (`prepareCoveredPrefixZeros` in the C++ it replaces): the zero
+# fill of a private i64 array goes when a later fill of its first `count` elements
+# (`count << 3` bytes, no unsigned wrap) dominates every load, and every load's index is
+# proved below `count`, by scalar evolution or by the branches that reach the load.
+# Unknown uses keep the fill. Candidate functions are first simplified (the O1 function
+# pipeline, then loop idioms, instcombine and simplifycfg), which makes those prefix
+# fills out of their loops.
+include "./stack_prefix_zeros.elisa"
+include "../../llvm_c_api/transforms/elisa_llvm_pass_pipelines.elisa"
+
+const module CoveredPrefixBudget:
+    READS: u32 = 256
+    ROUNDS: u32 = 16
+    FUNCTION_INSTRUCTIONS: u32 = 50000
+    CANDIDATE_FUNCTIONS: usize = 32
+    SMALLEST: u64 = 8
+    LARGEST: u64 = 512
+
+# Branch conditions known along every path to a load, sorted by address like the C++
+# std::map they replace: their order decides which of two clashing facts survives.
+struct ConditionFacts:
+    conditions: mutable darray[LLVMValueRef]
+    truths: mutable darray[bool]
+
+extend Backend:
+    private:
+        def known_condition(facts: ConditionFacts&, condition: LLVMValueRef) -> bool? can[Abort.Panic, Unsafe.PointerCast]:
+            position: usize = sorted_position(&facts.conditions, condition)
+            return null if position >= facts.conditions.count or facts.conditions[position] != condition
+            facts.truths[position]
+
+        def record_condition(facts: mutable ConditionFacts&, condition: LLVMValueRef, truth: bool) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: usize = sorted_position(&facts.conditions, condition)
+            if position < facts.conditions.count and facts.conditions[position] == condition:
+                facts.truths[position] <- truth
+                return
+            insert_fact(&facts.conditions, condition)
+            facts.truths.push(truth)
+            moving: mutable usize = facts.truths.count - 1
+            while moving > position |moving, facts|:
+                facts.truths[moving] <- facts.truths[moving - 1]
+                moving <- moving - 1
+            facts.truths[position] <- truth
+
+        def copied_condition_facts(facts: ConditionFacts&) -> ConditionFacts can[Memory.Allocate]:
+            truths: mutable darray[bool] = []
+            for truth in facts.truths |truths|:
+                truths.push(truth)
+            ConditionFacts{conditions: copied_values(&facts.conditions), truths: truths}
+
+        def same_condition_facts(first: ConditionFacts&, second: ConditionFacts&) -> bool can[Abort.Panic]:
+            return false if first.truths.count != second.truths.count or not same_values(&first.conditions, &second.conditions)
+            for index in 0..<first.truths.count |first, second|:
+                return false if first.truths[index] != second.truths[index]
+            true
+
+        # The conditions of the two-way branches whose edge dominates AT's block.
+        def dominating_branch_facts(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, at: LLVMValueRef) -> ConditionFacts can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            facts: mutable ConditionFacts = ConditionFacts{conditions: [], truths: []}
+            target: LLVMBasicBlockRef = LLVMGetInstructionParent(at)
+            cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while cursor is block |cursor, facts, analyses, target|:
+                cursor <- LLVMGetNextBasicBlock(block)
+                branch: LLVMValueRef = terminator_of(block)
+                continue if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                for successor in 0..<2 |facts, analyses, target, block, branch|:
+                    if ElisaLLVMEdgeDominates(analyses, block, LLVMGetSuccessor(branch, successor.u32()), target) != 0:
+                        record_condition(&facts, LLVMGetCondition(branch), successor == 0)
+            facts
+
+        # One round of `and`/`or` propagation over the facts of OLD, written into FACTS.
+        def propagate_logic_facts(facts: mutable ConditionFacts&, old: ConditionFacts&) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<old.conditions.count |facts, old|:
+                value: LLVMValueRef = old.conditions[index]
+                truth: bool = old.truths[index]
+                continue if LLVMIsABinaryOperator(value) == null
+                opcode: u32 = LLVMGetInstructionOpcode(value)
+                left: LLVMValueRef = LLVMGetOperand(value, 0)
+                right: LLVMValueRef = LLVMGetOperand(value, 1)
+                if (opcode == LLVMOpcode::AND and truth) or (opcode == LLVMOpcode::OR and not truth):
+                    record_condition(facts, left, truth)
+                    record_condition(facts, right, truth)
+                if (opcode == LLVMOpcode::AND and not truth) or (opcode == LLVMOpcode::OR and truth):
+                    if known_condition(facts, left) is left_truth:
+                        record_condition(facts, right, truth) if left_truth != truth
+                    if known_condition(facts, right) is right_truth:
+                        record_condition(facts, left, truth) if right_truth != truth
+
+        # One round of implied comparisons, for the comparisons operands of OLD's `and`/
+        # `or` formulas need; false when two known facts imply opposite answers.
+        def imply_comparison_facts(facts: mutable ConditionFacts&, old: ConditionFacts&, module: LLVMModuleRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for index in 0..<old.conditions.count |facts, old, module|:
+                formula: LLVMValueRef = old.conditions[index]
+                continue if LLVMIsABinaryOperator(formula) == null
+                for operand_index in 0..<2 |facts, old, module, formula|:
+                    target: LLVMValueRef = LLVMGetOperand(formula, operand_index.u32())
+                    continue if not is_llvm_instruction_with_opcode(target, LLVMOpcode::ICMP)
+                    for known in 0..<old.conditions.count |facts, old, module, target|:
+                        known_truth: bool = old.truths[known]
+                        implied: i32 = ElisaLLVMIsImpliedComparison(old.conditions[known], LLVMGetICmpPredicate(target), LLVMGetOperand(target, 0), LLVMGetOperand(target, 1), module, 1 if known_truth else 0)
+                        continue if implied < 0
+                        if known_condition(facts, target) is existing:
+                            return false if existing != (implied == 1)
+                        record_condition(facts, target, implied == 1)
+            true
+
+        # Whether the branches reaching AT prove `index <u count` (`coveredPrefixBranchProof`).
+        def covered_prefix_branch_proof(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, index: LLVMValueRef, count: LLVMValueRef, at: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            facts: mutable ConditionFacts = dominating_branch_facts(function, analyses, at)
+            module: LLVMModuleRef = LLVMGetGlobalParent(function)
+            for round in 0..<CoveredPrefixBudget::ROUNDS |facts, module|:
+                old: ConditionFacts = copied_condition_facts(&facts)
+                propagate_logic_facts(&facts, &old)
+                return false if not imply_comparison_facts(&facts, &old, module)
+                break if same_condition_facts(&old, &facts)
+            for position in 0..<facts.conditions.count |facts, index, count|:
+                comparison: LLVMValueRef = facts.conditions[position]
+                if is_llvm_instruction_with_opcode(comparison, LLVMOpcode::ICMP):
+                    predicate: i32 = LLVMGetICmpPredicate(comparison)
+                    holds: bool = facts.truths[position]
+                    taken: i32 = predicate if holds else inverse_integer_predicate(predicate)
+                    return true if LLVMGetOperand(comparison, 0) == index and LLVMGetOperand(comparison, 1) == count and taken == LLVMIntPredicate::ULT
+            false
+
+        # FILL zeroes all of a static private array of i64 elements with a 64-bit length.
+        def full_i64_array_zero_fill(fill: LLVMValueRef) -> LLVMValueRef?:
+            buffer: LLVMValueRef = LLVMGetOperand(fill, 0)
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            return null if LLVMIsAAllocaInst(buffer) == null or ElisaLLVMIsStaticAlloca(buffer) == 0 or call_is_volatile(fill) or LLVMGetNumOperandBundles(fill) != 0
+            return null if LLVMIsAConstantInt(length) == null or not is_llvm_integer_type(LLVMTypeOf(length), 64) or LLVMGetPointerAddressSpace(LLVMTypeOf(buffer)) != 0
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or not is_llvm_integer_type(LLVMGetElementType(array), 64)
+            return buffer if LLVMConstIntGetZExtValue(length) == LLVMGetArrayLength2(array) * 8 else null
+
+        # The last fill of BUFFER after INIT whose length is `count << 3` without unsigned
+        # wrap: (the fill, count).
+        def prefix_cover(analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, init: LLVMValueRef, intrinsics: MemsetIntrinsics&) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            cover: mutable darray[LLVMValueRef] = []
+            for user in use_list_users(buffer) |cover, analyses, buffer, init, intrinsics|:
+                continue if user == init or not is_memset(user, intrinsics) or LLVMGetOperand(user, 0) != buffer
+                continue if call_is_volatile(user) or LLVMGetNumOperandBundles(user) != 0 or ElisaLLVMInstructionDominates(analyses, init, user) == 0
+                shift: LLVMValueRef = LLVMGetOperand(user, 2)
+                continue if not is_llvm_instruction_with_opcode(shift, LLVMOpcode::SHL) or LLVMGetNUW(shift) == 0
+                amount: LLVMValueRef = LLVMGetOperand(shift, 1)
+                if LLVMIsAConstantInt(amount) != null and ElisaLLVMConstantIntEquals(amount, 3) != 0:
+                    cover.truncate(0)
+                    cover.push(user)
+                    cover.push(LLVMGetOperand(shift, 0))
+            cover
+
+        # LOAD's INDEX is below COUNT: scalar evolution proves `index + 1 <=u count` at the
+        # load (with `index + 1` not wrapping), or the branches reaching it prove it.
+        def covered_index(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, index: LLVMValueRef, count: LLVMValueRef, load: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            range: ElisaConstantRangeRef = ElisaLLVMScalarEvolutionUnsignedRange(analyses, index)
+            below_maximum: bool = ElisaLLVMConstantRangeUnsignedMax(range) != 18446744073709551615
+            ElisaLLVMDisposeConstantRange(range)
+            if below_maximum:
+                index_expression: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionOfValue(analyses, index)
+                end: ElisaScalarEvolutionExpressionRef = ElisaLLVMScalarEvolutionAdd(analyses, index_expression, ElisaLLVMScalarEvolutionConstantOf(analyses, LLVMTypeOf(index), 1))
+                return true if ElisaLLVMScalarEvolutionIsKnownPredicateAt(analyses, LLVMIntPredicate::ULE, end, ElisaLLVMScalarEvolutionOfValue(analyses, count), load) != 0
+            covered_prefix_branch_proof(function, analyses, index, count, load)
+
+        # Every use of BUFFER besides INIT, COVER and lifetime markers is an 8-byte element
+        # GEP whose users store into it or load i64 after COVER at a covered index; how many
+        # loads, or null.
+        def covered_reads(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, init: LLVMValueRef, cover: LLVMValueRef, count: LLVMValueRef, layout: LLVMTargetDataRef) -> u32? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            reads: mutable u32 = 0
+            for user in use_list_users(buffer) |reads, function, analyses, buffer, init, cover, count, layout|:
+                continue if user == init or user == cover or is_lifetime_marker(user)
+                return null if LLVMIsAGetElementPtrInst(user) == null or LLVMGetOperand(user, 0) != buffer or LLVMGetNumIndices(user) != 1
+                return null if LLVMABISizeOfType(layout, LLVMGetGEPSourceElementType(user)) != 8
+                index: LLVMValueRef = LLVMGetOperand(user, 1)
+                return null if LLVMTypeOf(index) != LLVMTypeOf(count)
+                for access in use_list_users(user) |reads, function, analyses, cover, count, index, user|:
+                    if LLVMIsAStoreInst(access) != null:
+                        continue if LLVMGetVolatile(access) == 0 and LLVMGetOrdering(access) == 0 and LLVMGetOperand(access, 1) == user and LLVMGetOperand(access, 0) != user
+                    return null if LLVMIsALoadInst(access) == null or LLVMGetVolatile(access) != 0 or LLVMGetOrdering(access) != 0 or LLVMGetOperand(access, 0) != user
+                    return null if not is_llvm_integer_type(LLVMTypeOf(access), 64) or ElisaLLVMInstructionDominates(analyses, cover, access) == 0
+                    reads <- reads + 1
+                    return null if reads > CoveredPrefixBudget::READS
+                    return null if not covered_index(function, analyses, index, count, access)
+            reads
+
+        # FUNCTION's covered zero fills removed (`removeCoveredPrefixZeros`).
+        def remove_function_covered_zeros(function: LLVMValueRef, layout: LLVMTargetDataRef, intrinsics: MemsetIntrinsics&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            inits: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, inits, intrinsics|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, inits, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    continue if not is_memset(instruction, intrinsics)
+                    value: LLVMValueRef = LLVMGetOperand(instruction, 1)
+                    inits.push(instruction) if LLVMIsAConstantInt(value) != null and LLVMIsNull(value) != 0
+            return 0 if inits.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            removed: mutable u32 = 0
+            for init in inits |removed, function, analyses, layout, intrinsics|:
+                buffer: LLVMValueRef = get full_i64_array_zero_fill(init) else continue
+                cover: darray[LLVMValueRef] = prefix_cover(analyses, buffer, init, intrinsics)
+                continue if cover.count == 0 or not is_llvm_integer_type(LLVMTypeOf(cover[1]), 64)
+                reads: u32 = get covered_reads(function, analyses, buffer, init, cover[0], cover[1], layout) else continue
+                if reads > 0:
+                    LLVMInstructionEraseFromParent(init)
+                    removed <- removed + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            removed
+
+        # FUNCTION holds a zero fill of a whole private array of 8 to 512 i64 elements, and
+        # has at most 50000 instructions.
+        def covered_prefix_candidate(function: LLVMValueRef, intrinsics: MemsetIntrinsics&) -> bool can[Abort.Panic]:
+            candidate: mutable bool = false
+            visited: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidate, visited, intrinsics|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, candidate, visited, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    visited <- visited + 1
+                    return false if visited > CoveredPrefixBudget::FUNCTION_INSTRUCTIONS
+                    continue if not is_memset(instruction, intrinsics) or call_is_volatile(instruction)
+                    buffer: LLVMValueRef = LLVMGetOperand(instruction, 0)
+                    length: LLVMValueRef = LLVMGetOperand(instruction, 2)
+                    value: LLVMValueRef = LLVMGetOperand(instruction, 1)
+                    continue if LLVMIsAAllocaInst(buffer) == null or LLVMIsAConstantInt(length) == null or not is_llvm_integer_type(LLVMTypeOf(length), 64)
+                    continue if LLVMIsAConstantInt(value) == null or LLVMIsNull(value) == 0
+                    array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+                    continue if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or not is_llvm_integer_type(LLVMGetElementType(array), 64)
+                    elements: u64 = LLVMGetArrayLength2(array)
+                    candidate <- true if elements >= CoveredPrefixBudget::SMALLEST and elements <= CoveredPrefixBudget::LARGEST and LLVMConstIntGetZExtValue(length) == elements * 8
+            candidate
+
+        def optimizable_function(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            LLVMIsDeclaration(function) == 0 and not function_is_size_optimized(function) and not function_is_sanitized(function)
+
+    public:
+        # MODULE's covered prefix zeros removed; how many were. Only on AArch64 macOS
+        # and Linux, without debug info, and for at most 32 candidate functions.
+        def prepare_covered_prefix_zeros(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_named_metadata(module, "llvm.dbg.cu")
+            return 0 if not ((ElisaLLVMModuleTargetIsMacOSX(module) != 0 or ElisaLLVMModuleTargetIsLinux(module) != 0) and module_targets_aarch64_architecture(module))
+            intrinsics: MemsetIntrinsics = memset_intrinsics()
+            candidates: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, candidates, intrinsics|:
+                cursor <- LLVMGetNextFunction(function)
+                candidates.push(function) if optimizable_function(function) and covered_prefix_candidate(function, &intrinsics)
+            return 0 if candidates.count == 0 or candidates.count > CoveredPrefixBudget::CANDIDATE_FUNCTIONS
+            options: LLVMPassBuilderOptionsRef = LLVMCreatePassBuilderOptions()
+            passes_storage: mutable darray[u8] = []
+            idioms: cstr = sview_to_cstr("loop(loop-idiom),instcombine<no-verify-fixpoint>,simplifycfg", passes_storage)
+            for function in candidates |options, idioms|:
+                ElisaLLVMRunO1FunctionSimplificationPipeline(function)
+                if LLVMRunPassesOnFunction(function, idioms, null, options) is failure:
+                    LLVMConsumeError(failure)
+                    LLVMDisposePassBuilderOptions(options)
+                    return 0
+            LLVMDisposePassBuilderOptions(options)
+            remove_covered_prefix_zeros(module)
+
+        # The removal step alone, over every optimizable function of MODULE
+        # (`removeCoveredPrefixZeros`).
+        def remove_covered_prefix_zeros(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            intrinsics: MemsetIntrinsics = memset_intrinsics()
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            removed: mutable u32 = 0
+            function_cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while function_cursor is function |function_cursor, removed, layout, intrinsics|:
+                function_cursor <- LLVMGetNextFunction(function)
+                removed <- removed + remove_function_covered_zeros(function, layout, &intrinsics) if optimizable_function(function)
+            removed

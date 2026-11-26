@@ -497,6 +497,14 @@ int ElisaLLVMIsImpliedCondition(LLVMValueRef condition, LLVMValueRef implied, LL
   return Known ? (*Known ? 1 : 0) : -1;
 }
 
+int ElisaLLVMIsImpliedComparison(LLVMValueRef condition, LLVMIntPredicate predicate, LLVMValueRef left,
+                                 LLVMValueRef right, LLVMModuleRef module, int condition_is_true) {
+  std::optional<bool> Known = isImpliedCondition(unwrap(condition), static_cast<CmpInst::Predicate>(predicate),
+                                                 unwrap(left), unwrap(right), unwrap(module)->getDataLayout(),
+                                                 condition_is_true != 0);
+  return Known ? (*Known ? 1 : 0) : -1;
+}
+
 int ElisaLLVMConstantMaxBackedgeTakenCount(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
                                            uint64_t *count) {
   auto *Max = dyn_cast<SCEVConstant>(

@@ -240,6 +240,10 @@ ElisaConstantRangeRef ElisaLLVMLazyValueConstantRangeAtUse(ElisaFunctionAnalyses
  * `condition_is_true` decides `implied`. 1 implied true, 0 implied false, -1 unknown. */
 int ElisaLLVMIsImpliedCondition(LLVMValueRef condition, LLVMValueRef implied, LLVMModuleRef module,
                                 int condition_is_true);
+/* The same for the comparison `left predicate right` given only by its plain predicate
+ * (the isImpliedCondition overload taking a predicate and operands). */
+int ElisaLLVMIsImpliedComparison(LLVMValueRef condition, LLVMIntPredicate predicate, LLVMValueRef left,
+                                 LLVMValueRef right, LLVMModuleRef module, int condition_is_true);
 
 /* --- scalar evolution --------------------------------------------------- */
 /* The constant maximum backedge-taken count of the loop; returns 0 when it
