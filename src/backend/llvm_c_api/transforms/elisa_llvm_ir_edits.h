@@ -161,6 +161,11 @@ void ElisaLLVMSetCallAttributesFromFunction(LLVMValueRef call, LLVMValueRef func
  * wrapping arithmetic. Constant offsets fold to a constant. */
 LLVMValueRef ElisaLLVMEmitGEPOffset(LLVMBuilderRef builder, LLVMValueRef gep);
 
+/* DbgLabelRecord::createUnresolvedDbgLabelRecord(empty node), inserted before INSTRUCTION
+ * with BasicBlock::insertDbgRecordBefore: a debug record the C API cannot build, for tests
+ * of code that must step over records. */
+void ElisaLLVMInsertUnresolvedDebugLabelBefore(LLVMValueRef instruction);
+
 #ifdef __cplusplus
 }
 #endif

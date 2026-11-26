@@ -24,14 +24,14 @@ for name,changes in cases.items():
     values=base|changes; text=template.replace('@BACKEND@',str(root/'src/backend'))
     for key,value in values.items(): text=text.replace(key,value)
     if name == 'debug_record':
-        text = text.replace('extern LLVMSetVolatile', 'extern split_test_attach_debug_record(value: LLVMValueRef) -> void\nextern LLVMSetVolatile')
-        text = text.replace('    count: mutable usize = 0', '    split_test_attach_debug_record(result)\n    count: mutable usize = 0')
+        text = text.replace('extern LLVMSetVolatile', 'extern ElisaLLVMInsertUnresolvedDebugLabelBefore(instruction: LLVMValueRef) -> void\nextern LLVMSetVolatile')
+        text = text.replace('    count: mutable usize = 0', '    ElisaLLVMInsertUnresolvedDebugLabelBefore(result)\n    count: mutable usize = 0')
     (out/f'{name}.elisa').write_text(text)
 PY
 test_cases=(positive multiple_store volatile atomic escape cross_block exact nuw before_store)
 if [[ "$ELISA_HOST_OS" == Linux ]]; then
   CXX="${ELISA_CXX:-$ELISA_LLVM_BIN_DIR/clang++}"
-  run "$CXX" $($LLVM_CONFIG --cxxflags) -c "$ROOT/test/parity/stage1_split_half_debug_record.cpp" -o "$T/debug_record_helper.o"
+  run "$CXX" $($LLVM_CONFIG --cxxflags) -c "$ROOT/src/backend/llvm_c_api/transforms/elisa_llvm_ir_edits.cpp" -o "$T/debug_record_helper.o"
   test_cases+=(debug_record)
 fi
 for test_case in "${test_cases[@]}"; do

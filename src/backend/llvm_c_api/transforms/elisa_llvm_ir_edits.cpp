@@ -11,6 +11,7 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/DebugProgramInstruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
@@ -222,6 +223,13 @@ int ElisaLLVMReplaceSimplifiedLibraryCall(ElisaFunctionAnalysesRef analyses, LLV
   Call->replaceAllUsesWith(Replacement);
   Call->eraseFromParent();
   return 1;
+}
+
+void ElisaLLVMInsertUnresolvedDebugLabelBefore(LLVMValueRef instruction) {
+  auto *Before = cast<Instruction>(unwrap(instruction));
+  MDNode *Node = MDNode::get(Before->getContext(), {});
+  DbgLabelRecord *Record = DbgLabelRecord::createUnresolvedDbgLabelRecord(Node);
+  Before->getParent()->insertDbgRecordBefore(Record, Before->getIterator());
 }
 
 } // extern "C"
