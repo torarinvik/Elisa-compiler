@@ -1,0 +1,168 @@
+# The abstract states of the stack-prefix proof (`StackPrefixState` in the C++ pass it
+# replaces). A private i64 array used as a push/pop stack has elements [0, prefix)
+# initialized, plus the element at the prefix when `extra` holds; the prefix lies in
+# [low, high]. An SSA value has an offset when it is proven equal to prefix + offset
+# (modulo 2^64). The offsets are kept sorted by value address, so equal states hold
+# equal arrays. States are interned like the scratch-prefix ones (prefix_states.elisa).
+include "./prefix_states.elisa"
+
+const module StackPrefixLimit:
+    # Offsets further from the prefix than this are forgotten.
+    OFFSET: i32 = 1024
+    # A constant is an offset of an exact prefix only within the signed 16-bit range.
+    CONSTANT_LOW: i64 = -32768
+    CONSTANT_HIGH: i64 = 32767
+
+# One abstract state at the start of block BLOCK (an index in the function's block list).
+struct StackPrefixState:
+    block: mutable u32
+    low: mutable u32
+    high: mutable u32
+    active: mutable bool
+    extra: mutable bool
+    offset_values: mutable darray[LLVMValueRef]
+    offsets: mutable darray[i32]
+
+# Every state seen, a lookup from a state's hash to the first state with it, and for each
+# state the next one with the same hash (its index plus one, or zero).
+struct StackPrefixStateTable:
+    states: mutable darray[StackPrefixState]
+    lookup: mutable KeyTable
+    next_same: mutable darray[u32]
+
+extend Backend:
+    private:
+        def same_stack_state(first: StackPrefixState&, second: StackPrefixState&) -> bool can[Abort.Panic]:
+            return false if first.block != second.block or first.low != second.low or first.high != second.high
+            return false if first.active != second.active or first.extra != second.extra
+            return false if first.offsets.count != second.offsets.count or not same_values(&first.offset_values, &second.offset_values)
+            for index in 0..<first.offsets.count |first, second|:
+                return false if first.offsets[index] != second.offsets[index]
+            true
+
+        def stack_state_key(state: StackPrefixState&) -> TableKey can[Unsafe.PointerCast]:
+            flags: u64 = (1 if state.active else 0) + (2 if state.extra else 0)
+            # Every offset is above -65536: constants give at least -32768, sums at least -1024.
+            offsets: mutable u64 = 1469598103 ^ state.offsets.count.u64()
+            for offset in state.offsets |offsets|:
+                offsets <- (offsets ^ (offset + 65536).u64()) * 1099511628211
+            first: u64 = values_hash(&state.offset_values, 14695981039346656037)
+            second: u64 = (state.low.u64() << 32) + state.high.u64()
+            third: u64 = (state.block.u64() << 2) + flags + offsets
+            TableKey{first: first, second: second, third: third}
+
+    public:
+        def initial_stack_state(block: u32) -> StackPrefixState:
+            StackPrefixState{block: block, low: 0, high: 0, active: false, extra: false, offset_values: [], offsets: []}
+
+        def copied_stack_state(state: StackPrefixState&) -> StackPrefixState can[Memory.Allocate]:
+            offsets: mutable darray[i32] = []
+            for offset in state.offsets |offsets|:
+                offsets.push(offset)
+            StackPrefixState{block: state.block, low: state.low, high: state.high, active: state.active, extra: state.extra, offset_values: copied_values(&state.offset_values), offsets: offsets}
+
+        # The offset STATE gives VALUE, if any.
+        def recorded_offset(state: StackPrefixState&, value: LLVMValueRef) -> i32? can[Abort.Panic, Unsafe.PointerCast]:
+            position: usize = sorted_position(&state.offset_values, value)
+            return null if position >= state.offset_values.count or state.offset_values[position] != value
+            state.offsets[position]
+
+        # VALUE's offset from the prefix (`stackOffset`): a 64-bit constant against an
+        # exact prefix, else the recorded one.
+        def stack_offset(value: LLVMValueRef, state: StackPrefixState&) -> i32? can[Abort.Panic, Unsafe.PointerCast]:
+            if LLVMIsAConstantInt(value) != null and is_llvm_integer_type(LLVMTypeOf(value), 64) and state.low == state.high:
+                constant: i64 = LLVMConstIntGetSExtValue(value)
+                low: i64 = state.low.u64().i64()
+                if constant >= low + StackPrefixLimit::CONSTANT_LOW and constant <= low + StackPrefixLimit::CONSTANT_HIGH:
+                    return (constant - low).i32()
+            recorded_offset(state, value)
+
+        def set_offset(state: mutable StackPrefixState&, value: LLVMValueRef, offset: i32) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: usize = sorted_position(&state.offset_values, value)
+            if position < state.offset_values.count and state.offset_values[position] == value:
+                state.offsets[position] <- offset
+                return
+            insert_fact(&state.offset_values, value)
+            state.offsets.push(offset)
+            moving: mutable usize = state.offsets.count - 1
+            while moving > position |moving, state|:
+                state.offsets[moving] <- state.offsets[moving - 1]
+                moving <- moving - 1
+            state.offsets[position] <- offset
+
+        def erase_offset(state: mutable StackPrefixState&, value: LLVMValueRef) can[Abort.Panic, Unsafe.PointerCast]:
+            position: usize = sorted_position(&state.offset_values, value)
+            return if position >= state.offset_values.count or state.offset_values[position] != value
+            erase_fact(&state.offset_values, value)
+            for index in position..<state.offsets.count - 1 |state|:
+                state.offsets[index] <- state.offsets[index + 1]
+            state.offsets.truncate(state.offsets.count - 1)
+
+        def clear_offsets(state: mutable StackPrefixState&):
+            state.offset_values.truncate(0)
+            state.offsets.truncate(0)
+
+        # Only the offsets within 1024 of the prefix kept, in order.
+        def keep_offsets_within(state: mutable StackPrefixState&) can[Abort.Panic]:
+            kept: mutable usize = 0
+            for index in 0..<state.offsets.count |kept, state|:
+                offset: i32 = state.offsets[index]
+                if offset >= -StackPrefixLimit::OFFSET and offset <= StackPrefixLimit::OFFSET:
+                    state.offset_values[kept] <- state.offset_values[index]
+                    state.offsets[kept] <- offset
+                    kept <- kept + 1
+            state.offset_values.truncate(kept)
+            state.offsets.truncate(kept)
+
+        # The prefix moved by DELTA (one element pushed or popped), every offset with it
+        # (`stackShift`).
+        def stack_shift(state: mutable StackPrefixState&, delta: i32) can[Abort.Panic]:
+            if delta < 0:
+                state.low <- state.low - 1
+                state.high <- state.high - 1
+            else:
+                state.low <- state.low + 1
+                state.high <- state.high + 1
+            for index in 0..<state.offsets.count |state, delta|:
+                state.offsets[index] <- state.offsets[index] - delta
+            keep_offsets_within(state)
+
+        # The offsets of instructions whose block HEADER dominates forgotten.
+        def drop_loop_offsets(state: mutable StackPrefixState&, analyses: ElisaFunctionAnalysesRef, header: LLVMBasicBlockRef) can[Abort.Panic]:
+            kept: mutable usize = 0
+            for index in 0..<state.offsets.count |kept, state, analyses, header|:
+                value: LLVMValueRef = state.offset_values[index]
+                local: bool = LLVMIsAInstruction(value) != null and ElisaLLVMBlockDominates(analyses, header, LLVMGetInstructionParent(value)) != 0
+                if not local:
+                    state.offset_values[kept] <- value
+                    state.offsets[kept] <- state.offsets[index]
+                    kept <- kept + 1
+            state.offset_values.truncate(kept)
+            state.offsets.truncate(kept)
+
+        def new_stack_state_table() -> StackPrefixStateTable can[Memory.Allocate]:
+            StackPrefixStateTable{states: [], lookup: new_key_table(), next_same: []}
+
+        def seen_stack_state(table: StackPrefixStateTable&, state: StackPrefixState&) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            found: u32 = get key_table_find(&table.lookup, stack_state_key(state)) else return false
+            current: mutable u32 = found
+            while true |current, table, state|:
+                return true if same_stack_state(&table.states[current.u64()], state)
+                next: u32 = table.next_same[current.u64()]
+                return false if next == 0
+                current <- next - 1
+            false
+
+        # STATE stored as a new state, chained after the states with its hash.
+        def add_stack_state(table: mutable StackPrefixStateTable&, state: StackPrefixState) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            key: TableKey = stack_state_key(&state)
+            index: u32 = table.states.count.u32()
+            table.next_same.push(0)
+            if key_table_find(&table.lookup, key) is first:
+                last: mutable u32 = first
+                while table.next_same[last.u64()] != 0 |last, table|:
+                    last <- table.next_same[last.u64()] - 1
+                table.next_same[last.u64()] <- index + 1
+            else:
+                table.lookup <- key_table_insert(table.lookup, key, index)
+            table.states.push(state)

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Check conservative worklist initialization proofs with executable LLVM fixtures."""
-import os,random,shlex,subprocess,tempfile
+"""Check the stack-prefix zero removal's worklist proof on small push/pop shapes.
+
+Each case runs through `elisac llvm-pass stack-prefix-zeros`: the fill of an 8-element
+i64 stack goes only when every load reads an element written since the fill on every
+path to it.
+"""
+import os
+import sys
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[4]
-CONFIG=os.environ.get('LLVM_CONFIG','/opt/homebrew/opt/llvm@23/bin/llvm-config')
-def run(cmd):return subprocess.run([str(x) for x in cmd],capture_output=True,text=True,check=True,timeout=28)
-def flags(*args):return shlex.split(run([CONFIG,*args]).stdout)
-DRIVER='''#include <llvm/IRReader/IRReader.h>\n#include <llvm/Support/SourceMgr.h>\n#include <llvm/IR/Verifier.h>\n#include <llvm/IR/InstIterator.h>\n#include <llvm/IR/IntrinsicInst.h>\n#include <llvm/Analysis/ValueTracking.h>\n#include "llvm_stack_prefix.cpp"\nint main(int argc,char**argv){llvm::LLVMContext C;llvm::SMDiagnostic E;auto M=llvm::parseIRFile(argv[1],E,C);if(!M)return 2;llvm::errs()<<removeStackPrefixZeros(*M)<<"\\n";if(llvm::verifyModule(*M,&llvm::errs()))return 3;M->print(llvm::outs(),nullptr);}\n'''
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from elisa_llvm_pass import run_pass
+
 HEAD='''target triple = "TRIPLE"
 target datalayout = "e-m:o-i64:64-i128:128-n32:64-S128"
 declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)
@@ -28,8 +33,12 @@ CASES={
  'both_branches_write':(' %c = icmp eq i64 %i, 0\n br i1 %c, label %left, label %right\nleft:\n store i64 9, ptr %a\n br label %join\nright:\n store i64 8, ptr %a\n br label %join\njoin:\n %v = load i64, ptr %a',1),
  'loop_maybe_empty':(' br label %head\nhead:\n %n = phi i64 [0, %entry], [%n1, %body]\n %c = icmp ult i64 %n, %i\n br i1 %c, label %body, label %exit\nbody:\n store i64 7, ptr %a\n %n1 = add i64 %n, 1\n br label %head\nexit:\n %v = load i64, ptr %a',0),
 }
-with tempfile.TemporaryDirectory(prefix='stack-prefix-') as tmp:
- d=Path(tmp);(d/'driver.cpp').write_text(DRIVER);bindir=Path(run([CONFIG,'--bindir']).stdout.strip())
- run([bindir/'clang++',*flags('--cxxflags'),'-I'+str(ROOT/'src/backend'),d/'driver.cpp',*flags('--ldflags','--libs','core','irreader','passes','--system-libs'),'-Wl,-rpath,'+run([CONFIG,'--libdir']).stdout.strip(),'-o',d/'driver'])
- for name,(body,want) in CASES.items():
-  (d/'input.ll').write_text(HEAD+body+'\n ret i64 %v\n}\n');r=run([d/'driver',d/'input.ll']);got=int(r.stderr.strip());assert got==want,(name,got);print('PASS',name)
+failures = 0
+for name, (body, want) in CASES.items():
+    count, _ = run_pass('stack-prefix-zeros', HEAD + body + '\n ret i64 %v\n}\n')
+    if count == want:
+        print('PASS', name)
+    else:
+        failures += 1
+        print('FAIL', name, 'removed', count, 'want', want)
+assert failures == 0, f'{failures} stack-prefix cases differ'

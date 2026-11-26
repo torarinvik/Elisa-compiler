@@ -1,0 +1,344 @@
+# The zero fills of private i64 arrays used as push/pop stacks (`removeStackPrefixZeros`
+# in the C++ it replaces), removed when a bounded abstract interpretation shows every
+# load reads an element pushed since the fill. Stores on defined executions stay inside
+# the array, so a push never wraps the prefix past its capacity.
+include "./stack_prefix_states.elisa"
+
+const module StackPrefixBudget:
+    READS: u32 = 256
+    STATES: u32 = 4096
+    WORK_UNITS: u64 = 2000000
+    STATE_OFFSETS: usize = 1024
+    FUNCTION_INSTRUCTIONS: u32 = 50000
+    FUNCTION_FILLS: usize = 32
+    SMALLEST: u64 = 8
+    LARGEST: u64 = 512
+
+# What the proof of one fill works from.
+struct StackProofFacts:
+    analyses: ElisaFunctionAnalysesRef
+    buffer: LLVMValueRef
+    init: LLVMValueRef
+    capacity: u32
+    layout: LLVMTargetDataRef
+    zero: LLVMValueRef
+    relevant: darray[LLVMValueRef]
+
+# One instruction's effect on a state.
+const module StackStep:
+    CONTINUE: u32 = 0
+    FAIL: u32 = 1
+    IMPOSSIBLE: u32 = 2
+
+extend Backend:
+    private:
+        # The i64 element index POINTER addresses in BUFFER (`stackIndex`): ZERO for the
+        # array itself, or the index of an 8-byte element or `[0, i]` GEP.
+        def stack_index(pointer: LLVMValueRef, buffer: LLVMValueRef, layout: LLVMTargetDataRef, zero: LLVMValueRef) -> LLVMValueRef?:
+            return zero if pointer == buffer
+            return null if LLVMIsAGetElementPtrInst(pointer) == null or LLVMGetOperand(pointer, 0) != buffer
+            indices: u32 = LLVMGetNumIndices(pointer)
+            source: LLVMTypeRef = LLVMGetGEPSourceElementType(pointer)
+            if indices == 1 and LLVMABISizeOfType(layout, source) == 8:
+                index: LLVMValueRef = LLVMGetOperand(pointer, 1)
+                return index if is_llvm_integer_type(LLVMTypeOf(index), 64) else null
+            if indices == 2 and source == LLVMGetAllocatedType(buffer):
+                first: LLVMValueRef = LLVMGetOperand(pointer, 1)
+                second: LLVMValueRef = LLVMGetOperand(pointer, 2)
+                return second if LLVMIsAConstantInt(first) != null and LLVMIsNull(first) != 0 and is_llvm_integer_type(LLVMTypeOf(second), 64)
+            null
+
+        def simple_i64_access(access: LLVMValueRef, value_type: LLVMTypeRef) -> bool:
+            LLVMGetVolatile(access) == 0 and LLVMGetOrdering(access) == 0 and is_llvm_integer_type(value_type, 64)
+
+        # The index of ACCESS, a load or store of BUFFER that INIT dominates, or null.
+        def audited_stack_access(analyses: ElisaFunctionAnalysesRef, access: LLVMValueRef, buffer: LLVMValueRef, init: LLVMValueRef, layout: LLVMTargetDataRef, zero: LLVMValueRef) -> LLVMValueRef?:
+            if LLVMIsALoadInst(access) != null:
+                return null if not simple_i64_access(access, LLVMTypeOf(access))
+                index: LLVMValueRef = get stack_index(LLVMGetOperand(access, 0), buffer, layout, zero) else return null
+                return index if ElisaLLVMInstructionDominates(analyses, init, access) != 0 else null
+            return null if LLVMIsAStoreInst(access) == null or not simple_i64_access(access, LLVMTypeOf(LLVMGetOperand(access, 0)))
+            index: LLVMValueRef = get stack_index(LLVMGetOperand(access, 1), buffer, layout, zero) else return null
+            return index if ElisaLLVMInstructionDominates(analyses, init, access) != 0 else null
+
+        # The values an index of BUFFER is computed from (phis and binary operators,
+        # followed back), or null when a use of BUFFER is outside the model or it is read
+        # never or more than 256 times.
+        def relevant_stack_values(analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, init: LLVMValueRef, layout: LLVMTargetDataRef, zero: LLVMValueRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            lifetime_start: u32 = intrinsic_identifier("llvm.lifetime.start")
+            reads: mutable u32 = 0
+            pending: mutable darray[LLVMValueRef] = []
+            for user in use_list_users(buffer) |reads, pending, analyses, buffer, init, layout, zero, lifetime_start|:
+                continue if user == init
+                if is_lifetime_marker(user):
+                    return null if ElisaLLVMInstructionDominates(analyses, user, init) == 0 and called_intrinsic_id(user) == lifetime_start
+                    continue
+                accesses: mutable darray[LLVMValueRef] = []
+                if LLVMIsAGetElementPtrInst(user) != null:
+                    return null if LLVMGetOperand(user, 0) != buffer or ElisaLLVMIsUsedByMetadata(user) != 0
+                    for access in use_list_users(user) |accesses|:
+                        accesses.push(access)
+                else:
+                    accesses.push(user)
+                for access in accesses |reads, pending, analyses, buffer, init, layout, zero|:
+                    continue if access == init
+                    index: LLVMValueRef = get audited_stack_access(analyses, access, buffer, init, layout, zero) else return null
+                    reads <- reads + 1 if LLVMIsALoadInst(access) != null
+                    pending.push(index)
+            return null if reads == 0 or reads > StackPrefixBudget::READS
+            relevant: mutable darray[LLVMValueRef] = []
+            while pending.count > 0 |pending, relevant|:
+                value: LLVMValueRef = pending[pending.count - 1]
+                pending.truncate(pending.count - 1)
+                continue if contains_fact(&relevant, value)
+                insert_fact(&relevant, value)
+                if is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI):
+                    for edge in 0..<LLVMCountIncoming(value) |pending, value|:
+                        pending.push(LLVMGetIncomingValue(value, edge))
+                elif LLVMIsABinaryOperator(value) != null:
+                    pending.push(LLVMGetOperand(value, 0))
+                    pending.push(LLVMGetOperand(value, 1))
+            relevant
+
+        # STATE's prefix pinned below CAPACITY for an element written at it; whether that
+        # leaves the state possible.
+        def pin_below_capacity(state: mutable StackPrefixState&, capacity: u32) -> bool:
+            state.high <- capacity - 1 if state.high > capacity - 1
+            state.low <= state.high
+
+        # ADD, an i64 `x + c`, tracked: a pop (`prefix - 1`) or push (`prefix + 1`) of a
+        # relevant value moves the prefix, and any relevant sum near it is recorded.
+        def track_stack_add(state: mutable StackPrefixState&, add: LLVMValueRef, capacity: u32, relevant: darray[LLVMValueRef]&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            constant: mutable LLVMValueRef? = null
+            offset: mutable i32? = null
+            if LLVMIsAConstantInt(LLVMGetOperand(add, 1)) != null:
+                constant <- LLVMGetOperand(add, 1)
+                offset <- stack_offset(LLVMGetOperand(add, 0), state)
+            else:
+                offset <- stack_offset(LLVMGetOperand(add, 1), state)
+                constant <- LLVMGetOperand(add, 0) if LLVMIsAConstantInt(LLVMGetOperand(add, 0)) != null
+            erase_offset(state, add)
+            step: LLVMValueRef = get constant else return StackStep::CONTINUE
+            base: i32 = get offset else return StackStep::CONTINUE
+            delta: i64 = LLVMConstIntGetSExtValue(step)
+            return StackStep::CONTINUE if delta < StackPrefixLimit::CONSTANT_LOW or delta > StackPrefixLimit::CONSTANT_HIGH
+            tracked: bool = contains_fact(relevant, add)
+            sum: mutable i32 = base + delta.i32()
+            if tracked and base == 0 and delta == -1 and state.low > 0:
+                stack_shift(state, -1)
+                state.extra <- true
+                sum <- 0
+            elif tracked and base == 0 and delta == 1 and state.extra:
+                return StackStep::IMPOSSIBLE if not pin_below_capacity(state, capacity)
+                stack_shift(state, 1)
+                state.extra <- false
+                sum <- 0
+            set_offset(state, add, sum) if tracked and sum >= -StackPrefixLimit::OFFSET and sum <= StackPrefixLimit::OFFSET
+            StackStep::CONTINUE
+
+        # A store at OFFSET from the prefix: a push at the boundary element, a write of the
+        # boundary element, or a rewrite inside the prefix.
+        def track_stack_store(state: mutable StackPrefixState&, offset: i32, capacity: u32) -> u32 can[Abort.Panic]:
+            at: mutable i32 = offset
+            if at == 1 and state.extra:
+                return StackStep::IMPOSSIBLE if not pin_below_capacity(state, capacity)
+                stack_shift(state, 1)
+                state.extra <- false
+                at <- 0
+            if at == 0:
+                return StackStep::IMPOSSIBLE if not pin_below_capacity(state, capacity)
+                state.extra <- true
+                return StackStep::CONTINUE
+            return StackStep::CONTINUE if at < 0 and (-at).u32() <= state.low
+            StackStep::FAIL
+
+        # INSTRUCTION's effect on STATE.
+        def stack_instruction(state: mutable StackPrefixState&, instruction: LLVMValueRef, facts: StackProofFacts&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instruction == facts.init:
+                return StackStep::FAIL if state.active
+                state.active <- true
+                state.low <- 0
+                state.high <- 0
+                state.extra <- false
+                clear_offsets(state)
+                set_offset(state, facts.zero, 0)
+                return StackStep::CONTINUE
+            return StackStep::CONTINUE if not state.active
+            if is_llvm_instruction_with_opcode(instruction, LLVMOpcode::ADD) and is_llvm_integer_type(LLVMTypeOf(instruction), 64):
+                return track_stack_add(state, instruction, facts.capacity, &facts.relevant)
+            if LLVMIsALoadInst(instruction) != null and ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 0)) == facts.buffer:
+                index: LLVMValueRef = get stack_index(LLVMGetOperand(instruction, 0), facts.buffer, facts.layout, facts.zero) else return StackStep::FAIL
+                offset: i32 = get stack_offset(index, state) else return StackStep::FAIL
+                return StackStep::CONTINUE if (offset < 0 and (-offset).u32() <= state.low) or (offset == 0 and state.extra)
+                return StackStep::FAIL
+            if LLVMIsAStoreInst(instruction) != null and ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 1)) == facts.buffer:
+                index: LLVMValueRef = get stack_index(LLVMGetOperand(instruction, 1), facts.buffer, facts.layout, facts.zero) else return StackStep::FAIL
+                offset: i32 = get stack_offset(index, state) else return StackStep::FAIL
+                return track_stack_store(state, offset, facts.capacity)
+            StackStep::CONTINUE
+
+        # STATE along the edge to successor POSITION of BRANCH, refined by an equality of
+        # the prefix with zero; null when the edge cannot be taken.
+        def branch_refined_stack_state(state: StackPrefixState&, branch: LLVMValueRef, position: u32) -> StackPrefixState? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            next: mutable StackPrefixState = copied_stack_state(state)
+            if LLVMGetInstructionOpcode(branch) == LLVMOpcode::CONDITIONAL_BR:
+                condition: LLVMValueRef = LLVMGetCondition(branch)
+                if is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP):
+                    right: LLVMValueRef = LLVMGetOperand(condition, 1)
+                    against_zero: bool = LLVMIsAConstantInt(right) != null and LLVMIsNull(right) != 0
+                    predicate: i32 = LLVMGetICmpPredicate(condition)
+                    if against_zero and stack_offset(LLVMGetOperand(condition, 0), &next) is offset:
+                        if next.low == next.high and (predicate == LLVMIntPredicate::EQ or predicate == LLVMIntPredicate::NE):
+                            equal: bool = next.low.u64().i64() + offset.i64() == 0
+                            truth: bool = equal if predicate == LLVMIntPredicate::EQ else not equal
+                            return null if truth != (position == 0)
+                        if offset == 0:
+                            taken: i32 = predicate if position == 0 else inverse_integer_predicate(predicate)
+                            next.high <- 0 if taken == LLVMIntPredicate::EQ
+                            next.low <- 1 if (taken == LLVMIntPredicate::NE or taken == LLVMIntPredicate::UGT or taken == LLVMIntPredicate::SGT) and next.low < 1
+            return null if next.low > next.high
+            next
+
+        # Whether every phi of SUCCESSOR has an entry from BLOCK.
+        def phis_enter_from(successor: LLVMBasicBlockRef, block: LLVMBasicBlockRef) -> bool:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(successor)
+            while cursor is phi |cursor, block|:
+                return true if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                return false if phi_incoming_index(phi, block) < 0
+                cursor <- LLVMGetNextInstruction(phi)
+            true
+
+        # REFINED entering SUCCESSOR (block POSITION) from BLOCK: the phis take their
+        # incoming offsets, and on a back edge the loop's values are forgotten and an
+        # unknown prefix widened.
+        def carried_stack_state(refined: StackPrefixState&, block: LLVMBasicBlockRef, successor: LLVMBasicBlockRef, position: u32, facts: StackProofFacts&) -> StackPrefixState can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            next: mutable StackPrefixState = copied_stack_state(refined)
+            next.block <- position
+            phis: mutable darray[LLVMValueRef] = []
+            carried: mutable darray[i32?] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(successor)
+            while cursor is phi |cursor, phis, carried, next, block|:
+                break if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI)
+                cursor <- LLVMGetNextInstruction(phi)
+                phis.push(phi)
+                carried.push(stack_offset(LLVMGetIncomingValue(phi, phi_incoming_index(phi, block).u32()), &next))
+            for phi in phis |next|:
+                erase_offset(&next, phi)
+            if ElisaLLVMBlockDominates(facts.analyses, successor, block) != 0:
+                if recorded_offset(&next, facts.zero) == null:
+                    next.low <- 1 if next.low != 0 else 0
+                    next.high <- facts.capacity - 1 if next.extra else facts.capacity
+                drop_loop_offsets(&next, facts.analyses, successor)
+            for index in 0..<phis.count |next, phis, carried, facts|:
+                if carried[index] is offset:
+                    set_offset(&next, phis[index], offset) if contains_fact(&facts.relevant, phis[index])
+            next
+
+        # The worklist over FUNCTION's blocks (`stackPrefixProof`).
+        def stack_states_hold(function: LLVMValueRef, facts: StackProofFacts&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMBasicBlockRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is each |block_cursor, blocks|:
+                blocks.push(each)
+                block_cursor <- LLVMGetNextBasicBlock(each)
+            table: mutable StackPrefixStateTable = new_stack_state_table()
+            add_stack_state(&table, initial_stack_state(block_position(&blocks, LLVMGetEntryBasicBlock(function))))
+            work_units: mutable u64 = 0
+            head: mutable usize = 0
+            while head < table.states.count |head, table, work_units, blocks, facts|:
+                return false if head.u32() + 1 > StackPrefixBudget::STATES
+                state: mutable StackPrefixState = copied_stack_state(&table.states[head])
+                head <- head + 1
+                block: LLVMBasicBlockRef = blocks[state.block.u64()]
+                step: mutable u32 = StackStep::CONTINUE
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, state, work_units, step, facts|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    work_units <- work_units + 1
+                    return false if work_units > StackPrefixBudget::WORK_UNITS
+                    step <- stack_instruction(&state, instruction, facts)
+                    return false if step == StackStep::FAIL
+                    break if step == StackStep::IMPOSSIBLE
+                continue if step == StackStep::IMPOSSIBLE
+                terminator: LLVMValueRef = terminator_of(block)
+                successors: darray[LLVMBasicBlockRef] = get modeled_successors(terminator) else return false
+                for position in 0..<successors.count |table, state, successors, block, blocks, terminator, facts|:
+                    successor: LLVMBasicBlockRef = successors[position]
+                    refined: StackPrefixState = get branch_refined_stack_state(&state, terminator, position.u32()) else continue
+                    return false if not phis_enter_from(successor, block)
+                    next: StackPrefixState = carried_stack_state(&refined, block, successor, block_position(&blocks, successor), facts)
+                    return false if next.offsets.count > StackPrefixBudget::STATE_OFFSETS or table.states.count > StackPrefixBudget::STATES.u64()
+                    add_stack_state(&table, next) if not seen_stack_state(&table, &next)
+            true
+
+        # BUFFER's fill INIT is redundant: every load reads an element pushed since.
+        def stack_prefix_proof(function: LLVMValueRef, buffer: LLVMValueRef, init: LLVMValueRef, capacity: u32, layout: LLVMTargetDataRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(LLVMGetTypeContext(LLVMTypeOf(buffer))), 0, 0)
+            holds: mutable bool = false
+            if ElisaLLVMFunctionHasIrreducibleControlFlow(analyses) == 0:
+                if relevant_stack_values(analyses, buffer, init, layout, zero) is relevant:
+                    facts: StackProofFacts = StackProofFacts{analyses: analyses, buffer: buffer, init: init, capacity: capacity, layout: layout, zero: zero, relevant: relevant}
+                    holds <- stack_states_hold(function, &facts)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            holds
+
+        # The array FILL zeroes when it is a plain zero fill, inside the array, of a static
+        # private array of 8 to 512 i64 elements.
+        def stack_fill_array(fill: LLVMValueRef, module: LLVMModuleRef) -> LLVMValueRef? can[Abort.Panic, Unsafe.PointerCast]:
+            destination: LLVMValueRef = LLVMGetOperand(fill, 0)
+            buffer: LLVMValueRef = ElisaLLVMUnderlyingObject(destination)
+            return null if LLVMIsAAllocaInst(buffer) == null
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or not is_llvm_integer_type(LLVMGetElementType(array), 64)
+            elements: u64 = LLVMGetArrayLength2(array)
+            return null if elements < StackPrefixBudget::SMALLEST or elements > StackPrefixBudget::LARGEST or ElisaLLVMIsStaticAlloca(buffer) == 0
+            count: LLVMValueRef = LLVMGetOperand(buffer, 0)
+            return null if LLVMIsAConstantInt(count) == null or LLVMConstIntGetZExtValue(count) != 1
+            return null if LLVMGetPointerAddressSpace(LLVMTypeOf(buffer)) != 0 or ElisaLLVMIsUsedByMetadata(buffer) != 0
+            value: LLVMValueRef = LLVMGetOperand(fill, 1)
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            return null if LLVMIsAConstantInt(value) == null or LLVMIsNull(value) == 0 or LLVMIsAConstantInt(length) == null
+            return null if call_is_volatile(fill) or LLVMGetNumOperandBundles(fill) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(fill) != 0
+            base: PointerBase = pointer_base(destination, module)
+            bytes: u64 = elements * 8
+            return null if base.base != buffer or base.offset < 0 or base.offset.u64() > bytes
+            return null if LLVMConstIntGetZExtValue(length) > bytes - base.offset.u64()
+            buffer
+
+        # FUNCTION's stack fills removed.
+        def remove_function_stack_fills(function: LLVMValueRef, module: LLVMModuleRef, intrinsics: MemsetIntrinsics&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fills: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, fills, intrinsics|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, fills, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    fills.push(instruction) if is_memset(instruction, intrinsics)
+            return 0 if fills.count > StackPrefixBudget::FUNCTION_FILLS
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            removed: mutable u32 = 0
+            for fill in fills |removed, function, module, layout|:
+                if stack_fill_array(fill, module) is buffer:
+                    capacity: u32 = LLVMGetArrayLength2(LLVMGetAllocatedType(buffer)).u32()
+                    if stack_prefix_proof(function, buffer, fill, capacity, layout):
+                        LLVMInstructionEraseFromParent(fill)
+                        removed <- removed + 1
+            removed
+
+    public:
+        # The zero fills of MODULE's private i64 stacks that no load can observe removed;
+        # how many were. Only for 64-bit pointers and indices.
+        def remove_stack_prefix_zeros(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            return 0 if LLVMPointerSize(layout) != 8 or ElisaLLVMDataLayoutIndexSizeInBits(module, 0) != 64
+            intrinsics: MemsetIntrinsics = memset_intrinsics()
+            removed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, removed, module, intrinsics|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function) or function_is_sanitized(function)
+                continue if function_instruction_count(function) > StackPrefixBudget::FUNCTION_INSTRUCTIONS
+                removed <- removed + remove_function_stack_fills(function, module, &intrinsics)
+            removed

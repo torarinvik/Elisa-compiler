@@ -1,6 +1,6 @@
 //go:build cgo
 // The preparing phase of the scratch-prefix sequence: covered and counted array
-// initializers, covered prefix zeros and stack prefix zeros. The rest of the sequence,
+// initializers and covered prefix zeros. The rest of the sequence,
 // including the scratch fills this phase prepares for, lives in Elisa
 // (llvm_passes/scratch_prefix/).
 #include <llvm/ADT/SmallPtrSet.h>
@@ -41,7 +41,6 @@ using namespace llvm;
 #include "llvm_array_coverage.h"
 #include "llvm_counted_prefix.h"
 #include "llvm_covered_prefix.cpp"
-#include "llvm_stack_prefix.cpp"
 
 // The scratch-prefix sequence runs before O3 from Elisa
 // (llvm_passes/scratch_prefix/scratch_prefix_sequence.elisa): this phase first, then the
@@ -64,17 +63,13 @@ struct PhaseAnalyses {
 };
 } // namespace ElisaScratchPrefix
 
-// Covered and counted array initializers, covered prefix zeros, and (on AArch64 macOS and
-// Linux) stack prefix zeros.
+// Covered and counted array initializers and covered prefix zeros.
 extern "C" unsigned elisacorePrepareScratchPrefixArrays(LLVMModuleRef Ref) {
   Module &M = *unwrap(Ref);
   ElisaScratchPrefix::PhaseAnalyses Phase;
   unsigned Removed = prepareCoveredArrayInitializers(M, Phase.FAM, Phase.PB);
   Removed += removeCountedPrefixInitializers(M, Phase.FAM, Phase.PB);
   Removed += prepareCoveredPrefixZeros(M, Phase.FAM, Phase.PB);
-  if ((M.getTargetTriple().isMacOSX() || M.getTargetTriple().isOSLinux()) &&
-      M.getTargetTriple().getArch() == Triple::aarch64)
-    Removed += removeStackPrefixZeros(M);
   return Removed;
 }
 
