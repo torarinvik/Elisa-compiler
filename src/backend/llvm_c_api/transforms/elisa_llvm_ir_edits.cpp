@@ -1,5 +1,6 @@
 // Implementation of elisa_llvm_ir_edits.h over LLVM's C++ utilities.
 #include "elisa_llvm_ir_edits.h"
+#include "../analysis/elisa_llvm_function_analyses.h"
 
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/InlineCost.h>
@@ -18,6 +19,8 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/ValueMapper.h>
+#include <llvm/Transforms/Utils/SimplifyLibCalls.h>
+#include <llvm/IR/ValueHandle.h>
 
 using namespace llvm;
 
@@ -204,6 +207,21 @@ void ElisaLLVMSwapSuccessors(LLVMValueRef branch) {
 
 void ElisaLLVMSetCallAttributesFromFunction(LLVMValueRef call, LLVMValueRef function) {
   cast<CallBase>(unwrap(call))->setAttributes(cast<Function>(unwrap(function))->getAttributes());
+}
+
+int ElisaLLVMReplaceSimplifiedLibraryCall(ElisaFunctionAnalysesRef analyses, LLVMValueRef call) {
+  elisa_llvm::FunctionAnalyses *bundle = elisa_llvm::unwrapAnalyses(analyses);
+  auto *Call = cast<CallInst>(unwrap(call));
+  LibCallSimplifier Simplifier(bundle->function.getDataLayout(), &bundle->targetLibraryInfo(),
+                               bundle->dominators.get(), nullptr, &bundle->assumptionCache(),
+                               bundle->remarkEmitter(), nullptr, nullptr);
+  WeakTrackingVH Handle(Call);
+  IRBuilder<> Builder(Call);
+  Value *Replacement = Simplifier.optimizeCall(Call, Builder);
+  if (!Replacement || !Handle || Replacement == Call) return 0;
+  Call->replaceAllUsesWith(Replacement);
+  Call->eraseFromParent();
+  return 1;
 }
 
 } // extern "C"

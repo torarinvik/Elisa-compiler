@@ -1,0 +1,276 @@
+# The scratch-prefix proof (`verifyScratchPrefix`): a private byte array's zero fill is
+# dead when every store appends to a contiguous initialized prefix and every later load
+# is within that prefix and within the allocation. The proof walks the abstract states
+# of prefix_states.elisa forward from the entry. A store is accepted only at an exact
+# prefix alias that a true branch proved below the capacity, and must be followed at
+# once by `alias + 1`, the new prefix alias; a load needs an index proved below the
+# prefix and below the capacity. Branch edges refine the facts and phis carry them;
+# a back edge drops the facts of values its loop defines. Any gap, overwrite, unmodeled
+# alias, call, terminator or exceeded cap rejects.
+include "./prefix_states.elisa"
+
+const module ScratchPrefixLimit:
+    STATES: u32 = 4096
+    WORK_UNITS: u64 = 2000000
+    STATE_FACTS: usize = 1024
+    TOTAL_FACTS: u64 = 200000
+    ACCESSES: usize = 4096
+    CAPACITY: u64 = 8192
+
+extend Backend:
+    private:
+        # V as a signed 64-bit constant, when it is an i64 constant (`const64`).
+        def signed_i64_constant(value: LLVMValueRef) -> i64?:
+            return null if LLVMIsAConstantInt(value) == null or not is_llvm_integer_type(LLVMTypeOf(value), 64)
+            LLVMConstIntGetSExtValue(value)
+
+        # A load or store that is neither volatile nor atomic (`isSimple`).
+        def simple_access(access: LLVMValueRef) -> bool:
+            LLVMGetVolatile(access) == 0 and LLVMGetOrdering(access) == 0
+
+        # MEMSET is the one plain zero fill of all SIZE bytes of BUFFER (`isCanonicalMemset`).
+        def canonical_buffer_memset(memset: LLVMValueRef, buffer: LLVMValueRef, size: u64) -> bool can[Abort.Panic]:
+            return false if ElisaLLVMIsMemSet(memset) == 0 or LLVMConstIntGetZExtValue(LLVMGetOperand(memset, 3)) != 0
+            return false if LLVMGetNumOperandBundles(memset) != 0 or LLVMGetOperand(memset, 0) != buffer
+            fill: LLVMValueRef = LLVMGetOperand(memset, 1)
+            return false if LLVMIsAConstantInt(fill) == null or not is_zero_constant(fill)
+            return false if ElisaLLVMHasMetadataOtherThanDebugLoc(memset) != 0
+            length: i64 = get signed_i64_constant(LLVMGetOperand(memset, 2)) else return false
+            length >= 0 and length.u64() == size
+
+        # POINTER is `gep [N x i8], buffer, 0, index` for the buffer's own N = SIZE
+        # (`indexedBytePointer`).
+        def byte_pointer_index(pointer: LLVMValueRef, buffer: LLVMValueRef, size: u64) -> LLVMValueRef? can[Abort.Panic]:
+            return null if LLVMIsAGetElementPtrInst(pointer) == null or LLVMGetOperand(pointer, 0) != buffer or LLVMGetNumOperands(pointer) != 3
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return null if LLVMGetGEPSourceElementType(pointer) != array or LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY
+            return null if not is_llvm_integer_type(LLVMGetElementType(array), 8)
+            zero: LLVMValueRef = LLVMGetOperand(pointer, 1)
+            index: LLVMValueRef = LLVMGetOperand(pointer, 2)
+            return null if LLVMIsAConstantInt(zero) == null or not is_zero_constant(zero) or not is_llvm_integer_type(LLVMTypeOf(index), 64)
+            return null if LLVMGetArrayLength2(array) != size
+            index
+
+        # INSTRUCTION is `index + 1`, without wrap flags (`appendIncrement`).
+        def append_increment(instruction: LLVMValueRef, index: LLVMValueRef) -> bool:
+            return false if LLVMGetInstructionOpcode(instruction) != LLVMOpcode::ADD or LLVMGetNSW(instruction) != 0 or LLVMGetNUW(instruction) != 0
+            other: mutable LLVMValueRef? = null
+            if LLVMGetOperand(instruction, 0) == index:
+                other <- LLVMGetOperand(instruction, 1)
+            elif LLVMGetOperand(instruction, 1) == index:
+                other <- LLVMGetOperand(instruction, 0)
+            step: LLVMValueRef = get other else return false
+            constant: i64 = get signed_i64_constant(step) else return false
+            constant == 1
+
+        # The facts the edge to successor SUCCESSOR (0 the true edge) of BRANCH adds
+        # (`refineBranchFacts`).
+        def refine_branch_facts(state: mutable PrefixState&, branch: LLVMValueRef, successor: u32, capacity: u64) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return if LLVMIsAInstruction(compare) == null or LLVMGetInstructionOpcode(compare) != LLVMOpcode::ICMP
+            true_edge: bool = successor == 0
+            predicate: i32 = LLVMGetICmpPredicate(compare)
+            left: LLVMValueRef = LLVMGetOperand(compare, 0)
+            right: LLVMValueRef = LLVMGetOperand(compare, 1)
+            below: bool = (predicate == LLVMIntPredicate::ULT and true_edge) or (predicate == LLVMIntPredicate::UGE and not true_edge)
+            if below:
+                if signed_i64_constant(right) is bound:
+                    if bound.u64() == capacity:
+                        insert_fact(&state.read_in_bounds, left)
+                        insert_fact(&state.below_capacity, left) if contains_fact(&state.prefix_aliases, left)
+                insert_fact(&state.read_below_prefix, left) if contains_fact(&state.prefix_aliases, right)
+            reversed: bool = (predicate == LLVMIntPredicate::UGT and true_edge) or (predicate == LLVMIntPredicate::ULE and not true_edge)
+            if reversed and contains_fact(&state.prefix_aliases, left):
+                insert_fact(&state.read_below_prefix, right)
+
+        # INSTRUCTION's effect on STATE; false when it breaks the proof.
+        def prefix_instruction(state: mutable PrefixState&, instruction: LLVMValueRef, buffer: LLVMValueRef, init: LLVMValueRef, capacity: u64, trap: u32, zero: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if instruction == init:
+                return false if state.initialized
+                state.initialized <- true
+                state.prefix_aliases.truncate(0)
+                state.prefix_aliases.push(zero)
+                state.below_capacity.truncate(0)
+                state.below_capacity.push(zero)
+                state.read_below_prefix.truncate(0)
+                state.read_in_bounds.truncate(0)
+                return true
+            if state.append_pending:
+                pending: LLVMValueRef = get state.pending_index else return false
+                return false if not append_increment(instruction, pending)
+                # The aliases describe the current cursor only: keeping the old one would
+                # let a later store overwrite an earlier byte and advance across a gap.
+                state.prefix_aliases.truncate(0)
+                state.prefix_aliases.push(instruction)
+                state.append_pending <- false
+                state.pending_index <- null
+                return true
+            opcode: u32 = LLVMGetInstructionOpcode(instruction)
+            if opcode == LLVMOpcode::LOAD and ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 0)) == buffer:
+                return false if not state.initialized
+                index: LLVMValueRef = get byte_pointer_index(LLVMGetOperand(instruction, 0), buffer, capacity) else return false
+                return false if not contains_fact(&state.read_below_prefix, index) or not contains_fact(&state.read_in_bounds, index)
+            if opcode == LLVMOpcode::STORE and ElisaLLVMUnderlyingObject(LLVMGetOperand(instruction, 1)) == buffer:
+                return false if not state.initialized
+                index: LLVMValueRef = get byte_pointer_index(LLVMGetOperand(instruction, 1), buffer, capacity) else return false
+                return false if not contains_fact(&state.prefix_aliases, index) or not contains_fact(&state.below_capacity, index)
+                state.append_pending <- true
+                state.pending_index <- index
+            if is_call_base(instruction):
+                return true if called_intrinsic_id(instruction) == trap
+                # The buffer does not escape (the use audit), so a call that only reads
+                # memory cannot change its bytes.
+                return ElisaLLVMCallOnlyReadsMemory(instruction) != 0 and LLVMGetNumOperandBundles(instruction) == 0
+            return false if ElisaLLVMMayReadOrWriteMemory(instruction) != 0 and opcode != LLVMOpcode::LOAD and opcode != LLVMOpcode::STORE
+            true
+
+        # Every use of BUFFER but INIT is a GEP whose users are simple byte loads and
+        # stores INIT dominates; the GEPs, or null when one is not.
+        def audited_buffer_uses(analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, init: LLVMValueRef, element: LLVMTypeRef) -> darray[LLVMValueRef]? can[Abort.Panic, Memory.Allocate]:
+            geps: mutable darray[LLVMValueRef] = []
+            for user in use_list_users(buffer) |geps, analyses, buffer, init, element|:
+                continue if user == init
+                return null if LLVMIsAGetElementPtrInst(user) == null or LLVMGetOperand(user, 0) != buffer or ElisaLLVMIsUsedByMetadata(user) != 0
+                geps.push(user)
+                return null if geps.count > ScratchPrefixLimit::ACCESSES
+                for access in use_list_users(user) |analyses, init, element, user|:
+                    opcode: u32 = LLVMGetInstructionOpcode(access)
+                    if opcode == LLVMOpcode::LOAD:
+                        return null if LLVMGetOperand(access, 0) != user or not simple_access(access) or LLVMTypeOf(access) != element
+                    elif opcode == LLVMOpcode::STORE:
+                        return null if LLVMGetOperand(access, 1) != user or not simple_access(access) or LLVMTypeOf(LLVMGetOperand(access, 0)) != element
+                    else:
+                        return null
+                    return null if ElisaLLVMInstructionDominates(analyses, init, access) == 0
+            return null if geps.count == 0
+            for gep in geps |buffer|:
+                return null if LLVMGetNumOperands(gep) != 3 or LLVMGetGEPSourceElementType(gep) != LLVMGetAllocatedType(buffer)
+            geps
+
+        # The successors of BLOCK's terminator, or null for one outside the model.
+        def modeled_successors(terminator: LLVMValueRef) -> darray[LLVMBasicBlockRef]? can[Memory.Allocate]:
+            opcode: u32 = LLVMGetInstructionOpcode(terminator)
+            if opcode == LLVMOpcode::UNCONDITIONAL_BR:
+                single: darray[LLVMBasicBlockRef] = [LLVMGetSuccessor(terminator, 0)]
+                return single
+            if opcode == LLVMOpcode::CONDITIONAL_BR:
+                both: darray[LLVMBasicBlockRef] = [LLVMGetSuccessor(terminator, 0), LLVMGetSuccessor(terminator, 1)]
+                return both
+            return null if opcode != LLVMOpcode::RET and opcode != LLVMOpcode::UNREACHABLE
+            none: darray[LLVMBasicBlockRef] = []
+            none
+
+        # The index of BLOCK in BLOCKS.
+        def block_position(blocks: darray[LLVMBasicBlockRef]&, block: LLVMBasicBlockRef) -> u32 can[Abort.Panic]:
+            for index in 0..<blocks.count |blocks, block|:
+                return index.u32() if blocks[index] == block
+            blocks.count.u32()
+
+        # SET without the facts of values a loop headed by HEADER defines.
+        def drop_loop_facts(analyses: ElisaFunctionAnalysesRef, set: mutable darray[LLVMValueRef]&, header: LLVMBasicBlockRef) can[Abort.Panic]:
+            kept: mutable usize = 0
+            for index in 0..<set.count |kept, analyses, set, header|:
+                value: LLVMValueRef = set[index]
+                local: bool = LLVMIsAInstruction(value) != null and ElisaLLVMBlockDominates(analyses, header, LLVMGetInstructionParent(value)) != 0
+                if not local:
+                    set[kept] <- value
+                    kept <- kept + 1
+            set.truncate(kept)
+
+        # STATE leaving BLOCK along its edge to SUCCESSOR: branch facts, then the facts
+        # its phis take from their incoming values; null when a phi has no such edge.
+        def edge_state(analyses: ElisaFunctionAnalysesRef, state: PrefixState&, block: LLVMBasicBlockRef, successor: LLVMBasicBlockRef, position: u32, blocks: darray[LLVMBasicBlockRef]&, capacity: u64) -> PrefixState? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            next: mutable PrefixState = copied_prefix_state(state)
+            next.block <- block_position(blocks, successor)
+            refine_branch_facts(&next, terminator_of(block), position, capacity)
+            phis: mutable darray[LLVMValueRef] = []
+            flags: mutable darray[u32] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(successor)
+            while cursor is phi |cursor, next, phis, flags, block|:
+                break if LLVMGetInstructionOpcode(phi) != LLVMOpcode::PHI
+                cursor <- LLVMGetNextInstruction(phi)
+                incoming: mutable LLVMValueRef? = null
+                for edge in 0..<LLVMCountIncoming(phi) |incoming, phi, block|:
+                    if incoming == null and LLVMGetIncomingBlock(phi, edge) == block:
+                        incoming <- LLVMGetIncomingValue(phi, edge)
+                value: LLVMValueRef = get incoming else return null
+                bits: u32 = (1 if contains_fact(&next.prefix_aliases, value) else 0) + (2 if contains_fact(&next.below_capacity, value) else 0) + (4 if contains_fact(&next.read_below_prefix, value) else 0) + (8 if contains_fact(&next.read_in_bounds, value) else 0)
+                phis.push(phi)
+                flags.push(bits)
+                erase_fact(&next.prefix_aliases, phi)
+                erase_fact(&next.below_capacity, phi)
+                erase_fact(&next.read_below_prefix, phi)
+                erase_fact(&next.read_in_bounds, phi)
+            # On a back edge the previous iteration's results are stale values under the
+            # same names: only facts carried through the target's phis survive.
+            if ElisaLLVMBlockDominates(analyses, successor, block) != 0:
+                drop_loop_facts(analyses, &next.prefix_aliases, successor)
+                drop_loop_facts(analyses, &next.below_capacity, successor)
+                drop_loop_facts(analyses, &next.read_below_prefix, successor)
+                drop_loop_facts(analyses, &next.read_in_bounds, successor)
+            for index in 0..<phis.count |next, phis, flags|:
+                phi: LLVMValueRef = phis[index]
+                bits: u32 = flags[index]
+                insert_fact(&next.prefix_aliases, phi) if (bits & 1) != 0
+                insert_fact(&next.below_capacity, phi) if (bits & 2) != 0
+                insert_fact(&next.read_below_prefix, phi) if (bits & 4) != 0
+                insert_fact(&next.read_in_bounds, phi) if (bits & 8) != 0
+            next
+
+        # The proof over FUNCTION, with ANALYSES built for it; WORK_UNITS counts the
+        # instruction visits of every proof in the function.
+        def prefix_states_hold(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, buffer: LLVMValueRef, init: LLVMValueRef, capacity: u64, work_units: mutable u64&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMBasicBlockRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is each |block_cursor, blocks|:
+                blocks.push(each)
+                block_cursor <- LLVMGetNextBasicBlock(each)
+            name_storage: mutable darray[u8] = []
+            trap: u32 = LLVMLookupIntrinsicID(sview_to_cstr("llvm.trap", name_storage), 9)
+            zero: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(LLVMGetTypeContext(LLVMTypeOf(function))), 0, 0)
+            table: mutable PrefixStateTable = new_prefix_state_table()
+            _ = add_prefix_state(&table, initial_prefix_state(block_position(&blocks, LLVMGetEntryBasicBlock(function))))
+            total_facts: mutable u64 = 0
+            head: mutable usize = 0
+            while head < table.states.count |head, table, total_facts, work_units, blocks, analyses, buffer, init, capacity, trap, zero|:
+                return false if head.u32() + 1 > ScratchPrefixLimit::STATES
+                state: mutable PrefixState = copied_prefix_state(&table.states[head])
+                head <- head + 1
+                block: LLVMBasicBlockRef = blocks[state.block.u64()]
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, state, work_units, buffer, init, capacity, trap, zero|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    work_units <- work_units + 1
+                    return false if work_units > ScratchPrefixLimit::WORK_UNITS
+                    return false if not prefix_instruction(&state, instruction, buffer, init, capacity, trap, zero)
+                return false if state.append_pending
+                successors: darray[LLVMBasicBlockRef] = get modeled_successors(terminator_of(block)) else return false
+                for position in 0..<successors.count |table, total_facts, state, successors, block, blocks, analyses, capacity|:
+                    next: PrefixState = get edge_state(analyses, &state, block, successors[position], position.u32(), &blocks, capacity) else return false
+                    return false if fact_count(&next) > ScratchPrefixLimit::STATE_FACTS
+                    if seen_prefix_state(&table, &next) == null:
+                        return false if table.states.count >= ScratchPrefixLimit::STATES.u64()
+                        total_facts <- total_facts + fact_count(&next).u64()
+                        return false if total_facts > ScratchPrefixLimit::TOTAL_FACTS
+                        _ = add_prefix_state(&table, next)
+            true
+
+    public:
+        # Every store into BUFFER appends to the prefix its fill INIT starts and every load
+        # reads inside it (`verifyScratchPrefix`).
+        def verify_scratch_prefix(function: LLVMValueRef, buffer: LLVMValueRef, init: LLVMValueRef, work_units: mutable u64&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return false if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY
+            capacity: u64 = LLVMGetArrayLength2(array)
+            element: LLVMTypeRef = LLVMGetElementType(array)
+            return false if capacity == 0 or capacity > ScratchPrefixLimit::CAPACITY or not is_llvm_integer_type(element, 8) or ElisaLLVMIsStaticAlloca(buffer) == 0
+            return false if LLVMGetPointerAddressSpace(LLVMTypeOf(buffer)) != 0 or ElisaLLVMIsUsedByMetadata(buffer) != 0
+            return false if not canonical_buffer_memset(init, buffer, capacity) or function_is_sanitized(function)
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return false
+            holds: mutable bool = false
+            if ElisaLLVMFunctionHasIrreducibleControlFlow(analyses) == 0 and audited_buffer_uses(analyses, buffer, init, element) != null:
+                holds <- prefix_states_hold(function, analyses, buffer, init, capacity, work_units)
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            holds
+

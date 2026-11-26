@@ -1,0 +1,105 @@
+# The last phase of the scratch-prefix sequence (`elisacoreElideScratchPrefixArrays`):
+# the zero fills of private byte arrays (256 to 8192 bytes) whose every read the
+# scratch-prefix proof shows was written first. A `memset` library call that fills such
+# an array is first made the intrinsic the proof expects.
+include "./prefix_verification.elisa"
+
+const module ScratchArrayLimit:
+    FUNCTION_INSTRUCTIONS: u32 = 50000
+    FUNCTION_ARRAYS: usize = 16
+    MODULE_ANALYSES: u32 = 256
+    SMALLEST: u64 = 256
+
+extend Backend:
+    private:
+        # BUFFER is a static single array of 256 to 8192 bytes (`candidateByteArray`).
+        def candidate_byte_array(buffer: LLVMValueRef) -> bool:
+            return false if LLVMIsAAllocaInst(buffer) == null or ElisaLLVMIsStaticAlloca(buffer) == 0
+            count: LLVMValueRef = LLVMGetOperand(buffer, 0)
+            return false if LLVMIsAConstantInt(count) == null or LLVMConstIntGetZExtValue(count) != 1
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return false if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or not is_llvm_integer_type(LLVMGetElementType(array), 8)
+            length: u64 = LLVMGetArrayLength2(array)
+            length >= ScratchArrayLimit::SMALLEST and length <= ScratchPrefixLimit::CAPACITY
+
+        # CALL, a plain call of the library `memset` zeroing all of BUFFER, replaced by what
+        # the library-call simplifier makes of it (`canonicalizeTrustedMemset`).
+        def canonicalize_library_memset(analyses: ElisaFunctionAnalysesRef, call: LLVMValueRef, buffer: LLVMValueRef) -> void can[Abort.Panic, Memory.Allocate]:
+            return if LLVMGetNumArgOperands(call) != 3 or ElisaLLVMCallIsNoBuiltin(call) != 0 or LLVMGetInstructionCallConv(call) != 0
+            return if LLVMGetNumOperandBundles(call) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(call) != 0
+            callee: LLVMValueRef = get direct_callee(call) else return
+            return if LLVMIsDeclaration(callee) == 0 or function_has_attribute(callee, "nobuiltin")
+            return if ElisaLLVMCallIsAvailableLibFunction(analyses, call, "memset") == 0
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or LLVMGetOperand(call, 0) != buffer
+            fill: LLVMValueRef = LLVMGetOperand(call, 1)
+            length: LLVMValueRef = LLVMGetOperand(call, 2)
+            return if LLVMIsAConstantInt(fill) == null or not is_zero_constant(fill) or LLVMIsAConstantInt(length) == null
+            return if LLVMGetIntTypeWidth(LLVMTypeOf(length)) > 64 or LLVMConstIntGetZExtValue(length) != LLVMGetArrayLength2(array)
+            _ = ElisaLLVMReplaceSimplifiedLibraryCall(analyses, call)
+
+        # The one canonical zero fill of BUFFER, if there is exactly one.
+        def single_buffer_fill(buffer: LLVMValueRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate]:
+            size: u64 = LLVMGetArrayLength2(LLVMGetAllocatedType(buffer))
+            fill: mutable LLVMValueRef? = null
+            fills: mutable u32 = 0
+            for user in use_list_users(buffer) |fill, fills, buffer, size|:
+                if is_call_base(user) and canonical_buffer_memset(user, buffer, size):
+                    fill <- user
+                    fills <- fills + 1
+            return null if fills != 1
+            fill
+
+        # The candidate arrays of FUNCTION, in instruction order; none past 50000
+        # instructions.
+        def scratch_byte_arrays(function: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            arrays: mutable darray[LLVMValueRef] = []
+            visited: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, arrays, visited|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, arrays, visited|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    visited <- visited + 1
+                    if visited > ScratchArrayLimit::FUNCTION_INSTRUCTIONS:
+                        empty: darray[LLVMValueRef] = []
+                        return empty
+                    arrays.push(instruction) if candidate_byte_array(instruction)
+            arrays
+
+        # FUNCTION's scratch fills removed; ANALYSED counts the arrays analysed in the
+        # module, and the module stops at 256.
+        def elide_function_scratch_fills(function: LLVMValueRef, analysed: mutable u32&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arrays: darray[LLVMValueRef] = scratch_byte_arrays(function)
+            return 0 if arrays.count == 0 or arrays.count > ScratchArrayLimit::FUNCTION_ARRAYS
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            removed: mutable u32 = 0
+            work_units: mutable u64 = 0
+            for buffer in arrays |removed, work_units, analysed, analyses, function|:
+                break if analysed >= ScratchArrayLimit::MODULE_ANALYSES
+                analysed <- analysed + 1
+                calls: mutable darray[LLVMValueRef] = []
+                for user in use_list_users(buffer) |calls|:
+                    calls.push(user) if LLVMIsACallInst(user) != null
+                for call in calls |analyses, buffer|:
+                    canonicalize_library_memset(analyses, call, buffer)
+                if single_buffer_fill(buffer) is init:
+                    if verify_scratch_prefix(function, buffer, init, &work_units):
+                        LLVMInstructionEraseFromParent(init)
+                        removed <- removed + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            removed
+
+    public:
+        # Every proved scratch fill of MODULE removed; how many were.
+        def elide_scratch_prefix_arrays(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            removed: mutable u32 = 0
+            analysed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, removed, analysed|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_has_attribute(function, "optnone") or function_is_sanitized(function)
+                removed <- removed + elide_function_scratch_fills(function, &analysed)
+                break if analysed >= ScratchArrayLimit::MODULE_ANALYSES
+            removed

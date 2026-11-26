@@ -9,6 +9,8 @@
 #include <llvm-c/TargetMachine.h>
 #include <stdint.h>
 
+#include "../analysis/elisa_llvm_analysis.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -116,6 +118,11 @@ int ElisaLLVMMetadataIsDistinct(LLVMMetadataRef node);
  * value is replaced by it. */
 void ElisaLLVMBlockRemovePredecessor(LLVMBasicBlockRef block, LLVMBasicBlockRef predecessor,
                                      int keep_one_input_phis);
+
+// LibCallSimplifier::optimizeCall on CALL with the function's library info, dominator
+// tree and assumption cache: when it yields a different value, CALL's uses take it and
+// CALL is erased. Whether CALL was replaced.
+int ElisaLLVMReplaceSimplifiedLibraryCall(ElisaFunctionAnalysesRef analyses, LLVMValueRef call);
 
 /* BasicBlock::dropAllReferences: every instruction of the block drops its
  * operands, so blocks that refer to each other can then be erased in any order. */

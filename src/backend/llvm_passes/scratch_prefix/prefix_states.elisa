@@ -1,0 +1,144 @@
+# The abstract states of the scratch-prefix proof (`PrefixState` in the C++ pass it
+# replaces). At a block, a state holds the SSA values proven equal to the count of bytes
+# written from offset 0 (`prefix_aliases`), those proven below the buffer's capacity,
+# the indices proven below the prefix and those proven below the capacity. Each set is a
+# darray sorted by address, so equal sets are equal arrays. States are interned: each
+# distinct state is stored once and visited once, in the order first seen.
+
+# One abstract state at the start of block BLOCK (an index in the function's block list).
+struct PrefixState:
+    block: mutable u32
+    initialized: mutable bool
+    append_pending: mutable bool
+    pending_index: mutable LLVMValueRef?
+    prefix_aliases: mutable darray[LLVMValueRef]
+    below_capacity: mutable darray[LLVMValueRef]
+    read_below_prefix: mutable darray[LLVMValueRef]
+    read_in_bounds: mutable darray[LLVMValueRef]
+
+# Every state seen, a lookup from a state's hash to the first state with it, and for
+# each state the next one with the same hash (its index plus one, or zero).
+struct PrefixStateTable:
+    states: mutable darray[PrefixState]
+    lookup: mutable KeyTable
+    next_same: mutable darray[u32]
+
+extend Backend:
+    private:
+        def value_order(value: LLVMValueRef) -> u64 can[Unsafe.PointerCast]:
+            object_key(value.cast[void&])
+
+        # The position VALUE has, or would take, in SET.
+        def sorted_position(set: darray[LLVMValueRef]&, value: LLVMValueRef) -> usize can[Abort.Panic, Unsafe.PointerCast]:
+            key: u64 = value_order(value)
+            low: mutable usize = 0
+            high: mutable usize = set.count
+            while low < high |low, high, set, key|:
+                middle: usize = (low + high) / 2
+                if value_order(set[middle]) < key:
+                    low <- middle + 1
+                else:
+                    high <- middle
+            low
+
+        def copied_values(values: darray[LLVMValueRef]&) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            copy: mutable darray[LLVMValueRef] = []
+            for value in values |copy|:
+                copy.push(value)
+            copy
+
+        def same_values(first: darray[LLVMValueRef]&, second: darray[LLVMValueRef]&) -> bool can[Abort.Panic]:
+            return false if first.count != second.count
+            for index in 0..<first.count |first, second|:
+                return false if first[index] != second[index]
+            true
+
+        def values_hash(values: darray[LLVMValueRef]&, seed: u64) -> u64 can[Unsafe.PointerCast]:
+            hash: mutable u64 = seed ^ values.count.u64()
+            for value in values |hash|:
+                hash <- (hash ^ (value_order(value) >> 4)) * 1099511628211
+            hash
+
+        def same_pending(first: LLVMValueRef?, second: LLVMValueRef?) -> bool:
+            if first is one:
+                if second is other:
+                    return one == other
+                return false
+            if second is other:
+                return false
+            true
+
+        def same_state(first: PrefixState&, second: PrefixState&) -> bool can[Abort.Panic]:
+            return false if first.block != second.block or first.initialized != second.initialized or first.append_pending != second.append_pending
+            return false if not same_pending(first.pending_index, second.pending_index)
+            same_values(&first.prefix_aliases, &second.prefix_aliases) and same_values(&first.below_capacity, &second.below_capacity) and same_values(&first.read_below_prefix, &second.read_below_prefix) and same_values(&first.read_in_bounds, &second.read_in_bounds)
+
+        def state_key(state: PrefixState&) -> TableKey can[Unsafe.PointerCast]:
+            flags: u64 = (1 if state.initialized else 0) + (2 if state.append_pending else 0)
+            pending: mutable u64 = 0
+            if state.pending_index is index:
+                pending <- value_order(index)
+            first: u64 = values_hash(&state.prefix_aliases, 14695981039346656037) ^ (pending >> 4)
+            second: u64 = values_hash(&state.read_below_prefix, values_hash(&state.below_capacity, 1469598103))
+            third: u64 = values_hash(&state.read_in_bounds, (state.block.u64() << 2) + flags + 1)
+            TableKey{first: first, second: second, third: third}
+
+    public:
+        def initial_prefix_state(block: u32) -> PrefixState:
+            PrefixState{block: block, initialized: false, append_pending: false, pending_index: null, prefix_aliases: [], below_capacity: [], read_below_prefix: [], read_in_bounds: []}
+
+        def copied_prefix_state(state: PrefixState&) -> PrefixState can[Memory.Allocate]:
+            PrefixState{block: state.block, initialized: state.initialized, append_pending: state.append_pending, pending_index: state.pending_index, prefix_aliases: copied_values(&state.prefix_aliases), below_capacity: copied_values(&state.below_capacity), read_below_prefix: copied_values(&state.read_below_prefix), read_in_bounds: copied_values(&state.read_in_bounds)}
+
+        def contains_fact(set: darray[LLVMValueRef]&, value: LLVMValueRef) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            position: usize = sorted_position(set, value)
+            position < set.count and set[position] == value
+
+        def insert_fact(set: mutable darray[LLVMValueRef]&, value: LLVMValueRef) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            position: usize = sorted_position(set, value)
+            return if position < set.count and set[position] == value
+            set.push(value)
+            moving: mutable usize = set.count - 1
+            while moving > position |moving, set|:
+                set[moving] <- set[moving - 1]
+                moving <- moving - 1
+            set[position] <- value
+
+        def erase_fact(set: mutable darray[LLVMValueRef]&, value: LLVMValueRef) can[Abort.Panic, Unsafe.PointerCast]:
+            position: usize = sorted_position(set, value)
+            return if position >= set.count or set[position] != value
+            for index in position..<set.count - 1 |set|:
+                set[index] <- set[index + 1]
+            set.truncate(set.count - 1)
+
+        def fact_count(state: PrefixState&) -> usize:
+            state.prefix_aliases.count + state.below_capacity.count + state.read_below_prefix.count + state.read_in_bounds.count
+
+        def new_prefix_state_table() -> PrefixStateTable can[Memory.Allocate]:
+            PrefixStateTable{states: [], lookup: new_key_table(), next_same: []}
+
+        # The index of a seen state equal to STATE.
+        def seen_prefix_state(table: PrefixStateTable&, state: PrefixState&) -> u32? can[Abort.Panic, Unsafe.PointerCast]:
+            found: u32 = get key_table_find(&table.lookup, state_key(state)) else return null
+            current: mutable u32 = found
+            while true |current, table, state|:
+                return current if same_state(&table.states[current.u64()], state)
+                next: u32 = table.next_same[current.u64()]
+                return null if next == 0
+                current <- next - 1
+            null
+
+        # STATE stored as a new state, chained after the states with its hash.
+        def add_prefix_state(table: mutable PrefixStateTable&, state: PrefixState) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            key: TableKey = state_key(&state)
+            index: u32 = table.states.count.u32()
+            table.next_same.push(0)
+            if key_table_find(&table.lookup, key) is first:
+                last: mutable u32 = first
+                while table.next_same[last.u64()] != 0 |last, table|:
+                    last <- table.next_same[last.u64()] - 1
+                table.next_same[last.u64()] <- index + 1
+            else:
+                table.lookup <- key_table_insert(table.lookup, key, index)
+            table.states.push(state)
+            index
