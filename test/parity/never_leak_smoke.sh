@@ -4,16 +4,16 @@
 #
 #   - OFF by default: illegal.elisa draws no finding without the flag (every gate unaffected).
 #   - legal.elisa draws none in either mode. fixed.elisa (illegal.elisa with each STRICT rewrite
-#     applied verbatim) draws none under gentle and, under strict, only the candidates no rewrite
-#     fits: the accumulator `seen` and the 7 value-threading candidates (a borrow, a field of a
-#     borrow, a global, an arena local, two side-effect-only calls); both compilers build and
-#     run it (exit 0 checks the results).
+#     applied verbatim) draws none under gentle and, under strict, only the candidates an edit can
+#     still fix: the accumulator `seen` and the 2 side-effect-only value-threading calls. A borrow,
+#     a field of a borrow, a global and an arena local keep their in-place call by design and are
+#     never reported. Both compilers build and run it (exit 0 checks the results).
 #   - the stat rows of illegal.elisa are exactly expected-rows.txt (category, local, line; the
 #     rows are the same in both modes).
 #   - the full warning text is exactly expected-strict.txt under -Wnever-leak=strict and
 #     expected-gentle.txt under -Wnever-leak, -W never-leak and -Wnever-leak=gentle (gentle is
 #     the default: it accepts a local whose last use is the next statement and does not report
-#     accumulator or value-threading candidates no rewrite fits: 21 vs 9 findings, push loops
+#     accumulator or value-threading candidates no rewrite fits: 16 vs 9 findings, push loops
 #     included).
 #   - illegal_stage1.elisa holds the findings whose rewrites only stage1 compiles (a block that
 #     `continue`s its loop, a nested comprehension): the full text is expected-stage1.txt in both
@@ -44,10 +44,10 @@ for legal in legal fixed; do
         findings="$(printf '%s\n' "$output" | grep -c '\[-Wnever-leak\]$' || true)"
         allowed=0
         if [[ "$legal" == fixed && "$flag" == -Wnever-leak=strict ]]; then
-            allowed=8
+            allowed=3
             [[ "$output" == *"accumulator \`seen\` stays mutable"*"no loop-value rewrite applies"* ]] || fail "fixed.elisa under strict must report \`seen\` (no rewrite fits): $output"
             candidates="$(printf '%s\n' "$output" | grep -c '^  no value-threading rewrite applies: ' || true)"
-            [[ "$candidates" -eq 7 ]] || fail "fixed.elisa under strict must report the 7 value-threading candidates, has $candidates: $output"
+            [[ "$candidates" -eq 2 ]] || fail "fixed.elisa under strict must report the 2 value-threading candidates, has $candidates: $output"
         fi
         [[ "$findings" -eq "$allowed" ]] || fail "$legal.elisa drew $findings findings under $flag (expected $allowed): $output"
     done
@@ -91,7 +91,7 @@ expect_text expected-gentle.txt -W never-leak
 expect_text expected-gentle.txt -Wnever-leak=gentle
 expect_text expected-strict.txt -W never-leak=strict
 warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-strict.txt")"
-[[ "$warnings" -eq 21 ]] || fail "expected-strict.txt must hold 21 findings, has $warnings"
+[[ "$warnings" -eq 16 ]] || fail "expected-strict.txt must hold 16 findings, has $warnings"
 warnings="$(grep -c '\[-Wnever-leak\]$' "$FIXTURES/expected-gentle.txt")"
 [[ "$warnings" -eq 9 ]] || fail "expected-gentle.txt must hold 9 findings, has $warnings"
 
@@ -122,4 +122,4 @@ check -Wnever-leak=strict -Werror=never-leak "$FIXTURES/illegal.elisa"
 check -permissive -Wnever-leak "$FIXTURES/illegal.elisa"
 [[ "$status" -eq 0 && "$output" != *"never-leak"* ]] || fail "-permissive must turn the lint off: $output"
 
-echo "never-leak smoke OK: off by default, strict 21 and gentle 9 findings (accumulators, value-threading and push loops included) pinned verbatim, the stage1-only rewrites pinned in both modes, legal and rewritten fixtures clean, fixed.elisa runs on both compilers and fixed_stage1.elisa on stage1"
+echo "never-leak smoke OK: off by default, strict 16 and gentle 9 findings (accumulators, value-threading and push loops included) pinned verbatim, the stage1-only rewrites pinned in both modes, legal and rewritten fixtures clean, fixed.elisa runs on both compilers and fixed_stage1.elisa on stage1"

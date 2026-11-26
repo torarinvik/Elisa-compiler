@@ -399,10 +399,12 @@ threaded code builds with stage1 only.
 **The lint.** `-Wnever-leak` (section 8) points at the sites. It never forces the form. Gentle
 mode reports only an owned local `darray`/`dict` changed by a statement-level `push`, `clear`
 or `put`. Those sites have a paste-ready rebinding with the same machine code, and both
-compilers build it. `-Wnever-leak=strict` also lists the in-place calls no rewrite fits, each
-with the reason: a borrow, a field of a borrow, a global, a local of a `region`/`in` block's
-arena, or a side-effect-only call of your own `-> void` function that takes an owned local as
-`mutable T&`. From `test/fixtures/never_leak/expected-strict.txt`:
+compilers build it. `-Wnever-leak=strict` also lists the in-place calls an edit can still fix, each with the
+reason: a side-effect-only call of your own `-> void` function that takes an owned local as
+`mutable T&`, or a statement split over several lines. An in-place call on a borrow, a field of
+a borrow, a global or a local of a `region`/`in` block's arena is already the right spelling, so
+strict counts it under `--stats` but never reports it. A strict-clean directory needs no
+signature changes. From `test/fixtures/never_leak/expected-strict.txt`:
 
 ```text
 illegal.elisa:128: warning: owned local `xs` is changed in place by a statement that drops the call's result [-Wnever-leak]
@@ -417,7 +419,8 @@ illegal.elisa:129: warning: owned local `xs` is changed in place by a statement 
   no value-threading rewrite applies: `fill` takes `xs` as `mutable darray[i64]&` and returns nothing, so the call is there only for its effect and has no value form to call; give `fill` one that takes `out: darray[i64]` by value and returns it (`-> darray[i64]`, STYLE_GUIDE.md section 6), and the call becomes `xs <- fill(xs, seed)`
 ```
 
-Measured with `-Wnever-leak=strict` (rewritable sites, then candidates by reason):
+Measured with `-Wnever-leak=strict --stats` (rewritable sites, then candidates by reason; only the
+last two candidate columns are reported):
 
 | Corpus | Rewritable | Borrow | Field of a borrow | Global | Arena | Side-effect-only | Multi-line |
 |---|---|---|---|---|---|---|---|
