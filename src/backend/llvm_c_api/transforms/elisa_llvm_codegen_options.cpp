@@ -1,5 +1,8 @@
-// Select a scheduler per function while retaining the target default otherwise.
+// Implementation of elisa_llvm_codegen_options.h, and the selective machine scheduler.
+#include "elisa_llvm_codegen_options.h"
+
 #include <llvm/Config/llvm-config.h>
+#include <llvm/Support/CommandLine.h>
 #if LLVM_VERSION_MAJOR == 23 && defined(__linux__) && defined(__aarch64__)
 #include <llvm/CodeGen/MachineFunction.h>
 #include <llvm/CodeGen/MachineScheduler.h>
@@ -25,3 +28,17 @@ llvm::MachineSchedRegistry
                             elisaSelectiveSchedule);
 } // namespace
 #endif
+
+extern "C" int ElisaLLVMOptionOccurrences(const char *name) {
+  auto &registered = llvm::cl::getRegisteredOptions();
+  auto option = registered.find(name);
+  return option == registered.end() ? -1 : static_cast<int>(option->second->getNumOccurrences());
+}
+
+extern "C" int ElisaLLVMSelectiveSchedulerRegistered(void) {
+#if LLVM_VERSION_MAJOR == 23 && defined(__linux__) && defined(__aarch64__)
+  return 1;
+#else
+  return 0;
+#endif
+}

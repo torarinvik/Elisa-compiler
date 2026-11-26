@@ -29,7 +29,7 @@ FALLBACK_OBJ="$BUILD/runtime_fallback.o"
 clang -c -fPIC -fno-builtin -O2 -o "$FALLBACK_OBJ" "$ROOT/scripts/pymodule_runtime_fallback.c"
 PROFILE_OBJ="$BUILD/profile_hooks.o"
 clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"
-LLVM_BRIDGE_OBJ="$BUILD/llvm_validation_peel.o"
+LLVM_BRIDGE_OBJ="$BUILD/llvm_bridge.o"
 bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$LLVM_BRIDGE_OBJ"
 CXX_RUNTIME=-lc++
 [[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++

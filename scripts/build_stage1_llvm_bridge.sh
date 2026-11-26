@@ -12,7 +12,7 @@ cxx="${ELISA_LLVM_CXX:-$llvm_bindir/clang++}"
 read -r -a cxxflags <<<"$("$LLVM_CONFIG" --cxxflags)"
 backend="$ROOT/src/backend"
 sources=(
-  "$backend/llvm_validation_peel.cpp"
+  "$backend/llvm_c_api/transforms/elisa_llvm_codegen_options.cpp"
   "$backend/llvm_memory_and_call_passes.cpp"
   "$backend/llvm_c_api/analysis/elisa_llvm_analysis.cpp"
   "$backend/llvm_c_api/analysis/elisa_llvm_instruction_queries.cpp"

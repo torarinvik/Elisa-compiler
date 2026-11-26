@@ -88,7 +88,7 @@ file "$BIN"
 # seed_build: emit_expression recurses once per AST level, and this is the product binary.
 # The bridge and the compiler object have independent inputs. Start the bridge
 # before compiling so its cache lookup or build can overlap the frontend.
-bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$OUT_DIR/llvm_validation_peel.o" &
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$OUT_DIR/llvm_bridge.o" &
 bridge_pid=$!
 compile_status=0
 bridge_status=0
@@ -98,7 +98,7 @@ wait "$bridge_pid" || bridge_status=$?
 (( bridge_status == 0 )) || exit "$bridge_status"
 CXX_RUNTIME=-lc++
 [[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
-clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" "$OUT_DIR/llvm_validation_peel.o" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$OUT_DIR/elisac-stage1-gen2" "$OUT_DIR/elisac_stage1_gen2.o" "$RUNTIME_OBJ" "$OUT_DIR/llvm_bridge.o" -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR" $ELISA_LD_STACK_512M
 echo "wrote $OUT_DIR/elisac-stage1-gen2"
 # Fixture parity with gen2
 printf 'def main() -> i64:\n    return 42\n' >"$OUT_DIR/fix.elisa"

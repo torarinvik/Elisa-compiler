@@ -34,10 +34,10 @@ fi
 
 LIBDIR="$($LLVM_CONFIG --libdir)"
 LLC="$("$LLVM_CONFIG" --bindir)/llc"
-bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$WORK/llvm_validation_peel.o"
+bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$WORK/llvm_bridge.o"
 CXX_RUNTIME=-lc++
 [[ "$(uname -s)" == Linux ]] && CXX_RUNTIME=-lstdc++
-clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/emit_native" "$WORK/emit_native.o" "$RUNTIME" "$WORK/llvm_validation_peel.o" \
+clang $ELISA_LD_DEAD_STRIP $ELISA_LINK_EXE_FLAGS -o "$WORK/emit_native" "$WORK/emit_native.o" "$RUNTIME" "$WORK/llvm_bridge.o" \
   -L"$LIBDIR" $ELISA_LLVM_LIBS "$CXX_RUNTIME" $ELISA_LINK_EXE_FLAGS -Wl,-rpath,"$LIBDIR"
 
 printf '%b' 'struct Flags:\n    bits: bitset:\n        Read\n        Write\n\ndef main() -> i64:\n    return 42\n' \

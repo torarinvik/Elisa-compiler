@@ -30,7 +30,7 @@ if ! clang -c -O2 -o "$PROFILE_OBJ" "$ROOT/test/parity/profile_hooks.c"; then
     exit 1
 fi
 
-LLVM_BRIDGE_OBJ="$BUILD/llvm_validation_peel.o"
+LLVM_BRIDGE_OBJ="$BUILD/llvm_bridge.o"
 if ! bash "$ROOT/scripts/build_stage1_llvm_bridge.sh" "$LLVM_BRIDGE_OBJ"; then
     echo "build_drivers FAILED: could not compile LLVM bridge" >&2
     exit 1
