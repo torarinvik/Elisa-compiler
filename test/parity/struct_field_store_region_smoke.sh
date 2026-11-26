@@ -10,6 +10,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 ELISAC="${ELISAC:-$REPO_ROOT/bin/elisac-stage1}"
 FIXTURE="$REPO_ROOT/test/repro/struct_field_store_through_ref.elisa"
+GET_ELSE_FIXTURE="$REPO_ROOT/test/repro/struct_field_store_get_else_through_ref.elisa"
 work="$(mktemp -d "${TMPDIR:-/tmp}/struct-field-store-region.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
@@ -24,4 +25,12 @@ done
 "$ELISAC" -emit obj -o "$work/fixture.o" "$FIXTURE" > /dev/null 2>&1 || fail "fixture does not compile"
 cc "$work/fixture.o" "$REPO_ROOT/build/runtime/elisacore_runtime.o" -o "$work/fixture" || fail "fixture does not link"
 "$work/fixture" || fail "fixture exited $?"
+# The same store through `get make() else ...` must thread the caller's region too.
+"$ELISAC" -emit llvm -o "$work/get_else.ll" "$GET_ELSE_FIXTURE" > /dev/null 2>&1 || fail "get-else fixture does not compile to IR"
+body="$(awk '/^define .*@adopt\(/,/^}/' "$work/get_else.ll")"
+grep -q '^define .*@adopt(ptr %0, i64 %1, ptr %2)' <<< "$body" || fail "@adopt does not take the caller's region: $(head -1 <<< "$body")"
+! grep -q 'arena_free' <<< "$body" || fail "@adopt frees a region of its own"
+"$ELISAC" -emit obj -o "$work/get_else.o" "$GET_ELSE_FIXTURE" > /dev/null 2>&1 || fail "get-else fixture does not compile"
+cc "$work/get_else.o" "$REPO_ROOT/build/runtime/elisacore_runtime.o" -o "$work/get_else" || fail "get-else fixture does not link"
+"$work/get_else" || fail "get-else fixture exited $?"
 echo "struct field store region smoke OK: storing functions take the caller's region, fixture exits 0"
