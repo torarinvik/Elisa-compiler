@@ -1,0 +1,231 @@
+# The counted-prefix proof (`ElisaCountedPrefix::coversReads` in the C++ it replaces): a
+# private array's zero fill is not observed when one complete counted loop writes
+# elements [0, n) before every scalar read, and each read stays below n. An i32 read is
+# guarded by `index < n` on its own path or clamped to zero past n when its position is
+# fixed; an i16 read is the counter of a scan loop whose bound branches prove at most n.
+# The array may also escape as a {data, length} view (counted_prefix_view.elisa).
+include "./counted_prefix_view.elisa"
+include "../scratch_prefix/covered_array_initializers.elisa"
+
+const module CountedPrefixLimit:
+    BOUND_FACT_DEPTH: u32 = 12
+    GUARD_DEPTH: u32 = 8
+    READS: usize = 16
+    VIEWS: usize = 2
+    WRITERS: usize = 2
+
+# What branches establish about a scan bound: at least zero, signed or unsigned at most
+# the fill's bound (`collectBoundFacts`).
+struct BoundFacts:
+    nonnegative: mutable bool
+    signed_order: mutable bool
+    unsigned_order: mutable bool
+
+# A read of the array and the element index it reads.
+struct CountedRead:
+    read: LLVMValueRef
+    index: LLVMValueRef
+
+# The accesses of a counted-prefix candidate: its reads, its stores of one index, and
+# the views it escapes as.
+struct CountedAccesses:
+    reads: mutable darray[CountedRead]
+    writers: mutable darray[LLVMValueRef]
+    views: mutable darray[LLVMValueRef]
+    write_index: mutable LLVMValueRef?
+
+extend Backend:
+    private:
+        # FACTS with what CONDITION, taking the value TAKEN, says of BOUND against LIMIT
+        # (`collectBoundFacts`).
+        def collect_bound_facts(facts: mutable BoundFacts&, condition: LLVMValueRef, taken: bool, bound: LLVMValueRef, limit: LLVMValueRef, depth: u32) can[Abort.Panic]:
+            return if depth == CountedPrefixLimit::BOUND_FACT_DEPTH
+            if is_llvm_instruction_with_opcode(condition, LLVMOpcode::SELECT):
+                when_true: LLVMValueRef = LLVMGetOperand(condition, 1)
+                when_false: LLVMValueRef = LLVMGetOperand(condition, 2)
+                if LLVMIsAConstantInt(when_true) != null and (ElisaLLVMIsConstantOne(when_true) != 0) != taken:
+                    collect_bound_facts(facts, LLVMGetOperand(condition, 0), false, bound, limit, depth + 1)
+                    collect_bound_facts(facts, when_false, taken, bound, limit, depth + 1)
+                elif LLVMIsAConstantInt(when_false) != null and (ElisaLLVMIsConstantOne(when_false) != 0) != taken:
+                    collect_bound_facts(facts, LLVMGetOperand(condition, 0), true, bound, limit, depth + 1)
+                    collect_bound_facts(facts, when_true, taken, bound, limit, depth + 1)
+                return
+            if LLVMIsABinaryOperator(condition) != null:
+                opcode: u32 = LLVMGetInstructionOpcode(condition)
+                if (opcode == LLVMOpcode::OR and not taken) or (opcode == LLVMOpcode::AND and taken):
+                    collect_bound_facts(facts, LLVMGetOperand(condition, 0), taken, bound, limit, depth + 1)
+                    collect_bound_facts(facts, LLVMGetOperand(condition, 1), taken, bound, limit, depth + 1)
+                return
+            return if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP)
+            stated: i32 = LLVMGetICmpPredicate(condition)
+            predicate: mutable i32 = stated if taken else inverse_integer_predicate(stated)
+            other: mutable LLVMValueRef = LLVMGetOperand(condition, 1)
+            if other == bound:
+                predicate <- swapped_integer_predicate(predicate)
+                other <- LLVMGetOperand(condition, 0)
+            elif LLVMGetOperand(condition, 0) != bound:
+                return
+            if is_zero_integer(other) and predicate == LLVMIntPredicate::SGE:
+                facts.nonnegative <- true
+            if other == limit and (predicate == LLVMIntPredicate::SLE or predicate == LLVMIntPredicate::SLT):
+                facts.signed_order <- true
+            if other == limit and (predicate == LLVMIntPredicate::ULE or predicate == LLVMIntPredicate::ULT or predicate == LLVMIntPredicate::EQ):
+                facts.unsigned_order <- true
+
+        # VALUE is an instruction that may run again after AFTER (`canRecompute`).
+        def can_recompute(value: LLVMValueRef, after: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            return false if LLVMIsAInstruction(value) == null
+            ElisaLLVMBlockIsPotentiallyReachableWithin(analyses, after, LLVMGetInstructionParent(value), 1) != 0
+
+        # Branches whose edges dominate READ show BOUND at most LIMIT: unsigned, or signed
+        # and nonnegative (`boundIsCovered`).
+        def bound_is_covered(bound: LLVMValueRef, limit: LLVMValueRef, read: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic]:
+            return true if bound == limit
+            facts: mutable BoundFacts = BoundFacts{nonnegative: false, signed_order: false, unsigned_order: false}
+            read_block: LLVMBasicBlockRef = LLVMGetInstructionParent(read)
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(LLVMGetBasicBlockParent(read_block))
+            while block_cursor is block |block_cursor, facts, bound, limit, analyses, read_block|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                if conditional_terminator(block) is branch:
+                    if LLVMGetSuccessor(branch, 0) != LLVMGetSuccessor(branch, 1):
+                        for edge in 0..<2 |facts, bound, limit, analyses, read_block, block, branch|:
+                            target: LLVMBasicBlockRef = LLVMGetSuccessor(branch, edge.u32())
+                            continue if ElisaLLVMEdgeDominates(analyses, block, target, read_block) == 0
+                            continue if can_recompute(bound, target, analyses) or can_recompute(limit, target, analyses)
+                            collect_bound_facts(&facts, LLVMGetCondition(branch), edge == 0, bound, limit, 0)
+                return true if facts.unsigned_order or (facts.nonnegative and facts.signed_order)
+            false
+
+        # The element index of ADDRESS, a GEP over elements of ELEMENT or over an array of
+        # them from element zero (`elementIndex`).
+        def element_index(address: LLVMValueRef, layout: LLVMTargetDataRef, element: LLVMTypeRef) -> LLVMValueRef?:
+            source: LLVMTypeRef = LLVMGetGEPSourceElementType(address)
+            indices: u32 = LLVMGetNumIndices(address)
+            return LLVMGetOperand(address, 1) if indices == 1 and LLVMABISizeOfType(layout, source) == LLVMABISizeOfType(layout, element)
+            return null if indices != 2 or LLVMGetTypeKind(source) != LLVMTypeKindValue::ARRAY or LLVMGetElementType(source) != element
+            return null if not is_zero_integer(LLVMGetOperand(address, 1))
+            LLVMGetOperand(address, 2)
+
+        # READ is immediately guarded by `index < length`: a chain of single predecessors
+        # ends in that branch, so each read takes the guard again (`guardedPrefixIndex`).
+        def guarded_prefix_index(index: LLVMValueRef, length: LLVMValueRef, read: LLVMValueRef) -> bool can[Abort.Panic]:
+            block: mutable LLVMBasicBlockRef = LLVMGetInstructionParent(read)
+            for _depth in 0..<CountedPrefixLimit::GUARD_DEPTH |block, index, length|:
+                predecessor: LLVMBasicBlockRef = get single_predecessor(block) else return false
+                return false if predecessor == block
+                if conditional_terminator(predecessor) is branch:
+                    compare: LLVMValueRef = LLVMGetCondition(branch)
+                    if is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) and LLVMGetSuccessor(branch, 0) != LLVMGetSuccessor(branch, 1) and LLVMGetOperand(compare, 0) == index and LLVMGetOperand(compare, 1) == length:
+                        stated: i32 = LLVMGetICmpPredicate(compare)
+                        predicate: i32 = stated if LLVMGetSuccessor(branch, 0) == block else inverse_integer_predicate(stated)
+                        return true if predicate == LLVMIntPredicate::ULT
+                block <- predecessor
+            false
+
+        # VALUE is stable across its uses, or STABILIZE gains it to be frozen
+        # (`stabilizeIfNeeded`).
+        def stabilize_if_needed(value: LLVMValueRef, stabilize: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            return true if LLVMIsAConstantInt(value) != null or is_llvm_instruction_with_opcode(value, LLVMOpcode::FREEZE)
+            return false if LLVMIsAInstruction(value) == null
+            phi: bool = is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI)
+            return false if not phi and LLVMGetNextInstruction(value) == null
+            return false if ElisaLLVMFirstInsertionPoint(LLVMGetInstructionParent(value)) == null
+            stabilize.push(value) if not contains_value(stabilize, value)
+            true
+
+        # Every path from the fill body to the latch stores the induction index
+        # (`writersCoverIteration`).
+        def writers_cover_iteration(writers: darray[LLVMValueRef]&, fill: CountedInduction&, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(fill.loop) else return false
+            blocks: mutable darray[LLVMBasicBlockRef] = []
+            for writer in writers |blocks, latch, analyses|:
+                block: LLVMBasicBlockRef = LLVMGetInstructionParent(writer)
+                return true if ElisaLLVMBlockDominates(analyses, block, latch) != 0
+                blocks.push(block) if not contains_block(blocks, block)
+            return false if contains_block(blocks, fill.body) or contains_block(blocks, latch)
+            ElisaLLVMBlockIsPotentiallyReachableAvoiding(fill.body, latch, (&blocks[0]).cast[void&], blocks.count.u32()) == 0
+
+        # ACCESSES with ACCESS, a user of ADDRESS (an element GEP of the array with index
+        # INDEX); false when it is not a read, a view or a store of one index.
+        def add_counted_access(accesses: mutable CountedAccesses&, access: LLVMValueRef, address: LLVMValueRef, index: LLVMValueRef, element: LLVMTypeRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            if LLVMIsALoadInst(access) != null and is_simple_access(access) and LLVMGetOperand(access, 0) == address and LLVMTypeOf(access) == element and accesses.reads.count < CountedPrefixLimit::READS:
+                accesses.reads.push(CountedRead{read: access, index: index})
+                return true
+            if is_llvm_instruction_with_opcode(access, LLVMOpcode::INSERT_VALUE) and is_llvm_integer_type(element, 32) and is_zero_start(index) and LLVMGetOperand(access, 1) == address and accesses.views.count < CountedPrefixLimit::VIEWS:
+                accesses.views.push(access)
+                return true
+            return false if LLVMIsAStoreInst(access) == null or not is_simple_access(access) or accesses.writers.count == CountedPrefixLimit::WRITERS
+            if accesses.write_index is written:
+                return false if written != index
+            return false if LLVMGetOperand(access, 1) != address or LLVMTypeOf(LLVMGetOperand(access, 0)) != element
+            accesses.writers.push(access)
+            accesses.write_index <- index
+            true
+
+        # The accesses of BUFFER besides INIT: element GEPs with pointer-sized indices only.
+        def counted_accesses(buffer: LLVMValueRef, init: LLVMValueRef, element: LLVMTypeRef, layout: LLVMTargetDataRef, index_bits: u32) -> CountedAccesses? can[Abort.Panic, Memory.Allocate]:
+            accesses: mutable CountedAccesses = CountedAccesses{reads: [], writers: [], views: [], write_index: null}
+            for user in use_list_users(buffer) |accesses, buffer, init, element, layout, index_bits|:
+                continue if user == init
+                return null if LLVMIsAGetElementPtrInst(user) == null or LLVMGetOperand(user, 0) != buffer or ElisaLLVMIsUsedByMetadata(user) != 0
+                index: LLVMValueRef = get element_index(user, layout, element) else return null
+                return null if not is_llvm_integer_type(LLVMTypeOf(index), index_bits)
+                for access in use_list_users(user) |accesses, user, index, element|:
+                    return null if not add_counted_access(&accesses, access, user, index, element)
+            accesses
+
+        # READ (at INDEX) runs after the fill completes (the edge HEADER -> EXIT) and stays
+        # inside the written prefix; STABILIZE and CLAMPED gain what the proof relies on.
+        def counted_read_covered(entry: CountedRead&, fill: CountedInduction&, exit: LLVMBasicBlockRef, element: LLVMTypeRef, analyses: ElisaFunctionAnalysesRef, stabilize: mutable darray[LLVMValueRef]&, clamped: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate]:
+            read_block: LLVMBasicBlockRef = LLVMGetInstructionParent(entry.read)
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(fill.loop)
+            return false if ElisaLLVMLoopContainsBlock(fill.loop, read_block) != 0 or ElisaLLVMEdgeDominates(analyses, header, exit, read_block) == 0
+            if is_llvm_integer_type(element, 32):
+                if LLVMIsAConstantInt(entry.index) != null:
+                    clamped.push(entry.read)
+                    return stabilize_if_needed(fill.bound, stabilize)
+                return guarded_prefix_index(entry.index, fill.bound, entry.read) and stabilize_if_needed(entry.index, stabilize) and stabilize_if_needed(fill.bound, stabilize)
+            scan: CountedInduction = get counted_induction(entry.index, analyses, false) else return false
+            return false if ElisaLLVMEdgeDominates(analyses, ElisaLLVMLoopHeader(scan.loop), scan.body, read_block) == 0
+            bound_is_covered(scan.bound, fill.bound, entry.read, analyses)
+
+        # READ, at a fixed position past which the zero fill was observed, made to read
+        # zero there: `select (position <u bound), read, 0`.
+        def clamp_fixed_read(read: LLVMValueRef, bound: LLVMValueRef, element: LLVMTypeRef, layout: LLVMTargetDataRef) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            next: LLVMValueRef = get LLVMGetNextInstruction(read) else return
+            position: LLVMValueRef = get element_index(LLVMGetOperand(read, 0), layout, element) else return
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetTypeContext(element))
+            position_builder_before(builder, next)
+            inside_name: mutable darray[u8] = []
+            read_name: mutable darray[u8] = []
+            fixed: LLVMValueRef = LLVMConstInt(LLVMTypeOf(bound), LLVMConstIntGetZExtValue(position), 0)
+            inside: LLVMValueRef = LLVMBuildICmp(builder, LLVMIntPredicate::ULT, fixed, bound, sview_to_cstr("prefix.fixed.inside", inside_name))
+            result: LLVMValueRef = LLVMBuildSelect(builder, inside, read, LLVMConstNull(element), sview_to_cstr("prefix.fixed.read", read_name))
+            LLVMDisposeBuilder(builder)
+            ElisaLLVMReplaceUsesExceptUser(read, result, result)
+
+        # The zero fill INIT of BUFFER is not observed: a complete counted fill covers every
+        # read; STABILIZE gains the values to freeze (`coversReads`).
+        def covers_reads(buffer: LLVMValueRef, init: LLVMValueRef, element: LLVMTypeRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef, stabilize: mutable darray[LLVMValueRef]&, quiet: darray[u32]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            init_block: LLVMBasicBlockRef = LLVMGetInstructionParent(init)
+            return false if ElisaLLVMLoopForBlock(analyses, init_block) != null or ElisaLLVMIsUsedByMetadata(buffer) != 0
+            index_bits: u32 = ElisaLLVMDataLayoutIndexSizeInBits(LLVMGetGlobalParent(LLVMGetBasicBlockParent(init_block)), 0)
+            accesses: CountedAccesses = get counted_accesses(buffer, init, element, layout, index_bits) else return false
+            return false if accesses.reads.count == 0 or accesses.writers.count == 0
+            write_index: LLVMValueRef = get accesses.write_index else return false
+            fill: CountedInduction = get counted_induction(write_index, analyses, true) else return false
+            return false if ElisaLLVMLoopParent(fill.loop) != null or ElisaLLVMLoopSubLoopCount(fill.loop) != 0 or not writers_cover_iteration(&accesses.writers, &fill, analyses)
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(fill.loop)
+            for writer in accesses.writers |init, analyses, header, fill|:
+                return false if ElisaLLVMInstructionDominates(analyses, init, writer) == 0 or ElisaLLVMEdgeDominates(analyses, header, fill.body, LLVMGetInstructionParent(writer)) == 0
+            exit: LLVMBasicBlockRef = get normal_loop_exit(fill.loop, quiet) else return false
+            return false if can_recompute(fill.bound, exit, analyses) or ElisaLLVMBlockIsPotentiallyReachableWithin(analyses, exit, init_block, 1) != 0
+            element_bytes: u64 = LLVMABISizeOfType(layout, element)
+            for data in accesses.views |fill, header, exit, element_bytes, analyses|:
+                return false if not view_escape_covered(data, fill.bound, header, exit, element_bytes, analyses)
+            clamped: mutable darray[LLVMValueRef] = []
+            for entry in accesses.reads |fill, exit, element, analyses, stabilize, clamped|:
+                return false if not counted_read_covered(&entry, &fill, exit, element, analyses, stabilize, &clamped)
+            for read in clamped |fill, element, layout|:
+                clamp_fixed_read(read, fill.bound, element, layout)
+            true

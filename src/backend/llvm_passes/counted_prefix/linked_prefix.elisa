@@ -1,0 +1,275 @@
+# Zero fills of index-linked scratch arrays (`ElisaLinkedPrefix` in the C++ it replaces).
+# Each array is completely written over [0, n) by a counted loop before any read. A value
+# is a link when, as an unsigned index, it is below n or at least the array length, so a
+# bounds-checked access through it either reads the written prefix or traps. Links are
+# constants, n - c, values guarded below n, phis and casts of links, and loads from
+# arrays whose every stored value is a link. Arrays whose reads all use links lose their
+# initializer.
+include "./counted_prefix_reads.elisa"
+
+const module LinkedPrefixLimit:
+    SMALLEST: u64 = 16
+    LARGEST: u64 = 4096
+    ARRAYS: usize = 8
+    WRITERS: usize = 4
+    BUDGET: u32 = 65536
+
+# An array the counted fill FILL completes before every read (`Candidate`).
+struct LinkedCandidate:
+    buffer: LLVMValueRef
+    init: LLVMValueRef
+    fill: CountedInduction
+    exit: LLVMBasicBlockRef
+    reads: darray[CountedRead]
+    stores: darray[LLVMValueRef]
+
+# The greatest-fixpoint prover over one group of arrays filled to the same bound
+# (`Prover`): REACHED are the loads whose reload of the bound was decided.
+struct LinkedProver:
+    bound: LLVMValueRef
+    length: u64
+    analyses: ElisaFunctionAnalysesRef
+    arrays: darray[LinkedCandidate]
+    clean: mutable darray[LLVMValueRef]
+    survivors: mutable darray[LLVMValueRef]
+    reload_loads: mutable darray[LLVMValueRef]
+    reload_same: mutable darray[bool]
+    budget: mutable u32
+
+extend Backend:
+    private:
+        # The element type of INIT's array when it is a linked-prefix candidate: a static
+        # array of 16 to 4096 i32 or i64 values zeroed in full (`linkedElement`).
+        def linked_element(init: LLVMValueRef, layout: LLVMTargetDataRef) -> LLVMTypeRef?:
+            buffer: LLVMValueRef = LLVMGetOperand(init, 0)
+            length: LLVMValueRef = LLVMGetOperand(init, 2)
+            filler: LLVMValueRef = LLVMGetOperand(init, 1)
+            return null if LLVMIsAAllocaInst(buffer) == null or ElisaLLVMIsStaticAlloca(buffer) == 0 or is_array_allocation(buffer)
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or call_is_volatile(init)
+            return null if LLVMIsAConstantInt(length) == null or LLVMIsAConstantInt(filler) == null or LLVMIsNull(filler) == 0
+            element: LLVMTypeRef = LLVMGetElementType(array)
+            return null if not is_llvm_integer_type(element, 32) and not is_llvm_integer_type(element, 64)
+            elements: u64 = LLVMGetArrayLength2(array)
+            return null if elements < LinkedPrefixLimit::SMALLEST or elements > LinkedPrefixLimit::LARGEST
+            return null if ElisaLLVMConstantIntActiveBits(length) > 64 or LLVMConstIntGetZExtValue(length) != LLVMABISizeOfType(layout, array)
+            element
+
+        # The reads and stores of BUFFER besides INIT, all through i64 element GEPs.
+        def linked_accesses(buffer: LLVMValueRef, init: LLVMValueRef, element: LLVMTypeRef, layout: LLVMTargetDataRef) -> CountedAccesses? can[Abort.Panic, Memory.Allocate]:
+            accesses: mutable CountedAccesses = CountedAccesses{reads: [], writers: [], views: [], write_index: null}
+            for user in use_list_users(buffer) |accesses, buffer, init, element, layout|:
+                continue if user == init
+                return null if LLVMIsAGetElementPtrInst(user) == null or LLVMGetOperand(user, 0) != buffer
+                index: LLVMValueRef = get element_index(user, layout, element) else return null
+                return null if not is_llvm_integer_type(LLVMTypeOf(index), 64)
+                for access in use_list_users(user) |accesses, user, index, element|:
+                    if LLVMIsALoadInst(access) != null and is_simple_access(access) and LLVMTypeOf(access) == element and LLVMGetOperand(access, 0) == user:
+                        accesses.reads.push(CountedRead{read: access, index: index})
+                    elif LLVMIsAStoreInst(access) != null and is_simple_access(access) and LLVMGetOperand(access, 1) == user and LLVMTypeOf(LLVMGetOperand(access, 0)) == element:
+                        accesses.writers.push(access)
+                    else:
+                        return null
+            accesses
+
+        # The element index a store writes.
+        def stored_index(store: LLVMValueRef, layout: LLVMTargetDataRef, element: LLVMTypeRef) -> LLVMValueRef?:
+            element_index(LLVMGetOperand(store, 1), layout, element)
+
+        # Element accesses only, and a complete counted fill before every read
+        # (`describe`).
+        def describe_linked(init: LLVMValueRef, element: LLVMTypeRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef, quiet: darray[u32]&) -> LinkedCandidate? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            buffer: LLVMValueRef = LLVMGetOperand(init, 0)
+            init_block: LLVMBasicBlockRef = LLVMGetInstructionParent(init)
+            return null if ElisaLLVMLoopForBlock(analyses, init_block) != null or ElisaLLVMIsUsedByMetadata(buffer) != 0
+            accesses: CountedAccesses = get linked_accesses(buffer, init, element, layout) else return null
+            writers: mutable darray[LLVMValueRef] = []
+            fill_found: mutable CountedInduction? = null
+            for write in accesses.writers |writers, fill_found, analyses, layout, element|:
+                index: LLVMValueRef? = stored_index(write, layout, element)
+                if writers.count == 0:
+                    candidate: LLVMValueRef = get index else continue
+                    fill_found <- get counted_induction(candidate, analyses, true) else continue
+                    writers.push(write)
+                elif same_optional_value(index, stored_index(writers[0], layout, element)):
+                    writers.push(write)
+            fill: CountedInduction = get fill_found else return null
+            return null if writers.count > LinkedPrefixLimit::WRITERS or accesses.reads.count == 0
+            return null if ElisaLLVMLoopParent(fill.loop) != null or ElisaLLVMLoopSubLoopCount(fill.loop) != 0 or not writers_cover_iteration(&writers, &fill, analyses)
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(fill.loop)
+            for writer in writers |init, analyses, header, fill|:
+                return null if ElisaLLVMInstructionDominates(analyses, init, writer) == 0 or ElisaLLVMEdgeDominates(analyses, header, fill.body, LLVMGetInstructionParent(writer)) == 0
+            exit: LLVMBasicBlockRef = get normal_loop_exit(fill.loop, quiet) else return null
+            return null if can_recompute(fill.bound, exit, analyses) or ElisaLLVMBlockIsPotentiallyReachableWithin(analyses, exit, init_block, 1) != 0
+            for entry in accesses.reads |fill, header, exit, analyses|:
+                block: LLVMBasicBlockRef = LLVMGetInstructionParent(entry.read)
+                return null if ElisaLLVMLoopContainsBlock(fill.loop, block) != 0 or ElisaLLVMEdgeDominates(analyses, header, exit, block) == 0
+            LinkedCandidate{buffer: buffer, init: init, fill: fill, exit: exit, reads: accesses.reads, stores: accesses.writers}
+
+        # CANDIDATE is the bound, or a reload of its address with no possible write between
+        # them (`isBound`).
+        def is_linked_bound(prover: mutable LinkedProver&, candidate: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            original: LLVMValueRef = prover.bound
+            return true if candidate == original
+            return false if LLVMIsALoadInst(candidate) == null or LLVMIsALoadInst(original) == null or not is_simple_access(candidate) or not is_simple_access(original)
+            return false if LLVMTypeOf(candidate) != LLVMTypeOf(original) or not same_address(LLVMGetOperand(candidate, 0), LLVMGetOperand(original, 0))
+            for position in 0..<prover.reload_loads.count |prover, candidate|:
+                return prover.reload_same[position] if prover.reload_loads[position] == candidate
+            first: mutable LLVMValueRef = candidate
+            last: mutable LLVMValueRef = original
+            if ElisaLLVMInstructionDominates(prover.analyses, original, candidate) != 0:
+                first <- original
+                last <- candidate
+            same: bool = ElisaLLVMInstructionDominates(prover.analyses, first, last) != 0 and not write_between(first, last, null)
+            prover.reload_loads.push(candidate)
+            prover.reload_same.push(same)
+            same
+
+        # FACT shows the bound n > VALUE (`boundExceeds`' test).
+        def fact_shows_bound_exceeds(prover: mutable LinkedProver&, fact: DecidedFact&, value: u64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            constant: bool = LLVMIsAConstantInt(fact.left) != null
+            if not is_linked_bound(prover, fact.right):
+                return value == 0 and is_linked_bound(prover, fact.left) and is_zero_integer(fact.right) and fact.predicate == LLVMIntPredicate::NE
+            nonnegative: bool = constant and ElisaLLVMConstantIntIsNegative(fact.left) == 0
+            known: u64 = (LLVMConstIntGetZExtValue(fact.left) if constant else 0)
+            return value == 0 or (constant and known >= value) if fact.predicate == LLVMIntPredicate::ULT
+            return nonnegative and known >= value if fact.predicate == LLVMIntPredicate::SLT
+            (fact.predicate == LLVMIntPredicate::ULE or (fact.predicate == LLVMIntPredicate::SLE and nonnegative)) and constant and known > value
+
+        # n > VALUE holds at CONTEXT (`boundExceeds`).
+        def linked_bound_exceeds(prover: mutable LinkedProver&, value: u64, context: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for fact in dominating_facts(context, prover.analyses) |prover, value|:
+                return true if fact_shows_bound_exceeds(prover, &fact, value)
+            false
+
+        # A dominating fact shows CANDIDATE <u n at CONTEXT (`guardedBelowBound`).
+        def guarded_below_bound(prover: mutable LinkedProver&, candidate: LLVMValueRef, context: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for fact in dominating_facts(context, prover.analyses) |prover, candidate|:
+                return true if fact.predicate == LLVMIntPredicate::ULT and is_linked_bound(prover, fact.right) and same_arithmetic(fact.left, candidate, 0)
+            false
+
+        # CANDIDATE, `n - c` with 0 < c <= the array length, is below n or wraps past the
+        # length.
+        def is_bound_minus_step(prover: mutable LinkedProver&, candidate: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if LLVMIsABinaryOperator(candidate) == null or LLVMGetInstructionOpcode(candidate) != LLVMOpcode::SUB
+            step: LLVMValueRef = LLVMGetOperand(candidate, 1)
+            return false if LLVMIsAConstantInt(step) == null or not is_linked_bound(prover, LLVMGetOperand(candidate, 0)) or LLVMIsNull(step) != 0
+            ElisaLLVMConstantIntActiveBits(step) <= 64 and LLVMConstIntGetZExtValue(step) <= prover.length
+
+        # CANDIDATE, a load, reads an array that survives and stores only links.
+        def is_clean_array_load(prover: LinkedProver&, candidate: LLVMValueRef) -> bool can[Abort.Panic, Unsafe.PointerCast]:
+            return false if LLVMIsALoadInst(candidate) == null
+            address: LLVMValueRef = LLVMGetOperand(candidate, 0)
+            return false if LLVMIsAGetElementPtrInst(address) == null
+            source: LLVMValueRef = LLVMGetOperand(address, 0)
+            LLVMIsAAllocaInst(source) != null and contains_fact(&prover.survivors, source) and contains_fact(&prover.clean, source)
+
+        # CANDIDATE is a link at CONTEXT; VISITING holds the phis being proved (`isLink`).
+        def is_link(prover: mutable LinkedProver&, candidate: LLVMValueRef, context: LLVMBasicBlockRef, visiting: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if prover.budget == 0
+            prover.budget <- prover.budget - 1
+            if LLVMIsAConstantInt(candidate) != null:
+                return true if ElisaLLVMConstantIntActiveBits(candidate) > 64 or LLVMConstIntGetZExtValue(candidate) >= prover.length
+                return linked_bound_exceeds(prover, LLVMConstIntGetZExtValue(candidate), context)
+            if is_llvm_instruction_with_opcode(candidate, LLVMOpcode::FREEZE) or is_llvm_instruction_with_opcode(candidate, LLVMOpcode::SEXT) or is_llvm_instruction_with_opcode(candidate, LLVMOpcode::ZEXT):
+                return is_link(prover, LLVMGetOperand(candidate, 0), context, visiting)
+            if is_llvm_instruction_with_opcode(candidate, LLVMOpcode::TRUNC):
+                return guarded_below_bound(prover, LLVMGetOperand(candidate, 0), context)
+            return true if is_bound_minus_step(prover, candidate) or guarded_below_bound(prover, candidate, context)
+            if is_llvm_instruction_with_opcode(candidate, LLVMOpcode::PHI):
+                return true if contains_fact(visiting, candidate)
+                insert_fact(visiting, candidate)
+                for index in 0..<LLVMCountIncoming(candidate) |prover, candidate, visiting|:
+                    return false if not is_link(prover, LLVMGetIncomingValue(candidate, index), LLVMGetIncomingBlock(candidate, index), visiting)
+                return true
+            is_clean_array_load(prover, candidate)
+
+        def is_top_link(prover: mutable LinkedProver&, candidate: LLVMValueRef, context: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            visiting: mutable darray[LLVMValueRef] = []
+            is_link(prover, candidate, context, &visiting)
+
+        # Array POSITION of the group stores only links.
+        def stores_links(prover: mutable LinkedProver&, position: usize) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            stores: mutable darray[LLVMValueRef] = []
+            for store in prover.arrays[position].stores |stores|:
+                stores.push(store)
+            for store in stores |prover|:
+                return false if not is_top_link(prover, LLVMGetOperand(store, 0), LLVMGetInstructionParent(store))
+            true
+
+        # Array POSITION of the group reads only through links.
+        def reads_links(prover: mutable LinkedProver&, position: usize) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            reads: mutable darray[CountedRead] = []
+            for entry in prover.arrays[position].reads |reads|:
+                reads.push(entry)
+            for entry in reads |prover|:
+                return false if not is_top_link(prover, entry.index, LLVMGetInstructionParent(entry.read))
+            true
+
+        # PROVER's survivors at the greatest fixpoint: surviving arrays read only link
+        # indices, and clean arrays store only links, assuming both of the current sets
+        # (`solve`).
+        def solve_linked(prover: mutable LinkedProver&) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for array in prover.arrays |prover|:
+                insert_fact(&prover.survivors, array.buffer)
+                insert_fact(&prover.clean, array.buffer)
+            changed: mutable bool = true
+            while changed |changed, prover|:
+                changed <- false
+                for position in 0..<prover.arrays.count |changed, prover|:
+                    buffer: LLVMValueRef = prover.arrays[position].buffer
+                    if contains_fact(&prover.clean, buffer) and not stores_links(prover, position):
+                        remove_fact(&prover.clean, buffer)
+                        changed <- true
+                    if contains_fact(&prover.survivors, buffer) and not reads_links(prover, position):
+                        remove_fact(&prover.survivors, buffer)
+                        changed <- true
+
+        # SET without VALUE.
+        def remove_fact(set: mutable darray[LLVMValueRef]&, value: LLVMValueRef) can[Abort.Panic, Unsafe.PointerCast]:
+            position: usize = sorted_position(set, value)
+            return if position >= set.count or set[position] != value
+            for moving in position..<set.count - 1 |set|:
+                set[moving] <- set[moving + 1]
+            set.truncate(set.count - 1)
+
+        # The array length of CANDIDATE's buffer.
+        def linked_length(candidate: LinkedCandidate&) -> u64:
+            LLVMGetArrayLength2(LLVMGetAllocatedType(candidate.buffer))
+
+        # The candidates of ARRAYS filled to BOUND, in order.
+        def linked_group(arrays: darray[LinkedCandidate]&, bound: LLVMValueRef) -> darray[LinkedCandidate] can[Memory.Allocate]:
+            group: mutable darray[LinkedCandidate] = []
+            for entry in arrays |group, bound|:
+                group.push(entry) if entry.fill.bound == bound
+            group
+
+        # FUNCTION's linked-prefix fills removed; how many were
+        # (`removeLinkedPrefixInitializers`).
+        def remove_linked_prefix_initializers(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef, quiet: darray[u32]&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            arrays: mutable darray[LinkedCandidate] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, arrays, analyses, layout, quiet|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, arrays, analyses, layout, quiet|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    continue if ElisaLLVMIsMemSet(instruction) == 0 or arrays.count >= LinkedPrefixLimit::ARRAYS
+                    element: LLVMTypeRef = get linked_element(instruction, layout) else continue
+                    described: LinkedCandidate = get describe_linked(instruction, element, analyses, layout, quiet) else continue
+                    arrays.push(described)
+            bounds: mutable darray[LLVMValueRef] = []
+            for entry in arrays |bounds|:
+                bounds.push(entry.fill.bound) if not contains_value(&bounds, entry.fill.bound)
+            removed: mutable u32 = 0
+            for bound in bounds |removed, arrays, analyses|:
+                group: darray[LinkedCandidate] = linked_group(&arrays, bound)
+                length: u64 = linked_length(&group[0])
+                continue if any entry in group where linked_length(&entry) != length
+                prover: mutable LinkedProver = LinkedProver{bound: bound, length: length, analyses: analyses, arrays: group, clean: [], survivors: [], reload_loads: [], reload_same: [], budget: LinkedPrefixLimit::BUDGET}
+                solve_linked(&prover)
+                for entry in prover.arrays |removed, prover|:
+                    if contains_fact(&prover.survivors, entry.buffer):
+                        LLVMInstructionEraseFromParent(entry.init)
+                        removed <- removed + 1
+            removed

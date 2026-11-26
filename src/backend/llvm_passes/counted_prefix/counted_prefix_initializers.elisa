@@ -1,0 +1,127 @@
+# The counted prefix initializers (`removeCountedPrefixInitializers` in the C++ it
+# replaces), run on AArch64 before O3. In each function of at most 2000 instructions it
+# drops the zero fill of a private i16 or i32 array that a counted loop writes before
+# every read (counted_prefix_reads.elisa), then the fills of index-linked i32 or i64
+# arrays (linked_prefix.elisa) and of bucket arrays filled by appending
+# (bucket_prefix.elisa). A function with an i16 candidate is first simplified
+# (simplifycfg, instcombine, loop-simplify) so its scan loops take their counted form.
+include "./bucket_prefix.elisa"
+
+const module CountedPrefixFunction:
+    INSTRUCTIONS: u32 = 2000
+    SMALLEST: u64 = 16
+    LARGEST: u64 = 4096
+
+extend Backend:
+    private:
+        # The element type of INIT's array when it is a counted-prefix candidate: a static
+        # array in address space 0 of 16 to 4096 i16 or i32 values that INIT, a plain
+        # memset, zeroes in full (`countedPrefixElement`).
+        def counted_prefix_element(init: LLVMValueRef, layout: LLVMTargetDataRef) -> LLVMTypeRef?:
+            buffer: LLVMValueRef = LLVMGetOperand(init, 0)
+            return null if LLVMIsAAllocaInst(buffer) == null or ElisaLLVMIsStaticAlloca(buffer) == 0 or is_array_allocation(buffer)
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or LLVMGetPointerAddressSpace(LLVMTypeOf(buffer)) != 0
+            return null if call_is_volatile(init) or LLVMGetNumOperandBundles(init) != 0 or ElisaLLVMHasMetadataOtherThanDebugLoc(init) != 0
+            length: LLVMValueRef = LLVMGetOperand(init, 2)
+            filler: LLVMValueRef = LLVMGetOperand(init, 1)
+            element: LLVMTypeRef = LLVMGetElementType(array)
+            return null if LLVMIsAConstantInt(length) == null or (not is_llvm_integer_type(element, 16) and not is_llvm_integer_type(element, 32))
+            elements: u64 = LLVMGetArrayLength2(array)
+            return null if elements < CountedPrefixFunction::SMALLEST or elements > CountedPrefixFunction::LARGEST
+            return null if ElisaLLVMConstantIntActiveBits(length) > 64 or LLVMConstIntGetZExtValue(length) != LLVMABISizeOfType(layout, array)
+            return null if LLVMIsAConstantInt(filler) == null or LLVMIsNull(filler) == 0
+            element
+
+        # The memsets of FUNCTION, in order.
+        def function_memsets(function: LLVMValueRef) -> darray[LLVMValueRef] can[Memory.Allocate]:
+            memsets: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, memsets|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, memsets|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    memsets.push(instruction) if ElisaLLVMIsMemSet(instruction) != 0
+            memsets
+
+        # FUNCTION is one the counted prefix initializers look at: defined, optimized for
+        # speed, uninstrumented and at most 2000 instructions.
+        def counted_prefix_function(function: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function) or function_is_sanitized(function)
+            function_instruction_count(function) <= CountedPrefixFunction::INSTRUCTIONS
+
+        # STABILIZE's values in FUNCTION's instruction order.
+        def in_function_order(function: LLVMValueRef, stabilize: darray[LLVMValueRef]&) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate]:
+            ordered: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, ordered, stabilize|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, ordered, stabilize|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    ordered.push(instruction) if contains_value(stabilize, instruction)
+            ordered
+
+        # DEFINITION frozen right after it (after the phis for a phi), every other use
+        # reading the frozen value.
+        def freeze_definition(definition: LLVMValueRef) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            insertion: LLVMValueRef? = (ElisaLLVMFirstInsertionPoint(LLVMGetInstructionParent(definition)) if is_llvm_instruction_with_opcode(definition, LLVMOpcode::PHI) else LLVMGetNextInstruction(definition))
+            point: LLVMValueRef = get insertion else return
+            builder: LLVMBuilderRef = LLVMCreateBuilderInContext(LLVMGetTypeContext(LLVMTypeOf(definition)))
+            position_builder_before(builder, point)
+            names: mutable darray[u8] = []
+            stable: LLVMValueRef = LLVMBuildFreeze(builder, definition, sview_to_cstr("prefix.index", names))
+            LLVMDisposeBuilder(builder)
+            ElisaLLVMReplaceUsesExceptUser(definition, stable, stable)
+
+        # The counted fills of FUNCTION removed, freezing the values each proof needs to
+        # stay put; how many were.
+        def remove_counted_fills(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef, quiet: darray[u32]&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            removed: mutable u32 = 0
+            for init in function_memsets(function) |removed, function, analyses, layout, quiet|:
+                element: LLVMTypeRef = get counted_prefix_element(init, layout) else continue
+                stabilize: mutable darray[LLVMValueRef] = []
+                continue if not covers_reads(LLVMGetOperand(init, 0), init, element, analyses, layout, &stabilize, quiet)
+                for definition in in_function_order(function, &stabilize):
+                    freeze_definition(definition)
+                LLVMInstructionEraseFromParent(init)
+                removed <- removed + 1
+            removed
+
+        # The intrinsics a dead-end block may run besides `unreachable`: traps and debug
+        # records (`isDeadEnd`).
+        def dead_end_intrinsics() -> darray[u32] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            [intrinsic_identifier("llvm.trap"), intrinsic_identifier("llvm.dbg.declare"), intrinsic_identifier("llvm.dbg.value"), intrinsic_identifier("llvm.dbg.assign"), intrinsic_identifier("llvm.dbg.label")]
+
+        # FUNCTION has a fill the counted or linked proofs could take.
+        def has_prefix_candidate(function: LLVMValueRef, layout: LLVMTargetDataRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            any init in function_memsets(function) where counted_prefix_element(init, layout) != null or linked_element(init, layout) != null
+
+        # FUNCTION has a counted candidate of i16 elements.
+        def has_short_candidate(function: LLVMValueRef, layout: LLVMTargetDataRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            for init in function_memsets(function) |layout|:
+                element: LLVMTypeRef = get counted_prefix_element(init, layout) else continue
+                return true if is_llvm_integer_type(element, 16)
+            false
+
+    public:
+        # MODULE's counted, linked and bucket prefix fills removed; how many were. Only on
+        # AArch64.
+        def remove_counted_prefix_initializers(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if not module_targets_aarch64(module)
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            quiet: darray[u32] = dead_end_intrinsics()
+            removed: mutable u32 = 0
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, removed, layout, quiet|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if not counted_prefix_function(function) or not has_prefix_candidate(function, layout)
+                if has_short_candidate(function, layout):
+                    _ = run_function_pipeline(function, null, "simplifycfg,instcombine<no-verify-fixpoint>,loop-simplify")
+                analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else continue
+                removed <- removed + remove_counted_fills(function, analyses, layout, &quiet)
+                removed <- removed + remove_linked_prefix_initializers(function, analyses, layout, &quiet)
+                removed <- removed + remove_bucket_initializers(function, analyses, layout)
+                ElisaLLVMDisposeFunctionAnalyses(analyses)
+            removed

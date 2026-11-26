@@ -26,6 +26,10 @@ int ElisaLLVMInstructionIsPotentiallyReachableInLoops(ElisaFunctionAnalysesRef a
  * dominator tree, and their loop info when USE_LOOPS is set. */
 int ElisaLLVMBlockIsPotentiallyReachableWithin(ElisaFunctionAnalysesRef analyses, LLVMBasicBlockRef from,
                                                LLVMBasicBlockRef to, int use_loops);
+/* isPotentiallyReachable(from, to, &excluded, nullptr, nullptr) between blocks: a path
+ * that enters none of the COUNT EXCLUDED blocks, searched without analyses. */
+int ElisaLLVMBlockIsPotentiallyReachableAvoiding(LLVMBasicBlockRef from, LLVMBasicBlockRef to,
+                                                 LLVMBasicBlockRef *excluded, unsigned count);
 /* ICFLoopSafetyInfo::isGuaranteedToExecute(instruction, DT, loop), with the safety info
  * computed for the loop as it is now. */
 int ElisaLLVMLoopIsGuaranteedToExecute(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,

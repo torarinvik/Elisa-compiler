@@ -1,0 +1,275 @@
+# The zero fill of an array used as fixed-width buckets (`ElisaBucketPrefix` in the C++
+# it replaces). A counter array C starts zeroed and only changes by `C[r] <- C[r] + 1`
+# right after slot r * W + C[r] of the bucket array is written, so every slot r * W + k
+# with k < C[r] has been written. When every read of slot r * W + j is guarded by
+# j < C[r], no read observes the bucket array's own zero fill (adjacency lists filled by
+# appending are the common case).
+include "./linked_prefix.elisa"
+
+const module BucketPrefixLimit:
+    SHIFT: u64 = 32
+
+# Slot r * W + k of a bucket array (`Slot`).
+struct BucketSlot:
+    row: LLVMValueRef
+    width: u64
+    column: LLVMValueRef
+
+# A read or write of an array element at INDEX.
+struct BucketAccess:
+    instruction: LLVMValueRef
+    index: LLVMValueRef
+
+# A fixed array alloca read and written only through element GEPs, plus one full zero
+# fill (a memset or an aggregate zero store) that runs once before every access
+# (`Array`).
+struct BucketArray:
+    buffer: LLVMValueRef
+    fill: LLVMValueRef
+    element: LLVMTypeRef
+    reads: darray[BucketAccess]
+    writes: darray[BucketAccess]
+
+# The proof that one bucket array's fill is unobserved (`Prover`): the counter array it
+# appends by and the bucket width. The first write's append names the counter, so it is
+# described before the proof starts (the C++ adopts it at that write).
+struct BucketProver:
+    analyses: ElisaFunctionAnalysesRef
+    layout: LLVMTargetDataRef
+    buckets: LLVMValueRef
+    counter: BucketArray
+    width: mutable u64
+
+extend Backend:
+    private:
+        def strip_zext(candidate: LLVMValueRef) -> LLVMValueRef:
+            return LLVMGetOperand(candidate, 0) if is_llvm_instruction_with_opcode(candidate, LLVMOpcode::ZEXT)
+            candidate
+
+        # VALUE is an `opcode` binary operation, as an instruction or a constant expression.
+        def binary_value(value: LLVMValueRef, opcode: u32) -> bool:
+            value_opcode(value) == opcode and (LLVMIsABinaryOperator(value) != null or LLVMIsAConstantExpr(value) != null)
+
+        # PRODUCT is `row * W` (or `W * row` when CONSTANT_FIRST) with W a constant.
+        def scaled_row(product: LLVMValueRef, column: LLVMValueRef, constant_first: bool) -> BucketSlot?:
+            return null if not binary_value(product, LLVMOpcode::MUL)
+            width: LLVMValueRef = LLVMGetOperand(product, (0 if constant_first else 1))
+            return null if LLVMIsAConstantInt(width) == null
+            BucketSlot{row: LLVMGetOperand(product, (1 if constant_first else 0)), width: LLVMConstIntGetZExtValue(width), column: strip_zext(column)}
+
+        # PRODUCT is `row << k` with k < 32.
+        def shifted_row(product: LLVMValueRef, column: LLVMValueRef) -> BucketSlot?:
+            return null if not binary_value(product, LLVMOpcode::SHL)
+            shift: LLVMValueRef = LLVMGetOperand(product, 1)
+            return null if LLVMIsAConstantInt(shift) == null or LLVMConstIntGetZExtValue(shift) >= BucketPrefixLimit::SHIFT
+            BucketSlot{row: LLVMGetOperand(product, 0), width: 1 << LLVMConstIntGetZExtValue(shift), column: strip_zext(column)}
+
+        # INDEX as r * W + k in either operand order, with W a constant (`slotOf`).
+        def slot_of(index: LLVMValueRef) -> BucketSlot? can[Abort.Panic]:
+            return null if not binary_value(index, LLVMOpcode::ADD)
+            left: LLVMValueRef = LLVMGetOperand(index, 0)
+            right: LLVMValueRef = LLVMGetOperand(index, 1)
+            for constant_first in [false, true] |left, right|:
+                if scaled_row(left, right, constant_first) is slot:
+                    return slot
+                if scaled_row(right, left, constant_first) is commuted:
+                    return commuted
+            if shifted_row(left, right) is shifted:
+                return shifted
+            shifted_row(right, left)
+
+        # STORE writes the whole array ARRAY with zeros, once, outside every loop; null when
+        # it stores the array type any other way.
+        def aggregate_zero_fill(store: LLVMValueRef, buffer: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            return false if not is_simple_access(store) or LLVMGetOperand(store, 1) != buffer or LLVMIsAConstantAggregateZero(LLVMGetOperand(store, 0)) == null
+            ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(store)) == null
+
+        # FILL zeroes all of BUFFER (of type ARRAY) once, outside every loop.
+        def full_zero_memset(fill: LLVMValueRef, buffer: LLVMValueRef, array: LLVMTypeRef, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> bool:
+            length: LLVMValueRef = LLVMGetOperand(fill, 2)
+            byte: LLVMValueRef = LLVMGetOperand(fill, 1)
+            return false if LLVMGetOperand(fill, 0) != buffer or call_is_volatile(fill) or LLVMIsAConstantInt(length) == null or LLVMIsAConstantInt(byte) == null or LLVMIsNull(byte) == 0
+            return false if ElisaLLVMConstantIntActiveBits(length) > 64 or LLVMConstIntGetZExtValue(length) != LLVMABISizeOfType(layout, array)
+            ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(fill)) == null
+
+        # The array BUFFER describes, when it is accessed only through element GEPs after
+        # one full zero fill (`describe`).
+        def describe_bucket(buffer: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef) -> BucketArray? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return null if LLVMIsAAllocaInst(buffer) == null
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or LLVMGetTypeKind(LLVMGetElementType(array)) != LLVMTypeKindValue::INTEGER
+            return null if ElisaLLVMIsStaticAlloca(buffer) == 0 or is_array_allocation(buffer) or ElisaLLVMIsUsedByMetadata(buffer) != 0 or ElisaLLVMPointerMayBeCaptured(buffer, 1, 0) != 0
+            element: LLVMTypeRef = LLVMGetElementType(array)
+            fill: mutable LLVMValueRef? = null
+            reads: mutable darray[BucketAccess] = []
+            writes: mutable darray[BucketAccess] = []
+            for user in use_list_users(buffer) |fill, reads, writes, buffer, array, element, layout, analyses|:
+                if LLVMIsAStoreInst(user) != null and LLVMTypeOf(LLVMGetOperand(user, 0)) == array:
+                    return null if fill != null or not aggregate_zero_fill(user, buffer, analyses)
+                    fill <- user
+                    continue
+                if ElisaLLVMIsMemSet(user) != 0:
+                    return null if fill != null or not full_zero_memset(user, buffer, array, layout, analyses)
+                    fill <- user
+                    continue
+                intrinsic: u32 = called_intrinsic_id(user)
+                continue if intrinsic != 0 and (intrinsic == intrinsic_identifier("llvm.lifetime.start") or intrinsic == intrinsic_identifier("llvm.lifetime.end"))
+                return null if LLVMIsAGetElementPtrInst(user) == null or LLVMGetOperand(user, 0) != buffer
+                index: LLVMValueRef = get element_index(user, layout, element) else return null
+                for access in use_list_users(user) |reads, writes, user, index, element|:
+                    if LLVMIsALoadInst(access) != null and is_simple_access(access) and LLVMTypeOf(access) == element:
+                        reads.push(BucketAccess{instruction: access, index: index})
+                    elif LLVMIsAStoreInst(access) != null and is_simple_access(access) and LLVMGetOperand(access, 1) == user and LLVMTypeOf(LLVMGetOperand(access, 0)) == element:
+                        writes.push(BucketAccess{instruction: access, index: index})
+                    else:
+                        return null
+            zeroes: LLVMValueRef = get fill else return null
+            for item in reads |zeroes, analyses|:
+                return null if ElisaLLVMInstructionDominates(analyses, zeroes, item.instruction) == 0
+            for item in writes |zeroes, analyses|:
+                return null if ElisaLLVMInstructionDominates(analyses, zeroes, item.instruction) == 0
+            BucketArray{buffer: buffer, fill: zeroes, element: element, reads: reads, writes: writes}
+
+        # A load of COUNTER[ROW], possibly zero extended (`counterLoad`).
+        def counter_load(prover: BucketProver&, candidate: LLVMValueRef, row: LLVMValueRef) -> LLVMValueRef?:
+            load: LLVMValueRef = strip_zext(candidate)
+            return null if LLVMIsALoadInst(load) == null
+            address: LLVMValueRef = LLVMGetOperand(load, 0)
+            return null if LLVMIsAGetElementPtrInst(address) == null or not is_simple_access(load) or LLVMGetOperand(address, 0) != prover.counter.buffer
+            index: LLVMValueRef = get element_index(address, prover.layout, prover.counter.element) else return null
+            load if same_arithmetic(index, row, 0) else null
+
+        # The array COLUMN loads from, when it is an alloca other than BUCKETS.
+        def column_array(column: LLVMValueRef, buckets: LLVMValueRef) -> LLVMValueRef?:
+            return null if LLVMIsALoadInst(column) == null
+            address: LLVMValueRef = LLVMGetOperand(column, 0)
+            return null if LLVMIsAGetElementPtrInst(address) == null
+            buffer: LLVMValueRef = LLVMGetOperand(address, 0)
+            return null if LLVMIsAAllocaInst(buffer) == null or buffer == buckets
+            buffer
+
+        # The counter array of BUCKETS, named by its first write's append and read at least
+        # once (`adoptCounter` at that write).
+        def bucket_counter(buckets: BucketArray&, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef) -> BucketArray? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            place: BucketSlot = get slot_of(buckets.writes[0].index) else return null
+            buffer: LLVMValueRef = get column_array(place.column, buckets.buffer) else return null
+            counter: BucketArray = get describe_bucket(buffer, analyses, layout) else return null
+            return null if counter.reads.count < 1
+            counter
+
+        # COLUMN loads the counter array (`adoptCounter` after the first write).
+        def adopt_counter(prover: BucketProver&, column: LLVMValueRef) -> bool:
+            buffer: LLVMValueRef = get column_array(column, prover.buckets) else return false
+            buffer == prover.counter.buffer
+
+        # The value an increment STORE adds one to, `previous + 1` in either order.
+        def incremented_value(store: LLVMValueRef) -> LLVMValueRef?:
+            sum: LLVMValueRef = LLVMGetOperand(store, 0)
+            return null if not binary_value(sum, LLVMOpcode::ADD)
+            return LLVMGetOperand(sum, 0) if is_one_integer(LLVMGetOperand(sum, 1))
+            return LLVMGetOperand(sum, 1) if is_one_integer(LLVMGetOperand(sum, 0))
+            null
+
+        def is_one_integer(value: LLVMValueRef) -> bool:
+            LLVMIsAConstantInt(value) != null and ElisaLLVMIsConstantOne(value) != 0
+
+        # UPDATE, a counter write, is the increment `C[r] <- C[r] + 1` that follows WRITE
+        # with no other counter write since COUNT, its load of C[r].
+        def increments_after(prover: BucketProver&, update: BucketAccess&, place: BucketSlot&, count: LLVMValueRef, write: LLVMValueRef, counter: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            store: LLVMValueRef = update.instruction
+            return false if not same_arithmetic(update.index, place.row, 0)
+            previous: LLVMValueRef = get incremented_value(store) else return false
+            reload: LLVMValueRef = get counter_load(prover, previous, place.row) else return false
+            return false if LLVMTypeOf(reload) != LLVMTypeOf(count) or ElisaLLVMInstructionDominates(prover.analyses, write, store) == 0
+            first: mutable LLVMValueRef? = null
+            if ElisaLLVMInstructionDominates(prover.analyses, count, reload) != 0:
+                first <- count
+            elif ElisaLLVMInstructionDominates(prover.analyses, reload, count) != 0:
+                first <- reload
+            earliest: LLVMValueRef = get first else return false
+            not write_between(earliest, store, counter)
+
+        # WRITE is `Buckets[r * W + C[r]] <- v`, followed by `C[r] <- C[r] + 1` with no
+        # other write of C from the load of C[r] until the increment (`appendThenCount`).
+        def append_then_count(prover: mutable BucketProver&, write: BucketAccess&, increments: mutable darray[LLVMValueRef]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            place: BucketSlot = get slot_of(write.index) else return false
+            return false if (prover.width != 0 and place.width != prover.width) or not adopt_counter(prover, place.column)
+            prover.width <- place.width
+            count: LLVMValueRef = get counter_load(prover, place.column, place.row) else return false
+            counter_buffer: LLVMValueRef = prover.counter.buffer
+            updates: mutable darray[BucketAccess] = []
+            for update in prover.counter.writes |updates|:
+                updates.push(update)
+            for update in updates |prover, place, count, write, increments, counter_buffer|:
+                continue if contains_fact(increments, update.instruction)
+                continue if not increments_after(prover, &update, &place, count, write.instruction, counter_buffer)
+                insert_fact(increments, update.instruction)
+                return true
+            false
+
+        # GUARDED, as compared by FACT, has the value USED reads: the same arithmetic, or a
+        # reload with no write of the (non-escaping) array after the compared load. The
+        # compared load must not run again between the comparison and the guard edge, or
+        # between the edge and USED (`equivalent`).
+        def equivalent_guard(guarded: LLVMValueRef, used: LLVMValueRef, fact: DecidedFact&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            compared: LLVMValueRef = strip_zext(guarded)
+            reload: LLVMValueRef = strip_zext(used)
+            return true if same_arithmetic(compared, reload, 0)
+            return false if LLVMIsALoadInst(compared) == null or LLVMIsALoadInst(reload) == null or not is_simple_access(compared) or not is_simple_access(reload)
+            return false if LLVMTypeOf(compared) != LLVMTypeOf(reload) or not same_address(LLVMGetOperand(compared, 0), LLVMGetOperand(reload, 0))
+            object: LLVMValueRef = ElisaLLVMUnderlyingObject(LLVMGetOperand(compared, 0))
+            return false if LLVMIsAAllocaInst(object) == null or ElisaLLVMPointerMayBeCaptured(object, 1, 0) != 0
+            compared_block: LLVMBasicBlockRef = LLVMGetInstructionParent(compared)
+            return false if compared_block == LLVMGetInstructionParent(reload) or LLVMGetInstructionParent(fact.compare) == compared_block
+            to_edge: darray[LLVMValueRef] = reach_forward(LLVMGetInstructionParent(fact.compare), null, false, null, fact.from)
+            to_use: darray[LLVMValueRef] = reach_forward(fact.target, fact.from, true, null, LLVMGetInstructionParent(reload))
+            compared_key: LLVMValueRef = LLVMBasicBlockAsValue(compared_block)
+            return false if contains_fact(&to_edge, compared_key) or contains_fact(&to_use, compared_key)
+            not write_between(compared, reload, object)
+
+        # READ is `Buckets[r * W + j]` under a dominating `j < C[r]` (`guardedRead`).
+        def guarded_bucket_read(prover: mutable BucketProver&, read: BucketAccess&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            place: BucketSlot = get slot_of(read.index) else return false
+            return false if place.width != prover.width
+            for fact in dominating_facts(LLVMGetInstructionParent(read.instruction), prover.analyses) |prover, place|:
+                continue if fact.predicate != LLVMIntPredicate::ULT or counter_load(prover, fact.right, place.row) == null
+                return true if equivalent_guard(fact.left, place.column, &fact)
+            false
+
+        # BUCKETS' fill is unobserved: every write appends and counts, the counter changes
+        # only by those increments, and every read is guarded by its bucket's count
+        # (`removable`).
+        def bucket_fill_removable(prover: mutable BucketProver&, buckets: BucketArray&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if buckets.writes.count == 0 or buckets.reads.count == 0
+            increments: mutable darray[LLVMValueRef] = []
+            for write in buckets.writes |prover, increments|:
+                return false if not append_then_count(prover, &write, &increments)
+            return false if prover.counter.writes.count != increments.count
+            for read in buckets.reads |prover|:
+                return false if not guarded_bucket_read(prover, &read)
+            true
+
+        # FUNCTION's bucket-array fills removed; how many were. A counter keeps its zero
+        # fill, even if it is also a bucket array (`removeBucketInitializers`).
+        def remove_bucket_initializers(function: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            buffers: mutable darray[LLVMValueRef] = []
+            fills: mutable darray[LLVMValueRef] = []
+            counters: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(function))
+            while cursor is instruction |cursor, buffers, fills, counters, analyses, layout|:
+                cursor <- LLVMGetNextInstruction(instruction)
+                continue if LLVMIsAAllocaInst(instruction) == null
+                buckets: BucketArray = get describe_bucket(instruction, analyses, layout) else continue
+                continue if buckets.writes.count == 0 or buckets.reads.count == 0
+                counter: BucketArray = get bucket_counter(&buckets, analyses, layout) else continue
+                prover: mutable BucketProver = BucketProver{analyses: analyses, layout: layout, buckets: instruction, counter: counter, width: 0}
+                continue if not bucket_fill_removable(&prover, &buckets)
+                buffers.push(instruction)
+                fills.push(buckets.fill)
+                counters.push(prover.counter.buffer) if not contains_value(&counters, prover.counter.buffer)
+            removed: mutable u32 = 0
+            for position in 0..<buffers.count |removed, buffers, fills, counters|:
+                if not contains_value(&counters, buffers[position]):
+                    LLVMInstructionEraseFromParent(fills[position])
+                    removed <- removed + 1
+            removed

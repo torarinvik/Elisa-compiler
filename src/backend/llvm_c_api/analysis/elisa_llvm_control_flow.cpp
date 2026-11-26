@@ -35,6 +35,13 @@ int ElisaLLVMBlockIsPotentiallyReachableWithin(ElisaFunctionAnalysesRef analyses
                                 use_loops ? &A->loops() : nullptr);
 }
 
+int ElisaLLVMBlockIsPotentiallyReachableAvoiding(LLVMBasicBlockRef from, LLVMBasicBlockRef to,
+                                                 LLVMBasicBlockRef *excluded, unsigned count) {
+  SmallPtrSet<BasicBlock *, 8> Excluded;
+  for (unsigned Index = 0; Index < count; ++Index) Excluded.insert(unwrap(excluded[Index]));
+  return isPotentiallyReachable(unwrap(from), unwrap(to), &Excluded, nullptr, nullptr);
+}
+
 int ElisaLLVMLoopIsGuaranteedToExecute(ElisaFunctionAnalysesRef analyses, ElisaLoopRef loop,
                                        LLVMValueRef instruction) {
   ICFLoopSafetyInfo Safety;

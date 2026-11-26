@@ -1,6 +1,7 @@
 // Implementation of elisa_llvm_instruction_queries.h.
 #include "elisa_llvm_instruction_queries.h"
 
+#include <llvm/Analysis/MemoryLocation.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
@@ -51,6 +52,23 @@ int ElisaLLVMGEPConstantOffset(LLVMValueRef gep, int64_t *offset) {
   if (!Address->accumulateConstantOffset(Layout, Offset)) return 0;
   *offset = Offset.getSExtValue();
   return 1;
+}
+
+LLVMValueRef ElisaLLVMWrittenLocationPointer(LLVMValueRef instruction) {
+  auto *Writer = cast<Instruction>(unwrap(instruction));
+  std::optional<MemoryLocation> Location = MemoryLocation::getOrNone(Writer);
+  if (!Location) {
+    auto *Fill = dyn_cast<AnyMemIntrinsic>(Writer);
+    if (!Fill) return nullptr;
+    Location = MemoryLocation::getForDest(Fill);
+  }
+  return wrap(const_cast<Value *>(Location->Ptr));
+}
+
+LLVMValueRef ElisaLLVMFirstInsertionPoint(LLVMBasicBlockRef block) {
+  BasicBlock *Block = unwrap(block);
+  auto Point = Block->getFirstInsertionPt();
+  return Point == Block->end() ? nullptr : wrap(&*Point);
 }
 
 } // extern "C"

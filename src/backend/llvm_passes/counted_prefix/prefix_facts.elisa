@@ -1,0 +1,258 @@
+# Facts shared by the prefix-initializer proofs (`ElisaPrefixFacts` in the C++ it
+# replaces): comparisons decided by dominating branch edges, structural value equality,
+# and whether a write can execute between two instructions.
+include "../ir/llvm_ir_queries.elisa"
+include "../ir/key_table.elisa"
+include "../ir/decided_compares.elisa"
+
+const module PrefixFactLimit:
+    SAME_DEPTH: u32 = 3
+    CONDITION_DEPTH: u32 = 8
+    VIA_DEPTH: u32 = 4
+
+# A comparison decided by a branch edge that dominates a block: `left predicate right`,
+# with greater-than forms swapped into less-than forms, and the comparison and the edge
+# FROM -> TARGET whose taking decides it (`Evidence`).
+struct DecidedFact:
+    predicate: i32
+    left: LLVMValueRef
+    right: LLVMValueRef
+    compare: LLVMValueRef
+    from: LLVMBasicBlockRef
+    target: LLVMBasicBlockRef
+
+# The comparisons a condition decides and the predecessors of the short-circuit phis it
+# looked through (`factsOf`).
+struct EdgeConditionFacts:
+    facts: mutable darray[CompareFact]
+    via: mutable darray[LLVMBasicBlockRef]
+
+# A walk's pending (block, entered-from) pairs and those already seen.
+struct BlockWalk:
+    work_blocks: mutable darray[LLVMBasicBlockRef]
+    work_from: mutable darray[LLVMBasicBlockRef?]
+    seen: mutable KeyTable
+
+extend Backend:
+    private:
+        # The same pure arithmetic over the same operands (`same`).
+        def same_arithmetic(left: LLVMValueRef, right: LLVMValueRef, depth: u32) -> bool:
+            return true if left == right
+            return false if depth >= PrefixFactLimit::SAME_DEPTH or LLVMIsABinaryOperator(left) == null or LLVMIsABinaryOperator(right) == null
+            return false if LLVMGetInstructionOpcode(left) != LLVMGetInstructionOpcode(right)
+            same_arithmetic(LLVMGetOperand(left, 0), LLVMGetOperand(right, 0), depth + 1) and same_arithmetic(LLVMGetOperand(left, 1), LLVMGetOperand(right, 1), depth + 1)
+
+        # Two GEPs of one pointer with the same source type and the same indices
+        # (`sameAddress`).
+        def same_address(left: LLVMValueRef, right: LLVMValueRef) -> bool:
+            return true if left == right
+            return false if LLVMIsAGetElementPtrInst(left) == null or LLVMIsAGetElementPtrInst(right) == null
+            return false if LLVMGetGEPSourceElementType(left) != LLVMGetGEPSourceElementType(right) or LLVMGetOperand(left, 0) != LLVMGetOperand(right, 0)
+            indices: u32 = LLVMGetNumIndices(left)
+            return false if indices != LLVMGetNumIndices(right)
+            for position in 1..<indices + 1 |left, right|:
+                return false if not same_arithmetic(LLVMGetOperand(left, position), LLVMGetOperand(right, position), 0)
+            true
+
+        # INSTRUCTION may write memory and is not a lifetime marker (`anyWrite`).
+        def any_memory_write(instruction: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMMayWriteToMemory(instruction) == 0
+            intrinsic: u32 = called_intrinsic_id(instruction)
+            intrinsic == 0 or (intrinsic != intrinsic_identifier("llvm.lifetime.start") and intrinsic != intrinsic_identifier("llvm.lifetime.end"))
+
+        # INSTRUCTION may write OBJECT, an alloca whose address does not escape: only
+        # accesses through pointers derived from it can reach it (`mayWrite`).
+        def may_write_object(instruction: LLVMValueRef, object: LLVMValueRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not any_memory_write(instruction)
+            pointer: LLVMValueRef = get ElisaLLVMWrittenLocationPointer(instruction) else return not is_call_base(instruction)
+            root: LLVMValueRef = ElisaLLVMUnderlyingObject(pointer)
+            return true if root == object
+            LLVMIsAAllocaInst(root) == null and LLVMIsAArgument(root) == null and LLVMIsAGlobalValue(root) == null and LLVMIsALoadInst(root) == null and not is_call_base(root)
+
+        # A write WRITE_TARGET cares about: any write when it is null, else a write of it.
+        def relevant_write(instruction: LLVMValueRef, write_target: LLVMValueRef?) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if write_target is object:
+                return may_write_object(instruction, object)
+            any_memory_write(instruction)
+
+        # BLOCK holds a write WRITE_TARGET cares about.
+        def block_writes(block: LLVMBasicBlockRef, write_target: LLVMValueRef?) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, write_target|:
+                return true if relevant_write(instruction, write_target)
+                cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+        # The one successor TERMINATOR, BLOCK's branch on an i1 phi of BLOCK, takes after
+        # an entry from PREDECESSOR, when the phi's value from it is a constant.
+        def decided_successor(block: LLVMBasicBlockRef, terminator: LLVMValueRef, predecessor: LLVMBasicBlockRef?) -> LLVMBasicBlockRef?:
+            from: LLVMBasicBlockRef = get predecessor else return null
+            return null if LLVMGetInstructionOpcode(terminator) != LLVMOpcode::CONDITIONAL_BR
+            phi: LLVMValueRef = LLVMGetCondition(terminator)
+            return null if not is_llvm_instruction_with_opcode(phi, LLVMOpcode::PHI) or LLVMGetInstructionParent(phi) != block
+            decided: LLVMValueRef = get phi_incoming_for_block(phi, from) else return null
+            return null if LLVMIsAConstantInt(decided) == null
+            LLVMGetSuccessor(terminator, (0 if ElisaLLVMIsConstantOne(decided) != 0 else 1))
+
+        # The successors of BLOCK that can follow its entry from PREDECESSOR (null when
+        # unknown). A branch on an i1 phi of BLOCK itself is decided by the phi's constant
+        # incoming value: short-circuit joins take only one way per arm
+        # (`feasibleSuccessors`).
+        def feasible_successors(block: LLVMBasicBlockRef, predecessor: LLVMBasicBlockRef?) -> darray[LLVMBasicBlockRef] can[Abort.Panic, Memory.Allocate]:
+            next: mutable darray[LLVMBasicBlockRef] = []
+            terminator: LLVMValueRef = get LLVMGetBasicBlockTerminator(block) else return next
+            if decided_successor(block, terminator, predecessor) is only:
+                next.push(only)
+                return next
+            for position in 0..<LLVMGetNumSuccessors(terminator) |next, terminator|:
+                next.push(LLVMGetSuccessor(terminator, position))
+            next
+
+        def can_follow(block: LLVMBasicBlockRef, predecessor: LLVMBasicBlockRef, successor: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate]:
+            for next in feasible_successors(block, predecessor) |successor|:
+                return true if next == successor
+            false
+
+        def walk_key(block: LLVMBasicBlockRef, from: LLVMBasicBlockRef?) -> TableKey can[Unsafe.PointerCast]:
+            from_key: u64 = (object_key(LLVMBasicBlockAsValue(entered).cast[void&]) if from is entered else 0)
+            TableKey{first: object_key(LLVMBasicBlockAsValue(block).cast[void&]), second: from_key, third: 0}
+
+        # WALK with (BLOCK, FROM) pending unless it is BARRIER or was seen.
+        def walk_push(walk: mutable BlockWalk&, block: LLVMBasicBlockRef, from: LLVMBasicBlockRef?, barrier: LLVMBasicBlockRef?) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return if same_optional_block(barrier, block)
+            key: TableKey = walk_key(block, from)
+            return if key_table_find(&walk.seen, key) != null
+            walk.seen <- key_table_insert(walk.seen, key, 0)
+            walk.work_blocks.push(block)
+            walk.work_from.push(from)
+
+        def walk_expand(walk: mutable BlockWalk&, block: LLVMBasicBlockRef, from: LLVMBasicBlockRef?, barrier: LLVMBasicBlockRef?) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            for successor in feasible_successors(block, from) |walk, block, barrier|:
+                walk_push(walk, successor, block, barrier)
+
+        # The blocks reachable from START, entered from ENTERED_FROM, without entering
+        # BARRIER or expanding past STOP, as a sorted set (`reachForward`).
+        def reach_forward(start: LLVMBasicBlockRef, entered_from: LLVMBasicBlockRef?, inclusive: bool, barrier: LLVMBasicBlockRef?, stop: LLVMBasicBlockRef?) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMValueRef] = []
+            walk: mutable BlockWalk = BlockWalk{work_blocks: [], work_from: [], seen: new_key_table()}
+            if inclusive:
+                walk_push(&walk, start, entered_from, barrier)
+            elif not same_optional_block(stop, start):
+                walk_expand(&walk, start, entered_from, barrier)
+            while walk.work_blocks.count > 0 |walk, blocks, barrier, stop|:
+                last: usize = walk.work_blocks.count - 1
+                block: LLVMBasicBlockRef = walk.work_blocks[last]
+                from: LLVMBasicBlockRef? = walk.work_from[last]
+                walk.work_blocks.truncate(last)
+                walk.work_from.truncate(last)
+                insert_fact(&blocks, LLVMBasicBlockAsValue(block))
+                continue if same_optional_block(stop, block)
+                walk_expand(&walk, block, from, barrier)
+            blocks
+
+        # The blocks from which TARGET can be reached without entering BARRIER, as a
+        # sorted set (`reachBackward`).
+        def reach_backward(target: LLVMBasicBlockRef, barrier: LLVMBasicBlockRef) -> darray[LLVMValueRef] can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            blocks: mutable darray[LLVMValueRef] = []
+            walk: mutable BlockWalk = BlockWalk{work_blocks: [], work_from: [], seen: new_key_table()}
+            for predecessor in predecessor_edges(target) |walk, target, barrier|:
+                walk_push(&walk, predecessor, target, barrier)
+            while walk.work_blocks.count > 0 |walk, blocks, barrier|:
+                last: usize = walk.work_blocks.count - 1
+                block: LLVMBasicBlockRef = walk.work_blocks[last]
+                entered: LLVMBasicBlockRef? = walk.work_from[last]
+                walk.work_blocks.truncate(last)
+                walk.work_from.truncate(last)
+                insert_fact(&blocks, LLVMBasicBlockAsValue(block))
+                successor: LLVMBasicBlockRef = get entered else continue
+                for predecessor in predecessor_edges(block) |walk, block, successor, barrier|:
+                    continue if predecessor == barrier or not can_follow(block, predecessor, successor)
+                    walk_push(&walk, predecessor, block, null)
+            blocks
+
+        # A write WRITE_TARGET cares about may execute after the latest execution of FIRST
+        # and before LAST. Only paths that do not pass FIRST again matter: a later FIRST is
+        # the one whose value reaches LAST. Exact reachability over feasible edges, with no
+        # exploration limit (`writeBetween`).
+        def write_between(first: LLVMValueRef, last: LLVMValueRef, write_target: LLVMValueRef?) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            origin: LLVMBasicBlockRef = LLVMGetInstructionParent(first)
+            last_block: LLVMBasicBlockRef = LLVMGetInstructionParent(last)
+            before: darray[LLVMValueRef] = reach_backward(last_block, origin)
+            for block in reach_forward(origin, null, false, origin, null) |before, write_target|:
+                return true if contains_fact(&before, block) and block_writes(LLVMValueAsBasicBlock(block), write_target)
+            step: mutable LLVMValueRef? = LLVMGetNextInstruction(first)
+            while step is current |step, last, write_target|:
+                break if current == last
+                return true if relevant_write(current, write_target)
+                step <- LLVMGetNextInstruction(current)
+            return false if origin == last_block
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(last_block)
+            while cursor is current |cursor, last, write_target|:
+                break if current == last
+                return true if relevant_write(current, write_target)
+                cursor <- LLVMGetNextInstruction(current)
+            false
+
+        # FOUND with the comparisons CONDITION decides when it has value TRUTH, looking
+        # through and/or, selects and short-circuit phis of i1 values. VIA collects the one
+        # possible predecessor of each short-circuit phi: facts that hold at the end of that
+        # block also hold on the edge (`factsOf`).
+        def condition_facts(found: mutable EdgeConditionFacts&, condition: LLVMValueRef, truth: bool, depth: u32) can[Abort.Panic, Memory.Allocate]:
+            return if depth == PrefixFactLimit::CONDITION_DEPTH
+            if is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP):
+                found.facts.push(CompareFact{compare: condition, truth: truth})
+                return
+            if logical_operands(condition, truth) is operands:
+                condition_facts(found, operands.left, truth, depth + 1)
+                condition_facts(found, operands.right, truth, depth + 1)
+                return
+            return if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::PHI) or not is_llvm_integer_type(LLVMTypeOf(condition), 1)
+            possible: mutable LLVMValueRef? = null
+            from: mutable LLVMBasicBlockRef? = null
+            for index in 0..<LLVMCountIncoming(condition) |possible, from, condition, truth|:
+                incoming: LLVMValueRef = LLVMGetIncomingValue(condition, index)
+                if LLVMIsAConstantInt(incoming) != null:
+                    return if (ElisaLLVMIsConstantOne(incoming) != 0) == truth
+                    continue
+                return if possible != null
+                possible <- incoming
+                from <- LLVMGetIncomingBlock(condition, index)
+            value: LLVMValueRef = get possible else return
+            block: LLVMBasicBlockRef = get from else return
+            found.via.push(block)
+            condition_facts(found, value, truth, depth + 1)
+
+        # FACTS with the comparisons decided by branch edges that dominate CONTEXT
+        # (`anyFact`'s walk; the provers test each one).
+        def collect_dominating_facts(facts: mutable darray[DecidedFact]&, context: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef, depth: u32) can[Abort.Panic, Memory.Allocate]:
+            return if depth == PrefixFactLimit::VIA_DEPTH or ElisaLLVMIsReachableFromEntry(analyses, context) == 0
+            node: mutable LLVMBasicBlockRef? = context
+            while node is dominator |node, facts, context, analyses, depth|:
+                node <- ElisaLLVMImmediateDominator(analyses, dominator)
+                for predecessor in predecessor_edges(dominator) |facts, context, analyses, depth, dominator|:
+                    branch: LLVMValueRef = get conditional_terminator(predecessor) else continue
+                    continue if LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                    for edge in 0..<2 |facts, context, analyses, depth, dominator, predecessor, branch|:
+                        continue if LLVMGetSuccessor(branch, edge.u32()) != dominator or ElisaLLVMEdgeDominates(analyses, predecessor, dominator, context) == 0
+                        found: mutable EdgeConditionFacts = EdgeConditionFacts{facts: [], via: []}
+                        condition_facts(&found, LLVMGetCondition(branch), edge == 0, 0)
+                        for before in found.via |facts, analyses, depth|:
+                            collect_dominating_facts(facts, before, analyses, depth + 1)
+                        for decided in found.facts |facts, predecessor, dominator|:
+                            facts.push(oriented_fact(decided, predecessor, dominator))
+
+        # DECIDED as a less-than-form fact on the edge FROM -> TARGET.
+        def oriented_fact(decided: CompareFact, from: LLVMBasicBlockRef, target: LLVMBasicBlockRef) -> DecidedFact:
+            compare: LLVMValueRef = decided.compare
+            stated: i32 = LLVMGetICmpPredicate(compare)
+            predicate: i32 = stated if decided.truth else inverse_integer_predicate(stated)
+            left: LLVMValueRef = LLVMGetOperand(compare, 0)
+            right: LLVMValueRef = LLVMGetOperand(compare, 1)
+            if predicate == LLVMIntPredicate::UGT or predicate == LLVMIntPredicate::SGT or predicate == LLVMIntPredicate::UGE or predicate == LLVMIntPredicate::SGE:
+                return DecidedFact{predicate: swapped_integer_predicate(predicate), left: right, right: left, compare: compare, from: from, target: target}
+            DecidedFact{predicate: predicate, left: left, right: right, compare: compare, from: from, target: target}
+
+        def dominating_facts(context: LLVMBasicBlockRef, analyses: ElisaFunctionAnalysesRef) -> darray[DecidedFact] can[Abort.Panic, Memory.Allocate]:
+            facts: mutable darray[DecidedFact] = []
+            collect_dominating_facts(&facts, context, analyses, 0)
+            facts

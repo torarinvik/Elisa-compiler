@@ -40,7 +40,7 @@ for part in \
 done
 printf '%s\n' '# seed fixture source' > "$WORK/src/driver/elisac.elisa"
 mkdir -p "$WORK/src/backend"
-for source in llvm_memory_and_call_passes llvm_c_api/transforms/elisa_llvm_codegen_options; do
+for source in llvm_c_api/transforms/elisa_llvm_codegen_options; do
   mkdir -p "$(dirname "$WORK/src/backend/$source")"
   printf '%s\n' '// LLVM bridge fixture' > "$WORK/src/backend/$source.cpp"
 done

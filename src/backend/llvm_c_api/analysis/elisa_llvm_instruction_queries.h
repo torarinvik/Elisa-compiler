@@ -34,6 +34,13 @@ unsigned ElisaLLVMMemoryIntrinsicDestinationAlignment(LLVMValueRef intrinsic);
  * byte offset (at the index width, sign-extended to 64 bits) in *offset, when every index is
  * constant. */
 int ElisaLLVMGEPConstantOffset(LLVMValueRef gep, int64_t *offset);
+/* The pointer of MemoryLocation::getOrNone(instruction), or of getForDest for a memory
+ * intrinsic: the memory a write through the instruction lands in, or null when it is
+ * not one location (a call). */
+LLVMValueRef ElisaLLVMWrittenLocationPointer(LLVMValueRef instruction);
+/* BasicBlock::getFirstInsertionPt: the first instruction after the phis and any
+ * landing pad, or null when the block has no place to insert. */
+LLVMValueRef ElisaLLVMFirstInsertionPoint(LLVMBasicBlockRef block);
 
 #ifdef __cplusplus
 }

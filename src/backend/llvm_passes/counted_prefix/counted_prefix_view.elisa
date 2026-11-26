@@ -1,0 +1,204 @@
+# A counted-prefix buffer may escape as a {data, length} view argument when the view
+# starts at element zero, its length is at most the prefix count, and the private callee
+# reaches the data only through accesses guarded by index < length (the view half of
+# `ElisaCountedPrefix` in the C++ it replaces). The callee can then neither read nor
+# write the suffix.
+include "./prefix_facts.elisa"
+
+const module CountedViewLimit:
+    CALLEE_INSTRUCTIONS: u32 = 2000
+    LENGTH_DEPTH: u32 = 6
+
+# A `select`, or Stage0's branchless form B ^ ((A ^ B) & -zext(C)), which is A when C
+# holds and B otherwise.
+struct SelectShape:
+    condition: LLVMValueRef
+    when_true: LLVMValueRef
+    when_false: LLVMValueRef
+
+extend Backend:
+    private:
+        # CANDIDATE with any freezes around it removed (`stripFreeze`).
+        def strip_freeze(candidate: LLVMValueRef) -> LLVMValueRef:
+            current: mutable LLVMValueRef = candidate
+            while is_llvm_instruction_with_opcode(current, LLVMOpcode::FREEZE) |current|:
+                current <- LLVMGetOperand(current, 0)
+            current
+
+        # CANDIDATE is field FIELD of the view argument VIEW (`isViewField`).
+        def is_view_field(candidate: LLVMValueRef, view: LLVMValueRef, field: u32) -> bool:
+            extract: LLVMValueRef = strip_freeze(candidate)
+            return false if not is_llvm_instruction_with_opcode(extract, LLVMOpcode::EXTRACT_VALUE) or LLVMGetOperand(extract, 0) != view
+            LLVMGetNumIndices(extract) == 1 and aggregate_field_index(extract) == field
+
+        # A dominating branch edge establishes INDEX < VIEW.length at ACCESS
+        # (`accessGuarded`).
+        def access_guarded(access: LLVMValueRef, index: LLVMValueRef, view: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic]:
+            wanted: LLVMValueRef = strip_freeze(index)
+            access_block: LLVMBasicBlockRef = LLVMGetInstructionParent(access)
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(LLVMGetBasicBlockParent(access_block))
+            while block_cursor is block |block_cursor, wanted, view, analyses, access_block|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                branch: LLVMValueRef = get conditional_terminator(block) else continue
+                compare: LLVMValueRef = LLVMGetCondition(branch)
+                continue if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetSuccessor(branch, 0) == LLVMGetSuccessor(branch, 1)
+                for edge in 0..<2 |wanted, view, analyses, access_block, block, branch, compare|:
+                    continue if ElisaLLVMEdgeDominates(analyses, block, LLVMGetSuccessor(branch, edge.u32()), access_block) == 0
+                    stated: i32 = LLVMGetICmpPredicate(compare)
+                    predicate: i32 = stated if edge == 0 else inverse_integer_predicate(stated)
+                    left: LLVMValueRef = LLVMGetOperand(compare, 0)
+                    right: LLVMValueRef = LLVMGetOperand(compare, 1)
+                    if predicate == LLVMIntPredicate::UGT:
+                        return true if strip_freeze(right) == wanted and is_view_field(left, view, 1)
+                    elif predicate == LLVMIntPredicate::ULT:
+                        return true if strip_freeze(left) == wanted and is_view_field(right, view, 1)
+            false
+
+        # The pointer operand of a load or store; null for any other instruction.
+        def load_store_pointer(access: LLVMValueRef) -> LLVMValueRef?:
+            return LLVMGetOperand(access, 0) if LLVMIsALoadInst(access) != null
+            return LLVMGetOperand(access, 1) if LLVMIsAStoreInst(access) != null
+            null
+
+        # ACCESS, a user of ADDRESS (an element GEP of the view's data), loads or stores at
+        # most ELEMENT_BYTES through it under a guard of its index.
+        def guarded_view_access(access: LLVMValueRef, address: LLVMValueRef, view: LLVMValueRef, element_bytes: u64, layout: LLVMTargetDataRef, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic]:
+            accessed: LLVMTypeRef = (LLVMTypeOf(access) if LLVMIsALoadInst(access) != null else LLVMTypeOf(LLVMGetOperand(access, 0)))
+            pointer: LLVMValueRef = get load_store_pointer(access) else return false
+            return false if pointer != address or LLVMStoreSizeOfType(layout, accessed) > element_bytes
+            access_guarded(access, LLVMGetOperand(address, 1), view, analyses)
+
+        # A call taking the view (argument POSITION of CLONE) passes it only at POSITION to
+        # ORIGINAL or CLONE itself.
+        def view_passed_through(call: LLVMValueRef, view: LLVMValueRef, position: u32, clone: LLVMValueRef, original: LLVMValueRef) -> bool:
+            callee: LLVMValueRef = get direct_callee(call) else return false
+            return false if callee != original and callee != clone
+            for index in 0..<LLVMGetNumArgOperands(call) |call, view, position|:
+                return false if (LLVMGetOperand(call, index) == view) != (index == position)
+            true
+
+        # Every use of CLONE's view argument POSITION is guarded: a recursive call passes
+        # it on in place, the length is read freely, and the data is reached only through
+        # guarded element accesses (`viewUsesGuarded`).
+        def view_uses_guarded(clone: LLVMValueRef, position: u32, original: LLVMValueRef, element_bytes: u64, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            view: LLVMValueRef = LLVMGetParam(clone, position)
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(LLVMGetGlobalParent(clone))
+            for user in use_list_users(view) |view, position, clone, original, element_bytes, analyses, layout|:
+                if LLVMIsACallInst(user) != null:
+                    return false if not view_passed_through(user, view, position, clone, original)
+                    continue
+                return false if not is_llvm_instruction_with_opcode(user, LLVMOpcode::EXTRACT_VALUE) or LLVMGetNumIndices(user) != 1
+                field: u32 = aggregate_field_index(user)
+                return false if field > 1
+                continue if field == 1
+                for address in use_list_users(user) |user, view, element_bytes, analyses, layout|:
+                    return false if LLVMIsAGetElementPtrInst(address) == null or LLVMGetOperand(address, 0) != user or LLVMGetNumIndices(address) != 1
+                    return false if LLVMABISizeOfType(layout, LLVMGetGEPSourceElementType(address)) != element_bytes
+                    for access in use_list_users(address) |address, view, element_bytes, analyses, layout|:
+                        return false if not guarded_view_access(access, address, view, element_bytes, layout, analyses)
+            true
+
+        # CALLEE, a private function, keeps its view argument POSITION guarded. The property
+        # is proved on a scalarized copy, since the callee may still keep its view parameter
+        # in a local slot at this point of the pipeline (`calleeGuardsView`).
+        def callee_guards_view(callee: LLVMValueRef, position: u32, element_bytes: u64) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if not has_local_linkage(callee) or LLVMIsDeclaration(callee) != 0 or LLVMIsFunctionVarArg(LLVMGlobalGetValueType(callee)) != 0
+            return false if position >= LLVMCountParams(callee) or function_instruction_count(callee) > CountedViewLimit::CALLEE_INSTRUCTIONS
+            clone: LLVMValueRef = ElisaLLVMCloneFunction(callee)
+            guarded: mutable bool = false
+            if run_function_pipeline(clone, null, "sroa,early-cse"):
+                if ElisaLLVMCreateFunctionAnalyses(clone) is analyses:
+                    guarded <- view_uses_guarded(clone, position, callee, element_bytes, analyses)
+                    ElisaLLVMDisposeFunctionAnalyses(analyses)
+            LLVMDeleteFunction(clone)
+            guarded
+
+        def is_zero_integer(candidate: LLVMValueRef) -> bool:
+            LLVMIsAConstantInt(candidate) != null and LLVMIsNull(candidate) != 0
+
+        def binary_instruction(candidate: LLVMValueRef, opcode: u32) -> bool:
+            LLVMIsABinaryOperator(candidate) != null and LLVMGetInstructionOpcode(candidate) == opcode
+
+        # The branchless select whose mask is MASKED and whose base is BASE, if MASKED is
+        # `(A ^ BASE) & -zext(C)` in either operand order.
+        def branchless_select(base: LLVMValueRef, masked: LLVMValueRef) -> SelectShape? can[Abort.Panic]:
+            return null if not binary_instruction(masked, LLVMOpcode::AND)
+            for part in 0..<2 |base, masked|:
+                difference: LLVMValueRef = LLVMGetOperand(masked, part.u32())
+                negated: LLVMValueRef = LLVMGetOperand(masked, (1 - part).u32())
+                continue if not binary_instruction(difference, LLVMOpcode::XOR) or not binary_instruction(negated, LLVMOpcode::SUB)
+                extend: LLVMValueRef = LLVMGetOperand(negated, 1)
+                continue if not is_zero_integer(LLVMGetOperand(negated, 0)) or not is_llvm_instruction_with_opcode(extend, LLVMOpcode::ZEXT)
+                flag: LLVMValueRef = LLVMGetOperand(extend, 0)
+                continue if not is_llvm_integer_type(LLVMTypeOf(flag), 1) or not is_llvm_instruction_with_opcode(flag, LLVMOpcode::ICMP)
+                if LLVMGetOperand(difference, 0) == base:
+                    return SelectShape{condition: flag, when_true: LLVMGetOperand(difference, 1), when_false: base}
+                if LLVMGetOperand(difference, 1) == base:
+                    return SelectShape{condition: flag, when_true: LLVMGetOperand(difference, 0), when_false: base}
+            null
+
+        # CANDIDATE as a select on a comparison (`asSelect`).
+        def as_select(candidate: LLVMValueRef) -> SelectShape? can[Abort.Panic]:
+            if is_llvm_instruction_with_opcode(candidate, LLVMOpcode::SELECT):
+                condition: LLVMValueRef = LLVMGetOperand(candidate, 0)
+                return null if not is_llvm_instruction_with_opcode(condition, LLVMOpcode::ICMP)
+                return SelectShape{condition: condition, when_true: LLVMGetOperand(candidate, 1), when_false: LLVMGetOperand(candidate, 2)}
+            return null if not binary_instruction(candidate, LLVMOpcode::XOR)
+            for side in 0..<2 |candidate|:
+                if branchless_select(LLVMGetOperand(candidate, side.u32()), LLVMGetOperand(candidate, (1 - side).u32())) is shape:
+                    return shape
+            null
+
+        # Zero, or a clamp of zero whose condition `0 <= x` always holds (`isZeroStart`).
+        def is_zero_start(start: LLVMValueRef) -> bool can[Abort.Panic]:
+            return true if is_zero_integer(start)
+            shape: SelectShape = get as_select(start) else return false
+            return false if not is_zero_integer(shape.when_true)
+            predicate: i32 = LLVMGetICmpPredicate(shape.condition)
+            (predicate == LLVMIntPredicate::ULE and is_zero_integer(LLVMGetOperand(shape.condition, 0))) or (predicate == LLVMIntPredicate::UGE and is_zero_integer(LLVMGetOperand(shape.condition, 1)))
+
+        # The value LENGTH is at most, one step through a select that is always its operand
+        # or an unsigned minimum; null when no rule applies.
+        def select_length_step(shape: SelectShape&) -> LLVMValueRef?:
+            left: LLVMValueRef = LLVMGetOperand(shape.condition, 0)
+            right: LLVMValueRef = LLVMGetOperand(shape.condition, 1)
+            predicate: i32 = LLVMGetICmpPredicate(shape.condition)
+            return shape.when_true if predicate == LLVMIntPredicate::UGE and left == shape.when_true and is_zero_integer(right) and is_zero_integer(shape.when_false)
+            return shape.when_false if predicate == LLVMIntPredicate::UGT and left == shape.when_false and right == shape.when_true
+            return shape.when_true if (predicate == LLVMIntPredicate::ULT or predicate == LLVMIntPredicate::ULE) and left == shape.when_true and right == shape.when_false
+            null
+
+        # LENGTH is the prefix count BOUND, or a value no larger than it: a subtraction of a
+        # zero start, a select that is always its operand, or an unsigned minimum
+        # (`lengthWithin`).
+        def length_within(length: LLVMValueRef, bound: LLVMValueRef) -> bool can[Abort.Panic]:
+            current: mutable LLVMValueRef = length
+            for _depth in 0..<CountedViewLimit::LENGTH_DEPTH |current, bound|:
+                return true if current == bound
+                if binary_instruction(current, LLVMOpcode::SUB):
+                    return false if not is_zero_start(LLVMGetOperand(current, 1))
+                    current <- LLVMGetOperand(current, 0)
+                    continue
+                shape: SelectShape = get as_select(current) else return false
+                current <- get select_length_step(&shape) else return false
+            false
+
+        # DATA, `insertvalue undef, data, 0`, becomes a view `insertvalue DATA, length, 1`
+        # with a length at most BOUND, passed only as view arguments to guarded callees
+        # after the prefix is complete (the edge COMPLETION_FROM -> COMPLETION_TO)
+        # (`viewEscapeCovered`).
+        def view_escape_covered(data: LLVMValueRef, bound: LLVMValueRef, completion_from: LLVMBasicBlockRef, completion_to: LLVMBasicBlockRef, element_bytes: u64, analyses: ElisaFunctionAnalysesRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            aggregate: LLVMTypeRef = LLVMTypeOf(data)
+            return false if LLVMGetTypeKind(aggregate) != LLVMTypeKindValue::STRUCT or LLVMCountStructElementTypes(aggregate) != 2
+            return false if LLVMGetNumIndices(data) != 1 or aggregate_field_index(data) != 0 or LLVMIsUndef(LLVMGetOperand(data, 0)) == 0 or not has_one_use(data)
+            only_use: LLVMUseRef = get LLVMGetFirstUse(data) else return false
+            view: LLVMValueRef = LLVMGetUser(only_use)
+            return false if not is_llvm_instruction_with_opcode(view, LLVMOpcode::INSERT_VALUE) or LLVMGetOperand(view, 0) != data
+            return false if LLVMGetNumIndices(view) != 1 or aggregate_field_index(view) != 1 or not length_within(LLVMGetOperand(view, 1), bound)
+            for user in use_list_users(view) |view, completion_from, completion_to, element_bytes, analyses|:
+                return false if LLVMIsACallInst(user) == null
+                callee: LLVMValueRef = get direct_callee(user) else return false
+                return false if ElisaLLVMEdgeDominates(analyses, completion_from, completion_to, LLVMGetInstructionParent(user)) == 0
+                for position in 0..<LLVMGetNumArgOperands(user) |user, view, callee, element_bytes|:
+                    return false if LLVMGetOperand(user, position) == view and not callee_guards_view(callee, position, element_bytes)
+            true
