@@ -1,0 +1,315 @@
+# The covered array initializers (`prepareCoveredArrayInitializers` in the C++ it
+# replaces): the zero fill of a private array of doubles goes when nested counted loops
+# write every element a load reads before it reads it. Each candidate function is first
+# cleaned up (mem2reg, instcombine, gvn, simplifycfg, loop-simplify, lcssa), which also
+# turns a library `memset` into the intrinsic. Unknown aliases, irregular loops,
+# skipped writes, exceptional exits and other accesses keep the fill. A module that
+# loses a fill is marked `elisa.covered-array-revisit` for the later revisit pass.
+include "../ir/llvm_ir_queries.elisa"
+
+const module CoveredArrayLimit:
+    INDEX_DEPTH: u32 = 12
+    FUNCTION_INSTRUCTIONS: u32 = 4000
+    CANDIDATE_FUNCTIONS: usize = 16
+    SCREENED_SMALLEST: u64 = 128
+    SMALLEST: u64 = 16
+    LARGEST: u64 = 8192
+    WALK_BLOCKS: usize = 512
+    WALK_PENDING: usize = 2048
+
+# A counted loop `for i in 0..<bound` whose body is BODY (`Induction`).
+struct CountedInduction:
+    loop: ElisaLoopRef
+    bound: LLVMValueRef
+    body: LLVMBasicBlockRef
+
+# The loops a read's index ranges over, each with the bound it counts to (the C++
+# `std::map<Loop *, Value *> used`; only membership and size are read).
+struct IndexLoops:
+    loops: mutable darray[ElisaLoopRef]
+    bounds: mutable darray[LLVMValueRef]
+
+extend Backend:
+    private:
+        # VALUE is the counter of a loop-simplify-form loop that counts from zero by one
+        # while `value <u bound` with an invariant bound (`induction`).
+        def counted_induction(value: LLVMValueRef, analyses: ElisaFunctionAnalysesRef) -> CountedInduction? can[Abort.Panic]:
+            return null if not is_llvm_instruction_with_opcode(value, LLVMOpcode::PHI) or not is_llvm_integer_type(LLVMTypeOf(value), 64)
+            header: LLVMBasicBlockRef = LLVMGetInstructionParent(value)
+            loop: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, header) else return null
+            return null if ElisaLLVMLoopHeader(loop) != header or ElisaLLVMLoopIsSimplifyForm(loop) == 0 or LLVMCountIncoming(value) != 2
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(loop) else return null
+            latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+            start: LLVMValueRef = get phi_incoming_for_block(value, preheader) else return null
+            step: LLVMValueRef = get phi_incoming_for_block(value, latch) else return null
+            return null if LLVMIsAConstantInt(start) == null or LLVMIsNull(start) == 0
+            return null if not is_llvm_instruction_with_opcode(step, LLVMOpcode::ADD) or LLVMGetOperand(step, 0) != value
+            one: LLVMValueRef = LLVMGetOperand(step, 1)
+            return null if LLVMIsAConstantInt(one) == null or ElisaLLVMConstantIntEquals(one, 1) == 0
+            branch: LLVMValueRef = terminator_of(header)
+            return null if LLVMGetInstructionOpcode(branch) != LLVMOpcode::CONDITIONAL_BR
+            compare: LLVMValueRef = LLVMGetCondition(branch)
+            return null if not is_llvm_instruction_with_opcode(compare, LLVMOpcode::ICMP) or LLVMGetICmpPredicate(compare) != LLVMIntPredicate::ULT or LLVMGetOperand(compare, 0) != value
+            bound: LLVMValueRef = LLVMGetOperand(compare, 1)
+            body: LLVMBasicBlockRef = LLVMGetSuccessor(branch, 0)
+            return null if ElisaLLVMLoopIsInvariant(loop, bound) == 0 or ElisaLLVMLoopContainsBlock(loop, body) == 0 or ElisaLLVMLoopContainsBlock(loop, LLVMGetSuccessor(branch, 1)) != 0
+            CountedInduction{loop: loop, bound: bound, body: body}
+
+        # The i64 element index of POINTER, an 8-byte-element GEP of BUFFER (`indexOf`).
+        def covered_array_index(pointer: LLVMValueRef, buffer: LLVMValueRef, layout: LLVMTargetDataRef) -> LLVMValueRef?:
+            return null if LLVMIsAGetElementPtrInst(pointer) == null or LLVMGetOperand(pointer, 0) != buffer or LLVMGetNumIndices(pointer) != 1
+            return null if LLVMABISizeOfType(layout, LLVMGetGEPSourceElementType(pointer)) != 8
+            index: LLVMValueRef = LLVMGetOperand(pointer, 1)
+            return index if is_llvm_integer_type(LLVMTypeOf(index), 64) else null
+
+        # The bound LOOPS records for LOOP, if any.
+        def index_loop_bound(loops: IndexLoops&, loop: ElisaLoopRef) -> LLVMValueRef? can[Abort.Panic]:
+            for position in 0..<loops.loops.count |loops, loop|:
+                return loops.bounds[position] if loops.loops[position] == loop
+            null
+
+        # Two 64-bit-or-narrower constants with the same low word (APInt equality of a
+        # single word, as the C++ compares them).
+        def same_constant(first: LLVMValueRef, second: LLVMValueRef) -> bool:
+            LLVMGetIntTypeWidth(LLVMTypeOf(first)) <= 64 and LLVMGetIntTypeWidth(LLVMTypeOf(second)) <= 64 and LLVMConstIntGetZExtValue(first) == LLVMConstIntGetZExtValue(second)
+
+        # The written index WRITTEN equals the read index READ at READ_ACCESS on every
+        # iteration that reaches it: the same loop-free value, equal constants, counters of
+        # loops with one bound (recorded in LOOPS), or the same `+`/`*` of such (`sameIndex`).
+        def same_covered_index(written: LLVMValueRef, read: LLVMValueRef, read_access: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, loops: mutable IndexLoops&, depth: u32) -> bool can[Abort.Panic, Memory.Allocate]:
+            return false if depth > CoveredArrayLimit::INDEX_DEPTH
+            if written == read:
+                return LLVMIsAInstruction(written) == null or ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(written)) == null
+            written_constant: bool = LLVMIsAConstantInt(written) != null
+            read_constant: bool = LLVMIsAConstantInt(read) != null
+            return written_constant and read_constant and same_constant(written, read) if written_constant or read_constant
+            if counted_induction(written, analyses) is writer:
+                if counted_induction(read, analyses) is reader:
+                    return false if writer.bound != reader.bound
+                    return false if ElisaLLVMEdgeDominates(analyses, ElisaLLVMLoopHeader(reader.loop), reader.body, LLVMGetInstructionParent(read_access)) == 0
+                    if index_loop_bound(loops, writer.loop) is recorded:
+                        return recorded == writer.bound
+                    loops.loops.push(writer.loop)
+                    loops.bounds.push(writer.bound)
+                    return true
+            return false if LLVMIsABinaryOperator(written) == null or LLVMIsABinaryOperator(read) == null
+            opcode: u32 = LLVMGetInstructionOpcode(written)
+            return false if opcode != LLVMGetInstructionOpcode(read) or (opcode != LLVMOpcode::ADD and opcode != LLVMOpcode::MUL)
+            return false if not same_covered_index(LLVMGetOperand(written, 0), LLVMGetOperand(read, 0), read_access, analyses, loops, depth + 1)
+            same_covered_index(LLVMGetOperand(written, 1), LLVMGetOperand(read, 1), read_access, analyses, loops, depth + 1)
+
+        # BLOCK only traps or is unreachable (`isDeadEnd`).
+        def dead_end_block(block: LLVMBasicBlockRef, quiet: darray[u32]&) -> bool can[Abort.Panic]:
+            cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+            while cursor is instruction |cursor, quiet|:
+                return true if LLVMGetInstructionOpcode(instruction) == LLVMOpcode::UNREACHABLE
+                intrinsic: u32 = called_intrinsic_id(instruction)
+                return false if intrinsic == 0 or not (any id in quiet where id == intrinsic)
+                cursor <- LLVMGetNextInstruction(instruction)
+            false
+
+        # The one exit of LOOP that is not a dead end, taken from its header, or null
+        # (`normalExit`).
+        def normal_loop_exit(loop: ElisaLoopRef, quiet: darray[u32]&) -> LLVMBasicBlockRef? can[Abort.Panic]:
+            normal: mutable LLVMBasicBlockRef? = null
+            header: LLVMBasicBlockRef = ElisaLLVMLoopHeader(loop)
+            for position in 0..<ElisaLLVMLoopBlockCount(loop) |normal, loop, header, quiet|:
+                block: LLVMBasicBlockRef = ElisaLLVMLoopBlockAt(loop, position)
+                terminator: LLVMValueRef = terminator_of(block)
+                for successor_index in 0..<LLVMGetNumSuccessors(terminator) |normal, loop, header, quiet, block, terminator|:
+                    exit: LLVMBasicBlockRef = LLVMGetSuccessor(terminator, successor_index)
+                    continue if ElisaLLVMLoopContainsBlock(loop, exit) != 0 or dead_end_block(exit, quiet)
+                    return null if block != header
+                    if normal is chosen:
+                        return null if chosen != exit
+                    normal <- exit
+            normal
+
+        # Every path from PARENT's header to READ passes PRE (`readerNeedsPreheader`): a
+        # depth-first walk that gives up (false) past 512 blocks or 2048 pending ones.
+        def reader_needs_preheader(parent: ElisaLoopRef, pre: LLVMBasicBlockRef, read: LLVMBasicBlockRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if read == pre or ElisaLLVMLoopContainsBlock(parent, read) == 0 or ElisaLLVMLoopContainsBlock(parent, pre) == 0
+            seen: mutable darray[LLVMValueRef] = []
+            work: mutable darray[LLVMBasicBlockRef] = [ElisaLLVMLoopHeader(parent)]
+            while work.count > 0 |seen, work, parent, pre, read|:
+                block: LLVMBasicBlockRef = work[work.count - 1]
+                work.truncate(work.count - 1)
+                key: LLVMValueRef = LLVMBasicBlockAsValue(block)
+                continue if block == pre or ElisaLLVMLoopContainsBlock(parent, block) == 0 or contains_fact(&seen, key)
+                return false if seen.count >= CoveredArrayLimit::WALK_BLOCKS
+                insert_fact(&seen, key)
+                return false if block == read
+                terminator: LLVMValueRef = terminator_of(block)
+                for successor_index in 0..<LLVMGetNumSuccessors(terminator) |work, terminator|:
+                    return false if work.count >= CoveredArrayLimit::WALK_PENDING
+                    work.push(LLVMGetSuccessor(terminator, successor_index))
+            true
+
+        # The loops of WRITER's index nest LOOPS, from the innermost outwards, each run to
+        # completion before READ; the exit READ must follow (`writerCovers`).
+        def covering_exit(writer: LLVMValueRef, read: LLVMValueRef, loops: IndexLoops&, analyses: ElisaFunctionAnalysesRef, quiet: darray[u32]&) -> LLVMBasicBlockRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            writer_block: LLVMBasicBlockRef = LLVMGetInstructionParent(writer)
+            inner: ElisaLoopRef = get ElisaLLVMLoopForBlock(analyses, writer_block) else return null
+            return null if index_loop_bound(loops, inner) == null
+            inner_latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(inner) else return null
+            return null if ElisaLLVMBlockDominates(analyses, writer_block, inner_latch) == 0
+            child: mutable ElisaLoopRef? = null
+            seen: mutable usize = 0
+            cursor: mutable ElisaLoopRef? = inner
+            while cursor is loop |cursor, child, seen, loops, analyses, quiet|:
+                break if index_loop_bound(loops, loop) == null
+                return null if ElisaLLVMLoopIsSimplifyForm(loop) == 0 or normal_loop_exit(loop, quiet) == null
+                seen <- seen + 1
+                if child is previous:
+                    previous_preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(previous) else return null
+                    latch: LLVMBasicBlockRef = get ElisaLLVMLoopLatch(loop) else return null
+                    return null if ElisaLLVMBlockDominates(analyses, previous_preheader, latch) == 0
+                child <- loop
+                cursor <- ElisaLLVMLoopParent(loop)
+            outer: ElisaLoopRef = get child else return null
+            return null if seen != loops.loops.count
+            preheader: LLVMBasicBlockRef = get ElisaLLVMLoopPreheader(outer) else return null
+            if ElisaLLVMLoopParent(outer) is parent:
+                return null if not reader_needs_preheader(parent, preheader, LLVMGetInstructionParent(read))
+            elif ElisaLLVMLoopForBlock(analyses, preheader) != null:
+                return null
+            for bound in loops.bounds |outer|:
+                return null if ElisaLLVMLoopIsInvariant(outer, bound) == 0
+            normal_loop_exit(outer, quiet)
+
+        # BUFFER's fill INIT, outside every loop, is covered: one store dominated by INIT
+        # writes, in counted loops that finish first, every element a load reads (`prove`).
+        def covered_array_proof(buffer: LLVMValueRef, init: LLVMValueRef, analyses: ElisaFunctionAnalysesRef, layout: LLVMTargetDataRef, quiet: darray[u32]&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return false if ElisaLLVMLoopForBlock(analyses, LLVMGetInstructionParent(init)) != null
+            reads: mutable darray[LLVMValueRef] = []
+            writes: mutable darray[LLVMValueRef] = []
+            for user in use_list_users(buffer) |reads, writes, buffer, init, layout|:
+                continue if user == init
+                return false if covered_array_index(user, buffer, layout) == null
+                for access in use_list_users(user) |reads, writes, user|:
+                    if LLVMIsALoadInst(access) != null:
+                        return false if LLVMGetVolatile(access) != 0 or LLVMGetOrdering(access) != 0 or LLVMGetTypeKind(LLVMTypeOf(access)) != LLVMTypeKindValue::DOUBLE or LLVMGetOperand(access, 0) != user
+                        reads.push(access)
+                    elif LLVMIsAStoreInst(access) != null:
+                        return false if LLVMGetVolatile(access) != 0 or LLVMGetOrdering(access) != 0 or LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(access, 0))) != LLVMTypeKindValue::DOUBLE or LLVMGetOperand(access, 1) != user
+                        writes.push(access)
+                    else:
+                        return false
+            return false if reads.count == 0
+            for write in writes |reads, buffer, init, layout, analyses, quiet|:
+                continue if ElisaLLVMInstructionDominates(analyses, init, write) == 0
+                written: LLVMValueRef = get covered_array_index(LLVMGetOperand(write, 1), buffer, layout) else continue
+                covers_all: mutable bool = true
+                for read in reads |covers_all, buffer, layout, analyses, quiet, written, write|:
+                    loops: mutable IndexLoops = IndexLoops{loops: [], bounds: []}
+                    read_index: LLVMValueRef? = covered_array_index(LLVMGetOperand(read, 0), buffer, layout)
+                    mutable exit: LLVMBasicBlockRef? = null
+                    if read_index is index:
+                        if same_covered_index(written, index, read, analyses, &loops, 0):
+                            exit <- covering_exit(write, read, &loops, analyses, quiet)
+                    if exit is covering:
+                        covers_all <- ElisaLLVMBlockDominates(analyses, covering, LLVMGetInstructionParent(read)) != 0
+                    else:
+                        covers_all <- false
+                    break if not covers_all
+                return true if covers_all
+            false
+
+        # CALL zeroes a private array of doubles: a non-volatile memset, or a plain call of
+        # the declared library `memset` that instcombine may make one. Screening only:
+        # the arguments still have to match (`screened_double_fill`).
+        def screened_fill_arguments(call: LLVMValueRef, intrinsics: MemsetIntrinsics&) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            if is_memset(call, intrinsics):
+                return not call_is_volatile(call) and LLVMGetNumOperandBundles(call) == 0
+            return false if LLVMIsACallInst(call) == null
+            callee: LLVMValueRef = get direct_callee(call) else return false
+            return false if LLVMIsDeclaration(callee) == 0 or not has_value_name(callee, "memset") or function_has_attribute(callee, "nobuiltin")
+            LLVMGetNumArgOperands(call) == 3 and LLVMGetInstructionCallConv(call) == 0 and LLVMGetNumOperandBundles(call) == 0 and ElisaLLVMCallIsNoBuiltin(call) == 0
+
+        # CALL's destination is an array of SMALLEST to 8192 doubles it fills with zero bytes
+        # over exactly its allocation size; the array, or null.
+        def double_array_zero_fill(call: LLVMValueRef, smallest: u64, layout: LLVMTargetDataRef) -> LLVMValueRef?:
+            buffer: LLVMValueRef = LLVMGetOperand(call, 0)
+            fill: LLVMValueRef = LLVMGetOperand(call, 1)
+            length: LLVMValueRef = LLVMGetOperand(call, 2)
+            return null if LLVMIsAAllocaInst(buffer) == null
+            array: LLVMTypeRef = LLVMGetAllocatedType(buffer)
+            return null if LLVMGetTypeKind(array) != LLVMTypeKindValue::ARRAY or LLVMGetTypeKind(LLVMGetElementType(array)) != LLVMTypeKindValue::DOUBLE
+            elements: u64 = LLVMGetArrayLength2(array)
+            return null if elements < smallest or elements > CoveredArrayLimit::LARGEST
+            return null if LLVMIsAConstantInt(fill) == null or LLVMIsNull(fill) == 0 or LLVMIsAConstantInt(length) == null or ElisaLLVMConstantIntActiveBits(length) > 64
+            return buffer if LLVMConstIntGetZExtValue(length) == LLVMABISizeOfType(layout, array) else null
+
+        # FUNCTION, at most 4000 instructions, fills an array of 128 to 8192 doubles with
+        # zeros.
+        def covered_array_candidate(function: LLVMValueRef, intrinsics: MemsetIntrinsics&, layout: LLVMTargetDataRef) -> bool can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            candidate: mutable bool = false
+            visited: mutable u32 = 0
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, candidate, visited, intrinsics, layout|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, candidate, visited, intrinsics, layout|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    visited <- visited + 1
+                    return false if visited > CoveredArrayLimit::FUNCTION_INSTRUCTIONS
+                    continue if not screened_fill_arguments(instruction, intrinsics)
+                    candidate <- true if double_array_zero_fill(instruction, CoveredArrayLimit::SCREENED_SMALLEST, layout) != null
+            candidate
+
+        # FUNCTION's covered fills removed after its cleanup pipeline.
+        def remove_function_covered_fills(function: LLVMValueRef, intrinsics: MemsetIntrinsics&, layout: LLVMTargetDataRef, quiet: darray[u32]&) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            fills: mutable darray[LLVMValueRef] = []
+            block_cursor: mutable LLVMBasicBlockRef? = LLVMGetFirstBasicBlock(function)
+            while block_cursor is block |block_cursor, fills, intrinsics|:
+                block_cursor <- LLVMGetNextBasicBlock(block)
+                cursor: mutable LLVMValueRef? = LLVMGetFirstInstruction(block)
+                while cursor is instruction |cursor, fills, intrinsics|:
+                    cursor <- LLVMGetNextInstruction(instruction)
+                    fills.push(instruction) if is_memset(instruction, intrinsics)
+            return 0 if fills.count == 0
+            analyses: ElisaFunctionAnalysesRef = get ElisaLLVMCreateFunctionAnalyses(function) else return 0
+            removed: mutable u32 = 0
+            for fill in fills |removed, analyses, layout, quiet|:
+                buffer: LLVMValueRef = get double_array_zero_fill(fill, CoveredArrayLimit::SMALLEST, layout) else continue
+                continue if ElisaLLVMIsStaticAlloca(buffer) == 0 or call_is_volatile(fill) or LLVMGetNumOperandBundles(fill) != 0
+                if covered_array_proof(buffer, fill, analyses, layout, quiet):
+                    LLVMInstructionEraseFromParent(fill)
+                    removed <- removed + 1
+            ElisaLLVMDisposeFunctionAnalyses(analyses)
+            removed
+
+    public:
+        # MODULE's covered array fills removed; how many were. Only on AArch64 macOS and
+        # Linux, without debug info, and for at most 16 candidate functions.
+        def prepare_covered_array_initializers(module: LLVMModuleRef) -> u32 can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            return 0 if module_has_named_metadata(module, "llvm.dbg.cu") or not module_targets_aarch64_architecture(module)
+            return 0 if ElisaLLVMModuleTargetIsMacOSX(module) == 0 and ElisaLLVMModuleTargetIsLinux(module) == 0
+            intrinsics: MemsetIntrinsics = memset_intrinsics()
+            layout: LLVMTargetDataRef = LLVMGetModuleDataLayout(module)
+            candidates: mutable darray[LLVMValueRef] = []
+            cursor: mutable LLVMValueRef? = LLVMGetFirstFunction(module)
+            while cursor is function |cursor, candidates, intrinsics, layout|:
+                cursor <- LLVMGetNextFunction(function)
+                continue if LLVMIsDeclaration(function) != 0 or function_is_size_optimized(function) or function_is_sanitized(function)
+                candidates.push(function) if covered_array_candidate(function, &intrinsics, layout)
+            return 0 if candidates.count == 0 or candidates.count > CoveredArrayLimit::CANDIDATE_FUNCTIONS
+            quiet: darray[u32] = [intrinsic_identifier("llvm.trap"), intrinsic_identifier("llvm.dbg.declare"), intrinsic_identifier("llvm.dbg.value"), intrinsic_identifier("llvm.dbg.assign"), intrinsic_identifier("llvm.dbg.label")]
+            options: LLVMPassBuilderOptionsRef = LLVMCreatePassBuilderOptions()
+            passes_storage: mutable darray[u8] = []
+            cleanup: cstr = sview_to_cstr("mem2reg,instcombine,gvn,simplifycfg,loop-simplify,lcssa", passes_storage)
+            removed: mutable u32 = 0
+            for function in candidates |removed, options, cleanup, intrinsics, layout, quiet|:
+                if LLVMRunPassesOnFunction(function, cleanup, null, options) is failure:
+                    LLVMConsumeError(failure)
+                    LLVMDisposePassBuilderOptions(options)
+                    return removed
+                removed <- removed + remove_function_covered_fills(function, &intrinsics, layout, &quiet)
+            LLVMDisposePassBuilderOptions(options)
+            if removed > 0:
+                context: LLVMContextRef = LLVMGetModuleContext(module)
+                name_storage: mutable darray[u8] = []
+                no_operands: mutable LLVMMetadataRef? = null
+                empty: LLVMMetadataRef = LLVMMDNodeInContext2(context, (&no_operands).cast[void&], 0)
+                LLVMAddNamedMetadataOperand(module, sview_to_cstr("elisa.covered-array-revisit", name_storage), LLVMMetadataAsValue(context, empty))
+            removed

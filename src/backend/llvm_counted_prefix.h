@@ -2,9 +2,68 @@
 // covers every subsequent scalar read, including reads of shorter prefixes.
 #include "llvm_counted_prefix_view.h"
 namespace ElisaCountedPrefix {
-using ElisaCoveredArray::Induction;
-using ElisaCoveredArray::induction;
-using ElisaCoveredArray::normalExit;
+struct Induction {
+  Loop *loop;
+  Value *bound;
+  BasicBlock *body;
+};
+static bool induction(Value *V, LoopInfo &LI, Induction &out, bool requireZeroStart = true) {
+  auto *P = dyn_cast<PHINode>(V);
+  if (!P || !P->getType()->isIntegerTy(64))
+    return false;
+  Loop *L = LI.getLoopFor(P->getParent());
+  if (!L || L->getHeader() != P->getParent() || !L->isLoopSimplifyForm() ||
+      P->getNumIncomingValues() != 2)
+    return false;
+  auto *Pre = L->getLoopPreheader();
+  auto *Latch = L->getLoopLatch();
+  if (!Pre || !Latch)
+    return false;
+  auto *Z = dyn_cast_or_null<ConstantInt>(P->getIncomingValueForBlock(Pre));
+  auto *A =
+      dyn_cast_or_null<BinaryOperator>(P->getIncomingValueForBlock(Latch));
+  if ((requireZeroStart && (!Z || !Z->isZero())) || !A ||
+      A->getOpcode() != Instruction::Add)
+    return false;
+  auto *One = dyn_cast<ConstantInt>(A->getOperand(1));
+  if (A->getOperand(0) != P || !One || !One->isOne())
+    return false;
+  auto *B = dyn_cast<CondBrInst>(L->getHeader()->getTerminator());
+  auto *C = B ? dyn_cast<ICmpInst>(B->getCondition()) : nullptr;
+  if (!C || C->getPredicate() != ICmpInst::ICMP_ULT || C->getOperand(0) != P ||
+      !L->isLoopInvariant(C->getOperand(1)) ||
+      !L->contains(B->getSuccessor(0)) || L->contains(B->getSuccessor(1)))
+    return false;
+  out = {L, C->getOperand(1), B->getSuccessor(0)};
+  return true;
+}
+static bool isDeadEnd(BasicBlock *B) {
+  for (Instruction &I : *B) {
+    if (isa<UnreachableInst>(I))
+      return true;
+    if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+      if (II->getIntrinsicID() == Intrinsic::trap)
+        continue;
+    }
+    if (isa<DbgInfoIntrinsic>(I))
+      continue;
+    return false;
+  }
+  return false;
+}
+static BasicBlock *normalExit(Loop *L) {
+  BasicBlock *normal = nullptr;
+  for (BasicBlock *B : L->blocks())
+    for (BasicBlock *E : successors(B)) {
+      if (L->contains(E) || isDeadEnd(E))
+        continue;
+      // Any non-header exit could bypass a suffix of the initialization loop.
+      if (B != L->getHeader() || (normal && normal != E))
+        return nullptr;
+      normal = E;
+    }
+  return normal;
+}
 
 static void collectBoundFacts(Value *Condition, bool Taken, Value *Bound,
                               Value *Limit, bool &Nonnegative,

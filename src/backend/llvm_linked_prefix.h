@@ -10,9 +10,9 @@ namespace ElisaLinkedPrefix {
 using ElisaPrefixFacts::same;
 using ElisaPrefixFacts::sameAddress;
 using ElisaPrefixFacts::writeBetween;
-using ElisaCoveredArray::Induction;
-using ElisaCoveredArray::induction;
-using ElisaCoveredArray::normalExit;
+using ElisaCountedPrefix::Induction;
+using ElisaCountedPrefix::induction;
+using ElisaCountedPrefix::normalExit;
 
 struct Access {
   Instruction *instruction;

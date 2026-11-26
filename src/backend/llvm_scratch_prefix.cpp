@@ -1,5 +1,5 @@
 //go:build cgo
-// The preparing phase of the scratch-prefix sequence: covered and counted array
+// The preparing phase of the scratch-prefix sequence: counted prefix
 // initializers. The rest of the sequence, including the scratch fills this phase
 // prepares for, lives in Elisa (llvm_passes/scratch_prefix/).
 #include <llvm/ADT/SmallPtrSet.h>
@@ -37,7 +37,6 @@
 using namespace llvm;
 
 #if LLVM_VERSION_MAJOR >= 23
-#include "llvm_array_coverage.h"
 #include "llvm_counted_prefix.h"
 
 // The scratch-prefix sequence runs before O3 from Elisa
@@ -61,13 +60,11 @@ struct PhaseAnalyses {
 };
 } // namespace ElisaScratchPrefix
 
-// Covered and counted array initializers.
+// Counted prefix initializers.
 extern "C" unsigned elisacorePrepareScratchPrefixArrays(LLVMModuleRef Ref) {
   Module &M = *unwrap(Ref);
   ElisaScratchPrefix::PhaseAnalyses Phase;
-  unsigned Removed = prepareCoveredArrayInitializers(M, Phase.FAM, Phase.PB);
-  Removed += removeCountedPrefixInitializers(M, Phase.FAM, Phase.PB);
-  return Removed;
+  return removeCountedPrefixInitializers(M, Phase.FAM, Phase.PB);
 }
 
 extern "C" unsigned elisacoreScratchPrefixSupported(void) { return 1; }
