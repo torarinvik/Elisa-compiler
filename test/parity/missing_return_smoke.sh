@@ -60,8 +60,10 @@ grep -q "unreachable code" <<< "$out" || fail "statement after aborting region-a
 out=$(printf 'def f(flag: bool) -> i64:\n    dead: i64 = match flag:\n        true: panic("left")\n        _: panic("right")\n' | "$RPT")
 grep -q "may fall through" <<< "$out" && fail "false positive on two-arm aborting match initializer: $out"
 
-# 11. An exhaustive value match with a fall-through wildcard arm is not a terminator.
-out=$(printf 'def f(flag: bool) -> i64:\n    dead: i64 = match flag:\n        true: panic("left")\n        _: 1\n' | "$RPT")
+# 11. An exhaustive value match with a fall-through wildcard arm is not a terminator. The
+# scrutinee is an integer: a bool match is itself an error, and "may fall through" is only
+# reported when it is the sole error (stage0 raises it in the backend).
+out=$(printf 'def f(code: i64) -> i64:\n    dead: i64 = match code:\n        0: panic("left")\n        _: 1\n' | "$RPT")
 grep -q "may fall through without returning a value" <<< "$out" || fail "one-arm aborting match hid a fall-through path: $out"
 
 # 12. A literal-true loop without a reachable break cannot fall through.
