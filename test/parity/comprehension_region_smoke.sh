@@ -64,6 +64,7 @@ accepted=(
   "struct_field|    h: Holder = Holder{items: [x.i64() for x in 0..<3]}\n    return h.items.count.i32()"
   "region_block|    region scratch(4096):\n        return take([x.i64() for x in 0..<3]).i32()"
   "query_argument|    xs: darray[i64] = [x.i64() for x in 0..<3]\n    return take(xs).i32() if (any v in xs where v == 2) else 0"
+  "rebind_tuple|    rebind count: i64, items: darray[i64] =\n        2, [x.i64() for x in 0..<3]\n    return (count + items.count.i64()).i32()"
   "extend_argument|    return 0"
   "auto_wrapped|    acc: mutable darray[i64] = []\n    acc.push(1)\n    return take([x.i64() for x in 0..<3]).i32()"
 )
