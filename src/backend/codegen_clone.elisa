@@ -131,6 +131,57 @@ extend Backend:
             return null
 
 
+        # The source of an INFERRED clone -- `clone(x)` or `x.clone()` -- or Absent. Both are
+        # stage0's builtin deep copy: plain `clone(x)` only while no user function is named
+        # clone, the method only while no one-argument clone could take the receiver by UFCS.
+        def clone_inferred_source(callee: Expr, arguments: darray[Expr]&, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&) -> Expr can[Abort.Panic, Memory.Allocate]:
+            match callee:
+                Expr.Ident(clone_name, clone_name_line):
+                    return arguments[0] if clone_name == "clone" and arguments.count == 1 and first_function_named(fns, "clone") < 0
+                Expr.Field(clone_receiver, clone_field, clone_field_line):
+                    return (Expr.Absent) if clone_field != "clone" or arguments.count != 0
+                    receiver_type: ValueType = expression_type(clone_receiver, local_scope, fns, structs, generics)
+                    return clone_receiver if not clone_ufcs_function_takes(receiver_type, fns, structs)
+                _:
+                    pass
+            return (Expr.Absent)
+
+        # A user one-argument `clone` whose parameter has the receiver's type (references
+        # stripped on both sides) takes `x.clone()` by UFCS; any other leaves the builtin.
+        def clone_ufcs_function_takes(receiver_type: ValueType, fns: FnTable&, structs: mutable StructTable&) -> bool can[Abort.Panic]:
+            receiver: ValueType = ref_target_of(receiver_type, structs) if receiver_type.kind == TypeKind.Ref else receiver_type
+            index_cursor: mutable i64 = first_function_named(fns, "clone")
+            while index_cursor >= 0 |index_cursor, fns, structs, receiver|:
+                index: usize = index_cursor.usize()
+                index_cursor <- next_function_named(fns, "clone", index_cursor)
+                if fns.names[index] == "clone" and fns.param_count[index] == 1 and fns.param_start[index] < fns.param_types.count:
+                    declared: ValueType = fns.param_types[fns.param_start[index]]
+                    parameter: ValueType = ref_target_of(declared, structs) if declared.kind == TypeKind.Ref else declared
+                    return true if parameter.kind == receiver.kind and parameter.bits == receiver.bits
+            return false
+
+        # The owned type an inferred clone produces: the source with its reference stripped,
+        # and a view widened to the darray it borrows from (stage0 cloneInferredTargetType).
+        def clone_inferred_type(source_type: ValueType, structs: mutable StructTable&) -> ValueType can[Abort.Panic, Memory.Allocate]:
+            owned: ValueType = ref_target_of(source_type, structs) if source_type.kind == TypeKind.Ref else source_type
+            return intern_darray_type(view_element_of(owned, structs), structs) if owned.kind == TypeKind.View
+            return owned
+
+        # The clone's source and its type. A reference source is read through, so the clone
+        # copies the referent.
+        def emit_clone_source(source: Expr, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> (value: LLVMValueRef?, value_type: ValueType) can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
+            can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+                source_type: ValueType = expression_type(source, local_scope, fns, structs, generics)
+                emit_type: ValueType = view_struct_type(source_type, structs) if source_type.kind == TypeKind.View else source_type
+                if (emit_expression(source, emit_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is source_value:
+                    return (source_value, source_type) if source_type.kind != TypeKind.Ref
+                    referent: ValueType = ref_target_of(source_type, structs)
+                    return (null, referent) if referent.kind == TypeKind.Unmodeled
+                    loaded: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(referent, structs, ctx), source_value, "clone.src.deref")
+                    return (loaded, referent)
+                return (null, source_type)
+
+
         def emit_clone_value_builtin(callee: Expr, arguments: darray[Expr]&, expected: ValueType, local_scope: mutable Scope&, fns: FnTable&, structs: mutable StructTable&, generics: mutable GenericTable&, runtime: Runtime&, m: LLVMModuleRef, ctx: LLVMContextRef, builder: LLVMBuilderRef) -> LLVMValueRef? can[Abort.Panic, Memory.Allocate, Unsafe.PointerCast]:
             can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
                 is_clone: mutable bool = false
@@ -149,10 +200,13 @@ extend Backend:
                                 pass
                     _:
                         pass
-                return null if not is_clone or arguments.count != 1 or expected.kind == TypeKind.DArray or expected.kind == TypeKind.Unmodeled
-                source_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
-                if (emit_expression(arguments[0], source_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is source_value:
-                    return (emit_clone_aggregate_value(source_value, source_type, expected, structs, runtime, m, ctx, builder) can Global{Read,Write})
+                clone_source: Expr = arguments[0] if is_clone and arguments.count == 1 else clone_inferred_source(callee, arguments, local_scope, fns, structs, generics)
+                return null if:
+                    clone_source is Expr.Absent
+                    expected.kind == TypeKind.DArray or expected.kind == TypeKind.Unmodeled
+                source: (value: LLVMValueRef?, value_type: ValueType) = emit_clone_source(clone_source, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+                if source.value is source_value:
+                    return (emit_clone_aggregate_value(source_value, source.value_type, expected, structs, runtime, m, ctx, builder) can Global{Read,Write})
                 return null
 
 
@@ -219,8 +273,10 @@ extend Backend:
                             pass
                 _:
                     pass
-            return null if not is_clone or arguments.count != 1 or expected.kind != TypeKind.DArray
-            source_type: ValueType = expression_type(arguments[0], local_scope, fns, structs, generics)
+            clone_source: Expr = arguments[0] if is_clone and arguments.count == 1 else clone_inferred_source(callee, arguments, local_scope, fns, structs, generics)
+            return null if clone_source is Expr.Absent or expected.kind != TypeKind.DArray
+            declared_source_type: ValueType = expression_type(clone_source, local_scope, fns, structs, generics)
+            source_type: ValueType = ref_target_of(declared_source_type, structs) if declared_source_type.kind == TypeKind.Ref else declared_source_type
             return null if source_type.kind != TypeKind.DArray and source_type.kind != TypeKind.View and source_type.kind != TypeKind.SView and source_type.kind != TypeKind.Array
             source_element: mutable ValueType = ValueType{kind: TypeKind.Unsigned, bits: 8}
             source_element <- darray_element_of(source_type, structs) if source_type.kind == TypeKind.DArray
@@ -230,8 +286,8 @@ extend Backend:
             return null if:
                 source_element.kind == TypeKind.Unmodeled or target_element.kind == TypeKind.Unmodeled
                 source_element.kind != target_element.kind or source_element.bits != target_element.bits
-            source_expression_type: ValueType = view_struct_type(source_type, structs) if source_type.kind == TypeKind.View else source_type
-            if (emit_expression(arguments[0], source_expression_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}) is source_value:
+            clone_darray_source: (value: LLVMValueRef?, value_type: ValueType) = emit_clone_source(clone_source, local_scope, fns, structs, generics, runtime, m, ctx, builder) can Global{Read,Write}
+            if clone_darray_source.value is source_value:
                 header: LLVMTypeRef = darray_llvm_type(structs, ctx)
                 count_type: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
                 # Each supported source shape initializes both fields in its

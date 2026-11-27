@@ -5,7 +5,7 @@ Start with the [quickstart](../README.md#run-your-first-program) and
 
 ## Language and interop
 
-- [Language notes](language/) cover integer behavior, regions, concurrency, and other language features, including [optional borrows](language/optional-borrows.md), [refinements and contracts](language/refinements-and-contracts.md), [returning a grown container](language/returning-grown-containers.md), and [where container literals and comprehensions allocate](language/container-literal-regions.md).
+- [Language notes](language/) cover integer behavior, regions, concurrency, and other language features, including [optional borrows](language/optional-borrows.md), [refinements and contracts](language/refinements-and-contracts.md), [returning a grown container](language/returning-grown-containers.md), [where container literals and comprehensions allocate](language/container-literal-regions.md), and [cloning values](language/cloning.md).
 - [Automatic memory management](automatic-memory-management.md) explains lifetime and allocation rules.
 - [Expression forms](119_expression_unification.md) describes how value-producing blocks and control flow fit together.
 - [Python extensions](interop/python.md) and [WebAssembly](interop/wasm.md) have runnable examples.
