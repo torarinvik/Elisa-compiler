@@ -4,6 +4,9 @@
 #     def take(xs: darray[i64]) -> i64: ...
 #     take([1, 2, 3])        # stage0: darray literal has no region to allocate in; ...
 #
+# A `[x for x in ...]` comprehension follows the same rule (stage0 names it bare,
+# "comprehension has no region..."), also through `&` where it would otherwise decline.
+#
 # stage0 checks this in its analyzer; stage1 had NO check — it accepted the darray form outright
 # and reached a bare backend DECLINE (exit 2, no diagnostic) for dict and set.
 #
@@ -50,6 +53,8 @@ extend Semantic:
                         return dict_pos
                     Expr.SetLit(elements_set, set_pos):
                         return set_pos
+                    Expr.Comprehension(_, _, _, _, comprehension_pos, _):
+                        return comprehension_pos
                     _:
                         return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
 
@@ -207,6 +212,67 @@ extend Semantic:
                     index <- index + 1
                 return (false, Ast::Expr.Absent)
 
+        # A `[x for x in ...]` comprehension allocates a darray and, like a literal, takes its
+        # region from its destination (stage0 analyzeListComprehensionExprWithExpected). Only a
+        # binding, an assignment, a return or a struct field supplies one; every other position
+        # -- a call argument of any callee, `&` of it, a `for` iterable, a method receiver --
+        # supplies none, so clr_check_expression reports the comprehension there.
+        def clr_check_comprehension_parts(comprehension: Ast::Expr, names: darray[sview]&, indices: darray[u32]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match comprehension:
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, _):
+                        table <- clr_check_expression(iterable, names, indices, types, table)
+                        table <- clr_check_expression(condition, names, indices, types, table)
+                        table <- clr_check_expression(body, names, indices, types, table)
+                    _:
+                        pass
+
+        # Expr.Comprehension also carries the allocation-free query and quantifier forms
+        # (`any x in xs where c`, `count`, `forall`, ...). Those take their scope ID from their
+        # own head token, which is also their position; a `[... for ...]` or `{... for ...}`
+        # comprehension takes it from its later `for` token.
+        def clr_builds_container(comprehension_pos: Ast::Pos, scope_id: u32) -> bool:
+            can Abort.Panic:
+                return scope_id != Ast::query_scope_id_from_offset(comprehension_pos.offset)
+
+        def clr_is_extend_callee(callee: Ast::Expr) -> bool:
+            can Abort.Panic:
+                match callee:
+                    Expr.Field(object, field, field_pos):
+                        return field == "extend"
+                    _:
+                        return false
+
+        # A value in a destination position: a comprehension there, or one reached through the
+        # shapes that pass the destination on (parentheses, conditional arms, a block's tail,
+        # container elements, struct fields), is given a region and is not reported.
+        def clr_check_destination(expression: Ast::Expr, names: darray[sview]&, indices: darray[u32]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                match expression:
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, _):
+                        table <- clr_check_comprehension_parts(expression, names, indices, types, table)
+                    Expr.Paren(inner, paren_pos):
+                        table <- clr_check_destination(inner, names, indices, types, table)
+                    Expr.If(condition, then_expr, else_expr, if_pos):
+                        table <- clr_check_expression(condition, names, indices, types, table)
+                        table <- clr_check_destination(then_expr, names, indices, types, table)
+                        table <- clr_check_destination(else_expr, names, indices, types, table)
+                    Expr.Block(statements, value, captures, block_pos):
+                        table <- clr_check_statements(statements, false, names, indices, types, table)
+                        table <- clr_check_destination(value, names, indices, types, table)
+                    Expr.Array(elements, array_pos) | Expr.SetLit(elements, array_pos):
+                        for element in elements |table|:
+                            table <- clr_check_destination(element, names, indices, types, table)
+                    Expr.DictLit(entries, dict_pos):
+                        for entry in entries |table|:
+                            table <- clr_check_expression(entry.key, names, indices, types, table)
+                            table <- clr_check_destination(entry.value, names, indices, types, table)
+                    Expr.Construct(type_expression, fields, construct_pos):
+                        for field in fields |table|:
+                            table <- clr_check_destination(field.value, names, indices, types, table)
+                    _:
+                        table <- clr_check_expression(expression, names, indices, types, table)
+
         def clr_check_expression(expression: Ast::Expr, names: darray[sview]&, indices: darray[u32]&, types: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 match expression:
@@ -219,12 +285,18 @@ extend Semantic:
                                 callee_name <- ident_name
                             _:
                                 pass
+                        # `xs.extend([f(x) for x in ...])` appends straight into the receiver, so
+                        # stage0 accepts that one comprehension argument (not `push`, not `&[...]`).
+                        extends_receiver: bool = arguments.count == 1 and clr_is_extend_callee(callee)
                         while position < arguments.count |position: usize = 0, table| -> table:
                             argument: Ast::Expr = arguments[position]
+                            if extends_receiver:
+                                table <- clr_check_destination(argument, names, indices, types, table)
+                            else:
+                                table <- clr_check_expression(argument, names, indices, types, table)
                             if callee_name != "" and clr_arg_may_carry_literal(argument):
                                 parameter: (found: bool, type_expression: Ast::Expr) = clr_param_type(names, indices, types, callee_name, position.u32())
                                 table <- clr_arg_literals_need_region(argument, parameter.type_expression, table) if parameter.found
-                            table <- clr_check_expression(argument, names, indices, types, table)
                             position <- position + 1
                         table <- clr_check_expression(callee, names, indices, types, table)
                     Expr.StaticEffectCall(effect_type, operation, candidates, arguments, argument_names, effect_call_pos):
@@ -267,7 +339,7 @@ extend Semantic:
                     Expr.Construct(type_expression, fields, construct_pos):
                         table <- clr_check_expression(type_expression, names, indices, types, table)
                         for field in fields |table|:
-                            table <- clr_check_expression(field.value, names, indices, types, table)
+                            table <- clr_check_destination(field.value, names, indices, types, table)
                     Expr.RecordUpdate(base, fields, update_pos):
                         table <- clr_check_expression(base, names, indices, types, table)
                         for field in fields |table|:
@@ -281,10 +353,9 @@ extend Semantic:
                         for arm in arms |table|:
                             table <- clr_check_expression(arm.guard, names, indices, types, table)
                             table <- clr_check_statements(arm.body, false, names, indices, types, table)
-                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, _):
-                        table <- clr_check_expression(iterable, names, indices, types, table)
-                        table <- clr_check_expression(condition, names, indices, types, table)
-                        table <- clr_check_expression(body, names, indices, types, table)
+                    Expr.Comprehension(variable, iterable, condition, body, comprehension_pos, comprehension_scope_id):
+                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.ContainerLiteralNoRegion, name: "comprehension", line: comprehension_pos.line, pos: comprehension_pos, expected: "", actual: ""}) if clr_builds_container(comprehension_pos, comprehension_scope_id)
+                        table <- clr_check_comprehension_parts(expression, names, indices, types, table)
                     Expr.Refinement(base, predicate, refinement_pos):
                         table <- clr_check_expression(base, names, indices, types, table)
                         table <- clr_check_expression(predicate, names, indices, types, table)
@@ -306,11 +377,11 @@ extend Semantic:
                         Stmt.Expr(expression, line):
                             table <- clr_check_expression(expression, names, indices, types, table) if not in_region
                         Stmt.VarDecl(_, _, value, _):
-                            table <- clr_check_expression(value, names, indices, types, table) if not in_region
+                            table <- clr_check_destination(value, names, indices, types, table) if not in_region
                         Stmt.Assign(target, assign_operator, value, line):
-                            table <- clr_check_expression(value, names, indices, types, table) if not in_region
+                            table <- clr_check_destination(value, names, indices, types, table) if not in_region
                         Stmt.Return(value, line):
-                            table <- clr_check_expression(returned, names, indices, types, table) if value is returned and not in_region
+                            table <- clr_check_destination(returned, names, indices, types, table) if value is returned and not in_region
                         Stmt.If(condition, then_body, else_body, if_line):
                             table <- clr_check_expression(condition, names, indices, types, table) if not in_region
                             table <- clr_check_statements(then_body, in_region, names, indices, types, table)
@@ -319,6 +390,7 @@ extend Semantic:
                             table <- clr_check_expression(condition, names, indices, types, table) if not in_region
                             table <- clr_check_statements(while_body, in_region, names, indices, types, table)
                         Stmt.For(bind, variables, iterable, for_body, for_line):
+                            table <- clr_check_expression(iterable, names, indices, types, table) if not in_region
                             table <- clr_check_statements(for_body, in_region, names, indices, types, table)
                         Stmt.Block(block_kind, clause, binding, body, block_line):
                             # Both block forms supply an ambient region to everything inside them.
