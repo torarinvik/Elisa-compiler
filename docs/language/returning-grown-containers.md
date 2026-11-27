@@ -20,5 +20,19 @@ def finish(queue: mutable darray[u8]) -> darray[u8]:
     return queue
 ```
 
-Both compilers reject the first form at check time. Regression fixture:
+The same applies when the reference is copied into a by-value initializer. That includes a call
+on another call's result and a value block that ends in the in-place call:
+
+```elisa
+receipt: darray[u8] = encode(prefix).push(10)   # error: variable "receipt" expects darray[u8], got mutable darray[u8]&
+target: darray[u8] =
+    buffer: mutable darray[u8] = []
+    buffer.resize(n)                             # error: the block's value is the reference
+```
+
+Bind the value first, then thread it: `receipt: mutable darray[u8] = encode(prefix)`, then
+`receipt <- receipt.push(10)`. In a block, write `buffer <- buffer.resize(n)` and end the block
+with `buffer`.
+
+Both compilers reject these forms at check time. Regression fixture:
 `test/parity/grown_return_smoke.sh`.

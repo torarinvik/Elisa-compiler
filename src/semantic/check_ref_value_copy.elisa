@@ -212,29 +212,70 @@ extend Semantic:
                         table.diagnostics <- table.diagnostics.truncate(write)
                     table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefValueCopy, name: target_name, pos: pos, line: line, expected: rvc_head(pointee), actual: rvc_second(pointee), detail: rvc_first(pointee), expected_count: rvc_extent(pointee), actual_count: rvc_shape(pointee, table), state_code: spelling})
 
-        # `return xs.push(v)` (and extend/reserve/resize/clear/truncate) on a by-value `darray[E]`:
-        # the in-place methods yield the receiver as `mutable darray[E]&`, so a function declared
-        # `-> darray[E]` copies out of a reference. stage0 refuses it ("return type expects
-        # darray[E], got mutable darray[E]&"); stage1 used to accept it and then decline in the
-        # backend. Write `xs <- xs.push(v)` and `return xs` instead.
-        def rvc_report_grown_return(callee: Ast::Expr, return_type: Ast::Expr, return_pos: Ast::Pos, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, binders: BorrowBinders&, table: lmut SymbolTable) -> void:
-            can Memory.Allocate, Abort.Panic:
-                match callee:
-                    Expr.Field(grown_receiver, grown_method, grown_field_pos):
-                        in_place: bool = when grown_method:
-                            "push" | "extend" | "reserve" | "resize" | "clear" | "truncate" -> true
-                            _ -> false
-                        receiver_name: sview = ident_name_of(grown_receiver)
-                        return if not in_place or receiver_name == "" or not binders_bound_once(binders, receiver_name)
-                        receiver_type: Ast::Expr = rvc_value_type(rvc_annotation(parameters, body, receiver_name))
-                        return if rvc_head(receiver_type) != "darray" or not rvc_same_type(receiver_type, rvc_value_type(return_type), table)
-                        report_pos: mutable Ast::Pos = return_pos
-                        report_pos.end_column <- return_pos.column + 6
-                        table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefValueCopy, name: "", pos: report_pos, line: return_pos.line, expected: rvc_head(receiver_type), actual: rvc_second(receiver_type), detail: rvc_first(receiver_type), expected_count: rvc_extent(receiver_type), actual_count: rvc_shape(receiver_type, table), state_code: 12})
-                    _:
-                        pass
+        # The in-place darray methods yield their receiver as `mutable darray[E]&`, not a value.
+        def rvc_in_place_method(method: sview) -> bool:
+            can Abort.Panic:
+                return when method:
+                    "push" | "extend" | "reserve" | "resize" | "clear" | "truncate" -> true
+                    _ -> false
 
-        def rvc_statements(statements: darray[Ast::Stmt], return_type: Ast::Expr, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, binders: BorrowBinders&, table: lmut SymbolTable) -> void:
+        # The declared return type of the one function named `name`, else Absent (unknown or overloaded).
+        def rvc_function_return(name: sview, function_names: darray[sview]&, function_returns: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                found: mutable Ast::Expr = (Ast::Expr.Absent)
+                matches: mutable u32 = 0
+                for index in 0..<function_names.count |found, matches|:
+                    if function_names[index] == name:
+                        found <- function_returns[index]
+                        matches <- matches + 1
+                return found if matches == 1 else (Ast::Expr.Absent)
+
+        # A value whose result is an in-place darray call (`xs.push(v)`, `make().push(v)`, or a
+        # value block ending in one): the receiver's `darray[E]`, else Absent. `scope` holds the
+        # enclosing value block's statements, where a block-local receiver is declared.
+        def rvc_grown_type(value: Ast::Expr, scope: darray[Ast::Stmt]&, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, binders: BorrowBinders&, function_names: darray[sview]&, function_returns: darray[Ast::Expr]&) -> Ast::Expr:
+            can Memory.Allocate, Abort.Panic:
+                match value:
+                    Expr.Paren(paren_inner, paren_pos):
+                        return rvc_grown_type(paren_inner, scope, parameters, body, binders, function_names, function_returns)
+                    Expr.Block(block_statements, block_value, block_captures, block_pos):
+                        return rvc_grown_type(block_value, block_statements, parameters, body, binders, function_names, function_returns)
+                    Expr.Call(grown_callee, grown_arguments, grown_names, grown_call_pos):
+                        match grown_callee:
+                            Expr.Field(grown_receiver, grown_method, grown_field_pos):
+                                return (Ast::Expr.Absent) if not rvc_in_place_method(grown_method)
+                                receiver_type: mutable Ast::Expr = (Ast::Expr.Absent)
+                                match grown_receiver:
+                                    Expr.Call(receiver_callee, receiver_arguments, receiver_names, receiver_pos):
+                                        receiver_type <- rvc_value_type(rvc_function_return(refinement_callee_name(receiver_callee), function_names, function_returns))
+                                    _:
+                                        receiver_name: sview = ident_name_of(grown_receiver)
+                                        if receiver_name != "":
+                                            local_annotation: Ast::Expr = rvc_body_annotation(scope, receiver_name)
+                                            if not rvc_is_absent(local_annotation):
+                                                receiver_type <- rvc_value_type(local_annotation)
+                                            elif binders_bound_once(binders, receiver_name):
+                                                receiver_type <- rvc_value_type(rvc_annotation(parameters, body, receiver_name))
+                                return receiver_type if rvc_head(receiver_type) == "darray" else (Ast::Expr.Absent)
+                            _:
+                                return (Ast::Expr.Absent)
+                    _:
+                        return (Ast::Expr.Absent)
+
+        # stage0 refuses an in-place call's reference result copied into a by-value
+        # `darray[E]` ("variable \"x\" expects darray[E], got mutable darray[E]&", or "return
+        # type expects ..."); stage1 used to accept it and then decline in the backend. Thread
+        # it instead: `xs <- xs.push(v)`, then use `xs`. `form` is 1 a declaration of `name`, 2 a return.
+        def rvc_report_grown(value: Ast::Expr, target_type: Ast::Expr, name: sview @source, form: u32, pos: Ast::Pos, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, binders: BorrowBinders&, function_names: darray[sview]&, function_returns: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+            can Memory.Allocate, Abort.Panic:
+                no_scope: darray[Ast::Stmt] = []
+                grown_type: Ast::Expr = rvc_grown_type(value, no_scope, parameters, body, binders, function_names, function_returns)
+                return if rvc_is_absent(grown_type) or not rvc_same_type(grown_type, rvc_value_type(target_type), table)
+                report_pos: mutable Ast::Pos = pos
+                report_pos.end_column <- pos.column + (6 if form == 2 else name.len.u32())
+                table.diagnostics <- table.diagnostics.push(Diagnostic{kind: DiagnosticKind.RefValueCopy, name: name, pos: report_pos, line: pos.line, expected: rvc_head(grown_type), actual: rvc_second(grown_type), detail: rvc_first(grown_type), expected_count: rvc_extent(grown_type), actual_count: rvc_shape(grown_type, table), state_code: form + 10})
+
+        def rvc_statements(statements: darray[Ast::Stmt], return_type: Ast::Expr, parameters: darray[Ast::ParamDecl]&, body: darray[Ast::Stmt]&, binders: BorrowBinders&, function_names: darray[sview]&, function_returns: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for statement in statements |table| -> table:
                     match statement:
@@ -243,7 +284,7 @@ extend Semantic:
                                 Expr.Ident(copy_source, copy_source_pos):
                                     table <- rvc_report(copy_source, copy_type, copy_name, 1, copy_pos, copy_pos.line, parameters, body, binders, table)
                                 _:
-                                    pass
+                                    table <- rvc_report_grown(copy_value, copy_type, copy_name, 1, copy_pos, parameters, body, binders, function_names, function_returns, table)
                         Stmt.Assign(assign_target, assign_operator, assign_value, assign_pos):
                             assign_target_name: sview = ident_name_of(assign_target)
                             if assign_operator == TokenKind.LArrow and binders_bound_once(binders, assign_target_name):
@@ -258,22 +299,20 @@ extend Semantic:
                                 match return_expression:
                                     Expr.Ident(return_source, return_source_pos):
                                         table <- rvc_report(return_source, return_type, "", 2, return_source_pos, return_source_pos.line, parameters, body, binders, table)
-                                    Expr.Call(grown_callee, grown_arguments, grown_names, grown_call_pos):
-                                        table <- rvc_report_grown_return(grown_callee, return_type, return_pos, parameters, body, binders, table)
                                     _:
-                                        pass
+                                        table <- rvc_report_grown(return_expression, return_type, "", 2, return_pos, parameters, body, binders, function_names, function_returns, table)
                         Stmt.If(copy_condition, copy_then, copy_else, copy_if_pos):
-                            table <- rvc_statements(copy_then, return_type, parameters, body, binders, table)
-                            table <- rvc_statements(copy_else, return_type, parameters, body, binders, table)
+                            table <- rvc_statements(copy_then, return_type, parameters, body, binders, function_names, function_returns, table)
+                            table <- rvc_statements(copy_else, return_type, parameters, body, binders, function_names, function_returns, table)
                         Stmt.While(copy_loop_condition, copy_loop_body, copy_loop_pos):
-                            table <- rvc_statements(copy_loop_body, return_type, parameters, body, binders, table)
+                            table <- rvc_statements(copy_loop_body, return_type, parameters, body, binders, function_names, function_returns, table)
                         Stmt.For(copy_bind, copy_variables, copy_iterable, copy_for_body, copy_for_pos):
-                            table <- rvc_statements(copy_for_body, return_type, parameters, body, binders, table)
+                            table <- rvc_statements(copy_for_body, return_type, parameters, body, binders, function_names, function_returns, table)
                         Stmt.Block(copy_kind, copy_clause, copy_binding, copy_block_body, copy_block_pos):
-                            table <- rvc_statements(copy_block_body, return_type, parameters, body, binders, table)
+                            table <- rvc_statements(copy_block_body, return_type, parameters, body, binders, function_names, function_returns, table)
                         Stmt.Match(copy_scrutinee, copy_arms, copy_match_pos):
                             for copy_arm in copy_arms |table| -> table:
-                                table <- rvc_statements(copy_arm.body, return_type, parameters, body, binders, table)
+                                table <- rvc_statements(copy_arm.body, return_type, parameters, body, binders, function_names, function_returns, table)
                         _:
                             pass
 
@@ -357,7 +396,7 @@ extend Semantic:
                         _:
                             pass
 
-        def rvc_declarations(declarations: darray[Ast::Decl], f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
+        def rvc_declarations(declarations: darray[Ast::Decl], f_struct: darray[sview]&, f_name: darray[sview]&, f_type: darray[Ast::Expr]&, function_names: darray[sview]&, function_returns: darray[Ast::Expr]&, table: lmut SymbolTable) -> void:
             can Memory.Allocate, Abort.Panic:
                 for declaration in declarations |table| -> table:
                     match declaration:
@@ -368,12 +407,30 @@ extend Semantic:
                             declared_return: mutable Ast::Expr = (Ast::Expr.Absent)
                             if function_return is present_return:
                                 declared_return <- present_return
-                            table <- rvc_statements(function_body, declared_return, function_parameters, function_body, binders, table) if readable
+                            table <- rvc_statements(function_body, declared_return, function_parameters, function_body, binders, function_names, function_returns, table) if readable
                             table <- rvc_construct_statements(function_body, function_parameters, function_body, binders, f_struct, f_name, f_type, table) if readable
                         Decl.Module(module_name, module_body, module_pos):
-                            table <- rvc_declarations(module_body, f_struct, f_name, f_type, table)
+                            table <- rvc_declarations(module_body, f_struct, f_name, f_type, function_names, function_returns, table)
                         Decl.Scoped(scoped_body, scoped_pos):
-                            table <- rvc_declarations(scoped_body, f_struct, f_name, f_type, table)
+                            table <- rvc_declarations(scoped_body, f_struct, f_name, f_type, function_names, function_returns, table)
+                        _:
+                            pass
+
+        # Every function's name and declared return type (Absent for none), modules included.
+        def rvc_collect_functions(declarations: darray[Ast::Decl]&, function_names: mutable darray[sview]&, function_returns: mutable darray[Ast::Expr]&) -> void:
+            can Memory.Allocate, Abort.Panic:
+                for declaration in declarations |function_names, function_returns|:
+                    match declaration:
+                        Decl.Func(collected_name, collected_parameters, collected_return, collected_body, collected_effects, collected_decorators, collected_pos):
+                            function_names.push(collected_name)
+                            collected_type: mutable Ast::Expr = (Ast::Expr.Absent)
+                            if collected_return is present_collected_return:
+                                collected_type <- present_collected_return
+                            function_returns.push(collected_type)
+                        Decl.Module(collected_module_name, collected_module_body, collected_module_pos):
+                            rvc_collect_functions(collected_module_body, function_names, function_returns)
+                        Decl.Scoped(collected_scoped_body, collected_scoped_pos):
+                            rvc_collect_functions(collected_scoped_body, function_names, function_returns)
                         _:
                             pass
 
@@ -384,4 +441,7 @@ extend Semantic:
                 f_name: mutable darray[sview] = []
                 f_type: mutable darray[Ast::Expr] = []
                 oe_collect_fields(declarations, f_struct, f_name, f_type)
-                table <- rvc_declarations(declarations, f_struct, f_name, f_type, table)
+                function_names: mutable darray[sview] = []
+                function_returns: mutable darray[Ast::Expr] = []
+                rvc_collect_functions(declarations, function_names, function_returns)
+                table <- rvc_declarations(declarations, f_struct, f_name, f_type, function_names, function_returns, table)
